@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct Permissions: u64 {
         const CREATE_INSTANT_INVITE = 1 << 0;
         const KICK_MEMBERS          = 1 << 1;
@@ -10,9 +10,15 @@ bitflags! {
         const ADMINISTRATOR         = 1 << 3;
         const MANAGE_CHANNELS       = 1 << 4;
         const MANAGE_GUILD          = 1 << 5;
+        const ADD_REACTIONS         = 1 << 6;
         const VIEW_CHANNEL          = 1 << 10;
         const SEND_MESSAGES         = 1 << 11;
         const MANAGE_MESSAGES       = 1 << 13;
+        const EMBED_LINKS           = 1 << 14;
+        const ATTACH_FILES          = 1 << 15;
+        const READ_MESSAGE_HISTORY  = 1 << 16;
+        const CONNECT               = 1 << 20;
+        const SPEAK                 = 1 << 21;
         const MANAGE_ROLES          = 1 << 28;
     }
 }
@@ -48,6 +54,16 @@ mod tests {
         assert_eq!(Permissions::VIEW_CHANNEL.bits(), 1 << 10);
         assert_eq!(Permissions::SEND_MESSAGES.bits(), 1 << 11);
         assert_eq!(Permissions::MANAGE_ROLES.bits(), 1 << 28);
+    }
+
+    #[test]
+    fn new_permission_bits() {
+        assert_eq!(Permissions::ADD_REACTIONS.bits(), 1 << 6);
+        assert_eq!(Permissions::EMBED_LINKS.bits(), 1 << 14);
+        assert_eq!(Permissions::ATTACH_FILES.bits(), 1 << 15);
+        assert_eq!(Permissions::READ_MESSAGE_HISTORY.bits(), 1 << 16);
+        assert_eq!(Permissions::CONNECT.bits(), 1 << 20);
+        assert_eq!(Permissions::SPEAK.bits(), 1 << 21);
     }
 
     #[test]
