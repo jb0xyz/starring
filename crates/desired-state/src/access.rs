@@ -8,11 +8,13 @@ use crate::identity::ResourceKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum Capability {
     View,
     Send,
-    React,
+    ReadHistory,
+    AddReactions,
+    AttachFiles,
+    EmbedLinks,
     ManageMessages,
     Connect,
     Speak,
@@ -74,8 +76,16 @@ mod tests {
             r#""view""#
         );
         assert_eq!(
-            serde_json::to_string(&Capability::ManageMessages).unwrap(),
-            r#""manage_messages""#
+            serde_json::to_string(&Capability::ReadHistory).unwrap(),
+            r#""read_history""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Capability::AddReactions).unwrap(),
+            r#""add_reactions""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Capability::EmbedLinks).unwrap(),
+            r#""embed_links""#
         );
     }
 

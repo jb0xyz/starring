@@ -24,8 +24,6 @@ pub enum ValidationError {
     AbsentRequiresOwnership(String),
     #[error("match by_name requires a name: {0}")]
     MatchByNameRequiresName(String),
-    #[error("access and raw overwrite target the same role in channel: {0}")]
-    AccessRawConflict(String),
 }
 
 impl DesiredState {
@@ -36,7 +34,6 @@ impl DesiredState {
         self.check_mode_scope(&mut errors);
         self.check_ownership_state(&mut errors);
         self.check_match_name(&mut errors);
-        self.check_access_raw_conflict(&mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -156,27 +153,6 @@ impl DesiredState {
                 errors.push(ValidationError::MatchByNameRequiresName(
                     channel.identity.key.0.clone(),
                 ));
-            }
-        }
-    }
-
-    fn check_access_raw_conflict(&self, errors: &mut Vec<ValidationError>) {
-        for channel in &self.channels {
-            let (Some(access), Some(raw_overwrite_list)) =
-                (&channel.access, &channel.raw_overwrites)
-            else {
-                continue;
-            };
-            let access_role_list: BTreeSet<&ResourceKey> = access.roles.keys().collect();
-            for raw_overwrite in raw_overwrite_list {
-                if let OverwriteTargetIntent::Role(key) = &raw_overwrite.target {
-                    if access_role_list.contains(key) {
-                        errors.push(ValidationError::AccessRawConflict(
-                            channel.identity.key.0.clone(),
-                        ));
-                        break;
-                    }
-                }
             }
         }
     }
@@ -331,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn access_raw_conflict_detected() {
+    fn access_and_raw_same_role_allowed_for_compiler() {
         let key = ResourceKey("verified".to_string());
         let mut roles = std::collections::BTreeMap::new();
         roles.insert(
@@ -360,21 +336,19 @@ mod tests {
                 deny: Permissions::empty(),
             }]),
         };
-        let referenced = RoleIntent {
+        let role = RoleIntent {
             identity: Identity {
                 key,
-                ownership: Ownership::Referenced,
                 ..Default::default()
             },
-            name: None,
+            name: Some("verified".to_string()),
             permissions: None,
         };
         let state = DesiredState {
-            roles: vec![referenced],
+            roles: vec![role],
             channels: vec![channel],
             ..Default::default()
         };
-        let err = state.validate().unwrap_err();
-        assert!(err.contains(&ValidationError::AccessRawConflict("c".to_string())));
+        assert!(state.validate().is_ok());
     }
 }
