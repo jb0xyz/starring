@@ -12,6 +12,8 @@
 
 모든 Task는 아래 제약을 암묵적으로 포함한다.
 
+> ⚠️ **주석 금지(전역)**: 이 프로젝트 코드에는 주석을 넣지 않는다 — `//`, `///`, `//!` 전부. **아래 각 Task의 코드 블록에 주석이 있으면 무시하고 제거한 채 구현한다**(로직·식별자·구조는 그대로 따른다). Task 1에서 이미 커밋된 두 `lib.rs`의 `//!` 주석도 해당 crate의 `lib.rs`를 재작성하는 Task(discord-model=Task 2, domain=Task 6)에서 주석 없이 다시 써서 제거한다. 설명·근거는 스펙 문서가 보관한다.
+
 - Rust **edition 2021**, toolchain **stable**.
 - 의존 방향은 **`domain → discord-model`** 단방향. 순환 금지. `discord-model`은 우리 crate에 의존하지 않는다.
 - 모든 데이터 타입 파생: `Clone, Debug, PartialEq, Eq, Serialize, Deserialize`. ID류는 추가로 `Copy, Hash, PartialOrd, Ord`. enum/`Permissions`는 추가로 `Copy`.

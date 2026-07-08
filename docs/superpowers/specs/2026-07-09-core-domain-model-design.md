@@ -187,6 +187,7 @@ pub struct LoggingRule    { /* skeleton */ }
 ## 5. 공통 컨벤션
 
 - **파생**: 모든 데이터 타입에 `Clone, Debug, PartialEq, Eq, Serialize, Deserialize`. ID류는 추가로 `Copy, Hash, Ord`.
+- **주석 없음**: 코드에 주석(`//`, `///`, `//!`)을 넣지 않는다(사용자 컨벤션). 코드는 자체 설명되도록 작성하고, 근거·설명은 본 스펙/문서가 보관한다.
 - **순수성**: 도메인 타입은 **DB/sqlx에 무관**하게 유지한다. persistence 매핑은 이후 `db` crate의 책임. serde만 붙여 AI/NATS/snapshot 직렬화를 지원.
 - **ID/permissions는 JSON에서 문자열**로 (Discord 관례 + JS 정밀도).
 - **에러**: Phase 1은 대부분 순수 데이터. 검증이 필요한 생성자에만 `thiserror` 기반 에러. 무리한 invariant 강제는 지양(YAGNI).
