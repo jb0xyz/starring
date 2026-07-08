@@ -1,1 +1,5 @@
-//! 고수준 플랫폼 도메인 개념 (OnboardingMode, Visibility, Feature).
+pub mod feature;
+pub mod onboarding;
+
+pub use feature::{Feature, LoggingRule, ModerationRule, VerificationPanel};
+pub use onboarding::{OnboardingMode, Visibility};
