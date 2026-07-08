@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/discord-model", "crates/domain", "crates/desired-state"]
+members = [
+    "crates/discord-model",
+    "crates/domain",
+    "crates/desired-state",
+    "crates/desired-compiler",
+]
 resolver = "2"
 
 [workspace.package]
