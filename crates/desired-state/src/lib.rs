@@ -4,6 +4,7 @@ pub mod feature;
 pub mod identity;
 pub mod mode;
 pub mod role;
+pub mod state;
 
 pub use access::{
     AccessGrant, AccessIntent, Capability, OverwriteOp, OverwriteTargetIntent,
@@ -14,3 +15,4 @@ pub use feature::{FeatureIntent, LoggingIntent, ModerationIntent, VerificationIn
 pub use identity::{Identity, MatchStrategy, Ownership, ResourceKey, ResourceState};
 pub use mode::{DesiredStateMode, ResourceScope, Scope};
 pub use role::RoleIntent;
+pub use state::DesiredState;
