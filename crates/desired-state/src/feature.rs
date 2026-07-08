@@ -24,6 +24,15 @@ pub enum FeatureIntent {
     Logging(LoggingIntent),
 }
 
+impl FeatureIntent {
+    pub fn identity(&self) -> Option<&Identity> {
+        match self {
+            FeatureIntent::Verification(v) => Some(&v.identity),
+            FeatureIntent::Moderation(_) | FeatureIntent::Logging(_) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
