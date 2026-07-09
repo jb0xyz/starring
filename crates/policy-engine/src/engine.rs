@@ -21,6 +21,14 @@ impl PolicyEngine {
         Self { rules }
     }
 
+    pub fn with_default_rules() -> Self {
+        Self::new(vec![
+            Box::new(crate::rules::PrivilegedPermissionRule),
+            Box::new(crate::rules::DestructiveOperationRule),
+            Box::new(crate::rules::EveryoneChangeRule),
+        ])
+    }
+
     pub fn evaluate(&self, graph: &OperationGraph) -> PolicyDecision {
         let mut findings = Vec::new();
         for rule in &self.rules {
@@ -85,5 +93,11 @@ mod tests {
         let decision = engine.evaluate(&OperationGraph::default());
         assert_eq!(decision.verdict, Verdict::Deny);
         assert_eq!(decision.findings.len(), 2);
+    }
+
+    #[test]
+    fn default_rules_allow_empty_graph() {
+        let decision = PolicyEngine::with_default_rules().evaluate(&OperationGraph::default());
+        assert_eq!(decision.verdict, Verdict::Allow);
     }
 }
