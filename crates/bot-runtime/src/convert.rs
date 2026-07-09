@@ -1,7 +1,7 @@
 use discord_model::{ChannelId, ChannelType, GuildId, OverwriteTarget, Permissions, RoleId};
-use twilight_model::channel::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType};
 use twilight_model::channel::ChannelType as TwilightChannelType;
 use twilight_model::guild::Permissions as TwilightPermissions;
+use twilight_model::http::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType};
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, RoleMarker};
 use twilight_model::id::Id;
 
@@ -39,8 +39,8 @@ pub fn to_permission_overwrite(
         OverwriteTarget::Member(user) => (user.0, PermissionOverwriteType::Member),
     };
     PermissionOverwrite {
-        allow: to_twilight_permissions(allow),
-        deny: to_twilight_permissions(deny),
+        allow: Some(to_twilight_permissions(allow)),
+        deny: Some(to_twilight_permissions(deny)),
         id: Id::new(raw_id),
         kind,
     }
@@ -50,8 +50,8 @@ pub fn to_permission_overwrite(
 mod tests {
     use super::*;
     use discord_model::{ChannelId, ChannelType, GuildId, OverwriteTarget, Permissions, RoleId};
-    use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
     use twilight_model::channel::ChannelType as TwilightChannelType;
+    use twilight_model::http::permission_overwrite::PermissionOverwriteType;
 
     #[test]
     fn permissions_roundtrip() {
@@ -91,6 +91,6 @@ mod tests {
         );
         assert_eq!(ow.id.get(), 7);
         assert_eq!(ow.kind, PermissionOverwriteType::Role);
-        assert_eq!(ow.allow.bits(), Permissions::VIEW_CHANNEL.bits());
+        assert_eq!(ow.allow.unwrap().bits(), Permissions::VIEW_CHANNEL.bits());
     }
 }
