@@ -13,6 +13,4 @@ desired-compiler = { path = "../../crates/desired-compiler" }
 diff-engine = { path = "../../crates/diff-engine" }
 operation-graph = { path = "../../crates/operation-graph" }
 discord-model = { path = "../../crates/discord-model" }
-
-[dev-dependencies]
 serde_json = { workspace = true }
