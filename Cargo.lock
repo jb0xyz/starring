@@ -30,6 +30,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "diff-engine"
+version = "0.1.0"
+dependencies = [
+ "desired-compiler",
+ "desired-state",
+ "discord-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "discord-model"
 version = "0.1.0"
 dependencies = [

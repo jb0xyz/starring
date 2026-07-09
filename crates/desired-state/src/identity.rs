@@ -5,7 +5,6 @@ pub struct ResourceKey(pub String);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "by", content = "value", rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum MatchStrategy {
     #[default]
     ByName,

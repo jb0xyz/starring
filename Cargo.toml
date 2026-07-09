@@ -4,6 +4,7 @@ members = [
     "crates/domain",
     "crates/desired-state",
     "crates/desired-compiler",
+    "crates/diff-engine",
 ]
 resolver = "2"
 
