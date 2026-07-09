@@ -6,7 +6,8 @@ use resource_resolution::{ResolutionError, ResourceResolutionContext};
 use crate::adapter::{AdapterError, AdapterErrorKind, ChannelSpec, DiscordAdapter, RoleSpec};
 use crate::request::{ApprovedExecutionRequest, ExecutorError};
 use crate::result::{
-    CreatedResource, JobResult, JobStatus, RollbackAction, StepOutcome, StepResult,
+    CreatedResource, JobResult, JobRun, JobStatus, RollbackAction, RollbackOutcome, RollbackReport,
+    RollbackStatus, RollbackStepResult, StepOutcome, StepResult,
 };
 
 pub struct Executor<A: DiscordAdapter> {
@@ -68,6 +69,120 @@ impl<A: DiscordAdapter> Executor<A> {
             JobStatus::Succeeded
         };
         Ok(JobResult { status, steps })
+    }
+
+    pub async fn execute_with_rollback(
+        &self,
+        request: &ApprovedExecutionRequest,
+    ) -> Result<JobRun, ExecutorError> {
+        let job = self.execute(request).await?;
+        let rollback = if matches!(job.status, JobStatus::Succeeded) {
+            RollbackReport {
+                status: RollbackStatus::NotRequired,
+                steps: Vec::new(),
+            }
+        } else {
+            self.rollback(&job, request.guild_id).await
+        };
+        Ok(JobRun { job, rollback })
+    }
+
+    async fn rollback(&self, job: &JobResult, guild: GuildId) -> RollbackReport {
+        let mut steps = Vec::new();
+        for step in job.steps.iter().rev() {
+            if !matches!(step.outcome, StepOutcome::Success) {
+                continue;
+            }
+            let action = match &step.rollback {
+                Some(action) => action,
+                None => continue,
+            };
+            let outcome = self.run_rollback(guild, action).await;
+            steps.push(RollbackStepResult {
+                source_op_id: step.op_id,
+                action: action.clone(),
+                outcome,
+            });
+        }
+        RollbackReport {
+            status: rollback_status(&steps),
+            steps,
+        }
+    }
+
+    async fn run_rollback(&self, guild: GuildId, action: &RollbackAction) -> RollbackOutcome {
+        let result = match action {
+            RollbackAction::DeleteRole { id } => self.adapter.delete_role(guild, *id).await,
+            RollbackAction::RestoreRole { id, before } => {
+                self.adapter
+                    .update_role(
+                        guild,
+                        *id,
+                        RoleSpec {
+                            name: Some(before.name.clone()),
+                            permissions: Some(before.permissions),
+                        },
+                    )
+                    .await
+            }
+            RollbackAction::RecreateRole { before } => self
+                .adapter
+                .create_role(
+                    guild,
+                    RoleSpec {
+                        name: Some(before.name.clone()),
+                        permissions: Some(before.permissions),
+                    },
+                )
+                .await
+                .map(|_| ()),
+            RollbackAction::DeleteChannel { id } => self.adapter.delete_channel(guild, *id).await,
+            RollbackAction::RestoreChannel { id, before } => {
+                self.adapter
+                    .update_channel(
+                        guild,
+                        *id,
+                        ChannelSpec {
+                            name: Some(before.name.clone()),
+                            channel_type: Some(before.channel_type),
+                            parent_id: before.parent_id,
+                        },
+                    )
+                    .await
+            }
+            RollbackAction::RecreateChannel { before } => self
+                .adapter
+                .create_channel(
+                    guild,
+                    ChannelSpec {
+                        name: Some(before.name.clone()),
+                        channel_type: Some(before.channel_type),
+                        parent_id: before.parent_id,
+                    },
+                )
+                .await
+                .map(|_| ()),
+            RollbackAction::RestoreOverwrite {
+                channel,
+                target,
+                before,
+            } => match before {
+                Some(overwrite) => {
+                    self.adapter
+                        .upsert_overwrite(guild, *channel, *target, overwrite.allow, overwrite.deny)
+                        .await
+                }
+                None => {
+                    return RollbackOutcome::Skipped {
+                        reason: "delete overwrite is not supported in Phase 15".to_string(),
+                    }
+                }
+            },
+        };
+        match result {
+            Ok(()) => RollbackOutcome::Undone,
+            Err(error) => RollbackOutcome::Failed(error),
+        }
     }
 
     async fn run_op<R: ResourceResolver>(
@@ -282,5 +397,78 @@ fn resolution_step(op_id: OpId, e: ResolutionError) -> StepResult {
         )),
         created: None,
         rollback: None,
+    }
+}
+
+fn rollback_status(steps: &[RollbackStepResult]) -> RollbackStatus {
+    if steps.is_empty() {
+        return RollbackStatus::NotRequired;
+    }
+    if steps
+        .iter()
+        .all(|step| matches!(step.outcome, RollbackOutcome::Undone))
+    {
+        return RollbackStatus::Succeeded;
+    }
+    if steps
+        .iter()
+        .all(|step| matches!(step.outcome, RollbackOutcome::Failed(_)))
+    {
+        return RollbackStatus::Failed;
+    }
+    RollbackStatus::Partial
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+    use crate::adapter::AdapterErrorKind;
+    use crate::mock::MockDiscordAdapter;
+    use discord_model::{ChannelId, OverwriteTarget, RoleId};
+
+    fn failed_job(rollback: RollbackAction) -> JobResult {
+        JobResult {
+            status: JobStatus::Failed,
+            steps: vec![StepResult {
+                op_id: OpId(0),
+                outcome: StepOutcome::Success,
+                created: None,
+                rollback: Some(rollback),
+            }],
+        }
+    }
+
+    #[test]
+    fn created_overwrite_rollback_is_skipped() {
+        let executor = Executor::new(MockDiscordAdapter::new());
+        let job = failed_job(RollbackAction::RestoreOverwrite {
+            channel: ChannelId(1),
+            target: OverwriteTarget::Role(RoleId(2)),
+            before: None,
+        });
+        let report = futures::executor::block_on(executor.rollback(&job, GuildId(1)));
+        assert_eq!(report.status, RollbackStatus::Partial);
+        assert!(matches!(
+            report.steps[0].outcome,
+            RollbackOutcome::Skipped { .. }
+        ));
+        assert_eq!(executor.adapter().calls().len(), 0);
+    }
+
+    #[test]
+    fn adapter_failure_is_recorded() {
+        let executor = Executor::new(MockDiscordAdapter::with_failure(
+            1,
+            AdapterError::new(AdapterErrorKind::Forbidden, "no"),
+        ));
+        let job = failed_job(RollbackAction::DeleteRole {
+            id: RoleId(900_000),
+        });
+        let report = futures::executor::block_on(executor.rollback(&job, GuildId(1)));
+        assert_eq!(report.status, RollbackStatus::Failed);
+        assert!(matches!(
+            report.steps[0].outcome,
+            RollbackOutcome::Failed(_)
+        ));
     }
 }

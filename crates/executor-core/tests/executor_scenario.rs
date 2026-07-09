@@ -13,7 +13,8 @@ use discord_model::{
 };
 use executor_core::{
     AdapterCall, AdapterError, AdapterErrorKind, ApprovedExecutionRequest, CreatedResource,
-    Executor, ExecutorError, JobStatus, MockDiscordAdapter, RollbackAction, StepOutcome,
+    Executor, ExecutorError, JobStatus, MockDiscordAdapter, RollbackAction, RollbackStatus,
+    StepOutcome,
 };
 use futures::executor::block_on;
 use operation_graph::compile_operations;
@@ -203,4 +204,37 @@ fn job_result_serde_roundtrips() {
         serde_json::from_str::<executor_core::JobResult>(&json).unwrap(),
         result
     );
+}
+
+#[test]
+fn success_needs_no_rollback() {
+    let executor = Executor::new(MockDiscordAdapter::new());
+    let run = block_on(executor.execute_with_rollback(&request(Verdict::Allow))).unwrap();
+    assert_eq!(run.job.status, JobStatus::Succeeded);
+    assert_eq!(run.rollback.status, RollbackStatus::NotRequired);
+    assert!(run.rollback.steps.is_empty());
+}
+
+#[test]
+fn failure_triggers_rollback_of_created_role() {
+    let executor = Executor::new(MockDiscordAdapter::with_failure(
+        2,
+        AdapterError::new(AdapterErrorKind::MissingPermissions, "no"),
+    ));
+    let run = block_on(executor.execute_with_rollback(&request(Verdict::Allow))).unwrap();
+    assert_eq!(run.job.status, JobStatus::Failed);
+    assert_eq!(run.rollback.status, RollbackStatus::Succeeded);
+    assert_eq!(run.rollback.steps.len(), 1);
+    assert!(matches!(
+        run.rollback.steps[0].action,
+        RollbackAction::DeleteRole { .. }
+    ));
+}
+
+#[test]
+fn not_approved_skips_rollback() {
+    let executor = Executor::new(MockDiscordAdapter::new());
+    let err = block_on(executor.execute_with_rollback(&request(Verdict::Deny))).unwrap_err();
+    assert_eq!(err, ExecutorError::NotApproved);
+    assert_eq!(executor.adapter().calls().len(), 0);
 }
