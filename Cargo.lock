@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "ai-eval"
+version = "0.1.0"
+dependencies = [
+ "ai-gateway",
+ "desired-compiler",
+ "desired-state",
+ "diff-engine",
+ "discord-model",
+ "operation-graph",
+ "serde_json",
+]
+
+[[package]]
 name = "ai-gateway"
 version = "0.1.0"
 dependencies = [

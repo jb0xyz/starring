@@ -1,0 +1,18 @@
+[package]
+name = "ai-eval"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+openai-client = ["ai-gateway/openai-client"]
+
+[dependencies]
+ai-gateway = { path = "../../crates/ai-gateway", default-features = false }
+desired-state = { path = "../../crates/desired-state" }
+desired-compiler = { path = "../../crates/desired-compiler" }
+diff-engine = { path = "../../crates/diff-engine" }
+operation-graph = { path = "../../crates/operation-graph" }
+discord-model = { path = "../../crates/discord-model" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
