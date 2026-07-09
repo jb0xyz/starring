@@ -28,6 +28,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "approval-manager"
+version = "0.1.0"
+dependencies = [
+ "discord-model",
+ "policy-engine",
+ "preview",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

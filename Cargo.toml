@@ -11,6 +11,7 @@ members = [
     "crates/simulator",
     "crates/virtual-apply",
     "crates/preview",
+    "crates/approval-manager",
     "tools/ai-eval",
 ]
 resolver = "2"
