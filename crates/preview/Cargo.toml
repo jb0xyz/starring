@@ -1,0 +1,18 @@
+[package]
+name = "preview"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+discord-model = { path = "../discord-model" }
+desired-state = { path = "../desired-state" }
+desired-compiler = { path = "../desired-compiler" }
+diff-engine = { path = "../diff-engine" }
+operation-graph = { path = "../operation-graph" }
+policy-engine = { path = "../policy-engine" }
+virtual-apply = { path = "../virtual-apply" }
+simulator = { path = "../simulator" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

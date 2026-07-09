@@ -742,6 +742,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "preview"
+version = "0.1.0"
+dependencies = [
+ "desired-compiler",
+ "desired-state",
+ "diff-engine",
+ "discord-model",
+ "operation-graph",
+ "policy-engine",
+ "serde",
+ "serde_json",
+ "simulator",
+ "virtual-apply",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"

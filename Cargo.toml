@@ -10,6 +10,7 @@ members = [
     "crates/policy-engine",
     "crates/simulator",
     "crates/virtual-apply",
+    "crates/preview",
     "tools/ai-eval",
 ]
 resolver = "2"
