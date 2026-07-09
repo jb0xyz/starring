@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use desired_compiler::{NormalizedDesiredState, NormalizedTarget};
+use desired_compiler::NormalizedDesiredState;
 use desired_state::ResourceKey;
-use diff_engine::{ResolveResult, ResourceResolver};
+use diff_engine::ResourceResolver;
 use discord_model::{
-    Channel, ChannelId, ChannelType, GuildState, OverwriteTarget, PermissionOverwrite, Role,
-    RoleId, UserId,
+    Channel, ChannelId, ChannelType, GuildState, PermissionOverwrite, Role, RoleId,
 };
 use operation_graph::{OpId, Operation, OperationGraph};
+use resource_resolution::ResourceResolutionContext;
 
 use crate::error::VirtualApplyError;
 use crate::result::VirtualApplyResult;
@@ -33,11 +33,8 @@ pub fn apply(
 
 struct ApplyContext<'a, R: ResourceResolver> {
     after: GuildState,
-    normalized: &'a NormalizedDesiredState,
-    resolver: &'a R,
+    resources: ResourceResolutionContext<'a, R>,
     next_id: u64,
-    role_ids: BTreeMap<ResourceKey, RoleId>,
-    channel_ids: BTreeMap<ResourceKey, ChannelId>,
     synthetic_roles: BTreeMap<ResourceKey, RoleId>,
     synthetic_channels: BTreeMap<ResourceKey, ChannelId>,
     applied: Vec<OpId>,
@@ -55,11 +52,8 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
         }
         Self {
             after: current.clone(),
-            normalized,
-            resolver,
+            resources: ResourceResolutionContext::new(normalized, resolver, current.guild.id),
             next_id: max_id + 1,
-            role_ids: BTreeMap::new(),
-            channel_ids: BTreeMap::new(),
             synthetic_roles: BTreeMap::new(),
             synthetic_channels: BTreeMap::new(),
             applied: Vec::new(),
@@ -81,7 +75,7 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 permissions,
             } => {
                 let id = RoleId(self.next_synthetic());
-                self.role_ids.insert(key.clone(), id);
+                self.resources.bind_role(key.clone(), id);
                 self.synthetic_roles.insert(key.clone(), id);
                 self.after.roles.push(Role {
                     id,
@@ -96,7 +90,7 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 name,
                 permissions,
             } => {
-                let id = self.resolve_role(key)?;
+                let id = self.resources.resolve_role_key(key)?;
                 if let Some(role) = self.after.roles.iter_mut().find(|r| r.id == id) {
                     if let Some(n) = name {
                         role.name = n.clone();
@@ -107,7 +101,7 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 }
             }
             Operation::DeleteRole { key } => {
-                let id = self.resolve_role(key)?;
+                let id = self.resources.resolve_role_key(key)?;
                 self.after.roles.retain(|r| r.id != id);
             }
             Operation::CreateChannel {
@@ -117,10 +111,10 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 parent,
             } => {
                 let id = ChannelId(self.next_synthetic());
-                self.channel_ids.insert(key.clone(), id);
+                self.resources.bind_channel(key.clone(), id);
                 self.synthetic_channels.insert(key.clone(), id);
                 let parent_id = match parent {
-                    Some(pk) => Some(self.resolve_channel(pk)?),
+                    Some(pk) => Some(self.resources.resolve_channel_key(pk)?),
                     None => None,
                 };
                 self.after.channels.push(Channel {
@@ -137,7 +131,7 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 name,
                 channel_type,
             } => {
-                let id = self.resolve_channel(key)?;
+                let id = self.resources.resolve_channel_key(key)?;
                 if let Some(ch) = self.after.channels.iter_mut().find(|c| c.id == id) {
                     if let Some(n) = name {
                         ch.name = n.clone();
@@ -148,7 +142,7 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 }
             }
             Operation::DeleteChannel { key } => {
-                let id = self.resolve_channel(key)?;
+                let id = self.resources.resolve_channel_key(key)?;
                 self.after.channels.retain(|c| c.id != id);
             }
             Operation::CreateOverwrite {
@@ -163,8 +157,8 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
                 allow,
                 deny,
             } => {
-                let channel_id = self.resolve_channel(channel)?;
-                let ow_target = self.resolve_target(target)?;
+                let channel_id = self.resources.resolve_channel_key(channel)?;
+                let ow_target = self.resources.resolve_target(target)?;
                 if let Some(ch) = self.after.channels.iter_mut().find(|c| c.id == channel_id) {
                     ch.overwrites.retain(|o| o.target != ow_target);
                     ch.overwrites.push(PermissionOverwrite {
@@ -179,67 +173,6 @@ impl<'a, R: ResourceResolver> ApplyContext<'a, R> {
             }
         }
         Ok(())
-    }
-
-    fn resolve_role(&mut self, key: &ResourceKey) -> Result<RoleId, VirtualApplyError> {
-        if let Some(id) = self.role_ids.get(key) {
-            return Ok(*id);
-        }
-        let resolved = {
-            let nr = self
-                .normalized
-                .roles
-                .iter()
-                .find(|r| &r.identity.key == key)
-                .ok_or_else(|| VirtualApplyError::MissingIdentity { key: key.0.clone() })?;
-            self.resolver.resolve_role(&nr.identity, nr.name.as_deref())
-        };
-        match resolved {
-            ResolveResult::Existing(role) => {
-                self.role_ids.insert(key.clone(), role.id);
-                Ok(role.id)
-            }
-            _ => Err(VirtualApplyError::UnresolvedKey { key: key.0.clone() }),
-        }
-    }
-
-    fn resolve_channel(&mut self, key: &ResourceKey) -> Result<ChannelId, VirtualApplyError> {
-        if let Some(id) = self.channel_ids.get(key) {
-            return Ok(*id);
-        }
-        let resolved = {
-            let nc = self
-                .normalized
-                .channels
-                .iter()
-                .find(|c| &c.identity.key == key)
-                .ok_or_else(|| VirtualApplyError::MissingIdentity { key: key.0.clone() })?;
-            self.resolver
-                .resolve_channel(&nc.identity, nc.name.as_deref())
-        };
-        match resolved {
-            ResolveResult::Existing(ch) => {
-                self.channel_ids.insert(key.clone(), ch.id);
-                Ok(ch.id)
-            }
-            _ => Err(VirtualApplyError::UnresolvedKey { key: key.0.clone() }),
-        }
-    }
-
-    fn resolve_target(
-        &mut self,
-        target: &NormalizedTarget,
-    ) -> Result<OverwriteTarget, VirtualApplyError> {
-        match target {
-            NormalizedTarget::Everyone => Ok(OverwriteTarget::Role(RoleId(self.after.guild.id.0))),
-            NormalizedTarget::Role(key) => Ok(OverwriteTarget::Role(self.resolve_role(key)?)),
-            NormalizedTarget::Member(id) => {
-                let raw = id
-                    .parse::<u64>()
-                    .map_err(|_| VirtualApplyError::UnresolvedKey { key: id.clone() })?;
-                Ok(OverwriteTarget::Member(UserId(raw)))
-            }
-        }
     }
 
     fn into_result(self) -> VirtualApplyResult {

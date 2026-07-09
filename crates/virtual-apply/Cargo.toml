@@ -11,6 +11,7 @@ operation-graph = { path = "../operation-graph" }
 desired-compiler = { path = "../desired-compiler" }
 desired-state = { path = "../desired-state" }
 diff-engine = { path = "../diff-engine" }
+resource-resolution = { path = "../resource-resolution" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

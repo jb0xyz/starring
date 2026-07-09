@@ -1311,6 +1311,7 @@ dependencies = [
  "diff-engine",
  "discord-model",
  "operation-graph",
+ "resource-resolution",
  "serde",
  "serde_json",
  "simulator",
