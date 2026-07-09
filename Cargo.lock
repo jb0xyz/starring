@@ -1274,6 +1274,7 @@ dependencies = [
  "operation-graph",
  "serde",
  "serde_json",
+ "simulator",
  "thiserror",
 ]
 
