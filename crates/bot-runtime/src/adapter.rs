@@ -9,7 +9,7 @@ use crate::convert::{
 use crate::error::{classify_body_error, classify_error};
 
 pub struct TwilightDiscordAdapter {
-    http: Client,
+    pub(crate) http: Client,
 }
 
 impl TwilightDiscordAdapter {
