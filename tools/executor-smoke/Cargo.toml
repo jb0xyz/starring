@@ -1,0 +1,17 @@
+[package]
+name = "executor-smoke"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+discord-model = { path = "../../crates/discord-model" }
+desired-state = { path = "../../crates/desired-state" }
+desired-compiler = { path = "../../crates/desired-compiler" }
+diff-engine = { path = "../../crates/diff-engine" }
+operation-graph = { path = "../../crates/operation-graph" }
+approval-manager = { path = "../../crates/approval-manager" }
+policy-engine = { path = "../../crates/policy-engine" }
+executor-core = { path = "../../crates/executor-core" }
+bot-runtime = { path = "../../crates/bot-runtime" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23", features = ["ring"] }

@@ -16,6 +16,7 @@ members = [
     "crates/executor-core",
     "crates/bot-runtime",
     "tools/ai-eval",
+    "tools/executor-smoke",
 ]
 resolver = "2"
 
