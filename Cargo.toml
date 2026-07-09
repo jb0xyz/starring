@@ -12,6 +12,7 @@ members = [
     "crates/virtual-apply",
     "crates/preview",
     "crates/approval-manager",
+    "crates/resource-resolution",
     "tools/ai-eval",
 ]
 resolver = "2"

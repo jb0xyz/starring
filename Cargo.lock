@@ -836,6 +836,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "resource-resolution"
+version = "0.1.0"
+dependencies = [
+ "desired-compiler",
+ "desired-state",
+ "diff-engine",
+ "discord-model",
+ "thiserror",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
