@@ -1,6 +1,7 @@
 pub mod compile;
 pub mod error;
 pub mod node;
+pub mod order;
 pub mod symbol;
 
 pub use compile::compile_operations;

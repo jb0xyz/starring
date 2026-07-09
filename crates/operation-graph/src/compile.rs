@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use desired_compiler::{
     NormalizedChannel, NormalizedDesiredState, NormalizedOverwrite, NormalizedRole,
     NormalizedTarget,
@@ -34,7 +36,30 @@ pub fn compile_operations(
         next_id += 1;
     }
 
-    Ok(OperationGraph { nodes })
+    derive_dependencies(&mut nodes);
+    let graph = OperationGraph { nodes };
+    graph.topological_order()?;
+    Ok(graph)
+}
+
+fn derive_dependencies(nodes: &mut [OperationNode]) {
+    let mut producers: HashMap<ResourceSymbol, OpId> = HashMap::new();
+    for node in nodes.iter() {
+        for symbol in &node.produces {
+            producers.insert(symbol.clone(), node.id);
+        }
+    }
+    for node in nodes.iter_mut() {
+        let mut deps: Vec<OpId> = node
+            .consumes
+            .iter()
+            .filter_map(|symbol| producers.get(symbol).copied())
+            .filter(|dep| *dep != node.id)
+            .collect();
+        deps.sort();
+        deps.dedup();
+        node.depends_on = deps;
+    }
 }
 
 fn build_operation(
@@ -267,6 +292,49 @@ mod tests {
         assert!(graph.nodes[0]
             .consumes
             .contains(&ResourceSymbol::Role(ResourceKey("r".to_string()))));
+    }
+
+    #[test]
+    fn overwrite_depends_on_role_create() {
+        let overwrite = NormalizedOverwrite {
+            target: NormalizedTarget::Role(ResourceKey("r".to_string())),
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+        };
+        let desired = NormalizedDesiredState {
+            roles: vec![nrole("r")],
+            channels: vec![nchannel("c", vec![overwrite])],
+            ..Default::default()
+        };
+        let diff = DiffResult {
+            changes: vec![
+                create(DiffTarget::Role {
+                    key: ResourceKey("r".to_string()),
+                }),
+                create(DiffTarget::Channel {
+                    key: ResourceKey("c".to_string()),
+                }),
+                create(DiffTarget::Overwrite {
+                    channel: ResourceKey("c".to_string()),
+                    target: NormalizedTarget::Role(ResourceKey("r".to_string())),
+                }),
+            ],
+            ..Default::default()
+        };
+        let graph = compile_operations(&diff, &desired).unwrap();
+        let role_id = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.operation, Operation::CreateRole { .. }))
+            .unwrap()
+            .id;
+        let overwrite_node = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.operation, Operation::CreateOverwrite { .. }))
+            .unwrap();
+        assert!(overwrite_node.depends_on.contains(&role_id));
+        assert!(graph.topological_order().is_ok());
     }
 
     #[test]
