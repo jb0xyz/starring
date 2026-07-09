@@ -1,0 +1,15 @@
+[package]
+name = "ai-gateway"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+openai-client = ["dep:reqwest"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+desired-state = { path = "../desired-state" }
+discord-model = { path = "../discord-model" }
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }

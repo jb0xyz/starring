@@ -6,6 +6,7 @@ members = [
     "crates/desired-compiler",
     "crates/diff-engine",
     "crates/operation-graph",
+    "crates/ai-gateway",
 ]
 resolver = "2"
 
