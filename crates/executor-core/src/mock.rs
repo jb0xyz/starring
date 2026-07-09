@@ -45,7 +45,7 @@ pub enum AdapterCall {
 pub struct MockDiscordAdapter {
     next_id: AtomicU64,
     calls: Mutex<Vec<AdapterCall>>,
-    fail_on: Option<(usize, AdapterError)>,
+    fail_on: Vec<(usize, AdapterError)>,
 }
 
 impl MockDiscordAdapter {
@@ -53,7 +53,7 @@ impl MockDiscordAdapter {
         Self {
             next_id: AtomicU64::new(900_000),
             calls: Mutex::new(Vec::new()),
-            fail_on: None,
+            fail_on: Vec::new(),
         }
     }
 
@@ -61,7 +61,15 @@ impl MockDiscordAdapter {
         Self {
             next_id: AtomicU64::new(900_000),
             calls: Mutex::new(Vec::new()),
-            fail_on: Some((call_number, error)),
+            fail_on: vec![(call_number, error)],
+        }
+    }
+
+    pub fn with_failures(failures: Vec<(usize, AdapterError)>) -> Self {
+        Self {
+            next_id: AtomicU64::new(900_000),
+            calls: Mutex::new(Vec::new()),
+            fail_on: failures,
         }
     }
 
@@ -76,7 +84,7 @@ impl MockDiscordAdapter {
     }
 
     fn check_fail(&self, call_number: usize) -> Result<(), AdapterError> {
-        if let Some((n, err)) = &self.fail_on {
+        for (n, err) in &self.fail_on {
             if *n == call_number {
                 return Err(err.clone());
             }
@@ -201,5 +209,23 @@ mod tests {
             },
         ));
         assert_eq!(r.unwrap_err().kind, AdapterErrorKind::RateLimited);
+    }
+
+    #[test]
+    fn with_failures_fails_multiple_calls() {
+        let mock = MockDiscordAdapter::with_failures(vec![
+            (1, AdapterError::new(AdapterErrorKind::RateLimited, "a")),
+            (2, AdapterError::new(AdapterErrorKind::Forbidden, "b")),
+        ]);
+        assert!(block_on(mock.create_role(
+            GuildId(1),
+            RoleSpec {
+                name: None,
+                permissions: None
+            }
+        ))
+        .is_err());
+        assert!(block_on(mock.delete_role(GuildId(1), RoleId(5))).is_err());
+        assert!(block_on(mock.delete_role(GuildId(1), RoleId(6))).is_ok());
     }
 }

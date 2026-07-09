@@ -69,3 +69,67 @@ pub struct JobResult {
     pub status: JobStatus,
     pub steps: Vec<StepResult>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackStatus {
+    NotRequired,
+    Succeeded,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RollbackOutcome {
+    Undone,
+    Failed(AdapterError),
+    Skipped { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackStepResult {
+    pub source_op_id: OpId,
+    pub action: RollbackAction,
+    pub outcome: RollbackOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackReport {
+    pub status: RollbackStatus,
+    pub steps: Vec<RollbackStepResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRun {
+    pub job: JobResult,
+    pub rollback: RollbackReport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::AdapterErrorKind;
+
+    #[test]
+    fn rollback_report_types_are_constructible() {
+        let error = AdapterError::new(AdapterErrorKind::Forbidden, "no");
+        let action = RollbackAction::DeleteRole { id: RoleId(1) };
+        let report = RollbackReport {
+            status: RollbackStatus::Failed,
+            steps: vec![RollbackStepResult {
+                source_op_id: OpId(1),
+                action: action.clone(),
+                outcome: RollbackOutcome::Failed(error),
+            }],
+        };
+        let run = JobRun {
+            job: JobResult {
+                status: JobStatus::Failed,
+                steps: vec![],
+            },
+            rollback: report,
+        };
+        assert_eq!(run.rollback.status, RollbackStatus::Failed);
+        assert_eq!(run.rollback.steps[0].action, action);
+    }
+}
