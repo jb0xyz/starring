@@ -13,6 +13,7 @@ members = [
     "crates/preview",
     "crates/approval-manager",
     "crates/resource-resolution",
+    "crates/executor-core",
     "tools/ai-eval",
 ]
 resolver = "2"
