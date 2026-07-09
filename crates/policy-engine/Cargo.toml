@@ -12,3 +12,4 @@ discord-model = { path = "../discord-model" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+diff-engine = { path = "../diff-engine" }
