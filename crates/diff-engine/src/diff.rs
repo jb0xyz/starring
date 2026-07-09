@@ -166,6 +166,16 @@ fn diff_channel(
                         target,
                         changed: vec![],
                     });
+                    for overwrite in &channel.overwrites {
+                        out.changes.push(DiffChange {
+                            op: ChangeOp::Create,
+                            target: DiffTarget::Overwrite {
+                                channel: channel.identity.key.clone(),
+                                target: overwrite.target.clone(),
+                            },
+                            changed: vec![],
+                        });
+                    }
                 }
             }
             ResolveResult::Conflict { reason } => push_conflict(out, target, &reason),
@@ -555,5 +565,32 @@ mod tests {
             .find(|change| matches!(change.target, DiffTarget::Overwrite { .. }))
             .unwrap();
         assert_eq!(overwrite.op, ChangeOp::Create);
+    }
+
+    #[test]
+    fn new_channel_emits_overwrite_creates() {
+        let guild = empty_guild();
+        let desired = NormalizedDesiredState {
+            channels: vec![nchannel(
+                "gen",
+                "general",
+                vec![NormalizedOverwrite {
+                    target: NormalizedTarget::Everyone,
+                    allow: Permissions::empty(),
+                    deny: Permissions::VIEW_CHANNEL,
+                }],
+            )],
+            ..Default::default()
+        };
+        let diff = diff(&desired, &InMemoryMatchResolver::new(&guild));
+        let overwrite_creates = diff
+            .changes
+            .iter()
+            .filter(|change| {
+                matches!(change.target, DiffTarget::Overwrite { .. })
+                    && change.op == ChangeOp::Create
+            })
+            .count();
+        assert_eq!(overwrite_creates, 1);
     }
 }
