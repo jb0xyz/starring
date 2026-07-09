@@ -7,6 +7,7 @@ members = [
     "crates/diff-engine",
     "crates/operation-graph",
     "crates/ai-gateway",
+    "crates/policy-engine",
     "tools/ai-eval",
 ]
 resolver = "2"
