@@ -17,6 +17,7 @@ members = [
     "crates/bot-runtime",
     "tools/ai-eval",
     "tools/executor-smoke",
+    "tools/starring-demo",
 ]
 resolver = "2"
 
