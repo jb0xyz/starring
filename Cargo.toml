@@ -5,6 +5,7 @@ members = [
     "crates/desired-state",
     "crates/desired-compiler",
     "crates/diff-engine",
+    "crates/operation-graph",
 ]
 resolver = "2"
 
