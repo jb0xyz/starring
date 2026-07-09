@@ -17,9 +17,11 @@ bitflags! {
         const EMBED_LINKS           = 1 << 14;
         const ATTACH_FILES          = 1 << 15;
         const READ_MESSAGE_HISTORY  = 1 << 16;
+        const MENTION_EVERYONE      = 1 << 17;
         const CONNECT               = 1 << 20;
         const SPEAK                 = 1 << 21;
         const MANAGE_ROLES          = 1 << 28;
+        const MODERATE_MEMBERS      = 1 << 40;
     }
 }
 
@@ -64,6 +66,12 @@ mod tests {
         assert_eq!(Permissions::READ_MESSAGE_HISTORY.bits(), 1 << 16);
         assert_eq!(Permissions::CONNECT.bits(), 1 << 20);
         assert_eq!(Permissions::SPEAK.bits(), 1 << 21);
+    }
+
+    #[test]
+    fn moderation_permission_bits() {
+        assert_eq!(Permissions::MENTION_EVERYONE.bits(), 1 << 17);
+        assert_eq!(Permissions::MODERATE_MEMBERS.bits(), 1 << 40);
     }
 
     #[test]
