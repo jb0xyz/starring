@@ -9,9 +9,10 @@ use desired_state::{
     RoleIntent,
 };
 use diff_engine::{diff, InMemoryMatchResolver};
-use discord_model::{ChannelType, Guild, GuildId, GuildState, Permissions, UserId};
+use discord_model::{ChannelType, GuildId, GuildState, Permissions, UserId};
 use executor_core::{
-    ApprovedExecutionRequest, DiscordAdapter, Executor, JobResult, RollbackAction, StepOutcome,
+    ApprovedExecutionRequest, DiscordAdapter, Executor, GuildStateReader, JobResult,
+    RollbackAction, StepOutcome,
 };
 use operation_graph::compile_operations;
 use policy_engine::{PolicyDecision, PolicyEngine};
@@ -135,24 +136,81 @@ fn no_admin() -> DesiredState {
     }
 }
 
+fn adopted() -> DesiredState {
+    let role = ResourceKey("smoke-adopted".to_string());
+    let mut roles = BTreeMap::new();
+    roles.insert(
+        role.clone(),
+        AccessGrant {
+            allow: vec![Capability::View, Capability::Send],
+            deny: vec![],
+        },
+    );
+    DesiredState {
+        roles: vec![RoleIntent {
+            identity: Identity {
+                key: role,
+                ..Default::default()
+            },
+            name: Some("starring-smoke-adopted".to_string()),
+            permissions: Some(Permissions::empty()),
+        }],
+        channels: vec![ChannelIntent {
+            identity: Identity {
+                key: ResourceKey("smoke-adopted-channel".to_string()),
+                ..Default::default()
+            },
+            name: Some("starring-smoke-adopted-channel".to_string()),
+            channel_type: Some(ChannelType::Text),
+            parent: None,
+            access: Some(AccessIntent {
+                everyone: Some(AccessGrant {
+                    allow: vec![],
+                    deny: vec![Capability::View],
+                }),
+                roles,
+            }),
+            raw_overwrites: None,
+        }],
+        ..Default::default()
+    }
+}
+
 fn scenario(name: &str) -> DesiredState {
     match name {
         "game-community" => game_community(),
         "no-admin" => no_admin(),
+        "adopted" => adopted(),
         _ => simple(),
     }
 }
 
-fn minimal_snapshot(guild_id: GuildId) -> GuildState {
-    GuildState {
-        guild: Guild {
-            id: guild_id,
-            name: "smoke".to_string(),
-            owner_id: UserId(1),
-        },
-        roles: vec![],
-        channels: vec![],
-        members: vec![],
+fn print_guild_state(state: &GuildState) {
+    println!(
+        "guild {}: {} roles, {} channels",
+        state.guild.id.0,
+        state.roles.len(),
+        state.channels.len()
+    );
+    for role in &state.roles {
+        println!("  role {} '{}'", role.id.0, role.name);
+    }
+    for channel in &state.channels {
+        println!(
+            "  channel {} '{}' {:?} ({} overwrites)",
+            channel.id.0,
+            channel.name,
+            channel.channel_type,
+            channel.overwrites.len()
+        );
+        for overwrite in &channel.overwrites {
+            println!(
+                "    {:?} allow={} deny={}",
+                overwrite.target,
+                overwrite.allow.bits(),
+                overwrite.deny.bits()
+            );
+        }
     }
 }
 
@@ -183,14 +241,14 @@ async fn cleanup(adapter: &TwilightDiscordAdapter, guild: GuildId, result: &JobR
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let scenario_name = std::env::args()
+    let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "simple".to_string());
 
     let token = match env::var("DISCORD_TEST_TOKEN") {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("set DISCORD_TEST_TOKEN and DISCORD_TEST_GUILD to run the smoke");
+            eprintln!("set DISCORD_TEST_TOKEN and DISCORD_TEST_GUILD");
             return;
         }
     };
@@ -205,9 +263,30 @@ async fn main() {
         }
     };
     let guild_id = GuildId(guild_raw);
+    let adapter = TwilightDiscordAdapter::new(token);
 
-    let desired = scenario(&scenario_name);
-    let snapshot = minimal_snapshot(guild_id);
+    if mode == "read" {
+        match adapter.read_guild_state(guild_id).await {
+            Ok(state) => print_guild_state(&state),
+            Err(e) => eprintln!("read failed: {e:?}"),
+        }
+        return;
+    }
+
+    let desired = scenario(&mode);
+    let before = match adapter.read_guild_state(guild_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("read before-state failed: {e:?}");
+            return;
+        }
+    };
+    println!(
+        "before-state: {} roles, {} channels",
+        before.roles.len(),
+        before.channels.len()
+    );
+
     let normalized = match compile(&desired) {
         Ok(n) => n,
         Err(errors) => {
@@ -215,7 +294,7 @@ async fn main() {
             return;
         }
     };
-    let diff_result = diff(&normalized, &InMemoryMatchResolver::new(&snapshot));
+    let diff_result = diff(&normalized, &InMemoryMatchResolver::new(&before));
     let graph = match compile_operations(&diff_result, &normalized) {
         Ok(g) => g,
         Err(e) => {
@@ -225,10 +304,7 @@ async fn main() {
     };
 
     let decision: PolicyDecision = PolicyEngine::with_default_rules().evaluate(&graph);
-    println!(
-        "scenario '{scenario_name}': {} operations",
-        graph.nodes.len()
-    );
+    println!("scenario '{mode}': {} operations", graph.nodes.len());
     println!("policy verdict: {:?}", decision.verdict);
     for finding in &decision.findings {
         println!(
@@ -244,7 +320,6 @@ async fn main() {
         }
         let _ = approval.approve(approver);
     }
-
     if !approval.can_execute() {
         println!(
             "NOT executing - approval state {:?}. no Discord change made.",
@@ -257,20 +332,27 @@ async fn main() {
         operation_graph: graph,
         normalized,
         approval,
-        snapshot,
+        snapshot: before,
         guild_id,
         requested_by: UserId(1),
         approved_by: vec![UserId(10), UserId(11)],
     };
 
-    let executor = Executor::new(TwilightDiscordAdapter::new(token));
-    println!("executing against guild {guild_raw} ...");
+    let executor = Executor::new(adapter);
+    println!("executing '{mode}' against guild {guild_raw} ...");
 
     match executor.execute(&request).await {
         Ok(result) => {
             println!("job status: {:?}", result.status);
             for step in &result.steps {
                 println!("  {:?}: {:?}", step.op_id, step.outcome);
+            }
+            match executor.adapter().read_guild_state(guild_id).await {
+                Ok(after) => {
+                    println!("after-state (read back from Discord):");
+                    print_guild_state(&after);
+                }
+                Err(e) => eprintln!("read after-state failed: {e:?}"),
             }
             println!("cleaning up (rollback, reverse order) ...");
             cleanup(executor.adapter(), guild_id, &result).await;
@@ -305,5 +387,12 @@ mod tests {
             desired.roles[0].permissions,
             Some(Permissions::ADMINISTRATOR)
         );
+    }
+
+    #[test]
+    fn adopted_has_role_and_channel() {
+        let desired = adopted();
+        assert_eq!(desired.roles.len(), 1);
+        assert_eq!(desired.channels.len(), 1);
     }
 }
