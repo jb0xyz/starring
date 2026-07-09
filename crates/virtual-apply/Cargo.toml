@@ -1,0 +1,16 @@
+[package]
+name = "virtual-apply"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+discord-model = { path = "../discord-model" }
+operation-graph = { path = "../operation-graph" }
+desired-compiler = { path = "../desired-compiler" }
+desired-state = { path = "../desired-state" }
+diff-engine = { path = "../diff-engine" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

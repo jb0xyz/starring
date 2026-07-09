@@ -9,6 +9,7 @@ members = [
     "crates/ai-gateway",
     "crates/policy-engine",
     "crates/simulator",
+    "crates/virtual-apply",
     "tools/ai-eval",
 ]
 resolver = "2"

@@ -1264,6 +1264,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "virtual-apply"
+version = "0.1.0"
+dependencies = [
+ "desired-compiler",
+ "desired-state",
+ "diff-engine",
+ "discord-model",
+ "operation-graph",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "want"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
