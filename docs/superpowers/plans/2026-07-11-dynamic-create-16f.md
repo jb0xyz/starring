@@ -458,17 +458,80 @@ git commit -m "feat(automation-core): channel/role sanitizers, create seams, Cre
 
 ## Task 3: automation-core — interpret · run · validate · policy + 테스트
 
-- [ ] **Step 1: `interpret.rs` — CreateChannel/CreateRole arm 추가**
-
-action match의 `ActionSpec::OpenModal { modal } => {...}` arm 다음에 추가:
+- [ ] **Step 1: `interpret.rs` 전체 교체** (청크 A의 no-op arm을 실제 arm으로 — 중복 추가 금지)
 
 ```rust
+use automation_state::{ActionSpec, ActionTarget, InteractionRuleSet, TriggerSpec};
+use resource_resolution::ResourceBindingMap;
+
+use crate::event::{EventKind, RuntimeEvent};
+use crate::plan::{ActionPlan, ModalPresentation, PlannedAction};
+
+pub fn interpret(
+    event: &RuntimeEvent,
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+) -> Option<ActionPlan> {
+    let rule = ruleset
+        .rules
+        .iter()
+        .find(|rule| trigger_matches(&rule.trigger, &event.kind))?;
+
+    let mut steps = Vec::new();
+    for action in &rule.actions {
+        match action {
+            ActionSpec::GrantRole { role, target } => {
+                let role_id = *bindings.role_bindings.get(role)?;
+                let target_id = match target {
+                    ActionTarget::Actor => event.actor,
+                };
+                steps.push(PlannedAction::GrantRole {
+                    role: role_id,
+                    target: target_id,
+                });
+            }
+            ActionSpec::RespondEphemeral { content } => {
+                steps.push(PlannedAction::RespondEphemeral {
+                    content: content.clone(),
+                });
+            }
+            ActionSpec::OpenModal { modal } => {
+                let spec = ruleset
+                    .modals
+                    .iter()
+                    .find(|candidate| candidate.key == *modal)?;
+                steps.push(PlannedAction::OpenModal(ModalPresentation {
+                    key: spec.key.clone(),
+                    title: spec.title.clone(),
+                    fields: spec.fields.clone(),
+                }));
+            }
             ActionSpec::CreateChannel { name } => {
                 steps.push(PlannedAction::CreateChannel { name: name.clone() });
             }
             ActionSpec::CreateRole { name } => {
                 steps.push(PlannedAction::CreateRole { name: name.clone() });
             }
+        }
+    }
+
+    Some(ActionPlan { steps })
+}
+
+fn trigger_matches(trigger: &TriggerSpec, kind: &EventKind) -> bool {
+    match (trigger, kind) {
+        (TriggerSpec::ButtonClick { component }, EventKind::ButtonClick { component: clicked }) => {
+            component == clicked
+        }
+        (
+            TriggerSpec::ModalSubmit { modal },
+            EventKind::ModalSubmit {
+                modal: submitted, ..
+            },
+        ) => modal == submitted,
+        _ => false,
+    }
+}
 ```
 
 - [ ] **Step 2: `run.rs` 전체 교체** (Vec 반환 + create arm + enumerate)
