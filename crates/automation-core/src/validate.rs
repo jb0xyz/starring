@@ -54,6 +54,7 @@ pub fn validate(
                     });
                 }
             }
+            TriggerSpec::ModalSubmit { .. } => {}
         }
         for action in &rule.actions {
             match action {
@@ -72,6 +73,7 @@ pub fn validate(
                         });
                     }
                 }
+                ActionSpec::OpenModal { .. } => {}
             }
         }
     }

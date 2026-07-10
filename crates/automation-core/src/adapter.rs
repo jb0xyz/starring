@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use discord_model::{GuildId, RoleId, UserId};
 
+use crate::plan::ModalPresentation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterErrorKind {
@@ -9,6 +11,7 @@ pub enum AdapterErrorKind {
     NotFound,
     RateLimited,
     Network,
+    Unsupported,
     Unknown,
 }
 
@@ -40,4 +43,11 @@ pub trait DiscordMutationAdapter {
 #[allow(async_fn_in_trait)]
 pub trait InteractionResponder {
     async fn respond_ephemeral(&self, content: String) -> Result<(), AdapterError>;
+
+    async fn open_modal(&self, _modal: &ModalPresentation) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "open_modal is not supported",
+        ))
+    }
 }

@@ -32,6 +32,7 @@ pub fn interpret(
                     content: content.clone(),
                 });
             }
+            ActionSpec::OpenModal { .. } => {}
         }
     }
 
@@ -43,5 +44,7 @@ fn trigger_matches(trigger: &TriggerSpec, kind: &EventKind) -> bool {
         (TriggerSpec::ButtonClick { component }, EventKind::ButtonClick { component: clicked }) => {
             component == clicked
         }
+        (TriggerSpec::ModalSubmit { .. }, _) => false,
+        _ => false,
     }
 }

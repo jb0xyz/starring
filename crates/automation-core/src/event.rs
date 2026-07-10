@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use discord_model::{GuildId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,7 +11,13 @@ pub struct RuntimeEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventKind {
-    ButtonClick { component: String },
+    ButtonClick {
+        component: String,
+    },
+    ModalSubmit {
+        modal: String,
+        inputs: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

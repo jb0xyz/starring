@@ -21,6 +21,7 @@ fn fixture() -> (InteractionRuleSet, ResourceBindingMap) {
                 label: "Verify".to_string(),
             }],
         }],
+        modals: vec![],
         rules: vec![InteractionRule {
             key: "verify_rule".to_string(),
             trigger: TriggerSpec::ButtonClick {

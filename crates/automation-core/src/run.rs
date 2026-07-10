@@ -22,6 +22,9 @@ pub async fn run(
             PlannedAction::RespondEphemeral { content } => {
                 responder.respond_ephemeral(content.clone()).await?;
             }
+            PlannedAction::OpenModal(modal) => {
+                responder.open_modal(modal).await?;
+            }
         }
     }
     Ok(())

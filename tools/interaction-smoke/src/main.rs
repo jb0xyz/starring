@@ -49,6 +49,7 @@ fn demo_ruleset() -> InteractionRuleSet {
                 label: "Verify".to_string(),
             }],
         }],
+        modals: vec![],
         rules: vec![InteractionRule {
             key: "demo_verify_rule".to_string(),
             trigger: TriggerSpec::ButtonClick {

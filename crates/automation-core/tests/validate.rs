@@ -44,6 +44,7 @@ fn valid_ruleset_passes() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![panel("verify_button")],
+        modals: vec![],
         rules: vec![rule("r1", "verify_button", "verified")],
     };
     assert!(validate(&set, &bindings_with("verified", 100)).is_ok());
@@ -54,6 +55,7 @@ fn missing_role_ref_fails() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![panel("verify_button")],
+        modals: vec![],
         rules: vec![rule("r1", "verify_button", "ghost_role")],
     };
     let errors = validate(&set, &bindings_with("verified", 100)).unwrap_err();
@@ -68,6 +70,7 @@ fn unknown_button_ref_fails() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![panel("verify_button")],
+        modals: vec![],
         rules: vec![rule("r1", "ghost_button", "verified")],
     };
     let errors = validate(&set, &bindings_with("verified", 100)).unwrap_err();
@@ -96,6 +99,7 @@ fn duplicate_rule_and_button_keys_fail() {
                 },
             ],
         }],
+        modals: vec![],
         rules: vec![rule("dup", "b", "verified"), rule("dup", "b", "verified")],
     };
     let errors = validate(&set, &bindings_with("verified", 100)).unwrap_err();
@@ -108,6 +112,7 @@ fn duplicate_button_trigger_fails() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![panel("verify_button")],
+        modals: vec![],
         rules: vec![
             rule("r1", "verify_button", "verified"),
             rule("r2", "verify_button", "verified"),
@@ -124,6 +129,7 @@ fn empty_respond_content_fails() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![panel("verify_button")],
+        modals: vec![],
         rules: vec![InteractionRule {
             key: "r1".to_string(),
             trigger: TriggerSpec::ButtonClick {

@@ -35,6 +35,7 @@ fn granting_privileged_role_is_flagged() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![],
+        modals: vec![],
         rules: vec![rule("r1", "admin")],
     };
     let findings = analyze(&set, &roles());
@@ -48,6 +49,7 @@ fn granting_ordinary_role_is_allowed() {
     let set = InteractionRuleSet {
         version: 1,
         panels: vec![],
+        modals: vec![],
         rules: vec![rule("r1", "verified")],
     };
     assert!(analyze(&set, &roles()).is_empty());

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use discord_model::{GuildId, RoleId, UserId};
 
 use crate::adapter::{AdapterError, DiscordMutationAdapter, InteractionResponder};
+use crate::plan::ModalPresentation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationCall {
@@ -58,6 +59,7 @@ impl DiscordMutationAdapter for MockMutationAdapter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResponderCall {
     RespondEphemeral { content: String },
+    OpenModal { modal: String },
 }
 
 #[derive(Default)]
@@ -81,6 +83,13 @@ impl InteractionResponder for MockInteractionResponder {
             .lock()
             .unwrap()
             .push(ResponderCall::RespondEphemeral { content });
+        Ok(())
+    }
+
+    async fn open_modal(&self, modal: &ModalPresentation) -> Result<(), AdapterError> {
+        self.calls.lock().unwrap().push(ResponderCall::OpenModal {
+            modal: modal.key.clone(),
+        });
         Ok(())
     }
 }
@@ -123,6 +132,23 @@ mod tests {
             mock.calls(),
             vec![ResponderCall::RespondEphemeral {
                 content: "hi".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn responder_records_open_modal() {
+        let mock = MockInteractionResponder::new();
+        let presentation = ModalPresentation {
+            key: "study_room_modal".to_string(),
+            title: "Create study room".to_string(),
+            fields: vec![],
+        };
+        block_on(mock.open_modal(&presentation)).unwrap();
+        assert_eq!(
+            mock.calls(),
+            vec![ResponderCall::OpenModal {
+                modal: "study_room_modal".to_string(),
             }]
         );
     }
