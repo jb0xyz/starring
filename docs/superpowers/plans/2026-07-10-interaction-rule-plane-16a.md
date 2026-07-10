@@ -15,15 +15,17 @@
 - **edition/의존성은 workspace 상속** — `edition.workspace = true`, `serde = { workspace = true }`, 크레이트 간은 `path` 의존.
 - **ID는 string-serde newtype** — `GuildId/RoleId/ChannelId/UserId(pub u64)`, Copy.
 - **비동기 trait 패턴** — `#[allow(async_fn_in_trait)]` + native `async fn`. 제네릭 정적 디스패치(`&impl Trait`). tokio 금지, 테스트는 `block_on`.
-- **automation-core는 ai-gateway/LLM에 의존 금지** — 이벤트-타임 AI 호출 금지의 빌드-레벨 강제. `tests/no_ai_gateway.rs`가 이를 검증.
+- **automation 런타임 크레이트는 ai-gateway/LLM 의존 금지** — 이벤트-타임 AI 호출 금지의 빌드-레벨 강제. `automation-state`·`automation-core` **각 크레이트**가 자기 `tests/no_ai_gateway.rs`에서 자신의 `Cargo.toml`의 `ai-gateway` 문자열을 차단. (스펙 문장: "automation runtime crates must not depend on ai-gateway. Runtime must not call LLM during interaction handling.")
+- **conditions 미지원 — 조용히 무시 금지.** 6개 스키마 타입 전부에 `#[serde(deny_unknown_fields)]`. `conditions`/`modal`/`template`/dynamic 등 미지원 필드가 오면 **역직렬화 실패**(무시 아님). serde 1.0.228은 internally-tagged enum(`tag = "type"`)에서도 `deny_unknown_fields`가 variant 내부 필드까지 거부함을 실증 확인. (스펙 문장: "Phase 16a does not support conditions. Unknown fields must be rejected, not ignored. If a rule contains conditions, deserialization or validation must fail.")
+- **하나의 ButtonClick은 0개 또는 1개 rule에만 매칭** — 같은 button trigger를 쓰는 rule이 2개 이상이면 **validate 실패**(중복 실행보다 명확성 우선).
 - **완료 게이트** — `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` 전부 통과. workspace `members`에 신규 크레이트 2개 추가. 완료 후 `git push origin main`.
 - **live/토큰/DB/modal/dynamic-template 없음** — 전부 Phase 16b/후속.
 
 ---
 
-## Scope 결정 (스펙 대비 확정 사항 — 사용자 검토 요망)
+## Scope 결정 (스펙 대비 확정 사항 — 사용자 승인 완료)
 
-1. **`ConditionSpec`는 16a에서 제외.** 스펙 §6이 `conditions: Vec<ConditionSpec>`를 그렸지만, `ActorLacksRole` 평가에는 **actor의 현재 역할 상태**가 필요한데 MVP 이벤트 모델엔 그게 없다. 평가 못 하는 condition 필드를 넣으면 "gating을 기대했는데 무시되어 무조건 발동"하는 **silent non-gating 안전 구멍**이 생긴다. 그래서 16a `InteractionRule = { key, trigger, actions }`로 두고, condition은 member 상태가 생기는 16b에서 추가한다. (스펙 §5도 condition을 "선택, 없어도 됨"으로 명시.)
+1. **`ConditionSpec`는 16a에서 제외.** 스펙 §6이 `conditions: Vec<ConditionSpec>`를 그렸지만, `ActorLacksRole` 평가에는 **actor의 현재 역할 상태**가 필요한데 MVP 이벤트 모델엔 그게 없다. 평가 못 하는 condition 필드를 넣으면 "gating을 기대했는데 무시되어 무조건 발동"하는 **silent non-gating 안전 구멍**이 생긴다. 그래서 16a `InteractionRule = { key, trigger, actions }`로 두고, condition은 member 상태가 생기는 16b에서 추가한다. (스펙 §5도 condition을 "선택, 없어도 됨"으로 명시.) **이 제외는 `deny_unknown_fields`로 강제** — conditions 필드가 오면 역직렬화가 실패하므로 조용히 무시되는 일이 없다.
 2. **`AdapterError`는 automation-core 자체 정의**(executor-core 재사용 안 함). Layer 2를 Layer 1 executor 내부에 결합시키지 않기 위함(executor-core를 끌어오면 desired-compiler/diff-engine 등 무거운 transitive dep가 딸려옴). 작은 enum 복제 비용 < 레이어 디커플링 이득. 스펙 §14가 "또는 자체"를 허용.
 3. **role key→id 해소는 `resource_resolution::ResourceBindingMap` 재사용.** 신규 registry 타입을 만들지 않는다. 16a 테스트는 이 바인딩 맵을 fixture로 주입(실제로는 Layer 1 해소 결과가 채운다).
 4. **policy는 role 권한 맵을 입력으로 받는 순수 함수.** `analyze(ruleset, roles: &BTreeMap<ResourceKey, Permissions>)`. privileged 판정은 `discord_model::Permissions` 비트로 실제 디코딩. 권한 맵의 Layer 1 연결 배선은 후속.
@@ -67,6 +69,7 @@
 - Create: `crates/automation-state/src/lib.rs`
 - Create: `crates/automation-state/src/panel.rs`
 - Create: `crates/automation-state/src/rule.rs`
+- Create: `crates/automation-state/tests/no_ai_gateway.rs`
 - Modify: `Cargo.toml` (workspace members)
 
 **Interfaces:**
@@ -106,6 +109,7 @@ use serde::{Deserialize, Serialize};
 use desired_state::ResourceKey;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PanelSpec {
     pub key: String,
     pub channel: ResourceKey,
@@ -115,6 +119,7 @@ pub struct PanelSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonSpec {
     pub key: String,
     pub label: String,
@@ -131,6 +136,7 @@ use desired_state::ResourceKey;
 use crate::panel::PanelSpec;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionRuleSet {
     pub version: u32,
     #[serde(default)]
@@ -140,6 +146,7 @@ pub struct InteractionRuleSet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionRule {
     pub key: String,
     pub trigger: TriggerSpec,
@@ -147,13 +154,13 @@ pub struct InteractionRule {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TriggerSpec {
     ButtonClick { component: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionSpec {
     GrantRole {
         role: ResourceKey,
@@ -230,6 +237,24 @@ mod tests {
         assert!(set.panels.is_empty());
         assert!(set.rules.is_empty());
     }
+
+    #[test]
+    fn conditions_field_is_rejected() {
+        let json = r#"{"key":"r","trigger":{"type":"button_click","component":"b"},"conditions":[],"actions":[]}"#;
+        assert!(serde_json::from_str::<InteractionRule>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_action_type_is_rejected() {
+        let json = r#"{"type":"open_modal","modal":"m"}"#;
+        assert!(serde_json::from_str::<ActionSpec>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_field_in_action_is_rejected() {
+        let json = r#"{"type":"grant_role","role":"verified","target":"actor","template":"x"}"#;
+        assert!(serde_json::from_str::<ActionSpec>(json).is_err());
+    }
 }
 ```
 
@@ -243,16 +268,28 @@ pub use panel::{ButtonSpec, PanelSpec};
 pub use rule::{ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, TriggerSpec};
 ```
 
-- [ ] **Step 6: 테스트 실행**
+- [ ] **Step 6: `crates/automation-state/tests/no_ai_gateway.rs` 작성** (런타임 크레이트 ai-gateway 의존 금지 가드)
+
+```rust
+#[test]
+fn manifest_does_not_depend_on_ai_gateway() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(!manifest.contains("ai-gateway"));
+    assert!(!manifest.contains("ai_gateway"));
+    assert!(!manifest.contains("llm"));
+}
+```
+
+- [ ] **Step 7: 테스트 실행**
 
 Run: `cargo test -p automation-state`
-Expected: PASS (3 tests).
+Expected: PASS (in-module 6 + no_ai_gateway 1 = 7 tests).
 
-- [ ] **Step 7: 커밋**
+- [ ] **Step 8: 커밋**
 
 ```bash
 git add crates/automation-state Cargo.toml
-git commit -m "feat(automation-state): interaction rule schema crate"
+git commit -m "feat(automation-state): interaction rule schema crate with strict deserialization"
 ```
 
 ---
@@ -577,7 +614,7 @@ git commit -m "feat(automation-core): runtime types, adapter seams, mocks, ai-ga
 **Interfaces:**
 - Consumes: `automation_state::{InteractionRuleSet, TriggerSpec, ActionSpec, ActionTarget}`, `resource_resolution::ResourceBindingMap`, `desired_state::ResourceKey`, `crate::event::{RuntimeEvent, EventKind}`, `crate::plan::{ActionPlan, PlannedAction}`.
 - Produces: `validate(&InteractionRuleSet, &ResourceBindingMap) -> Result<(), Vec<ValidationError>>`, `ValidationError`(enum), `interpret(&RuntimeEvent, &InteractionRuleSet, &ResourceBindingMap) -> Option<ActionPlan>`.
-- 계약: `interpret`는 validate 통과를 전제로 한다. 매칭 rule 없음 → `None`. (해소 실패는 이론상 발생하지 않으나, 발생 시에도 panic 없이 `None`.)
+- 계약: `interpret`는 validate 통과를 전제로 한다. 매칭 rule 없음 → `None`. validate가 중복 trigger를 거부하므로 하나의 이벤트는 **최대 1개** rule에만 매칭되고 `.find()`가 그 첫 매칭을 반환한다. (해소 실패는 이론상 발생하지 않으나, 발생 시에도 panic 없이 `None`.)
 
 - [ ] **Step 1: 실패 테스트 작성 — `crates/automation-core/tests/validate.rs`**
 
@@ -688,6 +725,43 @@ fn duplicate_rule_and_button_keys_fail() {
     assert!(errors.contains(&ValidationError::DuplicateButtonKey("b".to_string())));
     assert!(errors.contains(&ValidationError::DuplicateRuleKey("dup".to_string())));
 }
+
+#[test]
+fn duplicate_button_trigger_fails() {
+    let set = InteractionRuleSet {
+        version: 1,
+        panels: vec![panel("verify_button")],
+        rules: vec![
+            rule("r1", "verify_button", "verified"),
+            rule("r2", "verify_button", "verified"),
+        ],
+    };
+    let errors = validate(&set, &bindings_with("verified", 100)).unwrap_err();
+    assert!(errors.contains(&ValidationError::ConflictingTrigger {
+        component: "verify_button".to_string(),
+    }));
+}
+
+#[test]
+fn empty_respond_content_fails() {
+    let set = InteractionRuleSet {
+        version: 1,
+        panels: vec![panel("verify_button")],
+        rules: vec![InteractionRule {
+            key: "r1".to_string(),
+            trigger: TriggerSpec::ButtonClick {
+                component: "verify_button".to_string(),
+            },
+            actions: vec![ActionSpec::RespondEphemeral {
+                content: "   ".to_string(),
+            }],
+        }],
+    };
+    let errors = validate(&set, &bindings_with("verified", 100)).unwrap_err();
+    assert!(errors.contains(&ValidationError::EmptyResponseContent {
+        rule: "r1".to_string(),
+    }));
+}
 ```
 
 - [ ] **Step 2: 실행해서 실패(컴파일 에러) 확인**
@@ -711,6 +785,8 @@ pub enum ValidationError {
     DuplicateRuleKey(String),
     UnknownButtonRef { rule: String, component: String },
     UnknownRoleRef { rule: String, role: ResourceKey },
+    ConflictingTrigger { component: String },
+    EmptyResponseContent { rule: String },
 }
 
 pub fn validate(
@@ -733,6 +809,7 @@ pub fn validate(
     }
 
     let mut rule_keys: BTreeSet<&str> = BTreeSet::new();
+    let mut trigger_components: BTreeSet<String> = BTreeSet::new();
     for rule in &ruleset.rules {
         if !rule_keys.insert(rule.key.as_str()) {
             errors.push(ValidationError::DuplicateRuleKey(rule.key.clone()));
@@ -745,15 +822,29 @@ pub fn validate(
                         component: component.clone(),
                     });
                 }
+                if !trigger_components.insert(component.clone()) {
+                    errors.push(ValidationError::ConflictingTrigger {
+                        component: component.clone(),
+                    });
+                }
             }
         }
         for action in &rule.actions {
-            if let ActionSpec::GrantRole { role, .. } = action {
-                if !bindings.role_bindings.contains_key(role) {
-                    errors.push(ValidationError::UnknownRoleRef {
-                        rule: rule.key.clone(),
-                        role: role.clone(),
-                    });
+            match action {
+                ActionSpec::GrantRole { role, .. } => {
+                    if !bindings.role_bindings.contains_key(role) {
+                        errors.push(ValidationError::UnknownRoleRef {
+                            rule: rule.key.clone(),
+                            role: role.clone(),
+                        });
+                    }
+                }
+                ActionSpec::RespondEphemeral { content } => {
+                    if content.trim().is_empty() {
+                        errors.push(ValidationError::EmptyResponseContent {
+                            rule: rule.key.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -935,7 +1026,7 @@ pub use validate::{validate, ValidationError};
 - [ ] **Step 7: 테스트 실행**
 
 Run: `cargo test -p automation-core --test validate --test interpret`
-Expected: PASS (validate 4 + interpret 3).
+Expected: PASS (validate 6 + interpret 3).
 
 - [ ] **Step 8: 커밋**
 
@@ -955,14 +1046,14 @@ git commit -m "feat(automation-core): rule validation and deterministic interpre
 
 **Interfaces:**
 - Consumes: `crate::event::{RuntimeEvent, RuntimeContext}`, `crate::plan::{ActionPlan, PlannedAction}`, `crate::adapter::{AdapterError, DiscordMutationAdapter, InteractionResponder}`, `crate::interpret::interpret`, `automation_state::InteractionRuleSet`, `resource_resolution::ResourceBindingMap`.
-- Produces: `run(&RuntimeContext, &ActionPlan, &impl DiscordMutationAdapter, &impl InteractionResponder) -> Result<(), AdapterError>` (fail-fast), `handle_event(&RuntimeEvent, &InteractionRuleSet, &ResourceBindingMap, &impl DiscordMutationAdapter, &impl InteractionResponder) -> Result<bool, AdapterError>` (매칭 없으면 `Ok(false)`, 실행하면 `Ok(true)`).
+- Produces: `run(&RuntimeContext, &ActionPlan, &impl DiscordMutationAdapter, &impl InteractionResponder) -> Result<(), AdapterError>` (fail-fast), `HandleOutcome { Executed, NoOp }`, `handle_event(&RuntimeEvent, &InteractionRuleSet, &ResourceBindingMap, &impl DiscordMutationAdapter, &impl InteractionResponder) -> Result<HandleOutcome, AdapterError>` (매칭 없으면 `Ok(NoOp)`, 실행하면 `Ok(Executed)`).
 
 - [ ] **Step 1: 실패 테스트 작성 — `crates/automation-core/tests/run.rs`**
 
 ```rust
 use automation_core::event::{EventKind, RuntimeEvent};
 use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
-use automation_core::run::handle_event;
+use automation_core::run::{handle_event, HandleOutcome};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec,
     TriggerSpec,
@@ -1023,7 +1114,7 @@ fn matching_event_grants_role_and_responds() {
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
 
-    let fired = block_on(handle_event(
+    let outcome = block_on(handle_event(
         &click("verify_button"),
         &set,
         &bindings,
@@ -1032,7 +1123,7 @@ fn matching_event_grants_role_and_responds() {
     ))
     .unwrap();
 
-    assert!(fired);
+    assert_eq!(outcome, HandleOutcome::Executed);
     assert_eq!(
         mutation.calls(),
         vec![MutationCall::GrantRole {
@@ -1055,7 +1146,7 @@ fn unmatched_event_is_noop_with_no_calls() {
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
 
-    let fired = block_on(handle_event(
+    let outcome = block_on(handle_event(
         &click("other_button"),
         &set,
         &bindings,
@@ -1064,7 +1155,7 @@ fn unmatched_event_is_noop_with_no_calls() {
     ))
     .unwrap();
 
-    assert!(!fired);
+    assert_eq!(outcome, HandleOutcome::NoOp);
     assert!(mutation.calls().is_empty());
     assert!(responder.calls().is_empty());
 }
@@ -1128,20 +1219,26 @@ pub async fn run(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleOutcome {
+    Executed,
+    NoOp,
+}
+
 pub async fn handle_event(
     event: &RuntimeEvent,
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
     mutation: &impl DiscordMutationAdapter,
     responder: &impl InteractionResponder,
-) -> Result<bool, AdapterError> {
+) -> Result<HandleOutcome, AdapterError> {
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let context = RuntimeContext::from_event(event);
             run(&context, &plan, mutation, responder).await?;
-            Ok(true)
+            Ok(HandleOutcome::Executed)
         }
-        None => Ok(false),
+        None => Ok(HandleOutcome::NoOp),
     }
 }
 ```
@@ -1151,7 +1248,7 @@ pub async fn handle_event(
 `pub mod plan;` 아래에 `pub mod run;` 추가, 재노출에 다음 추가:
 
 ```rust
-pub use run::{handle_event, run};
+pub use run::{handle_event, run, HandleOutcome};
 ```
 
 - [ ] **Step 5: 테스트 실행**
@@ -1266,6 +1363,7 @@ pub fn privileged_mask() -> Permissions {
     Permissions::ADMINISTRATOR
         | Permissions::MANAGE_GUILD
         | Permissions::MANAGE_ROLES
+        | Permissions::MANAGE_CHANNELS
         | Permissions::BAN_MEMBERS
         | Permissions::KICK_MEMBERS
         | Permissions::MODERATE_MEMBERS
@@ -1330,7 +1428,7 @@ Expected: 성공, 경고 0.
 - [ ] **Step 2: 전체 테스트**
 
 Run: `cargo test`
-Expected: 전부 PASS. 신규 = automation-state 3 + automation-core (mock 3 + no_ai_gateway 1 + validate 4 + interpret 3 + run 3 + policy 2 = 16). 기존 159개 무변경.
+Expected: 전부 PASS. 신규 = automation-state 7 (스키마 6 + no_ai_gateway 1) + automation-core 18 (mock 3 + no_ai_gateway 1 + validate 6 + interpret 3 + run 3 + policy 2) = 25. 기존 159개 무변경 → 총 184.
 
 - [ ] **Step 3: clippy**
 
@@ -1339,7 +1437,7 @@ Expected: 경고/에러 0.
 
 - [ ] **Step 4: fmt 확인**
 
-Run: `cargo fmt --check`
+Run: `cargo fmt --all -- --check`
 Expected: diff 없음.
 
 - [ ] **Step 5: 푸시**
@@ -1352,15 +1450,16 @@ git push origin main
 
 ## Self-Review (스펙 대비)
 
-- **스펙 §6 타입 모델 커버리지:** InteractionRuleSet/InteractionRule/TriggerSpec/ActionSpec/ActionTarget/PanelSpec/ButtonSpec(Task 1), RuntimeEvent/EventKind/RuntimeContext/ActionPlan/PlannedAction(Task 2) ✅. `ConditionSpec`만 의도적으로 제외(§Scope 결정 1 — 사용자 검토 요망).
-- **스펙 §7 validate:** key 유일성 + button ref + role ref(Task 3, validate.rs) ✅.
-- **스펙 §8 policy:** privileged GrantRole 플래그(Task 5) ✅.
+- **스펙 §6 타입 모델 커버리지:** InteractionRuleSet/InteractionRule/TriggerSpec/ActionSpec/ActionTarget/PanelSpec/ButtonSpec(Task 1), RuntimeEvent/EventKind/RuntimeContext/ActionPlan/PlannedAction(Task 2) ✅. `ConditionSpec`는 의도적 제외(사용자 승인 — §Scope 결정 1).
+- **스펙 §7 validate:** key 유일성 + button ref + role ref + **중복 trigger 거부** + **빈 content 거부**(Task 3, validate.rs) ✅.
+- **스펙 §8 policy:** privileged GrantRole 플래그(ADMINISTRATOR/MANAGE_GUILD/MANAGE_ROLES/MANAGE_CHANNELS/BAN/KICK/MODERATE)(Task 5) ✅.
 - **스펙 §9 interpreter:** trigger match → ActionPlan, actor/role 해소, no-match None, LLM 없음(Task 3, interpret.rs) ✅.
 - **스펙 §10 seam 분리:** DiscordMutationAdapter / InteractionResponder + Mock(Task 2) ✅.
-- **스펙 §11 테스트 7 + policy:** (1)matching→Task3 interpret, (2)plan grant+respond→Task3, (3)no-match no-op→Task3+Task4, (4)missing role ref→Task3 validate, (5)dup key→Task3 validate, (6)RespondEphemeral 실행→Task4 run, (7)no ai-gateway→Task2, +policy privileged→Task5 ✅.
+- **스펙 §11 테스트 7 + policy:** (1)matching→Task3 interpret, (2)plan grant+respond→Task3, (3)no-match no-op→Task3+Task4, (4)missing role ref→Task3 validate, (5)dup key→Task3 validate, (6)RespondEphemeral 실행→Task4 run, (7)no ai-gateway→Task1·Task2, +policy privileged→Task5 ✅.
+- **사용자 보강 4개:** (1)ConditionSpec 제외→Task1 스키마 미포함, (2)unknown field 거부→6타입 `deny_unknown_fields` + Task1 거부 테스트 3개(conditions/unknown variant/variant 내부 필드), (3)중복 button trigger→validate `ConflictingTrigger` + 테스트, (4)ai-gateway 미의존→**두 크레이트** 각각 no_ai_gateway 가드 ✅.
 - **스펙 §12 forbidden:** live gateway/endpoint/DB/modal/dynamic template/condition-lang/retry/event-time-AI 전부 미구현 ✅.
 - **Placeholder 스캔:** 코드 블록 전부 완성형, TBD/TODO 없음 ✅.
-- **타입 일관성:** `validate`/`interpret`/`run`/`handle_event`/`analyze` 시그니처가 Task 간 consumes/produces와 일치. `ResourceBindingMap.role_bindings`(BTreeMap), `Permissions::intersects`, `block_on` 사용 실제 API 확인 ✅.
+- **타입 일관성:** `validate`/`interpret`/`run`/`handle_event`/`analyze` 시그니처가 Task 간 consumes/produces와 일치. `HandleOutcome`, `ResourceBindingMap.role_bindings`(BTreeMap), `Permissions::intersects`, `deny_unknown_fields`+internal-tag(serde 1.0.228 실증), `block_on` 사용 실제 API 확인 ✅.
 - **주석:** 코드 블록에 `//`/`///`/`//!` 없음 ✅.
 
 ---
@@ -1371,4 +1470,4 @@ git push origin main
 - **청크 B** = Task 3 + Task 4 (validate + interpret + run + handle_event). 커밋 2개.
 - **청크 C** = Task 5 + Task 6 (policy + 전체 검증 게이트 + push). 커밋 1개 + push.
 
-각 청크 끝에서 `cargo test`/`clippy -- -D warnings`/`fmt --check` 통과 확인. 최종 청크 뒤 `git push origin main`. **live/토큰/DB/modal/template/condition 평가 없음.** 완료 보고 시 크레이트별 테스트 수(automation-state 3 / automation-core 16 / 기존 159 무변경)를 명시.
+각 청크 끝에서 `cargo test`/`clippy --all-targets -- -D warnings`/`fmt --all -- --check` 통과 확인. 최종 청크 뒤 `git push origin main`. **live/토큰/DB/modal/template/condition 평가 없음.** 완료 보고 시 크레이트별 테스트 수(automation-state 7 / automation-core 18 / 기존 159 무변경 → 총 184)를 명시.

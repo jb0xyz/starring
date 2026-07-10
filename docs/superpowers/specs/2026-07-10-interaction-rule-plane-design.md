@@ -62,9 +62,11 @@ RuntimeEvent → 규칙 lookup → Trigger match → RuntimeContext → ActionPl
 - **Trigger**: `ButtonClick`
 - **Action**: `GrantRole`, `RespondEphemeral`
 - **Resource**: `Panel`, `Button`, `Role`(참조)
-- **Condition**: (선택) `ActorLacksRole` 정도. 없어도 됨.
+- **Condition**: **16a 미지원** — `ActorLacksRole` 평가엔 actor의 현재 역할 상태가 필요한데 MVP 이벤트 모델에 없어 silent non-gating 위험. 16b로 연기.
 
 MVP 대표 규칙: 인증 채널의 verify 버튼 클릭 → actor에게 verified 역할 부여 + ephemeral 응답. **하지만 코드는 범용 rule 엔진.**
+
+> **엄격 역직렬화 (필수):** *Phase 16a does not support conditions. Unknown fields must be rejected, not ignored. If a rule contains conditions, deserialization or validation must fail.* → 6개 스키마 타입 전부 `#[serde(deny_unknown_fields)]`(serde 1.0.228은 internally-tagged enum의 variant 내부 필드까지 거부).
 
 ---
 
@@ -96,14 +98,16 @@ enum PlannedAction {
     RespondEphemeral { content: String },
 }
 ```
-role key→id 해소는 설치 시점의 binding(Layer 1 resource-resolution 재활용) 또는 전달된 role registry 사용.
+role key→id 해소는 설치 시점의 binding(Layer 1 resource-resolution 재활용) 또는 전달된 role registry 사용. **Phase 16a uses ResourceBindingMap only as a deterministic key→id map. It does not introduce DB-backed binding persistence.** (DB binding registry는 후속.)
 
 ---
 
 ## 7. validate / compile 책임 (automation-core)
 - rule/panel/button **key 유일성**. trigger의 component가 존재하는 button을 가리키는가.
 - action이 참조하는 role key가 존재하는가(role registry/DesiredState).
-- 지원되지 않는 trigger/action이면 실패.
+- **하나의 ButtonClick은 0개 또는 1개 rule에만 매칭** — 같은 button trigger를 쓰는 rule이 2개 이상이면 validate 실패(중복 실행보다 명확성 우선; 다중 rule 허용은 후속).
+- RespondEphemeral content 비어 있음 방지.
+- 지원되지 않는 trigger/action이면 실패(closed enum + `deny_unknown_fields`).
 - → 유효하면 정규화된 RuleSet.
 
 ---
@@ -163,7 +167,7 @@ trait InteractionResponder {     // interaction token/callback (시간 제한·�
 - **modal** / **dynamic template**(`${input.x}`) / dynamic create_channel·create_role action
 - **condition expression language**
 - retry/backoff, live audit persistence
-- **⛔ event-time AI 호출** — `Runtime must not call LLM during interaction handling.`
+- **⛔ event-time AI 호출** — `automation runtime crates must not depend on ai-gateway. Runtime must not call LLM during interaction handling.` (automation-state·automation-core 각 크레이트의 `no_ai_gateway` 테스트로 빌드-레벨 강제.)
 
 ---
 
