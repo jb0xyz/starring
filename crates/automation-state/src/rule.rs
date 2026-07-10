@@ -68,6 +68,10 @@ pub enum ActionSpec {
         #[serde(default)]
         buttons: Vec<ButtonSpec>,
     },
+    DeferEphemeral,
+    EditResponse {
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,5 +318,24 @@ mod tests {
                 buttons: vec![],
             }
         );
+    }
+
+    #[test]
+    fn defer_and_edit_roundtrip() {
+        assert_eq!(
+            serde_json::from_str::<ActionSpec>(r#"{"type":"defer_ephemeral"}"#).unwrap(),
+            ActionSpec::DeferEphemeral
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionSpec>(r#"{"type":"edit_response","content":"완료"}"#)
+                .unwrap(),
+            ActionSpec::EditResponse {
+                content: "완료".to_string(),
+            }
+        );
+        assert!(serde_json::from_str::<ActionSpec>(
+            r#"{"type":"edit_response","content":"x","evil":1}"#
+        )
+        .is_err());
     }
 }
