@@ -90,6 +90,24 @@ pub enum ValidationError {
         rule: String,
         count: usize,
     },
+    DeferNotFirst {
+        rule: String,
+    },
+    ConflictingInitialResponse {
+        rule: String,
+    },
+    EditResponseWithoutDefer {
+        rule: String,
+    },
+    DeferredMissingEditResponse {
+        rule: String,
+    },
+    MultipleEditResponse {
+        rule: String,
+    },
+    EditResponseNotLast {
+        rule: String,
+    },
 }
 
 pub fn validate(
@@ -255,7 +273,64 @@ pub fn validate(
                     check_channel_ref(&mut errors, rule, bindings, &created, channel);
                     check_template(&mut errors, rule, &modal_fields, content);
                 }
+                ActionSpec::DeferEphemeral => {}
+                ActionSpec::EditResponse { content } => {
+                    check_template(&mut errors, rule, &modal_fields, content);
+                }
             }
+        }
+        let defer_positions: Vec<usize> = rule
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| matches!(action, ActionSpec::DeferEphemeral))
+            .map(|(index, _)| index)
+            .collect();
+        let edit_positions: Vec<usize> = rule
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| matches!(action, ActionSpec::EditResponse { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let has_other_initial = rule.actions.iter().any(|action| {
+            matches!(
+                action,
+                ActionSpec::RespondEphemeral { .. } | ActionSpec::OpenModal { .. }
+            )
+        });
+        let last_index = rule.actions.len().saturating_sub(1);
+        if defer_positions.iter().any(|&index| index != 0) {
+            errors.push(ValidationError::DeferNotFirst {
+                rule: rule.key.clone(),
+            });
+        }
+        if !defer_positions.is_empty() {
+            if has_other_initial {
+                errors.push(ValidationError::ConflictingInitialResponse {
+                    rule: rule.key.clone(),
+                });
+            }
+            if edit_positions.is_empty() {
+                errors.push(ValidationError::DeferredMissingEditResponse {
+                    rule: rule.key.clone(),
+                });
+            }
+        }
+        if !edit_positions.is_empty() && defer_positions.is_empty() {
+            errors.push(ValidationError::EditResponseWithoutDefer {
+                rule: rule.key.clone(),
+            });
+        }
+        if edit_positions.len() > 1 {
+            errors.push(ValidationError::MultipleEditResponse {
+                rule: rule.key.clone(),
+            });
+        }
+        if edit_positions.iter().any(|&index| index != last_index) {
+            errors.push(ValidationError::EditResponseNotLast {
+                rule: rule.key.clone(),
+            });
         }
     }
 

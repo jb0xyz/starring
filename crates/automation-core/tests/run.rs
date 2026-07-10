@@ -70,6 +70,7 @@ fn matching_event_grants_role_and_responds() {
         &bindings,
         &mutation,
         &responder,
+        "",
     ))
     .unwrap();
 
@@ -102,6 +103,7 @@ fn unmatched_event_is_noop_with_no_calls() {
         &bindings,
         &mutation,
         &responder,
+        "",
     ))
     .unwrap();
 
@@ -127,6 +129,7 @@ fn mutation_failure_propagates() {
         &bindings,
         &mutation,
         &responder,
+        "",
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);

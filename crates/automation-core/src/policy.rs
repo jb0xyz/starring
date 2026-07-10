@@ -89,7 +89,10 @@ pub fn analyze(
                         });
                     }
                 }
-                ActionSpec::RespondEphemeral { .. } | ActionSpec::OpenModal { .. } => {}
+                ActionSpec::RespondEphemeral { .. }
+                | ActionSpec::OpenModal { .. }
+                | ActionSpec::DeferEphemeral
+                | ActionSpec::EditResponse { .. } => {}
             }
         }
     }

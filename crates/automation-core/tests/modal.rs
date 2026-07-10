@@ -238,6 +238,7 @@ fn default_responder_open_modal_is_unsupported() {
         &ResourceBindingMap::default(),
         &mutation,
         &responder,
+        "",
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Unsupported);
 }
@@ -252,6 +253,7 @@ fn mock_responder_runs_open_modal() {
         &ResourceBindingMap::default(),
         &mutation,
         &responder,
+        "",
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);

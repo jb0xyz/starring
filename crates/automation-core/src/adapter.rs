@@ -116,4 +116,18 @@ pub trait InteractionResponder {
             "open_modal is not supported",
         ))
     }
+
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "defer_ephemeral is not supported",
+        ))
+    }
+
+    async fn edit_response(&self, _content: String) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "edit_response is not supported",
+        ))
+    }
 }

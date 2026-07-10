@@ -169,6 +169,8 @@ impl DiscordMutationAdapter for MockMutationAdapter {
 pub enum ResponderCall {
     RespondEphemeral { content: String },
     OpenModal { modal: String },
+    DeferEphemeral,
+    EditResponse { content: String },
 }
 
 #[derive(Default)]
@@ -199,6 +201,22 @@ impl InteractionResponder for MockInteractionResponder {
         self.calls.lock().unwrap().push(ResponderCall::OpenModal {
             modal: modal.key.clone(),
         });
+        Ok(())
+    }
+
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(ResponderCall::DeferEphemeral);
+        Ok(())
+    }
+
+    async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(ResponderCall::EditResponse { content });
         Ok(())
     }
 }

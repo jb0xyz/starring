@@ -87,6 +87,7 @@ fn responded(event: &RuntimeEvent, rule: InteractionRule) -> String {
         &ResourceBindingMap::default(),
         &mutation,
         &responder,
+        "",
     ))
     .unwrap();
     match responder.calls().into_iter().next().unwrap() {

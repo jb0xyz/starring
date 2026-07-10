@@ -60,6 +60,10 @@ pub enum PlannedAction {
         content: String,
         buttons: Vec<ButtonSpec>,
     },
+    DeferEphemeral,
+    EditResponse {
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

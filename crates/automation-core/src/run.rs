@@ -126,6 +126,13 @@ pub async fn run(
                     id,
                 });
             }
+            PlannedAction::DeferEphemeral => {
+                responder.defer_ephemeral().await?;
+            }
+            PlannedAction::EditResponse { content } => {
+                let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
+                responder.edit_response(rendered).await?;
+            }
         }
     }
     Ok(created)
@@ -202,12 +209,34 @@ pub async fn handle_event(
     bindings: &ResourceBindingMap,
     mutation: &impl DiscordMutationAdapter,
     responder: &impl InteractionResponder,
+    failure_message: &str,
 ) -> Result<HandleOutcome, AdapterError> {
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let context = RuntimeContext::from_event(event);
-            run(&context, &plan, mutation, responder).await?;
-            Ok(HandleOutcome::Executed)
+            let mut steps = plan.steps;
+            let defer_acked = if matches!(steps.first(), Some(PlannedAction::DeferEphemeral)) {
+                responder.defer_ephemeral().await?;
+                steps.remove(0);
+                true
+            } else {
+                false
+            };
+            match run(&context, &ActionPlan { steps }, mutation, responder).await {
+                Ok(_) => Ok(HandleOutcome::Executed),
+                Err(error) => {
+                    if defer_acked {
+                        if let Ok(rendered) = render(
+                            failure_message,
+                            &context,
+                            SanitizeContext::EphemeralMessageContent,
+                        ) {
+                            let _ = responder.edit_response(rendered).await;
+                        }
+                    }
+                    Err(error)
+                }
+            }
         }
         None => Ok(HandleOutcome::NoOp),
     }

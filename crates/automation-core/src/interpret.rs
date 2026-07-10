@@ -93,6 +93,14 @@ pub fn interpret(
                     buttons: buttons.clone(),
                 });
             }
+            ActionSpec::DeferEphemeral => {
+                steps.push(PlannedAction::DeferEphemeral);
+            }
+            ActionSpec::EditResponse { content } => {
+                steps.push(PlannedAction::EditResponse {
+                    content: content.clone(),
+                });
+            }
         }
     }
 

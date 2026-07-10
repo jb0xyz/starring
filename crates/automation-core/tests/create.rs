@@ -70,6 +70,7 @@ fn run_calls(event: &RuntimeEvent, actions: Vec<ActionSpec>) -> Vec<MutationCall
         &ResourceBindingMap::default(),
         &mutation,
         &responder,
+        "",
     ))
     .unwrap();
     mutation.calls()
@@ -134,6 +135,7 @@ fn create_channel_missing_input_errors() {
         &ResourceBindingMap::default(),
         &mutation,
         &responder,
+        "",
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
 }
