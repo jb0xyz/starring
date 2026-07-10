@@ -16,7 +16,7 @@ pub async fn handle_interaction(
     bindings: &ResourceBindingMap,
     interaction: &Interaction,
 ) {
-    let Some(event) = interaction_to_event(interaction) else {
+    let Some(event) = interaction_to_event(interaction, ruleset_key) else {
         return;
     };
     let responder = TwilightInteractionResponder::from_interaction(http, interaction, ruleset_key);

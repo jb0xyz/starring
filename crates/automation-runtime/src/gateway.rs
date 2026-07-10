@@ -13,7 +13,7 @@ pub async fn run(
     bindings: ResourceBindingMap,
 ) {
     let http = Client::new(token.clone());
-    let mutation = TwilightMutationAdapter::new(&http);
+    let mutation = TwilightMutationAdapter::new(&http, ruleset_key.clone());
     let mut shard = Shard::new(ShardId::ONE, token, Intents::empty());
 
     while let Some(item) = shard.next_event(EventTypeFlags::INTERACTION_CREATE).await {

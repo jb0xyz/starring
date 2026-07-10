@@ -15,3 +15,10 @@ pub fn classify_error(err: &twilight_http::Error) -> AdapterError {
     };
     AdapterError::new(kind, format!("twilight error: {err}"))
 }
+
+pub fn classify_body_error(err: &twilight_http::response::DeserializeBodyError) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Unknown,
+        format!("twilight model error: {err}"),
+    )
+}
