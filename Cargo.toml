@@ -17,6 +17,7 @@ members = [
     "crates/bot-runtime",
     "crates/automation-state",
     "crates/automation-core",
+    "crates/automation-runtime",
     "tools/ai-eval",
     "tools/executor-smoke",
     "tools/starring-demo",

@@ -1,0 +1,13 @@
+[package]
+name = "automation-runtime"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-state = { path = "../automation-state" }
+automation-core = { path = "../automation-core" }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+twilight-gateway = "0.17"
+twilight-http = "0.17"
+twilight-model = "0.17"
