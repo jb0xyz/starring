@@ -4,4 +4,6 @@ pub mod rule;
 
 pub use modal::{ModalFieldSpec, ModalFieldStyle, ModalSpec};
 pub use panel::{ButtonSpec, PanelSpec};
-pub use rule::{ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, TriggerSpec};
+pub use rule::{
+    ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, RoleRef, TriggerSpec,
+};

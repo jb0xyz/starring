@@ -35,22 +35,18 @@ pub enum TriggerSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionSpec {
-    GrantRole {
-        role: ResourceKey,
-        target: ActionTarget,
-    },
-    RespondEphemeral {
-        content: String,
-    },
-    OpenModal {
-        modal: String,
-    },
-    CreateChannel {
-        name: String,
-    },
-    CreateRole {
-        name: String,
-    },
+    GrantRole { role: RoleRef, target: ActionTarget },
+    RespondEphemeral { content: String },
+    OpenModal { modal: String },
+    CreateChannel { key: String, name: String },
+    CreateRole { key: String, name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RoleRef {
+    Existing(ResourceKey),
+    Created { created: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +81,7 @@ mod tests {
                 },
                 actions: vec![
                     ActionSpec::GrantRole {
-                        role: ResourceKey("verified_member".to_string()),
+                        role: RoleRef::Existing(ResourceKey("verified_member".to_string())),
                         target: ActionTarget::Actor,
                     },
                     ActionSpec::RespondEphemeral {
@@ -136,17 +132,20 @@ mod tests {
 
     #[test]
     fn create_actions_roundtrip() {
-        let channel_json = r#"{"type":"create_channel","name":"study-${input.room_name}"}"#;
-        let role_json = r#"{"type":"create_role","name":"${input.room_name} member"}"#;
+        let channel_json =
+            r#"{"type":"create_channel","key":"ch","name":"study-${input.room_name}"}"#;
+        let role_json = r#"{"type":"create_role","key":"role","name":"${input.room_name} member"}"#;
         assert_eq!(
             serde_json::from_str::<ActionSpec>(channel_json).unwrap(),
             ActionSpec::CreateChannel {
+                key: "ch".to_string(),
                 name: "study-${input.room_name}".to_string(),
             }
         );
         assert_eq!(
             serde_json::from_str::<ActionSpec>(role_json).unwrap(),
             ActionSpec::CreateRole {
+                key: "role".to_string(),
                 name: "${input.room_name} member".to_string(),
             }
         );
