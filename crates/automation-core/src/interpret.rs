@@ -43,7 +43,12 @@ pub fn interpret(
                     fields: spec.fields.clone(),
                 }));
             }
-            ActionSpec::CreateChannel { .. } | ActionSpec::CreateRole { .. } => {}
+            ActionSpec::CreateChannel { name } => {
+                steps.push(PlannedAction::CreateChannel { name: name.clone() });
+            }
+            ActionSpec::CreateRole { name } => {
+                steps.push(PlannedAction::CreateRole { name: name.clone() });
+            }
         }
     }
 

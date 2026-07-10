@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use automation_state::{ActionSpec, InteractionRuleSet, TriggerSpec};
+use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
 
@@ -139,37 +139,7 @@ pub fn validate(
                             rule: rule.key.clone(),
                         });
                     }
-                    match TemplateString::parse(content) {
-                        Err(_) => {
-                            errors.push(ValidationError::BadTemplate {
-                                rule: rule.key.clone(),
-                            });
-                        }
-                        Ok(template) => {
-                            for key in template.input_keys() {
-                                match &rule.trigger {
-                                    TriggerSpec::ButtonClick { .. } => {
-                                        errors.push(ValidationError::InputTemplateInButtonRule {
-                                            rule: rule.key.clone(),
-                                            input: key.to_string(),
-                                        });
-                                    }
-                                    TriggerSpec::ModalSubmit { modal } => {
-                                        let known = modal_fields
-                                            .get(modal)
-                                            .is_some_and(|fields| fields.contains(key));
-                                        if !known {
-                                            errors.push(ValidationError::UnknownTemplateInput {
-                                                rule: rule.key.clone(),
-                                                modal: modal.clone(),
-                                                input: key.to_string(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    check_template(&mut errors, rule, &modal_fields, content);
                 }
                 ActionSpec::OpenModal { modal } => {
                     if !modal_keys.contains(modal) {
@@ -179,7 +149,12 @@ pub fn validate(
                         });
                     }
                 }
-                ActionSpec::CreateChannel { .. } | ActionSpec::CreateRole { .. } => {}
+                ActionSpec::CreateChannel { name } => {
+                    check_template(&mut errors, rule, &modal_fields, name);
+                }
+                ActionSpec::CreateRole { name } => {
+                    check_template(&mut errors, rule, &modal_fields, name);
+                }
             }
         }
     }
@@ -188,5 +163,44 @@ pub fn validate(
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn check_template(
+    errors: &mut Vec<ValidationError>,
+    rule: &InteractionRule,
+    modal_fields: &BTreeMap<String, BTreeSet<String>>,
+    content: &str,
+) {
+    let template = match TemplateString::parse(content) {
+        Ok(template) => template,
+        Err(_) => {
+            errors.push(ValidationError::BadTemplate {
+                rule: rule.key.clone(),
+            });
+            return;
+        }
+    };
+    for key in template.input_keys() {
+        match &rule.trigger {
+            TriggerSpec::ButtonClick { .. } => {
+                errors.push(ValidationError::InputTemplateInButtonRule {
+                    rule: rule.key.clone(),
+                    input: key.to_string(),
+                });
+            }
+            TriggerSpec::ModalSubmit { modal } => {
+                if !modal_fields
+                    .get(modal)
+                    .is_some_and(|fields| fields.contains(key))
+                {
+                    errors.push(ValidationError::UnknownTemplateInput {
+                        rule: rule.key.clone(),
+                        modal: modal.clone(),
+                        input: key.to_string(),
+                    });
+                }
+            }
+        }
     }
 }

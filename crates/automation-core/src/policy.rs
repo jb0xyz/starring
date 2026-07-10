@@ -5,10 +5,15 @@ use desired_state::ResourceKey;
 use discord_model::Permissions;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyFinding {
-    pub rule: String,
-    pub role: ResourceKey,
-    pub reason: String,
+pub enum PolicyFinding {
+    PrivilegedRoleGrant { rule: String, role: ResourceKey },
+    DynamicResourceCreation { rule: String, action: DynamicAction },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicAction {
+    CreateChannel,
+    CreateRole,
 }
 
 pub fn privileged_mask() -> Permissions {
@@ -29,16 +34,28 @@ pub fn analyze(
     let mut findings = Vec::new();
     for rule in &ruleset.rules {
         for action in &rule.actions {
-            if let ActionSpec::GrantRole { role, .. } = action {
-                if let Some(permissions) = roles.get(role) {
-                    if permissions.intersects(mask) {
-                        findings.push(PolicyFinding {
+            match action {
+                ActionSpec::GrantRole { role, .. } => {
+                    if roles.get(role).is_some_and(|perms| perms.intersects(mask)) {
+                        findings.push(PolicyFinding::PrivilegedRoleGrant {
                             rule: rule.key.clone(),
                             role: role.clone(),
-                            reason: "grants a privileged role".to_string(),
                         });
                     }
                 }
+                ActionSpec::CreateChannel { .. } => {
+                    findings.push(PolicyFinding::DynamicResourceCreation {
+                        rule: rule.key.clone(),
+                        action: DynamicAction::CreateChannel,
+                    });
+                }
+                ActionSpec::CreateRole { .. } => {
+                    findings.push(PolicyFinding::DynamicResourceCreation {
+                        rule: rule.key.clone(),
+                        action: DynamicAction::CreateRole,
+                    });
+                }
+                ActionSpec::RespondEphemeral { .. } | ActionSpec::OpenModal { .. } => {}
             }
         }
     }
