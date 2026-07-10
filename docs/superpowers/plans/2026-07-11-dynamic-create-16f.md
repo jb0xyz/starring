@@ -731,6 +731,14 @@ pub fn analyze(
 }
 ```
 
+- [ ] **Step 4b: `lib.rs` — DynamicAction 재노출 추가** (청크 A에서 뺐던 것 — DynamicAction이 이제 존재)
+
+`pub use policy::{analyze, privileged_mask, PolicyFinding};` 를 다음으로:
+
+```rust
+pub use policy::{analyze, privileged_mask, DynamicAction, PolicyFinding};
+```
+
 - [ ] **Step 5: `tests/policy.rs` 전체 교체** (enum 반영 + dynamic 테스트)
 
 ```rust
