@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use desired_state::ResourceKey;
 
+use crate::modal::ModalSpec;
 use crate::panel::PanelSpec;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,6 +11,8 @@ pub struct InteractionRuleSet {
     pub version: u32,
     #[serde(default)]
     pub panels: Vec<PanelSpec>,
+    #[serde(default)]
+    pub modals: Vec<ModalSpec>,
     #[serde(default)]
     pub rules: Vec<InteractionRule>,
 }
@@ -26,6 +29,7 @@ pub struct InteractionRule {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TriggerSpec {
     ButtonClick { component: String },
+    ModalSubmit { modal: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +41,9 @@ pub enum ActionSpec {
     },
     RespondEphemeral {
         content: String,
+    },
+    OpenModal {
+        modal: String,
     },
 }
 
@@ -64,6 +71,7 @@ mod tests {
                     label: "Verify".to_string(),
                 }],
             }],
+            modals: vec![],
             rules: vec![InteractionRule {
                 key: "verify_rule".to_string(),
                 trigger: TriggerSpec::ButtonClick {
@@ -104,6 +112,7 @@ mod tests {
         let set: InteractionRuleSet = serde_json::from_str(r#"{"version":2}"#).unwrap();
         assert_eq!(set.version, 2);
         assert!(set.panels.is_empty());
+        assert!(set.modals.is_empty());
         assert!(set.rules.is_empty());
     }
 
@@ -115,7 +124,7 @@ mod tests {
 
     #[test]
     fn unknown_action_type_is_rejected() {
-        let json = r#"{"type":"open_modal","modal":"m"}"#;
+        let json = r#"{"type":"create_channel","channel":"x"}"#;
         assert!(serde_json::from_str::<ActionSpec>(json).is_err());
     }
 
