@@ -1,8 +1,14 @@
-use automation_state::{ActionSpec, ActionTarget, InteractionRuleSet, RoleRef, TriggerSpec};
+use automation_state::{
+    ActionSpec, ActionTarget, ChannelRef, InteractionRuleSet, OverwriteTargetSpec, RoleRef,
+    TriggerSpec,
+};
 use resource_resolution::ResourceBindingMap;
 
 use crate::event::{EventKind, RuntimeEvent};
-use crate::plan::{ActionPlan, ModalPresentation, PlannedAction, PlannedRole};
+use crate::plan::{
+    ActionPlan, ModalPresentation, PlannedAction, PlannedChannel, PlannedOverwriteTarget,
+    PlannedRole,
+};
 
 pub fn interpret(
     event: &RuntimeEvent,
@@ -18,12 +24,7 @@ pub fn interpret(
     for action in &rule.actions {
         match action {
             ActionSpec::GrantRole { role, target } => {
-                let planned_role = match role {
-                    RoleRef::Existing(key) => {
-                        PlannedRole::Resolved(*bindings.role_bindings.get(key)?)
-                    }
-                    RoleRef::Created { created } => PlannedRole::Created(created.clone()),
-                };
+                let planned_role = resolve_role(role, bindings)?;
                 let target_id = match target {
                     ActionTarget::Actor => event.actor,
                 };
@@ -60,10 +61,42 @@ pub fn interpret(
                     name: name.clone(),
                 });
             }
+            ActionSpec::UpsertOverwrite {
+                channel,
+                target,
+                allow,
+                deny,
+            } => {
+                let planned_channel = match channel {
+                    ChannelRef::Existing(key) => {
+                        PlannedChannel::Resolved(*bindings.channel_bindings.get(key)?)
+                    }
+                    ChannelRef::Created(inner) => PlannedChannel::Created(inner.created.clone()),
+                };
+                let planned_target = match target {
+                    OverwriteTargetSpec::Everyone => PlannedOverwriteTarget::Everyone,
+                    OverwriteTargetSpec::Role(role) => {
+                        PlannedOverwriteTarget::Role(resolve_role(role, bindings)?)
+                    }
+                };
+                steps.push(PlannedAction::UpsertOverwrite {
+                    channel: planned_channel,
+                    target: planned_target,
+                    allow: *allow,
+                    deny: *deny,
+                });
+            }
         }
     }
 
     Some(ActionPlan { steps })
+}
+
+fn resolve_role(role: &RoleRef, bindings: &ResourceBindingMap) -> Option<PlannedRole> {
+    match role {
+        RoleRef::Existing(key) => Some(PlannedRole::Resolved(*bindings.role_bindings.get(key)?)),
+        RoleRef::Created(inner) => Some(PlannedRole::Created(inner.created.clone())),
+    }
 }
 
 fn trigger_matches(trigger: &TriggerSpec, kind: &EventKind) -> bool {

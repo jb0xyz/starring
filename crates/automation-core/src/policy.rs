@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use automation_state::{ActionSpec, InteractionRuleSet, RoleRef};
+use automation_state::{ActionSpec, InteractionRuleSet, OverwriteTargetSpec, RoleRef};
 use desired_state::ResourceKey;
 use discord_model::Permissions;
 
@@ -9,6 +9,8 @@ pub enum PolicyFinding {
     PrivilegedRoleGrant { rule: String, role: ResourceKey },
     DynamicResourceCreation { rule: String, action: DynamicAction },
     CreatedResourceReference { rule: String },
+    EveryoneOverwrite { rule: String },
+    PrivilegedOverwriteAllow { rule: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +47,7 @@ pub fn analyze(
                             });
                         }
                     }
-                    RoleRef::Created { .. } => {
+                    RoleRef::Created(..) => {
                         findings.push(PolicyFinding::CreatedResourceReference {
                             rule: rule.key.clone(),
                         });
@@ -62,6 +64,18 @@ pub fn analyze(
                         rule: rule.key.clone(),
                         action: DynamicAction::CreateRole,
                     });
+                }
+                ActionSpec::UpsertOverwrite { target, allow, .. } => {
+                    if matches!(target, OverwriteTargetSpec::Everyone) {
+                        findings.push(PolicyFinding::EveryoneOverwrite {
+                            rule: rule.key.clone(),
+                        });
+                    }
+                    if allow.intersects(mask) {
+                        findings.push(PolicyFinding::PrivilegedOverwriteAllow {
+                            rule: rule.key.clone(),
+                        });
+                    }
                 }
                 ActionSpec::RespondEphemeral { .. } | ActionSpec::OpenModal { .. } => {}
             }

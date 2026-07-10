@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use discord_model::{ChannelId, GuildId, RoleId, UserId};
+use discord_model::{ChannelId, GuildId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::adapter::{
     AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, InteractionResponder,
@@ -22,6 +22,13 @@ pub enum MutationCall {
     CreateRole {
         guild: GuildId,
         name: String,
+    },
+    UpsertOverwrite {
+        guild: GuildId,
+        channel: ChannelId,
+        target: OverwriteTarget,
+        allow: Permissions,
+        deny: Permissions,
     },
 }
 
@@ -103,6 +110,30 @@ impl DiscordMutationAdapter for MockMutationAdapter {
         Ok(RoleId(
             800_000 + self.next_id.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+
+    async fn upsert_overwrite(
+        &self,
+        guild: GuildId,
+        channel: ChannelId,
+        target: OverwriteTarget,
+        allow: Permissions,
+        deny: Permissions,
+    ) -> Result<(), AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MutationCall::UpsertOverwrite {
+                guild,
+                channel,
+                target,
+                allow,
+                deny,
+            });
+        match &self.fail {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 }
 

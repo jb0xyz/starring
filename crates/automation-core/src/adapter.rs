@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use discord_model::{ChannelId, GuildId, RoleId, UserId};
+use discord_model::{ChannelId, GuildId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::plan::ModalPresentation;
 
@@ -69,6 +69,20 @@ pub trait DiscordMutationAdapter {
         Err(AdapterError::new(
             AdapterErrorKind::Unsupported,
             "create_role is not supported",
+        ))
+    }
+
+    async fn upsert_overwrite(
+        &self,
+        _guild: GuildId,
+        _channel: ChannelId,
+        _target: OverwriteTarget,
+        _allow: Permissions,
+        _deny: Permissions,
+    ) -> Result<(), AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "upsert_overwrite is not supported",
         ))
     }
 }

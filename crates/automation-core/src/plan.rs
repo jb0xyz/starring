@@ -1,5 +1,5 @@
 use automation_state::ModalFieldSpec;
-use discord_model::{ChannelId, RoleId, UserId};
+use discord_model::{ChannelId, Permissions, RoleId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionPlan {
@@ -20,12 +20,41 @@ pub enum PlannedRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedChannel {
+    Resolved(ChannelId),
+    Created(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedOverwriteTarget {
+    Everyone,
+    Role(PlannedRole),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlannedAction {
-    GrantRole { role: PlannedRole, target: UserId },
-    RespondEphemeral { content: String },
+    GrantRole {
+        role: PlannedRole,
+        target: UserId,
+    },
+    RespondEphemeral {
+        content: String,
+    },
     OpenModal(ModalPresentation),
-    CreateChannel { key: String, name: String },
-    CreateRole { key: String, name: String },
+    CreateChannel {
+        key: String,
+        name: String,
+    },
+    CreateRole {
+        key: String,
+        name: String,
+    },
+    UpsertOverwrite {
+        channel: PlannedChannel,
+        target: PlannedOverwriteTarget,
+        allow: Permissions,
+        deny: Permissions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
