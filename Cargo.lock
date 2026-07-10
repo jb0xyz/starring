@@ -788,6 +788,7 @@ dependencies = [
 name = "interaction-smoke"
 version = "0.1.0"
 dependencies = [
+ "automation-core",
  "automation-runtime",
  "automation-state",
  "desired-state",
