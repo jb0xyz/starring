@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RULESET_KEY.to_string(),
         ruleset,
         ResourceBindingMap::default(),
+        "스터디룸 생성에 실패했습니다. 봇 권한 또는 역할 순서를 확인해주세요.".to_string(),
     )
     .await;
     Ok(())
@@ -85,11 +86,7 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                     modal: MODAL_KEY.to_string(),
                 },
                 actions: vec![
-                    ActionSpec::RespondEphemeral {
-                        content:
-                            "스터디룸 '${input.room_name}'을 만들고 있어요. 곧 새 채널이 나타납니다."
-                                .to_string(),
-                    },
+                    ActionSpec::DeferEphemeral,
                     ActionSpec::CreateRole {
                         key: "study_member_role".to_string(),
                         name: "${input.room_name} 멤버".to_string(),
@@ -125,6 +122,10 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             key: "study_help".to_string(),
                             label: "도움말".to_string(),
                         }],
+                    },
+                    ActionSpec::EditResponse {
+                        content: "스터디룸 '${input.room_name}' 생성 완료! 새 채널을 확인하세요."
+                            .to_string(),
                     },
                 ],
             },
