@@ -5,6 +5,7 @@ pub mod mock;
 pub mod plan;
 pub mod policy;
 pub mod run;
+pub mod template;
 pub mod validate;
 
 pub use adapter::{AdapterError, AdapterErrorKind, DiscordMutationAdapter, InteractionResponder};
@@ -14,4 +15,5 @@ pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, Resp
 pub use plan::{ActionPlan, ModalPresentation, PlannedAction};
 pub use policy::{analyze, privileged_mask, PolicyFinding};
 pub use run::{handle_event, run, HandleOutcome};
+pub use template::{SanitizeContext, TemplateError, TemplateString};
 pub use validate::{validate, ValidationError};
