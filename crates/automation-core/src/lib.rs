@@ -8,11 +8,14 @@ pub mod run;
 pub mod template;
 pub mod validate;
 
-pub use adapter::{AdapterError, AdapterErrorKind, DiscordMutationAdapter, InteractionResponder};
+pub use adapter::{
+    AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
+    InteractionResponder,
+};
 pub use event::{EventKind, RuntimeContext, RuntimeEvent};
 pub use interpret::interpret;
 pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
-pub use plan::{ActionPlan, ModalPresentation, PlannedAction};
+pub use plan::{ActionPlan, CreatedResource, ModalPresentation, PlannedAction};
 pub use policy::{analyze, privileged_mask, PolicyFinding};
 pub use run::{handle_event, run, HandleOutcome};
 pub use template::{SanitizeContext, TemplateError, TemplateString};

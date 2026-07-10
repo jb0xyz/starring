@@ -179,6 +179,7 @@ pub fn validate(
                         });
                     }
                 }
+                ActionSpec::CreateChannel { .. } | ActionSpec::CreateRole { .. } => {}
             }
         }
     }

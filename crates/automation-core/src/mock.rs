@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use discord_model::{GuildId, RoleId, UserId};
+use discord_model::{ChannelId, GuildId, RoleId, UserId};
 
-use crate::adapter::{AdapterError, DiscordMutationAdapter, InteractionResponder};
+use crate::adapter::{
+    AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, InteractionResponder,
+};
 use crate::plan::ModalPresentation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,12 +15,21 @@ pub enum MutationCall {
         member: UserId,
         role: RoleId,
     },
+    CreateChannel {
+        guild: GuildId,
+        name: String,
+    },
+    CreateRole {
+        guild: GuildId,
+        name: String,
+    },
 }
 
 #[derive(Default)]
 pub struct MockMutationAdapter {
     calls: Mutex<Vec<MutationCall>>,
     fail: Option<AdapterError>,
+    next_id: AtomicU64,
 }
 
 impl MockMutationAdapter {
@@ -29,6 +41,7 @@ impl MockMutationAdapter {
         Self {
             calls: Mutex::new(Vec::new()),
             fail: Some(error),
+            next_id: AtomicU64::new(0),
         }
     }
 
@@ -53,6 +66,43 @@ impl DiscordMutationAdapter for MockMutationAdapter {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    async fn create_channel(
+        &self,
+        guild: GuildId,
+        spec: CreateChannelSpec,
+    ) -> Result<ChannelId, AdapterError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MutationCall::CreateChannel {
+                guild,
+                name: spec.name,
+            });
+        if let Some(error) = &self.fail {
+            return Err(error.clone());
+        }
+        Ok(ChannelId(
+            800_000 + self.next_id.fetch_add(1, Ordering::SeqCst),
+        ))
+    }
+
+    async fn create_role(
+        &self,
+        guild: GuildId,
+        spec: CreateRoleSpec,
+    ) -> Result<RoleId, AdapterError> {
+        self.calls.lock().unwrap().push(MutationCall::CreateRole {
+            guild,
+            name: spec.name,
+        });
+        if let Some(error) = &self.fail {
+            return Err(error.clone());
+        }
+        Ok(RoleId(
+            800_000 + self.next_id.fetch_add(1, Ordering::SeqCst),
+        ))
     }
 }
 

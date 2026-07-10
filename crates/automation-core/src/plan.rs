@@ -1,5 +1,5 @@
 use automation_state::ModalFieldSpec;
-use discord_model::{RoleId, UserId};
+use discord_model::{ChannelId, RoleId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionPlan {
@@ -18,4 +18,20 @@ pub enum PlannedAction {
     GrantRole { role: RoleId, target: UserId },
     RespondEphemeral { content: String },
     OpenModal(ModalPresentation),
+    CreateChannel { name: String },
+    CreateRole { name: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreatedResource {
+    Channel {
+        action_index: usize,
+        name: String,
+        id: ChannelId,
+    },
+    Role {
+        action_index: usize,
+        name: String,
+        id: RoleId,
+    },
 }

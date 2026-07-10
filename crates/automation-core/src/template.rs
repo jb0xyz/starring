@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 const EPHEMERAL_MAX_LEN: usize = 2000;
+const NAME_MAX_LEN: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SanitizeContext {
     EphemeralMessageContent,
+    ChannelName,
+    RoleName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +16,7 @@ pub enum TemplateError {
     UnsupportedVariable(String),
     MissingInput(String),
     TooLong { limit: usize, actual: usize },
+    EmptyAfterSanitize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +86,7 @@ impl TemplateString {
                 }
             }
         }
-        let sanitized = sanitize(&out, context);
+        let sanitized = sanitize(&out, context)?;
         let limit = max_len(context);
         let actual = sanitized.chars().count();
         if actual > limit {
@@ -95,12 +99,20 @@ impl TemplateString {
 fn max_len(context: SanitizeContext) -> usize {
     match context {
         SanitizeContext::EphemeralMessageContent => EPHEMERAL_MAX_LEN,
+        SanitizeContext::ChannelName | SanitizeContext::RoleName => NAME_MAX_LEN,
     }
 }
 
-fn sanitize(input: &str, context: SanitizeContext) -> String {
-    match context {
+fn sanitize(input: &str, context: SanitizeContext) -> Result<String, TemplateError> {
+    let result = match context {
         SanitizeContext::EphemeralMessageContent => sanitize_message(input),
+        SanitizeContext::ChannelName => sanitize_channel_name(input),
+        SanitizeContext::RoleName => sanitize_role_name(input),
+    };
+    if result.is_empty() {
+        Err(TemplateError::EmptyAfterSanitize)
+    } else {
+        Ok(result)
     }
 }
 
@@ -114,6 +126,31 @@ fn sanitize_message(input: &str) -> String {
         .chars()
         .filter(|character| *character == '\n' || !character.is_control())
         .collect()
+}
+
+fn sanitize_channel_name(input: &str) -> String {
+    let mut result = String::new();
+    for character in input.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            result.push(character);
+        } else if !result.ends_with('-') {
+            result.push('-');
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
+fn sanitize_role_name(input: &str) -> String {
+    let neutralized = input
+        .replace("@everyone", "@\u{200b}everyone")
+        .replace("@here", "@\u{200b}here")
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#");
+    let cleaned: String = neutralized
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -219,6 +256,79 @@ mod tests {
         let long = "a".repeat(2001);
         assert!(matches!(
             render("${input.x}", &[("x", long.as_str())]).unwrap_err(),
+            TemplateError::TooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_created_variable() {
+        assert_eq!(
+            TemplateString::parse("${created.channel.id}").unwrap_err(),
+            TemplateError::UnsupportedVariable("created.channel.id".to_string())
+        );
+    }
+
+    fn channel(input: &str) -> Result<String, TemplateError> {
+        TemplateString::parse("${input.x}")?
+            .render(&inputs(&[("x", input)]), SanitizeContext::ChannelName)
+    }
+
+    fn role(input: &str) -> Result<String, TemplateError> {
+        TemplateString::parse("${input.x}")?
+            .render(&inputs(&[("x", input)]), SanitizeContext::RoleName)
+    }
+
+    #[test]
+    fn channel_name_spaces_to_hyphens() {
+        assert_eq!(channel("study room").unwrap(), "study-room");
+    }
+
+    #[test]
+    fn channel_name_lowercased() {
+        assert_eq!(channel("Study Room 1").unwrap(), "study-room-1");
+    }
+
+    #[test]
+    fn channel_name_removes_invalid_chars() {
+        assert_eq!(channel("study!@#room").unwrap(), "study-room");
+    }
+
+    #[test]
+    fn channel_name_empty_after_sanitize_errors() {
+        assert_eq!(
+            channel("수학").unwrap_err(),
+            TemplateError::EmptyAfterSanitize
+        );
+        assert_eq!(
+            channel("!!!!").unwrap_err(),
+            TemplateError::EmptyAfterSanitize
+        );
+    }
+
+    #[test]
+    fn channel_name_too_long_errors() {
+        assert!(matches!(
+            channel(&"a".repeat(101)).unwrap_err(),
+            TemplateError::TooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn role_name_keeps_hangul() {
+        assert_eq!(role("수학 스터디 멤버").unwrap(), "수학 스터디 멤버");
+    }
+
+    #[test]
+    fn role_name_neutralizes_everyone() {
+        let out = role("@everyone 멤버").unwrap();
+        assert!(!out.contains("@everyone"));
+        assert!(out.contains("멤버"));
+    }
+
+    #[test]
+    fn role_name_too_long_errors() {
+        assert!(matches!(
+            role(&"가".repeat(101)).unwrap_err(),
             TemplateError::TooLong { .. }
         ));
     }

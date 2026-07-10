@@ -32,6 +32,7 @@ pub async fn run(
             PlannedAction::OpenModal(modal) => {
                 responder.open_modal(modal).await?;
             }
+            PlannedAction::CreateChannel { .. } | PlannedAction::CreateRole { .. } => {}
         }
     }
     Ok(())

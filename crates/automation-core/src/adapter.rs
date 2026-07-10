@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use discord_model::{GuildId, RoleId, UserId};
+use discord_model::{ChannelId, GuildId, RoleId, UserId};
 
 use crate::plan::ModalPresentation;
 
@@ -31,6 +31,16 @@ impl AdapterError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateChannelSpec {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateRoleSpec {
+    pub name: String,
+}
+
 #[allow(async_fn_in_trait)]
 pub trait DiscordMutationAdapter {
     async fn grant_role(
@@ -39,6 +49,28 @@ pub trait DiscordMutationAdapter {
         member: UserId,
         role: RoleId,
     ) -> Result<(), AdapterError>;
+
+    async fn create_channel(
+        &self,
+        _guild: GuildId,
+        _spec: CreateChannelSpec,
+    ) -> Result<ChannelId, AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "create_channel is not supported",
+        ))
+    }
+
+    async fn create_role(
+        &self,
+        _guild: GuildId,
+        _spec: CreateRoleSpec,
+    ) -> Result<RoleId, AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "create_role is not supported",
+        ))
+    }
 }
 
 #[allow(async_fn_in_trait)]
