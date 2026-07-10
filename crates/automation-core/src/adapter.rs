@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use discord_model::{ChannelId, GuildId, OverwriteTarget, Permissions, RoleId, UserId};
+use automation_state::ButtonSpec;
+use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::plan::ModalPresentation;
 
@@ -39,6 +40,12 @@ pub struct CreateChannelSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRoleSpec {
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostPanelSpec {
+    pub content: String,
+    pub buttons: Vec<ButtonSpec>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -83,6 +90,18 @@ pub trait DiscordMutationAdapter {
         Err(AdapterError::new(
             AdapterErrorKind::Unsupported,
             "upsert_overwrite is not supported",
+        ))
+    }
+
+    async fn post_panel(
+        &self,
+        _guild: GuildId,
+        _channel: ChannelId,
+        _spec: PostPanelSpec,
+    ) -> Result<MessageId, AdapterError> {
+        Err(AdapterError::new(
+            AdapterErrorKind::Unsupported,
+            "post_panel is not supported",
         ))
     }
 }

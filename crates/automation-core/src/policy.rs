@@ -11,6 +11,8 @@ pub enum PolicyFinding {
     CreatedResourceReference { rule: String },
     EveryoneOverwrite { rule: String },
     PrivilegedOverwriteAllow { rule: String },
+    RuntimeMessagePost { rule: String },
+    RuntimeInteractivePanel { rule: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +75,16 @@ pub fn analyze(
                     }
                     if allow.intersects(mask) {
                         findings.push(PolicyFinding::PrivilegedOverwriteAllow {
+                            rule: rule.key.clone(),
+                        });
+                    }
+                }
+                ActionSpec::PostPanel { buttons, .. } => {
+                    findings.push(PolicyFinding::RuntimeMessagePost {
+                        rule: rule.key.clone(),
+                    });
+                    if !buttons.is_empty() {
+                        findings.push(PolicyFinding::RuntimeInteractivePanel {
                             rule: rule.key.clone(),
                         });
                     }

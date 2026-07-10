@@ -6,7 +6,7 @@ use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
-    InteractionResponder,
+    InteractionResponder, PostPanelSpec,
 };
 use crate::event::{RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
@@ -84,13 +84,7 @@ pub async fn run(
                 allow,
                 deny,
             } => {
-                let channel_id = match channel {
-                    PlannedChannel::Resolved(id) => *id,
-                    PlannedChannel::Created(key) => *runtime
-                        .created_channels
-                        .get(key)
-                        .ok_or_else(|| unresolved_created_channel(key))?,
-                };
+                let channel_id = resolve_planned_channel(channel, &runtime)?;
                 let overwrite_target = match target {
                     PlannedOverwriteTarget::Everyone => {
                         OverwriteTarget::Role(RoleId(context.guild_id.0))
@@ -109,6 +103,29 @@ pub async fn run(
                     )
                     .await?;
             }
+            PlannedAction::PostPanel {
+                channel,
+                content,
+                buttons,
+            } => {
+                let channel_id = resolve_planned_channel(channel, &runtime)?;
+                let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
+                let id = mutation
+                    .post_panel(
+                        context.guild_id,
+                        channel_id,
+                        PostPanelSpec {
+                            content: rendered,
+                            buttons: buttons.clone(),
+                        },
+                    )
+                    .await?;
+                created.push(CreatedResource::Message {
+                    action_index,
+                    channel: channel_id,
+                    id,
+                });
+            }
         }
     }
     Ok(created)
@@ -125,6 +142,20 @@ fn resolve_planned_role(
             .get(key)
             .copied()
             .ok_or_else(|| unresolved_created_role(key)),
+    }
+}
+
+fn resolve_planned_channel(
+    channel: &PlannedChannel,
+    runtime: &RuntimeBindings,
+) -> Result<ChannelId, AdapterError> {
+    match channel {
+        PlannedChannel::Resolved(id) => Ok(*id),
+        PlannedChannel::Created(key) => runtime
+            .created_channels
+            .get(key)
+            .copied()
+            .ok_or_else(|| unresolved_created_channel(key)),
     }
 }
 

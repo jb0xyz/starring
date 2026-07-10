@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use discord_model::{ChannelId, GuildId, OverwriteTarget, Permissions, RoleId, UserId};
+use automation_state::ButtonSpec;
+use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::adapter::{
     AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, InteractionResponder,
+    PostPanelSpec,
 };
 use crate::plan::ModalPresentation;
 
@@ -29,6 +31,12 @@ pub enum MutationCall {
         target: OverwriteTarget,
         allow: Permissions,
         deny: Permissions,
+    },
+    PostPanel {
+        guild: GuildId,
+        channel: ChannelId,
+        content: String,
+        buttons: Vec<ButtonSpec>,
     },
 }
 
@@ -134,6 +142,26 @@ impl DiscordMutationAdapter for MockMutationAdapter {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    async fn post_panel(
+        &self,
+        guild: GuildId,
+        channel: ChannelId,
+        spec: PostPanelSpec,
+    ) -> Result<MessageId, AdapterError> {
+        self.calls.lock().unwrap().push(MutationCall::PostPanel {
+            guild,
+            channel,
+            content: spec.content,
+            buttons: spec.buttons,
+        });
+        if let Some(error) = &self.fail {
+            return Err(error.clone());
+        }
+        Ok(MessageId(
+            800_000 + self.next_id.fetch_add(1, Ordering::SeqCst),
+        ))
     }
 }
 

@@ -1,5 +1,5 @@
-use automation_state::ModalFieldSpec;
-use discord_model::{ChannelId, Permissions, RoleId, UserId};
+use automation_state::{ButtonSpec, ModalFieldSpec};
+use discord_model::{ChannelId, MessageId, Permissions, RoleId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionPlan {
@@ -55,6 +55,11 @@ pub enum PlannedAction {
         allow: Permissions,
         deny: Permissions,
     },
+    PostPanel {
+        channel: PlannedChannel,
+        content: String,
+        buttons: Vec<ButtonSpec>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,5 +73,10 @@ pub enum CreatedResource {
         action_index: usize,
         name: String,
         id: RoleId,
+    },
+    Message {
+        action_index: usize,
+        channel: ChannelId,
+        id: MessageId,
     },
 }

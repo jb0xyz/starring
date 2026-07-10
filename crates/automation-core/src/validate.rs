@@ -82,6 +82,14 @@ pub enum ValidationError {
     EmptyOverwrite {
         rule: String,
     },
+    EmptyButtonLabel {
+        rule: String,
+        button: String,
+    },
+    TooManyPanelButtons {
+        rule: String,
+        count: usize,
+    },
 }
 
 pub fn validate(
@@ -99,6 +107,30 @@ pub fn validate(
         for button in &panel.buttons {
             if !button_keys.insert(button.key.clone()) {
                 errors.push(ValidationError::DuplicateButtonKey(button.key.clone()));
+            }
+        }
+    }
+
+    for rule in &ruleset.rules {
+        for action in &rule.actions {
+            if let ActionSpec::PostPanel { buttons, .. } = action {
+                if buttons.len() > MAX_PANEL_BUTTONS {
+                    errors.push(ValidationError::TooManyPanelButtons {
+                        rule: rule.key.clone(),
+                        count: buttons.len(),
+                    });
+                }
+                for button in buttons {
+                    if button.label.trim().is_empty() {
+                        errors.push(ValidationError::EmptyButtonLabel {
+                            rule: rule.key.clone(),
+                            button: button.key.clone(),
+                        });
+                    }
+                    if !button_keys.insert(button.key.clone()) {
+                        errors.push(ValidationError::DuplicateButtonKey(button.key.clone()));
+                    }
+                }
             }
         }
     }
@@ -217,6 +249,12 @@ pub fn validate(
                         });
                     }
                 }
+                ActionSpec::PostPanel {
+                    channel, content, ..
+                } => {
+                    check_channel_ref(&mut errors, rule, bindings, &created, channel);
+                    check_template(&mut errors, rule, &modal_fields, content);
+                }
             }
         }
     }
@@ -227,6 +265,8 @@ pub fn validate(
         Err(errors)
     }
 }
+
+const MAX_PANEL_BUTTONS: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CreatedKind {

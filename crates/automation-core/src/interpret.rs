@@ -67,12 +67,7 @@ pub fn interpret(
                 allow,
                 deny,
             } => {
-                let planned_channel = match channel {
-                    ChannelRef::Existing(key) => {
-                        PlannedChannel::Resolved(*bindings.channel_bindings.get(key)?)
-                    }
-                    ChannelRef::Created(inner) => PlannedChannel::Created(inner.created.clone()),
-                };
+                let planned_channel = resolve_channel(channel, bindings)?;
                 let planned_target = match target {
                     OverwriteTargetSpec::Everyone => PlannedOverwriteTarget::Everyone,
                     OverwriteTargetSpec::Role(role) => {
@@ -86,6 +81,18 @@ pub fn interpret(
                     deny: *deny,
                 });
             }
+            ActionSpec::PostPanel {
+                channel,
+                content,
+                buttons,
+            } => {
+                let planned_channel = resolve_channel(channel, bindings)?;
+                steps.push(PlannedAction::PostPanel {
+                    channel: planned_channel,
+                    content: content.clone(),
+                    buttons: buttons.clone(),
+                });
+            }
         }
     }
 
@@ -96,6 +103,15 @@ fn resolve_role(role: &RoleRef, bindings: &ResourceBindingMap) -> Option<Planned
     match role {
         RoleRef::Existing(key) => Some(PlannedRole::Resolved(*bindings.role_bindings.get(key)?)),
         RoleRef::Created(inner) => Some(PlannedRole::Created(inner.created.clone())),
+    }
+}
+
+fn resolve_channel(channel: &ChannelRef, bindings: &ResourceBindingMap) -> Option<PlannedChannel> {
+    match channel {
+        ChannelRef::Existing(key) => Some(PlannedChannel::Resolved(
+            *bindings.channel_bindings.get(key)?,
+        )),
+        ChannelRef::Created(inner) => Some(PlannedChannel::Created(inner.created.clone())),
     }
 }
 
