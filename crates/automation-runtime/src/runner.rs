@@ -1,0 +1,26 @@
+use automation_core::handle_event;
+use automation_state::InteractionRuleSet;
+use resource_resolution::ResourceBindingMap;
+use twilight_http::Client;
+use twilight_model::application::interaction::Interaction;
+
+use crate::convert::interaction_to_event;
+use crate::mutation::TwilightMutationAdapter;
+use crate::responder::TwilightInteractionResponder;
+
+pub async fn handle_interaction(
+    http: &Client,
+    mutation: &TwilightMutationAdapter<'_>,
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+    interaction: &Interaction,
+) {
+    let Some(event) = interaction_to_event(interaction) else {
+        return;
+    };
+    let responder = TwilightInteractionResponder::from_interaction(http, interaction);
+    match handle_event(&event, ruleset, bindings, mutation, &responder).await {
+        Ok(outcome) => eprintln!("interaction {} -> {outcome:?}", interaction.id.get()),
+        Err(error) => eprintln!("interaction {} failed: {error:?}", interaction.id.get()),
+    }
+}
