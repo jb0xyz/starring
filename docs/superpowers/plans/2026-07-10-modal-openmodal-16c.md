@@ -610,9 +610,9 @@ fn trigger_matches(trigger: &TriggerSpec, kind: &EventKind) -> bool {
 }
 ```
 
-- [ ] **Step 3: `run.rs` — OpenModal arm 추가**
+- [ ] **Step 3: `run.rs` — OpenModal arm 확인 (청크 A 브리징에서 이미 추가됨 — 중복 추가 금지)**
 
-`run`의 match에서 `PlannedAction::RespondEphemeral { content } => { ... }` arm 다음에 추가:
+청크 A에서 run.rs에 이미 아래 arm이 들어가 있다. **동일한지 확인만 하고 다시 추가하지 말 것**(중복 시 컴파일 에러). 없거나 다르면 이 형태로 맞춘다:
 
 ```rust
             PlannedAction::OpenModal(modal) => {
