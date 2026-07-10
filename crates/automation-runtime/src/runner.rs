@@ -10,6 +10,7 @@ use crate::responder::TwilightInteractionResponder;
 
 pub async fn handle_interaction(
     http: &Client,
+    ruleset_key: &str,
     mutation: &TwilightMutationAdapter<'_>,
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
@@ -18,7 +19,7 @@ pub async fn handle_interaction(
     let Some(event) = interaction_to_event(interaction) else {
         return;
     };
-    let responder = TwilightInteractionResponder::from_interaction(http, interaction);
+    let responder = TwilightInteractionResponder::from_interaction(http, interaction, ruleset_key);
     match handle_event(&event, ruleset, bindings, mutation, &responder).await {
         Ok(outcome) => eprintln!("interaction {} -> {outcome:?}", interaction.id.get()),
         Err(error) => eprintln!("interaction {} failed: {error:?}", interaction.id.get()),

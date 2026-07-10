@@ -7,7 +7,9 @@ pub mod responder;
 pub mod runner;
 
 pub use convert::interaction_to_event;
-pub use custom_id::{decode, encode, CustomIdError, ParsedCustomId};
+pub use custom_id::{
+    decode, encode_button, encode_modal, ComponentKind, CustomIdError, ParsedCustomId,
+};
 pub use error::classify_error;
 pub use gateway::run;
 pub use mutation::TwilightMutationAdapter;
