@@ -47,6 +47,7 @@ define_id!(GuildId);
 define_id!(RoleId);
 define_id!(ChannelId);
 define_id!(UserId);
+define_id!(MessageId);
 
 #[cfg(test)]
 mod tests {
@@ -73,5 +74,13 @@ mod tests {
         let a = ChannelId(1);
         let b = UserId(1);
         assert_eq!(a.0, b.0);
+    }
+
+    #[test]
+    fn message_id_roundtrips() {
+        let id = MessageId(900_123);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"900123\"");
+        assert_eq!(serde_json::from_str::<MessageId>(&json).unwrap(), id);
     }
 }
