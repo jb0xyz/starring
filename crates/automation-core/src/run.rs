@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use automation_state::InteractionRuleSet;
+use discord_model::RoleId;
 use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
@@ -7,8 +10,13 @@ use crate::adapter::{
 };
 use crate::event::{RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
-use crate::plan::{ActionPlan, CreatedResource, PlannedAction};
+use crate::plan::{ActionPlan, CreatedResource, PlannedAction, PlannedRole};
 use crate::template::{SanitizeContext, TemplateError, TemplateString};
+
+#[derive(Default)]
+struct RuntimeBindings {
+    created_roles: BTreeMap<String, RoleId>,
+}
 
 pub async fn run(
     context: &RuntimeContext,
@@ -17,11 +25,19 @@ pub async fn run(
     responder: &impl InteractionResponder,
 ) -> Result<Vec<CreatedResource>, AdapterError> {
     let mut created = Vec::new();
+    let mut runtime = RuntimeBindings::default();
     for (action_index, step) in plan.steps.iter().enumerate() {
         match step {
             PlannedAction::GrantRole { role, target } => {
+                let role_id = match role {
+                    PlannedRole::Resolved(id) => *id,
+                    PlannedRole::Created(key) => *runtime
+                        .created_roles
+                        .get(key)
+                        .ok_or_else(|| unresolved_created_role(key))?,
+                };
                 mutation
-                    .grant_role(context.guild_id, *target, *role)
+                    .grant_role(context.guild_id, *target, role_id)
                     .await?;
             }
             PlannedAction::RespondEphemeral { content } => {
@@ -31,7 +47,7 @@ pub async fn run(
             PlannedAction::OpenModal(modal) => {
                 responder.open_modal(modal).await?;
             }
-            PlannedAction::CreateChannel { name } => {
+            PlannedAction::CreateChannel { name, .. } => {
                 let rendered = render(name, context, SanitizeContext::ChannelName)?;
                 let id = mutation
                     .create_channel(
@@ -47,7 +63,7 @@ pub async fn run(
                     id,
                 });
             }
-            PlannedAction::CreateRole { name } => {
+            PlannedAction::CreateRole { key, name } => {
                 let rendered = render(name, context, SanitizeContext::RoleName)?;
                 let id = mutation
                     .create_role(
@@ -57,6 +73,7 @@ pub async fn run(
                         },
                     )
                     .await?;
+                runtime.created_roles.insert(key.clone(), id);
                 created.push(CreatedResource::Role {
                     action_index,
                     name: rendered,
@@ -82,6 +99,13 @@ fn template_error(error: TemplateError) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::BadRequest,
         format!("template error: {error:?}"),
+    )
+}
+
+fn unresolved_created_role(key: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("unresolved created role: {key}"),
     )
 }
 

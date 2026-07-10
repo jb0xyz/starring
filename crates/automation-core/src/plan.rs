@@ -14,12 +14,18 @@ pub struct ModalPresentation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedRole {
+    Resolved(RoleId),
+    Created(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlannedAction {
-    GrantRole { role: RoleId, target: UserId },
+    GrantRole { role: PlannedRole, target: UserId },
     RespondEphemeral { content: String },
     OpenModal(ModalPresentation),
-    CreateChannel { name: String },
-    CreateRole { name: String },
+    CreateChannel { key: String, name: String },
+    CreateRole { key: String, name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

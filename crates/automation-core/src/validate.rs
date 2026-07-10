@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
+use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, RoleRef, TriggerSpec};
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
 
@@ -48,6 +48,18 @@ pub enum ValidationError {
         rule: String,
         modal: String,
         input: String,
+    },
+    DuplicateActionKey {
+        rule: String,
+        key: String,
+    },
+    UnknownCreatedRoleRef {
+        rule: String,
+        key: String,
+    },
+    CreatedRoleRefTypeMismatch {
+        rule: String,
+        key: String,
     },
 }
 
@@ -123,16 +135,32 @@ pub fn validate(
                 }
             }
         }
+        let mut created: BTreeMap<String, CreatedKind> = BTreeMap::new();
         for action in &rule.actions {
             match action {
-                ActionSpec::GrantRole { role, .. } => {
-                    if !bindings.role_bindings.contains_key(role) {
-                        errors.push(ValidationError::UnknownRoleRef {
-                            rule: rule.key.clone(),
-                            role: role.clone(),
-                        });
+                ActionSpec::GrantRole { role, .. } => match role {
+                    RoleRef::Existing(key) => {
+                        if !bindings.role_bindings.contains_key(key) {
+                            errors.push(ValidationError::UnknownRoleRef {
+                                rule: rule.key.clone(),
+                                role: key.clone(),
+                            });
+                        }
                     }
-                }
+                    RoleRef::Created { created: key } => match created.get(key) {
+                        None => errors.push(ValidationError::UnknownCreatedRoleRef {
+                            rule: rule.key.clone(),
+                            key: key.clone(),
+                        }),
+                        Some(CreatedKind::Channel) => {
+                            errors.push(ValidationError::CreatedRoleRefTypeMismatch {
+                                rule: rule.key.clone(),
+                                key: key.clone(),
+                            })
+                        }
+                        Some(CreatedKind::Role) => {}
+                    },
+                },
                 ActionSpec::RespondEphemeral { content } => {
                     if content.trim().is_empty() {
                         errors.push(ValidationError::EmptyResponseContent {
@@ -149,10 +177,22 @@ pub fn validate(
                         });
                     }
                 }
-                ActionSpec::CreateChannel { name } => {
+                ActionSpec::CreateChannel { key, name } => {
+                    if created.insert(key.clone(), CreatedKind::Channel).is_some() {
+                        errors.push(ValidationError::DuplicateActionKey {
+                            rule: rule.key.clone(),
+                            key: key.clone(),
+                        });
+                    }
                     check_template(&mut errors, rule, &modal_fields, name);
                 }
-                ActionSpec::CreateRole { name } => {
+                ActionSpec::CreateRole { key, name } => {
+                    if created.insert(key.clone(), CreatedKind::Role).is_some() {
+                        errors.push(ValidationError::DuplicateActionKey {
+                            rule: rule.key.clone(),
+                            key: key.clone(),
+                        });
+                    }
                     check_template(&mut errors, rule, &modal_fields, name);
                 }
             }
@@ -164,6 +204,12 @@ pub fn validate(
     } else {
         Err(errors)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreatedKind {
+    Role,
+    Channel,
 }
 
 fn check_template(

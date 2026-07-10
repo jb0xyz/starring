@@ -80,6 +80,7 @@ fn create_channel_renders_name() {
     let calls = run_calls(
         &submit("cozy corner"),
         vec![ActionSpec::CreateChannel {
+            key: "channel".to_string(),
             name: "study-${input.room_name}".to_string(),
         }],
     );
@@ -97,6 +98,7 @@ fn create_role_renders_name() {
     let calls = run_calls(
         &submit("코딩"),
         vec![ActionSpec::CreateRole {
+            key: "role".to_string(),
             name: "${input.room_name} 멤버".to_string(),
         }],
     );
@@ -126,6 +128,7 @@ fn create_channel_missing_input_errors() {
     let result = block_on(handle_event(
         &event,
         &ruleset(vec![ActionSpec::CreateChannel {
+            key: "channel".to_string(),
             name: "study-${input.room_name}".to_string(),
         }]),
         &ResourceBindingMap::default(),
@@ -141,9 +144,11 @@ fn created_ids_recorded_in_run_result() {
     let plan = ActionPlan {
         steps: vec![
             PlannedAction::CreateChannel {
+                key: "channel".to_string(),
                 name: "study-${input.room_name}".to_string(),
             },
             PlannedAction::CreateRole {
+                key: "role".to_string(),
                 name: "${input.room_name} 멤버".to_string(),
             },
         ],
@@ -188,6 +193,7 @@ fn button_rule_create_input_template_fails_validate() {
                 component: "b".to_string(),
             },
             actions: vec![ActionSpec::CreateChannel {
+                key: "channel".to_string(),
                 name: "study-${input.room_name}".to_string(),
             }],
         }],

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use automation_core::policy::{analyze, DynamicAction, PolicyFinding};
 use automation_state::{
-    ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, TriggerSpec,
+    ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::Permissions;
@@ -14,7 +14,7 @@ fn grant_rule(key: &str, role: &str) -> InteractionRule {
             component: "b".to_string(),
         },
         actions: vec![ActionSpec::GrantRole {
-            role: ResourceKey(role.to_string()),
+            role: RoleRef::Existing(ResourceKey(role.to_string())),
             target: ActionTarget::Actor,
         }],
     }
@@ -64,6 +64,7 @@ fn create_channel_is_flagged() {
             modal: "m".to_string(),
         },
         actions: vec![ActionSpec::CreateChannel {
+            key: "channel".to_string(),
             name: "study-x".to_string(),
         }],
     };
@@ -84,6 +85,7 @@ fn create_role_is_flagged() {
             modal: "m".to_string(),
         },
         actions: vec![ActionSpec::CreateRole {
+            key: "role".to_string(),
             name: "member".to_string(),
         }],
     };

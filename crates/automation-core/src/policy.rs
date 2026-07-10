@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use automation_state::{ActionSpec, InteractionRuleSet};
+use automation_state::{ActionSpec, InteractionRuleSet, RoleRef};
 use desired_state::ResourceKey;
 use discord_model::Permissions;
 
@@ -8,6 +8,7 @@ use discord_model::Permissions;
 pub enum PolicyFinding {
     PrivilegedRoleGrant { rule: String, role: ResourceKey },
     DynamicResourceCreation { rule: String, action: DynamicAction },
+    CreatedResourceReference { rule: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,14 +36,21 @@ pub fn analyze(
     for rule in &ruleset.rules {
         for action in &rule.actions {
             match action {
-                ActionSpec::GrantRole { role, .. } => {
-                    if roles.get(role).is_some_and(|perms| perms.intersects(mask)) {
-                        findings.push(PolicyFinding::PrivilegedRoleGrant {
+                ActionSpec::GrantRole { role, .. } => match role {
+                    RoleRef::Existing(key) => {
+                        if roles.get(key).is_some_and(|perms| perms.intersects(mask)) {
+                            findings.push(PolicyFinding::PrivilegedRoleGrant {
+                                rule: rule.key.clone(),
+                                role: key.clone(),
+                            });
+                        }
+                    }
+                    RoleRef::Created { .. } => {
+                        findings.push(PolicyFinding::CreatedResourceReference {
                             rule: rule.key.clone(),
-                            role: role.clone(),
                         });
                     }
-                }
+                },
                 ActionSpec::CreateChannel { .. } => {
                     findings.push(PolicyFinding::DynamicResourceCreation {
                         rule: rule.key.clone(),

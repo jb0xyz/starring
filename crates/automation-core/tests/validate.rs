@@ -1,6 +1,6 @@
 use automation_core::validate::{validate, ValidationError};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec,
+    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
     TriggerSpec,
 };
 use desired_state::ResourceKey;
@@ -21,7 +21,7 @@ fn rule(key: &str, component: &str, role: &str) -> InteractionRule {
             component: component.to_string(),
         },
         actions: vec![ActionSpec::GrantRole {
-            role: ResourceKey(role.to_string()),
+            role: RoleRef::Existing(ResourceKey(role.to_string())),
             target: ActionTarget::Actor,
         }],
     }

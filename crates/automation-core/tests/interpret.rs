@@ -1,8 +1,8 @@
 use automation_core::event::{EventKind, RuntimeEvent};
 use automation_core::interpret::interpret;
-use automation_core::plan::PlannedAction;
+use automation_core::plan::{PlannedAction, PlannedRole};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec,
+    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
     TriggerSpec,
 };
 use desired_state::ResourceKey;
@@ -29,7 +29,7 @@ fn fixture() -> (InteractionRuleSet, ResourceBindingMap) {
             },
             actions: vec![
                 ActionSpec::GrantRole {
-                    role: ResourceKey("verified_member".to_string()),
+                    role: RoleRef::Existing(ResourceKey("verified_member".to_string())),
                     target: ActionTarget::Actor,
                 },
                 ActionSpec::RespondEphemeral {
@@ -69,7 +69,7 @@ fn plan_grants_role_to_actor_and_responds() {
         plan.steps,
         vec![
             PlannedAction::GrantRole {
-                role: RoleId(555),
+                role: PlannedRole::Resolved(RoleId(555)),
                 target: UserId(42),
             },
             PlannedAction::RespondEphemeral {

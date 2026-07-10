@@ -15,7 +15,7 @@ pub use adapter::{
 pub use event::{EventKind, RuntimeContext, RuntimeEvent};
 pub use interpret::interpret;
 pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
-pub use plan::{ActionPlan, CreatedResource, ModalPresentation, PlannedAction};
+pub use plan::{ActionPlan, CreatedResource, ModalPresentation, PlannedAction, PlannedRole};
 pub use policy::{analyze, privileged_mask, DynamicAction, PolicyFinding};
 pub use run::{handle_event, run, HandleOutcome};
 pub use template::{SanitizeContext, TemplateError, TemplateString};

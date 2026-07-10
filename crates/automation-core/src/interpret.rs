@@ -1,8 +1,8 @@
-use automation_state::{ActionSpec, ActionTarget, InteractionRuleSet, TriggerSpec};
+use automation_state::{ActionSpec, ActionTarget, InteractionRuleSet, RoleRef, TriggerSpec};
 use resource_resolution::ResourceBindingMap;
 
 use crate::event::{EventKind, RuntimeEvent};
-use crate::plan::{ActionPlan, ModalPresentation, PlannedAction};
+use crate::plan::{ActionPlan, ModalPresentation, PlannedAction, PlannedRole};
 
 pub fn interpret(
     event: &RuntimeEvent,
@@ -18,12 +18,17 @@ pub fn interpret(
     for action in &rule.actions {
         match action {
             ActionSpec::GrantRole { role, target } => {
-                let role_id = *bindings.role_bindings.get(role)?;
+                let planned_role = match role {
+                    RoleRef::Existing(key) => {
+                        PlannedRole::Resolved(*bindings.role_bindings.get(key)?)
+                    }
+                    RoleRef::Created { created } => PlannedRole::Created(created.clone()),
+                };
                 let target_id = match target {
                     ActionTarget::Actor => event.actor,
                 };
                 steps.push(PlannedAction::GrantRole {
-                    role: role_id,
+                    role: planned_role,
                     target: target_id,
                 });
             }
@@ -43,11 +48,17 @@ pub fn interpret(
                     fields: spec.fields.clone(),
                 }));
             }
-            ActionSpec::CreateChannel { name } => {
-                steps.push(PlannedAction::CreateChannel { name: name.clone() });
+            ActionSpec::CreateChannel { key, name } => {
+                steps.push(PlannedAction::CreateChannel {
+                    key: key.clone(),
+                    name: name.clone(),
+                });
             }
-            ActionSpec::CreateRole { name } => {
-                steps.push(PlannedAction::CreateRole { name: name.clone() });
+            ActionSpec::CreateRole { key, name } => {
+                steps.push(PlannedAction::CreateRole {
+                    key: key.clone(),
+                    name: name.clone(),
+                });
             }
         }
     }

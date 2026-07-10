@@ -4,7 +4,7 @@ use automation_core::mock::{
 };
 use automation_core::run::{handle_event, HandleOutcome};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec,
+    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
     TriggerSpec,
 };
 use desired_state::ResourceKey;
@@ -32,7 +32,7 @@ fn fixture() -> (InteractionRuleSet, ResourceBindingMap) {
             },
             actions: vec![
                 ActionSpec::GrantRole {
-                    role: ResourceKey("verified_member".to_string()),
+                    role: RoleRef::Existing(ResourceKey("verified_member".to_string())),
                     target: ActionTarget::Actor,
                 },
                 ActionSpec::RespondEphemeral {
