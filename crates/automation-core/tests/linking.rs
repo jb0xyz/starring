@@ -8,8 +8,8 @@ use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
 use automation_state::{
-    ActionSpec, ActionTarget, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
-    ModalSpec, RoleRef, TriggerSpec,
+    ActionSpec, ActionTarget, CreatedRef, InteractionRule, InteractionRuleSet, ModalFieldSpec,
+    ModalFieldStyle, ModalSpec, RoleRef, TriggerSpec,
 };
 use discord_model::{ChannelId, GuildId, RoleId, UserId};
 use futures::executor::block_on;
@@ -54,9 +54,9 @@ fn study_actions() -> Vec<ActionSpec> {
             name: "study-${input.room_name}".to_string(),
         },
         ActionSpec::GrantRole {
-            role: RoleRef::Created {
+            role: RoleRef::Created(CreatedRef {
                 created: "member".to_string(),
-            },
+            }),
             target: ActionTarget::Actor,
         },
     ]
@@ -181,9 +181,9 @@ fn duplicate_action_key_fails_validate() {
 #[test]
 fn unknown_created_role_ref_fails_validate() {
     let set = submit_rule(vec![ActionSpec::GrantRole {
-        role: RoleRef::Created {
+        role: RoleRef::Created(CreatedRef {
             created: "ghost".to_string(),
-        },
+        }),
         target: ActionTarget::Actor,
     }]);
     let errors = validate(&set, &ResourceBindingMap::default()).unwrap_err();
@@ -201,9 +201,9 @@ fn created_role_ref_to_channel_fails_validate() {
             name: "study".to_string(),
         },
         ActionSpec::GrantRole {
-            role: RoleRef::Created {
+            role: RoleRef::Created(CreatedRef {
                 created: "channel".to_string(),
-            },
+            }),
             target: ActionTarget::Actor,
         },
     ]);
@@ -220,9 +220,9 @@ fn created_role_ref_to_channel_fails_validate() {
 fn forward_created_ref_fails_validate() {
     let set = submit_rule(vec![
         ActionSpec::GrantRole {
-            role: RoleRef::Created {
+            role: RoleRef::Created(CreatedRef {
                 created: "member".to_string(),
-            },
+            }),
             target: ActionTarget::Actor,
         },
         ActionSpec::CreateRole {
