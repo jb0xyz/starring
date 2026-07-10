@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 desired-state = { path = "../desired-state" }
+discord-model = { path = "../discord-model" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -97,6 +97,7 @@ name = "automation-state"
 version = "0.1.0"
 dependencies = [
  "desired-state",
+ "discord-model",
  "serde",
  "serde_json",
 ]
