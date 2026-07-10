@@ -1,0 +1,11 @@
+[package]
+name = "automation-state"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+desired-state = { path = "../desired-state" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
