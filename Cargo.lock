@@ -80,6 +80,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-instance"
+version = "0.1.0"
+dependencies = [
+ "discord-model",
+ "futures",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "automation-runtime"
 version = "0.1.0"
 dependencies = [

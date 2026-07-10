@@ -1,0 +1,40 @@
+use std::collections::BTreeMap;
+
+use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
+use serde::{Deserialize, Serialize};
+
+use crate::id::InstanceId;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceKind(pub String);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceResources {
+    #[serde(default)]
+    pub roles: BTreeMap<String, RoleId>,
+    #[serde(default)]
+    pub channels: BTreeMap<String, ChannelId>,
+    #[serde(default)]
+    pub messages: BTreeMap<String, MessageId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceStatus {
+    Active,
+    Disabled,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationInstance {
+    pub id: InstanceId,
+    pub guild_id: GuildId,
+    pub ruleset_key: String,
+    pub kind: InstanceKind,
+    pub created_by: UserId,
+    pub resources: InstanceResources,
+    pub status: InstanceStatus,
+}
