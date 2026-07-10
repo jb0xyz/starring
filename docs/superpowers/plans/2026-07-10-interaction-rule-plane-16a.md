@@ -75,14 +75,13 @@
 **Interfaces:**
 - Produces: `InteractionRuleSet { version: u32, panels: Vec<PanelSpec>, rules: Vec<InteractionRule> }`, `InteractionRule { key: String, trigger: TriggerSpec, actions: Vec<ActionSpec> }`, `TriggerSpec::ButtonClick { component: String }`, `ActionSpec::GrantRole { role: ResourceKey, target: ActionTarget }` / `ActionSpec::RespondEphemeral { content: String }`, `ActionTarget::Actor`, `PanelSpec { key, channel: ResourceKey, content, buttons: Vec<ButtonSpec> }`, `ButtonSpec { key, label }`. 전부 `Clone + Debug + PartialEq + Eq + Serialize + Deserialize`.
 
-- [ ] **Step 1: workspace members에 크레이트 등록**
+- [ ] **Step 1: workspace members에 automation-state 등록**
 
-Modify `Cargo.toml` (root), `members` 배열에서 `"crates/bot-runtime",` 다음 줄에 추가:
+Modify `Cargo.toml` (root), `members` 배열에서 `"crates/bot-runtime",` 다음 줄에 추가. **automation-core는 여기서 등록하지 않는다** — member 경로에 manifest가 없으면 cargo가 워크스페이스 로드에 실패하므로, automation-core는 Task 2에서 자신의 Cargo.toml과 함께 등록한다.
 
 ```toml
     "crates/bot-runtime",
     "crates/automation-state",
-    "crates/automation-core",
 ```
 
 - [ ] **Step 2: `crates/automation-state/Cargo.toml` 작성**
@@ -297,6 +296,7 @@ git commit -m "feat(automation-state): interaction rule schema crate with strict
 ## Task 2: `automation-core` 토대 (event · plan · seam · mock · 의존성 가드)
 
 **Files:**
+- Modify: `Cargo.toml` (workspace members — automation-core 등록)
 - Create: `crates/automation-core/Cargo.toml`
 - Create: `crates/automation-core/src/lib.rs`
 - Create: `crates/automation-core/src/event.rs`
@@ -309,7 +309,9 @@ git commit -m "feat(automation-state): interaction rule schema crate with strict
 - Consumes: `discord_model::{GuildId, RoleId, UserId}`.
 - Produces: `RuntimeEvent { guild_id, actor, kind }`, `EventKind::ButtonClick { component: String }`, `RuntimeContext { guild_id, actor }` + `RuntimeContext::from_event(&RuntimeEvent)`, `ActionPlan { steps: Vec<PlannedAction> }`, `PlannedAction::GrantRole { role: RoleId, target: UserId }` / `PlannedAction::RespondEphemeral { content: String }`, `AdapterError`/`AdapterErrorKind`, traits `DiscordMutationAdapter::grant_role(&self, GuildId, UserId, RoleId)` / `InteractionResponder::respond_ephemeral(&self, String)`, `MockMutationAdapter`/`MockInteractionResponder` (+ `.calls()`, `MutationCall`, `ResponderCall`).
 
-- [ ] **Step 1: `crates/automation-core/Cargo.toml` 작성**
+- [ ] **Step 1: workspace members에 automation-core 등록 + `crates/automation-core/Cargo.toml` 작성**
+
+먼저 root `Cargo.toml` `members`의 `"crates/automation-state",` 다음 줄에 `"crates/automation-core",`를 추가하고, 이어서 아래 manifest를 작성한다(이 둘은 함께 적용해야 cargo가 깨지지 않는다):
 
 ```toml
 [package]
