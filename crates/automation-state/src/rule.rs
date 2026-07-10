@@ -45,6 +45,12 @@ pub enum ActionSpec {
     OpenModal {
         modal: String,
     },
+    CreateChannel {
+        name: String,
+    },
+    CreateRole {
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,8 +130,26 @@ mod tests {
 
     #[test]
     fn unknown_action_type_is_rejected() {
-        let json = r#"{"type":"create_channel","channel":"x"}"#;
+        let json = r#"{"type":"post_panel","channel":"x"}"#;
         assert!(serde_json::from_str::<ActionSpec>(json).is_err());
+    }
+
+    #[test]
+    fn create_actions_roundtrip() {
+        let channel_json = r#"{"type":"create_channel","name":"study-${input.room_name}"}"#;
+        let role_json = r#"{"type":"create_role","name":"${input.room_name} member"}"#;
+        assert_eq!(
+            serde_json::from_str::<ActionSpec>(channel_json).unwrap(),
+            ActionSpec::CreateChannel {
+                name: "study-${input.room_name}".to_string(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionSpec>(role_json).unwrap(),
+            ActionSpec::CreateRole {
+                name: "${input.room_name} member".to_string(),
+            }
+        );
     }
 
     #[test]
