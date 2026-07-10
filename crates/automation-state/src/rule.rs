@@ -4,7 +4,7 @@ use desired_state::ResourceKey;
 use discord_model::Permissions;
 
 use crate::modal::ModalSpec;
-use crate::panel::PanelSpec;
+use crate::panel::{ButtonSpec, PanelSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +61,12 @@ pub enum ActionSpec {
         allow: Permissions,
         #[serde(default)]
         deny: Permissions,
+    },
+    PostPanel {
+        channel: ChannelRef,
+        content: String,
+        #[serde(default)]
+        buttons: Vec<ButtonSpec>,
     },
 }
 
@@ -275,5 +281,38 @@ mod tests {
         );
         let unknown = r#"{"type":"upsert_overwrite","channel":"g","target":"everyone","evil":1}"#;
         assert!(serde_json::from_str::<ActionSpec>(unknown).is_err());
+    }
+
+    #[test]
+    fn post_panel_action_roundtrips() {
+        let json = r#"{"type":"post_panel","channel":{"created":"study_channel"},"content":"환영 ${input.room_name}","buttons":[{"key":"study_help","label":"도움말"}]}"#;
+        let action: ActionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            action,
+            ActionSpec::PostPanel {
+                channel: ChannelRef::Created(CreatedRef {
+                    created: "study_channel".to_string(),
+                }),
+                content: "환영 ${input.room_name}".to_string(),
+                buttons: vec![ButtonSpec {
+                    key: "study_help".to_string(),
+                    label: "도움말".to_string(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn post_panel_buttons_default_empty() {
+        let json = r#"{"type":"post_panel","channel":"general","content":"hi"}"#;
+        let action: ActionSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            action,
+            ActionSpec::PostPanel {
+                channel: ChannelRef::Existing(ResourceKey("general".to_string())),
+                content: "hi".to_string(),
+                buttons: vec![],
+            }
+        );
     }
 }
