@@ -15,12 +15,22 @@ pub async fn handle_interaction(
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
     interaction: &Interaction,
+    failure_message: &str,
 ) {
     let Some(event) = interaction_to_event(interaction, ruleset_key) else {
         return;
     };
     let responder = TwilightInteractionResponder::from_interaction(http, interaction, ruleset_key);
-    match handle_event(&event, ruleset, bindings, mutation, &responder).await {
+    match handle_event(
+        &event,
+        ruleset,
+        bindings,
+        mutation,
+        &responder,
+        failure_message,
+    )
+    .await
+    {
         Ok(outcome) => eprintln!("interaction {} -> {outcome:?}", interaction.id.get()),
         Err(error) => eprintln!("interaction {} failed: {error:?}", interaction.id.get()),
     }

@@ -101,6 +101,27 @@ impl InteractionResponder for TwilightInteractionResponder<'_> {
         };
         self.send(&response).await
     }
+
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        let response = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                flags: Some(MessageFlags::EPHEMERAL),
+                ..Default::default()
+            }),
+        };
+        self.send(&response).await
+    }
+
+    async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
+        self.http
+            .interaction(self.application_id)
+            .update_response(&self.interaction_token)
+            .content(Some(content.as_str()))
+            .await
+            .map_err(|error| classify_error(&error))?;
+        Ok(())
+    }
 }
 
 fn text_input_style(style: ModalFieldStyle) -> TextInputStyle {

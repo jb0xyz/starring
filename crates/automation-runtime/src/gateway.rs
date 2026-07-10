@@ -11,6 +11,7 @@ pub async fn run(
     ruleset_key: String,
     ruleset: InteractionRuleSet,
     bindings: ResourceBindingMap,
+    failure_message: String,
 ) {
     let http = Client::new(token.clone());
     let mutation = TwilightMutationAdapter::new(&http, ruleset_key.clone());
@@ -32,6 +33,7 @@ pub async fn run(
                 &ruleset,
                 &bindings,
                 &interaction_create.0,
+                &failure_message,
             )
             .await;
         }
