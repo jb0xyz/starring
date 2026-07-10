@@ -784,6 +784,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "interaction-smoke"
+version = "0.1.0"
+dependencies = [
+ "automation-runtime",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "resource-resolution",
+ "rustls",
+ "tokio",
+ "twilight-http",
+ "twilight-model",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

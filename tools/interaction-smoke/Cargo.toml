@@ -1,0 +1,15 @@
+[package]
+name = "interaction-smoke"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-runtime = { path = "../../crates/automation-runtime" }
+automation-state = { path = "../../crates/automation-state" }
+desired-state = { path = "../../crates/desired-state" }
+discord-model = { path = "../../crates/discord-model" }
+resource-resolution = { path = "../../crates/resource-resolution" }
+twilight-http = "0.17"
+twilight-model = "0.17"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23", features = ["ring"] }

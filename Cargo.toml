@@ -21,6 +21,7 @@ members = [
     "tools/ai-eval",
     "tools/executor-smoke",
     "tools/starring-demo",
+    "tools/interaction-smoke",
 ]
 resolver = "2"
 
