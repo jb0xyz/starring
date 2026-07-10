@@ -12,6 +12,7 @@ pub enum AdapterErrorKind {
     RateLimited,
     Network,
     Unsupported,
+    BadRequest,
     Unknown,
 }
 

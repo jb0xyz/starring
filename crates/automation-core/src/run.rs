@@ -1,10 +1,13 @@
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 
-use crate::adapter::{AdapterError, DiscordMutationAdapter, InteractionResponder};
+use crate::adapter::{
+    AdapterError, AdapterErrorKind, DiscordMutationAdapter, InteractionResponder,
+};
 use crate::event::{RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
 use crate::plan::{ActionPlan, PlannedAction};
+use crate::template::{SanitizeContext, TemplateError, TemplateString};
 
 pub async fn run(
     context: &RuntimeContext,
@@ -20,7 +23,11 @@ pub async fn run(
                     .await?;
             }
             PlannedAction::RespondEphemeral { content } => {
-                responder.respond_ephemeral(content.clone()).await?;
+                let template = TemplateString::parse(content).map_err(template_error)?;
+                let rendered = template
+                    .render(&context.inputs, SanitizeContext::EphemeralMessageContent)
+                    .map_err(template_error)?;
+                responder.respond_ephemeral(rendered).await?;
             }
             PlannedAction::OpenModal(modal) => {
                 responder.open_modal(modal).await?;
@@ -28,6 +35,13 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+fn template_error(error: TemplateError) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("template error: {error:?}"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

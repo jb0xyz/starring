@@ -20,17 +20,23 @@ pub enum EventKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContext {
     pub guild_id: GuildId,
     pub actor: UserId,
+    pub inputs: BTreeMap<String, String>,
 }
 
 impl RuntimeContext {
     pub fn from_event(event: &RuntimeEvent) -> Self {
+        let inputs = match &event.kind {
+            EventKind::ModalSubmit { inputs, .. } => inputs.clone(),
+            EventKind::ButtonClick { .. } => BTreeMap::new(),
+        };
         Self {
             guild_id: event.guild_id,
             actor: event.actor,
+            inputs,
         }
     }
 }

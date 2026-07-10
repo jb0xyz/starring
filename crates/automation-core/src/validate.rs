@@ -1,22 +1,54 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use automation_state::{ActionSpec, InteractionRuleSet, TriggerSpec};
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
+
+use crate::template::TemplateString;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
     DuplicatePanelKey(String),
     DuplicateButtonKey(String),
     DuplicateRuleKey(String),
-    UnknownButtonRef { rule: String, component: String },
-    UnknownRoleRef { rule: String, role: ResourceKey },
-    ConflictingTrigger { component: String },
-    EmptyResponseContent { rule: String },
+    UnknownButtonRef {
+        rule: String,
+        component: String,
+    },
+    UnknownRoleRef {
+        rule: String,
+        role: ResourceKey,
+    },
+    ConflictingTrigger {
+        component: String,
+    },
+    EmptyResponseContent {
+        rule: String,
+    },
     DuplicateModalKey(String),
-    DuplicateModalFieldKey { modal: String, field: String },
-    UnknownModalRef { rule: String, modal: String },
-    ConflictingModalTrigger { modal: String },
+    DuplicateModalFieldKey {
+        modal: String,
+        field: String,
+    },
+    UnknownModalRef {
+        rule: String,
+        modal: String,
+    },
+    ConflictingModalTrigger {
+        modal: String,
+    },
+    BadTemplate {
+        rule: String,
+    },
+    InputTemplateInButtonRule {
+        rule: String,
+        input: String,
+    },
+    UnknownTemplateInput {
+        rule: String,
+        modal: String,
+        input: String,
+    },
 }
 
 pub fn validate(
@@ -39,19 +71,21 @@ pub fn validate(
     }
 
     let mut modal_keys: BTreeSet<String> = BTreeSet::new();
+    let mut modal_fields: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for modal in &ruleset.modals {
         if !modal_keys.insert(modal.key.clone()) {
             errors.push(ValidationError::DuplicateModalKey(modal.key.clone()));
         }
-        let mut field_keys: BTreeSet<&str> = BTreeSet::new();
+        let mut field_keys: BTreeSet<String> = BTreeSet::new();
         for field in &modal.fields {
-            if !field_keys.insert(field.key.as_str()) {
+            if !field_keys.insert(field.key.clone()) {
                 errors.push(ValidationError::DuplicateModalFieldKey {
                     modal: modal.key.clone(),
                     field: field.key.clone(),
                 });
             }
         }
+        modal_fields.insert(modal.key.clone(), field_keys);
     }
 
     let mut rule_keys: BTreeSet<&str> = BTreeSet::new();
@@ -104,6 +138,37 @@ pub fn validate(
                         errors.push(ValidationError::EmptyResponseContent {
                             rule: rule.key.clone(),
                         });
+                    }
+                    match TemplateString::parse(content) {
+                        Err(_) => {
+                            errors.push(ValidationError::BadTemplate {
+                                rule: rule.key.clone(),
+                            });
+                        }
+                        Ok(template) => {
+                            for key in template.input_keys() {
+                                match &rule.trigger {
+                                    TriggerSpec::ButtonClick { .. } => {
+                                        errors.push(ValidationError::InputTemplateInButtonRule {
+                                            rule: rule.key.clone(),
+                                            input: key.to_string(),
+                                        });
+                                    }
+                                    TriggerSpec::ModalSubmit { modal } => {
+                                        let known = modal_fields
+                                            .get(modal)
+                                            .is_some_and(|fields| fields.contains(key));
+                                        if !known {
+                                            errors.push(ValidationError::UnknownTemplateInput {
+                                                rule: rule.key.clone(),
+                                                modal: modal.clone(),
+                                                input: key.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ActionSpec::OpenModal { modal } => {
