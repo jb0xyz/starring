@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
-    InstanceStore,
+    InstanceStore, InstanceStoreError,
 };
 use automation_state::{InstanceResourceRefs, InteractionRuleSet};
 use discord_model::{ChannelId, MessageId, OverwriteTarget, RoleId};
@@ -12,7 +12,7 @@ use crate::adapter::{
     AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
     DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
 };
-use crate::event::{RuntimeContext, RuntimeEvent};
+use crate::event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
 use crate::plan::{
     ActionPlan, CreatedResource, PlannedAction, PlannedChannel, PlannedOverwriteTarget, PlannedRole,
@@ -43,7 +43,7 @@ where
     for (action_index, step) in plan.steps.iter().enumerate() {
         match step {
             PlannedAction::GrantRole { role, target } => {
-                let role_id = resolve_planned_role(role, &runtime)?;
+                let role_id = resolve_planned_role(role, &runtime, context)?;
                 services
                     .mutation
                     .grant_role(context.guild_id, *target, role_id)
@@ -106,7 +106,7 @@ where
                         OverwriteTarget::Role(RoleId(context.guild_id.0))
                     }
                     PlannedOverwriteTarget::Role(role) => {
-                        OverwriteTarget::Role(resolve_planned_role(role, &runtime)?)
+                        OverwriteTarget::Role(resolve_planned_role(role, &runtime, context)?)
                     }
                 };
                 services
@@ -200,6 +200,7 @@ where
 fn resolve_planned_role(
     role: &PlannedRole,
     runtime: &RuntimeBindings,
+    context: &RuntimeContext,
 ) -> Result<RoleId, AdapterError> {
     match role {
         PlannedRole::Resolved(id) => Ok(*id),
@@ -208,6 +209,19 @@ fn resolve_planned_role(
             .get(key)
             .copied()
             .ok_or_else(|| unresolved_created_role(key)),
+        PlannedRole::Instance { alias } => {
+            let resolved = context
+                .instance
+                .as_ref()
+                .ok_or_else(|| instance_context_missing(alias))?;
+            resolved
+                .instance
+                .resources
+                .roles
+                .get(alias)
+                .copied()
+                .ok_or_else(|| instance_resource_not_found(&resolved.instance.id, alias))
+        }
     }
 }
 
@@ -295,6 +309,54 @@ fn unresolved_created_channel(key: &str) -> AdapterError {
     )
 }
 
+fn instance_context_missing(alias: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("InstanceContextMissing: role alias={alias}"),
+    )
+}
+
+fn instance_resource_not_found(instance_id: &InstanceId, alias: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("InstanceResourceNotFound: instance={instance_id}, resource=role, alias={alias}"),
+    )
+}
+
+fn instance_store_error(error: InstanceStoreError) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Unknown,
+        format!("InstanceStoreError: {error:?}"),
+    )
+}
+
+fn instance_not_found(instance_id: &InstanceId) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::NotFound,
+        format!("InstanceNotFound: {instance_id}"),
+    )
+}
+
+fn instance_inactive(instance: &AutomationInstance) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Forbidden,
+        format!(
+            "InstanceInactive: instance={}, status={:?}",
+            instance.id, instance.status
+        ),
+    )
+}
+
+fn instance_ruleset_mismatch(instance: &AutomationInstance, ruleset_key: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Forbidden,
+        format!(
+            "InstanceRulesetMismatch: instance={}, expected={}, actual={}",
+            instance.id, ruleset_key, instance.ruleset_key
+        ),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleOutcome {
     Executed,
@@ -315,9 +377,31 @@ where
     S: InstanceStore,
     G: InstanceIdGenerator,
 {
+    let mut context = RuntimeContext::from_event(event, ruleset_key);
+    if let EventKind::InstanceAction {
+        instance_id,
+        action,
+    } = &event.kind
+    {
+        let instance = services
+            .instances
+            .get(event.guild_id, instance_id)
+            .await
+            .map_err(instance_store_error)?
+            .ok_or_else(|| instance_not_found(instance_id))?;
+        if instance.status != InstanceStatus::Active {
+            return Err(instance_inactive(&instance));
+        }
+        if instance.ruleset_key != ruleset_key {
+            return Err(instance_ruleset_mismatch(&instance, ruleset_key));
+        }
+        context.instance = Some(ResolvedInstanceContext {
+            instance,
+            action: action.clone(),
+        });
+    }
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
-            let context = RuntimeContext::from_event(event, ruleset_key);
             let mut steps = plan.steps;
             let defer_acked = if matches!(steps.first(), Some(PlannedAction::DeferEphemeral)) {
                 services.responder.defer_ephemeral().await?;

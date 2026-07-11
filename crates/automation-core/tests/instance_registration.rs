@@ -38,6 +38,7 @@ fn context(guild_id: GuildId) -> RuntimeContext {
         actor: UserId(3),
         ruleset_key: "studyroom_demo".to_string(),
         inputs,
+        instance: None,
     }
 }
 

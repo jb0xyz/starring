@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use automation_state::{
-    ActionSpec, ChannelRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet,
-    OverwriteTargetSpec, RoleRef, TriggerSpec,
+    ActionSpec, ButtonRoute, ChannelRef, InstanceRef, InstanceResourceRefs, InteractionRule,
+    InteractionRuleSet, OverwriteTargetSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
@@ -123,6 +123,12 @@ pub enum ValidationError {
     EditResponseNotLast {
         rule: String,
     },
+    InstanceRoleOutsideInstanceRule {
+        rule: String,
+    },
+    InstanceRoleMustUseEvent {
+        rule: String,
+    },
 }
 
 pub fn validate(
@@ -138,8 +144,10 @@ pub fn validate(
             errors.push(ValidationError::DuplicatePanelKey(panel.key.clone()));
         }
         for button in &panel.buttons {
-            if !button_keys.insert(button.key.clone()) {
-                errors.push(ValidationError::DuplicateButtonKey(button.key.clone()));
+            if let ButtonRoute::Static { key } = &button.route {
+                if !button_keys.insert(key.clone()) {
+                    errors.push(ValidationError::DuplicateButtonKey(key.clone()));
+                }
             }
         }
     }
@@ -154,14 +162,20 @@ pub fn validate(
                     });
                 }
                 for button in buttons {
+                    let button_name = match &button.route {
+                        ButtonRoute::Static { key } => key,
+                        ButtonRoute::InstanceAction { action, .. } => action,
+                    };
                     if button.label.trim().is_empty() {
                         errors.push(ValidationError::EmptyButtonLabel {
                             rule: rule.key.clone(),
-                            button: button.key.clone(),
+                            button: button_name.clone(),
                         });
                     }
-                    if !button_keys.insert(button.key.clone()) {
-                        errors.push(ValidationError::DuplicateButtonKey(button.key.clone()));
+                    if let ButtonRoute::Static { key } = &button.route {
+                        if !button_keys.insert(key.clone()) {
+                            errors.push(ValidationError::DuplicateButtonKey(key.clone()));
+                        }
                     }
                 }
             }
@@ -220,6 +234,7 @@ pub fn validate(
                     });
                 }
             }
+            TriggerSpec::InstanceAction { .. } => {}
         }
         let mut created: BTreeMap<String, CreatedKind> = BTreeMap::new();
         for action in &rule.actions {
@@ -405,7 +420,7 @@ fn check_template(
     };
     for key in template.input_keys() {
         match &rule.trigger {
-            TriggerSpec::ButtonClick { .. } => {
+            TriggerSpec::ButtonClick { .. } | TriggerSpec::InstanceAction { .. } => {
                 errors.push(ValidationError::InputTemplateInButtonRule {
                     rule: rule.key.clone(),
                     input: key.to_string(),
@@ -454,6 +469,19 @@ fn check_role_ref(
                 key: inner.created.clone(),
             }),
         },
+        RoleRef::Instance { instance, alias } => {
+            if !matches!(rule.trigger, TriggerSpec::InstanceAction { .. }) {
+                errors.push(ValidationError::InstanceRoleOutsideInstanceRule {
+                    rule: rule.key.clone(),
+                });
+            }
+            if !matches!(instance, InstanceRef::Event) {
+                errors.push(ValidationError::InstanceRoleMustUseEvent {
+                    rule: rule.key.clone(),
+                });
+            }
+            check_resource_alias(errors, rule, alias);
+        }
     }
 }
 

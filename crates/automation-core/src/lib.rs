@@ -12,7 +12,7 @@ pub use adapter::{
     AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
     DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
 };
-pub use event::{EventKind, RuntimeContext, RuntimeEvent};
+pub use event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
 pub use interpret::interpret;
 pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
 pub use plan::{

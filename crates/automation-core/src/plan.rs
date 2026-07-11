@@ -18,6 +18,7 @@ pub struct ModalPresentation {
 pub enum PlannedRole {
     Resolved(RoleId),
     Created(String),
+    Instance { alias: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use automation_state::{
-    ActionSpec, ActionTarget, ChannelRef, InteractionRuleSet, OverwriteTargetSpec, RoleRef,
-    TriggerSpec,
+    ActionSpec, ActionTarget, ChannelRef, InstanceRef, InteractionRuleSet, OverwriteTargetSpec,
+    RoleRef, TriggerSpec,
 };
 use resource_resolution::ResourceBindingMap;
 
@@ -124,6 +124,16 @@ fn resolve_role(role: &RoleRef, bindings: &ResourceBindingMap) -> Option<Planned
     match role {
         RoleRef::Existing(key) => Some(PlannedRole::Resolved(*bindings.role_bindings.get(key)?)),
         RoleRef::Created(inner) => Some(PlannedRole::Created(inner.created.clone())),
+        RoleRef::Instance {
+            instance: InstanceRef::Event,
+            alias,
+        } => Some(PlannedRole::Instance {
+            alias: alias.clone(),
+        }),
+        RoleRef::Instance {
+            instance: InstanceRef::Created(_),
+            ..
+        } => None,
     }
 }
 
@@ -147,6 +157,12 @@ fn trigger_matches(trigger: &TriggerSpec, kind: &EventKind) -> bool {
                 modal: submitted, ..
             },
         ) => modal == submitted,
+        (
+            TriggerSpec::InstanceAction { action },
+            EventKind::InstanceAction {
+                action: received, ..
+            },
+        ) => action == received,
         _ => false,
     }
 }

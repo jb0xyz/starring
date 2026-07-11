@@ -54,6 +54,7 @@ pub fn analyze(
                             rule: rule.key.clone(),
                         });
                     }
+                    RoleRef::Instance { .. } => {}
                 },
                 ActionSpec::CreateChannel { .. } => {
                     findings.push(PolicyFinding::DynamicResourceCreation {
