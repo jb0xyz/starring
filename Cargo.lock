@@ -146,6 +146,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-ruleset-readiness"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-ruleset",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "futures",
+ "resource-resolution",
+]
+
+[[package]]
 name = "automation-runtime"
 version = "0.1.0"
 dependencies = [
