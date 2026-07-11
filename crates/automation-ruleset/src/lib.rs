@@ -9,7 +9,9 @@ pub use hash::{
 };
 pub use key::{RuleSetKey, RuleSetKeyError};
 pub use model::{RuleSetActivation, RuleSetVersion};
-pub use store::{PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError};
+pub use store::{
+    InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError,
+};
 pub use version::{
     RuleSetSchemaVersion, RuleSetVersionError, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
