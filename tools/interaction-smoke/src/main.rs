@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 
 use automation_core::validate;
-use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
+use automation_instance::InMemoryInstanceStore;
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -15,6 +15,8 @@ use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
 use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
 use twilight_model::id::Id;
+
+mod random_instance_id;
 
 const RULESET_KEY: &str = "studyroom_demo";
 const BUTTON_KEY: &str = "create_study_room";
@@ -35,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_panel(&token, guild_id, channel_id).await?;
     eprintln!("panel installed; listening for interactions (Ctrl-C to stop)");
     let instances = InMemoryInstanceStore::new();
-    let instance_ids = SequenceInstanceIdGenerator::new("room", 1);
+    let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
     gateway::run(
         token,
         RULESET_KEY.to_string(),

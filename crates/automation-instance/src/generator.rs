@@ -5,6 +5,7 @@ use crate::id::{InstanceId, InstanceIdError};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceIdGenerationError {
     Invalid(InstanceIdError),
+    Entropy,
 }
 
 pub trait InstanceIdGenerator {

@@ -10,6 +10,7 @@ automation-runtime = { path = "../../crates/automation-runtime" }
 automation-state = { path = "../../crates/automation-state" }
 desired-state = { path = "../../crates/desired-state" }
 discord-model = { path = "../../crates/discord-model" }
+getrandom = "0.2"
 resource-resolution = { path = "../../crates/resource-resolution" }
 twilight-http = "0.17"
 twilight-model = "0.17"
