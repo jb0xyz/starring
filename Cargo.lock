@@ -169,11 +169,14 @@ version = "0.1.0"
 dependencies = [
  "automation-core",
  "automation-ruleset",
+ "automation-ruleset-postgres",
  "automation-state",
  "desired-state",
  "discord-model",
  "futures",
  "resource-resolution",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
