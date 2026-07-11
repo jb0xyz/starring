@@ -187,6 +187,7 @@ mod tests {
         assert_eq!(instance.id.as_str(), "room1");
         assert_eq!(instance.status, InstanceStatus::Active);
         assert_eq!(instance.created_by, UserId(3));
+        assert_eq!(instance.ruleset_version.get(), 1);
         assert_eq!(instance.kind, InstanceKind("study_room".to_string()));
     }
 

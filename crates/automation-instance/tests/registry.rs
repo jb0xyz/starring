@@ -62,6 +62,10 @@ fn automation_instance_serde_roundtrip() {
     let json = serde_json::to_string(&value).unwrap();
     let back: AutomationInstance = serde_json::from_str(&json).unwrap();
     assert_eq!(value, back);
+    let mut object = serde_json::to_value(&value).unwrap();
+    assert_eq!(object["ruleset_version"], 7);
+    object.as_object_mut().unwrap().remove("ruleset_version");
+    assert!(serde_json::from_value::<AutomationInstance>(object).is_err());
 }
 
 #[test]

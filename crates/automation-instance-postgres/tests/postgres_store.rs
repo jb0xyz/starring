@@ -6,7 +6,12 @@ use automation_instance::{
 };
 use automation_instance_postgres::{PostgresInstanceStore, MIGRATOR};
 use discord_model::{GuildId, RoleId, UserId};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
+
+const INITIAL_MIGRATION: &str =
+    include_str!("../../../migrations/202607110001_create_automation_instances.sql");
+const VERSION_MIGRATION: &str =
+    include_str!("../../../migrations/202607120001_add_instance_ruleset_version.sql");
 
 fn require_test_db() -> String {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
@@ -44,6 +49,65 @@ async fn cleanup(pool: &PgPool, guild: u64) {
         .await;
 }
 
+async fn legacy_connection(suffix: &str) -> (PgConnection, String) {
+    let url = require_test_db();
+    let mut connection = PgConnection::connect(&url).await.unwrap();
+    let schema = format!("instance_version_{}_{}", std::process::id(), suffix);
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query(&format!("SET search_path TO {schema}"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::raw_sql(INITIAL_MIGRATION)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    (connection, schema)
+}
+
+async fn drop_schema(connection: &mut PgConnection, schema: &str) {
+    sqlx::query("SET search_path TO public")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(connection)
+        .await
+        .unwrap();
+}
+
+async fn insert_legacy(connection: &mut PgConnection, status: &str) {
+    sqlx::query(
+        "INSERT INTO automation_instances \
+         (guild_id, instance_id, ruleset_key, kind, created_by, status, resources) \
+         VALUES ('7', 'legacy_room', 'studyroom_demo', 'study_room', '3', $1, '{}'::jsonb)",
+    )
+    .bind(status)
+    .execute(connection)
+    .await
+    .unwrap();
+}
+
+async fn assert_non_deleted_migration_fails(status: &str, suffix: &str) {
+    let (mut connection, schema) = legacy_connection(suffix).await;
+    insert_legacy(&mut connection, status).await;
+    let error = sqlx::raw_sql(VERSION_MIGRATION)
+        .execute(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("non-deleted legacy automation instances require an explicit ruleset version"));
+    drop_schema(&mut connection, &schema).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn register_reconnect_get_durability() {
@@ -54,6 +118,16 @@ async fn register_reconnect_get_durability() {
     let store_a = PostgresInstanceStore::new(pool_a.clone());
     let value = instance(990001, "durable_room");
     store_a.register(value.clone()).await.unwrap();
+    let persisted_version: i64 = sqlx::query_scalar(
+        "SELECT ruleset_version FROM automation_instances \
+         WHERE guild_id = $1 AND instance_id = $2",
+    )
+    .bind("990001")
+    .bind("durable_room")
+    .fetch_one(&pool_a)
+    .await
+    .unwrap();
+    assert_eq!(persisted_version, 7);
     assert_eq!(
         store_a.register(value.clone()).await.unwrap_err(),
         InstanceStoreError::DuplicateInstance
@@ -67,10 +141,9 @@ async fn register_reconnect_get_durability() {
         store_b.get(GuildId(990001), &id).await.unwrap(),
         Some(value)
     );
-    assert_eq!(
-        store_b.list_by_guild(GuildId(990001)).await.unwrap().len(),
-        1
-    );
+    let listed = store_b.list_by_guild(GuildId(990001)).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].ruleset_version.get(), 7);
     store_b
         .update_status(GuildId(990001), &id, InstanceStatus::Disabled)
         .await
@@ -120,4 +193,33 @@ async fn guild_isolation_and_missing() {
     cleanup(&pool, 990002).await;
     cleanup(&pool, 990003).await;
     pool.close().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn deleted_legacy_row_backfills_version_one() {
+    let (mut connection, schema) = legacy_connection("deleted").await;
+    insert_legacy(&mut connection, "deleted").await;
+    sqlx::raw_sql(VERSION_MIGRATION)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar("SELECT ruleset_version FROM automation_instances")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(version, 1);
+    drop_schema(&mut connection, &schema).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn active_legacy_row_blocks_migration() {
+    assert_non_deleted_migration_fails("active", "active").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn disabled_legacy_row_blocks_migration() {
+    assert_non_deleted_migration_fails("disabled", "disabled").await;
 }
