@@ -118,6 +118,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-panel-installation"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "futures",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "automation-ruleset"
 version = "0.1.0"
 dependencies = [
