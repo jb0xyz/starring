@@ -135,6 +135,7 @@ dependencies = [
 name = "automation-ruleset-postgres"
 version = "0.1.0"
 dependencies = [
+ "automation-core",
  "automation-ruleset",
  "automation-state",
  "discord-model",

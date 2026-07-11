@@ -3,7 +3,7 @@ use std::sync::Arc;
 use automation_ruleset::{
     PublishOutcome, PublishRuleSetRequest, RuleSetActivation, RuleSetContentHash, RuleSetHasher,
     RuleSetKey, RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersion,
-    RuleSetVersionId, Sha256RuleSetHasher,
+    RuleSetVersionId, Sha256RuleSetHasher, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_state::InteractionRuleSet;
 use discord_model::{GuildId, UserId};
@@ -100,10 +100,115 @@ impl TryFrom<RuleSetVersionRow> for RuleSetVersion {
 impl<H: RuleSetHasher> RuleSetStore for PostgresRuleSetStore<H> {
     async fn publish(
         &self,
-        _request: PublishRuleSetRequest,
+        request: PublishRuleSetRequest,
     ) -> Result<PublishOutcome, RuleSetStoreError> {
-        let _ = &self.hasher;
-        unimplemented!()
+        automation_core::validate_structural(&request.definition)
+            .map_err(RuleSetStoreError::InvalidDefinition)?;
+        let schema_version = CURRENT_RULESET_SCHEMA_VERSION;
+        let content_hash = self
+            .hasher
+            .hash(schema_version, &request.definition)
+            .map_err(|error| match error {
+                automation_ruleset::RuleSetHashError::Serialization(message) => {
+                    RuleSetStoreError::Canonicalization(message)
+                }
+            })?;
+        let guild = request.guild_id.to_string();
+        let key = request.ruleset_key.as_str();
+        let hash_hex = content_hash.to_hex();
+
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+
+        sqlx::query(
+            "INSERT INTO automation_ruleset_heads (guild_id, ruleset_key, next_version) \
+             VALUES ($1, $2, 1) ON CONFLICT (guild_id, ruleset_key) DO NOTHING",
+        )
+        .bind(&guild)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        let next_version: i64 = sqlx::query_scalar(
+            "SELECT next_version FROM automation_ruleset_heads \
+             WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE",
+        )
+        .bind(&guild)
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        let existing = sqlx::query_as::<_, RuleSetVersionRow>(&format!(
+            "SELECT {VERSION_COLUMNS} FROM automation_ruleset_versions \
+             WHERE guild_id = $1 AND ruleset_key = $2 AND content_hash = $3"
+        ))
+        .bind(&guild)
+        .bind(key)
+        .bind(&hash_hex)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        if let Some(row) = existing {
+            let existing_version = RuleSetVersion::try_from(row)?;
+            if existing_version.schema_version == schema_version
+                && existing_version.definition == request.definition
+            {
+                tx.commit().await.map_err(backend)?;
+                return Ok(PublishOutcome::Reused(existing_version));
+            }
+            tx.rollback().await.map_err(backend)?;
+            return Err(RuleSetStoreError::HashCollision);
+        }
+
+        let version = match u32::try_from(next_version)
+            .ok()
+            .and_then(|value| RuleSetVersionId::new(value).ok())
+        {
+            Some(version) => version,
+            None => {
+                tx.rollback().await.map_err(backend)?;
+                return Err(RuleSetStoreError::VersionOverflow);
+            }
+        };
+
+        sqlx::query(&format!(
+            "INSERT INTO automation_ruleset_versions ({VERSION_COLUMNS}) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        ))
+        .bind(&guild)
+        .bind(key)
+        .bind(i64::from(version.get()))
+        .bind(i64::from(schema_version.get()))
+        .bind(sqlx::types::Json(&request.definition))
+        .bind(&hash_hex)
+        .bind(request.created_by.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        sqlx::query(
+            "UPDATE automation_ruleset_heads SET next_version = next_version + 1 \
+             WHERE guild_id = $1 AND ruleset_key = $2",
+        )
+        .bind(&guild)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        tx.commit().await.map_err(backend)?;
+
+        Ok(PublishOutcome::Created(RuleSetVersion {
+            guild_id: request.guild_id,
+            ruleset_key: request.ruleset_key,
+            version,
+            schema_version,
+            definition: request.definition,
+            content_hash,
+            created_by: request.created_by,
+        }))
     }
 
     async fn get_version(
