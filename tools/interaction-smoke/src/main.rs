@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::env;
 
 use automation_core::validate;
-use automation_instance::InMemoryInstanceStore;
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -29,15 +28,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = env::var("DISCORD_TEST_TOKEN")?;
     let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
     let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
+    let database_url = env::var("STARRING_DATABASE_URL")?;
 
     let ruleset = studyroom_ruleset();
     let bindings = bindings(channel_id);
     validate(&ruleset, &bindings).expect("studyroom ruleset should validate");
 
-    install_panel(&token, guild_id, channel_id).await?;
-    eprintln!("panel installed; listening for interactions (Ctrl-C to stop)");
-    let instances = InMemoryInstanceStore::new();
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .map_err(report_connect_error)?;
+    automation_instance_postgres::MIGRATOR
+        .run(&pool)
+        .await
+        .map_err(|error| {
+            eprintln!("postgres startup: migration failed: {error}");
+            "PostgreSQL startup failed during migration".to_string()
+        })?;
+    let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
+
+    install_panel(&token, guild_id, channel_id).await?;
+    eprintln!("postgres connected; panel installed; listening for interactions (Ctrl-C to stop)");
     gateway::run(
         token,
         RULESET_KEY.to_string(),
@@ -55,6 +66,18 @@ fn created(key: &str) -> CreatedRef {
     CreatedRef {
         created: key.to_string(),
     }
+}
+
+fn report_connect_error(error: sqlx::Error) -> String {
+    match &error {
+        sqlx::Error::Configuration(_) => {
+            eprintln!("postgres startup: connection failed (invalid configuration)");
+        }
+        other => {
+            eprintln!("postgres startup: connection failed: {other}");
+        }
+    }
+    "PostgreSQL startup failed during connection".to_string()
 }
 
 fn bindings(channel_id: u64) -> ResourceBindingMap {
