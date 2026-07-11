@@ -5,6 +5,7 @@ const INSTANCE: &str = "i";
 const MAX_CUSTOM_ID_LEN: usize = 100;
 const BUTTON: &str = "button";
 const MODAL: &str = "modal";
+pub const PANEL_RENDER_REVISION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentKind {
@@ -200,5 +201,10 @@ mod tests {
             decode("starring:i:room_001:join:extra").unwrap_err(),
             CustomIdError::WrongShape
         );
+    }
+
+    #[test]
+    fn panel_render_revision_is_one() {
+        assert_eq!(PANEL_RENDER_REVISION, 1);
     }
 }

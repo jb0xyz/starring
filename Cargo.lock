@@ -211,9 +211,11 @@ version = "0.1.0"
 dependencies = [
  "automation-core",
  "automation-instance",
+ "automation-panel-installation",
  "automation-ruleset",
  "automation-ruleset-dispatch",
  "automation-state",
+ "desired-state",
  "discord-model",
  "resource-resolution",
  "twilight-gateway",
