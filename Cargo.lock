@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "automation-core",
  "automation-state",
+ "desired-state",
  "discord-model",
  "futures",
  "serde",
