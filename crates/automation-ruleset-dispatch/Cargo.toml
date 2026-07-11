@@ -1,0 +1,17 @@
+[package]
+name = "automation-ruleset-dispatch"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-core = { path = "../automation-core" }
+automation-state = { path = "../automation-state" }
+automation-instance = { path = "../automation-instance" }
+automation-ruleset = { path = "../automation-ruleset" }
+automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+desired-state = { path = "../desired-state" }
+
+[dev-dependencies]
+futures = "0.3"

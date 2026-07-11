@@ -23,6 +23,7 @@ members = [
     "crates/automation-ruleset",
     "crates/automation-ruleset-postgres",
     "crates/automation-ruleset-readiness",
+    "crates/automation-ruleset-dispatch",
     "tools/ai-eval",
     "tools/executor-smoke",
     "tools/starring-demo",

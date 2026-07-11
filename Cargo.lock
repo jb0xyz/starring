@@ -132,6 +132,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-ruleset-dispatch"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-instance",
+ "automation-ruleset",
+ "automation-ruleset-readiness",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "futures",
+ "resource-resolution",
+]
+
+[[package]]
 name = "automation-ruleset-postgres"
 version = "0.1.0"
 dependencies = [
