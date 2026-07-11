@@ -138,12 +138,15 @@ dependencies = [
  "automation-core",
  "automation-instance",
  "automation-ruleset",
+ "automation-ruleset-postgres",
  "automation-ruleset-readiness",
  "automation-state",
  "desired-state",
  "discord-model",
  "futures",
  "resource-resolution",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

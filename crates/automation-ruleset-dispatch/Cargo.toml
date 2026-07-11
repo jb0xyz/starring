@@ -15,3 +15,6 @@ desired-state = { path = "../desired-state" }
 
 [dev-dependencies]
 futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+automation-ruleset-postgres = { path = "../automation-ruleset-postgres" }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate"] }
