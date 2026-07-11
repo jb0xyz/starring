@@ -48,10 +48,16 @@ mod tests {
                 trigger: TriggerSpec::InstanceAction {
                     action: "test".to_string(),
                 },
-                actions: vec![ActionSpec::CreateRole {
-                    key: "role".to_string(),
-                    name: "n".to_string(),
-                }],
+                actions: vec![
+                    ActionSpec::DeferEphemeral,
+                    ActionSpec::CreateRole {
+                        key: "role".to_string(),
+                        name: "n".to_string(),
+                    },
+                    ActionSpec::EditResponse {
+                        content: "done".to_string(),
+                    },
+                ],
             }],
         }
     }

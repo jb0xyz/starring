@@ -21,6 +21,7 @@ fn ruleset(content: &str) -> InteractionRuleSet {
                 action: "join".to_string(),
             },
             actions: vec![
+                ActionSpec::DeferEphemeral,
                 ActionSpec::GrantRole {
                     role: RoleRef::Instance {
                         instance: InstanceRef::Event,
@@ -28,7 +29,7 @@ fn ruleset(content: &str) -> InteractionRuleSet {
                     },
                     target: ActionTarget::Actor,
                 },
-                ActionSpec::RespondEphemeral {
+                ActionSpec::EditResponse {
                     content: content.to_string(),
                 },
             ],

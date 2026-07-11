@@ -1,7 +1,7 @@
-use automation_core::validate::{validate, ValidationError};
+use automation_core::validate::{validate, validate_structural, ValidationError};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, InteractionRule, InteractionRuleSet,
-    PanelSpec, RoleRef, TriggerSpec,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, InstanceRef, InteractionRule,
+    InteractionRuleSet, PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::RoleId;
@@ -150,4 +150,32 @@ fn empty_respond_content_fails() {
     assert!(errors.contains(&ValidationError::EmptyResponseContent {
         rule: "r1".to_string(),
     }));
+}
+
+#[test]
+fn instance_action_rule_must_defer() {
+    let ruleset = InteractionRuleSet {
+        version: 1,
+        panels: vec![],
+        modals: vec![],
+        rules: vec![InteractionRule {
+            key: "join".to_string(),
+            trigger: TriggerSpec::InstanceAction {
+                action: "join".to_string(),
+            },
+            actions: vec![ActionSpec::GrantRole {
+                role: RoleRef::Instance {
+                    instance: InstanceRef::Event,
+                    alias: "member_role".to_string(),
+                },
+                target: ActionTarget::Actor,
+            }],
+        }],
+    };
+    let errors = validate_structural(&ruleset).unwrap_err();
+    assert!(
+        errors.contains(&ValidationError::InstanceActionRuleMustDefer {
+            rule: "join".to_string(),
+        })
+    );
 }

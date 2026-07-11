@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
-    InstanceStore, InstanceStoreError,
+    InstanceStore,
 };
 use automation_state::{
     ButtonRoute, ButtonSpec, InstanceRef, InstanceResourceRefs, InteractionRuleSet,
@@ -15,9 +15,7 @@ use crate::adapter::{
     DiscordMutationAdapter, InteractionResponder, PostPanelButtonSpec, PostPanelSpec,
     ResolvedButtonRoute,
 };
-use crate::event::{
-    EventKind, ResolvedInstanceContext, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
-};
+use crate::event::{EventKind, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
 use crate::plan::{
     ActionPlan, CreatedResource, PlannedAction, PlannedChannel, PlannedOverwriteTarget, PlannedRole,
@@ -387,83 +385,10 @@ fn instance_resource_not_found(instance_id: &InstanceId, alias: &str) -> Adapter
     )
 }
 
-fn instance_store_error(error: InstanceStoreError) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::Unknown,
-        format!("InstanceStoreError: {error:?}"),
-    )
-}
-
-fn instance_not_found(instance_id: &InstanceId) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::NotFound,
-        format!("InstanceNotFound: {instance_id}"),
-    )
-}
-
-fn instance_inactive(instance: &AutomationInstance) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::Forbidden,
-        format!(
-            "InstanceInactive: instance={}, status={:?}",
-            instance.id, instance.status
-        ),
-    )
-}
-
-fn instance_ruleset_mismatch(instance: &AutomationInstance, ruleset_key: &str) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::Forbidden,
-        format!(
-            "InstanceRulesetMismatch: instance={}, expected={}, actual={}",
-            instance.id, ruleset_key, instance.ruleset_key
-        ),
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleOutcome {
     Executed,
     NoOp,
-}
-
-async fn resolve_instance_and_run<M, R, S, G>(
-    event: &RuntimeEvent,
-    context: &mut RuntimeContext,
-    steps: Vec<PlannedAction>,
-    services: &AutomationServices<'_, M, R, S, G>,
-    identity: &RunningRuleSetIdentity,
-) -> Result<(), AdapterError>
-where
-    M: DiscordMutationAdapter,
-    R: InteractionResponder,
-    S: InstanceStore,
-    G: InstanceIdGenerator,
-{
-    if let EventKind::InstanceAction {
-        instance_id,
-        action,
-    } = &event.kind
-    {
-        let instance = services
-            .instances
-            .get(event.guild_id, instance_id)
-            .await
-            .map_err(instance_store_error)?
-            .ok_or_else(|| instance_not_found(instance_id))?;
-        if instance.status != InstanceStatus::Active {
-            return Err(instance_inactive(&instance));
-        }
-        if instance.ruleset_key != identity.key {
-            return Err(instance_ruleset_mismatch(&instance, &identity.key));
-        }
-        context.instance = Some(ResolvedInstanceContext {
-            instance,
-            action: action.clone(),
-        });
-    }
-    run(context, &ActionPlan { steps }, services).await?;
-    Ok(())
 }
 
 pub async fn handle_event<M, R, S, G>(
@@ -480,7 +405,13 @@ where
     S: InstanceStore,
     G: InstanceIdGenerator,
 {
-    let mut context = RuntimeContext::from_event(event, identity);
+    if let EventKind::InstanceAction { .. } = &event.kind {
+        return Err(AdapterError::new(
+            AdapterErrorKind::InvalidEventRoute,
+            "InstanceAction must be dispatched via automation-ruleset-dispatch",
+        ));
+    }
+    let context = RuntimeContext::from_event(event, identity);
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let mut steps = plan.steps;
@@ -491,8 +422,8 @@ where
             } else {
                 false
             };
-            match resolve_instance_and_run(event, &mut context, steps, services, identity).await {
-                Ok(()) => Ok(HandleOutcome::Executed),
+            match run(&context, &ActionPlan { steps }, services).await {
+                Ok(_) => Ok(HandleOutcome::Executed),
                 Err(error) => {
                     if defer_acked {
                         if let Ok(rendered) = render(

@@ -14,6 +14,7 @@ pub enum AdapterErrorKind {
     Network,
     Unsupported,
     BadRequest,
+    InvalidEventRoute,
     Unknown,
 }
 

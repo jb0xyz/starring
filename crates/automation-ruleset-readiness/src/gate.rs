@@ -89,6 +89,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn ruleset(actions: Vec<ActionSpec>) -> InteractionRuleSet {
+        let mut wrapped = vec![ActionSpec::DeferEphemeral];
+        wrapped.extend(actions);
+        wrapped.push(ActionSpec::EditResponse {
+            content: "done".to_string(),
+        });
         InteractionRuleSet {
             version: 1,
             panels: vec![],
@@ -98,7 +103,7 @@ mod tests {
                 trigger: TriggerSpec::InstanceAction {
                     action: "test".to_string(),
                 },
-                actions,
+                actions: wrapped,
             }],
         }
     }

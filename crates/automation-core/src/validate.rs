@@ -129,6 +129,9 @@ pub enum ValidationError {
     InstanceRoleMustUseEvent {
         rule: String,
     },
+    InstanceActionRuleMustDefer {
+        rule: String,
+    },
 }
 
 pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<ValidationError>> {
@@ -231,7 +234,13 @@ pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<Valid
                     });
                 }
             }
-            TriggerSpec::InstanceAction { .. } => {}
+            TriggerSpec::InstanceAction { .. } => {
+                if !matches!(rule.actions.first(), Some(ActionSpec::DeferEphemeral)) {
+                    errors.push(ValidationError::InstanceActionRuleMustDefer {
+                        rule: rule.key.clone(),
+                    });
+                }
+            }
         }
         let mut created: BTreeMap<String, CreatedKind> = BTreeMap::new();
         for action in &rule.actions {
