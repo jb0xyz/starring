@@ -112,8 +112,10 @@ fn button_input_template_fails_validate() {
             channel: desired_state::ResourceKey("c".to_string()),
             content: "x".to_string(),
             buttons: vec![automation_state::ButtonSpec {
-                key: "b".to_string(),
                 label: "B".to_string(),
+                route: automation_state::ButtonRoute::Static {
+                    key: "b".to_string(),
+                },
             }],
         }],
         modals: vec![],

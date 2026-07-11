@@ -5,7 +5,7 @@ use automation_core::validate;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
     InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
     ModalSpec, OverwriteTargetSpec, PanelSpec, RoleRef, TriggerSpec,
 };
@@ -62,8 +62,10 @@ fn studyroom_ruleset() -> InteractionRuleSet {
             channel: ResourceKey("study_channel".to_string()),
             content: "Create a study room".to_string(),
             buttons: vec![ButtonSpec {
-                key: BUTTON_KEY.to_string(),
                 label: "Create study room".to_string(),
+                route: ButtonRoute::Static {
+                    key: BUTTON_KEY.to_string(),
+                },
             }],
         }],
         modals: vec![ModalSpec {
@@ -126,8 +128,10 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             "스터디룸 '${input.room_name}'이 생성되었습니다. 이 채널은 스터디 멤버만 볼 수 있어요."
                                 .to_string(),
                         buttons: vec![ButtonSpec {
-                            key: "study_help".to_string(),
                             label: "도움말".to_string(),
+                            route: ButtonRoute::Static {
+                                key: "study_help".to_string(),
+                            },
                         }],
                     },
                     ActionSpec::RegisterInstance {

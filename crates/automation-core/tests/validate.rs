@@ -1,7 +1,7 @@
 use automation_core::validate::{validate, ValidationError};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
-    TriggerSpec,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, InteractionRule, InteractionRuleSet,
+    PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::RoleId;
@@ -33,8 +33,10 @@ fn panel(button: &str) -> PanelSpec {
         channel: ResourceKey("c".to_string()),
         content: "x".to_string(),
         buttons: vec![ButtonSpec {
-            key: button.to_string(),
             label: "b".to_string(),
+            route: ButtonRoute::Static {
+                key: button.to_string(),
+            },
         }],
     }
 }
@@ -90,12 +92,16 @@ fn duplicate_rule_and_button_keys_fail() {
             content: "x".to_string(),
             buttons: vec![
                 ButtonSpec {
-                    key: "b".to_string(),
                     label: "one".to_string(),
+                    route: ButtonRoute::Static {
+                        key: "b".to_string(),
+                    },
                 },
                 ButtonSpec {
-                    key: "b".to_string(),
                     label: "two".to_string(),
+                    route: ButtonRoute::Static {
+                        key: "b".to_string(),
+                    },
                 },
             ],
         }],

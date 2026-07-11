@@ -9,8 +9,8 @@ use automation_core::validate::{validate, ValidationError};
 use automation_core::{AutomationServices, RuntimeContext};
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
-    ActionSpec, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
-    ModalSpec, PanelSpec, TriggerSpec,
+    ActionSpec, ButtonRoute, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec,
+    ModalFieldStyle, ModalSpec, PanelSpec, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, RoleId, UserId};
@@ -207,8 +207,10 @@ fn button_rule_create_input_template_fails_validate() {
             channel: ResourceKey("c".to_string()),
             content: "x".to_string(),
             buttons: vec![ButtonSpec {
-                key: "b".to_string(),
                 label: "B".to_string(),
+                route: ButtonRoute::Static {
+                    key: "b".to_string(),
+                },
             }],
         }],
         modals: vec![],

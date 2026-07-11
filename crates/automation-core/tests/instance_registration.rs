@@ -16,9 +16,9 @@ use automation_instance::{
     SequenceInstanceIdGenerator,
 };
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, ChannelRef, CreatedRef, InstanceResourceRefs,
-    InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec,
-    OverwriteTargetSpec, RoleRef, TriggerSpec,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef,
+    InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
+    ModalSpec, OverwriteTargetSpec, RoleRef, TriggerSpec,
 };
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use futures::executor::block_on;
@@ -457,8 +457,10 @@ fn study_ruleset() -> InteractionRuleSet {
             channel: ChannelRef::Created(created("study_channel")),
             content: "환영합니다.".to_string(),
             buttons: vec![ButtonSpec {
-                key: "study_help".to_string(),
                 label: "도움말".to_string(),
+                route: ButtonRoute::Static {
+                    key: "study_help".to_string(),
+                },
             }],
         },
         register_action("study_room_instance", full_manifest()),
@@ -541,8 +543,10 @@ fn full_study_room_run_registers_instance() {
                 channel: ChannelId(800_001),
                 content: "환영합니다.".to_string(),
                 buttons: vec![ButtonSpec {
-                    key: "study_help".to_string(),
                     label: "도움말".to_string(),
+                    route: ButtonRoute::Static {
+                        key: "study_help".to_string(),
+                    },
                 }],
             },
         ]

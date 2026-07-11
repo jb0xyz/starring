@@ -34,6 +34,7 @@ pub struct InteractionRule {
 pub enum TriggerSpec {
     ButtonClick { component: String },
     ModalSubmit { modal: String },
+    InstanceAction { action: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +90,52 @@ pub struct CreatedRef {
     pub created: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstanceRef {
+    Event,
+    Created(CreatedRef),
+}
+
+impl serde::Serialize for InstanceRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            InstanceRef::Event => serializer.serialize_str("event"),
+            InstanceRef::Created(created) => created.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstanceRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InstanceRefVisitor;
+        impl<'de> serde::de::Visitor<'de> for InstanceRefVisitor {
+            type Value = InstanceRef;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#""event" or { "created": <key> }"#)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<InstanceRef, E> {
+                if value == "event" {
+                    Ok(InstanceRef::Event)
+                } else {
+                    Err(E::custom("expected \"event\""))
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<InstanceRef, A::Error> {
+                let created =
+                    CreatedRef::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(InstanceRef::Created(created))
+            }
+        }
+        deserializer.deserialize_any(InstanceRefVisitor)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceResourceRefs {
@@ -105,6 +152,10 @@ pub struct InstanceResourceRefs {
 pub enum RoleRef {
     Existing(ResourceKey),
     Created(CreatedRef),
+    Instance {
+        instance: InstanceRef,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +181,7 @@ pub enum ActionTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::{ButtonSpec, PanelSpec};
+    use crate::panel::{ButtonRoute, ButtonSpec, PanelSpec};
     use automation_instance::InstanceKind;
     use desired_state::ResourceKey;
     use discord_model::Permissions;
@@ -143,8 +194,10 @@ mod tests {
                 channel: ResourceKey("verify_channel".to_string()),
                 content: "click to verify".to_string(),
                 buttons: vec![ButtonSpec {
-                    key: "verify_button".to_string(),
                     label: "Verify".to_string(),
+                    route: ButtonRoute::Static {
+                        key: "verify_button".to_string(),
+                    },
                 }],
             }],
             modals: vec![],
@@ -310,7 +363,7 @@ mod tests {
 
     #[test]
     fn post_panel_action_roundtrips() {
-        let json = r#"{"type":"post_panel","key":"study_welcome_panel","channel":{"created":"study_channel"},"content":"환영 ${input.room_name}","buttons":[{"key":"study_help","label":"도움말"}]}"#;
+        let json = r#"{"type":"post_panel","key":"study_welcome_panel","channel":{"created":"study_channel"},"content":"환영 ${input.room_name}","buttons":[{"label":"도움말","route":{"static":{"key":"study_help"}}}]}"#;
         let action: ActionSpec = serde_json::from_str(json).unwrap();
         assert_eq!(
             action,
@@ -321,8 +374,10 @@ mod tests {
                 }),
                 content: "환영 ${input.room_name}".to_string(),
                 buttons: vec![ButtonSpec {
-                    key: "study_help".to_string(),
                     label: "도움말".to_string(),
+                    route: ButtonRoute::Static {
+                        key: "study_help".to_string(),
+                    },
                 }],
             }
         );
@@ -382,5 +437,91 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn instance_ref_serde_shapes() {
+        assert_eq!(
+            serde_json::to_string(&InstanceRef::Event).unwrap(),
+            r#""event""#
+        );
+        assert_eq!(
+            serde_json::from_str::<InstanceRef>(r#""event""#).unwrap(),
+            InstanceRef::Event
+        );
+        let created = InstanceRef::Created(CreatedRef {
+            created: "study_room_instance".to_string(),
+        });
+        assert_eq!(
+            serde_json::to_string(&created).unwrap(),
+            r#"{"created":"study_room_instance"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<InstanceRef>(r#"{"created":"study_room_instance"}"#).unwrap(),
+            created
+        );
+        assert!(serde_json::from_str::<InstanceRef>(r#""other""#).is_err());
+    }
+
+    #[test]
+    fn role_ref_three_shapes_roundtrip() {
+        let values = [
+            (
+                RoleRef::Existing(ResourceKey("member".to_string())),
+                r#""member""#,
+            ),
+            (
+                RoleRef::Created(CreatedRef {
+                    created: "member_role".to_string(),
+                }),
+                r#"{"created":"member_role"}"#,
+            ),
+            (
+                RoleRef::Instance {
+                    instance: InstanceRef::Event,
+                    alias: "member_role".to_string(),
+                },
+                r#"{"instance":"event","alias":"member_role"}"#,
+            ),
+        ];
+        for (value, json) in values {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<RoleRef>(json).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn button_route_serde_shapes() {
+        let values = [
+            (
+                ButtonRoute::Static {
+                    key: "help".to_string(),
+                },
+                r#"{"static":{"key":"help"}}"#,
+            ),
+            (
+                ButtonRoute::InstanceAction {
+                    instance: InstanceRef::Created(CreatedRef {
+                        created: "study_room_instance".to_string(),
+                    }),
+                    action: "join".to_string(),
+                },
+                r#"{"instance_action":{"instance":{"created":"study_room_instance"},"action":"join"}}"#,
+            ),
+        ];
+        for (value, json) in values {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<ButtonRoute>(json).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn instance_action_trigger_roundtrips() {
+        let trigger = TriggerSpec::InstanceAction {
+            action: "join".to_string(),
+        };
+        let json = r#"{"type":"instance_action","action":"join"}"#;
+        assert_eq!(serde_json::to_string(&trigger).unwrap(), json);
+        assert_eq!(serde_json::from_str::<TriggerSpec>(json).unwrap(), trigger);
     }
 }

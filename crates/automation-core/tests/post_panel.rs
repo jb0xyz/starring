@@ -11,8 +11,8 @@ use automation_core::validate::{validate, ValidationError};
 use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
-    ActionSpec, ButtonSpec, ChannelRef, CreatedRef, InteractionRule, InteractionRuleSet,
-    ModalFieldSpec, ModalFieldStyle, ModalSpec, PanelSpec, TriggerSpec,
+    ActionSpec, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InteractionRule,
+    InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec, PanelSpec, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
@@ -55,8 +55,10 @@ fn channel_created(key: &str) -> ChannelRef {
 
 fn button(key: &str, label: &str) -> ButtonSpec {
     ButtonSpec {
-        key: key.to_string(),
         label: label.to_string(),
+        route: ButtonRoute::Static {
+            key: key.to_string(),
+        },
     }
 }
 

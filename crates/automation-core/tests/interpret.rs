@@ -2,8 +2,8 @@ use automation_core::event::{EventKind, RuntimeEvent};
 use automation_core::interpret::interpret;
 use automation_core::plan::{PlannedAction, PlannedRole};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
-    TriggerSpec,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, InteractionRule, InteractionRuleSet,
+    PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{GuildId, RoleId, UserId};
@@ -17,8 +17,10 @@ fn fixture() -> (InteractionRuleSet, ResourceBindingMap) {
             channel: ResourceKey("verify_channel".to_string()),
             content: "click".to_string(),
             buttons: vec![ButtonSpec {
-                key: "verify_button".to_string(),
                 label: "Verify".to_string(),
+                route: ButtonRoute::Static {
+                    key: "verify_button".to_string(),
+                },
             }],
         }],
         modals: vec![],

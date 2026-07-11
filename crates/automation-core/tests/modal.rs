@@ -10,8 +10,8 @@ use automation_core::validate::{validate, ValidationError};
 use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
-    ActionSpec, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
-    ModalSpec, PanelSpec, TriggerSpec,
+    ActionSpec, ButtonRoute, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec,
+    ModalFieldStyle, ModalSpec, PanelSpec, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{GuildId, UserId};
@@ -39,8 +39,10 @@ fn ruleset() -> InteractionRuleSet {
             channel: ResourceKey("study_channel".to_string()),
             content: "Create a study room".to_string(),
             buttons: vec![ButtonSpec {
-                key: "create_study_button".to_string(),
                 label: "Create study room".to_string(),
+                route: ButtonRoute::Static {
+                    key: "create_study_button".to_string(),
+                },
             }],
         }],
         modals: vec![modal()],

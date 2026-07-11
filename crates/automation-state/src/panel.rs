@@ -15,6 +15,18 @@ pub struct PanelSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ButtonSpec {
-    pub key: String,
     pub label: String,
+    pub route: ButtonRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ButtonRoute {
+    Static {
+        key: String,
+    },
+    InstanceAction {
+        instance: crate::rule::InstanceRef,
+        action: String,
+    },
 }
