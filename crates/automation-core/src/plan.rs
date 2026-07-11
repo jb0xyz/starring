@@ -1,4 +1,5 @@
-use automation_state::{ButtonSpec, ModalFieldSpec};
+use automation_instance::InstanceId;
+use automation_state::{ButtonSpec, InstanceKind, InstanceResourceRefs, ModalFieldSpec};
 use discord_model::{ChannelId, MessageId, Permissions, RoleId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub enum PlannedAction {
         deny: Permissions,
     },
     PostPanel {
+        key: String,
         channel: PlannedChannel,
         content: String,
         buttons: Vec<ButtonSpec>,
@@ -64,23 +66,36 @@ pub enum PlannedAction {
     EditResponse {
         content: String,
     },
+    RegisterInstance {
+        key: String,
+        kind: InstanceKind,
+        resources: InstanceResourceRefs,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreatedResource {
     Channel {
         action_index: usize,
+        key: String,
         name: String,
         id: ChannelId,
     },
     Role {
         action_index: usize,
+        key: String,
         name: String,
         id: RoleId,
     },
     Message {
         action_index: usize,
+        key: String,
         channel: ChannelId,
         id: MessageId,
+    },
+    Instance {
+        action_index: usize,
+        key: String,
+        id: InstanceId,
     },
 }

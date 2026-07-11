@@ -24,11 +24,12 @@ pub enum EventKind {
 pub struct RuntimeContext {
     pub guild_id: GuildId,
     pub actor: UserId,
+    pub ruleset_key: String,
     pub inputs: BTreeMap<String, String>,
 }
 
 impl RuntimeContext {
-    pub fn from_event(event: &RuntimeEvent) -> Self {
+    pub fn from_event(event: &RuntimeEvent, ruleset_key: &str) -> Self {
         let inputs = match &event.kind {
             EventKind::ModalSubmit { inputs, .. } => inputs.clone(),
             EventKind::ButtonClick { .. } => BTreeMap::new(),
@@ -36,6 +37,7 @@ impl RuntimeContext {
         Self {
             guild_id: event.guild_id,
             actor: event.actor,
+            ruleset_key: ruleset_key.to_string(),
             inputs,
         }
     }
