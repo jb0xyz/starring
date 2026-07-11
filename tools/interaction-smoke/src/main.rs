@@ -3,6 +3,7 @@ use std::env;
 
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::InstanceRuleSetVersion;
+use automation_ruleset::RuleSetStore;
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -27,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
+    let activate = std::env::args().any(|a| a == "--activate");
     let force_activate = std::env::args().any(|a| a == "--force-activate");
 
     let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
@@ -55,7 +57,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("invalid ruleset key: {e:?}"))?;
 
     if mode == "seed-studyroom" {
-        return seed_studyroom(&ruleset_store, guild_id, &ruleset_key, force_activate).await;
+        return seed_studyroom(
+            &ruleset_store,
+            guild_id,
+            &ruleset_key,
+            activate,
+            force_activate,
+        )
+        .await;
+    }
+
+    if mode == "activate" {
+        let version_arg: u32 = std::env::args()
+            .nth(2)
+            .ok_or("usage: activate <version>")?
+            .parse()?;
+        let version = automation_ruleset::RuleSetVersionId::new(version_arg)
+            .map_err(|e| format!("invalid version: {e:?}"))?;
+        if ruleset_store
+            .get_version(GuildId(guild_id), &ruleset_key, version)
+            .await
+            .map_err(|e| format!("version lookup failed: {e:?}"))?
+            .is_none()
+        {
+            return Err(format!("version {version} not found; nothing activated").into());
+        }
+        let token = env::var("DISCORD_TEST_TOKEN")?;
+        let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
+        let bindings = bindings(channel_id);
+        let http = Client::new(token);
+        let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
+        let outcome = automation_ruleset_readiness::activate_if_ready(
+            &ruleset_store,
+            GuildId(guild_id),
+            &ruleset_key,
+            version,
+            &bindings,
+            &caps,
+            &role_permissions,
+        )
+        .await
+        .map_err(|e| format!("activation failed (active pointer unchanged): {e:?}"))?;
+        eprintln!(
+            "activated {} ({} notices)",
+            outcome.activation.active_version,
+            outcome.runtime_ruleset.notices.len()
+        );
+        return Ok(());
     }
 
     let token = env::var("DISCORD_TEST_TOKEN")?;
@@ -63,33 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bindings = bindings(channel_id);
 
     let http = Client::new(token.clone());
-    let bot = http.current_user().await?.model().await?;
-    let guild_roles = http.roles(Id::new(guild_id)).await?.model().await?;
-    let bot_member = http
-        .guild_member(Id::new(guild_id), bot.id)
-        .await?
-        .model()
-        .await?;
-
-    let roles_snapshot: std::collections::BTreeMap<RoleId, Permissions> = guild_roles
-        .iter()
-        .map(|role| {
-            (
-                RoleId(role.id.get()),
-                Permissions::from_bits_retain(role.permissions.bits()),
-            )
-        })
-        .collect();
-    let bot_role_ids: Vec<RoleId> = bot_member.roles.iter().map(|id| RoleId(id.get())).collect();
-
     let (guild_capabilities, role_permissions) =
-        automation_ruleset_readiness::build_readiness_context(
-            GuildId(guild_id),
-            &bindings,
-            &roles_snapshot,
-            &bot_role_ids,
-        )
-        .map_err(|e| format!("readiness context failed: {e:?}"))?;
+        readiness_context(&http, guild_id, &bindings).await?;
 
     let runtime = automation_ruleset_readiness::hydrate_active_ruleset(
         &ruleset_store,
@@ -134,17 +157,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn readiness_context(
+    http: &Client,
+    guild_id: u64,
+    bindings: &ResourceBindingMap,
+) -> Result<
+    (
+        automation_ruleset_readiness::GuildCapabilities,
+        BTreeMap<ResourceKey, Permissions>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let bot = http.current_user().await?.model().await?;
+    let guild_roles = http.roles(Id::new(guild_id)).await?.model().await?;
+    let bot_member = http
+        .guild_member(Id::new(guild_id), bot.id)
+        .await?
+        .model()
+        .await?;
+    let roles_snapshot: BTreeMap<RoleId, Permissions> = guild_roles
+        .iter()
+        .map(|role| {
+            (
+                RoleId(role.id.get()),
+                Permissions::from_bits_retain(role.permissions.bits()),
+            )
+        })
+        .collect();
+    let bot_role_ids: Vec<RoleId> = bot_member.roles.iter().map(|id| RoleId(id.get())).collect();
+    automation_ruleset_readiness::build_readiness_context(
+        GuildId(guild_id),
+        bindings,
+        &roles_snapshot,
+        &bot_role_ids,
+    )
+    .map_err(|e| format!("readiness context failed: {e:?}").into())
+}
+
 async fn seed_studyroom(
-    store: &automation_ruleset_postgres::PostgresRuleSetStore,
+    store: &impl RuleSetStore,
     guild_id: u64,
     key: &automation_ruleset::RuleSetKey,
+    activate: bool,
     force_activate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use automation_ruleset::{PublishOutcome, PublishRuleSetRequest, RuleSetStore};
-    let guild = GuildId(guild_id);
+    use automation_ruleset::{PublishOutcome, PublishRuleSetRequest};
     let published = store
         .publish(PublishRuleSetRequest {
-            guild_id: guild,
+            guild_id: GuildId(guild_id),
             ruleset_key: key.clone(),
             definition: studyroom_ruleset(),
             created_by: UserId(0),
@@ -154,42 +214,44 @@ async fn seed_studyroom(
     let version = match &published {
         PublishOutcome::Created(v) | PublishOutcome::Reused(v) => v.version,
     };
-    eprintln!("seed: {published:?}");
-    let active = store
-        .active(guild, key)
+    eprintln!("seed: published {version}");
+    if !activate {
+        return Ok(());
+    }
+    if let Some(current) = store
+        .active(GuildId(guild_id), key)
         .await
-        .map_err(|e| format!("active lookup failed: {e:?}"))?;
-    match active {
-        None => {
-            store
-                .activate(guild, key, version)
-                .await
-                .map_err(|e| format!("activate failed: {e:?}"))?;
-            eprintln!("seed: activated {version}");
-        }
-        Some(current) if current.version == version => {
-            store
-                .activate(guild, key, version)
-                .await
-                .map_err(|e| format!("activate failed: {e:?}"))?;
-            eprintln!("seed: already active {version} (idempotent)");
-        }
-        Some(current) => {
-            if force_activate {
-                store
-                    .activate(guild, key, version)
-                    .await
-                    .map_err(|e| format!("activate failed: {e:?}"))?;
-                eprintln!("seed: force-activated {version} (was {})", current.version);
-            } else {
-                return Err(format!(
-                    "seed: active version {} != published {}; pass --force-activate to override",
-                    current.version, version
-                )
-                .into());
-            }
+        .map_err(|e| format!("active lookup failed: {e:?}"))?
+    {
+        if current.version != version && !force_activate {
+            return Err(format!(
+                "seed: active version {} != target {version}; pass --force-activate to replace",
+                current.version
+            )
+            .into());
         }
     }
+    let token = env::var("DISCORD_TEST_TOKEN")?;
+    let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
+    let bindings = bindings(channel_id);
+    let http = Client::new(token);
+    let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
+    let outcome = automation_ruleset_readiness::activate_if_ready(
+        store,
+        GuildId(guild_id),
+        key,
+        version,
+        &bindings,
+        &caps,
+        &role_permissions,
+    )
+    .await
+    .map_err(|e| format!("seed activation failed (published, active unchanged): {e:?}"))?;
+    eprintln!(
+        "seed: activated {} ({} notices)",
+        outcome.activation.active_version,
+        outcome.runtime_ruleset.notices.len()
+    );
     Ok(())
 }
 
@@ -401,6 +463,9 @@ async fn install_panel(
 mod tests {
     use super::*;
     use automation_core::validate;
+    use automation_ruleset::{
+        InMemoryRuleSetStore, PublishRuleSetRequest, RuleSetStore, RuleSetVersionId,
+    };
 
     #[test]
     fn studyroom_ruleset_validates() {
@@ -423,5 +488,56 @@ mod tests {
             join.actions.last(),
             Some(ActionSpec::EditResponse { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn seed_without_activate_is_publish_only() {
+        let store = InMemoryRuleSetStore::default();
+        let key = automation_ruleset::RuleSetKey::parse(RULESET_KEY).unwrap();
+        seed_studyroom(&store, 7, &key, false, false).await.unwrap();
+        assert!(store.active(GuildId(7), &key).await.unwrap().is_none());
+        assert_eq!(
+            store.list_versions(GuildId(7), &key).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_activate_refuses_accidental_replacement() {
+        let store = InMemoryRuleSetStore::default();
+        let key = automation_ruleset::RuleSetKey::parse(RULESET_KEY).unwrap();
+        let mut old = studyroom_ruleset();
+        old.panels[0].content = "Old panel".to_string();
+        store
+            .publish(PublishRuleSetRequest {
+                guild_id: GuildId(7),
+                ruleset_key: key.clone(),
+                definition: old,
+                created_by: UserId(1),
+            })
+            .await
+            .unwrap();
+        store
+            .activate(GuildId(7), &key, RuleSetVersionId::FIRST)
+            .await
+            .unwrap();
+
+        let error = seed_studyroom(&store, 7, &key, true, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("pass --force-activate"));
+        assert_eq!(
+            store
+                .active(GuildId(7), &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            RuleSetVersionId::FIRST
+        );
+        assert_eq!(
+            store.list_versions(GuildId(7), &key).await.unwrap().len(),
+            2
+        );
     }
 }
