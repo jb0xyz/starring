@@ -118,6 +118,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-ruleset"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-state",
+ "discord-model",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "automation-runtime"
 version = "0.1.0"
 dependencies = [

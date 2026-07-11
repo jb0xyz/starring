@@ -20,6 +20,7 @@ members = [
     "crates/automation-runtime",
     "crates/automation-instance",
     "crates/automation-instance-postgres",
+    "crates/automation-ruleset",
     "tools/ai-eval",
     "tools/executor-smoke",
     "tools/starring-demo",
