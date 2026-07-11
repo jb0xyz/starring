@@ -1,6 +1,6 @@
 use automation_instance::{
-    AutomationInstance, InstanceId, InstanceKind, InstanceResources, InstanceStatus, InstanceStore,
-    InstanceStoreError,
+    AutomationInstance, InstanceId, InstanceKind, InstanceResources, InstanceRuleSetVersion,
+    InstanceStatus, InstanceStore, InstanceStoreError,
 };
 use discord_model::{GuildId, UserId};
 use sqlx::PgPool;
@@ -22,6 +22,7 @@ struct AutomationInstanceRow {
     guild_id: String,
     instance_id: String,
     ruleset_key: String,
+    ruleset_version: i64,
     kind: String,
     created_by: String,
     status: String,
@@ -50,6 +51,18 @@ impl TryFrom<AutomationInstanceRow> for AutomationInstance {
             .map_err(|_| backend(format!("invalid persisted guild_id: {}", row.guild_id)))?;
         let id = InstanceId::parse(&row.instance_id)
             .map_err(|error| backend(format!("invalid persisted instance_id: {error:?}")))?;
+        let ruleset_version_value = u32::try_from(row.ruleset_version).map_err(|_| {
+            backend(format!(
+                "invalid persisted ruleset_version: {}",
+                row.ruleset_version
+            ))
+        })?;
+        let ruleset_version = InstanceRuleSetVersion::new(ruleset_version_value).map_err(|_| {
+            backend(format!(
+                "invalid persisted ruleset_version: {}",
+                row.ruleset_version
+            ))
+        })?;
         let created_by = row
             .created_by
             .parse::<UserId>()
@@ -64,6 +77,7 @@ impl TryFrom<AutomationInstanceRow> for AutomationInstance {
             id,
             guild_id,
             ruleset_key: row.ruleset_key,
+            ruleset_version,
             kind: InstanceKind(row.kind),
             created_by,
             resources: row.resources.0,
@@ -75,12 +89,13 @@ impl TryFrom<AutomationInstanceRow> for AutomationInstance {
 impl InstanceStore for PostgresInstanceStore {
     async fn register(&self, instance: AutomationInstance) -> Result<(), InstanceStoreError> {
         let result = sqlx::query(
-            "INSERT INTO automation_instances (guild_id, instance_id, ruleset_key, kind, created_by, status, resources) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (guild_id, instance_id) DO NOTHING",
+            "INSERT INTO automation_instances (guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (guild_id, instance_id) DO NOTHING",
         )
         .bind(instance.guild_id.to_string())
         .bind(instance.id.as_str())
         .bind(&instance.ruleset_key)
+        .bind(i64::from(instance.ruleset_version.get()))
         .bind(&instance.kind.0)
         .bind(instance.created_by.to_string())
         .bind(status_str(instance.status))
@@ -100,7 +115,7 @@ impl InstanceStore for PostgresInstanceStore {
         instance_id: &InstanceId,
     ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
         let row = sqlx::query_as::<_, AutomationInstanceRow>(
-            "SELECT guild_id, instance_id, ruleset_key, kind, created_by, status, resources \
+            "SELECT guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources \
              FROM automation_instances WHERE guild_id = $1 AND instance_id = $2",
         )
         .bind(guild_id.to_string())
@@ -116,7 +131,7 @@ impl InstanceStore for PostgresInstanceStore {
         guild_id: GuildId,
     ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
         let rows = sqlx::query_as::<_, AutomationInstanceRow>(
-            "SELECT guild_id, instance_id, ruleset_key, kind, created_by, status, resources \
+            "SELECT guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources \
              FROM automation_instances WHERE guild_id = $1 ORDER BY instance_id",
         )
         .bind(guild_id.to_string())
@@ -157,6 +172,7 @@ mod tests {
             guild_id: "7".to_string(),
             instance_id: instance_id.to_string(),
             ruleset_key: "studyroom_demo".to_string(),
+            ruleset_version: 1,
             kind: "study_room".to_string(),
             created_by: "3".to_string(),
             status: status.to_string(),
@@ -188,5 +204,17 @@ mod tests {
             AutomationInstance::try_from(row("room1", "weird")),
             Err(InstanceStoreError::Backend(_))
         ));
+    }
+
+    #[test]
+    fn invalid_persisted_ruleset_version_is_backend() {
+        for value in [0, -1, i64::from(u32::MAX) + 1] {
+            let mut row = row("room1", "active");
+            row.ruleset_version = value;
+            assert!(matches!(
+                AutomationInstance::try_from(row),
+                Err(InstanceStoreError::Backend(_))
+            ));
+        }
     }
 }

@@ -18,6 +18,13 @@ use discord_model::{ChannelId, GuildId, OverwriteTarget, Permissions, RoleId, Us
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn modal() -> ModalSpec {
     ModalSpec {
         key: "m".to_string(),
@@ -101,7 +108,7 @@ fn submit(room: &str) -> RuntimeEvent {
 }
 
 fn run_plan(steps: Vec<PlannedAction>) -> Vec<MutationCall> {
-    let context = RuntimeContext::from_event(&submit("cozy"), "test");
+    let context = RuntimeContext::from_event(&submit("cozy"), &identity("test"));
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
     block_on(run(

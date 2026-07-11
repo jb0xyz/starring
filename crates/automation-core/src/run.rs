@@ -15,7 +15,9 @@ use crate::adapter::{
     DiscordMutationAdapter, InteractionResponder, PostPanelButtonSpec, PostPanelSpec,
     ResolvedButtonRoute,
 };
-use crate::event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
+use crate::event::{
+    EventKind, ResolvedInstanceContext, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
+};
 use crate::interpret::interpret;
 use crate::plan::{
     ActionPlan, CreatedResource, PlannedAction, PlannedChannel, PlannedOverwriteTarget, PlannedRole,
@@ -173,6 +175,7 @@ where
                     id: id.clone(),
                     guild_id: context.guild_id,
                     ruleset_key: context.ruleset_key.clone(),
+                    ruleset_version: context.ruleset_version,
                     kind: kind.clone(),
                     created_by: context.actor,
                     resources: resolved,
@@ -429,7 +432,7 @@ async fn resolve_instance_and_run<M, R, S, G>(
     context: &mut RuntimeContext,
     steps: Vec<PlannedAction>,
     services: &AutomationServices<'_, M, R, S, G>,
-    ruleset_key: &str,
+    identity: &RunningRuleSetIdentity,
 ) -> Result<(), AdapterError>
 where
     M: DiscordMutationAdapter,
@@ -451,8 +454,8 @@ where
         if instance.status != InstanceStatus::Active {
             return Err(instance_inactive(&instance));
         }
-        if instance.ruleset_key != ruleset_key {
-            return Err(instance_ruleset_mismatch(&instance, ruleset_key));
+        if instance.ruleset_key != identity.key {
+            return Err(instance_ruleset_mismatch(&instance, &identity.key));
         }
         context.instance = Some(ResolvedInstanceContext {
             instance,
@@ -469,7 +472,7 @@ pub async fn handle_event<M, R, S, G>(
     bindings: &ResourceBindingMap,
     services: &AutomationServices<'_, M, R, S, G>,
     failure_message: &str,
-    ruleset_key: &str,
+    identity: &RunningRuleSetIdentity,
 ) -> Result<HandleOutcome, AdapterError>
 where
     M: DiscordMutationAdapter,
@@ -477,7 +480,7 @@ where
     S: InstanceStore,
     G: InstanceIdGenerator,
 {
-    let mut context = RuntimeContext::from_event(event, ruleset_key);
+    let mut context = RuntimeContext::from_event(event, identity);
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let mut steps = plan.steps;
@@ -488,8 +491,7 @@ where
             } else {
                 false
             };
-            match resolve_instance_and_run(event, &mut context, steps, services, ruleset_key).await
-            {
+            match resolve_instance_and_run(event, &mut context, steps, services, identity).await {
                 Ok(()) => Ok(HandleOutcome::Executed),
                 Err(error) => {
                     if defer_acked {

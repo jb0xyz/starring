@@ -16,6 +16,13 @@ use discord_model::{GuildId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn modal() -> ModalSpec {
     ModalSpec {
         key: "m".to_string(),
@@ -72,7 +79,7 @@ fn defer_rule() -> InteractionRuleSet {
 
 #[test]
 fn run_executes_defer_and_edit() {
-    let context = RuntimeContext::from_event(&submit("cozy"), "test");
+    let context = RuntimeContext::from_event(&submit("cozy"), &identity("test"));
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
     let steps = vec![
@@ -118,7 +125,7 @@ fn handle_event_defer_success_edits_completion() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "실패",
-        "test",
+        &identity("test"),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);
@@ -151,7 +158,7 @@ fn handle_event_failure_edits_failure_message() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "스터디룸 '${input.room_name}' 실패",
-        "test",
+        &identity("test"),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);
     assert_eq!(

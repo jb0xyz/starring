@@ -1,3 +1,4 @@
+use automation_core::RunningRuleSetIdentity;
 use automation_instance::{InstanceIdGenerator, InstanceStore};
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
@@ -9,7 +10,7 @@ use crate::runner::handle_interaction;
 
 pub async fn run(
     token: String,
-    ruleset_key: String,
+    identity: RunningRuleSetIdentity,
     ruleset: InteractionRuleSet,
     bindings: ResourceBindingMap,
     failure_message: String,
@@ -17,7 +18,7 @@ pub async fn run(
     instance_ids: impl InstanceIdGenerator,
 ) {
     let http = Client::new(token.clone());
-    let mutation = TwilightMutationAdapter::new(&http, ruleset_key.clone());
+    let mutation = TwilightMutationAdapter::new(&http, identity.key.clone());
     let mut shard = Shard::new(ShardId::ONE, token, Intents::empty());
 
     while let Some(item) = shard.next_event(EventTypeFlags::INTERACTION_CREATE).await {
@@ -31,7 +32,7 @@ pub async fn run(
         if let Event::InteractionCreate(interaction_create) = event {
             handle_interaction(
                 &http,
-                &ruleset_key,
+                &identity,
                 &mutation,
                 &ruleset,
                 &bindings,

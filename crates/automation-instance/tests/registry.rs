@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdError, InstanceKind,
-    InstanceResources, InstanceStatus, InstanceStore, InstanceStoreError,
+    InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
 };
 use discord_model::{GuildId, RoleId, UserId};
 use futures::executor::block_on;
@@ -14,6 +14,7 @@ fn instance(guild: u64, id: &str) -> AutomationInstance {
         id: InstanceId::parse(id).unwrap(),
         guild_id: GuildId(guild),
         ruleset_key: "studyroom_demo".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(7).unwrap(),
         kind: InstanceKind("study_room".to_string()),
         created_by: UserId(3),
         resources: InstanceResources {
@@ -71,6 +72,13 @@ fn register_then_get() {
     assert_eq!(
         block_on(store.get(GuildId(7), &InstanceId::parse("room1").unwrap())).unwrap(),
         Some(value)
+    );
+    assert_eq!(
+        block_on(store.get(GuildId(7), &InstanceId::parse("room1").unwrap()))
+            .unwrap()
+            .unwrap()
+            .ruleset_version,
+        InstanceRuleSetVersion::new(7).unwrap()
     );
 }
 

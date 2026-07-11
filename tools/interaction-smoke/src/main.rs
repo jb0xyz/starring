@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::env;
 
+use automation_core::RunningRuleSetIdentity;
+use automation_instance::InstanceRuleSetVersion;
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -109,9 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_panel(&token, guild_id, channel_id).await?;
     let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
+    let identity = RunningRuleSetIdentity {
+        key: runtime.ruleset_key.as_str().to_string(),
+        version: InstanceRuleSetVersion::new(runtime.version.get())
+            .map_err(|error| format!("invalid runtime ruleset version: {error:?}"))?,
+    };
     gateway::run(
         token,
-        runtime.ruleset_key.as_str().to_string(),
+        identity,
         runtime.definition,
         bindings,
         "스터디룸 처리에 실패했습니다.".to_string(),

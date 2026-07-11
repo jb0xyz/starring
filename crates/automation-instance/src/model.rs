@@ -4,6 +4,7 @@ use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use serde::{Deserialize, Serialize};
 
 use crate::id::InstanceId;
+use crate::version::InstanceRuleSetVersion;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceKind(pub String);
@@ -33,6 +34,7 @@ pub struct AutomationInstance {
     pub id: InstanceId,
     pub guild_id: GuildId,
     pub ruleset_key: String,
+    pub ruleset_version: InstanceRuleSetVersion,
     pub kind: InstanceKind,
     pub created_by: UserId,
     pub resources: InstanceResources,

@@ -14,6 +14,13 @@ use discord_model::{GuildId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn modal() -> ModalSpec {
     ModalSpec {
         key: "study_modal".to_string(),
@@ -94,7 +101,7 @@ fn responded(event: &RuntimeEvent, rule: InteractionRule) -> String {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ))
     .unwrap();
     match responder.calls().into_iter().next().unwrap() {

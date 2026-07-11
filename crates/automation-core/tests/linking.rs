@@ -17,6 +17,13 @@ use discord_model::{ChannelId, GuildId, RoleId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn modal() -> ModalSpec {
     ModalSpec {
         key: "m".to_string(),
@@ -83,7 +90,7 @@ fn plan(steps: Vec<PlannedAction>) -> ActionPlan {
 
 #[test]
 fn created_role_granted_to_actor() {
-    let context = RuntimeContext::from_event(&submit("코딩"), "test");
+    let context = RuntimeContext::from_event(&submit("코딩"), &identity("test"));
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),
@@ -125,7 +132,7 @@ fn created_role_granted_to_actor() {
 
 #[test]
 fn full_study_run_creates_then_grants() {
-    let context = RuntimeContext::from_event(&submit("cozy"), "test");
+    let context = RuntimeContext::from_event(&submit("cozy"), &identity("test"));
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),
@@ -290,7 +297,7 @@ fn create_role_failure_skips_grant() {
             Err(AdapterError::new(AdapterErrorKind::Forbidden, "no"))
         }
     }
-    let context = RuntimeContext::from_event(&submit("x"), "test");
+    let context = RuntimeContext::from_event(&submit("x"), &identity("test"));
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),

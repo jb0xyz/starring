@@ -13,7 +13,9 @@ pub use adapter::{
     DiscordMutationAdapter, InteractionResponder, PostPanelButtonSpec, PostPanelSpec,
     ResolvedButtonRoute,
 };
-pub use event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
+pub use event::{
+    EventKind, ResolvedInstanceContext, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
+};
 pub use interpret::interpret;
 pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
 pub use plan::{

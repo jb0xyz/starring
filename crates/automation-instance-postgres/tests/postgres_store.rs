@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use automation_instance::{
-    AutomationInstance, InstanceId, InstanceKind, InstanceResources, InstanceStatus, InstanceStore,
-    InstanceStoreError,
+    AutomationInstance, InstanceId, InstanceKind, InstanceResources, InstanceRuleSetVersion,
+    InstanceStatus, InstanceStore, InstanceStoreError,
 };
 use automation_instance_postgres::{PostgresInstanceStore, MIGRATOR};
 use discord_model::{GuildId, RoleId, UserId};
@@ -25,6 +25,7 @@ fn instance(guild: u64, id: &str) -> AutomationInstance {
         id: InstanceId::parse(id).unwrap(),
         guild_id: GuildId(guild),
         ruleset_key: "studyroom_demo".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(7).unwrap(),
         kind: InstanceKind("study_room".to_string()),
         created_by: UserId(3),
         resources: InstanceResources {

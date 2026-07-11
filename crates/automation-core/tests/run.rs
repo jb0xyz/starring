@@ -14,6 +14,13 @@ use discord_model::{GuildId, RoleId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn fixture() -> (InteractionRuleSet, ResourceBindingMap) {
     let set = InteractionRuleSet {
         version: 1,
@@ -79,7 +86,7 @@ fn matching_event_grants_role_and_responds() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ))
     .unwrap();
 
@@ -117,7 +124,7 @@ fn unmatched_event_is_noop_with_no_calls() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ))
     .unwrap();
 
@@ -148,7 +155,7 @@ fn mutation_failure_propagates() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);

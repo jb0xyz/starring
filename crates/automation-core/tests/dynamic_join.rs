@@ -17,7 +17,8 @@ use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
-    InstanceStatus, InstanceStore, InstanceStoreError, SequenceInstanceIdGenerator,
+    InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
+    SequenceInstanceIdGenerator,
 };
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, CreatedRef, InstanceRef,
@@ -123,6 +124,13 @@ fn instance_id() -> InstanceId {
     InstanceId::parse("room_001").unwrap()
 }
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn instance(
     guild_id: GuildId,
     status: InstanceStatus,
@@ -133,6 +141,7 @@ fn instance(
         id: instance_id(),
         guild_id,
         ruleset_key: ruleset_key.to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
         kind: InstanceKind("study_room".to_string()),
         created_by: UserId(1),
         resources,
@@ -229,7 +238,7 @@ fn rejected(
         &ResourceBindingMap::default(),
         &services,
         "",
-        ruleset_key,
+        &identity(ruleset_key),
     ))
     .unwrap_err();
     (error, mutation.calls(), responder.calls())
@@ -324,7 +333,7 @@ fn active_instance_grants_resolved_role_and_responds() {
         &ResourceBindingMap::default(),
         &services,
         "",
-        "studyroom",
+        &identity("studyroom"),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);
@@ -522,7 +531,7 @@ fn created_instance_button_route_resolves_before_posting() {
                 component: "create".to_string(),
             },
         },
-        "studyroom",
+        &identity("studyroom"),
     );
     let plan = ActionPlan {
         steps: vec![
@@ -593,7 +602,7 @@ fn deferred_join_defers_before_resolution_and_grants() {
         &ResourceBindingMap::default(),
         &services,
         "could not join",
-        "studyroom",
+        &identity("studyroom"),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);
@@ -648,7 +657,7 @@ fn deferred_join_missing_instance_traces_defer_then_lookup_then_edit() {
         &ResourceBindingMap::default(),
         &services,
         "could not join",
-        "studyroom",
+        &identity("studyroom"),
     ))
     .unwrap_err();
     assert_eq!(error.kind, AdapterErrorKind::NotFound);
@@ -688,7 +697,7 @@ fn deferred_join_defer_failure_skips_lookup_and_edit() {
         &ResourceBindingMap::default(),
         &services,
         "could not join",
-        "studyroom",
+        &identity("studyroom"),
     ))
     .unwrap_err();
     assert_eq!(error.kind, AdapterErrorKind::Unknown);

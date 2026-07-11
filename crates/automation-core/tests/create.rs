@@ -17,6 +17,13 @@ use discord_model::{ChannelId, GuildId, RoleId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
 
+fn identity(key: &str) -> automation_core::RunningRuleSetIdentity {
+    automation_core::RunningRuleSetIdentity {
+        key: key.to_string(),
+        version: automation_instance::InstanceRuleSetVersion::new(1).unwrap(),
+    }
+}
+
 fn modal() -> ModalSpec {
     ModalSpec {
         key: "study_modal".to_string(),
@@ -76,7 +83,7 @@ fn run_calls(event: &RuntimeEvent, actions: Vec<ActionSpec>) -> Vec<MutationCall
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ))
     .unwrap();
     mutation.calls()
@@ -146,14 +153,14 @@ fn create_channel_missing_input_errors() {
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
         },
         "",
-        "test",
+        &identity("test"),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
 }
 
 #[test]
 fn created_ids_recorded_in_run_result() {
-    let context = RuntimeContext::from_event(&submit("cozy"), "test");
+    let context = RuntimeContext::from_event(&submit("cozy"), &identity("test"));
     let plan = ActionPlan {
         steps: vec![
             PlannedAction::CreateChannel {

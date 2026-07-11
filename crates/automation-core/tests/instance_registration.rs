@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use automation_core::adapter::{AdapterErrorKind, PostPanelButtonSpec, ResolvedButtonRoute};
-use automation_core::event::{EventKind, RuntimeContext, RuntimeEvent};
+use automation_core::event::{EventKind, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent};
 use automation_core::interpret::interpret;
 use automation_core::mock::{
     MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall,
@@ -12,8 +12,8 @@ use automation_core::validate::{validate, ValidationError};
 use automation_core::AutomationServices;
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdGenerationError,
-    InstanceIdGenerator, InstanceKind, InstanceResources, InstanceStatus, InstanceStore,
-    SequenceInstanceIdGenerator,
+    InstanceIdGenerator, InstanceKind, InstanceResources, InstanceRuleSetVersion, InstanceStatus,
+    InstanceStore, SequenceInstanceIdGenerator,
 };
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef,
@@ -37,6 +37,7 @@ fn context(guild_id: GuildId) -> RuntimeContext {
         guild_id,
         actor: UserId(3),
         ruleset_key: "studyroom_demo".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
         inputs,
         instance: None,
     }
@@ -126,6 +127,7 @@ fn stored_instance(guild_id: GuildId, id: &str) -> AutomationInstance {
         id: InstanceId::parse(id).unwrap(),
         guild_id,
         ruleset_key: "existing".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
         kind: InstanceKind("existing".to_string()),
         created_by: UserId(99),
         resources: InstanceResources::default(),
@@ -495,7 +497,10 @@ fn full_study_room_run_registers_instance() {
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
         },
         "실패",
-        "studyroom_demo",
+        &RunningRuleSetIdentity {
+            key: "studyroom_demo".to_string(),
+            version: InstanceRuleSetVersion::new(1).unwrap(),
+        },
     ))
     .unwrap();
 
@@ -609,4 +614,52 @@ fn same_instance_id_is_allowed_in_different_guilds() {
         block_on(instances.list_by_guild(GuildId(8))).unwrap().len(),
         1
     );
+}
+
+#[test]
+fn running_ruleset_v7_is_pinned_on_registered_instance() {
+    let ruleset = study_ruleset();
+    let event = event(GuildId(7));
+    let instances = InMemoryInstanceStore::new();
+    let identity = RunningRuleSetIdentity {
+        key: "studyroom_demo".to_string(),
+        version: InstanceRuleSetVersion::new(7).unwrap(),
+    };
+
+    block_on(handle_event(
+        &event,
+        &ruleset,
+        &ResourceBindingMap::default(),
+        &AutomationServices {
+            mutation: &MockMutationAdapter::new(),
+            responder: &MockInteractionResponder::new(),
+            instances: &instances,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+        },
+        "실패",
+        &identity,
+    ))
+    .unwrap();
+
+    let instance = block_on(instances.get(GuildId(7), &InstanceId::parse("room_001").unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(instance.ruleset_version, identity.version);
+}
+
+#[test]
+fn register_instance_action_has_no_ruleset_version() {
+    let value = serde_json::to_value(register_action("instance", full_manifest())).unwrap();
+    assert!(value.get("ruleset_version").is_none());
+}
+
+#[test]
+fn non_instance_event_context_has_ruleset_version() {
+    let identity = RunningRuleSetIdentity {
+        key: "studyroom_demo".to_string(),
+        version: InstanceRuleSetVersion::new(7).unwrap(),
+    };
+    let context = RuntimeContext::from_event(&event(GuildId(7)), &identity);
+    assert_eq!(context.ruleset_key, identity.key);
+    assert_eq!(context.ruleset_version, identity.version);
 }
