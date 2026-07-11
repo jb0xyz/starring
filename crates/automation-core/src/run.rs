@@ -424,21 +424,19 @@ pub enum HandleOutcome {
     NoOp,
 }
 
-pub async fn handle_event<M, R, S, G>(
+async fn resolve_instance_and_run<M, R, S, G>(
     event: &RuntimeEvent,
-    ruleset: &InteractionRuleSet,
-    bindings: &ResourceBindingMap,
+    context: &mut RuntimeContext,
+    steps: Vec<PlannedAction>,
     services: &AutomationServices<'_, M, R, S, G>,
-    failure_message: &str,
     ruleset_key: &str,
-) -> Result<HandleOutcome, AdapterError>
+) -> Result<(), AdapterError>
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
 {
-    let mut context = RuntimeContext::from_event(event, ruleset_key);
     if let EventKind::InstanceAction {
         instance_id,
         action,
@@ -461,6 +459,25 @@ where
             action: action.clone(),
         });
     }
+    run(context, &ActionPlan { steps }, services).await?;
+    Ok(())
+}
+
+pub async fn handle_event<M, R, S, G>(
+    event: &RuntimeEvent,
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+    services: &AutomationServices<'_, M, R, S, G>,
+    failure_message: &str,
+    ruleset_key: &str,
+) -> Result<HandleOutcome, AdapterError>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceStore,
+    G: InstanceIdGenerator,
+{
+    let mut context = RuntimeContext::from_event(event, ruleset_key);
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let mut steps = plan.steps;
@@ -471,8 +488,9 @@ where
             } else {
                 false
             };
-            match run(&context, &ActionPlan { steps }, services).await {
-                Ok(_) => Ok(HandleOutcome::Executed),
+            match resolve_instance_and_run(event, &mut context, steps, services, ruleset_key).await
+            {
+                Ok(()) => Ok(HandleOutcome::Executed),
                 Err(error) => {
                     if defer_acked {
                         if let Ok(rendered) = render(

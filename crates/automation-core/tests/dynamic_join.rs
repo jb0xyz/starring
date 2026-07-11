@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use automation_core::adapter::InteractionResponder;
 use automation_core::adapter::{
     AdapterError, AdapterErrorKind, AutomationServices, PostPanelButtonSpec, ResolvedButtonRoute,
 };
@@ -8,12 +10,14 @@ use automation_core::interpret::interpret;
 use automation_core::mock::{
     MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall,
 };
-use automation_core::plan::{ActionPlan, PlannedAction, PlannedChannel, PlannedRole};
+use automation_core::plan::{
+    ActionPlan, ModalPresentation, PlannedAction, PlannedChannel, PlannedRole,
+};
 use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
-    InstanceStatus, InstanceStore, SequenceInstanceIdGenerator,
+    InstanceStatus, InstanceStore, InstanceStoreError, SequenceInstanceIdGenerator,
 };
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, CreatedRef, InstanceRef,
@@ -23,6 +27,97 @@ use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use futures::executor::block_on;
 use resource_resolution::ResourceBindingMap;
+
+#[derive(Clone, Default)]
+struct Trace(Arc<Mutex<Vec<String>>>);
+
+impl Trace {
+    fn record(&self, entry: String) {
+        self.0.lock().unwrap().push(entry);
+    }
+    fn entries(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+struct TracingStore {
+    trace: Trace,
+    inner: InMemoryInstanceStore,
+}
+
+impl InstanceStore for TracingStore {
+    async fn register(&self, instance: AutomationInstance) -> Result<(), InstanceStoreError> {
+        self.inner.register(instance).await
+    }
+    async fn get(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        self.trace.record("instance_store.get".to_string());
+        self.inner.get(guild_id, instance_id).await
+    }
+    async fn list_by_guild(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        self.inner.list_by_guild(guild_id).await
+    }
+    async fn update_status(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+        status: InstanceStatus,
+    ) -> Result<(), InstanceStoreError> {
+        self.inner
+            .update_status(guild_id, instance_id, status)
+            .await
+    }
+}
+
+struct TracingResponder {
+    trace: Trace,
+}
+
+impl InteractionResponder for TracingResponder {
+    async fn respond_ephemeral(&self, content: String) -> Result<(), AdapterError> {
+        self.trace.record(format!("respond_ephemeral:{content}"));
+        Ok(())
+    }
+    async fn open_modal(&self, _modal: &ModalPresentation) -> Result<(), AdapterError> {
+        self.trace.record("open_modal".to_string());
+        Ok(())
+    }
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        self.trace.record("defer_ephemeral".to_string());
+        Ok(())
+    }
+    async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
+        self.trace.record(format!("edit_response:{content}"));
+        Ok(())
+    }
+}
+
+struct FailingDeferResponder {
+    trace: Trace,
+}
+
+impl InteractionResponder for FailingDeferResponder {
+    async fn respond_ephemeral(&self, _content: String) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn open_modal(&self, _modal: &ModalPresentation) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        self.trace.record("defer_ephemeral".to_string());
+        Err(AdapterError::new(AdapterErrorKind::Unknown, "defer failed"))
+    }
+    async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
+        self.trace.record(format!("edit_response:{content}"));
+        Ok(())
+    }
+}
 
 fn instance_id() -> InstanceId {
     InstanceId::parse("room_001").unwrap()
@@ -79,6 +174,30 @@ fn join_ruleset(role: RoleRef) -> InteractionRuleSet {
                     target: ActionTarget::Actor,
                 },
                 ActionSpec::RespondEphemeral {
+                    content: "joined".to_string(),
+                },
+            ],
+        }],
+    }
+}
+
+fn deferred_join_ruleset(role: RoleRef) -> InteractionRuleSet {
+    InteractionRuleSet {
+        version: 1,
+        panels: vec![],
+        modals: vec![],
+        rules: vec![InteractionRule {
+            key: "join_rule".to_string(),
+            trigger: TriggerSpec::InstanceAction {
+                action: "join".to_string(),
+            },
+            actions: vec![
+                ActionSpec::DeferEphemeral,
+                ActionSpec::GrantRole {
+                    role,
+                    target: ActionTarget::Actor,
+                },
+                ActionSpec::EditResponse {
                     content: "joined".to_string(),
                 },
             ],
@@ -444,4 +563,135 @@ fn created_instance_button_route_resolves_before_posting() {
             }],
         }]
     );
+}
+
+#[test]
+fn deferred_join_defers_before_resolution_and_grants() {
+    let instances = InMemoryInstanceStore::new();
+    let stored = instance(
+        GuildId(7),
+        InstanceStatus::Active,
+        "studyroom",
+        InstanceResources {
+            roles: BTreeMap::from([("member_role".to_string(), RoleId(55))]),
+            ..InstanceResources::default()
+        },
+    );
+    block_on(instances.register(stored)).unwrap();
+    let mutation = MockMutationAdapter::new();
+    let responder = MockInteractionResponder::new();
+    let generator = SequenceInstanceIdGenerator::new("unused", 1);
+    let services = AutomationServices {
+        mutation: &mutation,
+        responder: &responder,
+        instances: &instances,
+        instance_ids: &generator,
+    };
+    let outcome = block_on(handle_event(
+        &event(GuildId(7), "join"),
+        &deferred_join_ruleset(instance_role(InstanceRef::Event, "member_role")),
+        &ResourceBindingMap::default(),
+        &services,
+        "could not join",
+        "studyroom",
+    ))
+    .unwrap();
+    assert_eq!(outcome, HandleOutcome::Executed);
+    assert_eq!(
+        mutation.calls(),
+        vec![MutationCall::GrantRole {
+            guild: GuildId(7),
+            member: UserId(42),
+            role: RoleId(55),
+        }]
+    );
+    assert_eq!(
+        responder.calls(),
+        vec![
+            ResponderCall::DeferEphemeral,
+            ResponderCall::EditResponse {
+                content: "joined".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        responder
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, ResponderCall::DeferEphemeral))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn deferred_join_missing_instance_traces_defer_then_lookup_then_edit() {
+    let trace = Trace::default();
+    let instances = TracingStore {
+        trace: trace.clone(),
+        inner: InMemoryInstanceStore::new(),
+    };
+    let mutation = MockMutationAdapter::new();
+    let responder = TracingResponder {
+        trace: trace.clone(),
+    };
+    let generator = SequenceInstanceIdGenerator::new("unused", 1);
+    let services = AutomationServices {
+        mutation: &mutation,
+        responder: &responder,
+        instances: &instances,
+        instance_ids: &generator,
+    };
+    let error = block_on(handle_event(
+        &event(GuildId(7), "join"),
+        &deferred_join_ruleset(instance_role(InstanceRef::Event, "member_role")),
+        &ResourceBindingMap::default(),
+        &services,
+        "could not join",
+        "studyroom",
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, AdapterErrorKind::NotFound);
+    assert!(error.message.contains("InstanceNotFound"));
+    assert_eq!(
+        trace.entries(),
+        vec![
+            "defer_ephemeral".to_string(),
+            "instance_store.get".to_string(),
+            "edit_response:could not join".to_string(),
+        ]
+    );
+    assert!(mutation.calls().is_empty());
+}
+
+#[test]
+fn deferred_join_defer_failure_skips_lookup_and_edit() {
+    let trace = Trace::default();
+    let instances = TracingStore {
+        trace: trace.clone(),
+        inner: InMemoryInstanceStore::new(),
+    };
+    let mutation = MockMutationAdapter::new();
+    let responder = FailingDeferResponder {
+        trace: trace.clone(),
+    };
+    let generator = SequenceInstanceIdGenerator::new("unused", 1);
+    let services = AutomationServices {
+        mutation: &mutation,
+        responder: &responder,
+        instances: &instances,
+        instance_ids: &generator,
+    };
+    let error = block_on(handle_event(
+        &event(GuildId(7), "join"),
+        &deferred_join_ruleset(instance_role(InstanceRef::Event, "member_role")),
+        &ResourceBindingMap::default(),
+        &services,
+        "could not join",
+        "studyroom",
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, AdapterErrorKind::Unknown);
+    assert_eq!(trace.entries(), vec!["defer_ephemeral".to_string()]);
+    assert!(mutation.calls().is_empty());
 }
