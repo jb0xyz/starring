@@ -1,4 +1,4 @@
-use automation_core::handle_event;
+use automation_core::{handle_event, AutomationServices};
 use automation_instance::{InstanceIdGenerator, InstanceStore};
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
@@ -25,16 +25,19 @@ pub async fn handle_interaction(
         return;
     };
     let responder = TwilightInteractionResponder::from_interaction(http, interaction, ruleset_key);
+    let services = AutomationServices {
+        mutation,
+        responder: &responder,
+        instances,
+        instance_ids,
+    };
     match handle_event(
         &event,
         ruleset,
         bindings,
-        mutation,
-        &responder,
+        &services,
         failure_message,
         ruleset_key,
-        instances,
-        instance_ids,
     )
     .await
     {

@@ -6,7 +6,7 @@ use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, Mutat
 use automation_core::plan::{ActionPlan, CreatedResource, PlannedAction};
 use automation_core::run::{handle_event, run};
 use automation_core::validate::{validate, ValidationError};
-use automation_core::RuntimeContext;
+use automation_core::{AutomationServices, RuntimeContext};
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
@@ -69,12 +69,14 @@ fn run_calls(event: &RuntimeEvent, actions: Vec<ActionSpec>) -> Vec<MutationCall
         event,
         &ruleset(actions),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     mutation.calls()
@@ -137,12 +139,14 @@ fn create_channel_missing_input_errors() {
             name: "study-${input.room_name}".to_string(),
         }]),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
 }
@@ -167,10 +171,12 @@ fn created_ids_recorded_in_run_result() {
     let created = block_on(run(
         &context,
         &plan,
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap();
     assert_eq!(

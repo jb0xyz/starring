@@ -131,3 +131,16 @@ pub trait InteractionResponder {
         ))
     }
 }
+
+pub struct AutomationServices<'a, M, R, S, G>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: automation_instance::InstanceStore,
+    G: automation_instance::InstanceIdGenerator,
+{
+    pub mutation: &'a M,
+    pub responder: &'a R,
+    pub instances: &'a S,
+    pub instance_ids: &'a G,
+}

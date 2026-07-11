@@ -8,6 +8,7 @@ use automation_core::plan::{
 use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
+use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ButtonSpec, ChannelRef, CreatedRef, InteractionRule, InteractionRuleSet,
@@ -79,10 +80,12 @@ fn run_calls(steps: Vec<PlannedAction>) -> Vec<MutationCall> {
     block_on(run(
         &context,
         &ActionPlan { steps },
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap();
     mutation.calls()
@@ -95,10 +98,12 @@ fn run_created(steps: Vec<PlannedAction>) -> Vec<CreatedResource> {
     block_on(run(
         &context,
         &ActionPlan { steps },
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap()
 }
@@ -249,10 +254,12 @@ fn missing_input_fails_post_panel() {
     assert!(block_on(run(
         &context,
         &ActionPlan { steps },
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .is_err());
 }

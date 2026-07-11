@@ -9,8 +9,8 @@ pub mod template;
 pub mod validate;
 
 pub use adapter::{
-    AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
-    InteractionResponder, PostPanelSpec,
+    AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
+    DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
 };
 pub use event::{EventKind, RuntimeContext, RuntimeEvent};
 pub use interpret::interpret;

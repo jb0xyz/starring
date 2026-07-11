@@ -7,6 +7,7 @@ use automation_core::plan::{ActionPlan, CreatedResource, PlannedAction, PlannedR
 use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
+use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ActionTarget, CreatedRef, InteractionRule, InteractionRuleSet, ModalFieldSpec,
@@ -98,10 +99,12 @@ fn created_role_granted_to_actor() {
     block_on(run(
         &context,
         &plan(steps),
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap();
     assert_eq!(
@@ -142,10 +145,12 @@ fn full_study_run_creates_then_grants() {
     let created = block_on(run(
         &context,
         &plan(steps),
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap();
     assert_eq!(
@@ -300,10 +305,12 @@ fn create_role_failure_skips_grant() {
     let result = block_on(run(
         &context,
         &plan(steps),
-        &FailCreate,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &FailCreate,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);
 }

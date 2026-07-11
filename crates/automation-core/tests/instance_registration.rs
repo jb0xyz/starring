@@ -9,6 +9,7 @@ use automation_core::mock::{
 use automation_core::plan::{ActionPlan, CreatedResource, PlannedAction, PlannedChannel};
 use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
+use automation_core::AutomationServices;
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdGenerationError,
     InstanceIdGenerator, InstanceKind, InstanceResources, InstanceStatus, InstanceStore,
@@ -140,10 +141,12 @@ fn register_instance_resolves_and_stores_manifest() {
     let created_resources = block_on(run(
         &context(GuildId(7)),
         &registration_plan(),
-        &mutation,
-        &responder,
-        &instances,
-        &instance_ids,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &instances,
+            instance_ids: &instance_ids,
+        },
     ))
     .unwrap();
     let instance_id = InstanceId::parse("room_001").unwrap();
@@ -219,10 +222,12 @@ fn unresolved_manifest_stops_before_id_generation() {
     let result = block_on(run(
         &context(GuildId(7)),
         &plan,
-        &MockMutationAdapter::new(),
-        &MockInteractionResponder::new(),
-        &InMemoryInstanceStore::new(),
-        &PanicGenerator,
+        &AutomationServices {
+            mutation: &MockMutationAdapter::new(),
+            responder: &MockInteractionResponder::new(),
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &PanicGenerator,
+        },
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
@@ -257,10 +262,12 @@ fn duplicate_store_registration_is_fail_fast() {
     let result = block_on(run(
         &context(GuildId(7)),
         &plan,
-        &mutation,
-        &responder,
-        &instances,
-        &SequenceInstanceIdGenerator::new("room", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &instances,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+        },
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
@@ -478,12 +485,14 @@ fn full_study_room_run_registers_instance() {
         &event,
         &ruleset,
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &instances,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+        },
         "실패",
         "studyroom_demo",
-        &instances,
-        &SequenceInstanceIdGenerator::new("room", 1),
     ))
     .unwrap();
 
@@ -558,19 +567,23 @@ fn same_instance_id_is_allowed_in_different_guilds() {
     let first = block_on(run(
         &context(GuildId(7)),
         &registration_plan(),
-        &MockMutationAdapter::new(),
-        &MockInteractionResponder::new(),
-        &instances,
-        &SequenceInstanceIdGenerator::new("room", 1),
+        &AutomationServices {
+            mutation: &MockMutationAdapter::new(),
+            responder: &MockInteractionResponder::new(),
+            instances: &instances,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+        },
     ))
     .unwrap();
     let second = block_on(run(
         &context(GuildId(8)),
         &registration_plan(),
-        &MockMutationAdapter::new(),
-        &MockInteractionResponder::new(),
-        &instances,
-        &SequenceInstanceIdGenerator::new("room", 1),
+        &AutomationServices {
+            mutation: &MockMutationAdapter::new(),
+            responder: &MockInteractionResponder::new(),
+            instances: &instances,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+        },
     ))
     .unwrap();
 

@@ -3,6 +3,7 @@ use automation_core::mock::{
     MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall,
 };
 use automation_core::run::{handle_event, HandleOutcome};
+use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
@@ -69,12 +70,14 @@ fn matching_event_grants_role_and_responds() {
         &click("verify_button"),
         &set,
         &bindings,
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
 
@@ -105,12 +108,14 @@ fn unmatched_event_is_noop_with_no_calls() {
         &click("other_button"),
         &set,
         &bindings,
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
 
@@ -134,12 +139,14 @@ fn mutation_failure_propagates() {
         &click("verify_button"),
         &set,
         &bindings,
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);

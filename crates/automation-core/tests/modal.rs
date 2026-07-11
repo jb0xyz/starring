@@ -7,6 +7,7 @@ use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, Respo
 use automation_core::plan::PlannedAction;
 use automation_core::run::{handle_event, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
+use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
@@ -237,12 +238,14 @@ fn default_responder_open_modal_is_unsupported() {
         &button_event("create_study_button"),
         &ruleset(),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Unsupported);
 }
@@ -255,12 +258,14 @@ fn mock_responder_runs_open_modal() {
         &button_event("create_study_button"),
         &ruleset(),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);

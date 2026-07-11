@@ -9,8 +9,8 @@ use discord_model::{ChannelId, MessageId, OverwriteTarget, RoleId};
 use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
-    AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
-    InteractionResponder, PostPanelSpec,
+    AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
+    DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
 };
 use crate::event::{RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
@@ -27,34 +27,39 @@ struct RuntimeBindings {
     created_instances: BTreeMap<String, InstanceId>,
 }
 
-pub async fn run(
+pub async fn run<M, R, S, G>(
     context: &RuntimeContext,
     plan: &ActionPlan,
-    mutation: &impl DiscordMutationAdapter,
-    responder: &impl InteractionResponder,
-    instances: &impl InstanceStore,
-    instance_ids: &impl InstanceIdGenerator,
-) -> Result<Vec<CreatedResource>, AdapterError> {
+    services: &AutomationServices<'_, M, R, S, G>,
+) -> Result<Vec<CreatedResource>, AdapterError>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceStore,
+    G: InstanceIdGenerator,
+{
     let mut created = Vec::new();
     let mut runtime = RuntimeBindings::default();
     for (action_index, step) in plan.steps.iter().enumerate() {
         match step {
             PlannedAction::GrantRole { role, target } => {
                 let role_id = resolve_planned_role(role, &runtime)?;
-                mutation
+                services
+                    .mutation
                     .grant_role(context.guild_id, *target, role_id)
                     .await?;
             }
             PlannedAction::RespondEphemeral { content } => {
                 let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
-                responder.respond_ephemeral(rendered).await?;
+                services.responder.respond_ephemeral(rendered).await?;
             }
             PlannedAction::OpenModal(modal) => {
-                responder.open_modal(modal).await?;
+                services.responder.open_modal(modal).await?;
             }
             PlannedAction::CreateChannel { key, name } => {
                 let rendered = render(name, context, SanitizeContext::ChannelName)?;
-                let id = mutation
+                let id = services
+                    .mutation
                     .create_channel(
                         context.guild_id,
                         CreateChannelSpec {
@@ -72,7 +77,8 @@ pub async fn run(
             }
             PlannedAction::CreateRole { key, name } => {
                 let rendered = render(name, context, SanitizeContext::RoleName)?;
-                let id = mutation
+                let id = services
+                    .mutation
                     .create_role(
                         context.guild_id,
                         CreateRoleSpec {
@@ -103,7 +109,8 @@ pub async fn run(
                         OverwriteTarget::Role(resolve_planned_role(role, &runtime)?)
                     }
                 };
-                mutation
+                services
+                    .mutation
                     .upsert_overwrite(
                         context.guild_id,
                         channel_id,
@@ -121,7 +128,8 @@ pub async fn run(
             } => {
                 let channel_id = resolve_planned_channel(channel, &runtime)?;
                 let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
-                let id = mutation
+                let id = services
+                    .mutation
                     .post_panel(
                         context.guild_id,
                         channel_id,
@@ -140,11 +148,11 @@ pub async fn run(
                 });
             }
             PlannedAction::DeferEphemeral => {
-                responder.defer_ephemeral().await?;
+                services.responder.defer_ephemeral().await?;
             }
             PlannedAction::EditResponse { content } => {
                 let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
-                responder.edit_response(rendered).await?;
+                services.responder.edit_response(rendered).await?;
             }
             PlannedAction::RegisterInstance {
                 key,
@@ -152,7 +160,7 @@ pub async fn run(
                 resources,
             } => {
                 let resolved = resolve_manifest(resources, &runtime)?;
-                let id = instance_ids.generate().map_err(|error| {
+                let id = services.instance_ids.generate().map_err(|error| {
                     AdapterError::new(
                         AdapterErrorKind::BadRequest,
                         format!("instance id error: {error:?}"),
@@ -167,12 +175,16 @@ pub async fn run(
                     resources: resolved,
                     status: InstanceStatus::Active,
                 };
-                instances.register(instance).await.map_err(|error| {
-                    AdapterError::new(
-                        AdapterErrorKind::BadRequest,
-                        format!("instance register error: {error:?}"),
-                    )
-                })?;
+                services
+                    .instances
+                    .register(instance)
+                    .await
+                    .map_err(|error| {
+                        AdapterError::new(
+                            AdapterErrorKind::BadRequest,
+                            format!("instance register error: {error:?}"),
+                        )
+                    })?;
                 runtime.created_instances.insert(key.clone(), id.clone());
                 created.push(CreatedResource::Instance {
                     action_index,
@@ -289,39 +301,32 @@ pub enum HandleOutcome {
     NoOp,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_event(
+pub async fn handle_event<M, R, S, G>(
     event: &RuntimeEvent,
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
-    mutation: &impl DiscordMutationAdapter,
-    responder: &impl InteractionResponder,
+    services: &AutomationServices<'_, M, R, S, G>,
     failure_message: &str,
     ruleset_key: &str,
-    instances: &impl InstanceStore,
-    instance_ids: &impl InstanceIdGenerator,
-) -> Result<HandleOutcome, AdapterError> {
+) -> Result<HandleOutcome, AdapterError>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceStore,
+    G: InstanceIdGenerator,
+{
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
             let context = RuntimeContext::from_event(event, ruleset_key);
             let mut steps = plan.steps;
             let defer_acked = if matches!(steps.first(), Some(PlannedAction::DeferEphemeral)) {
-                responder.defer_ephemeral().await?;
+                services.responder.defer_ephemeral().await?;
                 steps.remove(0);
                 true
             } else {
                 false
             };
-            match run(
-                &context,
-                &ActionPlan { steps },
-                mutation,
-                responder,
-                instances,
-                instance_ids,
-            )
-            .await
-            {
+            match run(&context, &ActionPlan { steps }, services).await {
                 Ok(_) => Ok(HandleOutcome::Executed),
                 Err(error) => {
                     if defer_acked {
@@ -330,7 +335,7 @@ pub async fn handle_event(
                             &context,
                             SanitizeContext::EphemeralMessageContent,
                         ) {
-                            let _ = responder.edit_response(rendered).await;
+                            let _ = services.responder.edit_response(rendered).await;
                         }
                     }
                     Err(error)

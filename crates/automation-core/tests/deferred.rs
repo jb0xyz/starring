@@ -6,6 +6,7 @@ use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, Respo
 use automation_core::plan::{ActionPlan, PlannedAction};
 use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
+use automation_core::AutomationServices;
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec,
@@ -83,10 +84,12 @@ fn run_executes_defer_and_edit() {
     block_on(run(
         &context,
         &ActionPlan { steps },
-        &mutation,
-        &responder,
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
     ))
     .unwrap();
     assert_eq!(
@@ -108,12 +111,14 @@ fn handle_event_defer_success_edits_completion() {
         &submit("cozy"),
         &defer_rule(),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "실패",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);
@@ -139,12 +144,14 @@ fn handle_event_failure_edits_failure_message() {
         &submit("cozy"),
         &defer_rule(),
         &ResourceBindingMap::default(),
-        &mutation,
-        &responder,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+        },
         "스터디룸 '${input.room_name}' 실패",
         "test",
-        &InMemoryInstanceStore::new(),
-        &SequenceInstanceIdGenerator::new("test", 1),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);
     assert_eq!(
