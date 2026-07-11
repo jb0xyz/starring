@@ -133,6 +133,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-panel-installation-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-panel-installation",
+ "automation-ruleset",
+ "discord-model",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "automation-ruleset"
 version = "0.1.0"
 dependencies = [

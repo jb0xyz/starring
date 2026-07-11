@@ -1,0 +1,13 @@
+[package]
+name = "automation-panel-installation-postgres"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-panel-installation = { path = "../automation-panel-installation" }
+automation-ruleset = { path = "../automation-ruleset" }
+discord-model = { path = "../discord-model" }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "derive", "macros", "migrate"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
