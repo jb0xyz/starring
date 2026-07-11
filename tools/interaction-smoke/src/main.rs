@@ -221,6 +221,7 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                     action: "join".to_string(),
                 },
                 actions: vec![
+                    ActionSpec::DeferEphemeral,
                     ActionSpec::GrantRole {
                         role: RoleRef::Instance {
                             instance: InstanceRef::Event,
@@ -228,7 +229,7 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                         },
                         target: ActionTarget::Actor,
                     },
-                    ActionSpec::RespondEphemeral {
+                    ActionSpec::EditResponse {
                         content: "스터디룸에 참가했습니다.".to_string(),
                     },
                 ],
@@ -263,4 +264,32 @@ async fn install_panel(
         .components(&components)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studyroom_ruleset_validates() {
+        validate(&studyroom_ruleset(), &bindings(1)).expect("studyroom ruleset should validate");
+    }
+
+    #[test]
+    fn join_rule_uses_deferred_contract() {
+        let ruleset = studyroom_ruleset();
+        let join = ruleset
+            .rules
+            .iter()
+            .find(|rule| rule.key == "study_join_rule")
+            .expect("join rule present");
+        assert!(matches!(
+            join.actions.first(),
+            Some(ActionSpec::DeferEphemeral)
+        ));
+        assert!(matches!(
+            join.actions.last(),
+            Some(ActionSpec::EditResponse { .. })
+        ));
+    }
 }
