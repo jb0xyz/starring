@@ -1,4 +1,5 @@
 use automation_core::handle_event;
+use automation_instance::{InstanceIdGenerator, InstanceStore};
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
@@ -8,6 +9,7 @@ use crate::convert::interaction_to_event;
 use crate::mutation::TwilightMutationAdapter;
 use crate::responder::TwilightInteractionResponder;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_interaction(
     http: &Client,
     ruleset_key: &str,
@@ -16,6 +18,8 @@ pub async fn handle_interaction(
     bindings: &ResourceBindingMap,
     interaction: &Interaction,
     failure_message: &str,
+    instances: &impl InstanceStore,
+    instance_ids: &impl InstanceIdGenerator,
 ) {
     let Some(event) = interaction_to_event(interaction, ruleset_key) else {
         return;
@@ -28,6 +32,9 @@ pub async fn handle_interaction(
         mutation,
         &responder,
         failure_message,
+        ruleset_key,
+        instances,
+        instance_ids,
     )
     .await
     {

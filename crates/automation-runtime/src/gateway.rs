@@ -1,3 +1,4 @@
+use automation_instance::{InstanceIdGenerator, InstanceStore};
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
@@ -12,6 +13,8 @@ pub async fn run(
     ruleset: InteractionRuleSet,
     bindings: ResourceBindingMap,
     failure_message: String,
+    instances: impl InstanceStore,
+    instance_ids: impl InstanceIdGenerator,
 ) {
     let http = Client::new(token.clone());
     let mutation = TwilightMutationAdapter::new(&http, ruleset_key.clone());
@@ -34,6 +37,8 @@ pub async fn run(
                 &bindings,
                 &interaction_create.0,
                 &failure_message,
+                &instances,
+                &instance_ids,
             )
             .await;
         }

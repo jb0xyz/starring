@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 automation-core = { path = "../../crates/automation-core" }
+automation-instance = { path = "../../crates/automation-instance" }
 automation-runtime = { path = "../../crates/automation-runtime" }
 automation-state = { path = "../../crates/automation-state" }
 desired-state = { path = "../../crates/desired-state" }

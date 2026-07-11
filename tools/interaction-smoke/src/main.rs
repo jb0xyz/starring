@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
 use std::env;
 
 use automation_core::validate;
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonSpec, ChannelRef, CreatedRef, InteractionRule,
-    InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec, OverwriteTargetSpec, PanelSpec,
-    RoleRef, TriggerSpec,
+    ActionSpec, ActionTarget, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
+    InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
+    ModalSpec, OverwriteTargetSpec, PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{GuildId, Permissions};
@@ -31,12 +33,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     install_panel(&token, guild_id, channel_id).await?;
     eprintln!("panel installed; listening for interactions (Ctrl-C to stop)");
+    let instances = InMemoryInstanceStore::new();
+    let instance_ids = SequenceInstanceIdGenerator::new("room", 1);
     gateway::run(
         token,
         RULESET_KEY.to_string(),
         ruleset,
         ResourceBindingMap::default(),
         "스터디룸 생성에 실패했습니다. 봇 권한 또는 역할 순서를 확인해주세요.".to_string(),
+        instances,
+        instance_ids,
     )
     .await;
     Ok(())
@@ -114,6 +120,7 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                         target: ActionTarget::Actor,
                     },
                     ActionSpec::PostPanel {
+                        key: "study_welcome_panel".to_string(),
                         channel: ChannelRef::Created(created("study_channel")),
                         content:
                             "스터디룸 '${input.room_name}'이 생성되었습니다. 이 채널은 스터디 멤버만 볼 수 있어요."
@@ -122,6 +129,24 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             key: "study_help".to_string(),
                             label: "도움말".to_string(),
                         }],
+                    },
+                    ActionSpec::RegisterInstance {
+                        key: "study_room_instance".to_string(),
+                        kind: InstanceKind("study_room".to_string()),
+                        resources: InstanceResourceRefs {
+                            roles: BTreeMap::from([(
+                                "member_role".to_string(),
+                                created("study_member_role"),
+                            )]),
+                            channels: BTreeMap::from([(
+                                "room_channel".to_string(),
+                                created("study_channel"),
+                            )]),
+                            messages: BTreeMap::from([(
+                                "welcome_panel".to_string(),
+                                created("study_welcome_panel"),
+                            )]),
+                        },
                     },
                     ActionSpec::EditResponse {
                         content: "스터디룸 '${input.room_name}' 생성 완료! 새 채널을 확인하세요."

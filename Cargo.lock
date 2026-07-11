@@ -95,6 +95,7 @@ name = "automation-runtime"
 version = "0.1.0"
 dependencies = [
  "automation-core",
+ "automation-instance",
  "automation-state",
  "discord-model",
  "resource-resolution",
@@ -801,6 +802,7 @@ name = "interaction-smoke"
 version = "0.1.0"
 dependencies = [
  "automation-core",
+ "automation-instance",
  "automation-runtime",
  "automation-state",
  "desired-state",
