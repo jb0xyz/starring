@@ -1,12 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use automation_state::ButtonSpec;
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::adapter::{
     AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, InteractionResponder,
-    PostPanelSpec,
+    PostPanelButtonSpec, PostPanelSpec,
 };
 use crate::plan::ModalPresentation;
 
@@ -36,7 +35,7 @@ pub enum MutationCall {
         guild: GuildId,
         channel: ChannelId,
         content: String,
-        buttons: Vec<ButtonSpec>,
+        buttons: Vec<PostPanelButtonSpec>,
     },
 }
 

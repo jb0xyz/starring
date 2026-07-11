@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use automation_core::adapter::{PostPanelButtonSpec, ResolvedButtonRoute};
 use automation_core::event::{EventKind, RuntimeContext, RuntimeEvent};
 use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, MutationCall};
 use automation_core::plan::{
@@ -57,6 +58,15 @@ fn button(key: &str, label: &str) -> ButtonSpec {
     ButtonSpec {
         label: label.to_string(),
         route: ButtonRoute::Static {
+            key: key.to_string(),
+        },
+    }
+}
+
+fn resolved_button(key: &str, label: &str) -> PostPanelButtonSpec {
+    PostPanelButtonSpec {
+        label: label.to_string(),
+        route: ResolvedButtonRoute::Static {
             key: key.to_string(),
         },
     }
@@ -135,7 +145,7 @@ fn post_panel_into_created_channel() {
                 guild: GuildId(7),
                 channel: ChannelId(800_000),
                 content: "환영 cozy".to_string(),
-                buttons: vec![button("study_help", "도움말")],
+                buttons: vec![resolved_button("study_help", "도움말")],
             },
         ]
     );
@@ -211,7 +221,7 @@ fn full_study_room_call_sequence() {
                 guild: GuildId(7),
                 channel: ChannelId(800_001),
                 content: "스터디룸 개설 완료".to_string(),
-                buttons: vec![button("study_help", "도움말")],
+                buttons: vec![resolved_button("study_help", "도움말")],
             },
         ]
     );

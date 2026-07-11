@@ -6,11 +6,11 @@ use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
-    InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
-    ModalSpec, OverwriteTargetSpec, PanelSpec, RoleRef, TriggerSpec,
+    InstanceRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec,
+    ModalFieldStyle, ModalSpec, OverwriteTargetSpec, PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
-use discord_model::{GuildId, Permissions};
+use discord_model::{ChannelId, GuildId, Permissions};
 use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
 use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
@@ -29,7 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
 
     let ruleset = studyroom_ruleset();
-    validate(&ruleset, &ResourceBindingMap::default()).expect("studyroom ruleset should validate");
+    let bindings = bindings(channel_id);
+    validate(&ruleset, &bindings).expect("studyroom ruleset should validate");
 
     install_panel(&token, guild_id, channel_id).await?;
     eprintln!("panel installed; listening for interactions (Ctrl-C to stop)");
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token,
         RULESET_KEY.to_string(),
         ruleset,
-        ResourceBindingMap::default(),
+        bindings,
         "스터디룸 생성에 실패했습니다. 봇 권한 또는 역할 순서를 확인해주세요.".to_string(),
         instances,
         instance_ids,
@@ -54,12 +55,20 @@ fn created(key: &str) -> CreatedRef {
     }
 }
 
+fn bindings(channel_id: u64) -> ResourceBindingMap {
+    let mut bindings = ResourceBindingMap::default();
+    bindings
+        .channel_bindings
+        .insert(ResourceKey("study_hub".to_string()), ChannelId(channel_id));
+    bindings
+}
+
 fn studyroom_ruleset() -> InteractionRuleSet {
     InteractionRuleSet {
         version: 1,
         panels: vec![PanelSpec {
             key: "study_panel".to_string(),
-            channel: ResourceKey("study_channel".to_string()),
+            channel: ResourceKey("study_hub".to_string()),
             content: "Create a study room".to_string(),
             buttons: vec![ButtonSpec {
                 label: "Create study room".to_string(),
@@ -152,6 +161,18 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             )]),
                         },
                     },
+                    ActionSpec::PostPanel {
+                        key: "study_hub_entry".to_string(),
+                        channel: ChannelRef::Existing(ResourceKey("study_hub".to_string())),
+                        content: "'${input.room_name}' 스터디룸이 열렸습니다.".to_string(),
+                        buttons: vec![ButtonSpec {
+                            label: "참가하기".to_string(),
+                            route: ButtonRoute::InstanceAction {
+                                instance: InstanceRef::Created(created("study_room_instance")),
+                                action: "join".to_string(),
+                            },
+                        }],
+                    },
                     ActionSpec::EditResponse {
                         content: "스터디룸 '${input.room_name}' 생성 완료! 새 채널을 확인하세요."
                             .to_string(),
@@ -165,9 +186,27 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                 },
                 actions: vec![ActionSpec::RespondEphemeral {
                     content:
-                        "이 채널은 스터디 멤버만 볼 수 있는 비공개 스터디룸입니다. 공개 참가 기능은 다음 단계에서 연결됩니다."
+                        "이 채널은 스터디 멤버만 볼 수 있는 비공개 스터디룸입니다."
                             .to_string(),
                 }],
+            },
+            InteractionRule {
+                key: "study_join_rule".to_string(),
+                trigger: TriggerSpec::InstanceAction {
+                    action: "join".to_string(),
+                },
+                actions: vec![
+                    ActionSpec::GrantRole {
+                        role: RoleRef::Instance {
+                            instance: InstanceRef::Event,
+                            alias: "member_role".to_string(),
+                        },
+                        target: ActionTarget::Actor,
+                    },
+                    ActionSpec::RespondEphemeral {
+                        content: "스터디룸에 참가했습니다.".to_string(),
+                    },
+                ],
             },
         ],
     }

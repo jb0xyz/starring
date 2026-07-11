@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use automation_core::adapter::AdapterErrorKind;
+use automation_core::adapter::{AdapterErrorKind, PostPanelButtonSpec, ResolvedButtonRoute};
 use automation_core::event::{EventKind, RuntimeContext, RuntimeEvent};
 use automation_core::interpret::interpret;
 use automation_core::mock::{
@@ -543,9 +543,9 @@ fn full_study_room_run_registers_instance() {
                 guild: GuildId(7),
                 channel: ChannelId(800_001),
                 content: "환영합니다.".to_string(),
-                buttons: vec![ButtonSpec {
+                buttons: vec![PostPanelButtonSpec {
                     label: "도움말".to_string(),
-                    route: ButtonRoute::Static {
+                    route: ResolvedButtonRoute::Static {
                         key: "study_help".to_string(),
                     },
                 }],

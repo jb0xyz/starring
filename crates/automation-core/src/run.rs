@@ -4,13 +4,16 @@ use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
     InstanceStore, InstanceStoreError,
 };
-use automation_state::{InstanceResourceRefs, InteractionRuleSet};
+use automation_state::{
+    ButtonRoute, ButtonSpec, InstanceRef, InstanceResourceRefs, InteractionRuleSet,
+};
 use discord_model::{ChannelId, MessageId, OverwriteTarget, RoleId};
 use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
     AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
-    DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
+    DiscordMutationAdapter, InteractionResponder, PostPanelButtonSpec, PostPanelSpec,
+    ResolvedButtonRoute,
 };
 use crate::event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
@@ -135,7 +138,7 @@ where
                         channel_id,
                         PostPanelSpec {
                             content: rendered,
-                            buttons: buttons.clone(),
+                            buttons: resolve_panel_buttons(buttons, &runtime, context)?,
                         },
                     )
                     .await?;
@@ -239,6 +242,50 @@ fn resolve_planned_channel(
     }
 }
 
+fn resolve_panel_buttons(
+    buttons: &[ButtonSpec],
+    runtime: &RuntimeBindings,
+    context: &RuntimeContext,
+) -> Result<Vec<PostPanelButtonSpec>, AdapterError> {
+    buttons
+        .iter()
+        .map(|button| {
+            let route = match &button.route {
+                ButtonRoute::Static { key } => ResolvedButtonRoute::Static { key: key.clone() },
+                ButtonRoute::InstanceAction { instance, action } => {
+                    ResolvedButtonRoute::InstanceAction {
+                        instance_id: resolve_button_instance(instance, runtime, context)?,
+                        action: action.clone(),
+                    }
+                }
+            };
+            Ok(PostPanelButtonSpec {
+                label: button.label.clone(),
+                route,
+            })
+        })
+        .collect()
+}
+
+fn resolve_button_instance(
+    instance: &InstanceRef,
+    runtime: &RuntimeBindings,
+    context: &RuntimeContext,
+) -> Result<InstanceId, AdapterError> {
+    match instance {
+        InstanceRef::Created(created) => runtime
+            .created_instances
+            .get(&created.created)
+            .cloned()
+            .ok_or_else(|| unresolved_created_instance(&created.created)),
+        InstanceRef::Event => context
+            .instance
+            .as_ref()
+            .map(|resolved| resolved.instance.id.clone())
+            .ok_or_else(event_instance_missing),
+    }
+}
+
 fn resolve_manifest(
     refs: &InstanceResourceRefs,
     runtime: &RuntimeBindings,
@@ -306,6 +353,20 @@ fn unresolved_created_channel(key: &str) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::BadRequest,
         format!("unresolved created channel: {key}"),
+    )
+}
+
+fn unresolved_created_instance(key: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("unresolved created instance: {key}"),
+    )
+}
+
+fn event_instance_missing() -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        "InstanceContextMissing: button route",
     )
 }
 

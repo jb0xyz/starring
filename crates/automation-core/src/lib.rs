@@ -10,7 +10,8 @@ pub mod validate;
 
 pub use adapter::{
     AdapterError, AdapterErrorKind, AutomationServices, CreateChannelSpec, CreateRoleSpec,
-    DiscordMutationAdapter, InteractionResponder, PostPanelSpec,
+    DiscordMutationAdapter, InteractionResponder, PostPanelButtonSpec, PostPanelSpec,
+    ResolvedButtonRoute,
 };
 pub use event::{EventKind, ResolvedInstanceContext, RuntimeContext, RuntimeEvent};
 pub use interpret::interpret;

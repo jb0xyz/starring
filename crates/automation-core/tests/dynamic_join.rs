@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 
-use automation_core::adapter::{AdapterError, AdapterErrorKind, AutomationServices};
+use automation_core::adapter::{
+    AdapterError, AdapterErrorKind, AutomationServices, PostPanelButtonSpec, ResolvedButtonRoute,
+};
 use automation_core::event::{EventKind, RuntimeEvent};
 use automation_core::interpret::interpret;
 use automation_core::mock::{
     MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall,
 };
-use automation_core::plan::{PlannedAction, PlannedRole};
-use automation_core::run::{handle_event, HandleOutcome};
+use automation_core::plan::{ActionPlan, PlannedAction, PlannedChannel, PlannedRole};
+use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
     InstanceStatus, InstanceStore, SequenceInstanceIdGenerator,
 };
 use automation_state::{
-    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, CreatedRef, InstanceRef, InteractionRule,
-    InteractionRuleSet, PanelSpec, RoleRef, TriggerSpec,
+    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, CreatedRef, InstanceRef,
+    InstanceResourceRefs, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
@@ -379,4 +381,67 @@ fn invalid_instance_role_alias_fails_validation() {
         rule: "join_rule".to_string(),
         alias: "bad alias".to_string(),
     }));
+}
+
+#[test]
+fn created_instance_button_route_resolves_before_posting() {
+    let mutation = MockMutationAdapter::new();
+    let responder = MockInteractionResponder::new();
+    let instances = InMemoryInstanceStore::new();
+    let generator = SequenceInstanceIdGenerator::new("room", 1);
+    let services = AutomationServices {
+        mutation: &mutation,
+        responder: &responder,
+        instances: &instances,
+        instance_ids: &generator,
+    };
+    let context = automation_core::RuntimeContext::from_event(
+        &RuntimeEvent {
+            guild_id: GuildId(7),
+            actor: UserId(42),
+            kind: EventKind::ButtonClick {
+                component: "create".to_string(),
+            },
+        },
+        "studyroom",
+    );
+    let plan = ActionPlan {
+        steps: vec![
+            PlannedAction::RegisterInstance {
+                key: "study_room_instance".to_string(),
+                kind: InstanceKind("study_room".to_string()),
+                resources: InstanceResourceRefs::default(),
+            },
+            PlannedAction::PostPanel {
+                key: "hub_entry".to_string(),
+                channel: PlannedChannel::Resolved(ChannelId(99)),
+                content: "join".to_string(),
+                buttons: vec![ButtonSpec {
+                    label: "Join".to_string(),
+                    route: ButtonRoute::InstanceAction {
+                        instance: InstanceRef::Created(CreatedRef {
+                            created: "study_room_instance".to_string(),
+                        }),
+                        action: "join".to_string(),
+                    },
+                }],
+            },
+        ],
+    };
+    block_on(run(&context, &plan, &services)).unwrap();
+    assert_eq!(
+        mutation.calls(),
+        vec![MutationCall::PostPanel {
+            guild: GuildId(7),
+            channel: ChannelId(99),
+            content: "join".to_string(),
+            buttons: vec![PostPanelButtonSpec {
+                label: "Join".to_string(),
+                route: ResolvedButtonRoute::InstanceAction {
+                    instance_id: instance_id(),
+                    action: "join".to_string(),
+                },
+            }],
+        }]
+    );
 }

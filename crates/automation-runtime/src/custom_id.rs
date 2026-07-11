@@ -1,6 +1,7 @@
 use discord_model::GuildId;
 
 const PREFIX: &str = "starring";
+const INSTANCE: &str = "i";
 const BUTTON: &str = "button";
 const MODAL: &str = "modal";
 
@@ -11,11 +12,17 @@ pub enum ComponentKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedCustomId {
-    pub guild_id: GuildId,
-    pub ruleset_key: String,
-    pub kind: ComponentKind,
-    pub key: String,
+pub enum ParsedCustomId {
+    Component {
+        guild_id: GuildId,
+        ruleset_key: String,
+        kind: ComponentKind,
+        key: String,
+    },
+    InstanceAction {
+        instance_id: String,
+        action: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,13 +47,26 @@ pub fn encode_modal(guild_id: GuildId, ruleset_key: &str, modal_key: &str) -> St
     )
 }
 
+pub fn encode_instance_action(instance_id: &str, action: &str) -> String {
+    format!("{PREFIX}:{INSTANCE}:{instance_id}:{action}")
+}
+
 pub fn decode(custom_id: &str) -> Result<ParsedCustomId, CustomIdError> {
     let parts: Vec<&str> = custom_id.split(':').collect();
-    if parts.len() != 5 {
-        return Err(CustomIdError::WrongShape);
-    }
     if parts[0] != PREFIX {
         return Err(CustomIdError::WrongPrefix);
+    }
+    if parts.get(1) == Some(&INSTANCE) {
+        if parts.len() != 4 {
+            return Err(CustomIdError::WrongShape);
+        }
+        return Ok(ParsedCustomId::InstanceAction {
+            instance_id: parts[2].to_string(),
+            action: parts[3].to_string(),
+        });
+    }
+    if parts.len() != 5 {
+        return Err(CustomIdError::WrongShape);
     }
     let guild_id = parts[1]
         .parse::<u64>()
@@ -57,7 +77,7 @@ pub fn decode(custom_id: &str) -> Result<ParsedCustomId, CustomIdError> {
         MODAL => ComponentKind::Modal,
         _ => return Err(CustomIdError::UnknownKind),
     };
-    Ok(ParsedCustomId {
+    Ok(ParsedCustomId::Component {
         guild_id,
         ruleset_key: parts[2].to_string(),
         kind,
@@ -78,7 +98,7 @@ mod tests {
         );
         assert_eq!(
             decode(&encoded).unwrap(),
-            ParsedCustomId {
+            ParsedCustomId::Component {
                 guild_id: GuildId(123),
                 ruleset_key: "study_demo".to_string(),
                 kind: ComponentKind::Button,
@@ -92,8 +112,14 @@ mod tests {
         let encoded = encode_modal(GuildId(123), "study_demo", "create_study_modal");
         assert_eq!(encoded, "starring:123:study_demo:modal:create_study_modal");
         let parsed = decode(&encoded).unwrap();
-        assert_eq!(parsed.kind, ComponentKind::Modal);
-        assert_eq!(parsed.key, "create_study_modal");
+        assert!(matches!(
+            parsed,
+            ParsedCustomId::Component {
+                kind: ComponentKind::Modal,
+                key,
+                ..
+            } if key == "create_study_modal"
+        ));
     }
 
     #[test]
@@ -125,6 +151,35 @@ mod tests {
         assert_eq!(
             decode("starring:1:rs:select:s").unwrap_err(),
             CustomIdError::UnknownKind
+        );
+    }
+
+    #[test]
+    fn encode_instance_action_roundtrip() {
+        let encoded = encode_instance_action("room_001", "join");
+        assert_eq!(encoded, "starring:i:room_001:join");
+        assert_eq!(
+            decode(&encoded).unwrap(),
+            ParsedCustomId::InstanceAction {
+                instance_id: "room_001".to_string(),
+                action: "join".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decode_rejects_instance_without_action() {
+        assert_eq!(
+            decode("starring:i:room_001").unwrap_err(),
+            CustomIdError::WrongShape
+        );
+    }
+
+    #[test]
+    fn decode_rejects_instance_extra_segment() {
+        assert_eq!(
+            decode("starring:i:room_001:join:extra").unwrap_err(),
+            CustomIdError::WrongShape
         );
     }
 }

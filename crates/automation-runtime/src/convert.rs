@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use automation_core::{EventKind, RuntimeEvent};
+use automation_instance::InstanceId;
 use discord_model::{GuildId, UserId};
 use twilight_model::application::interaction::modal::{
     ModalInteractionComponent, ModalInteractionData,
@@ -14,34 +15,26 @@ pub fn interaction_to_event(interaction: &Interaction, ruleset_key: &str) -> Opt
     let actor = actor_id(interaction)?;
     match &interaction.data {
         Some(InteractionData::MessageComponent(data)) => {
-            let parsed = custom_id::decode(&data.custom_id).ok()?;
-            if parsed.kind != ComponentKind::Button {
-                return None;
-            }
-            if !matches_context(&parsed, ruleset_key, guild_id) {
-                return None;
-            }
-            Some(RuntimeEvent {
-                guild_id,
-                actor,
-                kind: EventKind::ButtonClick {
-                    component: parsed.key,
-                },
-            })
+            message_component_event(guild_id, actor, &data.custom_id, ruleset_key)
         }
         Some(InteractionData::ModalSubmit(data)) => {
-            let parsed = custom_id::decode(&data.custom_id).ok()?;
-            if parsed.kind != ComponentKind::Modal {
+            let ParsedCustomId::Component {
+                guild_id: parsed_guild,
+                ruleset_key: parsed_ruleset,
+                kind: ComponentKind::Modal,
+                key,
+            } = custom_id::decode(&data.custom_id).ok()?
+            else {
                 return None;
-            }
-            if !matches_context(&parsed, ruleset_key, guild_id) {
+            };
+            if !matches_context(&parsed_ruleset, parsed_guild, ruleset_key, guild_id) {
                 return None;
             }
             Some(RuntimeEvent {
                 guild_id,
                 actor,
                 kind: EventKind::ModalSubmit {
-                    modal: parsed.key,
+                    modal: key,
                     inputs: collect_inputs(data),
                 },
             })
@@ -50,8 +43,47 @@ pub fn interaction_to_event(interaction: &Interaction, ruleset_key: &str) -> Opt
     }
 }
 
-fn matches_context(parsed: &ParsedCustomId, ruleset_key: &str, guild_id: GuildId) -> bool {
-    parsed.ruleset_key == ruleset_key && parsed.guild_id == guild_id
+fn message_component_event(
+    guild_id: GuildId,
+    actor: UserId,
+    custom_id: &str,
+    ruleset_key: &str,
+) -> Option<RuntimeEvent> {
+    match custom_id::decode(custom_id).ok()? {
+        ParsedCustomId::Component {
+            guild_id: parsed_guild,
+            ruleset_key: parsed_ruleset,
+            kind: ComponentKind::Button,
+            key,
+        } if matches_context(&parsed_ruleset, parsed_guild, ruleset_key, guild_id) => {
+            Some(RuntimeEvent {
+                guild_id,
+                actor,
+                kind: EventKind::ButtonClick { component: key },
+            })
+        }
+        ParsedCustomId::InstanceAction {
+            instance_id,
+            action,
+        } => Some(RuntimeEvent {
+            guild_id,
+            actor,
+            kind: EventKind::InstanceAction {
+                instance_id: InstanceId::parse(&instance_id).ok()?,
+                action,
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn matches_context(
+    parsed_ruleset: &str,
+    parsed_guild: GuildId,
+    ruleset_key: &str,
+    guild_id: GuildId,
+) -> bool {
+    parsed_ruleset == ruleset_key && parsed_guild == guild_id
 }
 
 fn collect_inputs(data: &ModalInteractionData) -> BTreeMap<String, String> {
@@ -92,19 +124,11 @@ fn actor_id(interaction: &Interaction) -> Option<UserId> {
 mod tests {
     use super::*;
 
-    fn parsed(ruleset: &str, guild: u64) -> ParsedCustomId {
-        ParsedCustomId {
-            guild_id: GuildId(guild),
-            ruleset_key: ruleset.to_string(),
-            kind: ComponentKind::Button,
-            key: "study_help".to_string(),
-        }
-    }
-
     #[test]
     fn matches_same_context() {
         assert!(matches_context(
-            &parsed("studyroom_demo", 7),
+            "studyroom_demo",
+            GuildId(7),
             "studyroom_demo",
             GuildId(7)
         ));
@@ -113,7 +137,8 @@ mod tests {
     #[test]
     fn rejects_ruleset_mismatch() {
         assert!(!matches_context(
-            &parsed("other_demo", 7),
+            "other_demo",
+            GuildId(7),
             "studyroom_demo",
             GuildId(7)
         ));
@@ -122,9 +147,52 @@ mod tests {
     #[test]
     fn rejects_guild_mismatch() {
         assert!(!matches_context(
-            &parsed("studyroom_demo", 9),
+            "studyroom_demo",
+            GuildId(9),
             "studyroom_demo",
             GuildId(7)
         ));
+    }
+
+    #[test]
+    fn instance_action_converts_without_ruleset_guard() {
+        assert_eq!(
+            message_component_event(
+                GuildId(7),
+                UserId(42),
+                "starring:i:room_001:join",
+                "other_ruleset",
+            ),
+            Some(RuntimeEvent {
+                guild_id: GuildId(7),
+                actor: UserId(42),
+                kind: EventKind::InstanceAction {
+                    instance_id: automation_instance::InstanceId::parse("room_001").unwrap(),
+                    action: "join".to_string(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_instance_id_is_rejected() {
+        assert!(message_component_event(
+            GuildId(7),
+            UserId(42),
+            "starring:i:bad id:join",
+            "studyroom_demo",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn static_button_still_requires_context() {
+        assert!(message_component_event(
+            GuildId(7),
+            UserId(42),
+            "starring:7:other:button:help",
+            "studyroom_demo",
+        )
+        .is_none());
     }
 }

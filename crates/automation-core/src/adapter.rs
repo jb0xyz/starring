@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use automation_state::ButtonSpec;
+use automation_instance::InstanceId;
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::plan::ModalPresentation;
@@ -45,7 +45,24 @@ pub struct CreateRoleSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostPanelSpec {
     pub content: String,
-    pub buttons: Vec<ButtonSpec>,
+    pub buttons: Vec<PostPanelButtonSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostPanelButtonSpec {
+    pub label: String,
+    pub route: ResolvedButtonRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedButtonRoute {
+    Static {
+        key: String,
+    },
+    InstanceAction {
+        instance_id: InstanceId,
+        action: String,
+    },
 }
 
 #[allow(async_fn_in_trait)]

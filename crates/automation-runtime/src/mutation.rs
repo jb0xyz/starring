@@ -1,7 +1,7 @@
 use automation_core::{
-    AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, PostPanelSpec,
+    AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, PostPanelButtonSpec,
+    PostPanelSpec, ResolvedButtonRoute,
 };
-use automation_state::ButtonSpec;
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use twilight_http::Client;
 use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
@@ -9,7 +9,7 @@ use twilight_model::guild::Permissions as TwilightPermissions;
 use twilight_model::http::permission_overwrite::{PermissionOverwrite, PermissionOverwriteType};
 use twilight_model::id::Id;
 
-use crate::custom_id::encode_button;
+use crate::custom_id::{encode_button, encode_instance_action};
 use crate::error::{classify_body_error, classify_error};
 
 pub struct TwilightMutationAdapter<'a> {
@@ -44,10 +44,21 @@ fn to_permission_overwrite(
     }
 }
 
-fn to_button_component(guild: GuildId, ruleset_key: &str, button: &ButtonSpec) -> Component {
+fn to_button_component(
+    guild: GuildId,
+    ruleset_key: &str,
+    button: &PostPanelButtonSpec,
+) -> Component {
+    let custom_id = match &button.route {
+        ResolvedButtonRoute::Static { key } => encode_button(guild, ruleset_key, key),
+        ResolvedButtonRoute::InstanceAction {
+            instance_id,
+            action,
+        } => encode_instance_action(instance_id.as_str(), action),
+    };
     Component::Button(Button {
         id: None,
-        custom_id: Some(encode_button(guild, ruleset_key, &button.key)),
+        custom_id: Some(custom_id),
         disabled: false,
         emoji: None,
         label: Some(button.label.clone()),
