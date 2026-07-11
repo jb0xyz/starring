@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
 
-use automation_core::validate;
 use automation_runtime::{custom_id, gateway};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -9,7 +8,7 @@ use automation_state::{
     ModalFieldStyle, ModalSpec, OverwriteTargetSpec, PanelSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
-use discord_model::{ChannelId, GuildId, Permissions};
+use discord_model::{ChannelId, GuildId, Permissions, RoleId, UserId};
 use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
 use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
@@ -25,14 +24,11 @@ const MODAL_KEY: &str = "create_study_modal";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let token = env::var("DISCORD_TEST_TOKEN")?;
-    let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
-    let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
-    let database_url = env::var("STARRING_DATABASE_URL")?;
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
+    let force_activate = std::env::args().any(|a| a == "--force-activate");
 
-    let ruleset = studyroom_ruleset();
-    let bindings = bindings(channel_id);
-    validate(&ruleset, &bindings).expect("studyroom ruleset should validate");
+    let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
+    let database_url = env::var("STARRING_DATABASE_URL")?;
 
     let pool = sqlx::PgPool::connect(&database_url)
         .await
@@ -41,24 +37,147 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run(&pool)
         .await
         .map_err(|error| {
-            eprintln!("postgres startup: migration failed: {error}");
+            eprintln!("postgres startup: instance migration failed: {error}");
             "PostgreSQL startup failed during migration".to_string()
         })?;
+    automation_ruleset_postgres::MIGRATOR
+        .run(&pool)
+        .await
+        .map_err(|error| {
+            eprintln!("postgres startup: ruleset migration failed: {error}");
+            "PostgreSQL startup failed during migration".to_string()
+        })?;
+
+    let ruleset_store = automation_ruleset_postgres::PostgresRuleSetStore::new(pool.clone());
+    let ruleset_key = automation_ruleset::RuleSetKey::parse(RULESET_KEY)
+        .map_err(|e| format!("invalid ruleset key: {e:?}"))?;
+
+    if mode == "seed-studyroom" {
+        return seed_studyroom(&ruleset_store, guild_id, &ruleset_key, force_activate).await;
+    }
+
+    let token = env::var("DISCORD_TEST_TOKEN")?;
+    let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
+    let bindings = bindings(channel_id);
+
+    let http = Client::new(token.clone());
+    let bot = http.current_user().await?.model().await?;
+    let guild_roles = http.roles(Id::new(guild_id)).await?.model().await?;
+    let bot_member = http
+        .guild_member(Id::new(guild_id), bot.id)
+        .await?
+        .model()
+        .await?;
+
+    let roles_snapshot: std::collections::BTreeMap<RoleId, Permissions> = guild_roles
+        .iter()
+        .map(|role| {
+            (
+                RoleId(role.id.get()),
+                Permissions::from_bits_retain(role.permissions.bits()),
+            )
+        })
+        .collect();
+    let bot_role_ids: Vec<RoleId> = bot_member.roles.iter().map(|id| RoleId(id.get())).collect();
+
+    let (guild_capabilities, role_permissions) =
+        automation_ruleset_readiness::build_readiness_context(
+            GuildId(guild_id),
+            &bindings,
+            &roles_snapshot,
+            &bot_role_ids,
+        )
+        .map_err(|e| format!("readiness context failed: {e:?}"))?;
+
+    let runtime = automation_ruleset_readiness::hydrate_active_ruleset(
+        &ruleset_store,
+        GuildId(guild_id),
+        &ruleset_key,
+        &bindings,
+        &guild_capabilities,
+        &role_permissions,
+    )
+    .await
+    .map_err(|e| format!("hydration failed (fail-closed, not starting): {e:?}"))?;
+
+    eprintln!(
+        "hydrated ruleset {} v{} ({} notices); installing panel + starting gateway",
+        runtime.ruleset_key,
+        runtime.version,
+        runtime.notices.len()
+    );
+    install_panel(&token, guild_id, channel_id).await?;
     let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
-
-    install_panel(&token, guild_id, channel_id).await?;
-    eprintln!("postgres connected; panel installed; listening for interactions (Ctrl-C to stop)");
     gateway::run(
         token,
-        RULESET_KEY.to_string(),
-        ruleset,
+        runtime.ruleset_key.as_str().to_string(),
+        runtime.definition,
         bindings,
-        "스터디룸 생성에 실패했습니다. 봇 권한 또는 역할 순서를 확인해주세요.".to_string(),
+        "스터디룸 처리에 실패했습니다.".to_string(),
         instances,
         instance_ids,
     )
     .await;
+    Ok(())
+}
+
+async fn seed_studyroom(
+    store: &automation_ruleset_postgres::PostgresRuleSetStore,
+    guild_id: u64,
+    key: &automation_ruleset::RuleSetKey,
+    force_activate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use automation_ruleset::{PublishOutcome, PublishRuleSetRequest, RuleSetStore};
+    let guild = GuildId(guild_id);
+    let published = store
+        .publish(PublishRuleSetRequest {
+            guild_id: guild,
+            ruleset_key: key.clone(),
+            definition: studyroom_ruleset(),
+            created_by: UserId(0),
+        })
+        .await
+        .map_err(|e| format!("publish failed: {e:?}"))?;
+    let version = match &published {
+        PublishOutcome::Created(v) | PublishOutcome::Reused(v) => v.version,
+    };
+    eprintln!("seed: {published:?}");
+    let active = store
+        .active(guild, key)
+        .await
+        .map_err(|e| format!("active lookup failed: {e:?}"))?;
+    match active {
+        None => {
+            store
+                .activate(guild, key, version)
+                .await
+                .map_err(|e| format!("activate failed: {e:?}"))?;
+            eprintln!("seed: activated {version}");
+        }
+        Some(current) if current.version == version => {
+            store
+                .activate(guild, key, version)
+                .await
+                .map_err(|e| format!("activate failed: {e:?}"))?;
+            eprintln!("seed: already active {version} (idempotent)");
+        }
+        Some(current) => {
+            if force_activate {
+                store
+                    .activate(guild, key, version)
+                    .await
+                    .map_err(|e| format!("activate failed: {e:?}"))?;
+                eprintln!("seed: force-activated {version} (was {})", current.version);
+            } else {
+                return Err(format!(
+                    "seed: active version {} != published {}; pass --force-activate to override",
+                    current.version, version
+                )
+                .into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -269,6 +388,7 @@ async fn install_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automation_core::validate;
 
     #[test]
     fn studyroom_ruleset_validates() {
