@@ -8,6 +8,7 @@ use automation_core::plan::{
 use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ActionTarget, ChannelRef, CreatedRef, InteractionRule, InteractionRuleSet,
     ModalFieldSpec, ModalFieldStyle, ModalSpec, OverwriteTargetSpec, RoleRef, TriggerSpec,
@@ -99,10 +100,18 @@ fn submit(room: &str) -> RuntimeEvent {
 }
 
 fn run_plan(steps: Vec<PlannedAction>) -> Vec<MutationCall> {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    block_on(run(&context, &ActionPlan { steps }, &mutation, &responder)).unwrap();
+    block_on(run(
+        &context,
+        &ActionPlan { steps },
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     mutation.calls()
 }
 

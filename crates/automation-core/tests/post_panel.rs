@@ -8,6 +8,7 @@ use automation_core::plan::{
 use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ButtonSpec, ChannelRef, CreatedRef, InteractionRule, InteractionRuleSet,
     ModalFieldSpec, ModalFieldStyle, ModalSpec, PanelSpec, TriggerSpec,
@@ -72,18 +73,34 @@ fn submit(room: &str) -> RuntimeEvent {
 }
 
 fn run_calls(steps: Vec<PlannedAction>) -> Vec<MutationCall> {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    block_on(run(&context, &ActionPlan { steps }, &mutation, &responder)).unwrap();
+    block_on(run(
+        &context,
+        &ActionPlan { steps },
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     mutation.calls()
 }
 
 fn run_created(steps: Vec<PlannedAction>) -> Vec<CreatedResource> {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    block_on(run(&context, &ActionPlan { steps }, &mutation, &responder)).unwrap()
+    block_on(run(
+        &context,
+        &ActionPlan { steps },
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -94,6 +111,7 @@ fn post_panel_into_created_channel() {
             name: "study-${input.room_name}".to_string(),
         },
         PlannedAction::PostPanel {
+            key: "panel".to_string(),
             channel: PlannedChannel::Created("c".to_string()),
             content: "환영 ${input.room_name}".to_string(),
             buttons: vec![button("study_help", "도움말")],
@@ -146,6 +164,7 @@ fn full_study_room_call_sequence() {
             target: UserId(3),
         },
         PlannedAction::PostPanel {
+            key: "study_welcome_panel".to_string(),
             channel: PlannedChannel::Created("study_channel".to_string()),
             content: "스터디룸 개설 완료".to_string(),
             buttons: vec![button("study_help", "도움말")],
@@ -199,6 +218,7 @@ fn message_id_recorded_in_result() {
             name: "study".to_string(),
         },
         PlannedAction::PostPanel {
+            key: "panel".to_string(),
             channel: PlannedChannel::Created("c".to_string()),
             content: "hi".to_string(),
             buttons: vec![],
@@ -208,6 +228,7 @@ fn message_id_recorded_in_result() {
         created.last().unwrap(),
         &CreatedResource::Message {
             action_index: 1,
+            key: "panel".to_string(),
             channel: ChannelId(800_000),
             id: MessageId(800_001),
         }
@@ -216,20 +237,30 @@ fn message_id_recorded_in_result() {
 
 #[test]
 fn missing_input_fails_post_panel() {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let steps = vec![PlannedAction::PostPanel {
+        key: "panel".to_string(),
         channel: PlannedChannel::Resolved(ChannelId(999)),
         content: "${input.missing}".to_string(),
         buttons: vec![],
     }];
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    assert!(block_on(run(&context, &ActionPlan { steps }, &mutation, &responder)).is_err());
+    assert!(block_on(run(
+        &context,
+        &ActionPlan { steps },
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .is_err());
 }
 
 #[test]
 fn unknown_created_channel_ref_fails() {
     let set = post_panel_rule(vec![ActionSpec::PostPanel {
+        key: "panel".to_string(),
         channel: channel_created("ghost"),
         content: "hi".to_string(),
         buttons: vec![],
@@ -250,6 +281,7 @@ fn channel_ref_to_role_key_fails() {
             name: "x".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("somerole"),
             content: "hi".to_string(),
             buttons: vec![],
@@ -267,6 +299,7 @@ fn channel_ref_to_role_key_fails() {
 fn forward_channel_ref_fails() {
     let set = post_panel_rule(vec![
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons: vec![],
@@ -292,6 +325,7 @@ fn empty_button_label_fails() {
             name: "study".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons: vec![button("b", "  ")],
@@ -314,6 +348,7 @@ fn too_many_buttons_fails() {
             name: "study".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons,
@@ -335,6 +370,7 @@ fn duplicate_button_key_within_panel_fails() {
             name: "study".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons: vec![button("dup", "x"), button("dup", "y")],
@@ -353,6 +389,7 @@ fn panel_button_collides_with_post_panel_button_fails() {
             name: "study".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons: vec![button("shared", "x")],
@@ -377,11 +414,13 @@ fn two_post_panels_same_button_key_fails() {
             name: "study".to_string(),
         },
         ActionSpec::PostPanel {
+            key: "panel_one".to_string(),
             channel: channel_created("c"),
             content: "hi".to_string(),
             buttons: vec![button("shared", "x")],
         },
         ActionSpec::PostPanel {
+            key: "panel_two".to_string(),
             channel: channel_created("c"),
             content: "bye".to_string(),
             buttons: vec![button("shared", "y")],
@@ -410,6 +449,7 @@ fn post_panel_button_referenced_by_button_click_ok() {
                         name: "study".to_string(),
                     },
                     ActionSpec::PostPanel {
+                        key: "panel".to_string(),
                         channel: channel_created("c"),
                         content: "hi".to_string(),
                         buttons: vec![button("study_help", "도움말")],
@@ -439,6 +479,7 @@ fn post_panel_flagged_by_policy() {
                 name: "study".to_string(),
             },
             ActionSpec::PostPanel {
+                key: "panel".to_string(),
                 channel: channel_created("c"),
                 content: "hi".to_string(),
                 buttons: vec![button("study_help", "도움말")],

@@ -4,6 +4,7 @@ use automation_core::event::{EventKind, RuntimeEvent};
 use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, ResponderCall};
 use automation_core::run::handle_event;
 use automation_core::validate::{validate, ValidationError};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec,
     TriggerSpec,
@@ -88,6 +89,9 @@ fn responded(event: &RuntimeEvent, rule: InteractionRule) -> String {
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     match responder.calls().into_iter().next().unwrap() {

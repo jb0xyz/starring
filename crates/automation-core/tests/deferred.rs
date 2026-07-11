@@ -6,6 +6,7 @@ use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, Respo
 use automation_core::plan::{ActionPlan, PlannedAction};
 use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec,
     TriggerSpec,
@@ -70,7 +71,7 @@ fn defer_rule() -> InteractionRuleSet {
 
 #[test]
 fn run_executes_defer_and_edit() {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
     let steps = vec![
@@ -79,7 +80,15 @@ fn run_executes_defer_and_edit() {
             content: "완료".to_string(),
         },
     ];
-    block_on(run(&context, &ActionPlan { steps }, &mutation, &responder)).unwrap();
+    block_on(run(
+        &context,
+        &ActionPlan { steps },
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     assert_eq!(
         responder.calls(),
         vec![
@@ -102,6 +111,9 @@ fn handle_event_defer_success_edits_completion() {
         &mutation,
         &responder,
         "실패",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     assert_eq!(outcome, HandleOutcome::Executed);
@@ -130,6 +142,9 @@ fn handle_event_failure_edits_failure_message() {
         &mutation,
         &responder,
         "스터디룸 '${input.room_name}' 실패",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);
     assert_eq!(

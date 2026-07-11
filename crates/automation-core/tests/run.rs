@@ -3,6 +3,7 @@ use automation_core::mock::{
     MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall,
 };
 use automation_core::run::{handle_event, HandleOutcome};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ActionTarget, ButtonSpec, InteractionRule, InteractionRuleSet, PanelSpec, RoleRef,
     TriggerSpec,
@@ -71,6 +72,9 @@ fn matching_event_grants_role_and_responds() {
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
 
@@ -104,6 +108,9 @@ fn unmatched_event_is_noop_with_no_calls() {
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
 
@@ -130,6 +137,9 @@ fn mutation_failure_propagates() {
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ));
 
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);

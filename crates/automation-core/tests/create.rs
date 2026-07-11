@@ -7,6 +7,7 @@ use automation_core::plan::{ActionPlan, CreatedResource, PlannedAction};
 use automation_core::run::{handle_event, run};
 use automation_core::validate::{validate, ValidationError};
 use automation_core::RuntimeContext;
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ButtonSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
     ModalSpec, PanelSpec, TriggerSpec,
@@ -71,6 +72,9 @@ fn run_calls(event: &RuntimeEvent, actions: Vec<ActionSpec>) -> Vec<MutationCall
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ))
     .unwrap();
     mutation.calls()
@@ -136,13 +140,16 @@ fn create_channel_missing_input_errors() {
         &mutation,
         &responder,
         "",
+        "test",
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::BadRequest);
 }
 
 #[test]
 fn created_ids_recorded_in_run_result() {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let plan = ActionPlan {
         steps: vec![
             PlannedAction::CreateChannel {
@@ -157,17 +164,27 @@ fn created_ids_recorded_in_run_result() {
     };
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    let created = block_on(run(&context, &plan, &mutation, &responder)).unwrap();
+    let created = block_on(run(
+        &context,
+        &plan,
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     assert_eq!(
         created,
         vec![
             CreatedResource::Channel {
                 action_index: 0,
+                key: "channel".to_string(),
                 name: "study-cozy".to_string(),
                 id: ChannelId(800_000),
             },
             CreatedResource::Role {
                 action_index: 1,
+                key: "role".to_string(),
                 name: "cozy 멤버".to_string(),
                 id: RoleId(800_001),
             },

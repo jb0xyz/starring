@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use automation_state::{
-    ActionSpec, ChannelRef, InteractionRule, InteractionRuleSet, OverwriteTargetSpec, RoleRef,
-    TriggerSpec,
+    ActionSpec, ChannelRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet,
+    OverwriteTargetSpec, RoleRef, TriggerSpec,
 };
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
@@ -75,6 +75,21 @@ pub enum ValidationError {
     CreatedChannelRefTypeMismatch {
         rule: String,
         key: String,
+    },
+    UnknownCreatedMessageRef {
+        rule: String,
+        key: String,
+    },
+    CreatedMessageRefTypeMismatch {
+        rule: String,
+        key: String,
+    },
+    EmptyInstanceResources {
+        rule: String,
+    },
+    InvalidResourceAlias {
+        rule: String,
+        alias: String,
     },
     OverlappingOverwrite {
         rule: String,
@@ -268,14 +283,36 @@ pub fn validate(
                     }
                 }
                 ActionSpec::PostPanel {
-                    channel, content, ..
+                    key,
+                    channel,
+                    content,
+                    ..
                 } => {
+                    if created.insert(key.clone(), CreatedKind::Message).is_some() {
+                        errors.push(ValidationError::DuplicateActionKey {
+                            rule: rule.key.clone(),
+                            key: key.clone(),
+                        });
+                    }
                     check_channel_ref(&mut errors, rule, bindings, &created, channel);
                     check_template(&mut errors, rule, &modal_fields, content);
                 }
                 ActionSpec::DeferEphemeral => {}
                 ActionSpec::EditResponse { content } => {
                     check_template(&mut errors, rule, &modal_fields, content);
+                }
+                ActionSpec::RegisterInstance {
+                    key,
+                    kind: _,
+                    resources,
+                } => {
+                    if created.insert(key.clone(), CreatedKind::Instance).is_some() {
+                        errors.push(ValidationError::DuplicateActionKey {
+                            rule: rule.key.clone(),
+                            key: key.clone(),
+                        });
+                    }
+                    check_manifest(&mut errors, rule, &created, resources);
                 }
             }
         }
@@ -347,6 +384,8 @@ const MAX_PANEL_BUTTONS: usize = 5;
 enum CreatedKind {
     Role,
     Channel,
+    Message,
+    Instance,
 }
 
 fn check_template(
@@ -409,13 +448,11 @@ fn check_role_ref(
                 rule: rule.key.clone(),
                 key: inner.created.clone(),
             }),
-            Some(CreatedKind::Channel) => {
-                errors.push(ValidationError::CreatedRoleRefTypeMismatch {
-                    rule: rule.key.clone(),
-                    key: inner.created.clone(),
-                })
-            }
             Some(CreatedKind::Role) => {}
+            Some(_) => errors.push(ValidationError::CreatedRoleRefTypeMismatch {
+                rule: rule.key.clone(),
+                key: inner.created.clone(),
+            }),
         },
     }
 }
@@ -441,13 +478,90 @@ fn check_channel_ref(
                 rule: rule.key.clone(),
                 key: inner.created.clone(),
             }),
-            Some(CreatedKind::Role) => {
+            Some(CreatedKind::Channel) => {}
+            Some(_) => errors.push(ValidationError::CreatedChannelRefTypeMismatch {
+                rule: rule.key.clone(),
+                key: inner.created.clone(),
+            }),
+        },
+    }
+}
+
+fn check_manifest(
+    errors: &mut Vec<ValidationError>,
+    rule: &InteractionRule,
+    created: &BTreeMap<String, CreatedKind>,
+    resources: &InstanceResourceRefs,
+) {
+    if resources.roles.is_empty() && resources.channels.is_empty() && resources.messages.is_empty()
+    {
+        errors.push(ValidationError::EmptyInstanceResources {
+            rule: rule.key.clone(),
+        });
+    }
+
+    for (alias, reference) in &resources.roles {
+        check_resource_alias(errors, rule, alias);
+        match created.get(&reference.created) {
+            None => errors.push(ValidationError::UnknownCreatedRoleRef {
+                rule: rule.key.clone(),
+                key: reference.created.clone(),
+            }),
+            Some(CreatedKind::Role) => {}
+            Some(_) => {
+                errors.push(ValidationError::CreatedRoleRefTypeMismatch {
+                    rule: rule.key.clone(),
+                    key: reference.created.clone(),
+                });
+            }
+        }
+    }
+
+    for (alias, reference) in &resources.channels {
+        check_resource_alias(errors, rule, alias);
+        match created.get(&reference.created) {
+            None => errors.push(ValidationError::UnknownCreatedChannelRef {
+                rule: rule.key.clone(),
+                key: reference.created.clone(),
+            }),
+            Some(CreatedKind::Channel) => {}
+            Some(_) => {
                 errors.push(ValidationError::CreatedChannelRefTypeMismatch {
                     rule: rule.key.clone(),
-                    key: inner.created.clone(),
-                })
+                    key: reference.created.clone(),
+                });
             }
-            Some(CreatedKind::Channel) => {}
-        },
+        }
+    }
+
+    for (alias, reference) in &resources.messages {
+        check_resource_alias(errors, rule, alias);
+        match created.get(&reference.created) {
+            None => errors.push(ValidationError::UnknownCreatedMessageRef {
+                rule: rule.key.clone(),
+                key: reference.created.clone(),
+            }),
+            Some(CreatedKind::Message) => {}
+            Some(_) => {
+                errors.push(ValidationError::CreatedMessageRefTypeMismatch {
+                    rule: rule.key.clone(),
+                    key: reference.created.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn check_resource_alias(errors: &mut Vec<ValidationError>, rule: &InteractionRule, alias: &str) {
+    if alias.is_empty()
+        || alias.len() > 32
+        || !alias.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+    {
+        errors.push(ValidationError::InvalidResourceAlias {
+            rule: rule.key.clone(),
+            alias: alias.to_string(),
+        });
     }
 }

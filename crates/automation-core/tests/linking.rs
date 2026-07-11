@@ -7,6 +7,7 @@ use automation_core::plan::{ActionPlan, CreatedResource, PlannedAction, PlannedR
 use automation_core::policy::{analyze, PolicyFinding};
 use automation_core::run::run;
 use automation_core::validate::{validate, ValidationError};
+use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, ActionTarget, CreatedRef, InteractionRule, InteractionRuleSet, ModalFieldSpec,
     ModalFieldStyle, ModalSpec, RoleRef, TriggerSpec,
@@ -81,7 +82,7 @@ fn plan(steps: Vec<PlannedAction>) -> ActionPlan {
 
 #[test]
 fn created_role_granted_to_actor() {
-    let context = RuntimeContext::from_event(&submit("코딩"));
+    let context = RuntimeContext::from_event(&submit("코딩"), "test");
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),
@@ -94,7 +95,15 @@ fn created_role_granted_to_actor() {
     ];
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    block_on(run(&context, &plan(steps), &mutation, &responder)).unwrap();
+    block_on(run(
+        &context,
+        &plan(steps),
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     assert_eq!(
         mutation.calls(),
         vec![
@@ -113,7 +122,7 @@ fn created_role_granted_to_actor() {
 
 #[test]
 fn full_study_run_creates_then_grants() {
-    let context = RuntimeContext::from_event(&submit("cozy"));
+    let context = RuntimeContext::from_event(&submit("cozy"), "test");
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),
@@ -130,17 +139,27 @@ fn full_study_run_creates_then_grants() {
     ];
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
-    let created = block_on(run(&context, &plan(steps), &mutation, &responder)).unwrap();
+    let created = block_on(run(
+        &context,
+        &plan(steps),
+        &mutation,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ))
+    .unwrap();
     assert_eq!(
         created,
         vec![
             CreatedResource::Role {
                 action_index: 0,
+                key: "member".to_string(),
                 name: "cozy 멤버".to_string(),
                 id: RoleId(800_000),
             },
             CreatedResource::Channel {
                 action_index: 1,
+                key: "channel".to_string(),
                 name: "study-cozy".to_string(),
                 id: ChannelId(800_001),
             },
@@ -266,7 +285,7 @@ fn create_role_failure_skips_grant() {
             Err(AdapterError::new(AdapterErrorKind::Forbidden, "no"))
         }
     }
-    let context = RuntimeContext::from_event(&submit("x"));
+    let context = RuntimeContext::from_event(&submit("x"), "test");
     let steps = vec![
         PlannedAction::CreateRole {
             key: "member".to_string(),
@@ -278,7 +297,14 @@ fn create_role_failure_skips_grant() {
         },
     ];
     let responder = MockInteractionResponder::new();
-    let result = block_on(run(&context, &plan(steps), &FailCreate, &responder));
+    let result = block_on(run(
+        &context,
+        &plan(steps),
+        &FailCreate,
+        &responder,
+        &InMemoryInstanceStore::new(),
+        &SequenceInstanceIdGenerator::new("test", 1),
+    ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);
 }
 

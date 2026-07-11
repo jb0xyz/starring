@@ -92,7 +92,8 @@ pub fn analyze(
                 ActionSpec::RespondEphemeral { .. }
                 | ActionSpec::OpenModal { .. }
                 | ActionSpec::DeferEphemeral
-                | ActionSpec::EditResponse { .. } => {}
+                | ActionSpec::EditResponse { .. }
+                | ActionSpec::RegisterInstance { .. } => {}
             }
         }
     }

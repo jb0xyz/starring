@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 
-use automation_state::InteractionRuleSet;
-use discord_model::{ChannelId, OverwriteTarget, RoleId};
+use automation_instance::{
+    AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
+    InstanceStore,
+};
+use automation_state::{InstanceResourceRefs, InteractionRuleSet};
+use discord_model::{ChannelId, MessageId, OverwriteTarget, RoleId};
 use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
@@ -19,6 +23,8 @@ use crate::template::{SanitizeContext, TemplateError, TemplateString};
 struct RuntimeBindings {
     created_roles: BTreeMap<String, RoleId>,
     created_channels: BTreeMap<String, ChannelId>,
+    created_messages: BTreeMap<String, MessageId>,
+    created_instances: BTreeMap<String, InstanceId>,
 }
 
 pub async fn run(
@@ -26,6 +32,8 @@ pub async fn run(
     plan: &ActionPlan,
     mutation: &impl DiscordMutationAdapter,
     responder: &impl InteractionResponder,
+    instances: &impl InstanceStore,
+    instance_ids: &impl InstanceIdGenerator,
 ) -> Result<Vec<CreatedResource>, AdapterError> {
     let mut created = Vec::new();
     let mut runtime = RuntimeBindings::default();
@@ -57,6 +65,7 @@ pub async fn run(
                 runtime.created_channels.insert(key.clone(), id);
                 created.push(CreatedResource::Channel {
                     action_index,
+                    key: key.clone(),
                     name: rendered,
                     id,
                 });
@@ -74,6 +83,7 @@ pub async fn run(
                 runtime.created_roles.insert(key.clone(), id);
                 created.push(CreatedResource::Role {
                     action_index,
+                    key: key.clone(),
                     name: rendered,
                     id,
                 });
@@ -104,6 +114,7 @@ pub async fn run(
                     .await?;
             }
             PlannedAction::PostPanel {
+                key,
                 channel,
                 content,
                 buttons,
@@ -120,8 +131,10 @@ pub async fn run(
                         },
                     )
                     .await?;
+                runtime.created_messages.insert(key.clone(), id);
                 created.push(CreatedResource::Message {
                     action_index,
+                    key: key.clone(),
                     channel: channel_id,
                     id,
                 });
@@ -132,6 +145,40 @@ pub async fn run(
             PlannedAction::EditResponse { content } => {
                 let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
                 responder.edit_response(rendered).await?;
+            }
+            PlannedAction::RegisterInstance {
+                key,
+                kind,
+                resources,
+            } => {
+                let resolved = resolve_manifest(resources, &runtime)?;
+                let id = instance_ids.generate().map_err(|error| {
+                    AdapterError::new(
+                        AdapterErrorKind::BadRequest,
+                        format!("instance id error: {error:?}"),
+                    )
+                })?;
+                let instance = AutomationInstance {
+                    id: id.clone(),
+                    guild_id: context.guild_id,
+                    ruleset_key: context.ruleset_key.clone(),
+                    kind: kind.clone(),
+                    created_by: context.actor,
+                    resources: resolved,
+                    status: InstanceStatus::Active,
+                };
+                instances.register(instance).await.map_err(|error| {
+                    AdapterError::new(
+                        AdapterErrorKind::BadRequest,
+                        format!("instance register error: {error:?}"),
+                    )
+                })?;
+                runtime.created_instances.insert(key.clone(), id.clone());
+                created.push(CreatedResource::Instance {
+                    action_index,
+                    key: key.clone(),
+                    id,
+                });
             }
         }
     }
@@ -164,6 +211,45 @@ fn resolve_planned_channel(
             .copied()
             .ok_or_else(|| unresolved_created_channel(key)),
     }
+}
+
+fn resolve_manifest(
+    refs: &InstanceResourceRefs,
+    runtime: &RuntimeBindings,
+) -> Result<InstanceResources, AdapterError> {
+    let mut resources = InstanceResources::default();
+    for (alias, created) in &refs.roles {
+        let id = runtime
+            .created_roles
+            .get(&created.created)
+            .copied()
+            .ok_or_else(|| unresolved_manifest(&created.created))?;
+        resources.roles.insert(alias.clone(), id);
+    }
+    for (alias, created) in &refs.channels {
+        let id = runtime
+            .created_channels
+            .get(&created.created)
+            .copied()
+            .ok_or_else(|| unresolved_manifest(&created.created))?;
+        resources.channels.insert(alias.clone(), id);
+    }
+    for (alias, created) in &refs.messages {
+        let id = runtime
+            .created_messages
+            .get(&created.created)
+            .copied()
+            .ok_or_else(|| unresolved_manifest(&created.created))?;
+        resources.messages.insert(alias.clone(), id);
+    }
+    Ok(resources)
+}
+
+fn unresolved_manifest(key: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("unresolved manifest ref: {key}"),
+    )
 }
 
 fn render(
@@ -203,6 +289,7 @@ pub enum HandleOutcome {
     NoOp,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_event(
     event: &RuntimeEvent,
     ruleset: &InteractionRuleSet,
@@ -210,10 +297,13 @@ pub async fn handle_event(
     mutation: &impl DiscordMutationAdapter,
     responder: &impl InteractionResponder,
     failure_message: &str,
+    ruleset_key: &str,
+    instances: &impl InstanceStore,
+    instance_ids: &impl InstanceIdGenerator,
 ) -> Result<HandleOutcome, AdapterError> {
     match interpret(event, ruleset, bindings) {
         Some(plan) => {
-            let context = RuntimeContext::from_event(event);
+            let context = RuntimeContext::from_event(event, ruleset_key);
             let mut steps = plan.steps;
             let defer_acked = if matches!(steps.first(), Some(PlannedAction::DeferEphemeral)) {
                 responder.defer_ephemeral().await?;
@@ -222,7 +312,16 @@ pub async fn handle_event(
             } else {
                 false
             };
-            match run(&context, &ActionPlan { steps }, mutation, responder).await {
+            match run(
+                &context,
+                &ActionPlan { steps },
+                mutation,
+                responder,
+                instances,
+                instance_ids,
+            )
+            .await
+            {
                 Ok(_) => Ok(HandleOutcome::Executed),
                 Err(error) => {
                     if defer_acked {

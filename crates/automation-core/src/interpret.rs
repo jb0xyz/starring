@@ -82,12 +82,14 @@ pub fn interpret(
                 });
             }
             ActionSpec::PostPanel {
+                key,
                 channel,
                 content,
                 buttons,
             } => {
                 let planned_channel = resolve_channel(channel, bindings)?;
                 steps.push(PlannedAction::PostPanel {
+                    key: key.clone(),
                     channel: planned_channel,
                     content: content.clone(),
                     buttons: buttons.clone(),
@@ -99,6 +101,17 @@ pub fn interpret(
             ActionSpec::EditResponse { content } => {
                 steps.push(PlannedAction::EditResponse {
                     content: content.clone(),
+                });
+            }
+            ActionSpec::RegisterInstance {
+                key,
+                kind,
+                resources,
+            } => {
+                steps.push(PlannedAction::RegisterInstance {
+                    key: key.clone(),
+                    kind: kind.clone(),
+                    resources: resources.clone(),
                 });
             }
         }
