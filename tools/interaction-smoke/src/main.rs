@@ -4,7 +4,7 @@ use std::env;
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::InstanceRuleSetVersion;
 use automation_ruleset::RuleSetStore;
-use automation_runtime::{custom_id, gateway};
+use automation_runtime::gateway;
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
     InstanceRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet, ModalFieldSpec,
@@ -14,7 +14,6 @@ use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, Permissions, RoleId, UserId};
 use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
-use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle, Component};
 use twilight_model::id::Id;
 
 mod random_instance_id;
@@ -49,6 +48,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|error| {
             eprintln!("postgres startup: ruleset migration failed: {error}");
+            "PostgreSQL startup failed during migration".to_string()
+        })?;
+    automation_panel_installation_postgres::MIGRATOR
+        .run(&pool)
+        .await
+        .map_err(|error| {
+            eprintln!("postgres startup: panel installation migration failed: {error}");
             "PostgreSQL startup failed during migration".to_string()
         })?;
 
@@ -125,16 +131,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("hydration failed (fail-closed, not starting): {e:?}"))?;
 
+    let installation_store =
+        automation_panel_installation_postgres::PostgresPanelInstallationStore::new(pool.clone());
+    let panel_installer = automation_runtime::TwilightPanelInstaller::new(&http);
+    let install_report = automation_panel_installation::install_declared_panels(
+        GuildId(guild_id),
+        &runtime.ruleset_key,
+        runtime.version,
+        automation_runtime::PANEL_RENDER_REVISION,
+        &runtime.definition.panels,
+        &bindings,
+        &installation_store,
+        &panel_installer,
+    )
+    .await
+    .map_err(|error| format!("panel installation failed (fail-closed, not starting): {error:?}"))?;
     eprintln!(
-        "hydrated ruleset {} v{} ({} notices); installing panel + starting gateway",
+        "hydrated ruleset {} v{} ({} notices); panel reconcile {:?}; starting gateway",
         runtime.ruleset_key,
         runtime.version,
-        runtime.notices.len()
+        runtime.notices.len(),
+        install_report.outcomes
     );
     let snapshot_provider = automation_runtime::TwilightGuildRoleSnapshotProvider::new(&http)
         .await
         .map_err(|error| format!("snapshot provider startup failed: {error:?}"))?;
-    install_panel(&token, guild_id, channel_id).await?;
     let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
     let identity = RunningRuleSetIdentity {
@@ -431,34 +452,6 @@ fn studyroom_ruleset() -> InteractionRuleSet {
     }
 }
 
-async fn install_panel(
-    token: &str,
-    guild_id: u64,
-    channel_id: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let http = Client::new(token.to_string());
-    let encoded = custom_id::encode_button(GuildId(guild_id), RULESET_KEY, BUTTON_KEY);
-    let button = Component::Button(Button {
-        id: None,
-        custom_id: Some(encoded),
-        disabled: false,
-        emoji: None,
-        label: Some("Create study room".to_string()),
-        style: ButtonStyle::Primary,
-        url: None,
-        sku_id: None,
-    });
-    let components = [Component::ActionRow(ActionRow {
-        id: None,
-        components: vec![button],
-    })];
-    http.create_message(Id::new(channel_id))
-        .content("Study room panel")
-        .components(&components)
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +532,15 @@ mod tests {
             store.list_versions(GuildId(7), &key).await.unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn run_uses_ruleset_declared_panel_reconcile() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production.contains("install_declared_panels("));
+        assert!(!production.contains("async fn install_panel("));
     }
 }

@@ -1168,6 +1168,8 @@ dependencies = [
  "automation-core",
  "automation-instance",
  "automation-instance-postgres",
+ "automation-panel-installation",
+ "automation-panel-installation-postgres",
  "automation-ruleset",
  "automation-ruleset-postgres",
  "automation-ruleset-readiness",
