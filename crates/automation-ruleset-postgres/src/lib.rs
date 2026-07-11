@@ -1,9 +1,39 @@
+use std::sync::Arc;
+
 use automation_ruleset::{
-    RuleSetContentHash, RuleSetKey, RuleSetSchemaVersion, RuleSetStoreError, RuleSetVersion,
-    RuleSetVersionId,
+    PublishOutcome, PublishRuleSetRequest, RuleSetActivation, RuleSetContentHash, RuleSetHasher,
+    RuleSetKey, RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersion,
+    RuleSetVersionId, Sha256RuleSetHasher,
 };
 use automation_state::InteractionRuleSet;
 use discord_model::{GuildId, UserId};
+use sqlx::PgPool;
+
+const VERSION_COLUMNS: &str =
+    "guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by";
+
+pub struct PostgresRuleSetStore<H: RuleSetHasher = Sha256RuleSetHasher> {
+    pool: PgPool,
+    hasher: Arc<H>,
+}
+
+impl PostgresRuleSetStore<Sha256RuleSetHasher> {
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            hasher: Arc::new(Sha256RuleSetHasher),
+        }
+    }
+}
+
+impl<H: RuleSetHasher> PostgresRuleSetStore<H> {
+    pub fn with_hasher(pool: PgPool, hasher: H) -> Self {
+        Self {
+            pool,
+            hasher: Arc::new(hasher),
+        }
+    }
+}
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -64,6 +94,106 @@ impl TryFrom<RuleSetVersionRow> for RuleSetVersion {
             content_hash,
             created_by,
         })
+    }
+}
+
+impl<H: RuleSetHasher> RuleSetStore for PostgresRuleSetStore<H> {
+    async fn publish(
+        &self,
+        _request: PublishRuleSetRequest,
+    ) -> Result<PublishOutcome, RuleSetStoreError> {
+        let _ = &self.hasher;
+        unimplemented!()
+    }
+
+    async fn get_version(
+        &self,
+        guild_id: GuildId,
+        key: &RuleSetKey,
+        version: RuleSetVersionId,
+    ) -> Result<Option<RuleSetVersion>, RuleSetStoreError> {
+        let row = sqlx::query_as::<_, RuleSetVersionRow>(&format!(
+            "SELECT {VERSION_COLUMNS} FROM automation_ruleset_versions \
+             WHERE guild_id = $1 AND ruleset_key = $2 AND version = $3"
+        ))
+        .bind(guild_id.to_string())
+        .bind(key.as_str())
+        .bind(i64::from(version.get()))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.map(RuleSetVersion::try_from).transpose()
+    }
+
+    async fn list_versions(
+        &self,
+        guild_id: GuildId,
+        key: &RuleSetKey,
+    ) -> Result<Vec<RuleSetVersion>, RuleSetStoreError> {
+        let rows = sqlx::query_as::<_, RuleSetVersionRow>(&format!(
+            "SELECT {VERSION_COLUMNS} FROM automation_ruleset_versions \
+             WHERE guild_id = $1 AND ruleset_key = $2 ORDER BY version"
+        ))
+        .bind(guild_id.to_string())
+        .bind(key.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.into_iter().map(RuleSetVersion::try_from).collect()
+    }
+
+    async fn activate(
+        &self,
+        guild_id: GuildId,
+        key: &RuleSetKey,
+        version: RuleSetVersionId,
+    ) -> Result<RuleSetActivation, RuleSetStoreError> {
+        let row = sqlx::query(
+            "INSERT INTO automation_ruleset_activations (guild_id, ruleset_key, active_version) \
+             SELECT guild_id, ruleset_key, version FROM automation_ruleset_versions \
+             WHERE guild_id = $1 AND ruleset_key = $2 AND version = $3 \
+             ON CONFLICT (guild_id, ruleset_key) DO UPDATE SET active_version = EXCLUDED.active_version \
+             RETURNING active_version",
+        )
+        .bind(guild_id.to_string())
+        .bind(key.as_str())
+        .bind(i64::from(version.get()))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        match row {
+            Some(_) => Ok(RuleSetActivation {
+                guild_id,
+                ruleset_key: key.clone(),
+                active_version: version,
+            }),
+            None => Err(RuleSetStoreError::VersionNotFound),
+        }
+    }
+
+    async fn active(
+        &self,
+        guild_id: GuildId,
+        key: &RuleSetKey,
+    ) -> Result<Option<RuleSetVersion>, RuleSetStoreError> {
+        let row = sqlx::query_as::<_, RuleSetVersionRow>(&format!(
+            "SELECT {} FROM automation_ruleset_versions v \
+             JOIN automation_ruleset_activations a \
+               ON a.guild_id = v.guild_id AND a.ruleset_key = v.ruleset_key \
+              AND a.active_version = v.version \
+             WHERE v.guild_id = $1 AND v.ruleset_key = $2",
+            VERSION_COLUMNS
+                .split(", ")
+                .map(|c| format!("v.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .bind(guild_id.to_string())
+        .bind(key.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.map(RuleSetVersion::try_from).transpose()
     }
 }
 
