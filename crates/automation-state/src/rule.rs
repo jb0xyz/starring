@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use automation_instance::InstanceKind;
 use serde::{Deserialize, Serialize};
 
 use desired_state::ResourceKey;
@@ -63,6 +66,7 @@ pub enum ActionSpec {
         deny: Permissions,
     },
     PostPanel {
+        key: String,
         channel: ChannelRef,
         content: String,
         #[serde(default)]
@@ -72,12 +76,28 @@ pub enum ActionSpec {
     EditResponse {
         content: String,
     },
+    RegisterInstance {
+        key: String,
+        kind: InstanceKind,
+        resources: InstanceResourceRefs,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreatedRef {
     pub created: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceResourceRefs {
+    #[serde(default)]
+    pub roles: BTreeMap<String, CreatedRef>,
+    #[serde(default)]
+    pub channels: BTreeMap<String, CreatedRef>,
+    #[serde(default)]
+    pub messages: BTreeMap<String, CreatedRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +131,7 @@ pub enum ActionTarget {
 mod tests {
     use super::*;
     use crate::panel::{ButtonSpec, PanelSpec};
+    use automation_instance::InstanceKind;
     use desired_state::ResourceKey;
     use discord_model::Permissions;
 
@@ -289,11 +310,12 @@ mod tests {
 
     #[test]
     fn post_panel_action_roundtrips() {
-        let json = r#"{"type":"post_panel","channel":{"created":"study_channel"},"content":"환영 ${input.room_name}","buttons":[{"key":"study_help","label":"도움말"}]}"#;
+        let json = r#"{"type":"post_panel","key":"study_welcome_panel","channel":{"created":"study_channel"},"content":"환영 ${input.room_name}","buttons":[{"key":"study_help","label":"도움말"}]}"#;
         let action: ActionSpec = serde_json::from_str(json).unwrap();
         assert_eq!(
             action,
             ActionSpec::PostPanel {
+                key: "study_welcome_panel".to_string(),
                 channel: ChannelRef::Created(CreatedRef {
                     created: "study_channel".to_string(),
                 }),
@@ -308,11 +330,13 @@ mod tests {
 
     #[test]
     fn post_panel_buttons_default_empty() {
-        let json = r#"{"type":"post_panel","channel":"general","content":"hi"}"#;
+        let json =
+            r#"{"type":"post_panel","key":"general_panel","channel":"general","content":"hi"}"#;
         let action: ActionSpec = serde_json::from_str(json).unwrap();
         assert_eq!(
             action,
             ActionSpec::PostPanel {
+                key: "general_panel".to_string(),
                 channel: ChannelRef::Existing(ResourceKey("general".to_string())),
                 content: "hi".to_string(),
                 buttons: vec![],
@@ -337,5 +361,26 @@ mod tests {
             r#"{"type":"edit_response","content":"x","evil":1}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn register_instance_roundtrip() {
+        let json = r#"{"type":"register_instance","key":"study_room_instance","kind":"study_room","resources":{"roles":{"member_role":{"created":"study_member_role"}},"channels":{},"messages":{}}}"#;
+        let action: ActionSpec = serde_json::from_str(json).unwrap();
+        match action {
+            ActionSpec::RegisterInstance {
+                key,
+                kind,
+                resources,
+            } => {
+                assert_eq!(key, "study_room_instance");
+                assert_eq!(kind, InstanceKind("study_room".to_string()));
+                assert_eq!(
+                    resources.roles.get("member_role").unwrap().created,
+                    "study_member_role"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
