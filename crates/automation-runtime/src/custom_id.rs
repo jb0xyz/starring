@@ -2,6 +2,7 @@ use discord_model::GuildId;
 
 const PREFIX: &str = "starring";
 const INSTANCE: &str = "i";
+const MAX_CUSTOM_ID_LEN: usize = 100;
 const BUTTON: &str = "button";
 const MODAL: &str = "modal";
 
@@ -31,6 +32,7 @@ pub enum CustomIdError {
     WrongShape,
     BadGuildId,
     UnknownKind,
+    TooLong,
 }
 
 pub fn encode_button(guild_id: GuildId, ruleset_key: &str, button_key: &str) -> String {
@@ -47,8 +49,12 @@ pub fn encode_modal(guild_id: GuildId, ruleset_key: &str, modal_key: &str) -> St
     )
 }
 
-pub fn encode_instance_action(instance_id: &str, action: &str) -> String {
-    format!("{PREFIX}:{INSTANCE}:{instance_id}:{action}")
+pub fn encode_instance_action(instance_id: &str, action: &str) -> Result<String, CustomIdError> {
+    let encoded = format!("{PREFIX}:{INSTANCE}:{instance_id}:{action}");
+    if encoded.len() > MAX_CUSTOM_ID_LEN {
+        return Err(CustomIdError::TooLong);
+    }
+    Ok(encoded)
 }
 
 pub fn decode(custom_id: &str) -> Result<ParsedCustomId, CustomIdError> {
@@ -156,7 +162,7 @@ mod tests {
 
     #[test]
     fn encode_instance_action_roundtrip() {
-        let encoded = encode_instance_action("room_001", "join");
+        let encoded = encode_instance_action("room_001", "join").unwrap();
         assert_eq!(encoded, "starring:i:room_001:join");
         assert_eq!(
             decode(&encoded).unwrap(),
@@ -164,6 +170,19 @@ mod tests {
                 instance_id: "room_001".to_string(),
                 action: "join".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn encode_instance_action_enforces_hundred_char_limit() {
+        let max_instance_id = "z".repeat(32);
+        let action_at_limit = "a".repeat(56);
+        let encoded = encode_instance_action(&max_instance_id, &action_at_limit).unwrap();
+        assert_eq!(encoded.len(), 100);
+        let action_over_limit = "a".repeat(57);
+        assert_eq!(
+            encode_instance_action(&max_instance_id, &action_over_limit).unwrap_err(),
+            CustomIdError::TooLong
         );
     }
 

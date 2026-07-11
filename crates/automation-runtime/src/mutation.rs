@@ -1,6 +1,6 @@
 use automation_core::{
-    AdapterError, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter, PostPanelButtonSpec,
-    PostPanelSpec, ResolvedButtonRoute,
+    AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
+    PostPanelButtonSpec, PostPanelSpec, ResolvedButtonRoute,
 };
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use twilight_http::Client;
@@ -48,15 +48,20 @@ fn to_button_component(
     guild: GuildId,
     ruleset_key: &str,
     button: &PostPanelButtonSpec,
-) -> Component {
+) -> Result<Component, AdapterError> {
     let custom_id = match &button.route {
         ResolvedButtonRoute::Static { key } => encode_button(guild, ruleset_key, key),
         ResolvedButtonRoute::InstanceAction {
             instance_id,
             action,
-        } => encode_instance_action(instance_id.as_str(), action),
+        } => encode_instance_action(instance_id.as_str(), action).map_err(|error| {
+            AdapterError::new(
+                AdapterErrorKind::BadRequest,
+                format!("custom_id error: {error:?}"),
+            )
+        })?,
     };
-    Component::Button(Button {
+    Ok(Component::Button(Button {
         id: None,
         custom_id: Some(custom_id),
         disabled: false,
@@ -65,7 +70,7 @@ fn to_button_component(
         style: ButtonStyle::Primary,
         url: None,
         sku_id: None,
-    })
+    }))
 }
 
 impl DiscordMutationAdapter for TwilightMutationAdapter<'_> {
@@ -141,7 +146,7 @@ impl DiscordMutationAdapter for TwilightMutationAdapter<'_> {
             .buttons
             .iter()
             .map(|button| to_button_component(guild, &self.ruleset_key, button))
-            .collect();
+            .collect::<Result<Vec<Component>, AdapterError>>()?;
         let components = [Component::ActionRow(ActionRow {
             id: None,
             components: buttons,
