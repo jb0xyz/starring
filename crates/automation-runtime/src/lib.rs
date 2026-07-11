@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod mutation;
 pub mod responder;
 pub mod runner;
+pub mod snapshot;
 
 pub use convert::interaction_to_event;
 pub use custom_id::{
@@ -14,3 +15,4 @@ pub use error::classify_error;
 pub use gateway::run;
 pub use mutation::TwilightMutationAdapter;
 pub use responder::TwilightInteractionResponder;
+pub use snapshot::TwilightGuildRoleSnapshotProvider;

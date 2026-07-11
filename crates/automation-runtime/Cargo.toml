@@ -7,6 +7,8 @@ edition.workspace = true
 automation-instance = { path = "../automation-instance" }
 automation-state = { path = "../automation-state" }
 automation-core = { path = "../automation-core" }
+automation-ruleset = { path = "../automation-ruleset" }
+automation-ruleset-dispatch = { path = "../automation-ruleset-dispatch" }
 discord-model = { path = "../discord-model" }
 resource-resolution = { path = "../resource-resolution" }
 twilight-gateway = "0.17"

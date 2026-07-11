@@ -179,6 +179,8 @@ version = "0.1.0"
 dependencies = [
  "automation-core",
  "automation-instance",
+ "automation-ruleset",
+ "automation-ruleset-dispatch",
  "automation-state",
  "discord-model",
  "resource-resolution",

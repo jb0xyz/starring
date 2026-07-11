@@ -108,6 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime.version,
         runtime.notices.len()
     );
+    let snapshot_provider = automation_runtime::TwilightGuildRoleSnapshotProvider::new(&http)
+        .await
+        .map_err(|error| format!("snapshot provider startup failed: {error:?}"))?;
     install_panel(&token, guild_id, channel_id).await?;
     let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
@@ -124,6 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "스터디룸 처리에 실패했습니다.".to_string(),
         instances,
         instance_ids,
+        &ruleset_store,
+        &snapshot_provider,
     )
     .await;
     Ok(())

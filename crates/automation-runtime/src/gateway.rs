@@ -1,5 +1,7 @@
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_ruleset::RuleSetStore;
+use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
@@ -8,6 +10,7 @@ use twilight_http::Client;
 use crate::mutation::TwilightMutationAdapter;
 use crate::runner::handle_interaction;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     token: String,
     identity: RunningRuleSetIdentity,
@@ -16,6 +19,8 @@ pub async fn run(
     failure_message: String,
     instances: impl InstanceStore,
     instance_ids: impl InstanceIdGenerator,
+    ruleset_store: &impl RuleSetStore,
+    snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) {
     let http = Client::new(token.clone());
     let mutation = TwilightMutationAdapter::new(&http, identity.key.clone());
@@ -40,6 +45,8 @@ pub async fn run(
                 &failure_message,
                 &instances,
                 &instance_ids,
+                ruleset_store,
+                snapshot_provider,
             )
             .await;
         }
