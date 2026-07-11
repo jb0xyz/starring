@@ -10,6 +10,7 @@ use desired_state::ResourceKey;
 use discord_model::{GuildId, Permissions, RoleId};
 use resource_resolution::ResourceBindingMap;
 
+#[derive(Debug)]
 pub struct GuildCapabilities {
     pub base_permissions: Permissions,
 }
