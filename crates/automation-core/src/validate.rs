@@ -131,10 +131,7 @@ pub enum ValidationError {
     },
 }
 
-pub fn validate(
-    ruleset: &InteractionRuleSet,
-    bindings: &ResourceBindingMap,
-) -> Result<(), Vec<ValidationError>> {
+pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
     let mut panel_keys: BTreeSet<&str> = BTreeSet::new();
@@ -240,7 +237,7 @@ pub fn validate(
         for action in &rule.actions {
             match action {
                 ActionSpec::GrantRole { role, .. } => {
-                    check_role_ref(&mut errors, rule, bindings, &created, role);
+                    check_role_ref(&mut errors, rule, &created, role);
                 }
                 ActionSpec::RespondEphemeral { content } => {
                     if content.trim().is_empty() {
@@ -282,9 +279,9 @@ pub fn validate(
                     allow,
                     deny,
                 } => {
-                    check_channel_ref(&mut errors, rule, bindings, &created, channel);
+                    check_channel_ref(&mut errors, rule, &created, channel);
                     if let OverwriteTargetSpec::Role(role) = target {
-                        check_role_ref(&mut errors, rule, bindings, &created, role);
+                        check_role_ref(&mut errors, rule, &created, role);
                     }
                     if allow.intersects(*deny) {
                         errors.push(ValidationError::OverlappingOverwrite {
@@ -309,7 +306,7 @@ pub fn validate(
                             key: key.clone(),
                         });
                     }
-                    check_channel_ref(&mut errors, rule, bindings, &created, channel);
+                    check_channel_ref(&mut errors, rule, &created, channel);
                     check_template(&mut errors, rule, &modal_fields, content);
                 }
                 ActionSpec::DeferEphemeral => {}
@@ -393,6 +390,89 @@ pub fn validate(
     }
 }
 
+pub fn validate_bindings(
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    for rule in &ruleset.rules {
+        for action in &rule.actions {
+            match action {
+                ActionSpec::GrantRole { role, .. } => {
+                    check_role_binding(&mut errors, rule, bindings, role);
+                }
+                ActionSpec::UpsertOverwrite {
+                    channel, target, ..
+                } => {
+                    check_channel_binding(&mut errors, rule, bindings, channel);
+                    if let OverwriteTargetSpec::Role(role) = target {
+                        check_role_binding(&mut errors, rule, bindings, role);
+                    }
+                }
+                ActionSpec::PostPanel { channel, .. } => {
+                    check_channel_binding(&mut errors, rule, bindings, channel);
+                }
+                _ => {}
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn validate(
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    if let Err(structural) = validate_structural(ruleset) {
+        errors.extend(structural);
+    }
+    if let Err(binding) = validate_bindings(ruleset, bindings) {
+        errors.extend(binding);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn check_role_binding(
+    errors: &mut Vec<ValidationError>,
+    rule: &InteractionRule,
+    bindings: &ResourceBindingMap,
+    role: &RoleRef,
+) {
+    if let RoleRef::Existing(key) = role {
+        if !bindings.role_bindings.contains_key(key) {
+            errors.push(ValidationError::UnknownRoleRef {
+                rule: rule.key.clone(),
+                role: key.clone(),
+            });
+        }
+    }
+}
+
+fn check_channel_binding(
+    errors: &mut Vec<ValidationError>,
+    rule: &InteractionRule,
+    bindings: &ResourceBindingMap,
+    channel: &ChannelRef,
+) {
+    if let ChannelRef::Existing(key) = channel {
+        if !bindings.channel_bindings.contains_key(key) {
+            errors.push(ValidationError::UnknownChannelRef {
+                rule: rule.key.clone(),
+                channel: key.clone(),
+            });
+        }
+    }
+}
+
 const MAX_PANEL_BUTTONS: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -445,19 +525,11 @@ fn check_template(
 fn check_role_ref(
     errors: &mut Vec<ValidationError>,
     rule: &InteractionRule,
-    bindings: &ResourceBindingMap,
     created: &BTreeMap<String, CreatedKind>,
     role: &RoleRef,
 ) {
     match role {
-        RoleRef::Existing(key) => {
-            if !bindings.role_bindings.contains_key(key) {
-                errors.push(ValidationError::UnknownRoleRef {
-                    rule: rule.key.clone(),
-                    role: key.clone(),
-                });
-            }
-        }
+        RoleRef::Existing(_) => {}
         RoleRef::Created(inner) => match created.get(&inner.created) {
             None => errors.push(ValidationError::UnknownCreatedRoleRef {
                 rule: rule.key.clone(),
@@ -488,19 +560,11 @@ fn check_role_ref(
 fn check_channel_ref(
     errors: &mut Vec<ValidationError>,
     rule: &InteractionRule,
-    bindings: &ResourceBindingMap,
     created: &BTreeMap<String, CreatedKind>,
     channel: &ChannelRef,
 ) {
     match channel {
-        ChannelRef::Existing(key) => {
-            if !bindings.channel_bindings.contains_key(key) {
-                errors.push(ValidationError::UnknownChannelRef {
-                    rule: rule.key.clone(),
-                    channel: key.clone(),
-                });
-            }
-        }
+        ChannelRef::Existing(_) => {}
         ChannelRef::Created(inner) => match created.get(&inner.created) {
             None => errors.push(ValidationError::UnknownCreatedChannelRef {
                 rule: rule.key.clone(),

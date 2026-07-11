@@ -23,4 +23,4 @@ pub use plan::{
 pub use policy::{analyze, privileged_mask, DynamicAction, PolicyFinding};
 pub use run::{handle_event, run, HandleOutcome};
 pub use template::{SanitizeContext, TemplateError, TemplateString};
-pub use validate::{validate, ValidationError};
+pub use validate::{validate, validate_bindings, validate_structural, ValidationError};
