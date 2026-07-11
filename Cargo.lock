@@ -132,6 +132,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-ruleset-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-state",
+ "discord-model",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "automation-runtime"
 version = "0.1.0"
 dependencies = [
