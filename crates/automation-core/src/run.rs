@@ -4,6 +4,7 @@ use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceMessageRef, InstanceResources,
     InstanceStatus, InstanceStore,
 };
+use automation_instance_teardown::InstanceTeardownService;
 use automation_state::{
     ButtonRoute, ButtonSpec, InstanceRef, InstanceResourceRefs, InteractionRuleSet,
 };
@@ -18,7 +19,8 @@ use crate::adapter::{
 use crate::event::{EventKind, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
 use crate::plan::{
-    ActionPlan, CreatedResource, PlannedAction, PlannedChannel, PlannedOverwriteTarget, PlannedRole,
+    ActionPlan, CreatedResource, PlannedAction, PlannedChannel, PlannedOverwriteTarget,
+    PlannedRole, ResponseDeliveryOutcome, RunResult, TeardownActionResult,
 };
 use crate::template::{SanitizeContext, TemplateError, TemplateString};
 
@@ -31,18 +33,20 @@ struct RuntimeBindings {
     created_instances: BTreeMap<String, InstanceId>,
 }
 
-pub async fn run<M, R, S, G>(
+pub async fn run<M, R, S, G, T>(
     context: &RuntimeContext,
     plan: &ActionPlan,
-    services: &AutomationServices<'_, M, R, S, G>,
-) -> Result<Vec<CreatedResource>, AdapterError>
+    services: &AutomationServices<'_, M, R, S, G, T>,
+) -> Result<RunResult, AdapterError>
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
+    T: InstanceTeardownService,
 {
     let mut created = Vec::new();
+    let mut teardowns: Vec<TeardownActionResult> = Vec::new();
     let mut runtime = RuntimeBindings {
         planned_instances: prepare_instance_identities(plan, services.instance_ids)?,
         ..RuntimeBindings::default()
@@ -165,7 +169,14 @@ where
             }
             PlannedAction::EditResponse { content } => {
                 let rendered = render(content, context, SanitizeContext::EphemeralMessageContent)?;
-                services.responder.edit_response(rendered).await?;
+                if let Err(error) = services.responder.edit_response(rendered).await {
+                    if teardowns.is_empty() {
+                        return Err(error);
+                    }
+                    for teardown in &mut teardowns {
+                        teardown.response = ResponseDeliveryOutcome::Failed;
+                    }
+                }
             }
             PlannedAction::RegisterInstance {
                 key,
@@ -205,9 +216,23 @@ where
                     id,
                 });
             }
+            PlannedAction::TeardownInstance { instance } => {
+                let instance_id = resolve_instance_ref(instance, &runtime, context)?;
+                let outcome = services
+                    .teardown
+                    .teardown(context.guild_id, instance_id.clone())
+                    .await
+                    .map_err(teardown_error)?;
+                teardowns.push(TeardownActionResult {
+                    action_index,
+                    instance_id,
+                    teardown: outcome,
+                    response: ResponseDeliveryOutcome::Sent,
+                });
+            }
         }
     }
-    Ok(created)
+    Ok(RunResult { created, teardowns })
 }
 
 fn prepare_instance_identities<G>(
@@ -315,6 +340,26 @@ fn resolve_button_instance(
     }
 }
 
+fn resolve_instance_ref(
+    instance: &InstanceRef,
+    runtime: &RuntimeBindings,
+    context: &RuntimeContext,
+) -> Result<InstanceId, AdapterError> {
+    match instance {
+        InstanceRef::Event => context
+            .instance
+            .as_ref()
+            .map(|resolved| resolved.instance.id.clone())
+            .ok_or_else(event_instance_missing),
+        InstanceRef::Created(created) => runtime
+            .created_instances
+            .get(&created.created)
+            .or_else(|| runtime.planned_instances.get(&created.created))
+            .cloned()
+            .ok_or_else(|| unresolved_planned_instance(&created.created)),
+    }
+}
+
 fn resolve_manifest(
     refs: &InstanceResourceRefs,
     runtime: &RuntimeBindings,
@@ -365,6 +410,13 @@ fn unresolved_planned_instance(key: &str) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::BadRequest,
         format!("unresolved planned instance: {key}"),
+    )
+}
+
+fn teardown_error(error: automation_instance_teardown::TeardownError) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("instance teardown error: {error:?}"),
     )
 }
 
@@ -426,11 +478,11 @@ pub enum HandleOutcome {
     NoOp,
 }
 
-pub async fn handle_event<M, R, S, G>(
+pub async fn handle_event<M, R, S, G, T>(
     event: &RuntimeEvent,
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
-    services: &AutomationServices<'_, M, R, S, G>,
+    services: &AutomationServices<'_, M, R, S, G, T>,
     failure_message: &str,
     identity: &RunningRuleSetIdentity,
 ) -> Result<HandleOutcome, AdapterError>
@@ -439,6 +491,7 @@ where
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
+    T: InstanceTeardownService,
 {
     if let EventKind::InstanceAction { .. } = &event.kind {
         return Err(AdapterError::new(

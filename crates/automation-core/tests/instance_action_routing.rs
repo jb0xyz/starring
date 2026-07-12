@@ -73,6 +73,7 @@ fn handle_event_rejects_instance_action() {
         responder: &responder,
         instances: &instances,
         instance_ids: &ids,
+        teardown: &automation_core::MockInstanceTeardownService::new(),
     };
     let event = RuntimeEvent {
         guild_id: GuildId(7),

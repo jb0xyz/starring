@@ -169,6 +169,7 @@ async fn pinned_v1_dispatch_uses_postgres_version_while_v2_is_active() {
         responder: &responder,
         instances: &instances,
         instance_ids: &instance_ids,
+        teardown: &automation_core::MockInstanceTeardownService::new(),
     };
     let event = join_event();
     let outcome = dispatch_instance_action(

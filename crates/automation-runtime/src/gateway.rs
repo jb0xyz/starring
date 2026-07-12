@@ -1,5 +1,6 @@
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetStore;
 use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
 use automation_state::InteractionRuleSet;
@@ -19,6 +20,7 @@ pub async fn run(
     failure_message: String,
     instances: impl InstanceStore,
     instance_ids: impl InstanceIdGenerator,
+    teardown: impl InstanceTeardownService,
     ruleset_store: &impl RuleSetStore,
     snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) {
@@ -45,6 +47,7 @@ pub async fn run(
                 &failure_message,
                 &instances,
                 &instance_ids,
+                &teardown,
                 ruleset_store,
                 snapshot_provider,
             )

@@ -114,6 +114,11 @@ pub fn interpret(
                     resources: resources.clone(),
                 });
             }
+            ActionSpec::TeardownInstance { instance } => {
+                steps.push(PlannedAction::TeardownInstance {
+                    instance: instance.clone(),
+                });
+            }
         }
     }
 

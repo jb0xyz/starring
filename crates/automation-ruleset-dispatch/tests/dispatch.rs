@@ -285,6 +285,7 @@ struct Fixture {
     mutation: MockMutationAdapter,
     ids: SequenceInstanceIdGenerator,
     responder: TracingResponder,
+    teardown: automation_core::MockInstanceTeardownService,
 }
 
 fn fixture(
@@ -311,6 +312,7 @@ fn fixture(
             fail_defer,
             fail_edit,
         },
+        teardown: automation_core::MockInstanceTeardownService::new(),
     }
 }
 
@@ -322,12 +324,14 @@ fn services(
     TracingResponder,
     TracingInstances,
     SequenceInstanceIdGenerator,
+    automation_core::MockInstanceTeardownService,
 > {
     AutomationServices {
         mutation: &fixture.mutation,
         responder: &fixture.responder,
         instances: &fixture.instances,
         instance_ids: &fixture.ids,
+        teardown: &fixture.teardown,
     }
 }
 

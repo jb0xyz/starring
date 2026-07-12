@@ -104,6 +104,7 @@ fn run_calls(steps: Vec<PlannedAction>) -> Vec<MutationCall> {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -122,9 +123,11 @@ fn run_created(steps: Vec<PlannedAction>) -> Vec<CreatedResource> {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap()
+    .created
 }
 
 #[test]
@@ -278,6 +281,7 @@ fn missing_input_fails_post_panel() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .is_err());

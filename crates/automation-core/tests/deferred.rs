@@ -96,6 +96,7 @@ fn run_executes_defer_and_edit() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -123,6 +124,7 @@ fn handle_event_defer_success_edits_completion() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "실패",
         &identity("test"),
@@ -156,6 +158,7 @@ fn handle_event_failure_edits_failure_message() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "스터디룸 '${input.room_name}' 실패",
         &identity("test"),

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 automation-instance = { path = "../automation-instance" }
+automation-instance-teardown = { path = "../automation-instance-teardown" }
 serde = { workspace = true }
 automation-state = { path = "../automation-state" }
 desired-state = { path = "../desired-state" }

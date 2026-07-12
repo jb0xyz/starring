@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::time::Duration;
 
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::InstanceRuleSetVersion;
@@ -131,6 +132,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("hydration failed (fail-closed, not starting): {e:?}"))?;
 
+    let instances = automation_instance_postgres::PostgresInstanceStore::new(pool.clone());
+    let teardown = automation_instance_teardown::Teardown::new(
+        automation_instance_postgres::PostgresInstanceStore::new(pool.clone()),
+        automation_runtime::TwilightInstanceDeleter::new(&http),
+    );
+    match automation_runtime::resume_deleting_instances(
+        GuildId(guild_id),
+        &instances,
+        &teardown,
+        automation_runtime::ResumeConfig {
+            max_concurrency: 4,
+            per_instance_timeout: Duration::from_secs(10),
+        },
+    )
+    .await
+    {
+        Ok(report) => {
+            for entry in report.entries {
+                eprintln!("teardown resume: {entry:?}");
+            }
+        }
+        Err(error) => {
+            eprintln!("teardown resume list failed; continuing startup: {error:?}");
+        }
+    }
+
     let installation_store =
         automation_panel_installation_postgres::PostgresPanelInstallationStore::new(pool.clone());
     let panel_installer = automation_runtime::TwilightPanelInstaller::new(&http);
@@ -156,7 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot_provider = automation_runtime::TwilightGuildRoleSnapshotProvider::new(&http)
         .await
         .map_err(|error| format!("snapshot provider startup failed: {error:?}"))?;
-    let instances = automation_instance_postgres::PostgresInstanceStore::new(pool);
     let instance_ids = random_instance_id::RandomInstanceIdGenerator::new();
     let identity = RunningRuleSetIdentity {
         key: runtime.ruleset_key.as_str().to_string(),
@@ -171,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "스터디룸 처리에 실패했습니다.".to_string(),
         instances,
         instance_ids,
+        teardown,
         &ruleset_store,
         &snapshot_provider,
     )
@@ -380,6 +407,12 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             route: ButtonRoute::Static {
                                 key: "study_help".to_string(),
                             },
+                        }, ButtonSpec {
+                            label: "방 닫기".to_string(),
+                            route: ButtonRoute::InstanceAction {
+                                instance: InstanceRef::Created(created("study_room_instance")),
+                                action: "close".to_string(),
+                            },
                         }],
                     },
                     ActionSpec::PostPanel {
@@ -451,6 +484,21 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                     },
                 ],
             },
+            InteractionRule {
+                key: "study_close_rule".to_string(),
+                trigger: TriggerSpec::InstanceAction {
+                    action: "close".to_string(),
+                },
+                actions: vec![
+                    ActionSpec::DeferEphemeral,
+                    ActionSpec::TeardownInstance {
+                        instance: InstanceRef::Event,
+                    },
+                    ActionSpec::EditResponse {
+                        content: "스터디룸을 닫았습니다.".to_string(),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -517,6 +565,26 @@ mod tests {
         assert!(matches!(
             join.actions.last(),
             Some(ActionSpec::EditResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn close_rule_uses_deferred_teardown_contract() {
+        let ruleset = studyroom_ruleset();
+        let close = ruleset
+            .rules
+            .iter()
+            .find(|rule| rule.key == "study_close_rule")
+            .unwrap();
+        assert!(matches!(
+            close.actions.as_slice(),
+            [
+                ActionSpec::DeferEphemeral,
+                ActionSpec::TeardownInstance {
+                    instance: InstanceRef::Event,
+                },
+                ActionSpec::EditResponse { .. },
+            ]
         ));
     }
 

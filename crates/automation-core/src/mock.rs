@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use automation_instance::InstanceId;
+use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
 use crate::adapter::{
@@ -217,6 +219,52 @@ impl InteractionResponder for MockInteractionResponder {
             .unwrap()
             .push(ResponderCall::EditResponse { content });
         Ok(())
+    }
+}
+
+pub struct MockInstanceTeardownService {
+    calls: Mutex<Vec<(GuildId, InstanceId)>>,
+    result: Result<TeardownOutcome, TeardownError>,
+}
+
+impl MockInstanceTeardownService {
+    pub fn new() -> Self {
+        Self::with_outcome(TeardownOutcome::Completed)
+    }
+
+    pub fn with_outcome(outcome: TeardownOutcome) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(outcome),
+        }
+    }
+
+    pub fn with_error(error: TeardownError) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            result: Err(error),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<(GuildId, InstanceId)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Default for MockInstanceTeardownService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstanceTeardownService for MockInstanceTeardownService {
+    async fn teardown(
+        &self,
+        guild_id: GuildId,
+        instance_id: InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.calls.lock().unwrap().push((guild_id, instance_id));
+        self.result.clone()
     }
 }
 

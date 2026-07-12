@@ -82,6 +82,9 @@ pub enum ActionSpec {
         kind: InstanceKind,
         resources: InstanceResourceRefs,
     },
+    TeardownInstance {
+        instance: InstanceRef,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +440,32 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn teardown_instance_roundtrips() {
+        let event = ActionSpec::TeardownInstance {
+            instance: InstanceRef::Event,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"teardown_instance","instance":"event"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionSpec>(
+                r#"{"type":"teardown_instance","instance":{"created":"room"}}"#
+            )
+            .unwrap(),
+            ActionSpec::TeardownInstance {
+                instance: InstanceRef::Created(CreatedRef {
+                    created: "room".to_string(),
+                }),
+            }
+        );
+        assert!(serde_json::from_str::<ActionSpec>(
+            r#"{"type":"teardown_instance","instance":"event","extra":true}"#
+        )
+        .is_err());
     }
 
     #[test]

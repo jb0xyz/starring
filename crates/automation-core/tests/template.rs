@@ -99,6 +99,7 @@ fn responded(event: &RuntimeEvent, rule: InteractionRule) -> String {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "",
         &identity("test"),

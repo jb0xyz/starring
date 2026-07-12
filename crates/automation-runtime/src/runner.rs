@@ -1,5 +1,6 @@
 use automation_core::{handle_event, AutomationServices, EventKind, RunningRuleSetIdentity};
 use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetStore;
 use automation_ruleset_dispatch::{dispatch_instance_action, GuildRoleSnapshotProvider};
 use automation_state::InteractionRuleSet;
@@ -22,6 +23,7 @@ pub async fn handle_interaction(
     failure_message: &str,
     instances: &impl InstanceStore,
     instance_ids: &impl InstanceIdGenerator,
+    teardown: &impl InstanceTeardownService,
     ruleset_store: &impl RuleSetStore,
     snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) {
@@ -35,6 +37,7 @@ pub async fn handle_interaction(
         responder: &responder,
         instances,
         instance_ids,
+        teardown,
     };
     match &event.kind {
         EventKind::ButtonClick { .. } | EventKind::ModalSubmit { .. } => {

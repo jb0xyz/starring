@@ -1,10 +1,33 @@
 use automation_instance::InstanceId;
-use automation_state::{ButtonSpec, InstanceKind, InstanceResourceRefs, ModalFieldSpec};
+use automation_instance_teardown::TeardownOutcome;
+use automation_state::{
+    ButtonSpec, InstanceKind, InstanceRef, InstanceResourceRefs, ModalFieldSpec,
+};
 use discord_model::{ChannelId, MessageId, Permissions, RoleId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionPlan {
     pub steps: Vec<PlannedAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseDeliveryOutcome {
+    Sent,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeardownActionResult {
+    pub action_index: usize,
+    pub instance_id: InstanceId,
+    pub teardown: TeardownOutcome,
+    pub response: ResponseDeliveryOutcome,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunResult {
+    pub created: Vec<CreatedResource>,
+    pub teardowns: Vec<TeardownActionResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +94,9 @@ pub enum PlannedAction {
         key: String,
         kind: InstanceKind,
         resources: InstanceResourceRefs,
+    },
+    TeardownInstance {
+        instance: InstanceRef,
     },
 }
 

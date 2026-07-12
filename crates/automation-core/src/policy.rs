@@ -94,7 +94,8 @@ pub fn analyze(
                 | ActionSpec::OpenModal { .. }
                 | ActionSpec::DeferEphemeral
                 | ActionSpec::EditResponse { .. }
-                | ActionSpec::RegisterInstance { .. } => {}
+                | ActionSpec::RegisterInstance { .. }
+                | ActionSpec::TeardownInstance { .. } => {}
             }
         }
     }

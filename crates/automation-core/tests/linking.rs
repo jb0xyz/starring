@@ -111,6 +111,7 @@ fn created_role_granted_to_actor() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -157,11 +158,12 @@ fn full_study_run_creates_then_grants() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
     assert_eq!(
-        created,
+        created.created,
         vec![
             CreatedResource::Role {
                 action_index: 0,
@@ -317,6 +319,7 @@ fn create_role_failure_skips_grant() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
     assert_eq!(result.unwrap_err().kind, AdapterErrorKind::Forbidden);

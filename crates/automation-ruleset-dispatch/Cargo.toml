@@ -7,6 +7,7 @@ edition.workspace = true
 automation-core = { path = "../automation-core" }
 automation-state = { path = "../automation-state" }
 automation-instance = { path = "../automation-instance" }
+automation-instance-teardown = { path = "../automation-instance-teardown" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
 discord-model = { path = "../discord-model" }

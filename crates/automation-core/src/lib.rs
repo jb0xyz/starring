@@ -17,10 +17,13 @@ pub use event::{
     EventKind, ResolvedInstanceContext, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
 };
 pub use interpret::interpret;
-pub use mock::{MockInteractionResponder, MockMutationAdapter, MutationCall, ResponderCall};
+pub use mock::{
+    MockInstanceTeardownService, MockInteractionResponder, MockMutationAdapter, MutationCall,
+    ResponderCall,
+};
 pub use plan::{
     ActionPlan, CreatedResource, ModalPresentation, PlannedAction, PlannedChannel,
-    PlannedOverwriteTarget, PlannedRole,
+    PlannedOverwriteTarget, PlannedRole, ResponseDeliveryOutcome, RunResult, TeardownActionResult,
 };
 pub use policy::{analyze, privileged_mask, DynamicAction, PolicyFinding};
 pub use run::{handle_event, run, HandleOutcome};

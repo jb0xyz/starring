@@ -81,6 +81,7 @@ fn run_calls(event: &RuntimeEvent, actions: Vec<ActionSpec>) -> Vec<MutationCall
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "",
         &identity("test"),
@@ -151,6 +152,7 @@ fn create_channel_missing_input_errors() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "",
         &identity("test"),
@@ -183,11 +185,12 @@ fn created_ids_recorded_in_run_result() {
             responder: &responder,
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
     assert_eq!(
-        created,
+        created.created,
         vec![
             CreatedResource::Channel {
                 action_index: 0,

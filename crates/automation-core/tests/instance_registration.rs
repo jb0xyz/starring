@@ -148,6 +148,7 @@ fn register_instance_resolves_and_stores_manifest() {
             responder: &responder,
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -176,7 +177,7 @@ fn register_instance_resolves_and_stores_manifest() {
         ChannelId(800_001)
     );
     assert_eq!(
-        created_resources,
+        created_resources.created,
         vec![
             CreatedResource::Role {
                 action_index: 0,
@@ -225,6 +226,7 @@ fn unresolved_manifest_fails_after_id_preallocation() {
             responder: &MockInteractionResponder::new(),
             instances: &InMemoryInstanceStore::new(),
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 
@@ -265,6 +267,7 @@ fn duplicate_store_registration_is_fail_fast() {
             responder: &responder,
             instances: &instances,
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 
@@ -490,6 +493,7 @@ fn full_study_room_run_registers_instance() {
             responder: &responder,
             instances: &instances,
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "실패",
         &RunningRuleSetIdentity {
@@ -581,6 +585,7 @@ fn same_instance_id_is_allowed_in_different_guilds() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -592,19 +597,20 @@ fn same_instance_id_is_allowed_in_different_guilds() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
 
     assert_eq!(
-        first.last(),
+        first.created.last(),
         Some(&CreatedResource::Instance {
             action_index: 3,
             key: "study_room_instance".to_string(),
             id: InstanceId::parse("room_001").unwrap(),
         })
     );
-    assert_eq!(first.last(), second.last());
+    assert_eq!(first.created.last(), second.created.last());
     assert_eq!(
         block_on(instances.list_by_guild(GuildId(7))).unwrap().len(),
         1
@@ -634,6 +640,7 @@ fn running_ruleset_v7_is_pinned_on_registered_instance() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
         "실패",
         &identity,

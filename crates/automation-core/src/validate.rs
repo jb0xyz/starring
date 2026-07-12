@@ -146,6 +146,20 @@ pub enum ValidationError {
     InstanceActionRuleMustDefer {
         rule: String,
     },
+    TeardownInstanceOutsideInstanceRule {
+        rule: String,
+    },
+    UnknownCreatedInstanceRef {
+        rule: String,
+        key: String,
+    },
+    CreatedInstanceRefTypeMismatch {
+        rule: String,
+        key: String,
+    },
+    TeardownRegisterConflict {
+        rule: String,
+    },
 }
 
 pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<ValidationError>> {
@@ -256,6 +270,19 @@ pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<Valid
                 }
             }
         }
+        let has_register = rule
+            .actions
+            .iter()
+            .any(|action| matches!(action, ActionSpec::RegisterInstance { .. }));
+        let has_teardown = rule
+            .actions
+            .iter()
+            .any(|action| matches!(action, ActionSpec::TeardownInstance { .. }));
+        if has_register && has_teardown {
+            errors.push(ValidationError::TeardownRegisterConflict {
+                rule: rule.key.clone(),
+            });
+        }
         let mut created: BTreeMap<String, CreatedKind> = BTreeMap::new();
         for action in &rule.actions {
             match action {
@@ -348,6 +375,9 @@ pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<Valid
                         });
                     }
                     check_manifest(&mut errors, rule, &created, resources);
+                }
+                ActionSpec::TeardownInstance { instance } => {
+                    check_teardown_instance_ref(&mut errors, rule, &created, instance);
                 }
             }
         }
@@ -665,6 +695,34 @@ fn check_channel_ref(
             Some(_) => errors.push(ValidationError::CreatedChannelRefTypeMismatch {
                 rule: rule.key.clone(),
                 key: inner.created.clone(),
+            }),
+        },
+    }
+}
+
+fn check_teardown_instance_ref(
+    errors: &mut Vec<ValidationError>,
+    rule: &InteractionRule,
+    created: &BTreeMap<String, CreatedKind>,
+    instance: &InstanceRef,
+) {
+    match instance {
+        InstanceRef::Event => {
+            if !matches!(rule.trigger, TriggerSpec::InstanceAction { .. }) {
+                errors.push(ValidationError::TeardownInstanceOutsideInstanceRule {
+                    rule: rule.key.clone(),
+                });
+            }
+        }
+        InstanceRef::Created(reference) => match created.get(&reference.created) {
+            None => errors.push(ValidationError::UnknownCreatedInstanceRef {
+                rule: rule.key.clone(),
+                key: reference.created.clone(),
+            }),
+            Some(CreatedKind::Instance) => {}
+            Some(_) => errors.push(ValidationError::CreatedInstanceRefTypeMismatch {
+                rule: rule.key.clone(),
+                key: reference.created.clone(),
             }),
         },
     }

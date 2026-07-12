@@ -210,6 +210,7 @@ fn planned_id_routes_hub_and_registration_persists_complete_manifest() {
             responder: &responder,
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ))
     .unwrap();
@@ -258,7 +259,7 @@ fn planned_id_routes_hub_and_registration_persists_complete_manifest() {
         ChannelId(99)
     );
     assert_eq!(
-        created_resources.last(),
+        created_resources.created.last(),
         Some(&CreatedResource::Instance {
             action_index: 4,
             key: "study_room_instance".to_string(),
@@ -280,6 +281,7 @@ fn allocator_failure_prevents_mutations_and_store_calls() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 
@@ -305,6 +307,7 @@ fn mutation_failure_after_preallocation_does_not_register() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 
@@ -338,6 +341,7 @@ fn duplicate_store_id_does_not_reallocate() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 
@@ -369,6 +373,7 @@ fn duplicate_logical_register_key_allocates_once() {
             responder: &MockInteractionResponder::new(),
             instances: &instances,
             instance_ids: &instance_ids,
+            teardown: &automation_core::MockInstanceTeardownService::new(),
         },
     ));
 

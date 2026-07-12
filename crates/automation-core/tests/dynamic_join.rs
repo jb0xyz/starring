@@ -198,6 +198,7 @@ fn created_instance_button_route_resolves_before_posting() {
         responder: &responder,
         instances: &instances,
         instance_ids: &generator,
+        teardown: &automation_core::MockInstanceTeardownService::new(),
     };
     let context = automation_core::RuntimeContext::from_event(
         &RuntimeEvent {

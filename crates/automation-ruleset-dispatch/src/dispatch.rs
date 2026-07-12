@@ -8,6 +8,7 @@ use automation_core::{
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceStatus, InstanceStore,
 };
+use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::{RuleSetKey, RuleSetStore, RuleSetVersionId};
 use automation_ruleset_readiness::{
     build_readiness_context, check_readiness, RuleSetReadinessInput,
@@ -19,14 +20,14 @@ use crate::error::{DispatchError, DispatchFailure, FailureResponseOutcome};
 use crate::snapshot::GuildRoleSnapshotProvider;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn dispatch_instance_action<M, R, S, G, RS, P>(
+pub async fn dispatch_instance_action<M, R, S, G, T, RS, P>(
     event: &RuntimeEvent,
     instance_id: &InstanceId,
     action: &str,
     ruleset_store: &RS,
     snapshot_provider: &P,
     bindings: &ResourceBindingMap,
-    services: &AutomationServices<'_, M, R, S, G>,
+    services: &AutomationServices<'_, M, R, S, G, T>,
     failure_message: &str,
 ) -> Result<HandleOutcome, DispatchFailure>
 where
@@ -34,6 +35,7 @@ where
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
+    T: InstanceTeardownService,
     RS: RuleSetStore,
     P: GuildRoleSnapshotProvider,
 {
@@ -65,20 +67,21 @@ where
     }
 }
 
-async fn run_pinned<M, R, S, G, RS, P>(
+async fn run_pinned<M, R, S, G, T, RS, P>(
     event: &RuntimeEvent,
     instance_id: &InstanceId,
     action: &str,
     ruleset_store: &RS,
     snapshot_provider: &P,
     bindings: &ResourceBindingMap,
-    services: &AutomationServices<'_, M, R, S, G>,
+    services: &AutomationServices<'_, M, R, S, G, T>,
 ) -> Result<HandleOutcome, DispatchError>
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
+    T: InstanceTeardownService,
     RS: RuleSetStore,
     P: GuildRoleSnapshotProvider,
 {
@@ -156,8 +159,8 @@ fn ensure_active(instance: &AutomationInstance) -> Result<(), DispatchError> {
     Ok(())
 }
 
-async fn emit_failure<M, R, S, G>(
-    services: &AutomationServices<'_, M, R, S, G>,
+async fn emit_failure<M, R, S, G, T>(
+    services: &AutomationServices<'_, M, R, S, G, T>,
     failure_message: &str,
 ) -> FailureResponseOutcome
 where
@@ -165,6 +168,7 @@ where
     R: InteractionResponder,
     S: InstanceStore,
     G: InstanceIdGenerator,
+    T: InstanceTeardownService,
 {
     let inputs: BTreeMap<String, String> = BTreeMap::new();
     let rendered = match TemplateString::parse(failure_message)
