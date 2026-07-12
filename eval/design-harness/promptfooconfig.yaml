@@ -1,0 +1,10 @@
+description: Starring design harness serving benchmark
+prompts:
+  - label: design-request
+    raw: "{{request}}"
+providers:
+  - id: file://provider.js
+    label: gemma4-12b-mlx
+    config:
+      model: gemma4:12b-mlx
+tests: file://cases.yaml

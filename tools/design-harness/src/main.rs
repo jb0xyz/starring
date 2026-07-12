@@ -1,13 +1,16 @@
 mod client;
 mod config;
+mod eval;
 
+use std::env;
 use std::error::Error;
+use std::time::Instant;
 
 use design_harness::{
     BurstOutcome, DesignSession, DraftSummary, HaltReport, LimitKind, Observability,
     StructuredError,
 };
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::GemmaClient;
 use crate::config::EdgeConfig;
@@ -15,7 +18,10 @@ use crate::config::EdgeConfig;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = EdgeConfig::from_env()?;
-    let client = GemmaClient::new(config.base_url, config.api_key)?;
+    let client = GemmaClient::new(config.base_url, config.api_key, config.model)?;
+    if env::args().nth(1).as_deref() == Some("--eval-json") {
+        return run_eval(client, config.session_config).await;
+    }
     let mut session = DesignSession::with_config(client, config.session_config);
     let mut lines = BufReader::new(io::stdin()).lines();
     let mut output = io::stdout();
@@ -46,6 +52,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    Ok(())
+}
+
+async fn run_eval(
+    client: GemmaClient,
+    config: design_harness::SessionConfig,
+) -> Result<(), Box<dyn Error>> {
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).await?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("evaluation prompt must not be empty".into());
+    }
+    let mut session = DesignSession::with_config(client, config);
+    let started = Instant::now();
+    let outcome = session.run_burst(prompt).await;
+    let document = eval::report(&session, &outcome, started.elapsed()).await;
+    let mut output = io::stdout();
+    output
+        .write_all(serde_json::to_string(&document)?.as_bytes())
+        .await?;
+    output.write_all(b"\n").await?;
+    output.flush().await?;
     Ok(())
 }
 
@@ -118,13 +147,14 @@ async fn write_observability<W: AsyncWriteExt + Unpin>(
     write_line(
         output,
         &format!(
-            "metrics> model_calls={} tool_calls={} mutation_tools={} clarifications={} validation_failures={} simulation_failures={} nudges={}",
+            "metrics> model_calls={} tool_calls={} mutation_tools={} clarifications={} validation_failures={} simulation_failures={} repeated_errors={} nudges={}",
             observability.model_calls,
             observability.tool_calls,
             tools,
             observability.clarification_count,
             observability.validation_failures,
             observability.simulation_failures,
+            observability.repeated_errors,
             observability.nudge_count
         ),
     )

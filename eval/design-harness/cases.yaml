@@ -1,0 +1,56 @@
+- description: StudyRoom full design
+  vars:
+    caseId: studyroom_full
+    request: |-
+      Discord StudyRoom 자동화를 완성해줘. study_hub 채널에 key=study_panel, content="Create a study room"인 패널과 label="Create room", static key=create_study_room 버튼을 선언한다. key=study_modal, title="Create study room"인 모달에는 required short 필드 room_name을 둔다. create_study_room 버튼 규칙 open_modal은 study_modal을 연다. study_modal 제출 규칙 submit_room은 순서대로 ephemeral defer, key=member_role 역할("${input.room_name} members") 생성, key=room_channel 채널("study-${input.room_name}") 생성, everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여, 생성 채널에 key=welcome_panel 패널 게시(static Help=study_help와 instance action Close=close 버튼), study_hub에 key=hub_panel 패널 게시(instance action Join=join 버튼), "Created ${input.room_name}"로 응답 수정, 마지막으로 key=study_instance kind=study_room 인스턴스 등록을 한다. 등록 manifest에는 member_role, room_channel, welcome_panel, hub_panel을 같은 alias로 모두 포함한다. 현재 revision을 validate하고 StudyRoom golden trace로 simulate한 뒤에만 DONE으로 끝내라. 질문하지 말고 지정된 값 그대로 설계하라.
+    requireSimulation: true
+    expectedPanels: 1
+    expectedModals: 1
+    expectedRules: 2
+    expectedActions: 11
+    minDistinctMutationTools: 10
+    maxModelCalls: 10
+    maxToolCalls: 24
+  assert:
+    - type: javascript
+      value: file://assertions.js:terminalOutcome
+    - type: javascript
+      value: file://assertions.js:finalGates
+    - type: javascript
+      value: file://assertions.js:draftShape
+    - type: javascript
+      value: file://assertions.js:taskSemantics
+    - type: javascript
+      value: file://assertions.js:distinctMutationTools
+    - type: javascript
+      value: file://assertions.js:noExcessiveRepeatedErrors
+    - type: javascript
+      value: file://assertions.js:callBudgets
+- description: Simple modal acknowledgement
+  vars:
+    caseId: simple_modal_ack
+    request: |-
+      Discord 자동화 Draft를 설계해줘. key=feedback_modal, title="Feedback"인 모달을 선언하고 required paragraph 필드 key=message, label="Message"를 넣어라. key=ack_feedback 규칙은 feedback_modal 제출로 시작하고, ephemeral defer 후 "Thanks, ${input.message}"로 응답을 수정한다. 다른 패널이나 규칙이나 action은 만들지 말고 validate_draft까지 통과시켜라. 현재 simulator는 StudyRoom 전용이므로 simulate_draft는 호출하지 말고, 검증이 통과하면 정확히 "QUESTION: Validation passed; stop this benchmark?"라고 답해서 턴을 끝내라.
+    requireSimulation: false
+    expectedPanels: 0
+    expectedModals: 1
+    expectedRules: 1
+    expectedActions: 2
+    minDistinctMutationTools: 3
+    maxModelCalls: 6
+    maxToolCalls: 8
+  assert:
+    - type: javascript
+      value: file://assertions.js:terminalOutcome
+    - type: javascript
+      value: file://assertions.js:finalGates
+    - type: javascript
+      value: file://assertions.js:draftShape
+    - type: javascript
+      value: file://assertions.js:taskSemantics
+    - type: javascript
+      value: file://assertions.js:distinctMutationTools
+    - type: javascript
+      value: file://assertions.js:noExcessiveRepeatedErrors
+    - type: javascript
+      value: file://assertions.js:callBudgets

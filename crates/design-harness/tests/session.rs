@@ -140,6 +140,39 @@ fn failed_tool_stops_the_remaining_batch() {
 }
 
 #[test]
+fn repeated_failure_signatures_are_counted_across_model_calls() {
+    block_on(async {
+        let invalid = || {
+            call(
+                "missing-panel",
+                "add_button",
+                json!({
+                    "panel_key":"missing",
+                    "label":"Open",
+                    "route":{"kind":"static","key":"open"}
+                }),
+            )
+        };
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![invalid()]),
+            LlmResponse::ToolCalls(vec![invalid()]),
+            LlmResponse::Text("QUESTION: Should I create the panel?".to_string()),
+        ]);
+        let mut session = DesignSession::with_config(client, large_config());
+
+        let outcome = session.run_burst("Continue").await;
+
+        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert_eq!(session.observability().repeated_errors, 1);
+        assert_eq!(session.observability().failure_signatures.len(), 1);
+        assert_eq!(
+            session.observability().failure_signatures.values().next(),
+            Some(&2)
+        );
+    });
+}
+
+#[test]
 fn question_and_current_done_end_the_burst() {
     block_on(async {
         let question_client = ScriptedClient::new(vec![LlmResponse::Text(

@@ -6,16 +6,15 @@ use design_harness::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MODEL: &str = "gemma4:e2b-mlx";
-
 pub struct GemmaClient {
     http: reqwest::Client,
     endpoint: String,
     api_key: String,
+    model: String,
 }
 
 impl GemmaClient {
-    pub fn new(base_url: String, api_key: String) -> Result<Self, LlmError> {
+    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -24,6 +23,7 @@ impl GemmaClient {
             http,
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             api_key,
+            model,
         })
     }
 }
@@ -34,7 +34,7 @@ impl LlmClient for GemmaClient {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, LlmError> {
-        let body = build_request_body(messages, tools)?;
+        let body = build_request_body(messages, tools, &self.model)?;
         let response = self
             .http
             .post(&self.endpoint)
@@ -59,7 +59,7 @@ impl LlmClient for GemmaClient {
 
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
-    model: &'static str,
+    model: &'a str,
     messages: Vec<OpenAiMessage<'a>>,
     tools: Vec<OpenAiTool<'a>>,
     tool_choice: &'static str,
@@ -103,7 +103,11 @@ struct OpenAiFunctionTool<'a> {
     parameters: &'a Value,
 }
 
-fn build_request_body(messages: &[Message], tools: &[ToolDefinition]) -> Result<Value, LlmError> {
+fn build_request_body(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    model: &str,
+) -> Result<Value, LlmError> {
     let messages = messages
         .iter()
         .map(openai_message)
@@ -120,7 +124,7 @@ fn build_request_body(messages: &[Message], tools: &[ToolDefinition]) -> Result<
         })
         .collect();
     serde_json::to_value(ChatCompletionRequest {
-        model: MODEL,
+        model,
         messages,
         tools,
         tool_choice: "auto",
@@ -255,9 +259,9 @@ mod tests {
         ];
         let definitions = tool_definitions();
 
-        let body = build_request_body(&messages, &definitions).unwrap();
+        let body = build_request_body(&messages, &definitions, "gemma4:12b-mlx").unwrap();
 
-        assert_eq!(body["model"], "gemma4:e2b-mlx");
+        assert_eq!(body["model"], "gemma4:12b-mlx");
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["stream"], false);

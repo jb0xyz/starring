@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -47,6 +47,8 @@ pub struct Observability {
     pub clarification_count: usize,
     pub validation_failures: usize,
     pub simulation_failures: usize,
+    pub failure_signatures: BTreeMap<String, usize>,
+    pub repeated_errors: usize,
     pub nudge_count: usize,
 }
 
@@ -178,6 +180,16 @@ impl<C> DesignSession<C> {
         let Some(failure) = result.failure() else {
             return;
         };
+        let signature = format!("{}@{}", failure.code, failure.location);
+        let count = self
+            .observability
+            .failure_signatures
+            .entry(signature)
+            .or_default();
+        if *count > 0 {
+            self.observability.repeated_errors += 1;
+        }
+        *count += 1;
         self.last_error = Some(StructuredError::new(
             failure.code.clone(),
             failure.location.clone(),

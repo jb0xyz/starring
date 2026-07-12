@@ -5,10 +5,12 @@ use std::fmt;
 use design_harness::SessionConfig;
 
 const DEFAULT_BASE_URL: &str = "https://llm-api.starring.co.kr/v1";
+const DEFAULT_MODEL: &str = "gemma4:12b-mlx";
 
 pub struct EdgeConfig {
     pub base_url: String,
     pub api_key: String,
+    pub model: String,
     pub session_config: SessionConfig,
 }
 
@@ -23,10 +25,15 @@ impl EdgeConfig {
         if api_key.trim().is_empty() {
             return Err(ConfigError::MissingApiKey);
         }
+        let model = env::var("STARRING_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        if model.trim().is_empty() {
+            return Err(ConfigError::EmptyModel);
+        }
         let session_config = session_config_from(|name| env::var(name).ok())?;
         Ok(Self {
             base_url,
             api_key,
+            model,
             session_config,
         })
     }
@@ -79,6 +86,7 @@ fn parse_bound(
 #[derive(Debug)]
 pub enum ConfigError {
     EmptyBaseUrl,
+    EmptyModel,
     InvalidBound { name: &'static str },
     MissingApiKey,
 }
@@ -87,6 +95,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyBaseUrl => formatter.write_str("STARRING_LLM_BASE_URL must not be empty"),
+            Self::EmptyModel => formatter.write_str("STARRING_LLM_MODEL must not be empty"),
             Self::InvalidBound { name } => write!(formatter, "{name} must be a positive integer"),
             Self::MissingApiKey => formatter.write_str("STARRING_LLM_API_KEY is required"),
         }
