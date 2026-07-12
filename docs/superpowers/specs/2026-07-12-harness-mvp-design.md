@@ -235,13 +235,43 @@ Per-session observability log: `model_calls`, `tool_calls`,
 
 ## LLM Integration
 
-The gemma edge (`LlmClient` impl) calls the OpenAI-compatible gateway's
-chat-completions: `model = gemma4:e2b-mlx`, `messages`, `tools` = the 11 DTO JSON
-schemas, `tool_choice = auto`, `parallel_tool_calls = false`, `stream = false`.
-Base URL and Bearer key are read once at the edge from env / keychain and never
-logged or committed. The `LlmClient` trait returns `LlmResponse::ToolCalls(...)`
-or `LlmResponse::Text(...)`, so `session` is driven by a scripted mock client in
-unit tests.
+**Deployment.** The home server (Mac mini) only exposes the model as an
+OpenAI-compatible API (Node gateway → Ollama → `gemma4:e2b-mlx`), already
+reachable over a Cloudflare Tunnel. `design-harness` is a **client** of that API,
+built in this repo like all other Starring code and run on the developer machine
+(or anywhere with network access and the key). It is **not** deployed to the home
+server; there is no home-server build/agent/CI for it.
+
+The gemma edge (`LlmClient` impl) calls chat-completions with `model =
+gemma4:e2b-mlx` (the gateway forces this model and ignores the field, but send it
+for clarity), `messages`, `tools` = the 11 DTO JSON schemas, `tool_choice = auto`
+(the gateway supports only `auto` / `none`), `stream = false` (tool calls require
+it). `parallel_tool_calls = false` when accepted; the harness serializes returned
+calls regardless.
+
+**Config, edge-only.** Base URL from env (default
+`https://llm-api.starring.co.kr/v1`, overridable to the local
+`http://127.0.0.1:18080/v1`) and the Bearer key from env / OS keychain on the
+running machine. Both are read once at the edge and **never** appear in code,
+config, the system prompt, tests, logs, or committed files.
+
+**Gateway limits that shape the design.** Single concurrent generation (serial
+execution already fits); per-request timeout 300s; max output 2048 tokens.
+
+**Context budget (critical).** The configured context is **8192 tokens** and the
+gateway caps input at **16000 characters**. Every request re-sends the system
+prompt plus all 11 tool schemas plus the running conversation, so the harness
+must stay within that budget: keep tool schemas compact; keep tool results short
+(already the design); and, as a burst grows, **trim older tool-result messages**
+while keeping the system prompt and a single running Draft-state summary as the
+anchor. If a request would exceed the input cap, the harness trims oldest-first;
+if it still cannot fit, it halts the burst and reports rather than sending a
+truncated request. This budget interacts with the 12-model-call bound — a burst
+cannot grow unboundedly.
+
+The `LlmClient` trait returns `LlmResponse::ToolCalls(...)` or
+`LlmResponse::Text(...)`, so `session` is driven by a scripted mock client in unit
+tests and by the gemma HTTP client at the edge.
 
 ## The Golden Trace
 
