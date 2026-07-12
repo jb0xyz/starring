@@ -4,7 +4,11 @@ use std::time::Duration;
 
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::InstanceRuleSetVersion;
-use automation_ruleset::{RuleSetKey, RuleSetStore};
+use automation_ruleset::{RuleSetKey, RuleSetStore, RuleSetVersionId};
+use automation_ruleset_activation::{
+    ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
+    ActivationRequestId, ActivationService, ActivationTarget, ApplyOutcome, RequestActivation,
+};
 use automation_runtime::gateway;
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -17,9 +21,12 @@ use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
 use twilight_model::id::Id;
 
+mod random_activation_id;
 mod random_instance_id;
 
 const DEFAULT_RULESET_KEY: &str = "studyroom_demo";
+const DEFAULT_REQUIRED_APPROVALS: u32 = 1;
+const DEFAULT_ACTIVATION_TTL_SECONDS: i64 = 86_400;
 const BUTTON_KEY: &str = "create_study_room";
 const MODAL_KEY: &str = "create_study_modal";
 
@@ -33,11 +40,34 @@ enum FixtureVariant {
 enum Command {
     Seed {
         variant: FixtureVariant,
-        activate: bool,
-        force_activate: bool,
     },
-    Activate {
-        version: u32,
+    RequestActivation {
+        version: RuleSetVersionId,
+        actor: UserId,
+        required_approvals: u32,
+        ttl_seconds: i64,
+    },
+    ApproveActivation {
+        request_id: ActivationRequestId,
+        actor: UserId,
+    },
+    RejectActivation {
+        request_id: ActivationRequestId,
+        actor: UserId,
+        reason: String,
+    },
+    ApplyActivation {
+        request_id: ActivationRequestId,
+        actor: UserId,
+    },
+    ResumeActivation {
+        request_id: ActivationRequestId,
+        actor: UserId,
+    },
+    #[cfg(feature = "unsafe-dev-activation")]
+    UnsafeDevActivate {
+        version: RuleSetVersionId,
+        actor: UserId,
     },
     Run,
 }
@@ -55,12 +85,32 @@ enum CliError {
     MissingVariantValue,
     DuplicateVariant,
     InvalidVariant(String),
+    MissingActorValue,
+    DuplicateActor,
+    InvalidActor(String),
+    MissingActor,
+    ActorNotAllowed,
+    MissingRequiredApprovalsValue,
+    DuplicateRequiredApprovals,
+    InvalidRequiredApprovals(String),
+    MissingTtlSecondsValue,
+    DuplicateTtlSeconds,
+    InvalidTtlSeconds(String),
+    MissingReasonValue,
+    DuplicateReason,
+    InvalidReason,
+    MissingReason,
+    RequestOptionsNotAllowed,
+    ReasonNotAllowed,
+    RulesetKeyNotAllowed,
     UnknownFlag(String),
     MissingVariantForSeed,
     VariantNotAllowed,
-    ActivateFlagNotAllowed,
-    MissingActivateVersion,
-    InvalidActivateVersion(String),
+    RemovedActivationFlag(String),
+    MissingActivationVersion,
+    InvalidActivationVersion(String),
+    MissingRequestId,
+    InvalidRequestId(String),
     UnknownMode(String),
     UnexpectedPositional(String),
     InvalidRulesetKey(String),
@@ -69,8 +119,10 @@ enum CliError {
 fn parse_cli(args: &[String]) -> Result<ParsedCli, CliError> {
     let mut ruleset_key = None;
     let mut variant = None;
-    let mut activate = false;
-    let mut force_activate = false;
+    let mut actor = None;
+    let mut required_approvals = None;
+    let mut ttl_seconds = None;
+    let mut reason = None;
     let mut positionals = Vec::new();
     let mut index = 0;
 
@@ -102,13 +154,72 @@ fn parse_cli(args: &[String]) -> Result<ParsedCli, CliError> {
                 });
                 index += 2;
             }
-            "--activate" => {
-                activate = true;
-                index += 1;
+            "--actor" => {
+                if actor.is_some() {
+                    return Err(CliError::DuplicateActor);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingActorValue)?;
+                actor = Some(
+                    value
+                        .parse::<u64>()
+                        .map(UserId)
+                        .map_err(|_| CliError::InvalidActor(value.clone()))?,
+                );
+                index += 2;
             }
-            "--force-activate" => {
-                force_activate = true;
-                index += 1;
+            "--required-approvals" => {
+                if required_approvals.is_some() {
+                    return Err(CliError::DuplicateRequiredApprovals);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingRequiredApprovalsValue)?;
+                required_approvals = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| CliError::InvalidRequiredApprovals(value.clone()))?,
+                );
+                index += 2;
+            }
+            "--ttl-seconds" => {
+                if ttl_seconds.is_some() {
+                    return Err(CliError::DuplicateTtlSeconds);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingTtlSecondsValue)?;
+                ttl_seconds = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| CliError::InvalidTtlSeconds(value.clone()))?,
+                );
+                index += 2;
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err(CliError::DuplicateReason);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingReasonValue)?;
+                if value.trim().is_empty() {
+                    return Err(CliError::InvalidReason);
+                }
+                reason = Some(value.clone());
+                index += 2;
+            }
+            "--activate" | "--force-activate" => {
+                return Err(CliError::RemovedActivationFlag(args[index].clone()));
             }
             value if value.starts_with("--") => {
                 return Err(CliError::UnknownFlag(value.to_string()));
@@ -124,37 +235,125 @@ fn parse_cli(args: &[String]) -> Result<ParsedCli, CliError> {
     let command = match mode {
         "seed-studyroom" => {
             let variant = variant.ok_or(CliError::MissingVariantForSeed)?;
+            if actor.is_some() {
+                return Err(CliError::ActorNotAllowed);
+            }
+            if required_approvals.is_some() || ttl_seconds.is_some() {
+                return Err(CliError::RequestOptionsNotAllowed);
+            }
+            if reason.is_some() {
+                return Err(CliError::ReasonNotAllowed);
+            }
             if let Some(extra) = positionals.get(1) {
                 return Err(CliError::UnexpectedPositional(extra.clone()));
             }
-            Command::Seed {
-                variant,
-                activate,
-                force_activate,
-            }
+            Command::Seed { variant }
         }
-        "activate" => {
+        "request-activation" => {
             if variant.is_some() {
                 return Err(CliError::VariantNotAllowed);
             }
-            if activate || force_activate {
-                return Err(CliError::ActivateFlagNotAllowed);
+            if reason.is_some() {
+                return Err(CliError::ReasonNotAllowed);
             }
-            let raw = positionals.get(1).ok_or(CliError::MissingActivateVersion)?;
+            let version = parse_version(
+                positionals
+                    .get(1)
+                    .ok_or(CliError::MissingActivationVersion)?,
+            )?;
             if let Some(extra) = positionals.get(2) {
                 return Err(CliError::UnexpectedPositional(extra.clone()));
             }
-            let version = raw
-                .parse()
-                .map_err(|_| CliError::InvalidActivateVersion(raw.clone()))?;
-            Command::Activate { version }
+            Command::RequestActivation {
+                version,
+                actor: actor.ok_or(CliError::MissingActor)?,
+                required_approvals: required_approvals.unwrap_or(DEFAULT_REQUIRED_APPROVALS),
+                ttl_seconds: ttl_seconds.unwrap_or(DEFAULT_ACTIVATION_TTL_SECONDS),
+            }
+        }
+        "approve-activation" | "apply-activation" | "resume-activation" => {
+            if ruleset_key.is_some() {
+                return Err(CliError::RulesetKeyNotAllowed);
+            }
+            if variant.is_some() {
+                return Err(CliError::VariantNotAllowed);
+            }
+            if required_approvals.is_some() || ttl_seconds.is_some() {
+                return Err(CliError::RequestOptionsNotAllowed);
+            }
+            if reason.is_some() {
+                return Err(CliError::ReasonNotAllowed);
+            }
+            let request_id =
+                parse_request_id(positionals.get(1).ok_or(CliError::MissingRequestId)?)?;
+            if let Some(extra) = positionals.get(2) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            let actor = actor.ok_or(CliError::MissingActor)?;
+            match mode {
+                "approve-activation" => Command::ApproveActivation { request_id, actor },
+                "apply-activation" => Command::ApplyActivation { request_id, actor },
+                "resume-activation" => Command::ResumeActivation { request_id, actor },
+                _ => unreachable!(),
+            }
+        }
+        "reject-activation" => {
+            if ruleset_key.is_some() {
+                return Err(CliError::RulesetKeyNotAllowed);
+            }
+            if variant.is_some() {
+                return Err(CliError::VariantNotAllowed);
+            }
+            if required_approvals.is_some() || ttl_seconds.is_some() {
+                return Err(CliError::RequestOptionsNotAllowed);
+            }
+            let request_id =
+                parse_request_id(positionals.get(1).ok_or(CliError::MissingRequestId)?)?;
+            if let Some(extra) = positionals.get(2) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            Command::RejectActivation {
+                request_id,
+                actor: actor.ok_or(CliError::MissingActor)?,
+                reason: reason.ok_or(CliError::MissingReason)?,
+            }
+        }
+        #[cfg(feature = "unsafe-dev-activation")]
+        "unsafe-dev-activate" => {
+            if variant.is_some() {
+                return Err(CliError::VariantNotAllowed);
+            }
+            if required_approvals.is_some() || ttl_seconds.is_some() {
+                return Err(CliError::RequestOptionsNotAllowed);
+            }
+            if reason.is_some() {
+                return Err(CliError::ReasonNotAllowed);
+            }
+            let version = parse_version(
+                positionals
+                    .get(1)
+                    .ok_or(CliError::MissingActivationVersion)?,
+            )?;
+            if let Some(extra) = positionals.get(2) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            Command::UnsafeDevActivate {
+                version,
+                actor: actor.ok_or(CliError::MissingActor)?,
+            }
         }
         "run" => {
             if variant.is_some() {
                 return Err(CliError::VariantNotAllowed);
             }
-            if activate || force_activate {
-                return Err(CliError::ActivateFlagNotAllowed);
+            if actor.is_some() {
+                return Err(CliError::ActorNotAllowed);
+            }
+            if required_approvals.is_some() || ttl_seconds.is_some() {
+                return Err(CliError::RequestOptionsNotAllowed);
+            }
+            if reason.is_some() {
+                return Err(CliError::ReasonNotAllowed);
             }
             if let Some(extra) = positionals.get(1) {
                 return Err(CliError::UnexpectedPositional(extra.clone()));
@@ -168,6 +367,27 @@ fn parse_cli(args: &[String]) -> Result<ParsedCli, CliError> {
         ruleset_key,
         command,
     })
+}
+
+fn parse_version(value: &str) -> Result<RuleSetVersionId, CliError> {
+    let raw = value
+        .parse::<u32>()
+        .map_err(|_| CliError::InvalidActivationVersion(value.to_string()))?;
+    RuleSetVersionId::new(raw).map_err(|_| CliError::InvalidActivationVersion(value.to_string()))
+}
+
+fn parse_request_id(value: &str) -> Result<ActivationRequestId, CliError> {
+    ActivationRequestId::parse(value).map_err(|_| CliError::InvalidRequestId(value.to_string()))
+}
+
+#[cfg(not(feature = "unsafe-dev-activation"))]
+fn usage() -> &'static str {
+    "usage: interaction-smoke [--ruleset-key <key>] [run | seed-studyroom --variant <v1|v2> | request-activation <version> --actor <user> [--required-approvals <n>] [--ttl-seconds <s>] | approve-activation <request_id> --actor <user> | reject-activation <request_id> --actor <user> --reason <text> | apply-activation <request_id> --actor <user> | resume-activation <request_id> --actor <user>]"
+}
+
+#[cfg(feature = "unsafe-dev-activation")]
+fn usage() -> &'static str {
+    "usage: interaction-smoke [--ruleset-key <key>] [run | seed-studyroom --variant <v1|v2> | request-activation <version> --actor <user> [--required-approvals <n>] [--ttl-seconds <s>] | approve-activation <request_id> --actor <user> | reject-activation <request_id> --actor <user> --reason <text> | apply-activation <request_id> --actor <user> | resume-activation <request_id> --actor <user> | unsafe-dev-activate <version> --actor <user>]"
 }
 
 fn resolve_ruleset_key(
@@ -186,25 +406,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = match parse_cli(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!(
-                "usage: interaction-smoke [--ruleset-key <key>] [run | activate <version> | seed-studyroom --variant <v1|v2> [--activate] [--force-activate]]"
-            );
+            eprintln!("{}", usage());
             return Err(format!("invalid command line: {error:?}").into());
         }
     };
     let env_ruleset_key = env::var("STARRING_RULESET_KEY").ok();
-    let ruleset_key = match resolve_ruleset_key(
-        parsed.ruleset_key.as_deref(),
-        env_ruleset_key.as_deref(),
-    ) {
-        Ok(key) => key,
-        Err(error) => {
-            eprintln!(
-                "usage: interaction-smoke [--ruleset-key <key>] [run | activate <version> | seed-studyroom --variant <v1|v2> [--activate] [--force-activate]]"
-            );
-            return Err(format!("invalid command line: {error:?}").into());
-        }
-    };
+    let ruleset_key =
+        match resolve_ruleset_key(parsed.ruleset_key.as_deref(), env_ruleset_key.as_deref()) {
+            Ok(key) => key,
+            Err(error) => {
+                eprintln!("{}", usage());
+                return Err(format!("invalid command line: {error:?}").into());
+            }
+        };
 
     let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
     let database_url = env::var("STARRING_DATABASE_URL")?;
@@ -233,61 +447,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("postgres startup: panel installation migration failed: {error}");
             "PostgreSQL startup failed during migration".to_string()
         })?;
+    automation_ruleset_activation_postgres::MIGRATOR
+        .run(&pool)
+        .await
+        .map_err(|error| {
+            eprintln!("postgres startup: activation migration failed: {error}");
+            "PostgreSQL startup failed during migration".to_string()
+        })?;
 
     let ruleset_store = automation_ruleset_postgres::PostgresRuleSetStore::new(pool.clone());
+    let activation_request_store =
+        automation_ruleset_activation_postgres::PostgresActivationRequestStore::new(pool.clone());
+    let activation_provider = TwilightActivationEnvironmentProvider;
+    let activation_service = ActivationService::new(
+        &activation_request_store,
+        &ruleset_store,
+        &activation_provider,
+    );
     match parsed.command {
-        Command::Seed {
-            variant,
-            activate,
-            force_activate,
-        } => {
-            return seed_studyroom(
-                &ruleset_store,
-                guild_id,
-                &ruleset_key,
-                variant,
-                activate,
-                force_activate,
-            )
-            .await;
+        Command::Seed { variant } => {
+            return seed_studyroom(&ruleset_store, guild_id, &ruleset_key, variant).await;
         }
-        Command::Activate {
-            version: version_arg,
+        Command::RequestActivation {
+            version,
+            actor,
+            required_approvals,
+            ttl_seconds,
         } => {
-            let version = automation_ruleset::RuleSetVersionId::new(version_arg)
-                .map_err(|e| format!("invalid version: {e:?}"))?;
-            if ruleset_store
-                .get_version(GuildId(guild_id), &ruleset_key, version)
+            let ttl = chrono::Duration::try_seconds(ttl_seconds)
+                .ok_or_else(|| "activation ttl is out of range".to_string())?;
+            let request = activation_service
+                .request_activation(RequestActivation {
+                    id: random_activation_id::random_request_id()?,
+                    guild_id: GuildId(guild_id),
+                    ruleset_key: ruleset_key.clone(),
+                    version,
+                    requester: actor,
+                    required_approvals,
+                    ttl,
+                })
                 .await
-                .map_err(|e| format!("version lookup failed: {e:?}"))?
-                .is_none()
-            {
-                return Err(format!("version {version} not found; nothing activated").into());
-            }
-            let token = env::var("DISCORD_TEST_TOKEN")?;
-            let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
-            let bindings = bindings(channel_id);
-            let http = Client::new(token);
-            let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
-            let outcome = automation_ruleset_readiness::activate_if_ready(
-                &ruleset_store,
-                GuildId(guild_id),
-                &ruleset_key,
-                version,
-                &bindings,
-                &caps,
-                &role_permissions,
-            )
-            .await
-            .map_err(|e| format!("activation failed (active pointer unchanged): {e:?}"))?;
+                .map_err(|error| format!("activation request failed: {error}"))?;
             eprintln!(
-                "activated {} ({} notices)",
-                outcome.activation.active_version,
-                outcome.runtime_ruleset.notices.len()
+                "activation request {}: target {} v{}, approvals {}/{}, expires {}",
+                request.id,
+                request.target.ruleset_key,
+                request.target.version,
+                request.approvals.len(),
+                request.required_approvals,
+                request.expires_at
             );
             return Ok(());
         }
+        Command::ApproveActivation { request_id, actor } => {
+            let request = activation_service
+                .approve(&request_id, actor)
+                .await
+                .map_err(|error| format!("activation approval failed: {error}"))?;
+            eprintln!(
+                "activation request {}: state {:?}, approvals {}/{}",
+                request.id,
+                request.state,
+                request.approvals.len(),
+                request.required_approvals
+            );
+            return Ok(());
+        }
+        Command::RejectActivation {
+            request_id,
+            actor,
+            reason,
+        } => {
+            let request = activation_service
+                .reject(&request_id, actor, reason)
+                .await
+                .map_err(|error| format!("activation rejection failed: {error}"))?;
+            eprintln!(
+                "activation request {}: rejected by {}, state {:?}",
+                request.id, actor, request.state
+            );
+            return Ok(());
+        }
+        Command::ApplyActivation { request_id, actor } => {
+            let outcome = activation_service
+                .apply(
+                    &request_id,
+                    random_activation_id::random_attempt_id()?,
+                    actor,
+                )
+                .await
+                .map_err(|error| format!("activation apply failed: {error}"))?;
+            report_apply_outcome(request_id.as_str(), outcome);
+            return Ok(());
+        }
+        Command::ResumeActivation { request_id, actor } => {
+            let outcome = activation_service
+                .resume(
+                    &request_id,
+                    random_activation_id::random_attempt_id()?,
+                    actor,
+                )
+                .await
+                .map_err(|error| format!("activation resume failed: {error}"))?;
+            report_apply_outcome(request_id.as_str(), outcome);
+            return Ok(());
+        }
+        #[cfg(feature = "unsafe-dev-activation")]
+        Command::UnsafeDevActivate { version, actor } => {
+            let artifact = ruleset_store
+                .get_version(GuildId(guild_id), &ruleset_key, version)
+                .await
+                .map_err(|error| format!("version lookup failed: {error:?}"))?
+                .ok_or_else(|| format!("version {version} not found"))?;
+            eprintln!(
+                "warning: unsafe development activation bypasses human approval for {} v{}",
+                ruleset_key, version
+            );
+            let outcome = automation_ruleset_activation::unsafe_dev_activate(
+                &ruleset_store,
+                &activation_provider,
+                ActivationTarget {
+                    guild_id: GuildId(guild_id),
+                    ruleset_key: ruleset_key.clone(),
+                    version,
+                    content_hash: artifact.content_hash,
+                },
+                actor,
+            )
+            .await
+            .map_err(|error| format!("unsafe development activation failed: {error}"))?;
+            report_apply_outcome("unsafe development activation", outcome);
+            return Ok(());
+        }
         Command::Run => {}
+    }
+
+    match activation_service.recover_applying(GuildId(guild_id)).await {
+        Ok(report) => {
+            for entry in report.entries {
+                eprintln!("activation recovery: {entry:?}");
+            }
+        }
+        Err(error) => {
+            eprintln!("activation recovery list failed; continuing startup: {error}");
+        }
     }
 
     let token = env::var("DISCORD_TEST_TOKEN")?;
@@ -382,6 +685,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+struct TwilightActivationEnvironmentProvider;
+
+impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
+    async fn load_fresh(
+        &self,
+        target: &ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        let token = env::var("DISCORD_TEST_TOKEN")
+            .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
+        let channel_id = env::var("DISCORD_TEST_CHANNEL")
+            .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?
+            .parse::<u64>()
+            .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
+        let bindings = bindings(channel_id);
+        let http = Client::new(token);
+        let (guild_capabilities, role_permissions) =
+            readiness_context(&http, target.guild_id.0, &bindings)
+                .await
+                .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
+        Ok(ActivationEnvironment {
+            bindings,
+            guild_capabilities,
+            role_permissions,
+        })
+    }
+}
+
+fn report_apply_outcome(subject: &str, outcome: ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Activated => {
+            eprintln!("activation {subject}: target activated");
+        }
+        ApplyOutcome::AlreadyActive => {
+            eprintln!("activation {subject}: target was already active");
+        }
+        ApplyOutcome::RecoveredAlreadyActive => {
+            eprintln!("activation {subject}: recovered already-active target");
+        }
+        ApplyOutcome::AlreadyApplied => {
+            eprintln!("activation {subject}: request was already applied");
+        }
+        ApplyOutcome::InProgress {
+            blocking_request_id,
+            lease_until,
+            lease_expired,
+        } => {
+            eprintln!(
+                "activation {subject}: blocked by request {blocking_request_id}, lease until {lease_until}, expired={lease_expired}"
+            );
+        }
+    }
+}
+
 async fn readiness_context(
     http: &Client,
     guild_id: u64,
@@ -424,8 +780,6 @@ async fn seed_studyroom(
     guild_id: u64,
     key: &automation_ruleset::RuleSetKey,
     variant: FixtureVariant,
-    activate: bool,
-    force_activate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use automation_ruleset::{PublishOutcome, PublishRuleSetRequest};
     let published = store
@@ -441,43 +795,6 @@ async fn seed_studyroom(
         PublishOutcome::Created(v) | PublishOutcome::Reused(v) => v.version,
     };
     eprintln!("seed: published {version}");
-    if !activate {
-        return Ok(());
-    }
-    if let Some(current) = store
-        .active(GuildId(guild_id), key)
-        .await
-        .map_err(|e| format!("active lookup failed: {e:?}"))?
-    {
-        if current.version != version && !force_activate {
-            return Err(format!(
-                "seed: active version {} != target {version}; pass --force-activate to replace",
-                current.version
-            )
-            .into());
-        }
-    }
-    let token = env::var("DISCORD_TEST_TOKEN")?;
-    let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
-    let bindings = bindings(channel_id);
-    let http = Client::new(token);
-    let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
-    let outcome = automation_ruleset_readiness::activate_if_ready(
-        store,
-        GuildId(guild_id),
-        key,
-        version,
-        &bindings,
-        &caps,
-        &role_permissions,
-    )
-    .await
-    .map_err(|e| format!("seed activation failed (published, active unchanged): {e:?}"))?;
-    eprintln!(
-        "seed: activated {} ({} notices)",
-        outcome.activation.active_version,
-        outcome.runtime_ruleset.notices.len()
-    );
     Ok(())
 }
 
@@ -701,6 +1018,84 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    #[test]
+    fn parse_cli_accepts_activation_authority_commands() {
+        assert_eq!(
+            parse_cli(&cli_args(&["request-activation", "7", "--actor", "10",]))
+                .unwrap()
+                .command,
+            Command::RequestActivation {
+                version: RuleSetVersionId::new(7).unwrap(),
+                actor: UserId(10),
+                required_approvals: 1,
+                ttl_seconds: 86_400,
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "approve-activation",
+                "request_1",
+                "--actor",
+                "20",
+            ]))
+            .unwrap()
+            .command,
+            Command::ApproveActivation {
+                request_id: automation_ruleset_activation::ActivationRequestId::parse("request_1",)
+                    .unwrap(),
+                actor: UserId(20),
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "reject-activation",
+                "request_1",
+                "--actor",
+                "30",
+                "--reason",
+                "unsafe",
+            ]))
+            .unwrap()
+            .command,
+            Command::RejectActivation {
+                request_id: automation_ruleset_activation::ActivationRequestId::parse("request_1",)
+                    .unwrap(),
+                actor: UserId(30),
+                reason: "unsafe".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "apply-activation",
+                "request_1",
+                "--actor",
+                "10",
+            ]))
+            .unwrap()
+            .command,
+            Command::ApplyActivation {
+                request_id: automation_ruleset_activation::ActivationRequestId::parse("request_1",)
+                    .unwrap(),
+                actor: UserId(10),
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "resume-activation",
+                "request_1",
+                "--actor",
+                "10",
+            ]))
+            .unwrap()
+            .command,
+            Command::ResumeActivation {
+                request_id: automation_ruleset_activation::ActivationRequestId::parse("request_1",)
+                    .unwrap(),
+                actor: UserId(10),
+            }
+        );
+    }
+
     fn register_resources(ruleset: &InteractionRuleSet) -> &InstanceResourceRefs {
         ruleset
             .rules
@@ -735,34 +1130,7 @@ mod tests {
                 ruleset_key: None,
                 command: Command::Seed {
                     variant: FixtureVariant::V1,
-                    activate: false,
-                    force_activate: false,
                 },
-            }
-        );
-        assert_eq!(
-            parse_cli(&cli_args(&[
-                "seed-studyroom",
-                "--variant",
-                "v2",
-                "--activate",
-                "--force-activate",
-            ]))
-            .unwrap(),
-            ParsedCli {
-                ruleset_key: None,
-                command: Command::Seed {
-                    variant: FixtureVariant::V2,
-                    activate: true,
-                    force_activate: true,
-                },
-            }
-        );
-        assert_eq!(
-            parse_cli(&cli_args(&["activate", "7"])).unwrap(),
-            ParsedCli {
-                ruleset_key: None,
-                command: Command::Activate { version: 7 },
             }
         );
         assert_eq!(
@@ -779,15 +1147,26 @@ mod tests {
         );
         assert_eq!(
             parse_cli(&cli_args(&[
-                "activate",
+                "request-activation",
                 "7",
+                "--actor",
+                "10",
+                "--required-approvals",
+                "2",
+                "--ttl-seconds",
+                "60",
                 "--ruleset-key",
                 "rollback_key",
             ]))
             .unwrap(),
             ParsedCli {
                 ruleset_key: Some("rollback_key".to_string()),
-                command: Command::Activate { version: 7 },
+                command: Command::RequestActivation {
+                    version: RuleSetVersionId::new(7).unwrap(),
+                    actor: UserId(10),
+                    required_approvals: 2,
+                    ttl_seconds: 60,
+                },
             }
         );
     }
@@ -823,26 +1202,89 @@ mod tests {
                 cli_args(&["seed-studyroom"]),
                 CliError::MissingVariantForSeed,
             ),
-            (cli_args(&["activate"]), CliError::MissingActivateVersion),
             (
-                cli_args(&["activate", "seven"]),
-                CliError::InvalidActivateVersion("seven".to_string()),
+                cli_args(&["activate", "7"]),
+                CliError::UnknownMode("activate".to_string()),
             ),
             (
                 cli_args(&["run", "--variant", "v1"]),
                 CliError::VariantNotAllowed,
             ),
             (
-                cli_args(&["activate", "7", "--variant", "v1"]),
-                CliError::VariantNotAllowed,
+                cli_args(&["seed-studyroom", "--variant", "v1", "--activate"]),
+                CliError::RemovedActivationFlag("--activate".to_string()),
             ),
             (
-                cli_args(&["run", "--activate"]),
-                CliError::ActivateFlagNotAllowed,
+                cli_args(&["seed-studyroom", "--variant", "v1", "--force-activate"]),
+                CliError::RemovedActivationFlag("--force-activate".to_string()),
             ),
             (
-                cli_args(&["activate", "7", "--force-activate"]),
-                CliError::ActivateFlagNotAllowed,
+                cli_args(&["request-activation", "--actor", "10"]),
+                CliError::MissingActivationVersion,
+            ),
+            (
+                cli_args(&["request-activation", "0", "--actor", "10"]),
+                CliError::InvalidActivationVersion("0".to_string()),
+            ),
+            (
+                cli_args(&["request-activation", "7"]),
+                CliError::MissingActor,
+            ),
+            (
+                cli_args(&["request-activation", "7", "--actor", "no"]),
+                CliError::InvalidActor("no".to_string()),
+            ),
+            (
+                cli_args(&[
+                    "request-activation",
+                    "7",
+                    "--actor",
+                    "10",
+                    "--required-approvals",
+                    "0",
+                ]),
+                CliError::InvalidRequiredApprovals("0".to_string()),
+            ),
+            (
+                cli_args(&[
+                    "request-activation",
+                    "7",
+                    "--actor",
+                    "10",
+                    "--ttl-seconds",
+                    "0",
+                ]),
+                CliError::InvalidTtlSeconds("0".to_string()),
+            ),
+            (
+                cli_args(&["approve-activation", "bad id", "--actor", "20"]),
+                CliError::InvalidRequestId("bad id".to_string()),
+            ),
+            (
+                cli_args(&["reject-activation", "request_1", "--actor", "20"]),
+                CliError::MissingReason,
+            ),
+            (
+                cli_args(&[
+                    "apply-activation",
+                    "request_1",
+                    "--actor",
+                    "20",
+                    "--reason",
+                    "no",
+                ]),
+                CliError::ReasonNotAllowed,
+            ),
+            (
+                cli_args(&[
+                    "apply-activation",
+                    "request_1",
+                    "--actor",
+                    "20",
+                    "--ruleset-key",
+                    "other",
+                ]),
+                CliError::RulesetKeyNotAllowed,
             ),
             (
                 cli_args(&["run", "extra"]),
@@ -857,6 +1299,31 @@ mod tests {
         for (args, expected) in cases {
             assert_eq!(parse_cli(&args), Err(expected));
         }
+    }
+
+    #[cfg(not(feature = "unsafe-dev-activation"))]
+    #[test]
+    fn unsafe_dev_command_is_absent_without_feature() {
+        assert_eq!(
+            parse_cli(&cli_args(&["unsafe-dev-activate", "7", "--actor", "10",])),
+            Err(CliError::UnknownMode("unsafe-dev-activate".to_string()))
+        );
+        assert!(!usage().contains("unsafe-dev-activate"));
+    }
+
+    #[cfg(feature = "unsafe-dev-activation")]
+    #[test]
+    fn unsafe_dev_command_exists_with_feature() {
+        assert_eq!(
+            parse_cli(&cli_args(&["unsafe-dev-activate", "7", "--actor", "10",]))
+                .unwrap()
+                .command,
+            Command::UnsafeDevActivate {
+                version: RuleSetVersionId::new(7).unwrap(),
+                actor: UserId(10),
+            }
+        );
+        assert!(usage().contains("unsafe-dev-activate"));
     }
 
     #[test]
@@ -1056,55 +1523,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_without_activate_is_publish_only() {
+    async fn seed_is_publish_only() {
         let store = InMemoryRuleSetStore::default();
         let key = automation_ruleset::RuleSetKey::parse(DEFAULT_RULESET_KEY).unwrap();
-        seed_studyroom(&store, 7, &key, FixtureVariant::V1, false, false)
+        seed_studyroom(&store, 7, &key, FixtureVariant::V1)
             .await
             .unwrap();
         assert!(store.active(GuildId(7), &key).await.unwrap().is_none());
         assert_eq!(
             store.list_versions(GuildId(7), &key).await.unwrap().len(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_activate_refuses_accidental_replacement() {
-        let store = InMemoryRuleSetStore::default();
-        let key = automation_ruleset::RuleSetKey::parse(DEFAULT_RULESET_KEY).unwrap();
-        let mut old = studyroom_ruleset(FixtureVariant::V1);
-        old.panels[0].content = "Old panel".to_string();
-        store
-            .publish(PublishRuleSetRequest {
-                guild_id: GuildId(7),
-                ruleset_key: key.clone(),
-                definition: old,
-                created_by: UserId(1),
-            })
-            .await
-            .unwrap();
-        store
-            .activate(GuildId(7), &key, RuleSetVersionId::FIRST)
-            .await
-            .unwrap();
-
-        let error = seed_studyroom(&store, 7, &key, FixtureVariant::V1, true, false)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("pass --force-activate"));
-        assert_eq!(
-            store
-                .active(GuildId(7), &key)
-                .await
-                .unwrap()
-                .unwrap()
-                .version,
-            RuleSetVersionId::FIRST
-        );
-        assert_eq!(
-            store.list_versions(GuildId(7), &key).await.unwrap().len(),
-            2
         );
     }
 
