@@ -1,5 +1,9 @@
 # AI 기반 Discord Control Plane 아키텍처 정리
 
+> [!WARNING]
+> 이 문서는 현재 구현보다 오래된 설계 기록입니다(OCI/vLLM 전제 등 현재 인프라와 불일치).
+> 현재 시스템 상태·크레이트 구조·검증 수준은 루트 `CURRENT_STATE.md`를 기준으로 확인하세요. 충돌 시 `CURRENT_STATE.md`가 우선합니다.
+
 ## 0. 문서 목적
 
 이 문서는 AI 기반 Discord 서버 통합 운영 플랫폼의 전체 구조를 정리한 기술 기획 문서다.

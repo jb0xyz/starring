@@ -1,5 +1,9 @@
 # 전체 타깃 레포 구조 (계획)
 
+> [!WARNING]
+> 이 문서는 현재 구현보다 오래된 설계 기록입니다(당시 계획 — 실제 workspace는 29 크레이트 + 4 tools로 성장).
+> 현재 크레이트 토폴로지·시스템 상태는 루트 `CURRENT_STATE.md`를 기준으로 확인하세요. 충돌 시 `CURRENT_STATE.md`가 우선합니다.
+
 > 아키텍처 문서 17장의 monorepo 구조. **현재는 계획**이며, 각 crate/service는 해당 Phase 구현 시점에 워크스페이스에 추가한다. 지금 물리 생성된 것은 `crates/discord-model`, `crates/domain`, `docs/`뿐이다.
 
 ```text
