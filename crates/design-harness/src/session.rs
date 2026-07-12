@@ -127,6 +127,10 @@ impl<C> DesignSession<C> {
             .push(Message::system(anchor_content(&self.draft)));
     }
 
+    fn routed_tools(&self) -> Vec<ToolDefinition> {
+        routed_tool_definitions(&self.draft, &self.tools)
+    }
+
     fn fit_context(&self, tools: &[ToolDefinition]) -> Option<Vec<Message>> {
         let mut messages = self.messages.clone();
         while Self::total_context_chars(&messages, tools) > self.config.context_char_budget {
@@ -184,7 +188,7 @@ impl<C> DesignSession<C> {
         self.observability.nudge_count += 1;
     }
 
-    fn record_failure(&mut self, name: &str, result: &ToolResult) {
+    fn record_failure(&mut self, name: Option<&str>, result: &ToolResult) {
         let Some(failure) = result.failure() else {
             return;
         };
@@ -205,8 +209,8 @@ impl<C> DesignSession<C> {
             failure.hint.clone(),
         ));
         match name {
-            "validate_draft" => self.observability.validation_failures += 1,
-            "simulate_draft" => self.observability.simulation_failures += 1,
+            Some("validate_draft") => self.observability.validation_failures += 1,
+            Some("simulate_draft") => self.observability.simulation_failures += 1,
             _ => {}
         }
     }
@@ -238,6 +242,23 @@ impl<C> DesignSession<C> {
         )
     }
 
+    fn unavailable_tool_result(&self, name: &str, tools: &[ToolDefinition]) -> ToolResult {
+        let available = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ToolResult::failure_from(
+            &self.draft,
+            StructuredError::new(
+                "TOOL_NOT_AVAILABLE_FOR_DRAFT_STATE",
+                format!("tool.{name}"),
+                "The requested design tool was not exposed for this model call or is no longer available for the current Draft state",
+                format!("Use one of the currently available tools: {available}"),
+            ),
+        )
+    }
+
     fn append_not_executed(&mut self, calls: &[ToolCall]) {
         for call in calls {
             let result = self.not_executed_result();
@@ -260,7 +281,8 @@ impl<C: LlmClient> DesignSession<C> {
                 );
             }
             self.append_anchor();
-            let Some(outbound_messages) = self.fit_context(&self.tools) else {
+            let routed_tools = self.routed_tools();
+            let Some(outbound_messages) = self.fit_context(&routed_tools) else {
                 return self.halt(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
                     "The system prompt, tool schemas, and current Draft anchor do not fit",
@@ -269,7 +291,11 @@ impl<C: LlmClient> DesignSession<C> {
             };
 
             self.observability.model_calls += 1;
-            let response = match self.client.complete(&outbound_messages, &self.tools).await {
+            let response = match self
+                .client
+                .complete(&outbound_messages, &routed_tools)
+                .await
+            {
                 Ok(response) => response,
                 Err(_) => {
                     self.last_error = Some(StructuredError::new(
@@ -310,14 +336,19 @@ impl<C: LlmClient> DesignSession<C> {
                             );
                         }
                         self.observability.tool_calls += 1;
-                        let result =
-                            dispatch_tool(&mut self.draft, &call.name, &call.arguments).await;
+                        let available = routed_tools.iter().any(|tool| tool.name == call.name)
+                            && tool_is_available(&self.draft, &call.name);
+                        let result = if available {
+                            dispatch_tool(&mut self.draft, &call.name, &call.arguments).await
+                        } else {
+                            self.unavailable_tool_result(&call.name, &self.routed_tools())
+                        };
                         if result.is_ok() && is_mutation_tool(&call.name) {
                             self.observability
                                 .distinct_mutation_tools
                                 .insert(call.name.clone());
                         }
-                        self.record_failure(&call.name, &result);
+                        self.record_failure(available.then_some(call.name.as_str()), &result);
                         let is_failure = !result.is_ok();
                         self.messages
                             .push(Message::tool(call.id.clone(), result.as_json()));
@@ -367,6 +398,64 @@ impl<C: LlmClient> DesignSession<C> {
             }
         }
     }
+}
+
+fn routed_tool_definitions(draft: &Draft, registry: &[ToolDefinition]) -> Vec<ToolDefinition> {
+    registry
+        .iter()
+        .filter(|tool| tool_is_available(draft, &tool.name))
+        .cloned()
+        .collect()
+}
+
+fn tool_is_available(draft: &Draft, name: &str) -> bool {
+    let has_rules = !draft.ruleset.rules.is_empty();
+    match name {
+        "add_panel" | "add_modal" | "begin_rule" => true,
+        "add_button" => !draft.ruleset.panels.is_empty(),
+        "add_resource_action"
+        | "add_upsert_overwrite_action"
+        | "add_interaction_action"
+        | "add_post_panel_action" => has_rules,
+        "add_grant_role_action" => has_rules && has_created_role(draft),
+        "set_register_instance" => has_rules && has_ownable_action(draft),
+        "validate_draft" => {
+            has_rules
+                && all_rules_have_actions(draft)
+                && draft.validated_revision != Some(draft.draft_revision)
+        }
+        "simulate_draft" => has_rules && draft.validated_revision == Some(draft.draft_revision),
+        _ => false,
+    }
+}
+
+fn has_created_role(draft: &Draft) -> bool {
+    draft.ruleset.rules.iter().any(|rule| {
+        rule.actions
+            .iter()
+            .any(|action| matches!(action, automation_state::ActionSpec::CreateRole { .. }))
+    })
+}
+
+fn has_ownable_action(draft: &Draft) -> bool {
+    draft.ruleset.rules.iter().any(|rule| {
+        rule.actions.iter().any(|action| {
+            matches!(
+                action,
+                automation_state::ActionSpec::CreateRole { .. }
+                    | automation_state::ActionSpec::CreateChannel { .. }
+                    | automation_state::ActionSpec::PostPanel { .. }
+            )
+        })
+    })
+}
+
+fn all_rules_have_actions(draft: &Draft) -> bool {
+    draft
+        .ruleset
+        .rules
+        .iter()
+        .all(|rule| !rule.actions.is_empty())
 }
 
 fn is_anchor(message: &Message) -> bool {

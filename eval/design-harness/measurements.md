@@ -23,3 +23,14 @@ Measured 2026-07-13 after moving the changing Draft anchor to the request tail, 
 | Simple modal acknowledgement | 3 | 0 | 0 | 1 | n/a | 66,373 | 89,192 | 11 | 10.67 | 2.33 | 8 |
 
 Mean latency fell 13.8% for StudyRoom and 7.0% for the simple case. Two StudyRoom runs reached a validator-clean but incomplete Draft, and one simple run reached the exact two-action Draft and human-question terminal state. All evaluation assertions still failed because tool confusion and call budgets remain unresolved.
+
+## 2. Deterministic Tool Router
+
+Measured 2026-07-13 after routing the locked registry by Draft dependencies. An empty Draft exposes three tools; buttons, role grants, instance registration, validation, and simulation become available only when their deterministic prerequisites hold. Hidden calls are rejected before dispatch and batch calls are rechecked against the current Draft. Conditions and sample size match the baseline.
+
+| Case | Runs | Pass rate | Completion rate | Validation rate | Required simulation rate | Mean ms | p95 ms | Mean model calls | Mean tool calls | Mean distinct mutation tools | Maximum identical error count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| StudyRoom full | 3 | 0 | 0 | 0 | 0 | 74,981 | 87,429 | 12 | 12 | 4.67 | 2 |
+| Simple modal acknowledgement | 3 | 0 | 0 | 1 | n/a | 71,410 | 82,596 | 12 | 12 | 2 | 7 |
+
+StudyRoom mean latency was 3.3% lower than Item 1 and 16.6% lower than baseline. The simple case was effectively unchanged from baseline and 7.6% slower than Item 1. No run completed: StudyRoom reached at most one action, while every simple run repeated the same malformed interaction-action shape seven times. The router removes impossible choices and lifecycle deadlocks, but the live result shows that structured one-attempt repair is still required.
