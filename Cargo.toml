@@ -17,6 +17,7 @@ members = [
     "crates/bot-runtime",
     "crates/automation-state",
     "crates/automation-core",
+    "crates/design-harness",
     "crates/automation-runtime",
     "crates/automation-instance",
     "crates/automation-instance-postgres",

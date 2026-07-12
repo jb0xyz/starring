@@ -1,0 +1,17 @@
+[package]
+name = "design-harness"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-core = { path = "../automation-core" }
+automation-instance = { path = "../automation-instance" }
+automation-state = { path = "../automation-state" }
+resource-resolution = { path = "../resource-resolution" }
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

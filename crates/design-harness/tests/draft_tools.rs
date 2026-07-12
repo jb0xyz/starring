@@ -1,0 +1,399 @@
+use automation_state::{
+    ActionSpec, ButtonRoute, ChannelRef, InstanceRef, ModalFieldStyle, OverwriteTargetSpec,
+    RoleRef, TriggerSpec,
+};
+use design_harness::{dispatch_tool, tool_definitions, Draft, ToolResult};
+use futures::executor::block_on;
+use serde_json::{json, Value};
+
+fn call(draft: &mut Draft, name: &str, arguments: Value) -> ToolResult {
+    block_on(dispatch_tool(draft, name, &arguments.to_string()))
+}
+
+#[test]
+fn tool_registry_contains_the_locked_eleven_tools() {
+    let definitions = tool_definitions();
+    let names: Vec<&str> = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect();
+
+    assert_eq!(
+        names,
+        vec![
+            "add_panel",
+            "add_button",
+            "add_modal",
+            "begin_rule",
+            "add_resource_action",
+            "add_permission_action",
+            "add_interaction_action",
+            "add_post_panel_action",
+            "set_register_instance",
+            "validate_draft",
+            "simulate_draft",
+        ]
+    );
+    assert!(definitions
+        .iter()
+        .all(|definition| definition.parameters.is_object()));
+    assert!(names
+        .iter()
+        .all(|name| !name.contains("activate") && !name.contains("publish")));
+}
+
+#[test]
+fn draft_mutation_increments_revision_and_invalidates_gates() {
+    let mut draft = Draft::new();
+    draft.validated_revision = Some(0);
+    draft.simulated_revision = Some(0);
+
+    let result = call(
+        &mut draft,
+        "add_panel",
+        json!({
+            "key": "study_panel",
+            "channel": "study_hub",
+            "content": "Create a study room"
+        }),
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(draft.draft_revision, 1);
+    assert_eq!(draft.validated_revision, None);
+    assert_eq!(draft.simulated_revision, None);
+    assert_eq!(draft.summary().panels, 1);
+    assert_eq!(draft.summary().actions, 0);
+}
+
+#[test]
+fn structure_dtos_normalize_to_state_types() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_panel",
+        json!({"key":"study_panel","channel":"study_hub","content":"Create"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_button",
+        json!({
+            "panel_key":"study_panel",
+            "label":"Create room",
+            "route":{"static":"create_study_room"}
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({
+            "key":"study_modal",
+            "title":"Create study room",
+            "fields":[
+                {"key":"room_name","label":"Room name","style":"short","required":true},
+                {"key":"topic","label":"Topic","style":"paragraph","required":false}
+            ]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"open_modal","trigger":{"button_click":"create_study_room"}}),
+    )
+    .is_ok());
+
+    assert_eq!(draft.ruleset.panels[0].key, "study_panel");
+    assert!(matches!(
+        draft.ruleset.panels[0].buttons[0].route,
+        ButtonRoute::Static { ref key } if key == "create_study_room"
+    ));
+    assert_eq!(
+        draft.ruleset.modals[0].fields[0].style,
+        ModalFieldStyle::Short
+    );
+    assert_eq!(
+        draft.ruleset.modals[0].fields[1].style,
+        ModalFieldStyle::Paragraph
+    );
+    assert!(matches!(
+        draft.ruleset.rules[0].trigger,
+        TriggerSpec::ButtonClick { ref component } if component == "create_study_room"
+    ));
+}
+
+#[test]
+fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({
+            "key":"study_modal",
+            "title":"Create study room",
+            "fields":[{"key":"room_name","label":"Room name","style":"short","required":true}]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"submit_room","trigger":{"modal_submit":"study_modal"}}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"submit_room","kind":"defer_ephemeral"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({
+            "rule_key":"submit_room",
+            "kind":"create_role",
+            "key":"member_role",
+            "name":"${input.room_name} members"
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({
+            "rule_key":"submit_room",
+            "kind":"create_channel",
+            "key":"room_channel",
+            "name":"study-${input.room_name}"
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_permission_action",
+        json!({
+            "rule_key":"submit_room",
+            "kind":"upsert_overwrite",
+            "channel":{"created":"room_channel"},
+            "target":"everyone",
+            "allow":[],
+            "deny":["view_channel"]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_permission_action",
+        json!({
+            "rule_key":"submit_room",
+            "kind":"grant_role",
+            "role":{"created":"member_role"},
+            "target":"actor"
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_post_panel_action",
+        json!({
+            "rule_key":"submit_room",
+            "key":"hub_panel",
+            "channel":{"existing":"study_hub"},
+            "content":"Room ${input.room_name} is open",
+            "buttons":[
+                {"label":"Help","route":{"static":"study_help"}},
+                {"label":"Join","route":{"instance_action":"join"}}
+            ]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({
+            "rule_key":"submit_room",
+            "kind":"edit_response",
+            "content":"Created ${input.room_name}"
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "set_register_instance",
+        json!({
+            "rule_key":"submit_room",
+            "instance_key":"study_instance",
+            "kind":"study_room",
+            "roles":[{"alias":"member_role","created":"member_role"}],
+            "channels":[{"alias":"room_channel","created":"room_channel"}],
+            "messages":[{"alias":"hub_panel","created":"hub_panel"}]
+        }),
+    )
+    .is_ok());
+
+    let actions = &draft.ruleset.rules[0].actions;
+    assert!(matches!(actions[0], ActionSpec::DeferEphemeral));
+    assert!(matches!(actions[1], ActionSpec::CreateRole { .. }));
+    assert!(matches!(actions[2], ActionSpec::CreateChannel { .. }));
+    assert!(matches!(
+        actions[3],
+        ActionSpec::UpsertOverwrite {
+            channel: ChannelRef::Created(_),
+            target: OverwriteTargetSpec::Everyone,
+            ..
+        }
+    ));
+    assert!(matches!(
+        actions[4],
+        ActionSpec::GrantRole {
+            role: RoleRef::Created(_),
+            ..
+        }
+    ));
+    let ActionSpec::PostPanel { buttons, .. } = &actions[5] else {
+        panic!("expected post panel")
+    };
+    assert!(matches!(
+        buttons[1].route,
+        ButtonRoute::InstanceAction {
+            instance: InstanceRef::Created(ref created),
+            ref action,
+        } if created.created == "study_instance" && action == "join"
+    ));
+    assert!(matches!(actions[6], ActionSpec::RegisterInstance { .. }));
+    assert!(matches!(actions[7], ActionSpec::EditResponse { .. }));
+}
+
+#[test]
+fn open_modal_and_instance_trigger_dtos_normalize() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({"key":"m","title":"Modal","fields":[]}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"open","trigger":{"button_click":"open_button"}}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"open","kind":"open_modal","modal":"m"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"join","trigger":{"instance_action":"join"}}),
+    )
+    .is_ok());
+
+    assert!(matches!(
+        draft.ruleset.rules[0].actions[0],
+        ActionSpec::OpenModal { ref modal } if modal == "m"
+    ));
+    assert!(matches!(
+        draft.ruleset.rules[1].trigger,
+        TriggerSpec::InstanceAction { ref action } if action == "join"
+    ));
+}
+
+#[test]
+fn incomplete_register_manifest_is_structured_and_non_mutating() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"submit","trigger":{"button_click":"submit"}}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({"rule_key":"submit","kind":"create_role","key":"member","name":"Member"}),
+    )
+    .is_ok());
+    let revision = draft.draft_revision;
+
+    let result = call(
+        &mut draft,
+        "set_register_instance",
+        json!({
+            "rule_key":"submit",
+            "instance_key":"instance",
+            "kind":"study_room",
+            "roles":[],
+            "channels":[],
+            "messages":[]
+        }),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "INSTANCE_RESOURCE_MISSING");
+    assert_eq!(failure.location, "rule.submit.actions");
+    assert!(failure.hint.contains("member"));
+    assert_eq!(draft.draft_revision, revision);
+    assert_eq!(draft.ruleset.rules[0].actions.len(), 1);
+}
+
+#[test]
+fn malformed_and_unknown_tool_calls_return_structured_errors() {
+    let mut draft = Draft::new();
+    let malformed = block_on(dispatch_tool(&mut draft, "add_panel", "{"));
+    assert_eq!(malformed.failure().unwrap().code, "INVALID_TOOL_ARGUMENTS");
+
+    let unknown = call(&mut draft, "activate", json!({}));
+    assert_eq!(unknown.failure().unwrap().code, "UNKNOWN_TOOL");
+    assert_eq!(draft.draft_revision, 0);
+}
+
+#[test]
+fn summary_reports_unknown_fixed_bindings() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_panel",
+        json!({"key":"p","channel":"unknown_hub","content":"Panel"}),
+    )
+    .is_ok());
+
+    assert_eq!(
+        draft.summary().unresolved_references,
+        vec!["unknown_hub".to_string()]
+    );
+}
+
+#[test]
+fn register_rejects_an_empty_ownable_footprint() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"empty","trigger":{"button_click":"empty"}}),
+    )
+    .is_ok());
+    let revision = draft.draft_revision;
+
+    let result = call(
+        &mut draft,
+        "set_register_instance",
+        json!({
+            "rule_key":"empty",
+            "instance_key":"empty_instance",
+            "kind":"empty",
+            "roles":[],
+            "channels":[],
+            "messages":[]
+        }),
+    );
+
+    assert_eq!(result.failure().unwrap().code, "EMPTY_INSTANCE_RESOURCES");
+    assert_eq!(draft.draft_revision, revision);
+}
