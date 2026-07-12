@@ -59,6 +59,29 @@ fn large_config() -> SessionConfig {
     }
 }
 
+fn assert_complete_tool_pairs(messages: &[Message]) {
+    for (assistant_index, message) in messages.iter().enumerate() {
+        for call in &message.tool_calls {
+            assert!(messages.iter().skip(assistant_index + 1).any(|candidate| {
+                candidate.role == MessageRole::Tool
+                    && candidate.tool_call_id.as_deref() == Some(call.id.as_str())
+            }));
+        }
+    }
+    for (tool_index, message) in messages.iter().enumerate() {
+        if message.role != MessageRole::Tool {
+            continue;
+        }
+        let tool_call_id = message.tool_call_id.as_deref().unwrap();
+        assert!(messages[..tool_index].iter().any(|candidate| {
+            candidate
+                .tool_calls
+                .iter()
+                .any(|call| call.id == tool_call_id)
+        }));
+    }
+}
+
 #[test]
 fn tool_calls_execute_serially_before_the_next_model_call() {
     block_on(async {
@@ -98,6 +121,45 @@ fn tool_calls_execute_serially_before_the_next_model_call() {
             .iter()
             .filter(|message| message.role == MessageRole::Tool)
             .all(|message| message.content.contains("\"ok\":true")));
+    });
+}
+
+#[test]
+fn prompt_builder_keeps_a_fixed_prefix_and_appends_current_anchors() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "1",
+                "add_panel",
+                json!({"key":"p","channel":"study_hub","content":"Panel"}),
+            )]),
+            LlmResponse::Text("QUESTION: Continue?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, large_config());
+
+        assert_eq!(
+            session.messages(),
+            &[Message::system(DEFAULT_SYSTEM_PROMPT)]
+        );
+
+        let outcome = session.run_burst("Build a panel").await;
+
+        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        let seen = probe.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0][0], Message::system(DEFAULT_SYSTEM_PROMPT));
+        assert_eq!(seen[0][1], Message::user("Build a panel"));
+        assert!(seen[0][2]
+            .content
+            .starts_with("DRAFT_STATE:{\"revision\":0,"));
+        assert!(seen[1].starts_with(&seen[0]));
+        assert!(seen[1]
+            .last()
+            .unwrap()
+            .content
+            .starts_with("DRAFT_STATE:{\"revision\":1,"));
+        assert!(session.messages().starts_with(&seen[1]));
     });
 }
 
@@ -392,7 +454,21 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
             .count();
         assert!(second_tool_results < 8);
         assert_eq!(seen[1][0].role, MessageRole::System);
-        assert!(seen[1][1].content.starts_with("DRAFT_STATE:"));
+        assert_eq!(seen[1][0].content, DEFAULT_SYSTEM_PROMPT);
+        assert!(seen[1]
+            .last()
+            .unwrap()
+            .content
+            .starts_with("DRAFT_STATE:{\"revision\":8,"));
+        assert_complete_tool_pairs(&seen[1]);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter(|message| message.role == MessageRole::Tool)
+                .count(),
+            8
+        );
 
         let impossible_client = ScriptedClient::new(vec![]);
         let mut impossible = DesignSession::with_config(

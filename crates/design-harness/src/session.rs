@@ -87,10 +87,7 @@ impl<C> DesignSession<C> {
 
     pub fn with_config(client: C, config: SessionConfig) -> Self {
         let draft = Draft::new();
-        let messages = vec![
-            Message::system(DEFAULT_SYSTEM_PROMPT),
-            Message::system(anchor_content(&draft)),
-        ];
+        let messages = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
         Self {
             client,
             draft,
@@ -119,40 +116,51 @@ impl<C> DesignSession<C> {
         &self.observability
     }
 
-    fn refresh_anchor(&mut self) {
-        self.messages[1].content = anchor_content(&self.draft);
-    }
-
-    fn total_context_chars(&self) -> usize {
-        let tools = serde_json::to_string(&self.tools).map_or(usize::MAX, |value| value.len());
-        let messages =
-            serde_json::to_string(&self.messages).map_or(usize::MAX, |value| value.len());
+    fn total_context_chars(messages: &[Message], tools: &[ToolDefinition]) -> usize {
+        let tools = serde_json::to_string(tools).map_or(usize::MAX, |value| value.len());
+        let messages = serde_json::to_string(messages).map_or(usize::MAX, |value| value.len());
         tools.saturating_add(messages)
     }
 
-    fn fit_context(&mut self) -> bool {
-        while self.total_context_chars() > self.config.context_char_budget {
-            let Some(index) = self
-                .messages
-                .iter()
-                .enumerate()
-                .skip(2)
-                .find_map(|(index, message)| (message.role == MessageRole::Tool).then_some(index))
-            else {
-                return false;
-            };
-            let tool_call_id = self.messages[index].tool_call_id.clone();
-            self.messages.remove(index);
-            if let Some(tool_call_id) = tool_call_id {
-                self.remove_trimmed_tool_call(&tool_call_id);
-            }
-        }
-        true
+    fn append_anchor(&mut self) {
+        self.messages
+            .push(Message::system(anchor_content(&self.draft)));
     }
 
-    fn remove_trimmed_tool_call(&mut self, tool_call_id: &str) {
+    fn fit_context(&self, tools: &[ToolDefinition]) -> Option<Vec<Message>> {
+        let mut messages = self.messages.clone();
+        while Self::total_context_chars(&messages, tools) > self.config.context_char_budget {
+            if let Some(index) = messages
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(index, message)| (message.role == MessageRole::Tool).then_some(index))
+            {
+                let tool_call_id = messages[index].tool_call_id.clone();
+                messages.remove(index);
+                if let Some(tool_call_id) = tool_call_id {
+                    Self::remove_trimmed_tool_call(&mut messages, &tool_call_id);
+                }
+                continue;
+            }
+            if let Some(index) = messages
+                .iter()
+                .enumerate()
+                .skip(1)
+                .take(messages.len().saturating_sub(2))
+                .find_map(|(index, message)| is_anchor(message).then_some(index))
+            {
+                messages.remove(index);
+                continue;
+            }
+            return None;
+        }
+        Some(messages)
+    }
+
+    fn remove_trimmed_tool_call(messages: &mut Vec<Message>, tool_call_id: &str) {
         let mut empty_assistant = None;
-        for (index, message) in self.messages.iter_mut().enumerate().skip(2) {
+        for (index, message) in messages.iter_mut().enumerate().skip(1) {
             if message.role != MessageRole::Assistant {
                 continue;
             }
@@ -167,7 +175,7 @@ impl<C> DesignSession<C> {
             }
         }
         if let Some(index) = empty_assistant {
-            self.messages.remove(index);
+            messages.remove(index);
         }
     }
 
@@ -244,7 +252,6 @@ impl<C: LlmClient> DesignSession<C> {
         self.messages.push(Message::user(human_message));
         self.prose_nudged = false;
         loop {
-            self.refresh_anchor();
             if self.observability.model_calls >= self.config.max_model_calls {
                 return self.halt(
                     "MODEL_CALL_LIMIT_EXHAUSTED",
@@ -252,16 +259,17 @@ impl<C: LlmClient> DesignSession<C> {
                     Some(LimitKind::ModelCalls),
                 );
             }
-            if !self.fit_context() {
+            self.append_anchor();
+            let Some(outbound_messages) = self.fit_context(&self.tools) else {
                 return self.halt(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
                     "The system prompt, tool schemas, and current Draft anchor do not fit",
                     Some(LimitKind::ContextChars),
                 );
-            }
+            };
 
             self.observability.model_calls += 1;
-            let response = match self.client.complete(&self.messages, &self.tools).await {
+            let response = match self.client.complete(&outbound_messages, &self.tools).await {
                 Ok(response) => response,
                 Err(_) => {
                     self.last_error = Some(StructuredError::new(
@@ -313,7 +321,6 @@ impl<C: LlmClient> DesignSession<C> {
                         let is_failure = !result.is_ok();
                         self.messages
                             .push(Message::tool(call.id.clone(), result.as_json()));
-                        self.refresh_anchor();
                         if is_failure {
                             failed = true;
                             self.append_not_executed(&calls[index + 1..]);
@@ -360,6 +367,10 @@ impl<C: LlmClient> DesignSession<C> {
             }
         }
     }
+}
+
+fn is_anchor(message: &Message) -> bool {
+    message.role == MessageRole::System && message.content.starts_with("DRAFT_STATE:")
 }
 
 fn anchor_content(draft: &Draft) -> String {
