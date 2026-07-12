@@ -4,9 +4,9 @@ use automation_state::{
     ActionSpec, ButtonRoute, ChannelRef, InstanceRef, InteractionRuleSet, OverwriteTargetSpec,
     RoleRef, TriggerSpec,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub ruleset: InteractionRuleSet,
     pub draft_revision: u64,
@@ -73,7 +73,7 @@ impl Default for Draft {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftSummary {
     pub panels: usize,
     pub modals: usize,

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 design-harness = { path = "../../crates/design-harness" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod eval;
+mod store;
 
 use std::env;
 use std::error::Error;
@@ -13,7 +14,8 @@ use design_harness::{
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::GemmaClient;
-use crate::config::EdgeConfig;
+use crate::config::{EdgeConfig, PersistenceConfig};
+use crate::store::SessionStore;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -22,7 +24,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if env::args().nth(1).as_deref() == Some("--eval-json") {
         return run_eval(client, config.session_config).await;
     }
-    let mut session = DesignSession::with_config(client, config.session_config);
+    let persistence = PersistenceConfig::from_env()?;
+    let mut store = SessionStore::open(&persistence.db_path)?;
+    let mut session = match store.load(&persistence.session_id)? {
+        Some(snapshot) => DesignSession::restore(client, config.session_config, snapshot)?,
+        None => DesignSession::with_config(client, config.session_config),
+    };
     let mut lines = BufReader::new(io::stdin()).lines();
     let mut output = io::stdout();
 
@@ -36,7 +43,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         if line.is_empty() {
             continue;
         }
-        match session.run_burst(line).await {
+        let outcome = session.run_burst(line).await;
+        store.save(&persistence.session_id, &session.snapshot())?;
+        match outcome {
             BurstOutcome::AwaitingHuman { question } => {
                 write_line(&mut output, &format!("assistant> {question}")).await?;
             }

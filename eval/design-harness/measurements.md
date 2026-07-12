@@ -34,3 +34,14 @@ Measured 2026-07-13 after routing the locked registry by Draft dependencies. An 
 | Simple modal acknowledgement | 3 | 0 | 0 | 1 | n/a | 71,410 | 82,596 | 12 | 12 | 2 | 7 |
 
 StudyRoom mean latency was 3.3% lower than Item 1 and 16.6% lower than baseline. The simple case was effectively unchanged from baseline and 7.6% slower than Item 1. No run completed: StudyRoom reached at most one action, while every simple run repeated the same malformed interaction-action shape seven times. The router removes impossible choices and lifecycle deadlocks, but the live result shows that structured one-attempt repair is still required.
+
+## 3. SQLite state compression
+
+Measured 2026-07-13 after adding versioned session snapshots, CLI-edge SQLite persistence, a structured Draft anchor, bounded human-intent memory, and outbound-only compaction after the 16,000-character budget is exceeded. Conditions and sample size match the baseline. Persistence and restart recovery are covered by deterministic close/reopen and continuation tests; this single-burst live benchmark does not exercise a process restart.
+
+| Case | Runs | Pass rate | Completion rate | Validation rate | Required simulation rate | Mean ms | p95 ms | Mean model calls | Mean tool calls | Mean distinct mutation tools | Maximum identical error count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| StudyRoom full | 3 | 0 | 0 | 0.33 | 0 | 111,769 | 131,074 | 12 | 12 | 4.33 | 5 |
+| Simple modal acknowledgement | 3 | 0 | 0 | 0.67 | n/a | 113,560 | 116,813 | 12 | 12 | 2.33 | 8 |
+
+The durable state and compact overflow path pass their deterministic tests, but this short-session live benchmark regressed: mean latency rose 49.1% for StudyRoom and 59.0% for the simple case relative to Item 2. The richer append-only anchors remain in context while the transcript is below budget, and repeated malformed calls still consume all 12 model calls. One StudyRoom run reached a validator-clean incomplete Draft, while one simple run failed validation. These results make Item 4's bounded repair path necessary; Item 3 alone is not a live latency or completion improvement.

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use automation_state::{ActionSpec, InteractionRule, OverwriteTargetSpec, TriggerSpec};
 use design_harness::{
     tool_definitions, BurstOutcome, DesignSession, Draft, LimitKind, LlmClient, LlmError,
-    LlmResponse, Message, MessageRole, SessionConfig, ToolCall, DEFAULT_SYSTEM_PROMPT,
+    LlmResponse, Message, MessageRole, SessionConfig, SessionSnapshotError, ToolCall,
+    DEFAULT_SYSTEM_PROMPT,
 };
 use futures::executor::block_on;
 use serde_json::{json, Value};
@@ -191,7 +192,7 @@ fn tool_calls_execute_serially_before_the_next_model_call() {
 }
 
 #[test]
-fn prompt_builder_keeps_a_fixed_prefix_and_appends_current_anchors() {
+fn prompt_builder_fast_path_sends_the_exact_append_only_canonical_prefix() {
     block_on(async {
         let client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(vec![call(
@@ -220,12 +221,243 @@ fn prompt_builder_keeps_a_fixed_prefix_and_appends_current_anchors() {
             .content
             .starts_with("DRAFT_STATE:{\"revision\":0,"));
         assert!(seen[1].starts_with(&seen[0]));
+        assert_eq!(
+            seen[1]
+                .iter()
+                .filter(|message| message.content.starts_with("DRAFT_STATE:"))
+                .count(),
+            2
+        );
         assert!(seen[1]
             .last()
             .unwrap()
             .content
             .starts_with("DRAFT_STATE:{\"revision\":1,"));
-        assert!(session.messages().starts_with(&seen[1]));
+        assert_eq!(seen[1], session.messages()[..session.messages().len() - 1]);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter(|message| message.content.starts_with("DRAFT_STATE:"))
+                .count(),
+            2
+        );
+        assert_complete_tool_pairs(&seen[1]);
+    });
+}
+
+#[test]
+fn snapshot_json_roundtrip_restores_and_continues_the_session() {
+    block_on(async {
+        let first_client = ScriptedClient::new(vec![LlmResponse::Text(
+            "QUESTION: Which panel should I create?".to_string(),
+        )]);
+        let mut first = DesignSession::with_config(first_client, large_config());
+        assert!(matches!(
+            first.run_burst("Start a panel").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        let canonical = first.messages().to_vec();
+        let json = serde_json::to_string(&first.snapshot()).unwrap();
+        let snapshot = serde_json::from_str(&json).unwrap();
+        let second_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub","content":"Welcome"}),
+            )]),
+            LlmResponse::Text("QUESTION: Add a button?".to_string()),
+        ]);
+        let mut restored = DesignSession::restore(second_client, large_config(), snapshot).unwrap();
+
+        assert_eq!(restored.messages(), canonical);
+        assert!(matches!(
+            restored.run_burst("Create a welcome panel").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert_eq!(restored.draft().ruleset.panels[0].key, "welcome");
+        assert_eq!(restored.observability().model_calls, 3);
+        assert!(restored.messages().starts_with(&canonical));
+    });
+}
+
+#[test]
+fn snapshot_restore_rejects_versions_and_broken_invariants() {
+    let session = DesignSession::new(());
+    let mut future = session.snapshot();
+    future.schema_version += 1;
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), future),
+        Err(SessionSnapshotError::UnsupportedVersion { .. })
+    ));
+
+    let mut broken = session.snapshot();
+    broken.messages.clear();
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), broken),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
+
+    let mut invalid_role_fields = session.snapshot();
+    invalid_role_fields.messages[0]
+        .tool_calls
+        .push(call("system-call", "add_panel", json!({})));
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), invalid_role_fields),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
+
+    let mut malformed_anchor = session.snapshot();
+    malformed_anchor
+        .messages
+        .push(Message::system("DRAFT_STATE:not-json"));
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), malformed_anchor),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
+
+    let mut duplicate_ids = session.snapshot();
+    duplicate_ids
+        .messages
+        .push(Message::assistant_tool_calls(vec![
+            call("duplicate", "add_panel", json!({})),
+            call("duplicate", "add_modal", json!({})),
+        ]));
+    duplicate_ids
+        .messages
+        .push(Message::tool("duplicate", json!({}).to_string()));
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), duplicate_ids),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
+
+    let mut empty_id = session.snapshot();
+    empty_id
+        .messages
+        .push(Message::assistant_tool_calls(vec![call(
+            "",
+            "add_panel",
+            json!({}),
+        )]));
+    empty_id
+        .messages
+        .push(Message::tool("", json!({}).to_string()));
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), empty_id),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
+}
+
+#[test]
+fn expanded_anchor_carries_structure_aliases_and_failure_history() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "missing-panel",
+                "add_button",
+                json!({
+                    "panel_key":"missing",
+                    "label":"Open",
+                    "route":{"kind":"static","key":"open"}
+                }),
+            )]),
+            LlmResponse::Text("QUESTION: Should I repair the panel reference?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, large_config());
+        *session.draft_mut() = support::golden_draft().await;
+
+        assert!(matches!(
+            session.run_burst("Keep the StudyRoom design").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        let seen = probe.seen();
+        let anchor = seen[1]
+            .last()
+            .unwrap()
+            .content
+            .strip_prefix("DRAFT_STATE:")
+            .unwrap();
+        let state: Value = serde_json::from_str(anchor).unwrap();
+
+        assert_eq!(state["panels"][0]["key"], "study_panel");
+        assert_eq!(state["modals"][0]["key"], "study_modal");
+        assert_eq!(state["modals"][0]["fields"][0], "room_name");
+        assert!(state["rules"].as_array().unwrap().iter().any(|rule| {
+            rule["key"] == "submit_room" && rule["trigger"] == "modal_submit:study_modal"
+        }));
+        assert!(state["created_aliases"]["roles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("member_role")));
+        assert!(state["created_aliases"]["channels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("room_channel")));
+        assert!(state["created_aliases"]["messages"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("welcome_panel")));
+        assert!(state["created_aliases"]["instances"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("study_instance")));
+        assert_eq!(
+            state["failure_signatures"]["PANEL_NOT_FOUND@panel.missing"],
+            1
+        );
+        assert_eq!(state["last_error"]["code"], "PANEL_NOT_FOUND");
+        assert_eq!(state["last_error"]["location"], "panel.missing");
+        assert_eq!(
+            state["last_error"]["hint"],
+            "Call add_panel before add_button"
+        );
+        assert!(state["recent_human_intent"].as_array().unwrap().is_empty());
+        assert_eq!(state["current_human_intent"], "Keep the StudyRoom design");
+    });
+}
+
+#[test]
+fn anchor_separates_bounded_current_intent_from_prior_intents() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::Text("QUESTION: First?".to_string()),
+            LlmResponse::Text("QUESTION: Second?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, large_config());
+
+        assert!(matches!(
+            session.run_burst("First intent").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        let long_intent = "x".repeat(300);
+        assert!(matches!(
+            session.run_burst(&long_intent).await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+
+        let seen = probe.seen();
+        let anchor = seen[1]
+            .last()
+            .unwrap()
+            .content
+            .strip_prefix("DRAFT_STATE:")
+            .unwrap();
+        let state: Value = serde_json::from_str(anchor).unwrap();
+        assert_eq!(state["recent_human_intent"], json!(["First intent"]));
+        assert_eq!(
+            state["current_human_intent"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            241
+        );
+        assert!(state["current_human_intent"]
+            .as_str()
+            .unwrap()
+            .ends_with('…'));
     });
 }
 
@@ -1183,7 +1415,7 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
             tool_chars + DEFAULT_SYSTEM_PROMPT.len()
         );
 
-        let calls = (0..8)
+        let mut calls = (0..8)
             .map(|index| {
                 call(
                     &index.to_string(),
@@ -1195,7 +1427,16 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
                     }),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        calls.push(call(
+            "hidden-button",
+            "add_button",
+            json!({
+                "panel_key":"panel_0",
+                "label":"Open",
+                "route":{"kind":"static","key":"open"}
+            }),
+        ));
         let client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(calls),
             LlmResponse::Text("QUESTION: Continue?".to_string()),
@@ -1218,11 +1459,26 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
         assert!(second_tool_results < 8);
         assert_eq!(seen[1][0].role, MessageRole::System);
         assert_eq!(seen[1][0].content, DEFAULT_SYSTEM_PROMPT);
-        assert!(seen[1]
+        let anchor = seen[1]
             .last()
             .unwrap()
             .content
-            .starts_with("DRAFT_STATE:{\"revision\":8,"));
+            .strip_prefix("DRAFT_STATE:")
+            .unwrap();
+        let memory: Value = serde_json::from_str(anchor).unwrap();
+        assert_eq!(memory["revision"], 8);
+        assert!(memory["recent_human_intent"].as_array().unwrap().is_empty());
+        assert_eq!(memory["current_human_intent"], "Build panels");
+        assert_eq!(memory["panels"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            memory["last_error"]["code"],
+            "TOOL_NOT_AVAILABLE_FOR_DRAFT_STATE"
+        );
+        assert_eq!(memory["last_error"]["location"], "tool.add_button");
+        assert!(memory["last_error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("currently available tools"));
         assert_complete_tool_pairs(&seen[1]);
         assert_eq!(
             session
@@ -1230,7 +1486,7 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
                 .iter()
                 .filter(|message| message.role == MessageRole::Tool)
                 .count(),
-            8
+            9
         );
 
         let impossible_client = ScriptedClient::new(vec![]);

@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 
 use automation_core::{AdapterError, AdapterErrorKind, ValidationError};
 use automation_state::{ActionSpec, ChannelRef, InstanceRef, InteractionRuleSet, RoleRef};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{error::Category, Value};
 
 use crate::draft::{Draft, DraftSummary};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredError {
     pub code: String,
     pub location: String,

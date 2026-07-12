@@ -14,6 +14,6 @@ pub use gates::{simulate_draft, validate_draft};
 pub use llm::{LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall};
 pub use session::{
     BurstOutcome, DesignSession, HaltReport, LimitKind, Observability, SessionConfig,
-    DEFAULT_SYSTEM_PROMPT,
+    SessionSnapshot, SessionSnapshotError, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
 };
 pub use tools::{dispatch_tool, tool_definitions, ToolDefinition};
