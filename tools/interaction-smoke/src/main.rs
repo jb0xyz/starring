@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use automation_core::RunningRuleSetIdentity;
 use automation_instance::InstanceRuleSetVersion;
-use automation_ruleset::RuleSetStore;
+use automation_ruleset::{RuleSetKey, RuleSetStore};
 use automation_runtime::gateway;
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -19,17 +19,192 @@ use twilight_model::id::Id;
 
 mod random_instance_id;
 
-const RULESET_KEY: &str = "studyroom_demo";
+const DEFAULT_RULESET_KEY: &str = "studyroom_demo";
 const BUTTON_KEY: &str = "create_study_room";
 const MODAL_KEY: &str = "create_study_modal";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixtureVariant {
+    V1,
+    V2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Seed {
+        variant: FixtureVariant,
+        activate: bool,
+        force_activate: bool,
+    },
+    Activate {
+        version: u32,
+    },
+    Run,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedCli {
+    ruleset_key: Option<String>,
+    command: Command,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliError {
+    MissingRulesetKeyValue,
+    DuplicateRulesetKey,
+    MissingVariantValue,
+    DuplicateVariant,
+    InvalidVariant(String),
+    UnknownFlag(String),
+    MissingVariantForSeed,
+    VariantNotAllowed,
+    ActivateFlagNotAllowed,
+    MissingActivateVersion,
+    InvalidActivateVersion(String),
+    UnknownMode(String),
+    UnexpectedPositional(String),
+    InvalidRulesetKey(String),
+}
+
+fn parse_cli(args: &[String]) -> Result<ParsedCli, CliError> {
+    let mut ruleset_key = None;
+    let mut variant = None;
+    let mut activate = false;
+    let mut force_activate = false;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ruleset-key" => {
+                if ruleset_key.is_some() {
+                    return Err(CliError::DuplicateRulesetKey);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingRulesetKeyValue)?;
+                ruleset_key = Some(value.clone());
+                index += 2;
+            }
+            "--variant" => {
+                if variant.is_some() {
+                    return Err(CliError::DuplicateVariant);
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or(CliError::MissingVariantValue)?;
+                variant = Some(match value.as_str() {
+                    "v1" => FixtureVariant::V1,
+                    "v2" => FixtureVariant::V2,
+                    _ => return Err(CliError::InvalidVariant(value.clone())),
+                });
+                index += 2;
+            }
+            "--activate" => {
+                activate = true;
+                index += 1;
+            }
+            "--force-activate" => {
+                force_activate = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::UnknownFlag(value.to_string()));
+            }
+            value => {
+                positionals.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let mode = positionals.first().map(String::as_str).unwrap_or("run");
+    let command = match mode {
+        "seed-studyroom" => {
+            let variant = variant.ok_or(CliError::MissingVariantForSeed)?;
+            if let Some(extra) = positionals.get(1) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            Command::Seed {
+                variant,
+                activate,
+                force_activate,
+            }
+        }
+        "activate" => {
+            if variant.is_some() {
+                return Err(CliError::VariantNotAllowed);
+            }
+            if activate || force_activate {
+                return Err(CliError::ActivateFlagNotAllowed);
+            }
+            let raw = positionals.get(1).ok_or(CliError::MissingActivateVersion)?;
+            if let Some(extra) = positionals.get(2) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            let version = raw
+                .parse()
+                .map_err(|_| CliError::InvalidActivateVersion(raw.clone()))?;
+            Command::Activate { version }
+        }
+        "run" => {
+            if variant.is_some() {
+                return Err(CliError::VariantNotAllowed);
+            }
+            if activate || force_activate {
+                return Err(CliError::ActivateFlagNotAllowed);
+            }
+            if let Some(extra) = positionals.get(1) {
+                return Err(CliError::UnexpectedPositional(extra.clone()));
+            }
+            Command::Run
+        }
+        other => return Err(CliError::UnknownMode(other.to_string())),
+    };
+
+    Ok(ParsedCli {
+        ruleset_key,
+        command,
+    })
+}
+
+fn resolve_ruleset_key(
+    cli_value: Option<&str>,
+    env_value: Option<&str>,
+) -> Result<RuleSetKey, CliError> {
+    let raw = cli_value.or(env_value).unwrap_or(DEFAULT_RULESET_KEY);
+    RuleSetKey::parse(raw).map_err(|error| CliError::InvalidRulesetKey(format!("{error:?}")))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
-    let activate = std::env::args().any(|a| a == "--activate");
-    let force_activate = std::env::args().any(|a| a == "--force-activate");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match parse_cli(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!(
+                "usage: interaction-smoke [--ruleset-key <key>] [run | activate <version> | seed-studyroom --variant <v1|v2> [--activate] [--force-activate]]"
+            );
+            return Err(format!("invalid command line: {error:?}").into());
+        }
+    };
+    let env_ruleset_key = env::var("STARRING_RULESET_KEY").ok();
+    let ruleset_key = match resolve_ruleset_key(
+        parsed.ruleset_key.as_deref(),
+        env_ruleset_key.as_deref(),
+    ) {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!(
+                "usage: interaction-smoke [--ruleset-key <key>] [run | activate <version> | seed-studyroom --variant <v1|v2> [--activate] [--force-activate]]"
+            );
+            return Err(format!("invalid command line: {error:?}").into());
+        }
+    };
 
     let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
     let database_url = env::var("STARRING_DATABASE_URL")?;
@@ -60,57 +235,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     let ruleset_store = automation_ruleset_postgres::PostgresRuleSetStore::new(pool.clone());
-    let ruleset_key = automation_ruleset::RuleSetKey::parse(RULESET_KEY)
-        .map_err(|e| format!("invalid ruleset key: {e:?}"))?;
-
-    if mode == "seed-studyroom" {
-        return seed_studyroom(
-            &ruleset_store,
-            guild_id,
-            &ruleset_key,
+    match parsed.command {
+        Command::Seed {
+            variant,
             activate,
             force_activate,
-        )
-        .await;
-    }
-
-    if mode == "activate" {
-        let version_arg: u32 = std::env::args()
-            .nth(2)
-            .ok_or("usage: activate <version>")?
-            .parse()?;
-        let version = automation_ruleset::RuleSetVersionId::new(version_arg)
-            .map_err(|e| format!("invalid version: {e:?}"))?;
-        if ruleset_store
-            .get_version(GuildId(guild_id), &ruleset_key, version)
-            .await
-            .map_err(|e| format!("version lookup failed: {e:?}"))?
-            .is_none()
-        {
-            return Err(format!("version {version} not found; nothing activated").into());
+        } => {
+            return seed_studyroom(
+                &ruleset_store,
+                guild_id,
+                &ruleset_key,
+                variant,
+                activate,
+                force_activate,
+            )
+            .await;
         }
-        let token = env::var("DISCORD_TEST_TOKEN")?;
-        let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
-        let bindings = bindings(channel_id);
-        let http = Client::new(token);
-        let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
-        let outcome = automation_ruleset_readiness::activate_if_ready(
-            &ruleset_store,
-            GuildId(guild_id),
-            &ruleset_key,
-            version,
-            &bindings,
-            &caps,
-            &role_permissions,
-        )
-        .await
-        .map_err(|e| format!("activation failed (active pointer unchanged): {e:?}"))?;
-        eprintln!(
-            "activated {} ({} notices)",
-            outcome.activation.active_version,
-            outcome.runtime_ruleset.notices.len()
-        );
-        return Ok(());
+        Command::Activate {
+            version: version_arg,
+        } => {
+            let version = automation_ruleset::RuleSetVersionId::new(version_arg)
+                .map_err(|e| format!("invalid version: {e:?}"))?;
+            if ruleset_store
+                .get_version(GuildId(guild_id), &ruleset_key, version)
+                .await
+                .map_err(|e| format!("version lookup failed: {e:?}"))?
+                .is_none()
+            {
+                return Err(format!("version {version} not found; nothing activated").into());
+            }
+            let token = env::var("DISCORD_TEST_TOKEN")?;
+            let channel_id: u64 = env::var("DISCORD_TEST_CHANNEL")?.parse()?;
+            let bindings = bindings(channel_id);
+            let http = Client::new(token);
+            let (caps, role_permissions) = readiness_context(&http, guild_id, &bindings).await?;
+            let outcome = automation_ruleset_readiness::activate_if_ready(
+                &ruleset_store,
+                GuildId(guild_id),
+                &ruleset_key,
+                version,
+                &bindings,
+                &caps,
+                &role_permissions,
+            )
+            .await
+            .map_err(|e| format!("activation failed (active pointer unchanged): {e:?}"))?;
+            eprintln!(
+                "activated {} ({} notices)",
+                outcome.activation.active_version,
+                outcome.runtime_ruleset.notices.len()
+            );
+            return Ok(());
+        }
+        Command::Run => {}
     }
 
     let token = env::var("DISCORD_TEST_TOKEN")?;
@@ -246,6 +423,7 @@ async fn seed_studyroom(
     store: &impl RuleSetStore,
     guild_id: u64,
     key: &automation_ruleset::RuleSetKey,
+    variant: FixtureVariant,
     activate: bool,
     force_activate: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -254,7 +432,7 @@ async fn seed_studyroom(
         .publish(PublishRuleSetRequest {
             guild_id: GuildId(guild_id),
             ruleset_key: key.clone(),
-            definition: studyroom_ruleset(),
+            definition: studyroom_ruleset(variant),
             created_by: UserId(0),
         })
         .await
@@ -329,13 +507,20 @@ fn bindings(channel_id: u64) -> ResourceBindingMap {
     bindings
 }
 
-fn studyroom_ruleset() -> InteractionRuleSet {
+fn studyroom_ruleset(variant: FixtureVariant) -> InteractionRuleSet {
+    let (create_panel_content, join_response) = match variant {
+        FixtureVariant::V1 => ("스터디룸 만들기 · v1", "스터디룸에 참가했습니다. [v1]"),
+        FixtureVariant::V2 => (
+            "스터디룸 만들기 · v2",
+            "스터디룸 참가가 완료되었습니다. [v2]",
+        ),
+    };
     InteractionRuleSet {
         version: 1,
         panels: vec![PanelSpec {
             key: "study_panel".to_string(),
             channel: ResourceKey("study_hub".to_string()),
-            content: "Create a study room".to_string(),
+            content: create_panel_content.to_string(),
             buttons: vec![ButtonSpec {
                 label: "Create study room".to_string(),
                 route: ButtonRoute::Static {
@@ -480,7 +665,7 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                         target: ActionTarget::Actor,
                     },
                     ActionSpec::EditResponse {
-                        content: "스터디룸에 참가했습니다.".to_string(),
+                        content: join_response.to_string(),
                     },
                 ],
             },
@@ -506,53 +691,335 @@ fn studyroom_ruleset() -> InteractionRuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use automation_core::validate;
+    use automation_core::{analyze, validate};
     use automation_ruleset::{
-        InMemoryRuleSetStore, PublishRuleSetRequest, RuleSetStore, RuleSetVersionId,
+        InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetVersionId,
     };
+    use automation_ruleset_readiness::{policy_severity, required_capabilities};
 
-    #[test]
-    fn studyroom_ruleset_validates() {
-        validate(&studyroom_ruleset(), &bindings(1)).expect("studyroom ruleset should validate");
+    fn cli_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn register_resources(ruleset: &InteractionRuleSet) -> &InstanceResourceRefs {
+        ruleset
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.actions)
+            .find_map(|action| match action {
+                ActionSpec::RegisterInstance { resources, .. } => Some(resources),
+                _ => None,
+            })
+            .unwrap()
     }
 
     #[test]
-    fn studyroom_registers_after_hub_panel_with_complete_manifest() {
-        let ruleset = studyroom_ruleset();
-        let rule = ruleset
-            .rules
-            .iter()
-            .find(|rule| rule.key == "submit_study_modal")
-            .unwrap();
-        let hub_index = rule
-            .actions
-            .iter()
-            .position(|action| {
-                matches!(
-                    action,
-                    ActionSpec::PostPanel { key, .. } if key == "study_hub_entry"
-                )
-            })
-            .unwrap();
-        let register_index = rule
-            .actions
-            .iter()
-            .position(|action| matches!(action, ActionSpec::RegisterInstance { .. }))
-            .unwrap();
-        let ActionSpec::RegisterInstance { resources, .. } = &rule.actions[register_index] else {
-            unreachable!()
-        };
-
-        assert!(hub_index < register_index);
+    fn parse_cli_accepts_position_independent_happy_paths() {
         assert_eq!(
-            resources.messages.get("hub_panel"),
-            Some(&created("study_hub_entry"))
+            parse_cli(&[]).unwrap(),
+            ParsedCli {
+                ruleset_key: None,
+                command: Command::Run,
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&["run"])).unwrap(),
+            ParsedCli {
+                ruleset_key: None,
+                command: Command::Run,
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&["seed-studyroom", "--variant", "v1"])).unwrap(),
+            ParsedCli {
+                ruleset_key: None,
+                command: Command::Seed {
+                    variant: FixtureVariant::V1,
+                    activate: false,
+                    force_activate: false,
+                },
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "seed-studyroom",
+                "--variant",
+                "v2",
+                "--activate",
+                "--force-activate",
+            ]))
+            .unwrap(),
+            ParsedCli {
+                ruleset_key: None,
+                command: Command::Seed {
+                    variant: FixtureVariant::V2,
+                    activate: true,
+                    force_activate: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&["activate", "7"])).unwrap(),
+            ParsedCli {
+                ruleset_key: None,
+                command: Command::Activate { version: 7 },
+            }
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "--ruleset-key",
+                "rollback_key",
+                "seed-studyroom",
+                "--variant",
+                "v1",
+            ]))
+            .unwrap()
+            .ruleset_key,
+            Some("rollback_key".to_string())
+        );
+        assert_eq!(
+            parse_cli(&cli_args(&[
+                "activate",
+                "7",
+                "--ruleset-key",
+                "rollback_key",
+            ]))
+            .unwrap(),
+            ParsedCli {
+                ruleset_key: Some("rollback_key".to_string()),
+                command: Command::Activate { version: 7 },
+            }
         );
     }
 
     #[test]
+    fn parse_cli_rejects_ambiguous_or_invalid_inputs() {
+        let cases = vec![
+            (
+                cli_args(&["--ruleset-key", "one", "--ruleset-key", "two"]),
+                CliError::DuplicateRulesetKey,
+            ),
+            (
+                cli_args(&["--ruleset-key"]),
+                CliError::MissingRulesetKeyValue,
+            ),
+            (
+                cli_args(&["seed-studyroom", "--variant"]),
+                CliError::MissingVariantValue,
+            ),
+            (
+                cli_args(&["seed-studyroom", "--variant", "v1", "--variant", "v2"]),
+                CliError::DuplicateVariant,
+            ),
+            (
+                cli_args(&["seed-studyroom", "--variant", "v3"]),
+                CliError::InvalidVariant("v3".to_string()),
+            ),
+            (
+                cli_args(&["run", "--unknown"]),
+                CliError::UnknownFlag("--unknown".to_string()),
+            ),
+            (
+                cli_args(&["seed-studyroom"]),
+                CliError::MissingVariantForSeed,
+            ),
+            (cli_args(&["activate"]), CliError::MissingActivateVersion),
+            (
+                cli_args(&["activate", "seven"]),
+                CliError::InvalidActivateVersion("seven".to_string()),
+            ),
+            (
+                cli_args(&["run", "--variant", "v1"]),
+                CliError::VariantNotAllowed,
+            ),
+            (
+                cli_args(&["activate", "7", "--variant", "v1"]),
+                CliError::VariantNotAllowed,
+            ),
+            (
+                cli_args(&["run", "--activate"]),
+                CliError::ActivateFlagNotAllowed,
+            ),
+            (
+                cli_args(&["activate", "7", "--force-activate"]),
+                CliError::ActivateFlagNotAllowed,
+            ),
+            (
+                cli_args(&["run", "extra"]),
+                CliError::UnexpectedPositional("extra".to_string()),
+            ),
+            (
+                cli_args(&["other"]),
+                CliError::UnknownMode("other".to_string()),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(parse_cli(&args), Err(expected));
+        }
+    }
+
+    #[test]
+    fn resolve_ruleset_key_uses_cli_then_env_then_default() {
+        assert_eq!(
+            resolve_ruleset_key(Some("cli_key"), Some("env_key"))
+                .unwrap()
+                .as_str(),
+            "cli_key"
+        );
+        assert_eq!(
+            resolve_ruleset_key(None, Some("env_key")).unwrap().as_str(),
+            "env_key"
+        );
+        assert_eq!(
+            resolve_ruleset_key(None, None).unwrap().as_str(),
+            "studyroom_demo"
+        );
+        assert!(matches!(
+            resolve_ruleset_key(Some("bad key"), None),
+            Err(CliError::InvalidRulesetKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn variant_definitions_differ_only_in_presentation() {
+        let v1 = studyroom_ruleset(FixtureVariant::V1);
+        let v2 = studyroom_ruleset(FixtureVariant::V2);
+        let store = InMemoryRuleSetStore::default();
+        let key = automation_ruleset::RuleSetKey::parse("rollback_fixture").unwrap();
+        let first = store
+            .publish(PublishRuleSetRequest {
+                guild_id: GuildId(7),
+                ruleset_key: key.clone(),
+                definition: v1.clone(),
+                created_by: UserId(1),
+            })
+            .await
+            .unwrap();
+        let second = store
+            .publish(PublishRuleSetRequest {
+                guild_id: GuildId(7),
+                ruleset_key: key.clone(),
+                definition: v2.clone(),
+                created_by: UserId(1),
+            })
+            .await
+            .unwrap();
+        let reused = store
+            .publish(PublishRuleSetRequest {
+                guild_id: GuildId(7),
+                ruleset_key: key,
+                definition: v1.clone(),
+                created_by: UserId(1),
+            })
+            .await
+            .unwrap();
+        let PublishOutcome::Created(first) = first else {
+            panic!("first variant must be created")
+        };
+        let PublishOutcome::Created(second) = second else {
+            panic!("second variant must be created")
+        };
+        let PublishOutcome::Reused(reused) = reused else {
+            panic!("first variant must be reused")
+        };
+
+        assert_ne!(first.version, second.version);
+        assert_ne!(first.content_hash, second.content_hash);
+        assert_eq!(reused.version, first.version);
+        assert_eq!(reused.content_hash, first.content_hash);
+        validate(&v1, &bindings(1)).unwrap();
+        validate(&v2, &bindings(1)).unwrap();
+        assert_eq!(required_capabilities(&v1), required_capabilities(&v2));
+        let v1_findings = analyze(&v1, &BTreeMap::new());
+        let v2_findings = analyze(&v2, &BTreeMap::new());
+        assert_eq!(v1_findings, v2_findings);
+        assert_eq!(
+            v1_findings.iter().map(policy_severity).collect::<Vec<_>>(),
+            v2_findings.iter().map(policy_severity).collect::<Vec<_>>()
+        );
+        assert_eq!(register_resources(&v1), register_resources(&v2));
+        assert_eq!(v1.version, 1);
+        assert_eq!(v2.version, 1);
+        assert_eq!(v1.panels[0].content, "스터디룸 만들기 · v1");
+        assert_eq!(v2.panels[0].content, "스터디룸 만들기 · v2");
+
+        let mut normalized = v1.clone();
+        normalized.panels[0].content = v2.panels[0].content.clone();
+        let join = normalized
+            .rules
+            .iter_mut()
+            .find(|rule| {
+                matches!(
+                    rule.trigger,
+                    TriggerSpec::InstanceAction { ref action } if action == "join"
+                )
+            })
+            .unwrap();
+        let ActionSpec::EditResponse { content } = join.actions.last_mut().unwrap() else {
+            panic!("join response must be terminal")
+        };
+        *content = "스터디룸 참가가 완료되었습니다. [v2]".to_string();
+        assert_eq!(normalized, v2);
+    }
+
+    #[test]
+    fn studyroom_ruleset_validates() {
+        validate(&studyroom_ruleset(FixtureVariant::V1), &bindings(1))
+            .expect("studyroom ruleset should validate");
+    }
+
+    #[test]
+    fn studyroom_registers_after_hub_panel_with_complete_manifest() {
+        for variant in [FixtureVariant::V1, FixtureVariant::V2] {
+            let ruleset = studyroom_ruleset(variant);
+            let rule = ruleset
+                .rules
+                .iter()
+                .find(|rule| rule.key == "submit_study_modal")
+                .unwrap();
+            let hub_index = rule
+                .actions
+                .iter()
+                .position(|action| {
+                    matches!(
+                        action,
+                        ActionSpec::PostPanel { key, .. } if key == "study_hub_entry"
+                    )
+                })
+                .unwrap();
+            let register_index = rule
+                .actions
+                .iter()
+                .position(|action| matches!(action, ActionSpec::RegisterInstance { .. }))
+                .unwrap();
+            let ActionSpec::RegisterInstance { resources, .. } = &rule.actions[register_index]
+            else {
+                unreachable!()
+            };
+
+            assert!(hub_index < register_index);
+            assert_eq!(
+                resources.roles,
+                BTreeMap::from([("member_role".to_string(), created("study_member_role"))])
+            );
+            assert_eq!(
+                resources.channels,
+                BTreeMap::from([("room_channel".to_string(), created("study_channel"))])
+            );
+            assert_eq!(
+                resources.messages,
+                BTreeMap::from([
+                    ("welcome_panel".to_string(), created("study_welcome_panel"),),
+                    ("hub_panel".to_string(), created("study_hub_entry")),
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn join_rule_uses_deferred_contract() {
-        let ruleset = studyroom_ruleset();
+        let ruleset = studyroom_ruleset(FixtureVariant::V1);
         let join = ruleset
             .rules
             .iter()
@@ -570,7 +1037,7 @@ mod tests {
 
     #[test]
     fn close_rule_uses_deferred_teardown_contract() {
-        let ruleset = studyroom_ruleset();
+        let ruleset = studyroom_ruleset(FixtureVariant::V1);
         let close = ruleset
             .rules
             .iter()
@@ -591,8 +1058,10 @@ mod tests {
     #[tokio::test]
     async fn seed_without_activate_is_publish_only() {
         let store = InMemoryRuleSetStore::default();
-        let key = automation_ruleset::RuleSetKey::parse(RULESET_KEY).unwrap();
-        seed_studyroom(&store, 7, &key, false, false).await.unwrap();
+        let key = automation_ruleset::RuleSetKey::parse(DEFAULT_RULESET_KEY).unwrap();
+        seed_studyroom(&store, 7, &key, FixtureVariant::V1, false, false)
+            .await
+            .unwrap();
         assert!(store.active(GuildId(7), &key).await.unwrap().is_none());
         assert_eq!(
             store.list_versions(GuildId(7), &key).await.unwrap().len(),
@@ -603,8 +1072,8 @@ mod tests {
     #[tokio::test]
     async fn seed_activate_refuses_accidental_replacement() {
         let store = InMemoryRuleSetStore::default();
-        let key = automation_ruleset::RuleSetKey::parse(RULESET_KEY).unwrap();
-        let mut old = studyroom_ruleset();
+        let key = automation_ruleset::RuleSetKey::parse(DEFAULT_RULESET_KEY).unwrap();
+        let mut old = studyroom_ruleset(FixtureVariant::V1);
         old.panels[0].content = "Old panel".to_string();
         store
             .publish(PublishRuleSetRequest {
@@ -620,7 +1089,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = seed_studyroom(&store, 7, &key, true, false)
+        let error = seed_studyroom(&store, 7, &key, FixtureVariant::V1, true, false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("pass --force-activate"));
@@ -647,5 +1116,15 @@ mod tests {
             .unwrap();
         assert!(production.contains("install_declared_panels("));
         assert!(!production.contains("async fn install_panel("));
+    }
+
+    #[test]
+    fn default_ruleset_key_is_the_only_production_literal() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(production.matches("studyroom_demo").count(), 1);
+        assert!(production.contains("const DEFAULT_RULESET_KEY: &str = \"studyroom_demo\";"));
     }
 }
