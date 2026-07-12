@@ -169,6 +169,31 @@ impl InstanceStore for CountingStore {
             .update_status(guild_id, instance_id, status)
             .await
     }
+
+    async fn transition_to_deleting(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        self.inner
+            .transition_to_deleting(guild_id, instance_id)
+            .await
+    }
+
+    async fn mark_deleted(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        self.inner.mark_deleted(guild_id, instance_id).await
+    }
+
+    async fn list_deleting(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        self.inner.list_deleting(guild_id).await
+    }
 }
 
 #[test]
@@ -217,10 +242,21 @@ fn planned_id_routes_hub_and_registration_persists_complete_manifest() {
         ChannelId(800_001)
     );
     assert_eq!(
-        instance.resources.messages["welcome_panel"],
+        instance.resources.messages["welcome_panel"].id,
         MessageId(800_002)
     );
-    assert_eq!(instance.resources.messages["hub_panel"], MessageId(800_003));
+    assert_eq!(
+        instance.resources.messages["welcome_panel"].channel,
+        ChannelId(800_001)
+    );
+    assert_eq!(
+        instance.resources.messages["hub_panel"].id,
+        MessageId(800_003)
+    );
+    assert_eq!(
+        instance.resources.messages["hub_panel"].channel,
+        ChannelId(99)
+    );
     assert_eq!(
         created_resources.last(),
         Some(&CreatedResource::Instance {

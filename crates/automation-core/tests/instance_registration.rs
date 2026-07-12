@@ -168,8 +168,12 @@ fn register_instance_resolves_and_stores_manifest() {
         ChannelId(800_001)
     );
     assert_eq!(
-        instance.resources.messages["welcome_panel"],
+        instance.resources.messages["welcome_panel"].id,
         MessageId(800_002)
+    );
+    assert_eq!(
+        instance.resources.messages["welcome_panel"].channel,
+        ChannelId(800_001)
     );
     assert_eq!(
         created_resources,
@@ -557,8 +561,12 @@ fn full_study_room_run_registers_instance() {
         ChannelId(800_001)
     );
     assert_eq!(
-        instance.resources.messages["welcome_panel"],
+        instance.resources.messages["welcome_panel"].id,
         MessageId(800_002)
+    );
+    assert_eq!(
+        instance.resources.messages["welcome_panel"].channel,
+        ChannelId(800_001)
     );
 }
 

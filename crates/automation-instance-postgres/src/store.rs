@@ -32,6 +32,7 @@ struct AutomationInstanceRow {
 fn status_str(status: InstanceStatus) -> &'static str {
     match status {
         InstanceStatus::Active => "active",
+        InstanceStatus::Deleting => "deleting",
         InstanceStatus::Disabled => "disabled",
         InstanceStatus::Deleted => "deleted",
     }
@@ -69,6 +70,7 @@ impl TryFrom<AutomationInstanceRow> for AutomationInstance {
             .map_err(|_| backend(format!("invalid persisted created_by: {}", row.created_by)))?;
         let status = match row.status.as_str() {
             "active" => InstanceStatus::Active,
+            "deleting" => InstanceStatus::Deleting,
             "disabled" => InstanceStatus::Disabled,
             "deleted" => InstanceStatus::Deleted,
             other => return Err(backend(format!("invalid persisted status: {other}"))),
@@ -161,6 +163,61 @@ impl InstanceStore for PostgresInstanceStore {
         }
         Ok(())
     }
+
+    async fn transition_to_deleting(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        let result = sqlx::query(
+            "UPDATE automation_instances SET status = 'deleting' \
+             WHERE guild_id = $1 AND instance_id = $2 AND status = 'active'",
+        )
+        .bind(guild_id.to_string())
+        .bind(instance_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(InstanceStoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn mark_deleted(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        let result = sqlx::query(
+            "UPDATE automation_instances SET status = 'deleted' \
+             WHERE guild_id = $1 AND instance_id = $2 AND status = 'deleting'",
+        )
+        .bind(guild_id.to_string())
+        .bind(instance_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(InstanceStoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_deleting(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        let rows = sqlx::query_as::<_, AutomationInstanceRow>(
+            "SELECT guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources \
+             FROM automation_instances WHERE guild_id = $1 AND status = 'deleting' ORDER BY instance_id",
+        )
+        .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.into_iter().map(AutomationInstance::try_from).collect()
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +246,12 @@ mod tests {
         assert_eq!(instance.created_by, UserId(3));
         assert_eq!(instance.ruleset_version.get(), 1);
         assert_eq!(instance.kind, InstanceKind("study_room".to_string()));
+    }
+
+    #[test]
+    fn deleting_row_converts() {
+        let instance = AutomationInstance::try_from(row("room1", "deleting")).unwrap();
+        assert_eq!(instance.status, InstanceStatus::Deleting);
     }
 
     #[test]

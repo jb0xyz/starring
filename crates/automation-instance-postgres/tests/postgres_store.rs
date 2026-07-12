@@ -223,3 +223,63 @@ async fn active_legacy_row_blocks_migration() {
 async fn disabled_legacy_row_blocks_migration() {
     assert_non_deleted_migration_fails("disabled", "disabled").await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn teardown_status_cas_list_and_reconnect() {
+    let url = require_test_db();
+    let pool_a = PgPool::connect(&url).await.unwrap();
+    MIGRATOR.run(&pool_a).await.unwrap();
+    cleanup(&pool_a, 990004).await;
+    let store_a = PostgresInstanceStore::new(pool_a.clone());
+    let id = InstanceId::parse("teardown_room").unwrap();
+    store_a
+        .register(instance(990004, "teardown_room"))
+        .await
+        .unwrap();
+    store_a
+        .transition_to_deleting(GuildId(990004), &id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store_a
+            .transition_to_deleting(GuildId(990004), &id)
+            .await
+            .unwrap_err(),
+        InstanceStoreError::NotFound
+    );
+    assert_eq!(
+        store_a.list_deleting(GuildId(990004)).await.unwrap().len(),
+        1
+    );
+    pool_a.close().await;
+
+    let pool_b = PgPool::connect(&url).await.unwrap();
+    let store_b = PostgresInstanceStore::new(pool_b.clone());
+    assert_eq!(
+        store_b
+            .get(GuildId(990004), &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleting
+    );
+    store_b.mark_deleted(GuildId(990004), &id).await.unwrap();
+    assert!(store_b
+        .list_deleting(GuildId(990004))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store_b
+            .get(GuildId(990004), &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleted
+    );
+    cleanup(&pool_b, 990004).await;
+    pool_b.close().await;
+}

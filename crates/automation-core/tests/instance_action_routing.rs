@@ -41,6 +41,25 @@ impl InstanceStore for PanicInstances {
     ) -> Result<(), InstanceStoreError> {
         panic!("update_status must not be called on a misrouted InstanceAction")
     }
+
+    async fn transition_to_deleting(
+        &self,
+        _: GuildId,
+        _: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        panic!("transition_to_deleting must not be called on a misrouted InstanceAction")
+    }
+
+    async fn mark_deleted(&self, _: GuildId, _: &InstanceId) -> Result<(), InstanceStoreError> {
+        panic!("mark_deleted must not be called on a misrouted InstanceAction")
+    }
+
+    async fn list_deleting(
+        &self,
+        _: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        panic!("list_deleting must not be called on a misrouted InstanceAction")
+    }
 }
 
 #[test]

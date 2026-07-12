@@ -1,13 +1,13 @@
 use std::collections::{btree_map::Entry, BTreeMap};
 
 use automation_instance::{
-    AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
-    InstanceStore,
+    AutomationInstance, InstanceId, InstanceIdGenerator, InstanceMessageRef, InstanceResources,
+    InstanceStatus, InstanceStore,
 };
 use automation_state::{
     ButtonRoute, ButtonSpec, InstanceRef, InstanceResourceRefs, InteractionRuleSet,
 };
-use discord_model::{ChannelId, MessageId, OverwriteTarget, RoleId};
+use discord_model::{ChannelId, OverwriteTarget, RoleId};
 use resource_resolution::ResourceBindingMap;
 
 use crate::adapter::{
@@ -26,7 +26,7 @@ use crate::template::{SanitizeContext, TemplateError, TemplateString};
 struct RuntimeBindings {
     created_roles: BTreeMap<String, RoleId>,
     created_channels: BTreeMap<String, ChannelId>,
-    created_messages: BTreeMap<String, MessageId>,
+    created_messages: BTreeMap<String, InstanceMessageRef>,
     planned_instances: BTreeMap<String, InstanceId>,
     created_instances: BTreeMap<String, InstanceId>,
 }
@@ -146,7 +146,13 @@ where
                         },
                     )
                     .await?;
-                runtime.created_messages.insert(key.clone(), id);
+                runtime.created_messages.insert(
+                    key.clone(),
+                    InstanceMessageRef {
+                        channel: channel_id,
+                        id,
+                    },
+                );
                 created.push(CreatedResource::Message {
                     action_index,
                     key: key.clone(),
@@ -331,12 +337,12 @@ fn resolve_manifest(
         resources.channels.insert(alias.clone(), id);
     }
     for (alias, created) in &refs.messages {
-        let id = runtime
+        let message = runtime
             .created_messages
             .get(&created.created)
-            .copied()
+            .cloned()
             .ok_or_else(|| unresolved_manifest(&created.created))?;
-        resources.messages.insert(alias.clone(), id);
+        resources.messages.insert(alias.clone(), message);
     }
     Ok(resources)
 }

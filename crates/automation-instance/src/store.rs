@@ -31,6 +31,20 @@ pub trait InstanceStore {
         instance_id: &InstanceId,
         status: InstanceStatus,
     ) -> Result<(), InstanceStoreError>;
+    async fn transition_to_deleting(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError>;
+    async fn mark_deleted(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError>;
+    async fn list_deleting(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError>;
 }
 
 #[derive(Default)]
@@ -91,5 +105,52 @@ impl InstanceStore for InMemoryInstanceStore {
             .ok_or(InstanceStoreError::NotFound)?;
         instance.status = status;
         Ok(())
+    }
+
+    async fn transition_to_deleting(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        let mut guilds = self.inner.lock().unwrap();
+        let instance = guilds
+            .get_mut(&guild_id)
+            .and_then(|entries| entries.get_mut(instance_id))
+            .filter(|instance| instance.status == InstanceStatus::Active)
+            .ok_or(InstanceStoreError::NotFound)?;
+        instance.status = InstanceStatus::Deleting;
+        Ok(())
+    }
+
+    async fn mark_deleted(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        let mut guilds = self.inner.lock().unwrap();
+        let instance = guilds
+            .get_mut(&guild_id)
+            .and_then(|entries| entries.get_mut(instance_id))
+            .filter(|instance| instance.status == InstanceStatus::Deleting)
+            .ok_or(InstanceStoreError::NotFound)?;
+        instance.status = InstanceStatus::Deleted;
+        Ok(())
+    }
+
+    async fn list_deleting(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        let guilds = self.inner.lock().unwrap();
+        Ok(guilds
+            .get(&guild_id)
+            .map(|entries| {
+                entries
+                    .values()
+                    .filter(|instance| instance.status == InstanceStatus::Deleting)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }

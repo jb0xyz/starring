@@ -2,14 +2,23 @@ use std::collections::BTreeMap;
 
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdError, InstanceKind,
-    InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
+    InstanceMessageRef, InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore,
+    InstanceStoreError,
 };
-use discord_model::{GuildId, RoleId, UserId};
+use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use futures::executor::block_on;
 
 fn instance(guild: u64, id: &str) -> AutomationInstance {
     let mut roles = BTreeMap::new();
     roles.insert("member_role".to_string(), RoleId(100));
+    let mut messages = BTreeMap::new();
+    messages.insert(
+        "welcome_panel".to_string(),
+        InstanceMessageRef {
+            channel: ChannelId(200),
+            id: MessageId(300),
+        },
+    );
     AutomationInstance {
         id: InstanceId::parse(id).unwrap(),
         guild_id: GuildId(guild),
@@ -20,7 +29,7 @@ fn instance(guild: u64, id: &str) -> AutomationInstance {
         resources: InstanceResources {
             roles,
             channels: BTreeMap::new(),
-            messages: BTreeMap::new(),
+            messages,
         },
         status: InstanceStatus::Active,
     }
@@ -66,6 +75,22 @@ fn automation_instance_serde_roundtrip() {
     assert_eq!(object["ruleset_version"], 7);
     object.as_object_mut().unwrap().remove("ruleset_version");
     assert!(serde_json::from_value::<AutomationInstance>(object).is_err());
+    assert_eq!(
+        serde_json::to_value(&value).unwrap()["resources"]["messages"]["welcome_panel"],
+        serde_json::json!({"channel": "200", "id": "300"})
+    );
+}
+
+#[test]
+fn deleting_status_serializes_as_snake_case() {
+    assert_eq!(
+        serde_json::to_string(&InstanceStatus::Deleting).unwrap(),
+        r#""deleting""#
+    );
+    assert_eq!(
+        serde_json::from_str::<InstanceStatus>(r#""deleting""#).unwrap(),
+        InstanceStatus::Deleting
+    );
 }
 
 #[test]
@@ -167,6 +192,68 @@ fn update_status_missing_not_found() {
         block_on(store.update_status(GuildId(7), &id, InstanceStatus::Disabled)).unwrap_err(),
         InstanceStoreError::NotFound
     );
+}
+
+#[test]
+fn transition_to_deleting_is_active_only_cas() {
+    let store = InMemoryInstanceStore::new();
+    let id = InstanceId::parse("room1").unwrap();
+    block_on(store.register(instance(7, "room1"))).unwrap();
+
+    block_on(store.transition_to_deleting(GuildId(7), &id)).unwrap();
+    assert_eq!(
+        block_on(store.get(GuildId(7), &id))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleting
+    );
+    assert_eq!(
+        block_on(store.transition_to_deleting(GuildId(7), &id)).unwrap_err(),
+        InstanceStoreError::NotFound
+    );
+}
+
+#[test]
+fn mark_deleted_requires_deleting() {
+    let store = InMemoryInstanceStore::new();
+    let id = InstanceId::parse("room1").unwrap();
+    block_on(store.register(instance(7, "room1"))).unwrap();
+
+    assert_eq!(
+        block_on(store.mark_deleted(GuildId(7), &id)).unwrap_err(),
+        InstanceStoreError::NotFound
+    );
+    block_on(store.transition_to_deleting(GuildId(7), &id)).unwrap();
+    block_on(store.mark_deleted(GuildId(7), &id)).unwrap();
+    assert_eq!(
+        block_on(store.get(GuildId(7), &id))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleted
+    );
+    assert_eq!(
+        block_on(store.mark_deleted(GuildId(7), &id)).unwrap_err(),
+        InstanceStoreError::NotFound
+    );
+}
+
+#[test]
+fn list_deleting_filters_and_orders() {
+    let store = InMemoryInstanceStore::new();
+    for id in ["c", "a", "b"] {
+        block_on(store.register(instance(7, id))).unwrap();
+    }
+    block_on(store.transition_to_deleting(GuildId(7), &InstanceId::parse("c").unwrap())).unwrap();
+    block_on(store.transition_to_deleting(GuildId(7), &InstanceId::parse("a").unwrap())).unwrap();
+
+    let ids: Vec<String> = block_on(store.list_deleting(GuildId(7)))
+        .unwrap()
+        .into_iter()
+        .map(|instance| instance.id.as_str().to_string())
+        .collect();
+    assert_eq!(ids, vec!["a", "c"]);
 }
 
 #[test]
