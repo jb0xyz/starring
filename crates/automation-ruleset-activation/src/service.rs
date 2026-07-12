@@ -1,4 +1,10 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::thread;
+use std::time::Duration as StdDuration;
 
 use automation_ruleset::{RuleSetKey, RuleSetStore, RuleSetStoreError, RuleSetVersionId};
 use automation_ruleset_readiness::{
@@ -19,6 +25,99 @@ use crate::store::{
 };
 
 const APPLY_LEASE_SECONDS: i64 = 60;
+const APPLY_DEADLINE: StdDuration = StdDuration::from_secs(45);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeadlineElapsed;
+
+struct DeadlineState {
+    is_completed: bool,
+    is_timed_out: bool,
+    waker: Option<Waker>,
+}
+
+struct DeadlineSignal {
+    state: Mutex<DeadlineState>,
+    changed: Condvar,
+}
+
+struct Deadline<F> {
+    future: Pin<Box<F>>,
+    signal: Arc<DeadlineSignal>,
+}
+
+impl<F: Future> Future for Deadline<F> {
+    type Output = Result<F::Output, DeadlineElapsed>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.signal.state.lock().unwrap().is_timed_out {
+            return Poll::Ready(Err(DeadlineElapsed));
+        }
+        match this.future.as_mut().poll(context) {
+            Poll::Ready(output) => {
+                let mut state = this.signal.state.lock().unwrap();
+                if state.is_timed_out {
+                    return Poll::Ready(Err(DeadlineElapsed));
+                }
+                state.is_completed = true;
+                this.signal.changed.notify_one();
+                Poll::Ready(Ok(output))
+            }
+            Poll::Pending => {
+                let mut state = this.signal.state.lock().unwrap();
+                if state.is_timed_out {
+                    Poll::Ready(Err(DeadlineElapsed))
+                } else {
+                    state.waker = Some(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl<F> Drop for Deadline<F> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.signal.state.lock() {
+            state.is_completed = true;
+            self.signal.changed.notify_one();
+        }
+    }
+}
+
+fn with_deadline<F: Future>(future: F, duration: StdDuration) -> Deadline<F> {
+    let signal = Arc::new(DeadlineSignal {
+        state: Mutex::new(DeadlineState {
+            is_completed: false,
+            is_timed_out: false,
+            waker: None,
+        }),
+        changed: Condvar::new(),
+    });
+    let timer_signal = signal.clone();
+    thread::spawn(move || {
+        let state = timer_signal.state.lock().unwrap();
+        let (mut state, _) = timer_signal
+            .changed
+            .wait_timeout_while(state, duration, |state| !state.is_completed)
+            .unwrap();
+        let waker = if state.is_completed {
+            None
+        } else {
+            state.is_timed_out = true;
+            state.waker.take()
+        };
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    });
+    Deadline {
+        future: Box::pin(future),
+        signal,
+    }
+}
 
 pub struct ActivationEnvironment {
     pub bindings: ResourceBindingMap,
@@ -302,11 +401,31 @@ where
             ClaimOutcome::Expired => return Err(ApplyError::Expired),
         };
 
+        match with_deadline(
+            self.apply_claimed(request_id, &attempt_id, applied_by, request),
+            APPLY_DEADLINE,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(DeadlineElapsed) => Err(ApplyError::IndeterminateActivation(
+                RuleSetStoreError::Backend("activation deadline exceeded".to_string()),
+            )),
+        }
+    }
+
+    async fn apply_claimed(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        applied_by: UserId,
+        request: ActivationRequest,
+    ) -> Result<ApplyOutcome, ApplyError> {
         let prepared = match prepare_activation(self.rulesets, self.provider, &request.target).await
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.release_known(request_id, &attempt_id, &error).await?;
+                self.release_known(request_id, attempt_id, &error).await?;
                 return Err(error);
             }
         };
@@ -315,7 +434,7 @@ where
             PreparedActivation::AlreadyActive => {
                 self.complete(
                     request_id,
-                    &attempt_id,
+                    attempt_id,
                     applied_by,
                     CompletionKind::AlreadyActive,
                     None,
@@ -326,7 +445,7 @@ where
             PreparedActivation::Ready(environment) => {
                 if !self
                     .requests
-                    .renew_lease(request_id, &attempt_id, APPLY_LEASE_SECONDS)
+                    .renew_lease(request_id, attempt_id, APPLY_LEASE_SECONDS)
                     .await?
                 {
                     return Err(ApplyError::LeaseLost);
@@ -335,7 +454,7 @@ where
                     Ok(notices) => {
                         self.complete(
                             request_id,
-                            &attempt_id,
+                            attempt_id,
                             applied_by,
                             CompletionKind::Activated,
                             Some(notices),
@@ -345,7 +464,7 @@ where
                     }
                     Err(error @ ApplyError::IndeterminateActivation(_)) => Err(error),
                     Err(error) => {
-                        self.release_known(request_id, &attempt_id, &error).await?;
+                        self.release_known(request_id, attempt_id, &error).await?;
                         Err(error)
                     }
                 }
@@ -532,5 +651,34 @@ where
             execute_activation(rulesets, &target, &environment).await?;
             Ok(ApplyOutcome::Activated)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+
+    use super::{with_deadline, DeadlineElapsed};
+
+    #[test]
+    fn deadline_returns_ready_output() {
+        assert_eq!(
+            block_on(with_deadline(async { 7 }, Duration::from_secs(1))),
+            Ok(7)
+        );
+    }
+
+    #[test]
+    fn deadline_expires_pending_future() {
+        assert_eq!(
+            block_on(with_deadline(
+                future::pending::<()>(),
+                Duration::from_millis(5)
+            )),
+            Err(DeadlineElapsed)
+        );
     }
 }
