@@ -17,5 +17,6 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+automation-state = { path = "../automation-state" }
 futures = "0.3"
 serde_json = { workspace = true }
