@@ -1,0 +1,765 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use automation_ruleset::{
+    PublishOutcome, PublishRuleSetRequest, RuleSetActivation, RuleSetKey, RuleSetStore,
+    RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
+};
+use automation_ruleset_activation::{
+    ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
+    ActivationRequest, ActivationRequestId, ActivationRequestState, ActivationRequestStore,
+    ActivationService, ActivationTarget, ApplyAttemptId, ApplyError, ApplyErrorRecord,
+    ApplyFailureKind, ApplyOutcome, ClaimOutcome, CompletionKind, CreateActivationRequest,
+    RecoveryDisposition,
+};
+use automation_ruleset_activation_postgres::{PostgresActivationRequestStore, MIGRATOR};
+use automation_ruleset_postgres::PostgresRuleSetStore;
+use automation_ruleset_readiness::GuildCapabilities;
+use automation_state::InteractionRuleSet;
+use chrono::Duration;
+use discord_model::{GuildId, Permissions, UserId};
+use resource_resolution::ResourceBindingMap;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use tokio::sync::Notify;
+
+fn database_url() -> String {
+    let url = std::env::var("STARRING_TEST_DATABASE_URL")
+        .expect("STARRING_TEST_DATABASE_URL must be set for ignored postgres tests");
+    assert!(
+        url.contains("test"),
+        "refusing to run against a database whose name does not contain 'test'"
+    );
+    url
+}
+
+async fn pool() -> PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect(&database_url())
+        .await
+        .expect("connect");
+    MIGRATOR.run(&pool).await.expect("migrate");
+    pool
+}
+
+async fn cleanup(pool: &PgPool, guild_id: GuildId) {
+    let guild = guild_id.to_string();
+    sqlx::query("DELETE FROM activation_requests WHERE guild_id = $1")
+        .bind(&guild)
+        .execute(pool)
+        .await
+        .unwrap();
+    for table in [
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+        "automation_ruleset_heads",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
+            .bind(&guild)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+fn key() -> RuleSetKey {
+    RuleSetKey::parse("studyroom").unwrap()
+}
+
+fn definition(version: u32) -> InteractionRuleSet {
+    InteractionRuleSet {
+        version,
+        panels: vec![],
+        modals: vec![],
+        rules: vec![],
+    }
+}
+
+fn request_id(value: &str) -> ActivationRequestId {
+    ActivationRequestId::parse(value).unwrap()
+}
+
+fn attempt_id(value: &str) -> ApplyAttemptId {
+    ApplyAttemptId::parse(value).unwrap()
+}
+
+struct CountingRuleSetStore {
+    inner: PostgresRuleSetStore,
+    activate_calls: AtomicUsize,
+}
+
+impl CountingRuleSetStore {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            inner: PostgresRuleSetStore::new(pool),
+            activate_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn activate_calls(&self) -> usize {
+        self.activate_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl RuleSetStore for CountingRuleSetStore {
+    async fn publish(
+        &self,
+        request: PublishRuleSetRequest,
+    ) -> Result<PublishOutcome, RuleSetStoreError> {
+        self.inner.publish(request).await
+    }
+
+    async fn get_version(
+        &self,
+        guild_id: GuildId,
+        ruleset_key: &RuleSetKey,
+        version: RuleSetVersionId,
+    ) -> Result<Option<RuleSetVersion>, RuleSetStoreError> {
+        self.inner.get_version(guild_id, ruleset_key, version).await
+    }
+
+    async fn list_versions(
+        &self,
+        guild_id: GuildId,
+        ruleset_key: &RuleSetKey,
+    ) -> Result<Vec<RuleSetVersion>, RuleSetStoreError> {
+        self.inner.list_versions(guild_id, ruleset_key).await
+    }
+
+    async fn activate(
+        &self,
+        guild_id: GuildId,
+        ruleset_key: &RuleSetKey,
+        version: RuleSetVersionId,
+    ) -> Result<RuleSetActivation, RuleSetStoreError> {
+        self.activate_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.activate(guild_id, ruleset_key, version).await
+    }
+
+    async fn active(
+        &self,
+        guild_id: GuildId,
+        ruleset_key: &RuleSetKey,
+    ) -> Result<Option<RuleSetVersion>, RuleSetStoreError> {
+        self.inner.active(guild_id, ruleset_key).await
+    }
+}
+
+struct ReadyProvider;
+
+fn ready_environment() -> ActivationEnvironment {
+    ActivationEnvironment {
+        bindings: ResourceBindingMap::default(),
+        guild_capabilities: GuildCapabilities {
+            base_permissions: Permissions::ADMINISTRATOR,
+        },
+        role_permissions: BTreeMap::new(),
+    }
+}
+
+impl ActivationEnvironmentProvider for ReadyProvider {
+    async fn load_fresh(
+        &self,
+        _: &ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        Ok(ready_environment())
+    }
+}
+
+struct FailingProvider;
+
+impl ActivationEnvironmentProvider for FailingProvider {
+    async fn load_fresh(
+        &self,
+        _: &ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        Err(ActivationEnvironmentError::Load(
+            "snapshot unavailable".to_string(),
+        ))
+    }
+}
+
+struct BlockingProvider {
+    entered: Notify,
+    release: Notify,
+}
+
+impl BlockingProvider {
+    fn new() -> Self {
+        Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+}
+
+impl ActivationEnvironmentProvider for BlockingProvider {
+    async fn load_fresh(
+        &self,
+        _: &ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ready_environment())
+    }
+}
+
+async fn publish(store: &impl RuleSetStore, guild_id: GuildId, version: u32) -> RuleSetVersion {
+    let outcome = store
+        .publish(PublishRuleSetRequest {
+            guild_id,
+            ruleset_key: key(),
+            definition: definition(version),
+            created_by: UserId(1),
+        })
+        .await
+        .unwrap();
+    match outcome {
+        PublishOutcome::Created(version) | PublishOutcome::Reused(version) => version,
+    }
+}
+
+async fn create_request(
+    store: &PostgresActivationRequestStore,
+    id: &str,
+    target: &RuleSetVersion,
+    required_approvals: u32,
+) -> ActivationRequestId {
+    let id = request_id(id);
+    store
+        .create(CreateActivationRequest {
+            id: id.clone(),
+            target: ActivationTarget {
+                guild_id: target.guild_id,
+                ruleset_key: target.ruleset_key.clone(),
+                version: target.version,
+                content_hash: target.content_hash,
+            },
+            requester: UserId(10),
+            required_approvals,
+            ttl: Duration::minutes(30),
+            observed_active: None,
+        })
+        .await
+        .unwrap();
+    id
+}
+
+async fn approve(
+    store: &PostgresActivationRequestStore,
+    id: &ActivationRequestId,
+    approver: u64,
+) -> ActivationRequest {
+    store.approve(id, UserId(approver)).await.unwrap()
+}
+
+async fn create_approved(
+    store: &PostgresActivationRequestStore,
+    id: &str,
+    target: &RuleSetVersion,
+) -> ActivationRequestId {
+    let id = create_request(store, id, target, 1).await;
+    approve(store, &id, 20).await;
+    id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn concurrent_apply_serializes_and_activates_once() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_001);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, guild, 1).await;
+    let second = publish(&rulesets, guild, 2).await;
+    let first_id = create_approved(&requests, "serial_a", &first).await;
+    let second_id = create_approved(&requests, "serial_b", &second).await;
+    let provider = BlockingProvider::new();
+    let service = ActivationService::new(&requests, &rulesets, &provider);
+
+    let first_apply = service.apply(&first_id, attempt_id("serial_attempt_a"), UserId(10));
+    let second_apply = async {
+        provider.entered.notified().await;
+        let outcome = service
+            .apply(&second_id, attempt_id("serial_attempt_b"), UserId(10))
+            .await;
+        provider.release.notify_one();
+        outcome
+    };
+    let (first_outcome, second_outcome) = tokio::join!(first_apply, second_apply);
+
+    assert_eq!(first_outcome.unwrap(), ApplyOutcome::Activated);
+    assert!(matches!(
+        second_outcome.unwrap(),
+        ApplyOutcome::InProgress {
+            blocking_request_id,
+            lease_expired: false,
+            ..
+        } if blocking_request_id == first_id
+    ));
+    assert_eq!(rulesets.activate_calls(), 1);
+    assert_eq!(
+        requests.get(&first_id).await.unwrap().unwrap().state,
+        ActivationRequestState::Applied
+    );
+    assert_eq!(
+        requests.get(&second_id).await.unwrap().unwrap().state,
+        ActivationRequestState::Approved
+    );
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn expired_blocker_blocks_new_apply_without_mutation() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_002);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, guild, 1).await;
+    let second = publish(&rulesets, guild, 2).await;
+    let first_id = create_approved(&requests, "expired_a", &first).await;
+    let second_id = create_approved(&requests, "expired_b", &second).await;
+    assert!(matches!(
+        requests
+            .claim_apply(&first_id, attempt_id("expired_owner"), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    sqlx::query(
+        "UPDATE activation_requests SET apply_lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(first_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    let outcome = service
+        .apply(&second_id, attempt_id("expired_other"), UserId(10))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::InProgress {
+            blocking_request_id,
+            lease_expired: true,
+            ..
+        } if blocking_request_id == first_id
+    ));
+    assert_eq!(rulesets.activate_calls(), 0);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn resume_completes_blocker_and_releases_slot() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_003);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, guild, 1).await;
+    let second = publish(&rulesets, guild, 2).await;
+    let first_id = create_approved(&requests, "resume_a", &first).await;
+    let second_id = create_approved(&requests, "resume_b", &second).await;
+    requests
+        .claim_apply(&first_id, attempt_id("resume_owner"), 60)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE activation_requests SET apply_lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(first_id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    assert_eq!(
+        service
+            .resume(&first_id, attempt_id("resume_new"), UserId(10))
+            .await
+            .unwrap(),
+        ApplyOutcome::Activated
+    );
+    assert!(matches!(
+        requests
+            .claim_apply(&second_id, attempt_id("resume_b_owner"), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(rulesets.activate_calls(), 1);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn known_failure_releases_slot_for_next_request() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_004);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, guild, 1).await;
+    let second = publish(&rulesets, guild, 2).await;
+    let first_id = create_approved(&requests, "known_a", &first).await;
+    let second_id = create_approved(&requests, "known_b", &second).await;
+    let service = ActivationService::new(&requests, &rulesets, &FailingProvider);
+
+    assert!(matches!(
+        service
+            .apply(&first_id, attempt_id("known_attempt"), UserId(10))
+            .await
+            .unwrap_err(),
+        ApplyError::Environment(_)
+    ));
+    let first_request = requests.get(&first_id).await.unwrap().unwrap();
+    assert_eq!(first_request.state, ActivationRequestState::Approved);
+    assert_eq!(first_request.approvals.len(), 1);
+    assert!(first_request.last_apply_error.is_some());
+    assert!(matches!(
+        requests
+            .claim_apply(&second_id, attempt_id("known_next"), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(rulesets.activate_calls(), 0);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn crash_bookkeeping_recovers_and_releases_slot() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_005);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, guild, 1).await;
+    let second = publish(&rulesets, guild, 2).await;
+    let first_id = create_approved(&requests, "crash_a", &first).await;
+    let second_id = create_approved(&requests, "crash_b", &second).await;
+    requests
+        .claim_apply(&first_id, attempt_id("crash_owner"), 60)
+        .await
+        .unwrap();
+    rulesets
+        .inner
+        .activate(guild, &key(), first.version)
+        .await
+        .unwrap();
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    let report = service.recover_applying(guild).await.unwrap();
+
+    assert!(matches!(
+        report.entries.as_slice(),
+        [entry] if entry.request_id == first_id
+            && entry.disposition == RecoveryDisposition::Recovered
+    ));
+    assert!(matches!(
+        requests
+            .claim_apply(&second_id, attempt_id("crash_next"), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(rulesets.activate_calls(), 0);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn different_guilds_may_apply_concurrently() {
+    let pool = pool().await;
+    let first_guild = GuildId(9_100_006);
+    let second_guild = GuildId(9_100_007);
+    cleanup(&pool, first_guild).await;
+    cleanup(&pool, second_guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let first = publish(&rulesets, first_guild, 1).await;
+    let second = publish(&rulesets, second_guild, 1).await;
+    let first_id = create_approved(&requests, "guild_a", &first).await;
+    let second_id = create_approved(&requests, "guild_b", &second).await;
+
+    let (first_claim, second_claim) = tokio::join!(
+        requests.claim_apply(&first_id, attempt_id("guild_attempt_a"), 60),
+        requests.claim_apply(&second_id, attempt_id("guild_attempt_b"), 60)
+    );
+
+    assert!(matches!(first_claim.unwrap(), ClaimOutcome::Claimed(_)));
+    assert!(matches!(second_claim.unwrap(), ClaimOutcome::Claimed(_)));
+    cleanup(&pool, first_guild).await;
+    cleanup(&pool, second_guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn duplicate_targets_share_one_applying_slot() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_008);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let first_id = create_approved(&requests, "duplicate_a", &target).await;
+    let second_id = create_approved(&requests, "duplicate_b", &target).await;
+
+    let (first, second) = tokio::join!(
+        requests.claim_apply(&first_id, attempt_id("duplicate_attempt_a"), 60),
+        requests.claim_apply(&second_id, attempt_id("duplicate_attempt_b"), 60)
+    );
+    let outcomes = [first.unwrap(), second.unwrap()];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ClaimOutcome::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ClaimOutcome::InProgress { .. }))
+            .count(),
+        1
+    );
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn concurrent_approve_and_reject_choose_one_state() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_009);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = create_request(&requests, "approve_reject", &target, 1).await;
+
+    let (approval, rejection) = tokio::join!(
+        requests.approve(&id, UserId(20)),
+        requests.reject(&id, UserId(30), "no".to_string())
+    );
+
+    assert_ne!(approval.is_ok(), rejection.is_ok());
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert!(matches!(
+        stored.state,
+        ActivationRequestState::Approved | ActivationRequestState::Rejected
+    ));
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn concurrent_final_approvals_reach_quorum_once() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_010);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = create_request(&requests, "approval_quorum", &target, 2).await;
+
+    let (first, second) = tokio::join!(
+        requests.approve(&id, UserId(20)),
+        requests.approve(&id, UserId(30))
+    );
+    let states = [first.unwrap().state, second.unwrap().state];
+
+    assert_eq!(
+        states
+            .iter()
+            .filter(|state| **state == ActivationRequestState::Approved)
+            .count(),
+        1
+    );
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActivationRequestState::Approved);
+    assert_eq!(stored.approvals.len(), 2);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn expiry_and_apply_claim_cannot_both_transition() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_011);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = create_approved(&requests, "expiry_claim", &target).await;
+    sqlx::query(
+        "UPDATE activation_requests SET created_at = NOW() - INTERVAL '2 seconds', \
+         expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (expired, claim) = tokio::join!(
+        requests.mark_expired(&id),
+        requests.claim_apply(&id, attempt_id("expiry_attempt"), 60)
+    );
+
+    assert!(expired.unwrap() || matches!(claim.as_ref().unwrap(), ClaimOutcome::Expired));
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActivationRequestState::Expired);
+    assert!(stored.apply_attempt_id.is_none());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn stale_attempt_cannot_overwrite_new_attempt() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_012);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = create_approved(&requests, "stale_attempt", &target).await;
+    let stale = attempt_id("stale_owner");
+    let current = attempt_id("current_owner");
+    requests.claim_apply(&id, stale.clone(), 60).await.unwrap();
+    sqlx::query(
+        "UPDATE activation_requests SET apply_lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        requests
+            .claim_resume(&id, current.clone(), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+
+    assert!(!requests
+        .complete_applied(&id, &stale, UserId(10), CompletionKind::Activated, None)
+        .await
+        .unwrap());
+    assert!(!requests
+        .release_to_approved(
+            &id,
+            &stale,
+            ApplyErrorRecord {
+                kind: ApplyFailureKind::Activation,
+                message: "stale".to_string(),
+            }
+        )
+        .await
+        .unwrap());
+    assert!(requests
+        .complete_applied(&id, &current, UserId(10), CompletionKind::Activated, None)
+        .await
+        .unwrap());
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActivationRequestState::Applied);
+    assert_eq!(stored.apply_attempt_no, 2);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn database_checks_reject_invalid_rows() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_013);
+    cleanup(&pool, guild).await;
+    let base = "INSERT INTO activation_requests \
+        (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \
+         required_approvals, state, expires_at) \
+        VALUES ($1, $2, 'studyroom', 1, $3, '10', $4, $5, NOW() + INTERVAL '1 hour')";
+
+    let invalid_quorum = sqlx::query(base)
+        .bind("check_quorum")
+        .bind(guild.to_string())
+        .bind("11".repeat(32))
+        .bind(0_i32)
+        .bind("pending")
+        .execute(&pool)
+        .await;
+    let invalid_applying = sqlx::query(base)
+        .bind("check_applying")
+        .bind(guild.to_string())
+        .bind("22".repeat(32))
+        .bind(1_i32)
+        .bind("applying")
+        .execute(&pool)
+        .await;
+    let invalid_applied = sqlx::query(base)
+        .bind("check_applied")
+        .bind(guild.to_string())
+        .bind("33".repeat(32))
+        .bind(1_i32)
+        .bind("applied")
+        .execute(&pool)
+        .await;
+
+    assert!(invalid_quorum.is_err());
+    assert!(invalid_applying.is_err());
+    assert!(invalid_applied.is_err());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn reconnect_preserves_request_approvals_and_attempt() {
+    let guild = GuildId(9_100_014);
+    let id = request_id("reconnect_request");
+    let attempt = attempt_id("reconnect_attempt");
+    {
+        let first_pool = pool().await;
+        cleanup(&first_pool, guild).await;
+        let requests = PostgresActivationRequestStore::new(first_pool.clone());
+        let rulesets = PostgresRuleSetStore::new(first_pool.clone());
+        let target = publish(&rulesets, guild, 1).await;
+        create_approved(&requests, id.as_str(), &target).await;
+        requests
+            .claim_apply(&id, attempt.clone(), 60)
+            .await
+            .unwrap();
+        first_pool.close().await;
+    }
+
+    let second_pool = pool().await;
+    let requests = PostgresActivationRequestStore::new(second_pool.clone());
+    let stored = requests.get(&id).await.unwrap().unwrap();
+
+    assert_eq!(stored.state, ActivationRequestState::Applying);
+    assert_eq!(stored.approvals.len(), 1);
+    assert_eq!(stored.apply_attempt_id.as_ref(), Some(&attempt));
+    assert!(requests
+        .complete_applied(
+            &id,
+            &attempt,
+            UserId(10),
+            CompletionKind::Activated,
+            Some(vec!["durable".to_string()])
+        )
+        .await
+        .unwrap());
+    let completed = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(completed.state, ActivationRequestState::Applied);
+    assert_eq!(
+        completed.completion.unwrap().notices,
+        Some(vec!["durable".to_string()])
+    );
+    cleanup(&second_pool, guild).await;
+}
