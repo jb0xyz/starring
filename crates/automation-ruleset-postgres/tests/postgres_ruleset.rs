@@ -58,13 +58,19 @@ fn definition(alias: &str) -> InteractionRuleSet {
             trigger: TriggerSpec::InstanceAction {
                 action: "join".to_string(),
             },
-            actions: vec![ActionSpec::GrantRole {
-                role: RoleRef::Instance {
-                    instance: InstanceRef::Event,
-                    alias: alias.to_string(),
+            actions: vec![
+                ActionSpec::DeferEphemeral,
+                ActionSpec::GrantRole {
+                    role: RoleRef::Instance {
+                        instance: InstanceRef::Event,
+                        alias: alias.to_string(),
+                    },
+                    target: ActionTarget::Actor,
                 },
-                target: ActionTarget::Actor,
-            }],
+                ActionSpec::EditResponse {
+                    content: "done".to_string(),
+                },
+            ],
         }],
     }
 }
