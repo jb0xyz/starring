@@ -305,7 +305,7 @@ mod tests {
                 "content":"QUESTION: Which fields?"
             })
         );
-        assert_eq!(body["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 12);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "add_panel");
         assert!(body["tools"][0]["function"]["description"].is_string());

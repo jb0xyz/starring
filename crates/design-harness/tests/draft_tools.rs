@@ -33,7 +33,7 @@ fn schema_has_kind_variant(schema: &Value, variant: &str) -> bool {
 }
 
 #[test]
-fn tool_registry_contains_the_locked_eleven_tools() {
+fn tool_registry_contains_the_locked_twelve_tools() {
     let definitions = tool_definitions();
     let names: Vec<&str> = definitions
         .iter()
@@ -48,7 +48,8 @@ fn tool_registry_contains_the_locked_eleven_tools() {
             "add_modal",
             "begin_rule",
             "add_resource_action",
-            "add_permission_action",
+            "add_grant_role_action",
+            "add_upsert_overwrite_action",
             "add_interaction_action",
             "add_post_panel_action",
             "set_register_instance",
@@ -73,10 +74,8 @@ fn model_facing_reference_schemas_are_tagged() {
             "begin_rule",
             &["button_click", "modal_submit", "instance_action"][..],
         ),
-        (
-            "add_permission_action",
-            &["created", "existing", "everyone", "role"][..],
-        ),
+        ("add_grant_role_action", &["created", "existing"][..]),
+        ("add_upsert_overwrite_action", &["created", "existing"][..]),
         (
             "add_post_panel_action",
             &["created", "existing", "static", "instance_action"][..],
@@ -92,6 +91,40 @@ fn model_facing_reference_schemas_are_tagged() {
             assert!(schema_has_kind_variant(&definition.parameters, variant));
         }
     }
+}
+
+#[test]
+fn permission_tool_schemas_are_flat_and_share_reference_shape() {
+    let definitions = tool_definitions();
+    let grant = definitions
+        .iter()
+        .find(|definition| definition.name == "add_grant_role_action")
+        .unwrap();
+    let overwrite = definitions
+        .iter()
+        .find(|definition| definition.name == "add_upsert_overwrite_action")
+        .unwrap();
+    let grant_properties = grant.parameters["properties"].as_object().unwrap();
+    let overwrite_properties = overwrite.parameters["properties"].as_object().unwrap();
+
+    assert_eq!(grant_properties.len(), 3);
+    assert!(grant_properties.contains_key("rule_key"));
+    assert!(grant_properties.contains_key("role"));
+    assert!(grant_properties.contains_key("target"));
+    assert!(!grant_properties.contains_key("kind"));
+    assert_eq!(overwrite_properties.len(), 6);
+    assert!(overwrite_properties.contains_key("channel"));
+    assert!(overwrite_properties.contains_key("target_kind"));
+    assert!(overwrite_properties.contains_key("role"));
+    assert!(!overwrite_properties.contains_key("kind"));
+
+    let schema = format!("{}{}", grant.parameters, overwrite.parameters);
+    assert!(schema.contains("\"name\""));
+    assert!(schema.contains("\"everyone\""));
+    assert!(schema.contains("\"role\""));
+    assert!(!schema.contains("\"alias\""));
+    assert!(!schema.contains("\"binding\""));
+    assert!(!schema.contains("OverwriteTargetInput"));
 }
 
 #[test]
@@ -231,12 +264,11 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
     .is_ok());
     assert!(call(
         &mut draft,
-        "add_permission_action",
+        "add_upsert_overwrite_action",
         json!({
             "rule_key":"submit_room",
-            "kind":"upsert_overwrite",
-            "channel":{"kind":"created","alias":"room_channel"},
-            "target":{"kind":"everyone"},
+            "channel":{"kind":"created","name":"room_channel"},
+            "target_kind":"everyone",
             "allow":[],
             "deny":["view_channel"]
         }),
@@ -244,11 +276,10 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
     .is_ok());
     assert!(call(
         &mut draft,
-        "add_permission_action",
+        "add_grant_role_action",
         json!({
             "rule_key":"submit_room",
-            "kind":"grant_role",
-            "role":{"kind":"created","alias":"member_role"},
+            "role":{"kind":"created","name":"member_role"},
             "target":"actor"
         }),
     )
@@ -259,7 +290,7 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
         json!({
             "rule_key":"submit_room",
             "key":"hub_panel",
-            "channel":{"kind":"existing","binding":"study_hub"},
+            "channel":{"kind":"existing","name":"study_hub"},
             "content":"Room ${input.room_name} is open",
             "buttons":[
                 {"label":"Help","route":{"kind":"static","key":"study_help"}},
@@ -323,6 +354,67 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
     ));
     assert!(matches!(actions[6], ActionSpec::RegisterInstance { .. }));
     assert!(matches!(actions[7], ActionSpec::EditResponse { .. }));
+}
+
+#[test]
+fn overwrite_reference_error_hint_has_concrete_flat_shape() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "add_upsert_overwrite_action",
+        json!({
+            "rule_key":"submit_room",
+            "channel":{"kind":"created"},
+            "target_kind":"role",
+            "role":{"kind":"created","name":"member_role"},
+            "allow":["view_channel"],
+            "deny":[]
+        }),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "MISSING_REQUIRED_FIELD");
+    assert!(failure
+        .hint
+        .contains("channel: { kind: created(required), name: string(required) }"));
+    assert!(failure
+        .hint
+        .contains("target_kind: everyone|role(required)"));
+    assert!(!failure.hint.contains("value"));
+}
+
+#[test]
+fn overwrite_role_reference_matches_target_kind() {
+    let mut draft = Draft::new();
+    let missing = call(
+        &mut draft,
+        "add_upsert_overwrite_action",
+        json!({
+            "rule_key":"submit_room",
+            "channel":{"kind":"created","name":"room_channel"},
+            "target_kind":"role",
+            "allow":["view_channel"],
+            "deny":[]
+        }),
+    );
+    let unexpected = call(
+        &mut draft,
+        "add_upsert_overwrite_action",
+        json!({
+            "rule_key":"submit_room",
+            "channel":{"kind":"created","name":"room_channel"},
+            "target_kind":"everyone",
+            "role":{"kind":"created","name":"member_role"},
+            "allow":[],
+            "deny":["view_channel"]
+        }),
+    );
+
+    assert_eq!(missing.failure().unwrap().code, "MISSING_OVERWRITE_ROLE");
+    assert_eq!(
+        unexpected.failure().unwrap().code,
+        "UNEXPECTED_OVERWRITE_ROLE"
+    );
 }
 
 #[test]

@@ -191,12 +191,11 @@ fn failed_simulation_is_repaired_incrementally_on_the_same_draft() {
 
         let repair = dispatch_tool(
             &mut draft,
-            "add_permission_action",
+            "add_upsert_overwrite_action",
             &json!({
                 "rule_key":"submit_room",
-                "kind":"upsert_overwrite",
-                "channel":{"kind":"created","alias":"room_channel"},
-                "target":{"kind":"everyone"},
+                "channel":{"kind":"created","name":"room_channel"},
+                "target_kind":"everyone",
                 "allow":[],
                 "deny":["view_channel"]
             })

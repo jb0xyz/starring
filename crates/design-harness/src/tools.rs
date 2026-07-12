@@ -102,32 +102,34 @@ enum ResourceActionInput {
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ReferenceInput {
-    Created { alias: String },
-    Existing { binding: String },
+    Created { name: String },
+    Existing { name: String },
 }
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OverwriteTargetInput {
+#[serde(rename_all = "snake_case")]
+enum OverwriteTargetKindInput {
     Everyone,
-    Role { role: ReferenceInput },
+    Role,
 }
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum PermissionActionInput {
-    UpsertOverwrite {
-        rule_key: String,
-        channel: ReferenceInput,
-        target: OverwriteTargetInput,
-        allow: Vec<String>,
-        deny: Vec<String>,
-    },
-    GrantRole {
-        rule_key: String,
-        role: ReferenceInput,
-        target: ActorTargetInput,
-    },
+#[serde(deny_unknown_fields)]
+struct AddGrantRoleActionInput {
+    rule_key: String,
+    role: ReferenceInput,
+    target: ActorTargetInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddUpsertOverwriteActionInput {
+    rule_key: String,
+    channel: ReferenceInput,
+    target_kind: OverwriteTargetKindInput,
+    role: Option<ReferenceInput>,
+    allow: Vec<String>,
+    deny: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -193,9 +195,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             "add_resource_action",
             "Append a role or channel creation action",
         ),
-        definition::<PermissionActionInput>(
-            "add_permission_action",
-            "Append an overwrite or role grant action",
+        definition::<AddGrantRoleActionInput>(
+            "add_grant_role_action",
+            "Append a role grant action",
+        ),
+        definition::<AddUpsertOverwriteActionInput>(
+            "add_upsert_overwrite_action",
+            "Append a permission overwrite action",
         ),
         definition::<InteractionActionInput>(
             "add_interaction_action",
@@ -244,8 +250,11 @@ pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> To
         "add_resource_action" => {
             parse(name, arguments).and_then(|input| add_resource_action(draft, input))
         }
-        "add_permission_action" => {
-            parse(name, arguments).and_then(|input| add_permission_action(draft, input))
+        "add_grant_role_action" => {
+            parse(name, arguments).and_then(|input| add_grant_role_action(draft, input))
+        }
+        "add_upsert_overwrite_action" => {
+            parse(name, arguments).and_then(|input| add_upsert_overwrite_action(draft, input))
         }
         "add_interaction_action" => {
             parse(name, arguments).and_then(|input| add_interaction_action(draft, input))
@@ -263,7 +272,7 @@ pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> To
                     "UNKNOWN_TOOL",
                     "tool",
                     "The requested design tool does not exist",
-                    "Use one of the eleven registered design tools",
+                    "Use one of the twelve registered design tools",
                 ),
             );
         }
@@ -362,40 +371,34 @@ fn add_resource_action(
     Ok(change)
 }
 
-fn add_permission_action(
+fn add_grant_role_action(
     draft: &mut Draft,
-    input: PermissionActionInput,
+    input: AddGrantRoleActionInput,
 ) -> Result<String, StructuredError> {
-    let (rule_key, action, change) = match input {
-        PermissionActionInput::UpsertOverwrite {
-            rule_key,
-            channel,
-            target,
-            allow,
-            deny,
-        } => {
-            let action = overwrite_action(channel, target, &allow, &deny)?;
-            let change = format!("Added UpsertOverwrite to rule {rule_key}");
-            (rule_key, action, change)
-        }
-        PermissionActionInput::GrantRole {
-            rule_key,
-            role,
-            target,
-        } => {
-            let target = match target {
-                ActorTargetInput::Actor => ActionTarget::Actor,
-            };
-            let action = ActionSpec::GrantRole {
-                role: role_reference(role)?,
-                target,
-            };
-            let change = format!("Added GrantRole to rule {rule_key}");
-            (rule_key, action, change)
-        }
+    let target = match input.target {
+        ActorTargetInput::Actor => ActionTarget::Actor,
     };
-    append_action(draft, &rule_key, action)?;
-    Ok(change)
+    let action = ActionSpec::GrantRole {
+        role: role_reference(input.role)?,
+        target,
+    };
+    append_action(draft, &input.rule_key, action)?;
+    Ok(format!("Added GrantRole to rule {}", input.rule_key))
+}
+
+fn add_upsert_overwrite_action(
+    draft: &mut Draft,
+    input: AddUpsertOverwriteActionInput,
+) -> Result<String, StructuredError> {
+    let action = overwrite_action(
+        input.channel,
+        input.target_kind,
+        input.role,
+        &input.allow,
+        &input.deny,
+    )?;
+    append_action(draft, &input.rule_key, action)?;
+    Ok(format!("Added UpsertOverwrite to rule {}", input.rule_key))
 }
 
 fn add_interaction_action(
@@ -609,8 +612,8 @@ fn pending_button_route(input: ButtonRouteInput) -> ButtonRoute {
 
 fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
     match input {
-        ReferenceInput::Created { alias } => Ok(RoleRef::Created(CreatedRef { created: alias })),
-        ReferenceInput::Existing { binding } => serde_json::from_value(Value::String(binding))
+        ReferenceInput::Created { name } => Ok(RoleRef::Created(CreatedRef { created: name })),
+        ReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
             .map(RoleRef::Existing)
             .map_err(reference_conversion_error),
     }
@@ -618,8 +621,8 @@ fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
 
 fn channel_reference(input: ReferenceInput) -> Result<ChannelRef, StructuredError> {
     match input {
-        ReferenceInput::Created { alias } => Ok(ChannelRef::Created(CreatedRef { created: alias })),
-        ReferenceInput::Existing { binding } => serde_json::from_value(Value::String(binding))
+        ReferenceInput::Created { name } => Ok(ChannelRef::Created(CreatedRef { created: name })),
+        ReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
             .map(ChannelRef::Existing)
             .map_err(reference_conversion_error),
     }
@@ -636,14 +639,33 @@ fn reference_conversion_error(error: serde_json::Error) -> StructuredError {
 
 fn overwrite_action(
     channel: ReferenceInput,
-    target: OverwriteTargetInput,
+    target_kind: OverwriteTargetKindInput,
+    role: Option<ReferenceInput>,
     allow: &[String],
     deny: &[String],
 ) -> Result<ActionSpec, StructuredError> {
     let channel = reference_json(channel);
-    let target = match target {
-        OverwriteTargetInput::Everyone => json!("everyone"),
-        OverwriteTargetInput::Role { role } => json!({"role": reference_json(role)}),
+    let target = match (target_kind, role) {
+        (OverwriteTargetKindInput::Everyone, None) => json!("everyone"),
+        (OverwriteTargetKindInput::Everyone, Some(_)) => {
+            return Err(StructuredError::new(
+                "UNEXPECTED_OVERWRITE_ROLE",
+                "tool.add_upsert_overwrite_action.arguments.role",
+                "role must be omitted when target_kind is everyone",
+                "Remove role or change target_kind to role",
+            ));
+        }
+        (OverwriteTargetKindInput::Role, Some(role)) => {
+            json!({"role": reference_json(role)})
+        }
+        (OverwriteTargetKindInput::Role, None) => {
+            return Err(StructuredError::new(
+                "MISSING_OVERWRITE_ROLE",
+                "tool.add_upsert_overwrite_action.arguments.role",
+                "role is required when target_kind is role",
+                "Set role to {\"kind\":\"created\",\"name\":\"alias\"} or an existing reference",
+            ));
+        }
     };
     let value = json!({
         "type": "upsert_overwrite",
@@ -655,7 +677,7 @@ fn overwrite_action(
     serde_json::from_value(value).map_err(|error| {
         StructuredError::new(
             "ACTION_NORMALIZATION_FAILED",
-            "tool.add_permission_action",
+            "tool.add_upsert_overwrite_action",
             "The overwrite action could not be normalized",
             error.to_string(),
         )
@@ -664,8 +686,8 @@ fn overwrite_action(
 
 fn reference_json(input: ReferenceInput) -> Value {
     match input {
-        ReferenceInput::Created { alias } => json!({"created": alias}),
-        ReferenceInput::Existing { binding } => json!(binding),
+        ReferenceInput::Created { name } => json!({"created": name}),
+        ReferenceInput::Existing { name } => json!(name),
     }
 }
 

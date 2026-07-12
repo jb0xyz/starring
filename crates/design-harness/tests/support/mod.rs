@@ -70,36 +70,31 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "add_permission_action",
+            "add_upsert_overwrite_action",
             json!({
                 "rule_key":"submit_room",
-                "kind":"upsert_overwrite",
-                "channel":{"kind":"created","alias":"room_channel"},
-                "target":{"kind":"everyone"},
+                "channel":{"kind":"created","name":"room_channel"},
+                "target_kind":"everyone",
                 "allow":[],
                 "deny":["view_channel"]
             }),
         ),
         (
-            "add_permission_action",
+            "add_upsert_overwrite_action",
             json!({
                 "rule_key":"submit_room",
-                "kind":"upsert_overwrite",
-                "channel":{"kind":"created","alias":"room_channel"},
-                "target":{
-                    "kind":"role",
-                    "role":{"kind":"created","alias":"member_role"}
-                },
+                "channel":{"kind":"created","name":"room_channel"},
+                "target_kind":"role",
+                "role":{"kind":"created","name":"member_role"},
                 "allow":["view_channel"],
                 "deny":[]
             }),
         ),
         (
-            "add_permission_action",
+            "add_grant_role_action",
             json!({
                 "rule_key":"submit_room",
-                "kind":"grant_role",
-                "role":{"kind":"created","alias":"member_role"},
+                "role":{"kind":"created","name":"member_role"},
                 "target":"actor"
             }),
         ),
@@ -108,7 +103,7 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "key":"welcome_panel",
-                "channel":{"kind":"created","alias":"room_channel"},
+                "channel":{"kind":"created","name":"room_channel"},
                 "content":"Welcome to ${input.room_name}",
                 "buttons":[
                     {"label":"Help","route":{"kind":"static","key":"study_help"}},
@@ -121,7 +116,7 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "key":"hub_panel",
-                "channel":{"kind":"existing","binding":"study_hub"},
+                "channel":{"kind":"existing","name":"study_hub"},
                 "content":"${input.room_name} is open",
                 "buttons":[
                     {"label":"Join","route":{"kind":"instance_action","action":"join"}}
