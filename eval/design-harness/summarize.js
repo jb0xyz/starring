@@ -67,6 +67,10 @@ function summarize(document) {
     const toolCalls = reports.map((report) => Number(report.observability?.tool_calls));
     const distinctTools = reports.map((report) => Number(report.observability?.distinct_mutation_tools?.length));
     const repeatCounts = reports.map((report) => Number(report.max_repeat_count));
+    const repairAttempts = reports.map((report) => Number(report.observability?.repair_attempts ?? 0));
+    const repairSuccesses = reports.map((report) => Number(report.observability?.repair_successes ?? 0));
+    const repairFailures = reports.map((report) => Number(report.observability?.repair_failures ?? 0));
+    const repairEscalations = reports.map((report) => Number(report.observability?.repair_escalations ?? 0));
     return {
       provider: group.provider,
       case_id: group.caseId,
@@ -88,6 +92,10 @@ function summarize(document) {
       mean_model_calls: mean(modelCalls),
       mean_tool_calls: mean(toolCalls),
       mean_distinct_mutation_tools: mean(distinctTools),
+      mean_repair_attempts: mean(repairAttempts),
+      mean_repair_successes: mean(repairSuccesses),
+      mean_repair_failures: mean(repairFailures),
+      mean_repair_escalations: mean(repairEscalations),
     };
   });
 }

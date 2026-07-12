@@ -5,18 +5,21 @@ use std::sync::{Arc, Mutex};
 
 use automation_state::{ActionSpec, InteractionRule, OverwriteTargetSpec, TriggerSpec};
 use design_harness::{
-    tool_definitions, BurstOutcome, DesignSession, Draft, LimitKind, LlmClient, LlmError,
-    LlmResponse, Message, MessageRole, SessionConfig, SessionSnapshotError, ToolCall,
-    DEFAULT_SYSTEM_PROMPT,
+    dispatch_tool, tool_definitions, BurstOutcome, DesignSession, Draft, LimitKind, LlmClient,
+    LlmError, LlmResponse, Message, MessageRole, RepairState, SessionConfig, SessionSnapshotError,
+    StructuredError, ToolCall, DEFAULT_SYSTEM_PROMPT,
 };
 use futures::executor::block_on;
 use serde_json::{json, Value};
+
+type SeenToolParameters = Vec<Vec<(String, Value)>>;
 
 #[derive(Clone)]
 struct ScriptedClient {
     responses: Arc<Mutex<VecDeque<Result<LlmResponse, LlmError>>>>,
     seen: Arc<Mutex<Vec<Vec<Message>>>>,
     seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
+    seen_tool_parameters: Arc<Mutex<SeenToolParameters>>,
 }
 
 impl ScriptedClient {
@@ -25,6 +28,7 @@ impl ScriptedClient {
             responses: Arc::new(Mutex::new(responses.into_iter().map(Ok).collect())),
             seen: Arc::new(Mutex::new(Vec::new())),
             seen_tools: Arc::new(Mutex::new(Vec::new())),
+            seen_tool_parameters: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -34,6 +38,10 @@ impl ScriptedClient {
 
     fn seen_tools(&self) -> Vec<Vec<String>> {
         self.seen_tools.lock().unwrap().clone()
+    }
+
+    fn seen_tool_parameters(&self) -> Vec<Vec<(String, Value)>> {
+        self.seen_tool_parameters.lock().unwrap().clone()
     }
 }
 
@@ -48,6 +56,12 @@ impl LlmClient for ScriptedClient {
             .lock()
             .unwrap()
             .push(tools.iter().map(|tool| tool.name.clone()).collect());
+        self.seen_tool_parameters.lock().unwrap().push(
+            tools
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.parameters.clone()))
+                .collect(),
+        );
         self.responses
             .lock()
             .unwrap()
@@ -78,6 +92,61 @@ fn long_flow_config() -> SessionConfig {
         max_gate_failures: 4,
         context_char_budget: 500_000,
     }
+}
+
+async fn fixable_validation_draft() -> Draft {
+    let mut draft = Draft::new();
+    for (name, arguments) in [
+        (
+            "add_panel",
+            json!({"key":"launcher","channel":"study_hub","content":"Launch"}),
+        ),
+        (
+            "add_modal",
+            json!({"key":"room_modal","title":"Room","fields":[]}),
+        ),
+        (
+            "begin_rule",
+            json!({
+                "key":"open_room",
+                "trigger":{"kind":"button_click","component":"open_room"}
+            }),
+        ),
+        (
+            "add_interaction_action",
+            json!({"rule_key":"open_room","kind":"open_modal","modal":"room_modal"}),
+        ),
+    ] {
+        let result = dispatch_tool(&mut draft, name, &arguments.to_string()).await;
+        assert!(result.is_ok(), "{}", result.as_json());
+    }
+    draft
+}
+
+async fn fixable_simulation_draft() -> Draft {
+    let mut draft = support::golden_draft().await;
+    let submit_rule = draft
+        .ruleset
+        .rules
+        .iter_mut()
+        .find(|rule| rule.key == "submit_room")
+        .unwrap();
+    let overwrite = submit_rule
+        .actions
+        .iter()
+        .position(|action| {
+            matches!(
+                action,
+                ActionSpec::UpsertOverwrite {
+                    target: OverwriteTargetSpec::Everyone,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    submit_rule.actions.remove(overwrite);
+    draft.validated_revision = Some(draft.draft_revision);
+    draft
 }
 
 fn names(values: &[&str]) -> Vec<String> {
@@ -418,6 +487,755 @@ fn expanded_anchor_carries_structure_aliases_and_failure_history() {
 }
 
 #[test]
+fn argument_failure_gets_one_same_tool_repair_with_exact_schema() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "fixed-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub","content":"Welcome"}),
+            )]),
+            LlmResponse::Text("QUESTION: Add a button?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, large_config());
+
+        let outcome = session.run_burst("Build a welcome panel").await;
+
+        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert_eq!(session.draft().ruleset.panels[0].key, "welcome");
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_successes, 1);
+        assert_eq!(session.observability().repair_failures, 0);
+        assert!(session.snapshot().repair_state.is_none());
+        assert!(session.snapshot().last_error.is_none());
+        assert_eq!(probe.seen_tools()[1], names(&["add_panel"]));
+        let add_panel_schema = tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "add_panel")
+            .unwrap()
+            .parameters;
+        let directive_index = session
+            .messages()
+            .iter()
+            .position(|message| message.content.starts_with("REPAIR_REQUIRED:"))
+            .unwrap();
+        assert_eq!(
+            session.messages()[directive_index - 1].role,
+            MessageRole::Tool
+        );
+        let directive: Value = serde_json::from_str(
+            session.messages()[directive_index]
+                .content
+                .strip_prefix("REPAIR_REQUIRED:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(directive["attempts_remaining"], 1);
+        assert_eq!(directive["original"]["tool"]["name"], "add_panel");
+        assert_eq!(
+            directive["original"]["tool"]["arguments"],
+            json!({"key":"welcome","channel":"study_hub"}).to_string()
+        );
+        assert_eq!(directive["expected_argument_schema"], add_panel_schema);
+        assert_eq!(directive["allowed_repair_tools"], json!(["add_panel"]));
+        assert_eq!(
+            probe.seen_tool_parameters()[1],
+            vec![("add_panel".to_string(), add_panel_schema)]
+        );
+        let seen = probe.seen();
+        let repair_anchor = seen[1].last().unwrap().content.as_str();
+        let memory: Value =
+            serde_json::from_str(repair_anchor.strip_prefix("DRAFT_STATE:").unwrap()).unwrap();
+        assert_eq!(memory["current_human_intent"], "Build a welcome panel");
+        assert_eq!(memory["repair_state"]["stage"], "awaiting_attempt");
+        assert_eq!(memory["repair_state"]["kind"], "arguments");
+        assert_eq!(memory["repair_state"]["original_tool"], "add_panel");
+        assert_eq!(
+            memory["repair_state"]["error"]["code"],
+            "MISSING_REQUIRED_FIELD"
+        );
+        assert_eq!(
+            memory["repair_state"]["error"]["location"],
+            "tool.add_panel.arguments.content"
+        );
+        assert_eq!(
+            memory["repair_state"]["allowed_tools"],
+            json!(["add_panel"])
+        );
+        assert_eq!(
+            memory["repair_state"]["verification_path"],
+            json!(["add_panel"])
+        );
+        assert_eq!(memory["repair_state"]["attempts_remaining"], 1);
+        assert_eq!(memory["repair_state"]["root_revision"], 0);
+        let repair_memory = memory["repair_state"].as_object().unwrap();
+        assert!(!repair_memory.contains_key("original_call"));
+        assert!(!repair_memory.contains_key("arguments"));
+        assert!(!repair_memory.contains_key("expected_argument_schema"));
+        assert!(!repair_memory.contains_key("ticket"));
+        assert!(!repair_anchor.contains("expected_argument_schema"));
+        assert!(
+            !repair_anchor.contains(&json!({"key":"welcome","channel":"study_hub"}).to_string())
+        );
+    });
+}
+
+#[test]
+fn anchor_bounds_error_memory_on_character_boundaries_without_truncating_snapshot() {
+    block_on(async {
+        let message = "가".repeat(500);
+        let hint = "나".repeat(500);
+        let mut snapshot = DesignSession::new(()).snapshot();
+        snapshot.last_error = Some(StructuredError::new(
+            "LONG_ERROR",
+            "test.long_error",
+            message.clone(),
+            hint.clone(),
+        ));
+        let client =
+            ScriptedClient::new(vec![LlmResponse::Text("QUESTION: Continue?".to_string())]);
+        let probe = client.clone();
+        let mut session = DesignSession::restore(client, large_config(), snapshot).unwrap();
+
+        assert!(matches!(
+            session.run_burst("Continue the design").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+
+        let seen = probe.seen();
+        let anchor = seen[0]
+            .last()
+            .unwrap()
+            .content
+            .strip_prefix("DRAFT_STATE:")
+            .unwrap();
+        let memory: Value = serde_json::from_str(anchor).unwrap();
+        let compact_message = memory["last_error"]["message"].as_str().unwrap();
+        let compact_hint = memory["last_error"]["hint"].as_str().unwrap();
+        assert_eq!(compact_message.chars().count(), 361);
+        assert_eq!(compact_hint.chars().count(), 361);
+        assert!(compact_message.ends_with('…'));
+        assert!(compact_hint.ends_with('…'));
+
+        let persisted = session.snapshot();
+        assert_eq!(persisted.last_error.as_ref().unwrap().message, message);
+        assert_eq!(persisted.last_error.as_ref().unwrap().hint, hint);
+        let round_trip: design_harness::SessionSnapshot =
+            serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        DesignSession::restore((), large_config(), round_trip).unwrap();
+    });
+}
+
+#[test]
+fn second_argument_failure_halts_after_two_model_calls_and_human_can_resume() {
+    block_on(async {
+        let bad = || {
+            call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )
+        };
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![bad()]),
+            LlmResponse::ToolCalls(vec![bad()]),
+        ]);
+        let mut session = DesignSession::with_config(client, large_config());
+
+        let BurstOutcome::Halted(report) = session.run_burst("Build a panel").await else {
+            panic!("expected repair halt")
+        };
+
+        assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+        assert_eq!(session.observability().model_calls, 2);
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_failures, 1);
+        assert!(session.draft().ruleset.panels.is_empty());
+        let snapshot_json = serde_json::to_string(&session.snapshot()).unwrap();
+        let snapshot_value: Value = serde_json::from_str(&snapshot_json).unwrap();
+        assert_eq!(
+            snapshot_value["repair_state"]["ticket"]["original_call"]["arguments"],
+            json!({"key":"welcome","channel":"study_hub"}).to_string()
+        );
+        assert!(snapshot_value["repair_state"]["ticket"]["expected_argument_schema"].is_object());
+        let snapshot: design_harness::SessionSnapshot =
+            serde_json::from_str(&snapshot_json).unwrap();
+        let resume_client = ScriptedClient::new(vec![LlmResponse::Text(
+            "QUESTION: What content should it use?".to_string(),
+        )]);
+        let mut restored = DesignSession::restore(resume_client, large_config(), snapshot).unwrap();
+
+        assert!(matches!(
+            restored.run_burst("Let me choose the content").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert!(restored.snapshot().repair_state.is_none());
+        assert_eq!(restored.observability().repair_escalations, 1);
+    });
+}
+
+#[test]
+fn multi_call_repair_dispatches_nothing_and_keeps_complete_pairs() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "repair-one",
+                    "add_panel",
+                    json!({"key":"one","channel":"study_hub","content":"One"}),
+                ),
+                call(
+                    "repair-two",
+                    "add_panel",
+                    json!({"key":"two","channel":"study_hub","content":"Two"}),
+                ),
+            ]),
+        ]);
+        let mut session = DesignSession::with_config(client, large_config());
+
+        let BurstOutcome::Halted(report) = session.run_burst("Build a panel").await else {
+            panic!("expected repair halt")
+        };
+
+        assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+        assert!(session.draft().ruleset.panels.is_empty());
+        assert_eq!(session.observability().tool_calls, 1);
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_failures, 1);
+        for id in ["repair-one", "repair-two"] {
+            assert!(session.messages().iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id.as_deref() == Some(id)
+                    && message.content.contains("REPAIR_RESPONSE_REJECTED")
+            }));
+        }
+        assert_complete_tool_pairs(session.messages());
+        assert!(DesignSession::restore((), large_config(), session.snapshot()).is_ok());
+    });
+}
+
+#[test]
+fn malformed_text_empty_name_and_wrong_tool_repairs_halt_without_dispatch() {
+    block_on(async {
+        let cases = vec![
+            LlmResponse::ToolCalls(Vec::new()),
+            LlmResponse::Text("DONE: repaired".to_string()),
+            LlmResponse::Text("I repaired it".to_string()),
+            LlmResponse::ToolCalls(vec![call(
+                "wrong-tool",
+                "add_modal",
+                json!({"key":"m","title":"M","fields":[]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "empty-name",
+                "",
+                json!({"key":"p","channel":"study_hub","content":"P"}),
+            )]),
+        ];
+        for response in cases {
+            let client = ScriptedClient::new(vec![
+                LlmResponse::ToolCalls(vec![call(
+                    "bad-panel",
+                    "add_panel",
+                    json!({"key":"welcome","channel":"study_hub"}),
+                )]),
+                response,
+            ]);
+            let mut session = DesignSession::with_config(client, large_config());
+
+            let BurstOutcome::Halted(report) = session.run_burst("Build a panel").await else {
+                panic!("expected malformed repair halt")
+            };
+
+            assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+            assert_eq!(session.observability().tool_calls, 1);
+            assert_eq!(session.observability().repair_attempts, 1);
+            assert_eq!(session.observability().repair_failures, 1);
+            assert!(session.draft().ruleset.panels.is_empty());
+            assert_complete_tool_pairs(session.messages());
+            assert!(DesignSession::restore((), large_config(), session.snapshot()).is_ok());
+        }
+    });
+}
+
+#[test]
+fn malformed_gate_arguments_use_argument_repair_without_counting_gate_failures() {
+    block_on(async {
+        let validate_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-validate",
+                "validate_draft",
+                json!({"unexpected":true}),
+            )]),
+            LlmResponse::ToolCalls(vec![call("fixed-validate", "validate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Simulate?".to_string()),
+        ]);
+        let validate_probe = validate_client.clone();
+        let mut validate_session = DesignSession::with_config(validate_client, long_flow_config());
+        *validate_session.draft_mut() = support::golden_draft().await;
+
+        assert!(matches!(
+            validate_session.run_burst("Validate it").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert_eq!(validate_session.observability().validation_failures, 0);
+        assert_eq!(validate_session.observability().repair_successes, 1);
+        assert_eq!(validate_probe.seen_tools()[1], names(&["validate_draft"]));
+
+        let simulate_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-simulate",
+                "simulate_draft",
+                json!({"unexpected":true}),
+            )]),
+            LlmResponse::ToolCalls(vec![call("fixed-simulate", "simulate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Review?".to_string()),
+        ]);
+        let simulate_probe = simulate_client.clone();
+        let mut simulate_session = DesignSession::with_config(simulate_client, long_flow_config());
+        let mut draft = support::golden_draft().await;
+        draft.validated_revision = Some(draft.draft_revision);
+        *simulate_session.draft_mut() = draft;
+
+        assert!(matches!(
+            simulate_session.run_burst("Simulate it").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert_eq!(simulate_session.observability().simulation_failures, 0);
+        assert_eq!(simulate_session.observability().repair_successes, 1);
+        assert_eq!(simulate_probe.seen_tools()[1], names(&["simulate_draft"]));
+    });
+}
+
+#[test]
+fn pending_repair_limits_persist_failed_state_without_resetting_attempt_budget() {
+    block_on(async {
+        let model_limited_client = ScriptedClient::new(vec![LlmResponse::ToolCalls(vec![call(
+            "bad-panel",
+            "add_panel",
+            json!({"key":"welcome","channel":"study_hub"}),
+        )])]);
+        let mut model_limited = DesignSession::with_config(
+            model_limited_client,
+            SessionConfig {
+                max_model_calls: 1,
+                context_char_budget: 100_000,
+                ..SessionConfig::default()
+            },
+        );
+
+        let BurstOutcome::Halted(report) = model_limited.run_burst("Build a panel").await else {
+            panic!("expected repair model limit halt")
+        };
+        assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+        assert_eq!(model_limited.observability().repair_attempts, 0);
+        assert_eq!(model_limited.observability().repair_failures, 1);
+        assert!(matches!(
+            model_limited.snapshot().repair_state,
+            Some(RepairState::Failed(_))
+        ));
+        assert!(DesignSession::restore((), large_config(), model_limited.snapshot()).is_ok());
+
+        let failed_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel-again",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+        ]);
+        let mut failed = DesignSession::with_config(failed_client, large_config());
+        assert!(matches!(
+            failed.run_burst("Build a panel").await,
+            BurstOutcome::Halted(_)
+        ));
+        let mut pending = failed.snapshot();
+        let Some(RepairState::Failed(mut ticket)) = pending.repair_state.take() else {
+            panic!("expected failed ticket")
+        };
+        ticket.attempts_remaining = 1;
+        pending.repair_state = Some(RepairState::AwaitingAttempt(ticket.clone()));
+        pending.last_error = Some(ticket.original_error.clone());
+        pending.observability.repair_attempts = 0;
+        pending.observability.repair_failures = 0;
+        let restored = DesignSession::restore((), large_config(), pending.clone()).unwrap();
+        assert!(matches!(
+            restored.snapshot().repair_state,
+            Some(RepairState::AwaitingAttempt(_))
+        ));
+        let context_client = ScriptedClient::new(vec![]);
+        let mut context_limited = DesignSession::restore(
+            context_client,
+            SessionConfig {
+                context_char_budget: 1,
+                ..large_config()
+            },
+            pending,
+        )
+        .unwrap();
+
+        let BurstOutcome::Halted(report) = context_limited.run_burst("Continue").await else {
+            panic!("expected repair context halt")
+        };
+        assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+        assert_eq!(context_limited.observability().repair_attempts, 0);
+        assert_eq!(context_limited.observability().repair_failures, 1);
+        assert!(DesignSession::restore((), large_config(), context_limited.snapshot()).is_ok());
+    });
+}
+
+#[test]
+fn repair_snapshot_invariants_reject_budget_schema_root_and_verify_corruption() {
+    block_on(async {
+        let argument_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel-again",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+        ]);
+        let mut argument = DesignSession::with_config(argument_client, large_config());
+        assert!(matches!(
+            argument.run_burst("Build a panel").await,
+            BurstOutcome::Halted(_)
+        ));
+        let valid = argument.snapshot();
+
+        let mut reset_budget = valid.clone();
+        let Some(RepairState::Failed(ticket)) = reset_budget.repair_state.as_mut() else {
+            panic!("expected failed argument repair")
+        };
+        ticket.attempts_remaining = 1;
+        assert!(matches!(
+            DesignSession::restore((), large_config(), reset_budget),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut wrong_schema = valid.clone();
+        let Some(RepairState::Failed(ticket)) = wrong_schema.repair_state.as_mut() else {
+            panic!("expected failed argument repair")
+        };
+        ticket.expected_argument_schema = Some(Value::Null);
+        assert!(matches!(
+            DesignSession::restore((), large_config(), wrong_schema),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut overflow = valid.clone();
+        let Some(RepairState::Failed(ticket)) = overflow.repair_state.as_mut() else {
+            panic!("expected failed argument repair")
+        };
+        ticket.root_revision = u64::MAX;
+        overflow.draft.draft_revision = u64::MAX;
+        assert!(matches!(
+            DesignSession::restore((), large_config(), overflow),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut missing_root = valid;
+        missing_root.observability.failure_signatures.clear();
+        missing_root.observability.repeated_errors = 0;
+        assert!(matches!(
+            DesignSession::restore((), large_config(), missing_root),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let validation_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("root-validate", "validate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "irrelevant-panel",
+                "add_panel",
+                json!({"key":"other","channel":"study_hub","content":"Other"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call("verify-validate", "validate_draft", json!({}))]),
+        ]);
+        let mut validation = DesignSession::with_config(validation_client, long_flow_config());
+        *validation.draft_mut() = fixable_validation_draft().await;
+        assert!(matches!(
+            validation.run_burst("Validate it").await,
+            BurstOutcome::Halted(_)
+        ));
+        let mut verify = validation.snapshot();
+        let Some(RepairState::Failed(ticket)) = verify.repair_state.take() else {
+            panic!("expected failed validation repair")
+        };
+        verify.repair_state = Some(RepairState::VerifyValidation(ticket));
+        verify.observability.repair_failures = 0;
+        verify.last_error = None;
+        assert!(DesignSession::restore((), long_flow_config(), verify.clone()).is_ok());
+        verify.observability.repair_attempts = verify.observability.repair_successes;
+        assert!(matches!(
+            DesignSession::restore((), long_flow_config(), verify),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+    });
+}
+
+#[test]
+fn validation_repair_routes_one_mutation_then_exact_validation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("root-validate", "validate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "repair-button",
+                "add_button",
+                json!({
+                    "panel_key":"launcher",
+                    "label":"Open",
+                    "route":{"kind":"static","key":"open_room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call("verify-validate", "validate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Simulate it?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, long_flow_config());
+        *session.draft_mut() = fixable_validation_draft().await;
+
+        let outcome = session.run_burst("Validate the launcher").await;
+
+        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_successes, 1);
+        assert_eq!(session.observability().repair_failures, 0);
+        assert_eq!(session.observability().validation_failures, 1);
+        assert_eq!(
+            session.draft().validated_revision,
+            Some(session.draft().draft_revision)
+        );
+        assert!(session.snapshot().repair_state.is_none());
+        assert!(session.snapshot().last_error.is_none());
+        assert_eq!(
+            probe.seen_tools()[1],
+            rule_tool_names(true, false, false, None)
+        );
+        assert_eq!(probe.seen_tools()[2], names(&["validate_draft"]));
+        assert_eq!(
+            probe.seen_tools()[3],
+            rule_tool_names(true, false, false, Some("simulate_draft"))
+        );
+    });
+}
+
+#[test]
+fn failed_repair_validation_halts_without_a_second_mutation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("root-validate", "validate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "irrelevant-panel",
+                "add_panel",
+                json!({"key":"other","channel":"study_hub","content":"Other"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call("verify-validate", "validate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "never-run",
+                "add_button",
+                json!({
+                    "panel_key":"launcher",
+                    "label":"Open",
+                    "route":{"kind":"static","key":"open_room"}
+                }),
+            )]),
+        ]);
+        let mut session = DesignSession::with_config(client, long_flow_config());
+        *session.draft_mut() = fixable_validation_draft().await;
+
+        let BurstOutcome::Halted(report) = session.run_burst("Validate it").await else {
+            panic!("expected repair verification halt")
+        };
+
+        assert_eq!(report.code, "REPAIR_ATTEMPT_FAILED");
+        assert_eq!(session.observability().model_calls, 3);
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_failures, 1);
+        assert_eq!(session.observability().validation_failures, 2);
+        assert!(session
+            .draft()
+            .ruleset
+            .panels
+            .iter()
+            .all(|panel| panel.buttons.is_empty()));
+        assert!(DesignSession::restore((), long_flow_config(), session.snapshot()).is_ok());
+    });
+}
+
+#[test]
+fn simulation_repair_forces_mutation_validation_and_simulation_in_order() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("root-simulate", "simulate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "repair-overwrite",
+                "add_upsert_overwrite_action",
+                json!({
+                    "rule_key":"submit_room",
+                    "channel":{"kind":"created","name":"room_channel"},
+                    "target_kind":"everyone",
+                    "allow":[],
+                    "deny":["view_channel"]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call("verify-validate", "validate_draft", json!({}))]),
+            LlmResponse::ToolCalls(vec![call("verify-simulate", "simulate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Review the completed design?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, long_flow_config());
+        *session.draft_mut() = fixable_simulation_draft().await;
+
+        let outcome = session.run_burst("Repair the simulation").await;
+
+        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().repair_successes, 1);
+        assert_eq!(session.observability().simulation_failures, 1);
+        assert_eq!(
+            session.draft().simulated_revision,
+            Some(session.draft().draft_revision)
+        );
+        assert_eq!(
+            probe.seen_tools()[1],
+            rule_tool_names(true, true, true, None)
+        );
+        assert_eq!(probe.seen_tools()[2], names(&["validate_draft"]));
+        assert_eq!(probe.seen_tools()[3], names(&["simulate_draft"]));
+        assert_eq!(probe.seen_tools()[4], simulation_tool_names());
+        assert!(session.snapshot().last_error.is_none());
+    });
+}
+
+#[test]
+fn repair_question_escalates_and_internal_directive_never_replaces_human_intent() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "bad-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub"}),
+            )]),
+            LlmResponse::Text("QUESTION: What content should I use?".to_string()),
+            LlmResponse::ToolCalls(vec![call(
+                "human-fixed-panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"study_hub","content":"Hello"}),
+            )]),
+            LlmResponse::Text("QUESTION: Anything else?".to_string()),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_config(client, large_config());
+
+        assert!(matches!(
+            session.run_burst("Build my welcome panel").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert_eq!(session.observability().repair_attempts, 0);
+        assert_eq!(session.observability().repair_escalations, 1);
+        assert!(session.snapshot().repair_state.is_none());
+        let seen = probe.seen();
+        let anchor: Value = serde_json::from_str(
+            seen[1]
+                .last()
+                .unwrap()
+                .content
+                .strip_prefix("DRAFT_STATE:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(anchor["current_human_intent"], "Build my welcome panel");
+        assert!(anchor["recent_human_intent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|intent| !intent.as_str().unwrap().starts_with("REPAIR_REQUIRED:")));
+
+        assert!(matches!(
+            session.run_burst("Use a short greeting").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+        assert_eq!(session.observability().repair_escalations, 1);
+        assert!(session.snapshot().last_error.is_none());
+        let seen = probe.seen();
+        let resolved_anchor: Value = serde_json::from_str(
+            seen[3]
+                .last()
+                .unwrap()
+                .content
+                .strip_prefix("DRAFT_STATE:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(resolved_anchor["last_error"].is_null());
+    });
+}
+
+#[test]
+fn not_executed_batch_results_never_record_failures_or_open_tickets() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "bad-panel",
+                    "add_panel",
+                    json!({"key":"welcome","channel":"study_hub"}),
+                ),
+                call(
+                    "skipped-modal",
+                    "add_modal",
+                    json!({"key":"skipped","title":"Skipped","fields":[]}),
+                ),
+            ]),
+            LlmResponse::Text("QUESTION: Should I correct the panel?".to_string()),
+        ]);
+        let mut session = DesignSession::with_config(client, large_config());
+
+        assert!(matches!(
+            session.run_burst("Build it").await,
+            BurstOutcome::AwaitingHuman { .. }
+        ));
+
+        assert_eq!(session.observability().failure_signatures.len(), 1);
+        assert!(session
+            .observability()
+            .failure_signatures
+            .keys()
+            .all(|signature| !signature.contains("NOT_EXECUTED")));
+        assert!(session.draft().ruleset.modals.is_empty());
+        let directive_index = session
+            .messages()
+            .iter()
+            .position(|message| message.content.starts_with("REPAIR_REQUIRED:"))
+            .unwrap();
+        assert_eq!(
+            session.messages()[directive_index - 1]
+                .tool_call_id
+                .as_deref(),
+            Some("skipped-modal")
+        );
+    });
+}
+
+#[test]
 fn anchor_separates_bounded_current_intent_from_prior_intents() {
     block_on(async {
         let client = ScriptedClient::new(vec![
@@ -726,7 +1544,10 @@ fn failed_simulation_keeps_mutation_tools_available_for_repair() {
         assert_eq!(session.observability().simulation_failures, 1);
         assert_eq!(
             probe.seen_tools(),
-            vec![simulation_tool_names(), simulation_tool_names()]
+            vec![
+                simulation_tool_names(),
+                rule_tool_names(true, true, true, None)
+            ]
         );
     });
 }

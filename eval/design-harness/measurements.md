@@ -45,3 +45,14 @@ Measured 2026-07-13 after adding versioned session snapshots, CLI-edge SQLite pe
 | Simple modal acknowledgement | 3 | 0 | 0 | 0.67 | n/a | 113,560 | 116,813 | 12 | 12 | 2.33 | 8 |
 
 The durable state and compact overflow path pass their deterministic tests, but this short-session live benchmark regressed: mean latency rose 49.1% for StudyRoom and 59.0% for the simple case relative to Item 2. The richer append-only anchors remain in context while the transcript is below budget, and repeated malformed calls still consume all 12 model calls. One StudyRoom run reached a validator-clean incomplete Draft, while one simple run failed validation. These results make Item 4's bounded repair path necessary; Item 3 alone is not a live latency or completion improvement.
+
+## 4. Validator one-attempt repair
+
+Measured 2026-07-13 after adding a persisted one-attempt repair state machine. Argument errors expose the same tool and exact schema once; validation repair permits one mutation followed by exact validation; simulation repair adds exact simulation after validation. Malformed, mismatched, or repeatedly failing repair responses halt immediately. Full repair tickets stay in SQLite snapshots while the prompt anchor carries a bounded repair summary. Conditions and final three-run sample size match the baseline; an earlier one-run smoke check was excluded.
+
+| Case | Runs | Pass rate | Completion rate | Validation rate | Required simulation rate | Mean ms | p95 ms | Mean model calls | Mean tool calls | Mean distinct mutation tools | Maximum identical error count | Mean repair attempts | Mean repair successes | Mean repair failures |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| StudyRoom full | 3 | 0 | 0 | 0.33 | 0 | 185,738 | 214,993 | 11 | 10.33 | 4.67 | 2 | 4.33 | 4 | 0.33 |
+| Simple modal acknowledgement | 3 | 0 | 0 | 1 | n/a | 177,277 | 223,919 | 10 | 9.33 | 3.33 | 1 | 4.33 | 3.33 | 1 |
+
+The repeated-error contract improved decisively: the worst identical error count fell from 5 to 2 for StudyRoom and from 8 to 1 for the simple case, and no simple run repeated an error. Mean model calls fell 8.3% and 16.7% respectively relative to Item 3, and all simple Drafts passed final validation. Completion and exact-task pass rates remained zero. Latency still rose 66.2% for StudyRoom and 56.1% for the simple case because the model produced several different malformed calls instead of one repeated signature, averaging 4.33 repair attempts per run. Item 4 prevents unbounded flailing per error but does not impose a session-wide repair budget; that is the next performance policy to evaluate rather than an unmeasured claim of improvement.

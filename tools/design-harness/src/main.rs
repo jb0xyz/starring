@@ -156,7 +156,7 @@ async fn write_observability<W: AsyncWriteExt + Unpin>(
     write_line(
         output,
         &format!(
-            "metrics> model_calls={} tool_calls={} mutation_tools={} clarifications={} validation_failures={} simulation_failures={} repeated_errors={} nudges={}",
+            "metrics> model_calls={} tool_calls={} mutation_tools={} clarifications={} validation_failures={} simulation_failures={} repeated_errors={} repair_attempts={} repair_successes={} repair_failures={} repair_escalations={} nudges={}",
             observability.model_calls,
             observability.tool_calls,
             tools,
@@ -164,6 +164,10 @@ async fn write_observability<W: AsyncWriteExt + Unpin>(
             observability.validation_failures,
             observability.simulation_failures,
             observability.repeated_errors,
+            observability.repair_attempts,
+            observability.repair_successes,
+            observability.repair_failures,
+            observability.repair_escalations,
             observability.nudge_count
         ),
     )

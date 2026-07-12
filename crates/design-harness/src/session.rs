@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use automation_state::{ActionSpec, ButtonRoute, TriggerSpec};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::draft::{Draft, DraftSummary};
@@ -12,10 +13,12 @@ use crate::tools::{dispatch_tool, tool_definitions, ToolDefinition};
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only by calling the provided Draft tools. Never touch live Discord, publish, deploy, or activate. Make one logical change per tool call and reference created resources by alias. Validate before simulate. Text replies must be exactly QUESTION: followed by a question or DONE: followed by a summary. Use DONE: only after simulate_draft passes for the current revision.";
 
 const NUDGE: &str = "Call a design tool to change the Draft; use QUESTION: to ask the human; only use DONE: after simulate_draft passes on the current revision.";
+const REPAIR_REQUIRED_PREFIX: &str = "REPAIR_REQUIRED:";
 const MAX_INTENT_MEMORY_ITEMS: usize = 6;
 const MAX_INTENT_MEMORY_CHARS: usize = 240;
+const MAX_ERROR_MEMORY_CHARS: usize = 360;
 
-pub const SESSION_SNAPSHOT_VERSION: u32 = 1;
+pub const SESSION_SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -55,6 +58,10 @@ pub struct Observability {
     pub simulation_failures: usize,
     pub failure_signatures: BTreeMap<String, usize>,
     pub repeated_errors: usize,
+    pub repair_attempts: usize,
+    pub repair_successes: usize,
+    pub repair_failures: usize,
+    pub repair_escalations: usize,
     pub nudge_count: usize,
 }
 
@@ -75,6 +82,81 @@ pub enum BurstOutcome {
     Halted(Box<HaltReport>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairKind {
+    Arguments,
+    Validation,
+    Simulation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairTicket {
+    pub kind: RepairKind,
+    pub original_call: ToolCall,
+    pub original_error: StructuredError,
+    pub expected_argument_schema: Option<Value>,
+    pub allowed_repair_tools: Vec<String>,
+    pub verification_path: Vec<String>,
+    pub root_revision: u64,
+    pub attempts_remaining: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", content = "ticket", rename_all = "snake_case")]
+pub enum RepairState {
+    AwaitingAttempt(RepairTicket),
+    VerifyValidation(RepairTicket),
+    VerifySimulation(RepairTicket),
+    Failed(RepairTicket),
+}
+
+impl RepairState {
+    fn ticket(&self) -> &RepairTicket {
+        match self {
+            Self::AwaitingAttempt(ticket)
+            | Self::VerifyValidation(ticket)
+            | Self::VerifySimulation(ticket)
+            | Self::Failed(ticket) => ticket,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairOriginal {
+    tool: ToolCall,
+    error: StructuredError,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairDirective {
+    event: String,
+    attempts_remaining: u8,
+    original: RepairOriginal,
+    expected_argument_schema: Option<Value>,
+    allowed_repair_tools: Vec<String>,
+    verification_path: Vec<String>,
+}
+
+impl RepairDirective {
+    fn from_ticket(ticket: &RepairTicket) -> Self {
+        Self {
+            event: "repair_required".to_string(),
+            attempts_remaining: ticket.attempts_remaining,
+            original: RepairOriginal {
+                tool: ticket.original_call.clone(),
+                error: ticket.original_error.clone(),
+            },
+            expected_argument_schema: ticket.expected_argument_schema.clone(),
+            allowed_repair_tools: ticket.allowed_repair_tools.clone(),
+            verification_path: ticket.verification_path.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
@@ -84,6 +166,7 @@ pub struct SessionSnapshot {
     pub observability: Observability,
     pub last_error: Option<StructuredError>,
     pub prose_nudged: bool,
+    pub repair_state: Option<RepairState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -103,6 +186,7 @@ pub struct DesignSession<C> {
     observability: Observability,
     last_error: Option<StructuredError>,
     prose_nudged: bool,
+    repair_state: Option<RepairState>,
 }
 
 impl<C> DesignSession<C> {
@@ -122,6 +206,7 @@ impl<C> DesignSession<C> {
             observability: Observability::default(),
             last_error: None,
             prose_nudged: false,
+            repair_state: None,
         }
     }
 
@@ -149,6 +234,7 @@ impl<C> DesignSession<C> {
             observability: self.observability.clone(),
             last_error: self.last_error.clone(),
             prose_nudged: self.prose_nudged,
+            repair_state: self.repair_state.clone(),
         }
     }
 
@@ -167,6 +253,7 @@ impl<C> DesignSession<C> {
             observability: snapshot.observability,
             last_error: snapshot.last_error,
             prose_nudged: snapshot.prose_nudged,
+            repair_state: snapshot.repair_state,
         })
     }
 
@@ -181,12 +268,28 @@ impl<C> DesignSession<C> {
             &self.draft,
             &self.observability,
             self.last_error.as_ref(),
+            self.repair_state.as_ref(),
             &self.messages,
         )));
     }
 
     fn routed_tools(&self) -> Vec<ToolDefinition> {
-        routed_tool_definitions(&self.draft, &self.tools)
+        match self.repair_state.as_ref() {
+            Some(RepairState::AwaitingAttempt(ticket)) => self
+                .tools
+                .iter()
+                .filter(|tool| ticket.allowed_repair_tools.contains(&tool.name))
+                .cloned()
+                .collect(),
+            Some(RepairState::VerifyValidation(_)) => {
+                definitions_named(&self.tools, &["validate_draft"])
+            }
+            Some(RepairState::VerifySimulation(_)) => {
+                definitions_named(&self.tools, &["simulate_draft"])
+            }
+            Some(RepairState::Failed(_)) => Vec::new(),
+            None => routed_tool_definitions(&self.draft, &self.tools),
+        }
     }
 
     fn fit_context(&self, tools: &[ToolDefinition]) -> Option<Vec<Message>> {
@@ -245,8 +348,12 @@ impl<C> DesignSession<C> {
             failure.hint.clone(),
         ));
         match name {
-            Some("validate_draft") => self.observability.validation_failures += 1,
-            Some("simulate_draft") => self.observability.simulation_failures += 1,
+            Some("validate_draft") if !is_argument_failure(&failure.code) => {
+                self.observability.validation_failures += 1
+            }
+            Some("simulate_draft") if !is_argument_failure(&failure.code) => {
+                self.observability.simulation_failures += 1
+            }
             _ => {}
         }
     }
@@ -302,6 +409,140 @@ impl<C> DesignSession<C> {
                 .push(Message::tool(call.id.clone(), result.as_json()));
         }
     }
+
+    fn append_repair_directive(&mut self, ticket: &RepairTicket) {
+        let directive = RepairDirective::from_ticket(ticket);
+        let json = serde_json::to_string(&directive).unwrap_or_else(|_| {
+            r#"{"event":"repair_required","attempts_remaining":1}"#.to_string()
+        });
+        self.messages
+            .push(Message::user(format!("{REPAIR_REQUIRED_PREFIX}{json}")));
+    }
+
+    fn root_repair_ticket(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        request_tools: &[ToolDefinition],
+    ) -> Option<RepairTicket> {
+        let failure = result.failure()?;
+        let error = StructuredError::new(
+            failure.code.clone(),
+            failure.location.clone(),
+            failure.message.clone(),
+            failure.hint.clone(),
+        );
+        let tool_name = call.name.as_str();
+        let argument_failure = is_argument_failure(failure.code.as_str());
+        let kind = if argument_failure {
+            RepairKind::Arguments
+        } else if tool_name == "validate_draft" {
+            RepairKind::Validation
+        } else if tool_name == "simulate_draft" {
+            RepairKind::Simulation
+        } else {
+            return None;
+        };
+        let expected_argument_schema = argument_failure.then(|| {
+            request_tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .map(|tool| tool.parameters.clone())
+                .unwrap_or(Value::Null)
+        });
+        let allowed_repair_tools = if argument_failure {
+            vec![tool_name.to_string()]
+        } else {
+            routed_tool_definitions(&self.draft, &self.tools)
+                .into_iter()
+                .filter(|tool| is_mutation_tool(&tool.name))
+                .map(|tool| tool.name)
+                .collect()
+        };
+        let verification_path = match kind {
+            RepairKind::Arguments => vec![tool_name.to_string()],
+            RepairKind::Validation => {
+                vec!["mutation".to_string(), "validate_draft".to_string()]
+            }
+            RepairKind::Simulation => vec![
+                "mutation".to_string(),
+                "validate_draft".to_string(),
+                "simulate_draft".to_string(),
+            ],
+        };
+        Some(RepairTicket {
+            kind,
+            original_call: call.clone(),
+            original_error: error,
+            expected_argument_schema,
+            allowed_repair_tools,
+            verification_path,
+            root_revision: self.draft.draft_revision,
+            attempts_remaining: 1,
+        })
+    }
+
+    fn consume_repair_attempt(&mut self, ticket: &mut RepairTicket) {
+        ticket.attempts_remaining = 0;
+        self.observability.repair_attempts += 1;
+    }
+
+    fn append_repair_rejections(&mut self, calls: &[ToolCall], error: &StructuredError) {
+        let result = ToolResult::failure_from(&self.draft, error.clone());
+        self.record_failure(None, &result);
+        let json = result.as_json();
+        for call in calls {
+            self.messages
+                .push(Message::tool(call.id.clone(), json.clone()));
+        }
+    }
+
+    fn fail_repair(
+        &mut self,
+        mut ticket: RepairTicket,
+        error: StructuredError,
+        record_error: bool,
+    ) -> BurstOutcome {
+        ticket.attempts_remaining = 0;
+        if record_error {
+            let result = ToolResult::failure_from(&self.draft, error.clone());
+            self.record_failure(None, &result);
+        }
+        self.last_error = Some(error);
+        self.observability.repair_failures += 1;
+        self.repair_state = Some(RepairState::Failed(ticket));
+        self.halt(
+            "REPAIR_ATTEMPT_FAILED",
+            "The single automatic repair attempt failed",
+            None,
+        )
+    }
+}
+
+fn definitions_named(registry: &[ToolDefinition], names: &[&str]) -> Vec<ToolDefinition> {
+    registry
+        .iter()
+        .filter(|tool| names.contains(&tool.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn is_argument_failure(code: &str) -> bool {
+    matches!(
+        code,
+        "MISSING_REQUIRED_FIELD"
+            | "INVALID_KIND"
+            | "INVALID_TOOL_ARGUMENTS"
+            | "UNKNOWN_FIELD"
+            | "INVALID_FIELD_TYPE"
+    )
+}
+
+fn valid_tool_call_ids(calls: &[ToolCall]) -> bool {
+    let mut ids = BTreeSet::new();
+    calls.iter().all(|call| {
+        !call.id.trim().is_empty() && !call.name.trim().is_empty() && ids.insert(call.id.as_str())
+    })
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotError> {
@@ -350,7 +591,202 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotEr
             "repeated_errors does not match failure signature counts",
         ));
     }
+    validate_repair_snapshot(snapshot)?;
     validate_message_pairing(&snapshot.messages, snapshot.draft.draft_revision)
+}
+
+fn validate_repair_snapshot(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotError> {
+    if snapshot.observability.repair_successes > snapshot.observability.repair_attempts {
+        return Err(snapshot_invariant(
+            "repair successes exceed repair attempts",
+        ));
+    }
+    let Some(state) = snapshot.repair_state.as_ref() else {
+        return Ok(());
+    };
+    let ticket = state.ticket();
+    if ticket.original_call.id.trim().is_empty()
+        || ticket.original_call.name.trim().is_empty()
+        || ticket.root_revision > snapshot.draft.draft_revision
+        || ticket.root_revision == u64::MAX
+    {
+        return Err(snapshot_invariant(
+            "repair ticket has an invalid original call or revision",
+        ));
+    }
+    let signature = format!(
+        "{}@{}",
+        ticket.original_error.code, ticket.original_error.location
+    );
+    if snapshot
+        .observability
+        .failure_signatures
+        .get(&signature)
+        .copied()
+        .unwrap_or(0)
+        == 0
+    {
+        return Err(snapshot_invariant(
+            "repair ticket root failure is absent from observability",
+        ));
+    }
+    let mut allowed = BTreeSet::new();
+    if ticket.allowed_repair_tools.iter().any(|name| {
+        name.trim().is_empty()
+            || !allowed.insert(name.as_str())
+            || !tool_definitions().iter().any(|tool| tool.name == *name)
+    }) {
+        return Err(snapshot_invariant(
+            "repair ticket contains invalid allowed tools",
+        ));
+    }
+    match ticket.kind {
+        RepairKind::Arguments => {
+            let definition = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == ticket.original_call.name)
+                .ok_or_else(|| snapshot_invariant("argument repair tool is not registered"))?;
+            if ticket.expected_argument_schema.as_ref() != Some(&definition.parameters)
+                || ticket.allowed_repair_tools != vec![ticket.original_call.name.clone()]
+                || ticket.verification_path != vec![ticket.original_call.name.clone()]
+                || !is_argument_failure(&ticket.original_error.code)
+                || !matches!(
+                    state,
+                    RepairState::AwaitingAttempt(_) | RepairState::Failed(_)
+                )
+            {
+                return Err(snapshot_invariant(
+                    "argument repair ticket shape is inconsistent",
+                ));
+            }
+        }
+        RepairKind::Validation | RepairKind::Simulation => {
+            if ticket.expected_argument_schema.is_some()
+                || ticket.allowed_repair_tools.is_empty()
+                || ticket
+                    .allowed_repair_tools
+                    .iter()
+                    .any(|name| !is_mutation_tool(name))
+            {
+                return Err(snapshot_invariant(
+                    "gate repair ticket does not contain mutation-only tools",
+                ));
+            }
+            let expected_path = match ticket.kind {
+                RepairKind::Validation => vec!["mutation", "validate_draft"],
+                RepairKind::Simulation => {
+                    vec!["mutation", "validate_draft", "simulate_draft"]
+                }
+                RepairKind::Arguments => unreachable!(),
+            };
+            if ticket.verification_path != expected_path
+                || ticket.original_call.name
+                    != match ticket.kind {
+                        RepairKind::Validation => "validate_draft",
+                        RepairKind::Simulation => "simulate_draft",
+                        RepairKind::Arguments => unreachable!(),
+                    }
+                || is_argument_failure(&ticket.original_error.code)
+            {
+                return Err(snapshot_invariant(
+                    "gate repair ticket root or verification path is inconsistent",
+                ));
+            }
+            if matches!(state, RepairState::AwaitingAttempt(_)) {
+                let expected_allowed =
+                    routed_tool_definitions(&snapshot.draft, &tool_definitions())
+                        .into_iter()
+                        .filter(|tool| is_mutation_tool(&tool.name))
+                        .map(|tool| tool.name)
+                        .collect::<Vec<_>>();
+                if ticket.allowed_repair_tools != expected_allowed {
+                    return Err(snapshot_invariant(
+                        "gate repair tools do not match the root Draft state",
+                    ));
+                }
+            }
+        }
+    }
+    match state {
+        RepairState::AwaitingAttempt(_) => {
+            if ticket.attempts_remaining != 1
+                || ticket.root_revision != snapshot.draft.draft_revision
+                || snapshot.last_error.as_ref() != Some(&ticket.original_error)
+            {
+                return Err(snapshot_invariant(
+                    "awaiting repair ticket does not match the root failure state",
+                ));
+            }
+        }
+        RepairState::VerifyValidation(_) => {
+            let expected_revision = ticket
+                .root_revision
+                .checked_add(1)
+                .ok_or_else(|| snapshot_invariant("repair revision overflow"))?;
+            if ticket.attempts_remaining != 0
+                || ticket.kind == RepairKind::Arguments
+                || snapshot.observability.repair_attempts <= snapshot.observability.repair_successes
+                || snapshot.draft.draft_revision != expected_revision
+                || snapshot.draft.validated_revision.is_some()
+                || snapshot.draft.simulated_revision.is_some()
+            {
+                return Err(snapshot_invariant(
+                    "validation verification state is inconsistent",
+                ));
+            }
+        }
+        RepairState::VerifySimulation(_) => {
+            let expected_revision = ticket
+                .root_revision
+                .checked_add(1)
+                .ok_or_else(|| snapshot_invariant("repair revision overflow"))?;
+            if ticket.attempts_remaining != 0
+                || ticket.kind != RepairKind::Simulation
+                || snapshot.observability.repair_attempts <= snapshot.observability.repair_successes
+                || snapshot.draft.draft_revision != expected_revision
+                || snapshot.draft.validated_revision != Some(snapshot.draft.draft_revision)
+                || snapshot.draft.simulated_revision.is_some()
+            {
+                return Err(snapshot_invariant(
+                    "simulation verification state is inconsistent",
+                ));
+            }
+        }
+        RepairState::Failed(_) => {
+            if ticket.attempts_remaining != 0 || snapshot.observability.repair_failures == 0 {
+                return Err(snapshot_invariant("failed repair state is inconsistent"));
+            }
+        }
+    }
+    if !snapshot
+        .messages
+        .iter()
+        .filter_map(parse_repair_directive)
+        .any(|directive| directive_matches_ticket(&directive, ticket))
+    {
+        return Err(snapshot_invariant(
+            "repair ticket has no matching repair directive",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_repair_directive(message: &Message) -> Option<RepairDirective> {
+    if message.role != MessageRole::User {
+        return None;
+    }
+    let value = message.content.strip_prefix(REPAIR_REQUIRED_PREFIX)?;
+    serde_json::from_str(value).ok()
+}
+
+fn directive_matches_ticket(directive: &RepairDirective, ticket: &RepairTicket) -> bool {
+    directive.event == "repair_required"
+        && directive.attempts_remaining == 1
+        && directive.original.tool == ticket.original_call
+        && directive.original.error == ticket.original_error
+        && directive.expected_argument_schema == ticket.expected_argument_schema
+        && directive.allowed_repair_tools == ticket.allowed_repair_tools
+        && directive.verification_path == ticket.verification_path
 }
 
 fn validate_message_pairing(
@@ -473,10 +909,23 @@ fn snapshot_invariant(message: impl Into<String>) -> SessionSnapshotError {
 
 impl<C: LlmClient> DesignSession<C> {
     pub async fn run_burst(&mut self, human_message: &str) -> BurstOutcome {
+        if matches!(self.repair_state, Some(RepairState::Failed(_))) {
+            self.repair_state = None;
+            self.observability.repair_escalations += 1;
+        }
         self.messages.push(Message::user(human_message));
         self.prose_nudged = false;
         loop {
             if self.observability.model_calls >= self.config.max_model_calls {
+                if let Some(state) = self.repair_state.clone() {
+                    let error = StructuredError::new(
+                        "REPAIR_MODEL_CALL_LIMIT",
+                        "repair.model_calls",
+                        "The repair could not continue because the model call budget is exhausted",
+                        "Escalate to a human before continuing the design",
+                    );
+                    return self.fail_repair(state.ticket().clone(), error, true);
+                }
                 return self.halt(
                     "MODEL_CALL_LIMIT_EXHAUSTED",
                     "The session exhausted its model call budget",
@@ -486,6 +935,15 @@ impl<C: LlmClient> DesignSession<C> {
             self.append_anchor();
             let routed_tools = self.routed_tools();
             let Some(outbound_messages) = self.fit_context(&routed_tools) else {
+                if let Some(state) = self.repair_state.clone() {
+                    let error = StructuredError::new(
+                        "REPAIR_CONTEXT_LIMIT",
+                        "repair.context",
+                        "The repair directive and current Draft do not fit the context budget",
+                        "Increase the context budget or escalate to a human",
+                    );
+                    return self.fail_repair(state.ticket().clone(), error, true);
+                }
                 return self.halt(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
                     "The system prompt, tool schemas, and current Draft anchor do not fit",
@@ -501,15 +959,26 @@ impl<C: LlmClient> DesignSession<C> {
             {
                 Ok(response) => response,
                 Err(_) => {
-                    self.last_error = Some(StructuredError::new(
+                    let error = StructuredError::new(
                         "LLM_CLIENT_ERROR",
                         "llm",
                         "The model request failed",
                         "Stop the burst and retry after the model gateway is available",
-                    ));
+                    );
+                    if let Some(state) = self.repair_state.clone() {
+                        return self.fail_repair(state.ticket().clone(), error, true);
+                    }
+                    self.last_error = Some(error);
                     return self.halt("LLM_CLIENT_ERROR", "The model client failed", None);
                 }
             };
+
+            if self.repair_state.is_some() {
+                if let Some(outcome) = self.handle_repair_response(response, &routed_tools).await {
+                    return outcome;
+                }
+                continue;
+            }
 
             match response {
                 LlmResponse::ToolCalls(calls) => {
@@ -552,6 +1021,9 @@ impl<C: LlmClient> DesignSession<C> {
                                 .distinct_mutation_tools
                                 .insert(call.name.clone());
                         }
+                        if result.is_ok() {
+                            self.last_error = None;
+                        }
                         self.record_failure(available.then_some(call.name.as_str()), &result);
                         let is_failure = !result.is_ok();
                         self.messages
@@ -565,6 +1037,14 @@ impl<C: LlmClient> DesignSession<C> {
                                     "The session exhausted its validation and simulation failure budget",
                                     Some(LimitKind::GateFailures),
                                 );
+                            }
+                            if available {
+                                if let Some(ticket) =
+                                    self.root_repair_ticket(call, &result, &routed_tools)
+                                {
+                                    self.append_repair_directive(&ticket);
+                                    self.repair_state = Some(RepairState::AwaitingAttempt(ticket));
+                                }
                             }
                             break;
                         }
@@ -599,6 +1079,184 @@ impl<C: LlmClient> DesignSession<C> {
                     }
                     return self.halt("UNSTRUCTURED_MODEL_TEXT", &text, None);
                 }
+            }
+        }
+    }
+
+    async fn handle_repair_response(
+        &mut self,
+        response: LlmResponse,
+        routed_tools: &[ToolDefinition],
+    ) -> Option<BurstOutcome> {
+        let state = self.repair_state.clone()?;
+        let mut ticket = state.ticket().clone();
+        let awaiting_attempt = matches!(state, RepairState::AwaitingAttempt(_));
+        match response {
+            LlmResponse::Text(text) => {
+                self.messages.push(Message::assistant(text.clone()));
+                if let Some(question) = text.strip_prefix("QUESTION:") {
+                    self.observability.clarification_count += 1;
+                    self.observability.repair_escalations += 1;
+                    self.repair_state = None;
+                    return Some(BurstOutcome::AwaitingHuman {
+                        question: question.trim().to_string(),
+                    });
+                }
+                if awaiting_attempt {
+                    self.consume_repair_attempt(&mut ticket);
+                }
+                let error = StructuredError::new(
+                    "REPAIR_RESPONSE_REJECTED",
+                    "repair.response",
+                    "The repair response did not contain exactly one tool call",
+                    "Call exactly one tool exposed for the active repair stage",
+                );
+                Some(self.fail_repair(ticket, error, true))
+            }
+            LlmResponse::ToolCalls(calls) => {
+                if !valid_tool_call_ids(&calls) {
+                    self.messages.push(Message::assistant(
+                        "REPAIR_RESPONSE_REJECTED: invalid tool call identifiers",
+                    ));
+                    if awaiting_attempt {
+                        self.consume_repair_attempt(&mut ticket);
+                    }
+                    let error = StructuredError::new(
+                        "REPAIR_RESPONSE_REJECTED",
+                        "repair.tool_calls",
+                        "The repair response contained empty or duplicate tool call identifiers",
+                        "Return exactly one tool call with a non-empty unique identifier",
+                    );
+                    return Some(self.fail_repair(ticket, error, true));
+                }
+                self.messages
+                    .push(Message::assistant_tool_calls(calls.clone()));
+                if calls.len() != 1 {
+                    if awaiting_attempt {
+                        self.consume_repair_attempt(&mut ticket);
+                    }
+                    let error = StructuredError::new(
+                        "REPAIR_RESPONSE_REJECTED",
+                        "repair.tool_calls",
+                        "The repair response did not contain exactly one tool call",
+                        "Return exactly one tool call from the tools exposed for repair",
+                    );
+                    self.append_repair_rejections(&calls, &error);
+                    return Some(self.fail_repair(ticket, error, false));
+                }
+                if awaiting_attempt {
+                    self.consume_repair_attempt(&mut ticket);
+                }
+                let call = &calls[0];
+                if !routed_tools.iter().any(|tool| tool.name == call.name) {
+                    let error = StructuredError::new(
+                        "REPAIR_TOOL_MISMATCH",
+                        format!("repair.tool.{}", call.name),
+                        "The repair response selected a tool outside the active repair stage",
+                        format!(
+                            "Use exactly one of: {}",
+                            routed_tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                    self.append_repair_rejections(&calls, &error);
+                    return Some(self.fail_repair(ticket, error, false));
+                }
+                if self.observability.tool_calls >= self.config.max_tool_calls {
+                    self.append_not_executed(&calls);
+                    let error = StructuredError::new(
+                        "REPAIR_TOOL_CALL_LIMIT",
+                        "repair.tool_calls",
+                        "The repair could not execute because the tool call budget is exhausted",
+                        "Escalate to a human before continuing the design",
+                    );
+                    return Some(self.fail_repair(ticket, error, true));
+                }
+                self.observability.tool_calls += 1;
+                let result = dispatch_tool(&mut self.draft, &call.name, &call.arguments).await;
+                if result.is_ok() && is_mutation_tool(&call.name) {
+                    self.observability
+                        .distinct_mutation_tools
+                        .insert(call.name.clone());
+                }
+                if result.is_ok() {
+                    self.last_error = None;
+                }
+                self.record_failure(Some(call.name.as_str()), &result);
+                let failed = !result.is_ok();
+                let failure = result.failure().map(|failure| {
+                    StructuredError::new(
+                        failure.code.clone(),
+                        failure.location.clone(),
+                        failure.message.clone(),
+                        failure.hint.clone(),
+                    )
+                });
+                self.messages
+                    .push(Message::tool(call.id.clone(), result.as_json()));
+                if failed {
+                    return Some(self.fail_repair(
+                        ticket,
+                        failure.unwrap_or_else(|| {
+                            StructuredError::new(
+                                "REPAIR_TOOL_FAILED",
+                                "repair.tool",
+                                "The repair tool failed",
+                                "Escalate to a human before continuing the design",
+                            )
+                        }),
+                        false,
+                    ));
+                }
+                match state {
+                    RepairState::AwaitingAttempt(_) => match ticket.kind {
+                        RepairKind::Arguments => {
+                            self.repair_state = None;
+                            self.last_error = None;
+                            self.observability.repair_successes += 1;
+                        }
+                        RepairKind::Validation | RepairKind::Simulation => {
+                            self.repair_state = Some(RepairState::VerifyValidation(ticket));
+                        }
+                    },
+                    RepairState::VerifyValidation(_) => match ticket.kind {
+                        RepairKind::Validation => {
+                            self.repair_state = None;
+                            self.last_error = None;
+                            self.observability.repair_successes += 1;
+                        }
+                        RepairKind::Simulation => {
+                            self.repair_state = Some(RepairState::VerifySimulation(ticket));
+                        }
+                        RepairKind::Arguments => {
+                            let error = StructuredError::new(
+                                "REPAIR_STATE_INVALID",
+                                "repair.state",
+                                "Argument repair entered validation verification",
+                                "Escalate to a human and restart the repair",
+                            );
+                            return Some(self.fail_repair(ticket, error, true));
+                        }
+                    },
+                    RepairState::VerifySimulation(_) => {
+                        self.repair_state = None;
+                        self.last_error = None;
+                        self.observability.repair_successes += 1;
+                    }
+                    RepairState::Failed(_) => {
+                        let error = StructuredError::new(
+                            "REPAIR_STATE_INVALID",
+                            "repair.state",
+                            "A failed repair attempted another automatic action",
+                            "Escalate to a human before continuing the design",
+                        );
+                        return Some(self.fail_repair(ticket, error, true));
+                    }
+                }
+                None
             }
         }
     }
@@ -722,9 +1380,41 @@ struct DraftStateMemory {
     created_aliases: CreatedAliasMemory,
     unresolved_references: Vec<String>,
     failure_signatures: BTreeMap<String, usize>,
-    last_error: Option<StructuredError>,
+    last_error: Option<ErrorMemory>,
+    repair_state: Option<RepairMemory>,
     current_human_intent: Option<String>,
     recent_human_intent: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorMemory {
+    code: String,
+    location: String,
+    message: String,
+    hint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RepairStageMemory {
+    AwaitingAttempt,
+    VerifyValidation,
+    VerifySimulation,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepairMemory {
+    stage: RepairStageMemory,
+    kind: RepairKind,
+    original_tool: String,
+    error: ErrorMemory,
+    allowed_tools: Vec<String>,
+    verification_path: Vec<String>,
+    attempts_remaining: u8,
+    root_revision: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -762,6 +1452,7 @@ fn anchor_content(
     draft: &Draft,
     observability: &Observability,
     last_error: Option<&StructuredError>,
+    repair_state: Option<&RepairState>,
     messages: &[Message],
 ) -> String {
     let mut aliases = CreatedAliasMemory::default();
@@ -807,12 +1498,51 @@ fn anchor_content(
         created_aliases: aliases,
         unresolved_references: draft.summary().unresolved_references,
         failure_signatures: observability.failure_signatures.clone(),
-        last_error: last_error.cloned(),
+        last_error: last_error.map(error_memory),
+        repair_state: repair_state.map(repair_memory),
         current_human_intent: current_human_intent(messages),
         recent_human_intent: recent_human_intent(messages),
     };
     let state = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
     format!("DRAFT_STATE:{state}")
+}
+
+fn error_memory(error: &StructuredError) -> ErrorMemory {
+    ErrorMemory {
+        code: error.code.clone(),
+        location: error.location.clone(),
+        message: truncate_memory_text(&error.message, MAX_ERROR_MEMORY_CHARS),
+        hint: truncate_memory_text(&error.hint, MAX_ERROR_MEMORY_CHARS),
+    }
+}
+
+fn repair_memory(state: &RepairState) -> RepairMemory {
+    let (stage, ticket) = match state {
+        RepairState::AwaitingAttempt(ticket) => (RepairStageMemory::AwaitingAttempt, ticket),
+        RepairState::VerifyValidation(ticket) => (RepairStageMemory::VerifyValidation, ticket),
+        RepairState::VerifySimulation(ticket) => (RepairStageMemory::VerifySimulation, ticket),
+        RepairState::Failed(ticket) => (RepairStageMemory::Failed, ticket),
+    };
+    RepairMemory {
+        stage,
+        kind: ticket.kind,
+        original_tool: ticket.original_call.name.clone(),
+        error: error_memory(&ticket.original_error),
+        allowed_tools: ticket.allowed_repair_tools.clone(),
+        verification_path: ticket.verification_path.clone(),
+        attempts_remaining: ticket.attempts_remaining,
+        root_revision: ticket.root_revision,
+    }
+}
+
+fn truncate_memory_text(value: &str, limit: usize) -> String {
+    let mut characters = value.chars();
+    let prefix = characters.by_ref().take(limit).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn button_memory(button: &automation_state::ButtonSpec) -> String {
@@ -861,7 +1591,7 @@ fn action_memory(action: &ActionSpec, aliases: &mut CreatedAliasMemory) -> Strin
 fn recent_human_intent(messages: &[Message]) -> Vec<String> {
     let mut intents = messages
         .iter()
-        .filter(|message| message.role == MessageRole::User && message.content != NUDGE)
+        .filter(|message| is_genuine_human_message(message))
         .map(|message| compact_text(&message.content))
         .filter(|message| !message.is_empty())
         .collect::<Vec<_>>();
@@ -880,8 +1610,14 @@ fn current_human_intent(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|message| message.role == MessageRole::User && message.content != NUDGE)
+        .find(|message| is_genuine_human_message(message))
         .map(|message| compact_text(&message.content))
+}
+
+fn is_genuine_human_message(message: &Message) -> bool {
+    message.role == MessageRole::User
+        && message.content != NUDGE
+        && !message.content.starts_with(REPAIR_REQUIRED_PREFIX)
 }
 
 fn compact_text(value: &str) -> String {

@@ -81,19 +81,32 @@ impl SessionStore {
         let Some(snapshot_json) = snapshot_json else {
             return Ok(None);
         };
-        let snapshot =
-            serde_json::from_str::<SessionSnapshot>(&snapshot_json).map_err(|source| {
+        let value =
+            serde_json::from_str::<serde_json::Value>(&snapshot_json).map_err(|source| {
                 StoreError::CorruptSnapshot {
                     session_id: session_id.to_string(),
                     source,
                 }
             })?;
-        if snapshot.schema_version != SESSION_SNAPSHOT_VERSION {
+        let found = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| StoreError::CorruptSnapshotSchemaVersion {
+                session_id: session_id.to_string(),
+            })?;
+        if found != SESSION_SNAPSHOT_VERSION {
             return Err(StoreError::UnsupportedSnapshotVersion {
                 expected: SESSION_SNAPSHOT_VERSION,
-                found: snapshot.schema_version,
+                found,
             });
         }
+        let snapshot = serde_json::from_value::<SessionSnapshot>(value).map_err(|source| {
+            StoreError::CorruptSnapshot {
+                session_id: session_id.to_string(),
+                source,
+            }
+        })?;
         Ok(Some(snapshot))
     }
 
@@ -136,6 +149,8 @@ pub enum StoreError {
         session_id: String,
         source: serde_json::Error,
     },
+    #[error("session {session_id} contains a corrupt snapshot schema version")]
+    CorruptSnapshotSchemaVersion { session_id: String },
     #[error("unsupported session snapshot version {found}; expected {expected}")]
     UnsupportedSnapshotVersion { expected: u32, found: u32 },
 }
@@ -205,6 +220,39 @@ mod tests {
         assert!(matches!(
             store.save("future", &snapshot),
             Err(StoreError::UnsupportedSnapshotVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_snapshot_version_is_rejected_before_current_shape_decode() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let snapshot = DesignSession::new(()).snapshot();
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("repair_state");
+        let observability = legacy["observability"].as_object_mut().unwrap();
+        for field in [
+            "repair_attempts",
+            "repair_successes",
+            "repair_failures",
+            "repair_escalations",
+        ] {
+            observability.remove(field);
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at) VALUES (?1, ?2, 0)",
+                ["legacy", legacy.to_string().as_str()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load("legacy"),
+            Err(StoreError::UnsupportedSnapshotVersion {
+                expected: 2,
+                found: 1
+            })
         ));
     }
 
