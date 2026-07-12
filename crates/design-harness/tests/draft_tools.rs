@@ -10,6 +10,28 @@ fn call(draft: &mut Draft, name: &str, arguments: Value) -> ToolResult {
     block_on(dispatch_tool(draft, name, &arguments.to_string()))
 }
 
+fn schema_has_kind_variant(schema: &Value, variant: &str) -> bool {
+    match schema {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| schema_has_kind_variant(value, variant)),
+        Value::Object(values) => {
+            let matches = values
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get("kind"))
+                .and_then(|kind| kind.get("const"))
+                .and_then(Value::as_str)
+                == Some(variant);
+            matches
+                || values
+                    .values()
+                    .any(|value| schema_has_kind_variant(value, variant))
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn tool_registry_contains_the_locked_eleven_tools() {
     let definitions = tool_definitions();
@@ -40,6 +62,36 @@ fn tool_registry_contains_the_locked_eleven_tools() {
     assert!(names
         .iter()
         .all(|name| !name.contains("activate") && !name.contains("publish")));
+}
+
+#[test]
+fn model_facing_reference_schemas_are_tagged() {
+    let definitions = tool_definitions();
+    let expected = [
+        ("add_button", &["static", "instance_action"][..]),
+        (
+            "begin_rule",
+            &["button_click", "modal_submit", "instance_action"][..],
+        ),
+        (
+            "add_permission_action",
+            &["created", "existing", "everyone", "role"][..],
+        ),
+        (
+            "add_post_panel_action",
+            &["created", "existing", "static", "instance_action"][..],
+        ),
+    ];
+
+    for (name, variants) in expected {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap();
+        for variant in variants {
+            assert!(schema_has_kind_variant(&definition.parameters, variant));
+        }
+    }
 }
 
 #[test]
@@ -81,7 +133,7 @@ fn structure_dtos_normalize_to_state_types() {
         json!({
             "panel_key":"study_panel",
             "label":"Create room",
-            "route":{"static":"create_study_room"}
+            "route":{"kind":"static","key":"create_study_room"}
         }),
     )
     .is_ok());
@@ -101,7 +153,10 @@ fn structure_dtos_normalize_to_state_types() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"open_modal","trigger":{"button_click":"create_study_room"}}),
+        json!({
+            "key":"open_modal",
+            "trigger":{"kind":"button_click","component":"create_study_room"}
+        }),
     )
     .is_ok());
 
@@ -140,7 +195,10 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"submit_room","trigger":{"modal_submit":"study_modal"}}),
+        json!({
+            "key":"submit_room",
+            "trigger":{"kind":"modal_submit","modal":"study_modal"}
+        }),
     )
     .is_ok());
     assert!(call(
@@ -177,8 +235,8 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
         json!({
             "rule_key":"submit_room",
             "kind":"upsert_overwrite",
-            "channel":{"created":"room_channel"},
-            "target":"everyone",
+            "channel":{"kind":"created","alias":"room_channel"},
+            "target":{"kind":"everyone"},
             "allow":[],
             "deny":["view_channel"]
         }),
@@ -190,7 +248,7 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
         json!({
             "rule_key":"submit_room",
             "kind":"grant_role",
-            "role":{"created":"member_role"},
+            "role":{"kind":"created","alias":"member_role"},
             "target":"actor"
         }),
     )
@@ -201,11 +259,11 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
         json!({
             "rule_key":"submit_room",
             "key":"hub_panel",
-            "channel":{"existing":"study_hub"},
+            "channel":{"kind":"existing","binding":"study_hub"},
             "content":"Room ${input.room_name} is open",
             "buttons":[
-                {"label":"Help","route":{"static":"study_help"}},
-                {"label":"Join","route":{"instance_action":"join"}}
+                {"label":"Help","route":{"kind":"static","key":"study_help"}},
+                {"label":"Join","route":{"kind":"instance_action","action":"join"}}
             ]
         }),
     )
@@ -279,7 +337,10 @@ fn open_modal_and_instance_trigger_dtos_normalize() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"open","trigger":{"button_click":"open_button"}}),
+        json!({
+            "key":"open",
+            "trigger":{"kind":"button_click","component":"open_button"}
+        }),
     )
     .is_ok());
     assert!(call(
@@ -291,7 +352,10 @@ fn open_modal_and_instance_trigger_dtos_normalize() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"join","trigger":{"instance_action":"join"}}),
+        json!({
+            "key":"join",
+            "trigger":{"kind":"instance_action","action":"join"}
+        }),
     )
     .is_ok());
 
@@ -311,7 +375,10 @@ fn incomplete_register_manifest_is_structured_and_non_mutating() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"submit","trigger":{"button_click":"submit"}}),
+        json!({
+            "key":"submit",
+            "trigger":{"kind":"button_click","component":"submit"}
+        }),
     )
     .is_ok());
     assert!(call(
@@ -376,7 +443,10 @@ fn register_rejects_an_empty_ownable_footprint() {
     assert!(call(
         &mut draft,
         "begin_rule",
-        json!({"key":"empty","trigger":{"button_click":"empty"}}),
+        json!({
+            "key":"empty",
+            "trigger":{"kind":"button_click","component":"empty"}
+        }),
     )
     .is_ok());
     let revision = draft.draft_revision;

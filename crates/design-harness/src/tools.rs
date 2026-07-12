@@ -39,10 +39,10 @@ struct AddButtonInput {
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum ButtonRouteInput {
-    Static { r#static: String },
-    InstanceAction { instance_action: String },
+    Static { key: String },
+    InstanceAction { action: String },
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -77,11 +77,11 @@ struct BeginRuleInput {
 }
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum TriggerInput {
-    ButtonClick { button_click: String },
-    ModalSubmit { modal_submit: String },
-    InstanceAction { instance_action: String },
+    ButtonClick { component: String },
+    ModalSubmit { modal: String },
+    InstanceAction { action: String },
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -100,16 +100,16 @@ enum ResourceActionInput {
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum ReferenceInput {
-    Created { created: String },
-    Existing { existing: String },
+    Created { alias: String },
+    Existing { binding: String },
 }
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum OverwriteTargetInput {
-    Everyone(String),
+    Everyone,
     Role { role: ReferenceInput },
 }
 
@@ -601,44 +601,38 @@ fn modal_field(input: ModalFieldInput) -> ModalFieldSpec {
 
 fn trigger(input: TriggerInput) -> TriggerSpec {
     match input {
-        TriggerInput::ButtonClick { button_click } => TriggerSpec::ButtonClick {
-            component: button_click,
-        },
-        TriggerInput::ModalSubmit { modal_submit } => TriggerSpec::ModalSubmit {
-            modal: modal_submit,
-        },
-        TriggerInput::InstanceAction { instance_action } => TriggerSpec::InstanceAction {
-            action: instance_action,
-        },
+        TriggerInput::ButtonClick { component } => TriggerSpec::ButtonClick { component },
+        TriggerInput::ModalSubmit { modal } => TriggerSpec::ModalSubmit { modal },
+        TriggerInput::InstanceAction { action } => TriggerSpec::InstanceAction { action },
     }
 }
 
 fn declared_button_route(input: ButtonRouteInput) -> ButtonRoute {
     match input {
-        ButtonRouteInput::Static { r#static } => ButtonRoute::Static { key: r#static },
-        ButtonRouteInput::InstanceAction { instance_action } => ButtonRoute::InstanceAction {
+        ButtonRouteInput::Static { key } => ButtonRoute::Static { key },
+        ButtonRouteInput::InstanceAction { action } => ButtonRoute::InstanceAction {
             instance: InstanceRef::Event,
-            action: instance_action,
+            action,
         },
     }
 }
 
 fn pending_button_route(input: ButtonRouteInput) -> ButtonRoute {
     match input {
-        ButtonRouteInput::Static { r#static } => ButtonRoute::Static { key: r#static },
-        ButtonRouteInput::InstanceAction { instance_action } => ButtonRoute::InstanceAction {
+        ButtonRouteInput::Static { key } => ButtonRoute::Static { key },
+        ButtonRouteInput::InstanceAction { action } => ButtonRoute::InstanceAction {
             instance: InstanceRef::Created(CreatedRef {
                 created: PENDING_INSTANCE_REFERENCE.to_string(),
             }),
-            action: instance_action,
+            action,
         },
     }
 }
 
 fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
     match input {
-        ReferenceInput::Created { created } => Ok(RoleRef::Created(CreatedRef { created })),
-        ReferenceInput::Existing { existing } => serde_json::from_value(Value::String(existing))
+        ReferenceInput::Created { alias } => Ok(RoleRef::Created(CreatedRef { created: alias })),
+        ReferenceInput::Existing { binding } => serde_json::from_value(Value::String(binding))
             .map(RoleRef::Existing)
             .map_err(reference_conversion_error),
     }
@@ -646,8 +640,8 @@ fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
 
 fn channel_reference(input: ReferenceInput) -> Result<ChannelRef, StructuredError> {
     match input {
-        ReferenceInput::Created { created } => Ok(ChannelRef::Created(CreatedRef { created })),
-        ReferenceInput::Existing { existing } => serde_json::from_value(Value::String(existing))
+        ReferenceInput::Created { alias } => Ok(ChannelRef::Created(CreatedRef { created: alias })),
+        ReferenceInput::Existing { binding } => serde_json::from_value(Value::String(binding))
             .map(ChannelRef::Existing)
             .map_err(reference_conversion_error),
     }
@@ -670,15 +664,7 @@ fn overwrite_action(
 ) -> Result<ActionSpec, StructuredError> {
     let channel = reference_json(channel);
     let target = match target {
-        OverwriteTargetInput::Everyone(value) if value == "everyone" => json!("everyone"),
-        OverwriteTargetInput::Everyone(_) => {
-            return Err(StructuredError::new(
-                "INVALID_OVERWRITE_TARGET",
-                "tool.target",
-                "The string overwrite target must be everyone",
-                "Use everyone or {\"role\":{\"created\":\"alias\"}}",
-            ));
-        }
+        OverwriteTargetInput::Everyone => json!("everyone"),
         OverwriteTargetInput::Role { role } => json!({"role": reference_json(role)}),
     };
     let value = json!({
@@ -700,8 +686,8 @@ fn overwrite_action(
 
 fn reference_json(input: ReferenceInput) -> Value {
     match input {
-        ReferenceInput::Created { created } => json!({"created": created}),
-        ReferenceInput::Existing { existing } => json!(existing),
+        ReferenceInput::Created { alias } => json!({"created": alias}),
+        ReferenceInput::Existing { binding } => json!(binding),
     }
 }
 

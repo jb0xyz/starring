@@ -72,7 +72,11 @@ fn tool_calls_execute_serially_before_the_next_model_call() {
                 call(
                     "2",
                     "add_button",
-                    json!({"panel_key":"p","label":"Open","route":{"static":"open"}}),
+                    json!({
+                        "panel_key":"p",
+                        "label":"Open",
+                        "route":{"kind":"static","key":"open"}
+                    }),
                 ),
             ]),
             LlmResponse::Text("QUESTION: Which modal fields do you need?".to_string()),
@@ -105,7 +109,11 @@ fn failed_tool_stops_the_remaining_batch() {
                 call(
                     "1",
                     "add_button",
-                    json!({"panel_key":"missing","label":"Open","route":{"static":"open"}}),
+                    json!({
+                        "panel_key":"missing",
+                        "label":"Open",
+                        "route":{"kind":"static","key":"open"}
+                    }),
                 ),
                 call(
                     "2",

@@ -91,7 +91,7 @@ fn validation_errors_are_structured_without_rust_debug() {
             &json!({
                 "panel_key":"panel",
                 "label":"Open",
-                "route":{"static":"missing_button"}
+                "route":{"kind":"static","key":"missing_button"}
             })
             .to_string(),
         )
@@ -195,8 +195,8 @@ fn failed_simulation_is_repaired_incrementally_on_the_same_draft() {
             &json!({
                 "rule_key":"submit_room",
                 "kind":"upsert_overwrite",
-                "channel":{"created":"room_channel"},
-                "target":"everyone",
+                "channel":{"kind":"created","alias":"room_channel"},
+                "target":{"kind":"everyone"},
                 "allow":[],
                 "deny":["view_channel"]
             })

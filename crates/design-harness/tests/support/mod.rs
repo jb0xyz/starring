@@ -16,7 +16,7 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "panel_key":"study_panel",
                 "label":"Create room",
-                "route":{"static":"create_study_room"}
+                "route":{"kind":"static","key":"create_study_room"}
             }),
         ),
         (
@@ -31,7 +31,10 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
         ),
         (
             "begin_rule",
-            json!({"key":"open_modal","trigger":{"button_click":"create_study_room"}}),
+            json!({
+                "key":"open_modal",
+                "trigger":{"kind":"button_click","component":"create_study_room"}
+            }),
         ),
         (
             "add_interaction_action",
@@ -39,7 +42,10 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
         ),
         (
             "begin_rule",
-            json!({"key":"submit_room","trigger":{"modal_submit":"study_modal"}}),
+            json!({
+                "key":"submit_room",
+                "trigger":{"kind":"modal_submit","modal":"study_modal"}
+            }),
         ),
         (
             "add_interaction_action",
@@ -68,8 +74,8 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "kind":"upsert_overwrite",
-                "channel":{"created":"room_channel"},
-                "target":"everyone",
+                "channel":{"kind":"created","alias":"room_channel"},
+                "target":{"kind":"everyone"},
                 "allow":[],
                 "deny":["view_channel"]
             }),
@@ -79,8 +85,11 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "kind":"upsert_overwrite",
-                "channel":{"created":"room_channel"},
-                "target":{"role":{"created":"member_role"}},
+                "channel":{"kind":"created","alias":"room_channel"},
+                "target":{
+                    "kind":"role",
+                    "role":{"kind":"created","alias":"member_role"}
+                },
                 "allow":["view_channel"],
                 "deny":[]
             }),
@@ -90,7 +99,7 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "kind":"grant_role",
-                "role":{"created":"member_role"},
+                "role":{"kind":"created","alias":"member_role"},
                 "target":"actor"
             }),
         ),
@@ -99,11 +108,11 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "key":"welcome_panel",
-                "channel":{"created":"room_channel"},
+                "channel":{"kind":"created","alias":"room_channel"},
                 "content":"Welcome to ${input.room_name}",
                 "buttons":[
-                    {"label":"Help","route":{"static":"study_help"}},
-                    {"label":"Close","route":{"instance_action":"close"}}
+                    {"label":"Help","route":{"kind":"static","key":"study_help"}},
+                    {"label":"Close","route":{"kind":"instance_action","action":"close"}}
                 ]
             }),
         ),
@@ -112,10 +121,10 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "rule_key":"submit_room",
                 "key":"hub_panel",
-                "channel":{"existing":"study_hub"},
+                "channel":{"kind":"existing","binding":"study_hub"},
                 "content":"${input.room_name} is open",
                 "buttons":[
-                    {"label":"Join","route":{"instance_action":"join"}}
+                    {"label":"Join","route":{"kind":"instance_action","action":"join"}}
                 ]
             }),
         ),

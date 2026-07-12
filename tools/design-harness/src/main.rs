@@ -16,7 +16,7 @@ use crate::config::EdgeConfig;
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = EdgeConfig::from_env()?;
     let client = GemmaClient::new(config.base_url, config.api_key)?;
-    let mut session = DesignSession::new(client);
+    let mut session = DesignSession::with_config(client, config.session_config);
     let mut lines = BufReader::new(io::stdin()).lines();
     let mut output = io::stdout();
 
