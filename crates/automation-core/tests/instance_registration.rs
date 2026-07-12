@@ -11,9 +11,8 @@ use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
 use automation_core::AutomationServices;
 use automation_instance::{
-    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdGenerationError,
-    InstanceIdGenerator, InstanceKind, InstanceResources, InstanceRuleSetVersion, InstanceStatus,
-    InstanceStore, SequenceInstanceIdGenerator,
+    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
+    InstanceRuleSetVersion, InstanceStatus, InstanceStore, SequenceInstanceIdGenerator,
 };
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef,
@@ -202,16 +201,8 @@ fn register_instance_resolves_and_stores_manifest() {
     );
 }
 
-struct PanicGenerator;
-
-impl InstanceIdGenerator for PanicGenerator {
-    fn generate(&self) -> Result<InstanceId, InstanceIdGenerationError> {
-        panic!("generator must not run")
-    }
-}
-
 #[test]
-fn unresolved_manifest_stops_before_id_generation() {
+fn unresolved_manifest_fails_after_id_preallocation() {
     let plan = ActionPlan {
         steps: vec![PlannedAction::RegisterInstance {
             key: "instance".to_string(),
@@ -229,7 +220,7 @@ fn unresolved_manifest_stops_before_id_generation() {
             mutation: &MockMutationAdapter::new(),
             responder: &MockInteractionResponder::new(),
             instances: &InMemoryInstanceStore::new(),
-            instance_ids: &PanicGenerator,
+            instance_ids: &SequenceInstanceIdGenerator::new("room", 1),
         },
     ));
 

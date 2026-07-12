@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceIdGenerator, InstanceResources, InstanceStatus,
@@ -27,6 +27,7 @@ struct RuntimeBindings {
     created_roles: BTreeMap<String, RoleId>,
     created_channels: BTreeMap<String, ChannelId>,
     created_messages: BTreeMap<String, MessageId>,
+    planned_instances: BTreeMap<String, InstanceId>,
     created_instances: BTreeMap<String, InstanceId>,
 }
 
@@ -42,7 +43,10 @@ where
     G: InstanceIdGenerator,
 {
     let mut created = Vec::new();
-    let mut runtime = RuntimeBindings::default();
+    let mut runtime = RuntimeBindings {
+        planned_instances: prepare_instance_identities(plan, services.instance_ids)?,
+        ..RuntimeBindings::default()
+    };
     for (action_index, step) in plan.steps.iter().enumerate() {
         match step {
             PlannedAction::GrantRole { role, target } => {
@@ -162,13 +166,12 @@ where
                 kind,
                 resources,
             } => {
+                let id = runtime
+                    .planned_instances
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| unresolved_planned_instance(key))?;
                 let resolved = resolve_manifest(resources, &runtime)?;
-                let id = services.instance_ids.generate().map_err(|error| {
-                    AdapterError::new(
-                        AdapterErrorKind::BadRequest,
-                        format!("instance id error: {error:?}"),
-                    )
-                })?;
                 let instance = AutomationInstance {
                     id: id.clone(),
                     guild_id: context.guild_id,
@@ -199,6 +202,25 @@ where
         }
     }
     Ok(created)
+}
+
+fn prepare_instance_identities<G>(
+    plan: &ActionPlan,
+    instance_ids: &G,
+) -> Result<BTreeMap<String, InstanceId>, AdapterError>
+where
+    G: InstanceIdGenerator,
+{
+    let mut planned = BTreeMap::new();
+    for step in &plan.steps {
+        if let PlannedAction::RegisterInstance { key, .. } = step {
+            if let Entry::Vacant(entry) = planned.entry(key.clone()) {
+                let id = instance_ids.generate().map_err(instance_id_error)?;
+                entry.insert(id);
+            }
+        }
+    }
+    Ok(planned)
 }
 
 fn resolve_planned_role(
@@ -275,10 +297,10 @@ fn resolve_button_instance(
 ) -> Result<InstanceId, AdapterError> {
     match instance {
         InstanceRef::Created(created) => runtime
-            .created_instances
+            .planned_instances
             .get(&created.created)
             .cloned()
-            .ok_or_else(|| unresolved_created_instance(&created.created)),
+            .ok_or_else(|| unresolved_planned_instance(&created.created)),
         InstanceRef::Event => context
             .instance
             .as_ref()
@@ -326,6 +348,20 @@ fn unresolved_manifest(key: &str) -> AdapterError {
     )
 }
 
+fn instance_id_error(error: automation_instance::InstanceIdGenerationError) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("instance id error: {error:?}"),
+    )
+}
+
+fn unresolved_planned_instance(key: &str) -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::BadRequest,
+        format!("unresolved planned instance: {key}"),
+    )
+}
+
 fn render(
     source: &str,
     context: &RuntimeContext,
@@ -354,13 +390,6 @@ fn unresolved_created_channel(key: &str) -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::BadRequest,
         format!("unresolved created channel: {key}"),
-    )
-}
-
-fn unresolved_created_instance(key: &str) -> AdapterError {
-    AdapterError::new(
-        AdapterErrorKind::BadRequest,
-        format!("unresolved created instance: {key}"),
     )
 }
 

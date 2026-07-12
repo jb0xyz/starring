@@ -382,6 +382,18 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                             },
                         }],
                     },
+                    ActionSpec::PostPanel {
+                        key: "study_hub_entry".to_string(),
+                        channel: ChannelRef::Existing(ResourceKey("study_hub".to_string())),
+                        content: "'${input.room_name}' 스터디룸이 열렸습니다.".to_string(),
+                        buttons: vec![ButtonSpec {
+                            label: "참가하기".to_string(),
+                            route: ButtonRoute::InstanceAction {
+                                instance: InstanceRef::Created(created("study_room_instance")),
+                                action: "join".to_string(),
+                            },
+                        }],
+                    },
                     ActionSpec::RegisterInstance {
                         key: "study_room_instance".to_string(),
                         kind: InstanceKind("study_room".to_string()),
@@ -394,23 +406,14 @@ fn studyroom_ruleset() -> InteractionRuleSet {
                                 "room_channel".to_string(),
                                 created("study_channel"),
                             )]),
-                            messages: BTreeMap::from([(
-                                "welcome_panel".to_string(),
-                                created("study_welcome_panel"),
-                            )]),
+                            messages: BTreeMap::from([
+                                (
+                                    "welcome_panel".to_string(),
+                                    created("study_welcome_panel"),
+                                ),
+                                ("hub_panel".to_string(), created("study_hub_entry")),
+                            ]),
                         },
-                    },
-                    ActionSpec::PostPanel {
-                        key: "study_hub_entry".to_string(),
-                        channel: ChannelRef::Existing(ResourceKey("study_hub".to_string())),
-                        content: "'${input.room_name}' 스터디룸이 열렸습니다.".to_string(),
-                        buttons: vec![ButtonSpec {
-                            label: "참가하기".to_string(),
-                            route: ButtonRoute::InstanceAction {
-                                instance: InstanceRef::Created(created("study_room_instance")),
-                                action: "join".to_string(),
-                            },
-                        }],
                     },
                     ActionSpec::EditResponse {
                         content: "스터디룸 '${input.room_name}' 생성 완료! 새 채널을 확인하세요."
@@ -463,6 +466,40 @@ mod tests {
     #[test]
     fn studyroom_ruleset_validates() {
         validate(&studyroom_ruleset(), &bindings(1)).expect("studyroom ruleset should validate");
+    }
+
+    #[test]
+    fn studyroom_registers_after_hub_panel_with_complete_manifest() {
+        let ruleset = studyroom_ruleset();
+        let rule = ruleset
+            .rules
+            .iter()
+            .find(|rule| rule.key == "submit_study_modal")
+            .unwrap();
+        let hub_index = rule
+            .actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    ActionSpec::PostPanel { key, .. } if key == "study_hub_entry"
+                )
+            })
+            .unwrap();
+        let register_index = rule
+            .actions
+            .iter()
+            .position(|action| matches!(action, ActionSpec::RegisterInstance { .. }))
+            .unwrap();
+        let ActionSpec::RegisterInstance { resources, .. } = &rule.actions[register_index] else {
+            unreachable!()
+        };
+
+        assert!(hub_index < register_index);
+        assert_eq!(
+            resources.messages.get("hub_panel"),
+            Some(&created("study_hub_entry"))
+        );
     }
 
     #[test]

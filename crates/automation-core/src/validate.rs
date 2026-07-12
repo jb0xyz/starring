@@ -84,6 +84,20 @@ pub enum ValidationError {
         rule: String,
         key: String,
     },
+    InstanceResourceMissingFromManifest {
+        key: String,
+        kind: CreatedKind,
+    },
+    InstanceResourceDeclaredMultipleTimes {
+        key: String,
+    },
+    InstanceResourceProducedAfterRegister {
+        key: String,
+        kind: CreatedKind,
+    },
+    MultipleRegisterInstance {
+        rule: String,
+    },
     EmptyInstanceResources {
         rule: String,
     },
@@ -337,6 +351,7 @@ pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<Valid
                 }
             }
         }
+        check_instance_footprint(&mut errors, rule);
         let defer_positions: Vec<usize> = rule
             .actions
             .iter()
@@ -484,12 +499,79 @@ fn check_channel_binding(
 
 const MAX_PANEL_BUTTONS: usize = 5;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CreatedKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatedKind {
     Role,
     Channel,
     Message,
     Instance,
+}
+
+fn check_instance_footprint(errors: &mut Vec<ValidationError>, rule: &InteractionRule) {
+    let register_count = rule
+        .actions
+        .iter()
+        .filter(|action| matches!(action, ActionSpec::RegisterInstance { .. }))
+        .count();
+    if register_count == 0 {
+        return;
+    }
+    if register_count > 1 {
+        errors.push(ValidationError::MultipleRegisterInstance {
+            rule: rule.key.clone(),
+        });
+    }
+
+    let Some(first_register) = rule
+        .actions
+        .iter()
+        .position(|action| matches!(action, ActionSpec::RegisterInstance { .. }))
+    else {
+        return;
+    };
+    let mut ownable = BTreeMap::new();
+    let mut manifest_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for (index, action) in rule.actions.iter().enumerate() {
+        let produced = match action {
+            ActionSpec::CreateRole { key, .. } => Some((key, CreatedKind::Role)),
+            ActionSpec::CreateChannel { key, .. } => Some((key, CreatedKind::Channel)),
+            ActionSpec::PostPanel { key, .. } => Some((key, CreatedKind::Message)),
+            _ => None,
+        };
+        if let Some((key, kind)) = produced {
+            ownable.insert(key.clone(), kind);
+            if index > first_register {
+                errors.push(ValidationError::InstanceResourceProducedAfterRegister {
+                    key: key.clone(),
+                    kind,
+                });
+            }
+        }
+        if let ActionSpec::RegisterInstance { resources, .. } = action {
+            for reference in resources
+                .roles
+                .values()
+                .chain(resources.channels.values())
+                .chain(resources.messages.values())
+            {
+                *manifest_counts
+                    .entry(reference.created.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    for (key, kind) in ownable {
+        if !manifest_counts.contains_key(&key) {
+            errors.push(ValidationError::InstanceResourceMissingFromManifest { key, kind });
+        }
+    }
+    for (key, count) in manifest_counts {
+        if count > 1 {
+            errors.push(ValidationError::InstanceResourceDeclaredMultipleTimes { key });
+        }
+    }
 }
 
 fn check_template(
