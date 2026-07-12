@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use automation_core::{AdapterError, AdapterErrorKind, ValidationError};
 use automation_state::{ActionSpec, ChannelRef, InstanceRef, InteractionRuleSet, RoleRef};
 use serde::Serialize;
+use serde_json::{error::Category, Value};
 
 use crate::draft::{Draft, DraftSummary};
 
@@ -25,6 +28,237 @@ impl StructuredError {
             message: message.into(),
             hint: hint.into(),
         }
+    }
+}
+
+pub(crate) fn translate_tool_arguments_error(
+    tool_name: &str,
+    error: &serde_json::Error,
+    parameters: &Value,
+) -> StructuredError {
+    let detail = error.to_string();
+    let base_location = format!("tool.{tool_name}.arguments");
+    let valid_kinds = kind_values(parameters);
+    let (code, location, message) = if let Some(field) = quoted_value(&detail, "missing field `") {
+        (
+            "MISSING_REQUIRED_FIELD",
+            format!("{base_location}.{field}"),
+            format!("missing required field {field}"),
+        )
+    } else if let Some(value) = quoted_value(&detail, "unknown variant `") {
+        if is_kind_error(&detail, &valid_kinds) {
+            (
+                "INVALID_KIND",
+                base_location,
+                format!("kind {value} is not valid"),
+            )
+        } else {
+            (
+                "INVALID_TOOL_ARGUMENTS",
+                base_location,
+                format!("value {value} is not allowed"),
+            )
+        }
+    } else if let Some(field) = quoted_value(&detail, "unknown field `") {
+        (
+            "UNKNOWN_FIELD",
+            format!("{base_location}.{field}"),
+            format!("field {field} is not recognized"),
+        )
+    } else if detail.contains("invalid type:") {
+        (
+            "INVALID_FIELD_TYPE",
+            base_location,
+            "a field value has a type that does not match the schema".to_string(),
+        )
+    } else if matches!(
+        error.classify(),
+        Category::Io | Category::Syntax | Category::Eof
+    ) {
+        (
+            "INVALID_TOOL_ARGUMENTS",
+            base_location,
+            "tool arguments are not valid JSON".to_string(),
+        )
+    } else {
+        (
+            "INVALID_TOOL_ARGUMENTS",
+            base_location,
+            "tool arguments do not match the expected schema".to_string(),
+        )
+    };
+    let mut hint = format!(
+        "{tool_name} expects {}",
+        format_schema(parameters, parameters, 0)
+    );
+    if code == "INVALID_KIND" && !valid_kinds.is_empty() {
+        hint.push_str("; kind must be one of: ");
+        hint.push_str(&valid_kinds.into_iter().collect::<Vec<_>>().join(", "));
+    }
+    StructuredError::new(code, location, message, hint)
+}
+
+fn quoted_value(message: &str, prefix: &str) -> Option<String> {
+    let start = message.find(prefix)? + prefix.len();
+    let remaining = &message[start..];
+    let end = remaining.find('`')?;
+    Some(remaining[..end].to_string())
+}
+
+fn is_kind_error(message: &str, valid_kinds: &BTreeSet<String>) -> bool {
+    valid_kinds
+        .iter()
+        .any(|kind| message.contains(&format!("`{kind}`")))
+}
+
+fn format_schema(schema: &Value, root: &Value, depth: usize) -> String {
+    if depth > 12 {
+        return "value".to_string();
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return resolve_reference(root, reference)
+            .map(|resolved| format_schema(resolved, root, depth + 1))
+            .unwrap_or_else(|| "value".to_string());
+    }
+    if let Some(value) = schema.get("const") {
+        return scalar_name(value);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values.iter().map(scalar_name).collect::<Vec<_>>().join("|");
+    }
+    if let Some(variants) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return variants
+            .iter()
+            .map(|variant| format_schema(variant, root, depth + 1))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => format_object(schema, root, depth + 1),
+        Some("array") => format_array(schema, root, depth + 1),
+        Some("string") => "string".to_string(),
+        Some("boolean") => "boolean".to_string(),
+        Some("integer") => "integer".to_string(),
+        Some("number") => "number".to_string(),
+        Some("null") => "null".to_string(),
+        _ if schema.get("properties").is_some() => format_object(schema, root, depth + 1),
+        _ => "value".to_string(),
+    }
+}
+
+fn format_object(schema: &Value, root: &Value, depth: usize) -> String {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return "{}".to_string();
+    };
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let fields = properties
+        .iter()
+        .map(|(name, property)| {
+            format_property(
+                name,
+                property,
+                required.contains(name.as_str()),
+                root,
+                depth + 1,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{ {fields} }}")
+}
+
+fn format_property(
+    name: &str,
+    schema: &Value,
+    required: bool,
+    root: &Value,
+    depth: usize,
+) -> String {
+    let marker = if required { "(required)" } else { "" };
+    if schema_type(schema, root) == Some("array") {
+        let resolved = resolve_schema(schema, root);
+        let item = resolved
+            .get("items")
+            .map(|items| format_schema(items, root, depth + 1))
+            .unwrap_or_else(|| "value".to_string());
+        format!("{name}: array{marker} of {item}")
+    } else {
+        format!("{name}: {}{marker}", format_schema(schema, root, depth + 1))
+    }
+}
+
+fn format_array(schema: &Value, root: &Value, depth: usize) -> String {
+    let item = schema
+        .get("items")
+        .map(|items| format_schema(items, root, depth + 1))
+        .unwrap_or_else(|| "value".to_string());
+    format!("array of {item}")
+}
+
+fn schema_type<'a>(schema: &'a Value, root: &'a Value) -> Option<&'a str> {
+    resolve_schema(schema, root)
+        .get("type")
+        .and_then(Value::as_str)
+}
+
+fn resolve_schema<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
+    schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| resolve_reference(root, reference))
+        .unwrap_or(schema)
+}
+
+fn resolve_reference<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let name = reference.strip_prefix("#/$defs/")?;
+    root.get("$defs")?.get(name)
+}
+
+fn scalar_name(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn kind_values(schema: &Value) -> BTreeSet<String> {
+    let mut values = BTreeSet::new();
+    collect_kind_values(schema, &mut values);
+    values
+}
+
+fn collect_kind_values(schema: &Value, values: &mut BTreeSet<String>) {
+    match schema {
+        Value::Array(items) => {
+            for item in items {
+                collect_kind_values(item, values);
+            }
+        }
+        Value::Object(fields) => {
+            if let Some(kind) = fields
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get("kind"))
+                .and_then(|kind| kind.get("const"))
+                .and_then(Value::as_str)
+            {
+                values.insert(kind.to_string());
+            }
+            for value in fields.values() {
+                collect_kind_values(value, values);
+            }
+        }
+        _ => {}
     }
 }
 

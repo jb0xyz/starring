@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::draft::Draft;
-use crate::errors::{StructuredError, ToolResult};
+use crate::errors::{translate_tool_arguments_error, StructuredError, ToolResult};
 use crate::gates::{simulate_draft, validate_draft};
 
 const PENDING_INSTANCE_REFERENCE: &str = "__pending_instance__";
@@ -224,49 +224,37 @@ fn definition<T: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
 
 pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> ToolResult {
     if name == "validate_draft" {
-        if let Err(error) = parse::<EmptyInput>(arguments) {
-            return ToolResult::failure_from(
-                draft,
-                StructuredError {
-                    location: name.to_string(),
-                    ..error
-                },
-            );
+        if let Err(error) = parse::<EmptyInput>(name, arguments) {
+            return ToolResult::failure_from(draft, error);
         }
         return validate_draft(draft);
     }
     if name == "simulate_draft" {
-        if let Err(error) = parse::<EmptyInput>(arguments) {
-            return ToolResult::failure_from(
-                draft,
-                StructuredError {
-                    location: name.to_string(),
-                    ..error
-                },
-            );
+        if let Err(error) = parse::<EmptyInput>(name, arguments) {
+            return ToolResult::failure_from(draft, error);
         }
         return simulate_draft(draft).await;
     }
 
     let result = match name {
-        "add_panel" => parse(arguments).and_then(|input| add_panel(draft, input)),
-        "add_button" => parse(arguments).and_then(|input| add_button(draft, input)),
-        "add_modal" => parse(arguments).and_then(|input| add_modal(draft, input)),
-        "begin_rule" => parse(arguments).and_then(|input| begin_rule(draft, input)),
+        "add_panel" => parse(name, arguments).and_then(|input| add_panel(draft, input)),
+        "add_button" => parse(name, arguments).and_then(|input| add_button(draft, input)),
+        "add_modal" => parse(name, arguments).and_then(|input| add_modal(draft, input)),
+        "begin_rule" => parse(name, arguments).and_then(|input| begin_rule(draft, input)),
         "add_resource_action" => {
-            parse(arguments).and_then(|input| add_resource_action(draft, input))
+            parse(name, arguments).and_then(|input| add_resource_action(draft, input))
         }
         "add_permission_action" => {
-            parse(arguments).and_then(|input| add_permission_action(draft, input))
+            parse(name, arguments).and_then(|input| add_permission_action(draft, input))
         }
         "add_interaction_action" => {
-            parse(arguments).and_then(|input| add_interaction_action(draft, input))
+            parse(name, arguments).and_then(|input| add_interaction_action(draft, input))
         }
         "add_post_panel_action" => {
-            parse(arguments).and_then(|input| add_post_panel_action(draft, input))
+            parse(name, arguments).and_then(|input| add_post_panel_action(draft, input))
         }
         "set_register_instance" => {
-            parse(arguments).and_then(|input| set_register_instance(draft, input))
+            parse(name, arguments).and_then(|input| set_register_instance(draft, input))
         }
         _ => {
             return ToolResult::failure_from(
@@ -286,28 +274,18 @@ pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> To
             draft.mark_mutated();
             ToolResult::success(draft, change)
         }
-        Err(error) => {
-            let error = if error.code == "INVALID_TOOL_ARGUMENTS" {
-                StructuredError {
-                    location: name.to_string(),
-                    ..error
-                }
-            } else {
-                error
-            };
-            ToolResult::failure_from(draft, error)
-        }
+        Err(error) => ToolResult::failure_from(draft, error),
     }
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T, StructuredError> {
+fn parse<T: for<'de> Deserialize<'de>>(name: &str, arguments: &str) -> Result<T, StructuredError> {
     serde_json::from_str(arguments).map_err(|error| {
-        StructuredError::new(
-            "INVALID_TOOL_ARGUMENTS",
-            "tool",
-            "The tool arguments do not match the required shape",
-            error.to_string(),
-        )
+        let parameters = tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.parameters)
+            .unwrap_or_else(|| json!({}));
+        translate_tool_arguments_error(name, &error, &parameters)
     })
 }
 

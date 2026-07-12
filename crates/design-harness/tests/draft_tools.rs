@@ -422,6 +422,95 @@ fn malformed_and_unknown_tool_calls_return_structured_errors() {
 }
 
 #[test]
+fn missing_required_field_returns_expected_shape() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "add_modal",
+        json!({"title":"Study room","fields":[]}),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "MISSING_REQUIRED_FIELD");
+    assert_eq!(failure.location, "tool.add_modal.arguments.key");
+    assert_eq!(failure.message, "missing required field key");
+    assert!(failure.hint.contains("add_modal expects"));
+    assert!(failure.hint.contains("key: string(required)"));
+    assert!(failure.hint.contains("fields: array(required) of"));
+    assert!(failure.hint.contains("style: short|paragraph(required)"));
+    assert!(!failure.hint.contains("line 1 column"));
+}
+
+#[test]
+fn invalid_kind_returns_schema_kind_choices() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "begin_rule",
+        json!({
+            "key":"join",
+            "trigger":{"kind":"join_button","action":"join"}
+        }),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "INVALID_KIND");
+    assert_eq!(failure.location, "tool.begin_rule.arguments");
+    assert_eq!(failure.message, "kind join_button is not valid");
+    assert!(failure.hint.contains("button_click"));
+    assert!(failure.hint.contains("modal_submit"));
+    assert!(failure.hint.contains("instance_action"));
+    assert!(failure.hint.contains("kind must be one of"));
+    assert!(!failure.hint.contains("unknown variant"));
+}
+
+#[test]
+fn invalid_plain_enum_value_is_not_reported_as_kind() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "add_modal",
+        json!({
+            "key":"study_modal",
+            "title":"Study room",
+            "fields":[{
+                "key":"room_name",
+                "label":"Room name",
+                "style":"long",
+                "required":true
+            }]
+        }),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "INVALID_TOOL_ARGUMENTS");
+    assert_eq!(failure.message, "value long is not allowed");
+    assert!(failure.hint.contains("style: short|paragraph(required)"));
+    assert!(!failure.hint.contains("kind must be one of"));
+}
+
+#[test]
+fn invalid_field_type_returns_expected_nested_shape() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "add_modal",
+        json!({"key":"study_modal","title":"Study room","fields":"room_name"}),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "INVALID_FIELD_TYPE");
+    assert_eq!(failure.location, "tool.add_modal.arguments");
+    assert_eq!(
+        failure.message,
+        "a field value has a type that does not match the schema"
+    );
+    assert!(failure.hint.contains("fields: array(required) of"));
+    assert!(failure.hint.contains("required: boolean(required)"));
+    assert!(!failure.hint.contains("invalid type"));
+}
+
+#[test]
 fn summary_reports_unknown_fixed_bindings() {
     let mut draft = Draft::new();
     assert!(call(
