@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: false
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build unsafe development activation
+        run: cargo build -p interaction-smoke --features unsafe-dev-activation
+
+  postgres:
+    runs-on: ubuntu-latest
+    env:
+      STARRING_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/starring_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: false
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: Create test database
+        env:
+          PGPASSWORD: postgres
+        run: psql --host localhost --username postgres --dbname postgres --command "CREATE DATABASE starring_test"
+      - name: Test RuleSet PostgreSQL store
+        run: cargo test -p automation-ruleset-postgres -- --ignored --test-threads=1
+      - name: Test instance PostgreSQL store
+        run: cargo test -p automation-instance-postgres -- --ignored --test-threads=1
+      - name: Test panel installation PostgreSQL store
+        run: cargo test -p automation-panel-installation-postgres -- --ignored --test-threads=1
+      - name: Test activation PostgreSQL store
+        run: cargo test -p automation-ruleset-activation-postgres -- --ignored --test-threads=1
+      - name: Test pinned RuleSet dispatch
+        run: cargo test -p automation-ruleset-dispatch -- --ignored --test-threads=1
+      - name: Test RuleSet readiness activation
+        run: cargo test -p automation-ruleset-readiness -- --ignored --test-threads=1
