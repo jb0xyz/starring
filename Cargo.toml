@@ -34,6 +34,7 @@ members = [
     "tools/executor-smoke",
     "tools/starring-demo",
     "tools/interaction-smoke",
+    "tools/design-harness",
 ]
 resolver = "2"
 
