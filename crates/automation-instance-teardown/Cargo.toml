@@ -1,0 +1,11 @@
+[package]
+name = "automation-instance-teardown"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-instance = { path = "../automation-instance" }
+discord-model = { path = "../discord-model" }
+
+[dev-dependencies]
+futures = "0.3"

@@ -1,0 +1,505 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+use automation_instance::{
+    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceMessageRef,
+    InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
+};
+use automation_instance_teardown::{
+    DeleteOutcome, DeleterError, DeleterErrorKind, InstanceDeleter, InstanceResource,
+    InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
+};
+use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
+use futures::executor::block_on;
+
+const GUILD: GuildId = GuildId(7);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeleteCall {
+    Message(ChannelId, MessageId),
+    Channel(ChannelId),
+    Role(RoleId),
+}
+
+#[derive(Default)]
+struct StoreState {
+    inner: InMemoryInstanceStore,
+    get_calls: AtomicUsize,
+    transition_calls: AtomicUsize,
+    mark_calls: AtomicUsize,
+    fail_mark: AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct SharedStore(Arc<StoreState>);
+
+impl SharedStore {
+    fn get_calls(&self) -> usize {
+        self.0.get_calls.load(Ordering::SeqCst)
+    }
+
+    fn transition_calls(&self) -> usize {
+        self.0.transition_calls.load(Ordering::SeqCst)
+    }
+
+    fn mark_calls(&self) -> usize {
+        self.0.mark_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_fail_mark(&self, fail: bool) {
+        self.0.fail_mark.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl InstanceStore for SharedStore {
+    async fn register(&self, instance: AutomationInstance) -> Result<(), InstanceStoreError> {
+        self.0.inner.register(instance).await
+    }
+
+    async fn get(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        self.0.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.0.inner.get(guild_id, instance_id).await
+    }
+
+    async fn list_by_guild(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        self.0.inner.list_by_guild(guild_id).await
+    }
+
+    async fn update_status(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+        status: InstanceStatus,
+    ) -> Result<(), InstanceStoreError> {
+        self.0
+            .inner
+            .update_status(guild_id, instance_id, status)
+            .await
+    }
+
+    async fn transition_to_deleting(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        self.0.transition_calls.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .inner
+            .transition_to_deleting(guild_id, instance_id)
+            .await
+    }
+
+    async fn mark_deleted(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<(), InstanceStoreError> {
+        self.0.mark_calls.fetch_add(1, Ordering::SeqCst);
+        if self.0.fail_mark.load(Ordering::SeqCst) {
+            return Err(InstanceStoreError::Backend("mark failed".to_string()));
+        }
+        self.0.inner.mark_deleted(guild_id, instance_id).await
+    }
+
+    async fn list_deleting(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        self.0.inner.list_deleting(guild_id).await
+    }
+}
+
+#[derive(Default)]
+struct DeleterState {
+    calls: Mutex<Vec<DeleteCall>>,
+    outcomes: Mutex<VecDeque<Result<DeleteOutcome, DeleterError>>>,
+}
+
+#[derive(Clone, Default)]
+struct ScriptedDeleter(Arc<DeleterState>);
+
+impl ScriptedDeleter {
+    fn with_outcomes(outcomes: Vec<Result<DeleteOutcome, DeleterError>>) -> Self {
+        Self(Arc::new(DeleterState {
+            calls: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(outcomes.into()),
+        }))
+    }
+
+    fn calls(&self) -> Vec<DeleteCall> {
+        self.0.calls.lock().unwrap().clone()
+    }
+
+    fn replace_outcomes(&self, outcomes: Vec<Result<DeleteOutcome, DeleterError>>) {
+        *self.0.outcomes.lock().unwrap() = outcomes.into();
+    }
+
+    fn next(&self) -> Result<DeleteOutcome, DeleterError> {
+        self.0
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(DeleteOutcome::Deleted))
+    }
+}
+
+impl InstanceDeleter for ScriptedDeleter {
+    async fn delete_message(
+        &self,
+        _: GuildId,
+        channel: ChannelId,
+        message: MessageId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push(DeleteCall::Message(channel, message));
+        self.next()
+    }
+
+    async fn delete_channel(
+        &self,
+        _: GuildId,
+        channel: ChannelId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push(DeleteCall::Channel(channel));
+        self.next()
+    }
+
+    async fn delete_role(&self, _: GuildId, role: RoleId) -> Result<DeleteOutcome, DeleterError> {
+        self.0.calls.lock().unwrap().push(DeleteCall::Role(role));
+        self.next()
+    }
+}
+
+fn instance_id() -> InstanceId {
+    InstanceId::parse("room_001").unwrap()
+}
+
+fn resources() -> InstanceResources {
+    InstanceResources {
+        roles: BTreeMap::from([
+            ("z_role".to_string(), RoleId(601)),
+            ("a_role".to_string(), RoleId(600)),
+        ]),
+        channels: BTreeMap::from([
+            ("z_channel".to_string(), ChannelId(501)),
+            ("a_channel".to_string(), ChannelId(500)),
+        ]),
+        messages: BTreeMap::from([
+            (
+                "z_message".to_string(),
+                InstanceMessageRef {
+                    channel: ChannelId(99),
+                    id: MessageId(401),
+                },
+            ),
+            (
+                "a_message".to_string(),
+                InstanceMessageRef {
+                    channel: ChannelId(500),
+                    id: MessageId(400),
+                },
+            ),
+        ]),
+    }
+}
+
+fn instance(status: InstanceStatus) -> AutomationInstance {
+    AutomationInstance {
+        id: instance_id(),
+        guild_id: GUILD,
+        ruleset_key: "studyroom_demo".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
+        kind: InstanceKind("study_room".to_string()),
+        created_by: UserId(42),
+        resources: resources(),
+        status,
+    }
+}
+
+fn register(store: &SharedStore, status: InstanceStatus) {
+    block_on(store.register(instance(InstanceStatus::Active))).unwrap();
+    if status == InstanceStatus::Deleting {
+        block_on(store.transition_to_deleting(GUILD, &instance_id())).unwrap();
+    }
+    if status == InstanceStatus::Deleted {
+        block_on(store.transition_to_deleting(GUILD, &instance_id())).unwrap();
+        block_on(store.mark_deleted(GUILD, &instance_id())).unwrap();
+    }
+}
+
+fn expected_order() -> Vec<DeleteCall> {
+    vec![
+        DeleteCall::Message(ChannelId(500), MessageId(400)),
+        DeleteCall::Message(ChannelId(99), MessageId(401)),
+        DeleteCall::Channel(ChannelId(500)),
+        DeleteCall::Channel(ChannelId(501)),
+        DeleteCall::Role(RoleId(600)),
+        DeleteCall::Role(RoleId(601)),
+    ]
+}
+
+#[test]
+fn active_instance_deletes_in_order_and_preserves_footprint() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::default();
+    register(&store, InstanceStatus::Active);
+    let service = Teardown::new(store.clone(), deleter.clone());
+
+    let outcome = block_on(service.teardown(GUILD, instance_id())).unwrap();
+
+    assert_eq!(outcome, TeardownOutcome::Completed);
+    assert_eq!(deleter.calls(), expected_order());
+    let stored = block_on(store.get(GUILD, &instance_id())).unwrap().unwrap();
+    assert_eq!(stored.status, InstanceStatus::Deleted);
+    assert_eq!(stored.resources, resources());
+    assert_eq!(store.transition_calls(), 1);
+    assert_eq!(store.mark_calls(), 1);
+}
+
+#[test]
+fn already_gone_resources_are_successful() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::with_outcomes(vec![
+        Ok(DeleteOutcome::AlreadyGone),
+        Ok(DeleteOutcome::Deleted),
+        Ok(DeleteOutcome::AlreadyGone),
+        Ok(DeleteOutcome::Deleted),
+        Ok(DeleteOutcome::AlreadyGone),
+        Ok(DeleteOutcome::Deleted),
+    ]);
+    register(&store, InstanceStatus::Active);
+    let service = Teardown::new(store.clone(), deleter);
+
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap(),
+        TeardownOutcome::Completed
+    );
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleted
+    );
+}
+
+#[test]
+fn forbidden_channel_stops_before_roles_and_leaves_deleting() {
+    let store = SharedStore::default();
+    let forbidden = DeleterError {
+        kind: DeleterErrorKind::Forbidden,
+        message: "forbidden".to_string(),
+    };
+    let deleter = ScriptedDeleter::with_outcomes(vec![
+        Ok(DeleteOutcome::Deleted),
+        Ok(DeleteOutcome::Deleted),
+        Err(forbidden.clone()),
+    ]);
+    register(&store, InstanceStatus::Active);
+    let service = Teardown::new(store.clone(), deleter.clone());
+
+    let error = block_on(service.teardown(GUILD, instance_id())).unwrap_err();
+
+    assert_eq!(
+        error,
+        TeardownError::DeleteFailed {
+            resource: InstanceResource::Channel {
+                alias: "a_channel".to_string(),
+                id: ChannelId(500),
+            },
+            source: forbidden,
+        }
+    );
+    assert_eq!(deleter.calls().len(), 3);
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleting
+    );
+    assert_eq!(store.mark_calls(), 0);
+}
+
+#[test]
+fn deleting_instance_resumes_with_preserved_footprint() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::with_outcomes(vec![Ok(DeleteOutcome::AlreadyGone); 6]);
+    register(&store, InstanceStatus::Deleting);
+    let transition_calls = store.transition_calls();
+    let service = Teardown::new(store.clone(), deleter.clone());
+
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap(),
+        TeardownOutcome::ResumedAndCompleted
+    );
+    assert_eq!(deleter.calls(), expected_order());
+    assert_eq!(store.transition_calls(), transition_calls);
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .resources,
+        resources()
+    );
+}
+
+struct BlockingDeleter {
+    started: Arc<(Mutex<bool>, Condvar)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl InstanceDeleter for BlockingDeleter {
+    async fn delete_message(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+        _: MessageId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        let (started, started_ready) = &*self.started;
+        *started.lock().unwrap() = true;
+        started_ready.notify_all();
+        let (release, release_ready) = &*self.release;
+        let mut released = release.lock().unwrap();
+        while !*released {
+            released = release_ready.wait(released).unwrap();
+        }
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn delete_channel(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn delete_role(&self, _: GuildId, _: RoleId) -> Result<DeleteOutcome, DeleterError> {
+        Ok(DeleteOutcome::Deleted)
+    }
+}
+
+#[test]
+fn concurrent_call_returns_in_progress_without_store_read() {
+    let store = SharedStore::default();
+    register(&store, InstanceStatus::Active);
+    let started = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let service = Arc::new(Teardown::new(
+        store.clone(),
+        BlockingDeleter {
+            started: started.clone(),
+            release: release.clone(),
+        },
+    ));
+    let first_service = service.clone();
+    let first =
+        std::thread::spawn(move || block_on(first_service.teardown(GUILD, instance_id())).unwrap());
+    let (started_lock, started_ready) = &*started;
+    let mut has_started = started_lock.lock().unwrap();
+    while !*has_started {
+        has_started = started_ready.wait(has_started).unwrap();
+    }
+    drop(has_started);
+    let reads = store.get_calls();
+
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap(),
+        TeardownOutcome::InProgress
+    );
+    assert_eq!(store.get_calls(), reads);
+    let (release_lock, release_ready) = &*release;
+    *release_lock.lock().unwrap() = true;
+    release_ready.notify_all();
+    assert_eq!(first.join().unwrap(), TeardownOutcome::Completed);
+}
+
+#[test]
+fn deleted_instance_is_already_deleted_without_deletes() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::default();
+    register(&store, InstanceStatus::Deleted);
+    let service = Teardown::new(store, deleter.clone());
+
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap(),
+        TeardownOutcome::AlreadyDeleted
+    );
+    assert!(deleter.calls().is_empty());
+}
+
+#[test]
+fn mark_failure_keeps_deleting_and_resume_completes() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::default();
+    register(&store, InstanceStatus::Active);
+    store.set_fail_mark(true);
+    let service = Teardown::new(store.clone(), deleter.clone());
+
+    assert!(matches!(
+        block_on(service.teardown(GUILD, instance_id())),
+        Err(TeardownError::Store(InstanceStoreError::Backend(_)))
+    ));
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleting
+    );
+    store.set_fail_mark(false);
+    deleter.replace_outcomes(vec![Ok(DeleteOutcome::AlreadyGone); 6]);
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap(),
+        TeardownOutcome::ResumedAndCompleted
+    );
+}
+
+#[test]
+fn uncertain_delete_error_is_not_already_gone() {
+    let store = SharedStore::default();
+    let source = DeleterError {
+        kind: DeleterErrorKind::Unknown,
+        message: "uncertain".to_string(),
+    };
+    let deleter = ScriptedDeleter::with_outcomes(vec![Err(source.clone())]);
+    register(&store, InstanceStatus::Active);
+    let service = Teardown::new(store.clone(), deleter);
+
+    assert_eq!(
+        block_on(service.teardown(GUILD, instance_id())).unwrap_err(),
+        TeardownError::DeleteFailed {
+            resource: InstanceResource::Message {
+                alias: "a_message".to_string(),
+                channel: ChannelId(500),
+                id: MessageId(400),
+            },
+            source,
+        }
+    );
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Deleting
+    );
+    assert_eq!(store.mark_calls(), 0);
+}

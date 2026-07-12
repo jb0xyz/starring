@@ -118,6 +118,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-instance-teardown"
+version = "0.1.0"
+dependencies = [
+ "automation-instance",
+ "discord-model",
+ "futures",
+]
+
+[[package]]
 name = "automation-panel-installation"
 version = "0.1.0"
 dependencies = [

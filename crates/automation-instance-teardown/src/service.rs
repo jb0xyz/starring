@@ -1,0 +1,184 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use automation_instance::{InstanceId, InstanceStatus, InstanceStore};
+use discord_model::GuildId;
+
+use crate::domain::{InstanceDeleter, InstanceResource, TeardownError, TeardownOutcome};
+
+#[allow(async_fn_in_trait)]
+pub trait InstanceTeardownService {
+    async fn teardown(
+        &self,
+        guild_id: GuildId,
+        instance_id: InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError>;
+}
+
+#[derive(Default)]
+struct LockEntry {
+    held: AtomicBool,
+}
+
+struct KeyLockGuard<'a> {
+    registry: &'a Mutex<BTreeMap<InstanceId, Arc<LockEntry>>>,
+    key: InstanceId,
+    entry: Arc<LockEntry>,
+}
+
+impl Drop for KeyLockGuard<'_> {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap();
+        self.entry.held.store(false, Ordering::Release);
+        if Arc::strong_count(&self.entry) == 2
+            && registry
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
+pub struct Teardown<S, D> {
+    store: S,
+    deleter: D,
+    locks: Mutex<BTreeMap<InstanceId, Arc<LockEntry>>>,
+}
+
+impl<S, D> Teardown<S, D> {
+    pub fn new(store: S, deleter: D) -> Self {
+        Self {
+            store,
+            deleter,
+            locks: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn try_lock(&self, key: &InstanceId) -> Option<KeyLockGuard<'_>> {
+        let entry = {
+            let mut locks = self.locks.lock().unwrap();
+            locks.entry(key.clone()).or_default().clone()
+        };
+        if entry
+            .held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(KeyLockGuard {
+            registry: &self.locks,
+            key: key.clone(),
+            entry,
+        })
+    }
+}
+
+impl<S, D> Teardown<S, D>
+where
+    S: InstanceStore,
+    D: InstanceDeleter,
+{
+    async fn teardown_locked(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        let instance = self
+            .store
+            .get(guild_id, instance_id)
+            .await
+            .map_err(TeardownError::Lookup)?
+            .ok_or(TeardownError::InstanceNotFound)?;
+        let first_owner = match instance.status {
+            InstanceStatus::Deleted => return Ok(TeardownOutcome::AlreadyDeleted),
+            InstanceStatus::Deleting => false,
+            InstanceStatus::Active | InstanceStatus::Disabled => {
+                self.store
+                    .transition_to_deleting(guild_id, instance_id)
+                    .await
+                    .map_err(TeardownError::Store)?;
+                true
+            }
+        };
+
+        for (alias, message) in &instance.resources.messages {
+            let resource = InstanceResource::Message {
+                alias: alias.clone(),
+                channel: message.channel,
+                id: message.id,
+            };
+            self.deleter
+                .delete_message(guild_id, message.channel, message.id)
+                .await
+                .map_err(|source| TeardownError::DeleteFailed { resource, source })?;
+        }
+        for (alias, id) in &instance.resources.channels {
+            let resource = InstanceResource::Channel {
+                alias: alias.clone(),
+                id: *id,
+            };
+            self.deleter
+                .delete_channel(guild_id, *id)
+                .await
+                .map_err(|source| TeardownError::DeleteFailed { resource, source })?;
+        }
+        for (alias, id) in &instance.resources.roles {
+            let resource = InstanceResource::Role {
+                alias: alias.clone(),
+                id: *id,
+            };
+            self.deleter
+                .delete_role(guild_id, *id)
+                .await
+                .map_err(|source| TeardownError::DeleteFailed { resource, source })?;
+        }
+
+        self.store
+            .mark_deleted(guild_id, instance_id)
+            .await
+            .map_err(TeardownError::Store)?;
+        Ok(if first_owner {
+            TeardownOutcome::Completed
+        } else {
+            TeardownOutcome::ResumedAndCompleted
+        })
+    }
+}
+
+impl<S, D> InstanceTeardownService for Teardown<S, D>
+where
+    S: InstanceStore,
+    D: InstanceDeleter,
+{
+    async fn teardown(
+        &self,
+        guild_id: GuildId,
+        instance_id: InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        let Some(_guard) = self.try_lock(&instance_id) else {
+            return Ok(TeardownOutcome::InProgress);
+        };
+        self.teardown_locked(guild_id, &instance_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use automation_instance::InstanceId;
+
+    use super::Teardown;
+
+    #[test]
+    fn released_lock_is_removed_from_registry() {
+        let service = Teardown::new((), ());
+        let id = InstanceId::parse("room_001").unwrap();
+        {
+            let _guard = service.try_lock(&id).unwrap();
+            assert_eq!(service.locks.lock().unwrap().len(), 1);
+        }
+        assert!(service.locks.lock().unwrap().is_empty());
+    }
+}

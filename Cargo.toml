@@ -20,6 +20,7 @@ members = [
     "crates/automation-runtime",
     "crates/automation-instance",
     "crates/automation-instance-postgres",
+    "crates/automation-instance-teardown",
     "crates/automation-ruleset",
     "crates/automation-ruleset-postgres",
     "crates/automation-ruleset-readiness",
