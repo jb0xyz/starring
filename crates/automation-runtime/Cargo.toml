@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 automation-panel-installation = { path = "../automation-panel-installation" }
 automation-instance = { path = "../automation-instance" }
+automation-instance-teardown = { path = "../automation-instance-teardown" }
 automation-state = { path = "../automation-state" }
 automation-core = { path = "../automation-core" }
 automation-ruleset = { path = "../automation-ruleset" }
@@ -15,6 +16,8 @@ resource-resolution = { path = "../resource-resolution" }
 twilight-gateway = "0.17"
 twilight-http = "0.17"
 twilight-model = "0.17"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
 desired-state = { path = "../desired-state" }
