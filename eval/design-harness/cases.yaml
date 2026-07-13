@@ -59,11 +59,11 @@
         "turns": [
           {
             "id": "submit-resources",
-            "input": "기존 패널, 모달, open_modal 규칙을 정확히 보존해라. 이번 턴에는 key=submit_room 모달 제출 규칙과 다음 action만 순서대로 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members), key=room_channel 채널(study-${input.room_name}), 생성 채널에서 everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 이 턴은 draft_update이고 validate=false다. 패널 게시, 인스턴스 등록, validate, simulate는 하지 말고 progressed로 끝내라. set_turn_plan으로 정확한 계획을 세워라."
+            "input": "기존 패널, 모달, open_modal 규칙을 정확히 보존해라. 이번 턴에는 key=submit_room 모달 제출 규칙과 다음 action만 순서대로 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members), key=room_channel 채널(study-${input.room_name}), 생성 채널에서 everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 이 턴은 draft_update이고 validate=false다. 패널 게시, 인스턴스 등록, validate, simulate는 하지 말고 요청 범위를 완료해라. set_turn_plan으로 정확한 계획을 세워라."
           }
         ]
       }
-    expectedOutcomes: "progressed"
+    expectedOutcomes: "progressed,ready"
     inputTurnCount: 1
     minChangedTurns: 1
     requireSimulation: false
@@ -121,11 +121,11 @@
         "turns": [
           {
             "id": "submit-finalize",
-            "input": "기존 설계와 submit_room의 6개 action을 정확히 보존해라. 그 뒤에 생성 채널의 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub의 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 순서대로 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널은 추가하지 말고 validate, simulate 없이 progressed로 끝내라. set_turn_plan으로 정확한 계획을 세워라."
+            "input": "기존 설계와 submit_room의 6개 action을 정확히 보존해라. 그 뒤에 생성 채널의 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub의 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 순서대로 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널은 추가하지 말고 validate, simulate 없이 요청 범위를 완료해라. set_turn_plan으로 정확한 계획을 세워라."
           }
         ]
       }
-    expectedOutcomes: "progressed"
+    expectedOutcomes: "progressed,ready"
     inputTurnCount: 1
     minChangedTurns: 1
     requireSimulation: false
@@ -245,13 +245,13 @@
         "turns": [
           {
             "id": "submit-resources",
-            "input": "기존 패널, 모달, open_modal 규칙을 정확히 보존해라. 이번 턴에는 key=submit_room 모달 제출 규칙과 다음 action만 순서대로 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members), key=room_channel 채널(study-${input.room_name}), 생성 채널에서 everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 이 턴은 draft_update이고 validate=false다. 패널 게시, 인스턴스 등록, validate, simulate는 하지 말고 progressed로 끝내라.",
+            "input": "기존 패널, 모달, open_modal 규칙을 정확히 보존해라. 이번 턴에는 key=submit_room 모달 제출 규칙과 다음 action만 순서대로 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members), key=room_channel 채널(study-${input.room_name}), 생성 채널에서 everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 이 턴은 draft_update이고 validate=false다. 패널 게시, 인스턴스 등록, validate, simulate는 하지 말고 요청 범위를 완료해라.",
             "oracle_brief": {"intent":"build","objective":"Complete the submit_room resource stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_resources_plan"}
           }
         ]
       }
-    expectedOutcomes: "progressed"
+    expectedOutcomes: "progressed,ready"
     inputTurnCount: 1
     minChangedTurns: 1
     requireSimulation: false
@@ -310,13 +310,13 @@
         "turns": [
           {
             "id": "submit-finalize",
-            "input": "기존 설계와 submit_room의 6개 action을 정확히 보존해라. 그 뒤에 생성 채널의 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub의 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 순서대로 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널은 추가하지 말고 validate, simulate 없이 progressed로 끝내라.",
+            "input": "기존 설계와 submit_room의 6개 action을 정확히 보존해라. 그 뒤에 생성 채널의 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub의 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 순서대로 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널은 추가하지 말고 validate, simulate 없이 요청 범위를 완료해라.",
             "oracle_brief": {"intent":"build","objective":"Complete the submit_room finalize stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_finalize_plan"}
           }
         ]
       }
-    expectedOutcomes: "progressed"
+    expectedOutcomes: "progressed,ready"
     inputTurnCount: 1
     minChangedTurns: 1
     requireSimulation: false
