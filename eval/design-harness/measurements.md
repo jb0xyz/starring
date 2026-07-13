@@ -56,3 +56,37 @@ Measured 2026-07-13 after adding a persisted one-attempt repair state machine. A
 | Simple modal acknowledgement | 3 | 0 | 0 | 1 | n/a | 177,277 | 223,919 | 10 | 9.33 | 3.33 | 1 | 4.33 | 3.33 | 1 |
 
 The repeated-error contract improved decisively: the worst identical error count fell from 5 to 2 for StudyRoom and from 8 to 1 for the simple case, and no simple run repeated an error. Mean model calls fell 8.3% and 16.7% respectively relative to Item 3, and all simple Drafts passed final validation. Completion and exact-task pass rates remained zero. Latency still rose 66.2% for StudyRoom and 56.1% for the simple case because the model produced several different malformed calls instead of one repeated signature, averaging 4.33 repair attempts per run. Item 4 prevents unbounded flailing per error but does not impose a session-wide repair budget; that is the next performance policy to evaluate rather than an unmeasured claim of improvement.
+
+## 5. Multi-turn StudyRoom experiment
+
+Measured 2026-07-13 after adding adaptive multi-turn lifecycle support and an unchanged-Draft verification path. The model was already resident on the GPU before the sample, and the preceding `additive_revision` regression passed once in 673,634 ms; that regression is excluded from the three-run sample below. Promptfoo cache was disabled, concurrency was one, and the provider timeout was supplied through `STARRING_EVAL_TIMEOUT_MS=3600000`. The API key and gateway base URL were supplied only through the process environment and Keychain. Raw reports remain in the ignored `results/` directory.
+
+| Case | Runs | Pass rate | Completion rate | Validation rate | Required simulation rate | Mean ms | p95 ms | Mean model calls | Mean tool calls | Mean distinct mutation tools | Maximum identical error count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| StudyRoom incremental | 3 | 0 | 0 | 0 | 0 | 1,248,852 | 1,663,373 | 31.33 | 31.67 | 7 | 2 |
+
+All three reports were valid and none had a provider error. No run reached the fifth `validate-simulate` turn, so actual validation and actual StudyRoom simulation rates were both zero. The final cumulative Draft targets of one panel, one modal, two rules, eleven actions, ten distinct mutation tools, current validation, and current golden-trace simulation were not achieved.
+
+The per-turn `New distinct` column reports mutation tool names first introduced during that turn. `Mutation calls` reports every mutation tool executed during the turn, including tools used in prior turns.
+
+| Run | Turn | Outcome | Elapsed ms | Model calls | Tool calls | New distinct | Mutation calls | Draft after | Stall |
+| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |
+| 1 | surface | progressed | 155,213 | 8 | 8 | 3: add_panel, add_button, add_modal | add_panel×1, add_button×1, add_modal×1 | p1/m1/r0/a0 | none |
+| 1 | open-rule | progressed | 248,456 | 6 | 6 | 2: begin_rule, add_interaction_action | begin_rule×1, add_interaction_action×1 | p1/m1/r1/a1 | none |
+| 1 | submit-resources | halted | 140,529 | 5 | 5 | 0 | begin_rule×1, add_interaction_action×1 | p1/m1/r2/a2 | `REPAIR_ATTEMPT_FAILED`: repaired `add_resource_action` still omitted required `key` |
+| 1 | submit-finalize | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
+| 1 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
+| 2 | surface | progressed | 154,465 | 8 | 8 | 3: add_panel, add_button, add_modal | add_panel×1, add_button×1, add_modal×1 | p1/m1/r0/a0 | none |
+| 2 | open-rule | progressed | 302,962 | 7 | 7 | 2: begin_rule, add_interaction_action | begin_rule×1, add_interaction_action×1 | p1/m1/r1/a1 | none |
+| 2 | submit-resources | progressed | 560,580 | 12 | 12 | 3: add_resource_action, add_upsert_overwrite_action, add_grant_role_action | begin_rule×1, add_interaction_action×1, add_resource_action×2, add_upsert_overwrite_action×2, add_grant_role_action×1 | p1/m1/r2/a7 | none |
+| 2 | submit-finalize | halted | 645,363 | 12 | 12 | 0 | add_panel×8, add_button×2 | p9/m1/r2/a7 | `MODEL_CALL_LIMIT_EXHAUSTED`: used top-level panel tools instead of `add_post_panel_action` |
+| 2 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
+| 3 | surface | progressed | 150,413 | 7 | 8 | 3: add_panel, add_button, add_modal | add_panel×1, add_button×1, add_modal×1 | p1/m1/r0/a0 | none |
+| 3 | open-rule | progressed | 206,439 | 5 | 5 | 2: begin_rule, add_interaction_action | begin_rule×1, add_interaction_action×1 | p1/m1/r1/a1 | none |
+| 3 | submit-resources | progressed | 534,800 | 12 | 12 | 3: add_resource_action, add_upsert_overwrite_action, add_grant_role_action | begin_rule×1, add_interaction_action×1, add_resource_action×2, add_upsert_overwrite_action×2, add_grant_role_action×1 | p1/m1/r2/a7 | none |
+| 3 | submit-finalize | halted | 647,327 | 12 | 12 | 0 | add_panel×8, add_button×2 | p9/m1/r2/a7 | `MODEL_CALL_LIMIT_EXHAUSTED`: used top-level panel tools instead of `add_post_panel_action` |
+| 3 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
+
+The first two turns completed in all three runs. The seven-mutation third turn completed in two of three runs. Both runs that reached the fourth turn confused runtime panel actions with top-level panel construction and exhausted the per-turn model-call budget after adding duplicate panels. The first run failed earlier while repairing the first resource action. This locates two independent stalls: the seven-tool resource turn remains marginal, and the four-tool finalize turn needs a more discriminating tool route or a smaller split around runtime panel posting.
+
+The prior one-shot `studyroom_full` sample in section 4 also had 0% pass and 0% completion across three runs. The five-turn `studyroom_incremental` experiment therefore did not improve complex StudyRoom completion above the known one-shot 0% result. It did make the stall boundary observable and allowed two runs to reach the correct cumulative structure through seven actions, but that is partial progress, not completion. The hypothesis that this exact five-turn decomposition makes complex StudyRoom viable on local Gemma 12B is rejected by this sample.

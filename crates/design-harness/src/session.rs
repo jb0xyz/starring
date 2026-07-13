@@ -15,7 +15,7 @@ use crate::turn::{
     FinishTurnKind, RequestedOutcome, SimulationProfile, TurnBrief, TurnIntent,
 };
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Modification requests must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Modification requests must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
 
 const NUDGE: &str = "Call a design tool to change the Draft; use QUESTION: only for a blocking decision; use PROGRESSED: after useful changes when another user turn is appropriate; use READY: only after validate_draft passes on the current revision.";
 const REPAIR_REQUIRED_PREFIX: &str = "REPAIR_REQUIRED:";
@@ -672,7 +672,12 @@ impl<C> DesignSession<C> {
                         None,
                     );
                 }
-                let phase = if brief.requested_outcome == RequestedOutcome::Discussion
+                let verification_only = brief.intent == TurnIntent::Inspect
+                    && brief.requested_outcome == RequestedOutcome::ValidatedPreview
+                    && brief.verification.validate;
+                let phase = if verification_only {
+                    AdaptivePhase::Verify
+                } else if brief.requested_outcome == RequestedOutcome::Discussion
                     || matches!(brief.intent, TurnIntent::Brainstorm | TurnIntent::Inspect)
                 {
                     AdaptivePhase::Reply
@@ -682,7 +687,7 @@ impl<C> DesignSession<C> {
                 self.adaptive_turn = Some(AdaptiveTurnState {
                     phase,
                     brief: Some(brief),
-                    scoped_revision: None,
+                    scoped_revision: verification_only.then_some(self.draft.draft_revision),
                     previewed_revision: None,
                 });
                 (
@@ -1896,7 +1901,7 @@ impl<C: LlmClient> DesignSession<C> {
                         self.messages
                             .push(Message::tool(call.id.clone(), result.as_json()));
                         if self.adaptive_enabled
-                            && call.name == "check_turn_scope"
+                            && matches!(call.name.as_str(), "set_turn_brief" | "check_turn_scope")
                             && result.is_ok()
                         {
                             if let Some(outcome) = self.run_automatic_adaptive_phases().await {

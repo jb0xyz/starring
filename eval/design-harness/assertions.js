@@ -329,7 +329,7 @@ function expectedReplacementRevision() {
 function taskSemantics(output, context) {
   return checked(output, (report) => {
     const scenario = vars(context).caseId;
-    const expected = scenario === 'studyroom_full'
+    const expected = ['studyroom_full', 'studyroom_incremental'].includes(scenario)
       ? expectedStudyRoom()
       : ['simple_modal_ack', 'complete_one_shot', 'multi_turn_elaboration'].includes(scenario)
         ? expectedSimpleModal()

@@ -18,6 +18,7 @@ async function call(binary, config = {}) {
     binary: process.env.STARRING_HARNESS_BIN,
     baseUrl: process.env.STARRING_LLM_BASE_URL,
     apiKey: process.env.STARRING_LLM_API_KEY,
+    timeoutMs: process.env.STARRING_EVAL_TIMEOUT_MS,
   };
   process.env.STARRING_HARNESS_BIN = binary;
   process.env.STARRING_LLM_BASE_URL = 'http://127.0.0.1:1/v1';
@@ -29,6 +30,7 @@ async function call(binary, config = {}) {
       ['STARRING_HARNESS_BIN', previous.binary],
       ['STARRING_LLM_BASE_URL', previous.baseUrl],
       ['STARRING_LLM_API_KEY', previous.apiKey],
+      ['STARRING_EVAL_TIMEOUT_MS', previous.timeoutMs],
     ]) {
       if (value === undefined) {
         delete process.env[name];
@@ -57,4 +59,19 @@ test('provider waits for timeout termination and caps output', async () => {
   assert.match(timedOut.error, /timed out after 30 milliseconds/);
   const oversized = await call(executable("cat >/dev/null\nprintf '123456789'"), { maxOutputBytes: 4, killGraceMs: 10 });
   assert.match(oversized.error, /stdout exceeded 4 bytes/);
+});
+
+test('provider accepts a positive timeout from the environment', async () => {
+  const previous = process.env.STARRING_EVAL_TIMEOUT_MS;
+  process.env.STARRING_EVAL_TIMEOUT_MS = '30';
+  try {
+    const timedOut = await call(executable("trap '' TERM\ncat >/dev/null\nwhile :; do sleep 1; done"), { killGraceMs: 10 });
+    assert.match(timedOut.error, /timed out after 30 milliseconds/);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.STARRING_EVAL_TIMEOUT_MS;
+    } else {
+      process.env.STARRING_EVAL_TIMEOUT_MS = previous;
+    }
+  }
 });

@@ -38,7 +38,9 @@ class DesignHarnessProvider {
       let settled = false;
       let terminalError = null;
       let forceKillTimer;
-      const timeoutMs = this.config.timeoutMs || 600000;
+      const environmentTimeoutMs = Number(process.env.STARRING_EVAL_TIMEOUT_MS);
+      const timeoutMs = this.config.timeoutMs
+        || (Number.isSafeInteger(environmentTimeoutMs) && environmentTimeoutMs > 0 ? environmentTimeoutMs : 600000);
       const maxOutputBytes = this.config.maxOutputBytes || 4194304;
       const finish = (value) => {
         if (!settled) {

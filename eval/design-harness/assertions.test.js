@@ -187,3 +187,13 @@ test('task semantics require the exact simple RuleSet', () => {
   ruleset.rules[0].actions[1].content = 'wrong';
   assert.equal(checks.taskSemantics(report({ ruleset }), context({ caseId: 'simple_modal_ack' })).pass, false);
 });
+
+test('incremental StudyRoom uses the full StudyRoom semantic target', () => {
+  const outcome = checks.taskSemantics(
+    report({ ruleset: { version: 1, panels: [], modals: [], rules: [] } }),
+    context({ caseId: 'studyroom_incremental' }),
+  );
+
+  assert.equal(outcome.pass, false);
+  assert.match(outcome.reason, /studyroom_incremental ruleset does not exactly match/);
+});

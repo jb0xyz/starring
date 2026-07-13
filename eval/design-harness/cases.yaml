@@ -297,3 +297,69 @@
       value: file://assertions.js:callBudgets
     - type: javascript
       value: file://assertions.js:perTurnBudgets
+
+- description: StudyRoom incremental multi-turn build
+  vars:
+    caseId: studyroom_incremental
+    request: |-
+      {
+        "schema_version": 1,
+        "turns": [
+          {
+            "id": "surface",
+            "input": "Discord 스터디룸 자동화를 여러 턴에 걸쳐 조립할 거야. 이번 턴에는 표면 구조만 만들어라. study_hub 채널에 key=study_panel, content=Create a study room 패널을 선언하고 label=Create room, static key=create_study_room 버튼을 넣어라. 그리고 key=study_modal, title=Create study room 모달에 required short 필드 key=room_name, label=Room name을 둬라. 규칙이나 action은 아직 만들지 마라. 이 턴은 draft_update이고 set_turn_brief의 validate는 false다. validate나 simulate를 하지 말고 이번 턴 변경만 마친 뒤 progressed로 다음 지시를 기다려라."
+          },
+          {
+            "id": "open-rule",
+            "input": "기존 study_panel과 study_modal은 그대로 보존해라. 이번 턴에는 key=open_modal 규칙만 추가한다. 이 규칙은 create_study_room 버튼 클릭으로 시작하고 study_modal을 여는 action 하나만 가진다. 이 턴은 draft_update이고 set_turn_brief의 validate는 false다. validate나 simulate를 하지 말고 이번 턴 변경만 마친 뒤 progressed로 끝내라."
+          },
+          {
+            "id": "submit-resources",
+            "input": "기존 설계는 모두 보존해라. 이번 턴에는 key=submit_room 규칙을 시작한다. 이 규칙은 study_modal 제출로 시작하고 순서대로 다음 action을 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members) 생성, key=room_channel 채널(study-${input.room_name}) 생성, everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 여기까지만 하고 이번 턴을 마쳐라. 아직 패널 게시나 인스턴스 등록은 하지 마라. 이 턴은 draft_update이고 set_turn_brief의 validate는 false다. validate나 simulate를 하지 말고 progressed로 끝내라."
+          },
+          {
+            "id": "submit-finalize",
+            "input": "submit_room 규칙에 이어서 나머지 action을 추가한다. 기존 action은 중복 추가하지 말고 그 뒤에 붙여라: 생성된 채널에 key=welcome_panel, content=Welcome to ${input.room_name} 패널을 게시하되 static Help=study_help 버튼과 instance action Close=close 버튼을 포함하고, study_hub에 key=hub_panel, content=${input.room_name} is open 패널을 게시하되 instance action Join=join 버튼을 포함하고, key=study_instance kind=study_room 인스턴스를 등록하되 manifest에 member_role, room_channel, welcome_panel, hub_panel을 같은 alias로 모두 포함하고, 마지막으로 Created ${input.room_name}로 응답을 수정한다. 이 턴은 draft_update이고 set_turn_brief의 validate는 false다. validate나 simulate를 하지 말고 이번 턴 변경만 마친 뒤 progressed로 끝내라."
+          },
+          {
+            "id": "validate-simulate",
+            "input": "이제 설계가 끝났다. 더 이상 Draft를 바꾸지 마라. 이 턴은 기존 Draft 검증이 목적이므로 set_turn_brief를 intent=inspect, requested_outcome=validated_preview, validate=true로 설정하고 현재 revision을 validate한 뒤 StudyRoom golden trace로 simulate해서 미리보기 가능한 준비 상태로 끝내라. 질문하지 마라."
+          }
+        ]
+      }
+    expectedOutcomes: "ready,completed"
+    inputTurnCount: 5
+    minChangedTurns: 4
+    requireSimulation: true
+    requireActualValidation: true
+    requireActualSimulation: true
+    expectedPanels: 1
+    expectedModals: 1
+    expectedRules: 2
+    expectedActions: 11
+    minDistinctMutationTools: 10
+    maxModelCalls: 48
+    maxToolCalls: 96
+    maxModelCallsPerTurn: 12
+    maxToolCallsPerTurn: 24
+  assert:
+    - type: javascript
+      value: file://assertions.js:terminalOutcome
+    - type: javascript
+      value: file://assertions.js:conversationFlow
+    - type: javascript
+      value: file://assertions.js:actualGateStamps
+    - type: javascript
+      value: file://assertions.js:finalGates
+    - type: javascript
+      value: file://assertions.js:draftShape
+    - type: javascript
+      value: file://assertions.js:taskSemantics
+    - type: javascript
+      value: file://assertions.js:distinctMutationTools
+    - type: javascript
+      value: file://assertions.js:noExcessiveRepeatedErrors
+    - type: javascript
+      value: file://assertions.js:callBudgets
+    - type: javascript
+      value: file://assertions.js:perTurnBudgets

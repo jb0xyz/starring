@@ -22,6 +22,9 @@ fn adaptive_system_prompt_assigns_automatic_gates_to_the_harness() {
     ));
     assert!(DEFAULT_SYSTEM_PROMPT
         .contains("When finish_turn is the only available tool, call it with kind ready"));
+    assert!(DEFAULT_SYSTEM_PROMPT.contains(
+        "For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true"
+    ));
     assert!(!DEFAULT_SYSTEM_PROMPT.contains("render_preview for a validated preview"));
 }
 
@@ -2717,6 +2720,108 @@ fn adaptive_success_alias_cannot_bypass_ready_gates() {
         assert_eq!(report.last_error.unwrap().code, "TURN_NOT_READY");
         assert_eq!(session.draft().draft_revision, 0);
         assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Halted);
+    });
+}
+
+#[test]
+fn adaptive_inspect_verifies_an_unchanged_studyroom_draft() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"inspect",
+                    "objective":"Verify the completed StudyRoom design",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({
+                    "kind":"ready",
+                    "message":"The unchanged StudyRoom design is validated and simulated.",
+                    "question":null
+                }),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
+        let draft = support::golden_draft().await;
+        let revision = draft.draft_revision;
+        let ruleset = draft.ruleset.clone();
+        *session.draft_mut() = draft;
+
+        let outcome = session
+            .run_burst("Validate and simulate the current StudyRoom Draft without changing it")
+            .await;
+
+        assert!(matches!(
+            outcome,
+            BurstOutcome::Ready { ref summary }
+                if summary == "The unchanged StudyRoom design is validated and simulated."
+        ));
+        assert_eq!(session.draft().draft_revision, revision);
+        assert_eq!(session.draft().ruleset, ruleset);
+        assert_eq!(session.draft().validated_revision, Some(revision));
+        assert_eq!(session.draft().simulated_revision, Some(revision));
+        assert!(session.observability().mutation_tool_calls.is_empty());
+        let adaptive = session.adaptive_turn().unwrap();
+        assert_eq!(adaptive.phase, AdaptivePhase::Reply);
+        assert_eq!(adaptive.scoped_revision, Some(revision));
+        assert_eq!(adaptive.previewed_revision, Some(revision));
+        assert_eq!(probe.seen_tools()[0], names(&["set_turn_brief"]));
+        assert_eq!(probe.seen_tools()[1], names(&["finish_turn"]));
+    });
+}
+
+#[test]
+fn adaptive_inspect_ready_alias_cannot_bypass_verification_lifecycle() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"inspect",
+                    "objective":"Inspect the current StudyRoom design",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"success","message":"Ready."}),
+            )]),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(
+            client,
+            SessionConfig {
+                max_model_calls: 2,
+                ..long_flow_config()
+            },
+        );
+        let draft = support::golden_draft().await;
+        let revision = draft.draft_revision;
+        *session.draft_mut() = draft;
+
+        let outcome = session
+            .run_burst("Inspect StudyRoom without a preview")
+            .await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected the ready alias to halt")
+        };
+        assert_eq!(report.code, "MODEL_CALL_LIMIT_EXHAUSTED");
+        assert_eq!(report.last_error.unwrap().code, "TURN_NOT_READY");
+        assert_eq!(session.draft().draft_revision, revision);
+        assert_eq!(session.draft().validated_revision, None);
+        assert_eq!(session.draft().simulated_revision, None);
     });
 }
 
