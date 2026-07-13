@@ -5,6 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const DesignHarnessProvider = require('./provider');
+const { hydratePrompt } = require('./provider');
+const fixtures = require('./fixtures.json');
 
 function executable(body) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'starring-provider-'));
@@ -74,4 +76,43 @@ test('provider accepts a positive timeout from the environment', async () => {
       process.env.STARRING_EVAL_TIMEOUT_MS = previous;
     }
   }
+});
+
+test('provider hydrates exact Draft and oracle plan fixtures', () => {
+  const hydrated = JSON.parse(hydratePrompt(JSON.stringify({
+    schema_version: 2,
+    mode: 'typed_plan',
+    initial_draft: { $fixture: 'studyroom_before_resources' },
+    turns: [{
+      id: 'resources',
+      input: 'Build resources',
+      oracle_plan: { $fixture: 'studyroom_resources_plan' },
+    }],
+  })));
+
+  assert.equal(hydrated.initial_draft.draft_revision, 5);
+  assert.equal(hydrated.initial_draft.ruleset.rules[0].key, 'open_modal');
+  assert.equal(hydrated.turns[0].oracle_plan.requirements.length, 7);
+  assert.equal(hydrated.turns[0].oracle_plan.requirements[4].action.deny[0], 'view_channel');
+});
+
+test('provider rejects unknown fixture names', () => {
+  assert.throws(
+    () => hydratePrompt('{"schema_version":2,"initial_draft":{"$fixture":"missing"}}'),
+    /unknown evaluation fixture missing/,
+  );
+});
+
+test('full StudyRoom fixture is the exact ordered composition of stage plans', () => {
+  const expected = [
+    ...fixtures.studyroom_surface_plan.requirements,
+    ...fixtures.studyroom_open_rule_plan.requirements,
+    ...fixtures.studyroom_resources_plan.requirements,
+    ...fixtures.studyroom_finalize_plan.requirements,
+  ];
+
+  assert.deepEqual(fixtures.studyroom_full_plan.requirements, expected);
+  assert.equal(fixtures.studyroom_surface_plan.requirements.length, 3);
+  assert.equal(fixtures.studyroom_open_rule_plan.requirements.length, 2);
+  assert.equal(fixtures.studyroom_full_plan.requirements.length, 16);
 });

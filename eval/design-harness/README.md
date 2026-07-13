@@ -14,9 +14,26 @@ The CLI accepts a legacy plain-text prompt or a stateful document. Every scripte
 }
 ```
 
-The version 2 report contains `turns`, cumulative observability, per-turn observability deltas, revision continuity, and elapsed time. `actual_gates` reports stamps that the model really earned during the session. `postcheck` reports the evaluator's non-mutating validation and simulation checks. These are intentionally separate so a successful evaluator postcheck cannot be mistaken for a gate the model called.
+Input schema version 2 selects the typed-plan lifecycle. It can start from an exact serialized Draft and can inject one deterministic `set_turn_plan` call for an isolated oracle experiment. Fixture references are expanded by the provider before the document reaches the CLI. Oracle injection occurs only when `set_turn_plan` is the sole exposed tool; all other model calls still use the configured gateway. If an injected plan is rejected, the oracle turn fails closed instead of delegating a replacement plan to the gateway. Passing oracle cases require exact injected, submitted, accepted, and committed plan provenance with no plan execution failure, rollback, or conflict.
 
-The cases cover a complete one-shot request, an ambiguous request that should ask one blocking question, multi-turn elaboration, additive and replacement revisions that must preserve earlier work, and the complex StudyRoom one-shot stress test.
+```json
+{
+  "schema_version": 2,
+  "mode": "typed_plan",
+  "initial_draft": { "$fixture": "studyroom_before_resources" },
+  "turns": [
+    {
+      "id": "resources",
+      "input": "리소스 단계를 완성해줘",
+      "oracle_plan": { "$fixture": "studyroom_resources_plan" }
+    }
+  ]
+}
+```
+
+The version 2 report contains `turns`, cumulative observability, per-turn observability deltas, revision continuity, and elapsed time. Typed-plan observability separates submissions, accepted requirements, compiled tool calls, execution failures, rollbacks, commits, and conflicts. `actual_gates` reports stamps that the model really earned during the session. `postcheck` reports the evaluator's non-mutating validation and simulation checks. These are intentionally separate so a successful evaluator postcheck cannot be mistaken for a gate the model called.
+
+The cases cover a complete one-shot request, an ambiguous request that should ask one blocking question, multi-turn elaboration, additive and replacement revisions that must preserve earlier work, the complex StudyRoom one-shot stress test, and typed-plan StudyRoom one-shot, five-turn, resource, and finalize paths. Production typed-plan cases delegate every call to the configured model. Oracle cases inject only the declared plan calls and separately measure the remaining delegated model calls.
 
 Run from the repository root:
 
@@ -32,4 +49,4 @@ npm --prefix eval/design-harness run eval -- \
 npm --prefix eval/design-harness run summarize -- results/gemma-stateful.json
 ```
 
-Run Qwen against the gateway that serves it by changing `STARRING_LLM_BASE_URL` and `STARRING_LLM_MODEL=qwen3.5:9b-mlx`. The provider no longer overrides `STARRING_LLM_MODEL`, and its identifier includes the selected model. Keep concurrency at one for the current single-model server and keep `--no-cache` so repeated runs measure the model.
+Run Qwen only against a gateway that is actually configured to serve `qwen3.5:9b-mlx`. Changing `STARRING_LLM_MODEL` changes the requested model and result identifier; it does not reconfigure a fixed-model gateway. Verify `/v1/models` before every sample. Keep concurrency at one for the current single-model server and keep `--no-cache` so repeated runs measure the model.

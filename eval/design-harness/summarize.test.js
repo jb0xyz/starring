@@ -139,3 +139,59 @@ test('summary aggregates stateful turn and actual gate metrics separately', () =
   assert.equal(row.mean_turn_model_calls, 2);
   assert.equal(row.mean_turn_tool_calls, 2.5);
 });
+
+test('summary separates oracle injections from delegated model calls and semantic assertions', () => {
+  const report = {
+    schema_version: 2,
+    outcome: 'progressed',
+    completed: false,
+    elapsed_ms: 20,
+    max_repeat_count: 0,
+    actual_gates: { validation_current: false, simulation_current: false },
+    postcheck: { validate_passed: true, simulate_passed: false },
+    observability: {
+      model_calls: 3,
+      tool_calls: 9,
+      distinct_mutation_tools: ['a'],
+      plan_submissions: 1,
+      plan_acceptances: 1,
+      planned_requirements: 8,
+      plan_compiled_tool_calls: 7,
+      plan_execution_failures: 0,
+      plan_rollbacks: 0,
+      plan_commits: 1,
+      plan_conflicts: 0,
+    },
+    injected_control_calls: 1,
+    delegated_model_calls: 2,
+    turns: [],
+  };
+  const document = {
+    results: [{
+      provider: { label: 'gemma' },
+      vars: { caseId: 'oracle', requireSimulation: false },
+      success: true,
+      gradingResult: {
+        componentResults: [{
+          pass: true,
+          assertion: { value: 'file://assertions.js:taskSemantics' },
+        }],
+      },
+      response: { metadata: report },
+    }],
+  };
+
+  const [row] = summarize(document);
+
+  assert.equal(row.exact_semantics_rate, 1);
+  assert.equal(row.mean_injected_control_calls, 1);
+  assert.equal(row.mean_delegated_model_calls, 2);
+  assert.equal(row.mean_plan_submissions, 1);
+  assert.equal(row.mean_plan_acceptances, 1);
+  assert.equal(row.mean_planned_requirements, 8);
+  assert.equal(row.mean_plan_compiled_tool_calls, 7);
+  assert.equal(row.mean_plan_execution_failures, 0);
+  assert.equal(row.mean_plan_rollbacks, 0);
+  assert.equal(row.mean_plan_commits, 1);
+  assert.equal(row.mean_plan_conflicts, 0);
+});

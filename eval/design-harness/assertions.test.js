@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const checks = require('./assertions');
+const fixtures = require('./fixtures.json');
 
 function context(overrides = {}) {
   return {
@@ -196,4 +197,235 @@ test('incremental StudyRoom uses the full StudyRoom semantic target', () => {
 
   assert.equal(outcome.pass, false);
   assert.match(outcome.reason, /studyroom_incremental ruleset does not exactly match/);
+});
+
+test('isolated resource assertions require exact semantics revisions and oracle accounting', () => {
+  const document = JSON.parse(statefulReport({
+    input_schema_version: 2,
+    mode: 'typed_plan',
+    outcome: 'progressed',
+    completed: false,
+    draft: { panels: 1, modals: 1, rules: 2, actions: 7, unresolved_references: [] },
+    ruleset: structuredClone(fixtures.studyroom_before_finalize.ruleset),
+    actual_gates: { validation_current: false, simulation_current: false },
+    injected_control_calls: 1,
+    delegated_model_calls: 2,
+    observability: {
+      model_calls: 3,
+      tool_calls: 10,
+      distinct_mutation_tools: [],
+      plan_submissions: 1,
+      plan_acceptances: 1,
+      plan_commits: 1,
+      plan_execution_failures: 0,
+      plan_rollbacks: 0,
+      plan_conflicts: 0,
+    },
+    turns: [{
+      id: 'submit-resources',
+      outcome: 'progressed',
+      question: null,
+      draft_revision_before: 5,
+      draft_revision_after: 12,
+      draft_changed: true,
+      injected_control_calls: 1,
+      delegated_model_calls: 2,
+      observability_delta: {
+        model_calls: 3,
+        tool_calls: 10,
+        mutation_tool_calls: {},
+        plan_submissions: 1,
+        plan_acceptances: 1,
+        plan_commits: 1,
+        plan_execution_failures: 0,
+        plan_rollbacks: 0,
+        plan_conflicts: 0,
+      },
+    }],
+  }));
+  const isolated = context({
+    caseId: 'studyroom_resources_oracle',
+    expectedOutcomes: ['progressed'],
+    inputTurnCount: 1,
+    minChangedTurns: 1,
+    expectedInitialRevision: 5,
+    expectedFinalRevision: 12,
+    expectedRevisionPath: ['5>12'],
+    expectedLastTurnId: 'submit-resources',
+    expectedInjectedControlCalls: 1,
+    expectedInjectedCallsPerTurn: ['1'],
+    expectedPlanAcceptancesPerTurn: ['1'],
+    expectedPlanCommitsPerTurn: ['1'],
+    requireOracleProvenance: true,
+    forbidActualValidation: true,
+    forbidActualSimulation: true,
+  });
+
+  assert.equal(checks.taskSemantics(JSON.stringify(document), isolated).pass, true);
+  assert.equal(checks.conversationFlow(JSON.stringify(document), isolated).pass, true);
+  assert.equal(checks.actualGateStamps(JSON.stringify(document), isolated).pass, true);
+  assert.equal(checks.oracleControlCalls(JSON.stringify(document), isolated).pass, true);
+
+  document.ruleset.rules[1].actions[1].name = 'wrong';
+  assert.equal(checks.taskSemantics(JSON.stringify(document), isolated).pass, false);
+  document.ruleset = structuredClone(fixtures.studyroom_before_finalize.ruleset);
+  document.turns[0].draft_revision_after = 13;
+  assert.match(
+    checks.conversationFlow(JSON.stringify(document), isolated).reason,
+    /final_revision=13 expected=12/,
+  );
+  document.turns[0].draft_revision_after = 12;
+  document.observability.plan_submissions = 2;
+  assert.match(
+    checks.oracleControlCalls(JSON.stringify(document), isolated).reason,
+    /plan_submissions=2 expected=1/,
+  );
+  document.observability.plan_submissions = 1;
+  document.turns[0].observability_delta.plan_execution_failures = 1;
+  assert.match(
+    checks.oracleControlCalls(JSON.stringify(document), isolated).reason,
+    /submit-resources plan_execution_failures=1 expected=0/,
+  );
+  document.turns[0].observability_delta.plan_execution_failures = 0;
+  document.delegated_model_calls = 1;
+  document.turns[0].delegated_model_calls = 1;
+  assert.match(
+    checks.oracleControlCalls(JSON.stringify(document), isolated).reason,
+    /model_calls=3 accounted=2/,
+  );
+});
+
+test('typed production assertions require zero injected plan calls', () => {
+  const document = JSON.parse(statefulReport({
+    input_schema_version: 2,
+    mode: 'typed_plan',
+    outcome: 'progressed',
+    completed: false,
+    draft: { panels: 1, modals: 1, rules: 2, actions: 7, unresolved_references: [] },
+    ruleset: structuredClone(fixtures.studyroom_before_finalize.ruleset),
+    actual_gates: { validation_current: false, simulation_current: false },
+    injected_control_calls: 0,
+    delegated_model_calls: 3,
+    observability: { model_calls: 3, tool_calls: 10, distinct_mutation_tools: [] },
+    turns: [{
+      id: 'submit-resources',
+      outcome: 'progressed',
+      question: null,
+      draft_revision_before: 5,
+      draft_revision_after: 12,
+      draft_changed: true,
+      injected_control_calls: 0,
+      delegated_model_calls: 3,
+      observability_delta: { model_calls: 3, tool_calls: 10, mutation_tool_calls: {} },
+    }],
+  }));
+  const production = context({
+    caseId: 'studyroom_resources_typed',
+    expectedOutcomes: ['progressed'],
+    inputTurnCount: 1,
+    minChangedTurns: 1,
+    expectedInitialRevision: 5,
+    expectedFinalRevision: 12,
+    expectedRevisionPath: ['5>12'],
+    expectedLastTurnId: 'submit-resources',
+    expectedInjectedControlCalls: 0,
+    expectedInjectedCallsPerTurn: ['0'],
+  });
+
+  assert.equal(checks.taskSemantics(JSON.stringify(document), production).pass, true);
+  assert.equal(checks.conversationFlow(JSON.stringify(document), production).pass, true);
+  assert.equal(checks.oracleControlCalls(JSON.stringify(document), production).pass, true);
+
+  document.injected_control_calls = 1;
+  document.delegated_model_calls = 2;
+  document.turns[0].injected_control_calls = 1;
+  assert.equal(checks.oracleControlCalls(JSON.stringify(document), production).pass, false);
+});
+
+test('five-turn oracle assertions require four plans and a mutation-free inspect turn', () => {
+  const path = [
+    ['surface', 0, 3, 1],
+    ['open-rule', 3, 5, 1],
+    ['submit-resources', 5, 12, 1],
+    ['submit-finalize', 12, 16, 1],
+    ['validate-simulate', 16, 16, 0],
+  ];
+  const turns = path.map(([id, before, after, injected]) => ({
+    id,
+    outcome: id === 'validate-simulate' ? 'ready' : 'progressed',
+    question: null,
+    draft_revision_before: before,
+    draft_revision_after: after,
+    draft_changed: before !== after,
+    injected_control_calls: injected,
+    delegated_model_calls: 2,
+    observability_delta: {
+      model_calls: 2 + injected,
+      tool_calls: 4,
+      mutation_tool_calls: {},
+      plan_submissions: injected,
+      plan_acceptances: injected,
+      plan_commits: injected,
+      plan_execution_failures: 0,
+      plan_rollbacks: 0,
+      plan_conflicts: 0,
+    },
+  }));
+  const document = JSON.parse(statefulReport({
+    input_schema_version: 2,
+    mode: 'typed_plan',
+    outcome: 'ready',
+    completed: true,
+    injected_control_calls: 4,
+    delegated_model_calls: 10,
+    observability: {
+      model_calls: 14,
+      tool_calls: 20,
+      distinct_mutation_tools: [],
+      plan_submissions: 4,
+      plan_acceptances: 4,
+      plan_commits: 4,
+      plan_execution_failures: 0,
+      plan_rollbacks: 0,
+      plan_conflicts: 0,
+    },
+    turns,
+  }));
+  const incremental = context({
+    inputTurnCount: 5,
+    minChangedTurns: 4,
+    expectedInitialRevision: 0,
+    expectedFinalRevision: 16,
+    expectedRevisionPath: ['0>3', '3>5', '5>12', '12>16', '16>16'],
+    expectedLastTurnId: 'validate-simulate',
+    expectedInjectedControlCalls: 4,
+    expectedInjectedCallsPerTurn: ['1', '1', '1', '1', '0'],
+    expectedPlanAcceptancesPerTurn: ['1', '1', '1', '1', '0'],
+    expectedPlanCommitsPerTurn: ['1', '1', '1', '1', '0'],
+    requireOracleProvenance: true,
+    forbiddenLastTurnMutationTools: [
+      'add_panel',
+      'add_button',
+      'add_modal',
+      'begin_rule',
+      'add_interaction_action',
+      'add_resource_action',
+      'add_upsert_overwrite_action',
+      'add_grant_role_action',
+      'add_post_panel_action',
+      'set_register_instance',
+    ],
+  });
+
+  assert.equal(checks.conversationFlow(JSON.stringify(document), incremental).pass, true);
+  assert.equal(checks.oracleControlCalls(JSON.stringify(document), incremental).pass, true);
+
+  document.turns[4].draft_revision_after = 17;
+  assert.match(
+    checks.conversationFlow(JSON.stringify(document), incremental).reason,
+    /final_revision=17 expected=16/,
+  );
+  document.turns[4].draft_revision_after = 16;
+  document.turns[4].injected_control_calls = 1;
+  assert.equal(checks.oracleControlCalls(JSON.stringify(document), incremental).pass, false);
 });

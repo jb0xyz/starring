@@ -62,6 +62,15 @@ function actualGate(report, gate) {
   return report?.[`${gate}_current`] === true;
 }
 
+function assertionPassed(row, name) {
+  const components = row.gradingResult?.componentResults;
+  if (!Array.isArray(components)) {
+    return null;
+  }
+  const component = components.find((entry) => entry.assertion?.value?.endsWith(`:${name}`));
+  return component ? component.pass === true : null;
+}
+
 function summarize(document) {
   const groups = new Map();
   for (const row of rowsFrom(document)) {
@@ -85,10 +94,21 @@ function summarize(document) {
     const repairSuccesses = reports.map((report) => Number(report.observability?.repair_successes ?? 0));
     const repairFailures = reports.map((report) => Number(report.observability?.repair_failures ?? 0));
     const repairEscalations = reports.map((report) => Number(report.observability?.repair_escalations ?? 0));
+    const injectedControlCalls = reports.map((report) => Number(report.injected_control_calls ?? 0));
+    const delegatedModelCalls = reports.map((report) => Number(report.delegated_model_calls));
+    const planSubmissions = reports.map((report) => Number(report.observability?.plan_submissions ?? 0));
+    const planAcceptances = reports.map((report) => Number(report.observability?.plan_acceptances ?? 0));
+    const plannedRequirements = reports.map((report) => Number(report.observability?.planned_requirements ?? 0));
+    const planCompiledToolCalls = reports.map((report) => Number(report.observability?.plan_compiled_tool_calls ?? 0));
+    const planExecutionFailures = reports.map((report) => Number(report.observability?.plan_execution_failures ?? 0));
+    const planRollbacks = reports.map((report) => Number(report.observability?.plan_rollbacks ?? 0));
+    const planCommits = reports.map((report) => Number(report.observability?.plan_commits ?? 0));
+    const planConflicts = reports.map((report) => Number(report.observability?.plan_conflicts ?? 0));
     const turns = reports.flatMap((report) => Array.isArray(report.turns) ? report.turns : []);
     const turnElapsed = turns.map((turn) => Number(turn.elapsed_ms));
     const turnModelCalls = turns.map((turn) => Number(turn.observability_delta?.model_calls));
     const turnToolCalls = turns.map((turn) => Number(turn.observability_delta?.tool_calls));
+    const semanticRows = group.rows.filter((entry) => assertionPassed(entry.row, 'taskSemantics') !== null);
     return {
       provider: group.provider,
       case_id: group.caseId,
@@ -97,6 +117,9 @@ function summarize(document) {
       valid_report_rate: reports.length / group.rows.length,
       provider_error_rate: group.rows.filter((entry) => !entry.report || entry.row.response?.error).length / group.rows.length,
       pass_rate: group.rows.filter((entry) => entry.row.success === true).length / group.rows.length,
+      exact_semantics_rate: semanticRows.length === 0
+        ? null
+        : semanticRows.filter((entry) => assertionPassed(entry.row, 'taskSemantics') === true).length / semanticRows.length,
       completion_rate: group.rows.filter((entry) => entry.report?.completed === true).length / group.rows.length,
       validation_rate: group.rows.filter((entry) => postcheck(entry.report, 'validate')).length / group.rows.length,
       required_simulation_rate: requiredSimulation
@@ -118,6 +141,16 @@ function summarize(document) {
       mean_repair_successes: mean(repairSuccesses),
       mean_repair_failures: mean(repairFailures),
       mean_repair_escalations: mean(repairEscalations),
+      mean_injected_control_calls: mean(injectedControlCalls),
+      mean_delegated_model_calls: mean(delegatedModelCalls),
+      mean_plan_submissions: mean(planSubmissions),
+      mean_plan_acceptances: mean(planAcceptances),
+      mean_planned_requirements: mean(plannedRequirements),
+      mean_plan_compiled_tool_calls: mean(planCompiledToolCalls),
+      mean_plan_execution_failures: mean(planExecutionFailures),
+      mean_plan_rollbacks: mean(planRollbacks),
+      mean_plan_commits: mean(planCommits),
+      mean_plan_conflicts: mean(planConflicts),
       mean_turns: mean(reports.map((report) => Number(report.turns?.length))),
       changed_turn_rate: turns.length === 0 ? null : turns.filter((turn) => turn.draft_changed === true).length / turns.length,
       needs_input_turn_rate: turns.length === 0 ? null : turns.filter((turn) => ['needs_input', 'awaiting_human'].includes(turn.outcome)).length / turns.length,
