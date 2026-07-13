@@ -330,6 +330,7 @@ pub struct TurnBrief {
 pub enum FinishTurnKind {
     NeedsInput,
     Progressed,
+    #[serde(alias = "success")]
     Ready,
 }
 
@@ -338,10 +339,8 @@ pub enum FinishTurnKind {
 pub struct FinishTurn {
     pub kind: FinishTurnKind,
     pub message: String,
+    #[serde(default)]
     pub question: Option<String>,
-    pub options: Vec<String>,
-    pub assumptions: Vec<String>,
-    pub changes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -419,7 +418,7 @@ pub fn control_tool_definitions() -> Vec<ToolDefinition> {
         ),
         definition::<FinishTurn>(
             "finish_turn",
-            "Return a question, progress update, or review-ready response to the human",
+            "Finish the human turn with kind needs_input, progressed, or ready; include question only for needs_input",
         ),
     ]
 }
@@ -1202,9 +1201,42 @@ mod tests {
         assert!(schema.pointer("/properties/validate").is_some());
         assert!(schema.pointer("/properties/simulation").is_none());
         assert!(parse_finish_turn(
-            r#"{"kind":"needs_input","message":"Choose a genre","question":"Which genre?","options":["quiz"],"assumptions":[],"changes":[]}"#
+            r#"{"kind":"needs_input","message":"Choose a genre","question":"Which genre?"}"#
         )
         .is_ok());
+        assert_eq!(
+            parse_finish_turn(r#"{"kind":"ready","message":"Ready"}"#)
+                .unwrap()
+                .kind,
+            FinishTurnKind::Ready
+        );
+        assert_eq!(
+            parse_finish_turn(r#"{"kind":"success","message":"Ready"}"#)
+                .unwrap()
+                .kind,
+            FinishTurnKind::Ready
+        );
+        assert!(parse_finish_turn(r#"{"kind":"ready","message":"Ready","changes":[]}"#).is_err());
+        assert!(parse_finish_turn(r#"{"kind":"done","message":"Ready"}"#).is_err());
+        let finish_schema = control_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "finish_turn")
+            .unwrap()
+            .parameters;
+        let properties = finish_schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "kind".to_string(),
+                "message".to_string(),
+                "question".to_string()
+            ])
+        );
+        assert_eq!(finish_schema["required"], json!(["kind", "message"]));
+        assert_eq!(
+            finish_schema["$defs"]["FinishTurnKind"]["enum"],
+            json!(["needs_input", "progressed", "ready"])
+        );
         assert_eq!(control_tool_definitions().len(), 4);
     }
 }

@@ -15,6 +15,16 @@ use serde_json::{json, Value};
 
 type SeenToolParameters = Vec<Vec<(String, Value)>>;
 
+#[test]
+fn adaptive_system_prompt_assigns_automatic_gates_to_the_harness() {
+    assert!(DEFAULT_SYSTEM_PROMPT.contains(
+        "The harness then automatically runs requested validation, harness-selected simulation, and preview steps"
+    ));
+    assert!(DEFAULT_SYSTEM_PROMPT
+        .contains("When finish_turn is the only available tool, call it with kind ready"));
+    assert!(!DEFAULT_SYSTEM_PROMPT.contains("render_preview for a validated preview"));
+}
+
 #[derive(Clone)]
 struct ScriptedClient {
     responses: Arc<Mutex<VecDeque<Result<LlmResponse, LlmError>>>>,
@@ -1185,10 +1195,7 @@ fn adaptive_simulation_repair_restamps_scope_before_ready() {
                 json!({
                     "kind":"ready",
                     "message":"The repaired StudyRoom design is ready.",
-                    "question":null,
-                    "options":[],
-                    "assumptions":[],
-                    "changes":["Restored the required everyone overwrite"]
+                    "question":null
                 }),
             )]),
         ]);
@@ -2640,10 +2647,7 @@ fn adaptive_complete_request_builds_checks_validates_previews_and_returns_ready(
                 json!({
                     "kind":"ready",
                     "message":"The feedback automation is ready for review.",
-                    "question":null,
-                    "options":[],
-                    "assumptions":[],
-                    "changes":["Added the feedback modal and acknowledgement rule"]
+                    "question":null
                 }),
             )]),
         ]);
@@ -2676,6 +2680,47 @@ fn adaptive_complete_request_builds_checks_validates_previews_and_returns_ready(
 }
 
 #[test]
+fn adaptive_success_alias_cannot_bypass_ready_gates() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Create a feedback automation",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"success","message":"Ready."}),
+            )]),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(
+            client,
+            SessionConfig {
+                max_model_calls: 2,
+                ..large_config()
+            },
+        );
+
+        let outcome = session.run_burst("Create a feedback automation").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected the premature success alias to halt")
+        };
+        assert_eq!(report.code, "MODEL_CALL_LIMIT_EXHAUSTED");
+        assert_eq!(report.last_error.unwrap().code, "TURN_NOT_READY");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Halted);
+    });
+}
+
+#[test]
 fn adaptive_ambiguous_request_asks_one_structural_question_without_mutating() {
     block_on(async {
         let client = ScriptedClient::new(vec![
@@ -2696,10 +2741,7 @@ fn adaptive_ambiguous_request_asks_one_structural_question_without_mutating() {
                 json!({
                     "kind":"needs_input",
                     "message":"I need one structural decision.",
-                    "question":"Should rooms be private or publicly visible?",
-                    "options":["private","public"],
-                    "assumptions":[],
-                    "changes":[]
+                    "question":"Should rooms be private or publicly visible?"
                 }),
             )]),
         ]);
@@ -2749,10 +2791,7 @@ fn adaptive_simulation_profile_uses_only_the_full_current_human_turn() {
                 json!({
                     "kind":"needs_input",
                     "message":"Choose a direction.",
-                    "question":"Which direction?",
-                    "options":["one","two"],
-                    "assumptions":[],
-                    "changes":[]
+                    "question":"Which direction?"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -2772,10 +2811,7 @@ fn adaptive_simulation_profile_uses_only_the_full_current_human_turn() {
                 json!({
                     "kind":"needs_input",
                     "message":"Choose one option.",
-                    "question":"Which option?",
-                    "options":["one","two"],
-                    "assumptions":[],
-                    "changes":[]
+                    "question":"Which option?"
                 }),
             )]),
         ]);
@@ -2908,7 +2944,7 @@ fn adaptive_modification_uses_stable_action_update_and_revalidates() {
             LlmResponse::ToolCalls(vec![call(
                 "finish",
                 "finish_turn",
-                json!({"kind":"ready","message":"Updated.","question":null,"options":[],"assumptions":[],"changes":["Changed acknowledgement text"]}),
+                json!({"kind":"ready","message":"Updated."}),
             )]),
         ]);
         let probe = client.clone();
@@ -2984,7 +3020,7 @@ fn adaptive_phase_transition_stops_the_remaining_stale_batch() {
             LlmResponse::ToolCalls(vec![call(
                 "finish",
                 "finish_turn",
-                json!({"kind":"ready","message":"Ready.","question":null,"options":[],"assumptions":[],"changes":[]}),
+                json!({"kind":"ready","message":"Ready."}),
             )]),
         ]);
         let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
