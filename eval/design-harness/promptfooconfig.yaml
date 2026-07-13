@@ -1,0 +1,7 @@
+description: Starring design harness serving benchmark
+prompts:
+  - label: design-request
+    raw: "{{request}}"
+providers:
+  - id: file://provider.js
+tests: file://cases.yaml

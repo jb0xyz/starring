@@ -2,3 +2,5 @@
 /ai-eval-runs
 .DS_Store
 .env*
+/eval/design-harness/node_modules/
+/eval/design-harness/results/

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use automation_core::validate::{validate_structural, ValidationError};
 use automation_state::{
     ActionSpec, ButtonRoute, ChannelRef, InstanceRef, InteractionRuleSet, OverwriteTargetSpec,
     RoleRef, TriggerSpec,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     pub ruleset: InteractionRuleSet,
     pub draft_revision: u64,
@@ -65,6 +66,25 @@ impl Draft {
             "stale".to_string()
         }
     }
+
+    pub(crate) fn newly_unresolved_after(&self, candidate: &Self) -> Vec<String> {
+        let before: BTreeSet<String> = unresolved_references(&self.ruleset).into_iter().collect();
+        unresolved_references(&candidate.ruleset)
+            .into_iter()
+            .filter(|reference| !before.contains(reference))
+            .collect()
+    }
+
+    pub(crate) fn newly_dangling_after(&self, candidate: &Self) -> Vec<ValidationError> {
+        let before = validate_structural(&self.ruleset).err().unwrap_or_default();
+        validate_structural(&candidate.ruleset)
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(is_dangling_error)
+            .filter(|error| !before.contains(error))
+            .collect()
+    }
 }
 
 impl Default for Draft {
@@ -73,7 +93,7 @@ impl Default for Draft {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftSummary {
     pub panels: usize,
     pub modals: usize,
@@ -158,6 +178,28 @@ fn unresolved_references(ruleset: &InteractionRuleSet) -> Vec<String> {
         }
     }
     unresolved.into_iter().collect()
+}
+
+fn is_dangling_error(error: &ValidationError) -> bool {
+    matches!(
+        error,
+        ValidationError::UnknownButtonRef { .. }
+            | ValidationError::UnknownModalRef { .. }
+            | ValidationError::UnknownRoleRef { .. }
+            | ValidationError::UnknownChannelRef { .. }
+            | ValidationError::UnknownCreatedRoleRef { .. }
+            | ValidationError::UnknownCreatedChannelRef { .. }
+            | ValidationError::UnknownCreatedMessageRef { .. }
+            | ValidationError::UnknownCreatedInstanceRef { .. }
+            | ValidationError::CreatedRoleRefTypeMismatch { .. }
+            | ValidationError::CreatedChannelRefTypeMismatch { .. }
+            | ValidationError::CreatedMessageRefTypeMismatch { .. }
+            | ValidationError::CreatedInstanceRefTypeMismatch { .. }
+            | ValidationError::UnknownTemplateInput { .. }
+            | ValidationError::InputTemplateInButtonRule { .. }
+            | ValidationError::InstanceResourceMissingFromManifest { .. }
+            | ValidationError::InstanceResourceProducedAfterRegister { .. }
+    )
 }
 
 fn collect_action_references(

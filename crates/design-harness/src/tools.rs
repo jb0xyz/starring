@@ -1,17 +1,27 @@
-use std::collections::BTreeMap;
-
-use automation_state::{
-    ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
-    InstanceRef, InstanceResourceRefs, InteractionRule, ModalFieldSpec, ModalFieldStyle, ModalSpec,
-    PanelSpec, RoleRef, TriggerSpec,
-};
+use automation_state::InteractionRule;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::draft::Draft;
-use crate::errors::{translate_tool_arguments_error, StructuredError, ToolResult};
+use crate::errors::{
+    translate_tool_arguments_error, translate_validation_error, StructuredError, ToolResult,
+};
 use crate::gates::{simulate_draft, validate_draft};
+
+mod actions;
+mod instance;
+mod surface;
+
+use actions::{
+    add_grant_role_action, add_interaction_action, add_post_panel_action, add_resource_action,
+    add_upsert_overwrite_action, remove_action, update_action,
+};
+use instance::set_register_instance;
+use surface::{
+    add_button, add_modal, add_panel, begin_rule, remove_button, remove_modal, remove_panel,
+    remove_rule, update_button, update_modal, update_panel, update_rule,
+};
 
 const PENDING_INSTANCE_REFERENCE: &str = "__pending_instance__";
 
@@ -32,10 +42,40 @@ struct AddPanelInput {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct UpdatePanelInput {
+    key: String,
+    channel: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemovePanelInput {
+    key: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddButtonInput {
     panel_key: String,
     label: String,
     route: ButtonRouteInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateButtonInput {
+    panel_key: String,
+    selector: ButtonRouteInput,
+    label: Option<String>,
+    route: Option<ButtonRouteInput>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveButtonInput {
+    panel_key: String,
+    selector: ButtonRouteInput,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -51,6 +91,20 @@ struct AddModalInput {
     key: String,
     title: String,
     fields: Vec<ModalFieldInput>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateModalInput {
+    key: String,
+    title: Option<String>,
+    fields: Option<Vec<ModalFieldInput>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveModalInput {
+    key: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -73,7 +127,21 @@ enum ModalFieldStyleInput {
 #[serde(deny_unknown_fields)]
 struct BeginRuleInput {
     key: String,
+    trigger_kind: TriggerKindInput,
+    trigger_ref: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateRuleInput {
+    key: String,
     trigger: TriggerInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveRuleInput {
+    key: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -82,6 +150,14 @@ enum TriggerInput {
     ButtonClick { component: String },
     ModalSubmit { modal: String },
     InstanceAction { action: String },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TriggerKindInput {
+    ButtonClick,
+    ModalSubmit,
+    InstanceAction,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -142,8 +218,90 @@ enum ActorTargetInput {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum InteractionActionInput {
     OpenModal { rule_key: String, modal: String },
+    RespondEphemeral { rule_key: String, content: String },
     DeferEphemeral { rule_key: String },
     EditResponse { rule_key: String, content: String },
+    TeardownInstance { rule_key: String },
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ActionKindInput {
+    GrantRole,
+    RespondEphemeral,
+    OpenModal,
+    CreateChannel,
+    CreateRole,
+    UpsertOverwrite,
+    PostPanel,
+    DeferEphemeral,
+    EditResponse,
+    RegisterInstance,
+    TeardownInstance,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ActionSelectorInput {
+    ByKey {
+        key: String,
+    },
+    ByKind {
+        action: ActionKindInput,
+        #[serde(default)]
+        occurrence: usize,
+    },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ActionPatchInput {
+    CreateRole {
+        name: String,
+    },
+    CreateChannel {
+        name: String,
+    },
+    GrantRole {
+        role: ReferenceInput,
+        target: ActorTargetInput,
+    },
+    RespondEphemeral {
+        content: String,
+    },
+    OpenModal {
+        modal: String,
+    },
+    UpsertOverwrite {
+        channel: ReferenceInput,
+        target_kind: OverwriteTargetKindInput,
+        role: Option<ReferenceInput>,
+        allow: Vec<String>,
+        deny: Vec<String>,
+    },
+    PostPanel {
+        channel: ReferenceInput,
+        content: String,
+        buttons: Vec<PostPanelButtonInput>,
+    },
+    EditResponse {
+        content: String,
+    },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateActionInput {
+    rule_key: String,
+    selector: ActionSelectorInput,
+    patch: ActionPatchInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveActionInput {
+    rule_key: String,
+    selector: ActionSelectorInput,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -190,7 +348,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         definition::<AddPanelInput>("add_panel", "Add a declared panel"),
         definition::<AddButtonInput>("add_button", "Add a button to a declared panel"),
         definition::<AddModalInput>("add_modal", "Add a modal and its text fields"),
-        definition::<BeginRuleInput>("begin_rule", "Begin a rule with one trigger"),
+        definition::<BeginRuleInput>(
+            "begin_rule",
+            "Begin a rule; trigger_ref is the button component, modal key, or instance action selected by trigger_kind",
+        ),
         definition::<ResourceActionInput>(
             "add_resource_action",
             "Append a role or channel creation action",
@@ -214,6 +375,37 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         definition::<SetRegisterInstanceInput>(
             "set_register_instance",
             "Finalize a rule with its complete instance footprint",
+        ),
+        definition::<UpdatePanelInput>(
+            "update_panel",
+            "Update a panel channel or content while keeping its stable key",
+        ),
+        definition::<RemovePanelInput>("remove_panel", "Remove an unreferenced panel by key"),
+        definition::<UpdateButtonInput>(
+            "update_button",
+            "Update a declared button selected by its current route",
+        ),
+        definition::<RemoveButtonInput>(
+            "remove_button",
+            "Remove an unreferenced declared button selected by its current route",
+        ),
+        definition::<UpdateModalInput>(
+            "update_modal",
+            "Update a modal title or replace its fields while keeping its stable key",
+        ),
+        definition::<RemoveModalInput>("remove_modal", "Remove an unreferenced modal by key"),
+        definition::<UpdateRuleInput>(
+            "update_rule",
+            "Update a rule trigger while keeping its stable key and actions",
+        ),
+        definition::<RemoveRuleInput>("remove_rule", "Remove a rule by its stable key"),
+        definition::<UpdateActionInput>(
+            "update_action",
+            "Update an action without changing its identity or order; prefer by_key, while by_kind occurrence is zero-based and can shift after edits",
+        ),
+        definition::<RemoveActionInput>(
+            "remove_action",
+            "Remove an action; prefer by_key, while by_kind occurrence is zero-based and can shift after edits",
         ),
         definition::<EmptyInput>("validate_draft", "Validate the current Draft revision"),
         definition::<EmptyInput>("simulate_draft", "Run the current validated Draft revision"),
@@ -265,6 +457,26 @@ pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> To
         "set_register_instance" => {
             parse(name, arguments).and_then(|input| set_register_instance(draft, input))
         }
+        "update_panel" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| update_panel(candidate, input))),
+        "remove_panel" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| remove_panel(candidate, input))),
+        "update_button" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| update_button(candidate, input))),
+        "remove_button" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| remove_button(candidate, input))),
+        "update_modal" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| update_modal(candidate, input))),
+        "remove_modal" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| remove_modal(candidate, input))),
+        "update_rule" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| update_rule(candidate, input))),
+        "remove_rule" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| remove_rule(candidate, input))),
+        "update_action" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| update_action(candidate, input))),
+        "remove_action" => parse(name, arguments)
+            .and_then(|input| checked_edit(draft, |candidate| remove_action(candidate, input))),
         _ => {
             return ToolResult::failure_from(
                 draft,
@@ -272,7 +484,7 @@ pub async fn dispatch_tool(draft: &mut Draft, name: &str, arguments: &str) -> To
                     "UNKNOWN_TOOL",
                     "tool",
                     "The requested design tool does not exist",
-                    "Use one of the twelve registered design tools",
+                    "Use one of the registered design tools",
                 ),
             );
         }
@@ -298,255 +510,29 @@ fn parse<T: for<'de> Deserialize<'de>>(name: &str, arguments: &str) -> Result<T,
     })
 }
 
-fn add_panel(draft: &mut Draft, input: AddPanelInput) -> Result<String, StructuredError> {
-    let channel =
-        serde_json::from_value(Value::String(input.channel)).map_err(reference_conversion_error)?;
-    let key = input.key;
-    draft.ruleset.panels.push(PanelSpec {
-        key: key.clone(),
-        channel,
-        content: input.content,
-        buttons: Vec::new(),
-    });
-    Ok(format!("Added panel {key}"))
-}
-
-fn add_button(draft: &mut Draft, input: AddButtonInput) -> Result<String, StructuredError> {
-    let panel = draft
-        .ruleset
-        .panels
-        .iter_mut()
-        .find(|panel| panel.key == input.panel_key)
-        .ok_or_else(|| missing_panel(&input.panel_key))?;
-    panel.buttons.push(ButtonSpec {
-        label: input.label,
-        route: declared_button_route(input.route),
-    });
-    Ok(format!("Added button to panel {}", input.panel_key))
-}
-
-fn add_modal(draft: &mut Draft, input: AddModalInput) -> Result<String, StructuredError> {
-    let key = input.key;
-    draft.ruleset.modals.push(ModalSpec {
-        key: key.clone(),
-        title: input.title,
-        fields: input.fields.into_iter().map(modal_field).collect(),
-    });
-    Ok(format!("Added modal {key}"))
-}
-
-fn begin_rule(draft: &mut Draft, input: BeginRuleInput) -> Result<String, StructuredError> {
-    let key = input.key;
-    draft.ruleset.rules.push(InteractionRule {
-        key: key.clone(),
-        trigger: trigger(input.trigger),
-        actions: Vec::new(),
-    });
-    Ok(format!("Began rule {key}"))
-}
-
-fn add_resource_action(
-    draft: &mut Draft,
-    input: ResourceActionInput,
-) -> Result<String, StructuredError> {
-    let (rule_key, action, change) = match input {
-        ResourceActionInput::CreateRole {
-            rule_key,
-            key,
-            name,
-        } => {
-            let change = format!("Added CreateRole {key} to rule {rule_key}");
-            (rule_key, ActionSpec::CreateRole { key, name }, change)
-        }
-        ResourceActionInput::CreateChannel {
-            rule_key,
-            key,
-            name,
-        } => {
-            let change = format!("Added CreateChannel {key} to rule {rule_key}");
-            (rule_key, ActionSpec::CreateChannel { key, name }, change)
-        }
-    };
-    append_action(draft, &rule_key, action)?;
-    Ok(change)
-}
-
-fn add_grant_role_action(
-    draft: &mut Draft,
-    input: AddGrantRoleActionInput,
-) -> Result<String, StructuredError> {
-    let target = match input.target {
-        ActorTargetInput::Actor => ActionTarget::Actor,
-    };
-    let action = ActionSpec::GrantRole {
-        role: role_reference(input.role)?,
-        target,
-    };
-    append_action(draft, &input.rule_key, action)?;
-    Ok(format!("Added GrantRole to rule {}", input.rule_key))
-}
-
-fn add_upsert_overwrite_action(
-    draft: &mut Draft,
-    input: AddUpsertOverwriteActionInput,
-) -> Result<String, StructuredError> {
-    let action = overwrite_action(
-        input.channel,
-        input.target_kind,
-        input.role,
-        &input.allow,
-        &input.deny,
-    )?;
-    append_action(draft, &input.rule_key, action)?;
-    Ok(format!("Added UpsertOverwrite to rule {}", input.rule_key))
-}
-
-fn add_interaction_action(
-    draft: &mut Draft,
-    input: InteractionActionInput,
-) -> Result<String, StructuredError> {
-    let (rule_key, action, label) = match input {
-        InteractionActionInput::OpenModal { rule_key, modal } => {
-            (rule_key, ActionSpec::OpenModal { modal }, "OpenModal")
-        }
-        InteractionActionInput::DeferEphemeral { rule_key } => {
-            (rule_key, ActionSpec::DeferEphemeral, "DeferEphemeral")
-        }
-        InteractionActionInput::EditResponse { rule_key, content } => (
-            rule_key,
-            ActionSpec::EditResponse { content },
-            "EditResponse",
-        ),
-    };
-    append_action(draft, &rule_key, action)?;
-    Ok(format!("Added {label} to rule {rule_key}"))
-}
-
-fn add_post_panel_action(
-    draft: &mut Draft,
-    input: AddPostPanelActionInput,
-) -> Result<String, StructuredError> {
-    let action = ActionSpec::PostPanel {
-        key: input.key.clone(),
-        channel: channel_reference(input.channel)?,
-        content: input.content,
-        buttons: input
-            .buttons
-            .into_iter()
-            .map(|button| ButtonSpec {
-                label: button.label,
-                route: pending_button_route(button.route),
-            })
-            .collect(),
-    };
-    append_action(draft, &input.rule_key, action)?;
-    Ok(format!(
-        "Added PostPanel {} to rule {}",
-        input.key, input.rule_key
-    ))
-}
-
-fn set_register_instance(
-    draft: &mut Draft,
-    input: SetRegisterInstanceInput,
-) -> Result<String, StructuredError> {
-    let rule = find_rule_mut(draft, &input.rule_key)?;
-    let existing_registration =
-        rule.actions
-            .iter()
-            .enumerate()
-            .find_map(|(index, action)| match action {
-                ActionSpec::RegisterInstance { key, .. } => Some((index, key.clone())),
-                _ => None,
-            });
-
-    let ownable = ownable_resources(rule);
-    if ownable.is_empty() {
+fn checked_edit<F>(draft: &mut Draft, edit: F) -> Result<String, StructuredError>
+where
+    F: FnOnce(&mut Draft) -> Result<String, StructuredError>,
+{
+    let mut candidate = draft.clone();
+    let change = edit(&mut candidate)?;
+    if let Some(error) = draft.newly_dangling_after(&candidate).first() {
+        return Err(translate_validation_error(&candidate.ruleset, error));
+    }
+    let unresolved = draft.newly_unresolved_after(&candidate);
+    if !unresolved.is_empty() {
         return Err(StructuredError::new(
-            "EMPTY_INSTANCE_RESOURCES",
-            format!("rule.{}.actions", input.rule_key),
-            "The instance-creation rule has no ownable resources",
-            "Create a role, channel, or posted panel before set_register_instance",
+            "DANGLING_REFERENCE",
+            "draft.references",
+            format!(
+                "The edit would leave unresolved references: {}",
+                unresolved.join(", ")
+            ),
+            "Update or remove dependent rules and actions before retrying this edit",
         ));
     }
-    let roles = manifest_map(&input.rule_key, "role", input.roles)?;
-    let channels = manifest_map(&input.rule_key, "channel", input.channels)?;
-    let messages = manifest_map(&input.rule_key, "message", input.messages)?;
-    ensure_complete_manifest(&input.rule_key, &ownable, &roles, &channels, &messages)?;
-
-    for action in &mut rule.actions {
-        if let ActionSpec::PostPanel { buttons, .. } = action {
-            for button in buttons {
-                if let ButtonRoute::InstanceAction { instance, .. } = &mut button.route {
-                    if matches!(
-                        instance,
-                        InstanceRef::Created(reference)
-                            if reference.created == PENDING_INSTANCE_REFERENCE
-                                || existing_registration
-                                    .as_ref()
-                                    .is_some_and(|(_, key)| reference.created == *key)
-                    ) {
-                        *instance = InstanceRef::Created(CreatedRef {
-                            created: input.instance_key.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    let action = ActionSpec::RegisterInstance {
-        key: input.instance_key.clone(),
-        kind: InstanceKind(input.kind),
-        resources: InstanceResourceRefs {
-            roles,
-            channels,
-            messages,
-        },
-    };
-    if let Some((index, _)) = existing_registration {
-        rule.actions.remove(index);
-    }
-    insert_before_edit(rule, action);
-    Ok(format!(
-        "Finalized instance {} for rule {}",
-        input.instance_key, input.rule_key
-    ))
-}
-
-fn append_action(
-    draft: &mut Draft,
-    rule_key: &str,
-    action: ActionSpec,
-) -> Result<(), StructuredError> {
-    let rule = find_rule_mut(draft, rule_key)?;
-    if matches!(action, ActionSpec::DeferEphemeral) {
-        rule.actions.insert(0, action);
-        return Ok(());
-    }
-    if matches!(action, ActionSpec::EditResponse { .. }) {
-        rule.actions.push(action);
-        return Ok(());
-    }
-    if let Some(index) = rule
-        .actions
-        .iter()
-        .position(|candidate| matches!(candidate, ActionSpec::RegisterInstance { .. }))
-    {
-        rule.actions.insert(index, action);
-        return Ok(());
-    }
-    insert_before_edit(rule, action);
-    Ok(())
-}
-
-fn insert_before_edit(rule: &mut InteractionRule, action: ActionSpec) {
-    let index = rule
-        .actions
-        .iter()
-        .position(|candidate| matches!(candidate, ActionSpec::EditResponse { .. }))
-        .unwrap_or(rule.actions.len());
-    rule.actions.insert(index, action);
+    draft.ruleset = candidate.ruleset;
+    Ok(change)
 }
 
 fn find_rule_mut<'a>(
@@ -568,66 +554,6 @@ fn find_rule_mut<'a>(
         })
 }
 
-fn modal_field(input: ModalFieldInput) -> ModalFieldSpec {
-    ModalFieldSpec {
-        key: input.key,
-        label: input.label,
-        style: match input.style {
-            ModalFieldStyleInput::Short => ModalFieldStyle::Short,
-            ModalFieldStyleInput::Paragraph => ModalFieldStyle::Paragraph,
-        },
-        required: input.required,
-    }
-}
-
-fn trigger(input: TriggerInput) -> TriggerSpec {
-    match input {
-        TriggerInput::ButtonClick { component } => TriggerSpec::ButtonClick { component },
-        TriggerInput::ModalSubmit { modal } => TriggerSpec::ModalSubmit { modal },
-        TriggerInput::InstanceAction { action } => TriggerSpec::InstanceAction { action },
-    }
-}
-
-fn declared_button_route(input: ButtonRouteInput) -> ButtonRoute {
-    match input {
-        ButtonRouteInput::Static { key } => ButtonRoute::Static { key },
-        ButtonRouteInput::InstanceAction { action } => ButtonRoute::InstanceAction {
-            instance: InstanceRef::Event,
-            action,
-        },
-    }
-}
-
-fn pending_button_route(input: ButtonRouteInput) -> ButtonRoute {
-    match input {
-        ButtonRouteInput::Static { key } => ButtonRoute::Static { key },
-        ButtonRouteInput::InstanceAction { action } => ButtonRoute::InstanceAction {
-            instance: InstanceRef::Created(CreatedRef {
-                created: PENDING_INSTANCE_REFERENCE.to_string(),
-            }),
-            action,
-        },
-    }
-}
-
-fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
-    match input {
-        ReferenceInput::Created { name } => Ok(RoleRef::Created(CreatedRef { created: name })),
-        ReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
-            .map(RoleRef::Existing)
-            .map_err(reference_conversion_error),
-    }
-}
-
-fn channel_reference(input: ReferenceInput) -> Result<ChannelRef, StructuredError> {
-    match input {
-        ReferenceInput::Created { name } => Ok(ChannelRef::Created(CreatedRef { created: name })),
-        ReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
-            .map(ChannelRef::Existing)
-            .map_err(reference_conversion_error),
-    }
-}
-
 fn reference_conversion_error(error: serde_json::Error) -> StructuredError {
     StructuredError::new(
         "INVALID_REFERENCE",
@@ -637,203 +563,47 @@ fn reference_conversion_error(error: serde_json::Error) -> StructuredError {
     )
 }
 
-fn overwrite_action(
-    channel: ReferenceInput,
-    target_kind: OverwriteTargetKindInput,
-    role: Option<ReferenceInput>,
-    allow: &[String],
-    deny: &[String],
-) -> Result<ActionSpec, StructuredError> {
-    let channel = reference_json(channel);
-    let target = match (target_kind, role) {
-        (OverwriteTargetKindInput::Everyone, None) => json!("everyone"),
-        (OverwriteTargetKindInput::Everyone, Some(_)) => {
-            return Err(StructuredError::new(
-                "UNEXPECTED_OVERWRITE_ROLE",
-                "tool.add_upsert_overwrite_action.arguments.role",
-                "role must be omitted when target_kind is everyone",
-                "Remove role or change target_kind to role",
-            ));
-        }
-        (OverwriteTargetKindInput::Role, Some(role)) => {
-            json!({"role": reference_json(role)})
-        }
-        (OverwriteTargetKindInput::Role, None) => {
-            return Err(StructuredError::new(
-                "MISSING_OVERWRITE_ROLE",
-                "tool.add_upsert_overwrite_action.arguments.role",
-                "role is required when target_kind is role",
-                "Set role to {\"kind\":\"created\",\"name\":\"alias\"} or an existing reference",
-            ));
-        }
-    };
-    let value = json!({
-        "type": "upsert_overwrite",
-        "channel": channel,
-        "target": target,
-        "allow": permission_bits(allow)?.to_string(),
-        "deny": permission_bits(deny)?.to_string()
-    });
-    serde_json::from_value(value).map_err(|error| {
-        StructuredError::new(
-            "ACTION_NORMALIZATION_FAILED",
-            "tool.add_upsert_overwrite_action",
-            "The overwrite action could not be normalized",
-            error.to_string(),
-        )
-    })
-}
-
-fn reference_json(input: ReferenceInput) -> Value {
-    match input {
-        ReferenceInput::Created { name } => json!({"created": name}),
-        ReferenceInput::Existing { name } => json!(name),
-    }
-}
-
-fn permission_bits(names: &[String]) -> Result<u64, StructuredError> {
-    let mut bits = 0;
-    for name in names {
-        bits |= match name.as_str() {
-            "create_instant_invite" => 1 << 0,
-            "kick_members" => 1 << 1,
-            "ban_members" => 1 << 2,
-            "administrator" => 1 << 3,
-            "manage_channels" => 1 << 4,
-            "manage_guild" => 1 << 5,
-            "add_reactions" => 1 << 6,
-            "view_channel" => 1 << 10,
-            "send_messages" => 1 << 11,
-            "manage_messages" => 1 << 13,
-            "embed_links" => 1 << 14,
-            "attach_files" => 1 << 15,
-            "read_message_history" => 1 << 16,
-            "mention_everyone" => 1 << 17,
-            "connect" => 1 << 20,
-            "speak" => 1 << 21,
-            "manage_roles" => 1 << 28,
-            "moderate_members" => 1 << 40,
-            _ => {
-                return Err(StructuredError::new(
-                    "UNKNOWN_PERMISSION",
-                    "tool.permissions",
-                    format!("Permission {name} is not modeled"),
-                    "Use a permission name exposed by discord-model",
-                ));
-            }
-        };
-    }
-    Ok(bits)
-}
-
-fn ownable_resources(rule: &InteractionRule) -> BTreeMap<String, &'static str> {
-    rule.actions
-        .iter()
-        .filter_map(|action| match action {
-            ActionSpec::CreateRole { key, .. } => Some((key.clone(), "role")),
-            ActionSpec::CreateChannel { key, .. } => Some((key.clone(), "channel")),
-            ActionSpec::PostPanel { key, .. } => Some((key.clone(), "message")),
-            _ => None,
-        })
-        .collect()
-}
-
-fn manifest_map(
-    rule_key: &str,
-    kind: &str,
-    entries: Vec<ManifestEntryInput>,
-) -> Result<BTreeMap<String, CreatedRef>, StructuredError> {
-    let mut result = BTreeMap::new();
-    for entry in entries {
-        if result
-            .insert(
-                entry.alias.clone(),
-                CreatedRef {
-                    created: entry.created,
-                },
-            )
-            .is_some()
-        {
-            return Err(StructuredError::new(
-                "DUPLICATE_INSTANCE_RESOURCE_ALIAS",
-                format!("rule.{rule_key}.register.{kind}.{}", entry.alias),
-                "The instance manifest repeats an alias",
-                "Use each manifest alias once",
-            ));
-        }
-    }
-    Ok(result)
-}
-
-fn ensure_complete_manifest(
-    rule_key: &str,
-    ownable: &BTreeMap<String, &'static str>,
-    roles: &BTreeMap<String, CreatedRef>,
-    channels: &BTreeMap<String, CreatedRef>,
-    messages: &BTreeMap<String, CreatedRef>,
-) -> Result<(), StructuredError> {
-    let mut counts = BTreeMap::new();
-    let mut declared = BTreeMap::new();
-    for reference in roles.values() {
-        *counts.entry(reference.created.clone()).or_insert(0usize) += 1;
-        declared.insert(reference.created.clone(), "role");
-    }
-    for reference in channels.values() {
-        *counts.entry(reference.created.clone()).or_insert(0usize) += 1;
-        declared.insert(reference.created.clone(), "channel");
-    }
-    for reference in messages.values() {
-        *counts.entry(reference.created.clone()).or_insert(0usize) += 1;
-        declared.insert(reference.created.clone(), "message");
-    }
-
-    for (key, kind) in ownable {
-        match declared.get(key) {
-            None => {
-                return Err(StructuredError::new(
-                    "INSTANCE_RESOURCE_MISSING",
-                    format!("rule.{rule_key}.actions"),
-                    format!("Created {kind} {key} is missing from the instance manifest"),
-                    format!("Add {key} once to the {kind} manifest"),
-                ));
-            }
-            Some(declared_kind) if declared_kind != kind => {
-                return Err(StructuredError::new(
-                    "INSTANCE_RESOURCE_TYPE_MISMATCH",
-                    format!("rule.{rule_key}.register"),
-                    format!("Created resource {key} is declared as {declared_kind}"),
-                    format!("Move {key} to the {kind} manifest"),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    for (key, count) in counts {
-        if count > 1 {
-            return Err(StructuredError::new(
-                "INSTANCE_RESOURCE_DECLARED_MULTIPLE_TIMES",
-                format!("rule.{rule_key}.register"),
-                format!("Created resource {key} is declared more than once"),
-                format!("Keep exactly one manifest entry for {key}"),
-            ));
-        }
-        if !ownable.contains_key(&key) {
-            return Err(StructuredError::new(
-                "UNRESOLVED_CREATED_REFERENCE",
-                format!("rule.{rule_key}.register"),
-                format!("Manifest resource {key} has not been created"),
-                format!("Add the matching create action before registering {key}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn missing_panel(panel_key: &str) -> StructuredError {
     StructuredError::new(
         "PANEL_NOT_FOUND",
         format!("panel.{panel_key}"),
         "The target panel does not exist",
         "Call add_panel before add_button",
+    )
+}
+
+fn missing_modal(modal_key: &str) -> StructuredError {
+    StructuredError::new(
+        "MODAL_NOT_FOUND",
+        format!("modal.{modal_key}"),
+        "The target modal does not exist",
+        "Call add_modal before updating or removing it",
+    )
+}
+
+fn missing_rule(rule_key: &str) -> StructuredError {
+    StructuredError::new(
+        "RULE_NOT_FOUND",
+        format!("rule.{rule_key}"),
+        "The target rule does not exist",
+        "Call begin_rule before updating or removing it",
+    )
+}
+
+fn action_not_found(rule_key: &str) -> StructuredError {
+    StructuredError::new(
+        "ACTION_NOT_FOUND",
+        format!("rule.{rule_key}.actions"),
+        "No action matches the selector",
+        "Use by_key for keyed actions or a zero-based by_kind occurrence",
+    )
+}
+
+fn empty_update(tool: &str, fields: &str) -> StructuredError {
+    StructuredError::new(
+        "EMPTY_UPDATE",
+        format!("tool.{tool}.arguments"),
+        "The update does not contain any changed fields",
+        format!("Set at least one of {fields}"),
     )
 }

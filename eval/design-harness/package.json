@@ -1,0 +1,14 @@
+{
+  "name": "starring-design-harness-eval",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "check": "npm test && node --check provider.js && node --check assertions.js && node --check summarize.js && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate -c promptfooconfig.yaml",
+    "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval -c promptfooconfig.yaml -j 1 --no-cache --no-share --no-write",
+    "summarize": "node summarize.js",
+    "test": "node --test assertions.test.js provider.test.js summarize.test.js"
+  },
+  "devDependencies": {
+    "promptfoo": "0.121.18"
+  }
+}

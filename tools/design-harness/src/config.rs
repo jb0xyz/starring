@@ -1,15 +1,30 @@
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 
 use design_harness::SessionConfig;
 
 const DEFAULT_BASE_URL: &str = "https://llm-api.starring.co.kr/v1";
+const DEFAULT_MODEL: &str = "gemma4:12b-mlx";
+const DEFAULT_SESSION_ID: &str = "default";
 
 pub struct EdgeConfig {
     pub base_url: String,
     pub api_key: String,
+    pub model: String,
     pub session_config: SessionConfig,
+}
+
+pub struct PersistenceConfig {
+    pub db_path: PathBuf,
+    pub session_id: String,
+}
+
+impl PersistenceConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        persistence_config_from(|name| env::var(name).ok())
+    }
 }
 
 impl EdgeConfig {
@@ -23,10 +38,15 @@ impl EdgeConfig {
         if api_key.trim().is_empty() {
             return Err(ConfigError::MissingApiKey);
         }
+        let model = env::var("STARRING_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        if model.trim().is_empty() {
+            return Err(ConfigError::EmptyModel);
+        }
         let session_config = session_config_from(|name| env::var(name).ok())?;
         Ok(Self {
             base_url,
             api_key,
+            model,
             session_config,
         })
     }
@@ -76,19 +96,62 @@ fn parse_bound(
         .ok_or(ConfigError::InvalidBound { name })
 }
 
+fn persistence_config_from<F>(mut value: F) -> Result<PersistenceConfig, ConfigError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let session_id =
+        value("STARRING_HARNESS_SESSION_ID").unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
+    if session_id.trim().is_empty() {
+        return Err(ConfigError::EmptySessionId);
+    }
+    let db_path = match value("STARRING_HARNESS_DB_PATH") {
+        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+        Some(_) => return Err(ConfigError::EmptyDatabasePath),
+        None => {
+            let home = value("HOME")
+                .filter(|home| !home.trim().is_empty())
+                .ok_or(ConfigError::MissingHomeForDefaultDatabasePath)?;
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("starring")
+                .join("design-harness.sqlite3")
+        }
+    };
+    Ok(PersistenceConfig {
+        db_path,
+        session_id,
+    })
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
+    EmptyDatabasePath,
     EmptyBaseUrl,
+    EmptyModel,
+    EmptySessionId,
     InvalidBound { name: &'static str },
     MissingApiKey,
+    MissingHomeForDefaultDatabasePath,
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyDatabasePath => {
+                formatter.write_str("STARRING_HARNESS_DB_PATH must not be empty")
+            }
             Self::EmptyBaseUrl => formatter.write_str("STARRING_LLM_BASE_URL must not be empty"),
+            Self::EmptyModel => formatter.write_str("STARRING_LLM_MODEL must not be empty"),
+            Self::EmptySessionId => {
+                formatter.write_str("STARRING_HARNESS_SESSION_ID must not be empty")
+            }
             Self::InvalidBound { name } => write!(formatter, "{name} must be a positive integer"),
             Self::MissingApiKey => formatter.write_str("STARRING_LLM_API_KEY is required"),
+            Self::MissingHomeForDefaultDatabasePath => formatter.write_str(
+                "HOME or STARRING_HARNESS_DB_PATH is required for interactive persistence",
+            ),
         }
     }
 }
@@ -99,7 +162,7 @@ impl Error for ConfigError {}
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{session_config_from, ConfigError};
+    use super::{persistence_config_from, session_config_from, ConfigError};
 
     #[test]
     fn session_bounds_use_defaults_when_env_is_absent() {
@@ -108,7 +171,7 @@ mod tests {
         assert_eq!(config.max_model_calls, 12);
         assert_eq!(config.max_tool_calls, 24);
         assert_eq!(config.max_gate_failures, 4);
-        assert_eq!(config.context_char_budget, 16_000);
+        assert_eq!(config.context_char_budget, 44_000);
     }
 
     #[test]
@@ -147,6 +210,50 @@ mod tests {
             Err(ConfigError::InvalidBound {
                 name: "STARRING_HARNESS_CONTEXT_CHARS"
             })
+        ));
+    }
+
+    #[test]
+    fn persistence_defaults_under_home_and_accepts_overrides() {
+        let defaults =
+            persistence_config_from(|name| (name == "HOME").then(|| "/home/tester".to_string()))
+                .unwrap();
+        assert_eq!(defaults.session_id, "default");
+        assert_eq!(
+            defaults.db_path,
+            std::path::Path::new("/home/tester/.local/share/starring/design-harness.sqlite3")
+        );
+
+        let values = BTreeMap::from([
+            ("STARRING_HARNESS_DB_PATH", "/tmp/harness.db"),
+            ("STARRING_HARNESS_SESSION_ID", "study-room"),
+        ]);
+        let custom =
+            persistence_config_from(|name| values.get(name).map(ToString::to_string)).unwrap();
+        assert_eq!(custom.db_path, std::path::Path::new("/tmp/harness.db"));
+        assert_eq!(custom.session_id, "study-room");
+    }
+
+    #[test]
+    fn persistence_rejects_empty_values_and_missing_home() {
+        assert!(matches!(
+            persistence_config_from(|_| None),
+            Err(ConfigError::MissingHomeForDefaultDatabasePath)
+        ));
+        assert!(matches!(
+            persistence_config_from(|name| match name {
+                "HOME" => Some("/home/tester".to_string()),
+                "STARRING_HARNESS_SESSION_ID" => Some(String::new()),
+                _ => None,
+            }),
+            Err(ConfigError::EmptySessionId)
+        ));
+        assert!(matches!(
+            persistence_config_from(|name| match name {
+                "STARRING_HARNESS_DB_PATH" => Some(String::new()),
+                _ => None,
+            }),
+            Err(ConfigError::EmptyDatabasePath)
         ));
     }
 }
