@@ -33,6 +33,22 @@ impl<C> DesignSession<C> {
         match state.phase {
             AdaptivePhase::Assess => definitions_named(&self.tools, &["set_turn_brief"]),
             AdaptivePhase::Build => {
+                if self.planned_enabled
+                    && state
+                        .brief
+                        .as_ref()
+                        .is_some_and(|brief| brief.intent == crate::turn::TurnIntent::Build)
+                {
+                    let planned = state
+                        .brief
+                        .as_ref()
+                        .is_some_and(|brief| !brief.requirements.is_empty());
+                    return if planned {
+                        Vec::new()
+                    } else {
+                        definitions_named(&self.tools, &["set_turn_plan"])
+                    };
+                }
                 let mut names = state
                     .brief
                     .as_ref()
@@ -171,7 +187,7 @@ pub(super) fn is_mutation_tool(name: &str) -> bool {
 pub(super) fn is_control_tool(name: &str) -> bool {
     matches!(
         name,
-        "set_turn_brief" | "check_turn_scope" | "render_preview" | "finish_turn"
+        "set_turn_brief" | "set_turn_plan" | "check_turn_scope" | "render_preview" | "finish_turn"
     )
 }
 

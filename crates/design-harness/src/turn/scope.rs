@@ -205,7 +205,7 @@ pub enum ScopeAction {
 }
 
 impl ScopeAction {
-    fn kind(&self) -> ActionKind {
+    pub(crate) fn kind(&self) -> ActionKind {
         match self {
             Self::GrantRole { .. } => ActionKind::GrantRole,
             Self::RespondEphemeral { .. } => ActionKind::RespondEphemeral,
@@ -330,7 +330,7 @@ pub fn required_mutation_tools(brief: &TurnBrief) -> BTreeSet<String> {
     tools
 }
 
-fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool {
+pub(crate) fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool {
     match requirement {
         ScopeRequirement::Panel {
             key,
@@ -396,7 +396,7 @@ fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool 
     }
 }
 
-fn action_matches(action: &ActionSpec, required: &ScopeAction) -> bool {
+pub(crate) fn action_matches(action: &ActionSpec, required: &ScopeAction) -> bool {
     match (action, required) {
         (
             ActionSpec::GrantRole { role, target },
@@ -505,7 +505,7 @@ fn action_target_matches(target: &ActionTarget, expected: ScopeActionTarget) -> 
     )
 }
 
-fn resource_ref_matches(reference: &ChannelRef, expected: &ScopeResourceRef) -> bool {
+pub(crate) fn resource_ref_matches(reference: &ChannelRef, expected: &ScopeResourceRef) -> bool {
     match (reference, expected) {
         (ChannelRef::Created(reference), ScopeResourceRef::Created { name }) => {
             reference.created == *name
@@ -542,7 +542,10 @@ fn instance_ref_matches(reference: &InstanceRef, expected: &ScopeInstanceRef) ->
     }
 }
 
-fn overwrite_target_matches(target: &OverwriteTargetSpec, expected: &ScopeOverwriteTarget) -> bool {
+pub(crate) fn overwrite_target_matches(
+    target: &OverwriteTargetSpec,
+    expected: &ScopeOverwriteTarget,
+) -> bool {
     match (target, expected) {
         (OverwriteTargetSpec::Everyone, ScopeOverwriteTarget::Everyone) => true,
         (OverwriteTargetSpec::Role(role), ScopeOverwriteTarget::Role { role: expected }) => {

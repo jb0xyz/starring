@@ -130,11 +130,21 @@ struct SetTurnBriefInput {
     validate: bool,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetTurnPlanInput {
+    requirements: Vec<ScopeRequirement>,
+}
+
 pub fn control_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         definition::<SetTurnBriefInput>(
             "set_turn_brief",
             "Classify the current user turn with a concise objective and verification plan",
+        ),
+        definition::<SetTurnPlanInput>(
+            "set_turn_plan",
+            "Declare the exact ordered Draft requirements for the current additive build turn",
         ),
         definition::<EmptyInput>(
             "check_turn_scope",
@@ -164,6 +174,10 @@ pub fn parse_turn_brief(arguments: &str) -> Result<TurnBrief, StructuredError> {
             simulation: SimulationProfile::None,
         },
     })
+}
+
+pub(crate) fn parse_turn_plan(arguments: &str) -> Result<Vec<ScopeRequirement>, StructuredError> {
+    parse::<SetTurnPlanInput>("set_turn_plan", arguments).map(|input| input.requirements)
 }
 
 pub fn parse_finish_turn(arguments: &str) -> Result<FinishTurn, StructuredError> {
@@ -243,6 +257,12 @@ mod tests {
             .parameters;
         assert!(schema.pointer("/properties/validate").is_some());
         assert!(schema.pointer("/properties/simulation").is_none());
+        let plan = parse_turn_plan(
+            r#"{"requirements":[{"kind":"no_unresolved_references","id":"refs"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(parse_turn_plan(r#"{"requirements":[],"extra":true}"#).is_err());
         assert!(parse_finish_turn(
             r#"{"kind":"needs_input","message":"Choose a genre","question":"Which genre?"}"#
         )
@@ -280,6 +300,6 @@ mod tests {
             finish_schema["$defs"]["FinishTurnKind"]["enum"],
             json!(["needs_input", "progressed", "ready"])
         );
-        assert_eq!(control_tool_definitions().len(), 4);
+        assert_eq!(control_tool_definitions().len(), 5);
     }
 }

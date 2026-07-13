@@ -76,6 +76,12 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
 
     async fn run_automatic_gate(&mut self, name: &str) -> Result<bool, BurstOutcome> {
         if self.turn_tool_calls() >= self.config.max_tool_calls {
+            self.rollback_planned_root(StructuredError::new(
+                "PLAN_TOOL_CALL_LIMIT",
+                "turn.plan",
+                "The planned verification path exhausted the tool call budget",
+                "Retry the request with a smaller plan or a larger tool call budget",
+            ));
             return Err(self.halt(
                 "TOOL_CALL_LIMIT_EXHAUSTED",
                 "The session exhausted its executed tool call budget",
@@ -93,6 +99,19 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
         self.record_failure(Some(name), &result);
         if result.is_ok() {
             return Ok(true);
+        }
+        let planned_error = result.failure().map(|failure| {
+            StructuredError::new(
+                failure.code.clone(),
+                failure.location.clone(),
+                failure.message.clone(),
+                failure.hint.clone(),
+            )
+        });
+        if let Some(error) = planned_error {
+            if let Some(recovery) = self.recover_planned_phase_failure(error) {
+                return recovery;
+            }
         }
         if self.turn_gate_failures() >= self.config.max_gate_failures {
             return Err(self.halt(
@@ -131,6 +150,12 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
 
     async fn run_automatic_preview(&mut self) -> Result<bool, BurstOutcome> {
         if self.turn_tool_calls() >= self.config.max_tool_calls {
+            self.rollback_planned_root(StructuredError::new(
+                "PLAN_TOOL_CALL_LIMIT",
+                "turn.plan",
+                "The planned preview path exhausted the tool call budget",
+                "Retry the request with a smaller plan or a larger tool call budget",
+            ));
             return Err(self.halt(
                 "TOOL_CALL_LIMIT_EXHAUSTED",
                 "The session exhausted its executed tool call budget",
@@ -162,6 +187,9 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
                 )
             },
         );
+        if let Some(recovery) = self.recover_planned_phase_failure(error.clone()) {
+            return recovery;
+        }
         self.last_error = Some(error);
         Err(self.halt(
             "AUTOMATIC_PREVIEW_FAILED",

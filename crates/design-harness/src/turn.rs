@@ -1,5 +1,9 @@
+mod plan;
 mod protocol;
 mod scope;
+
+pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
+pub(crate) use protocol::parse_turn_plan;
 
 pub use protocol::{
     control_tool_definitions, parse_empty_control, parse_finish_turn, parse_turn_brief,

@@ -9,13 +9,14 @@ use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::tools::{dispatch_tool, ToolDefinition};
 use crate::turn::{
-    check_scope, parse_empty_control, parse_finish_turn, parse_turn_brief, render_preview,
-    AdaptivePhase, AdaptiveTurnState, FinishTurnKind, RequestedOutcome, SimulationProfile,
-    TurnBrief, TurnIntent,
+    check_scope, normalize_turn_plan, parse_empty_control, parse_finish_turn, parse_turn_brief,
+    parse_turn_plan, render_preview, AdaptivePhase, AdaptiveTurnState, FinishTurnKind,
+    RequestedOutcome, SimulationProfile, TurnBrief, TurnIntent,
 };
 
 mod adaptive;
 mod context;
+mod frontier;
 mod repair;
 mod routing;
 mod snapshot;
@@ -29,7 +30,7 @@ use routing::{
 };
 use snapshot::validate_snapshot;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Modification requests must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. When set_turn_plan is the only available tool, submit the exact ordered semantic requirements once; the harness executes them deterministically. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Modification requests must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
 
 const NUDGE: &str = "Call a design tool to change the Draft; use QUESTION: only for a blocking decision; use PROGRESSED: after useful changes when another user turn is appropriate; use READY: only after validate_draft passes on the current revision.";
 const REPAIR_REQUIRED_PREFIX: &str = "REPAIR_REQUIRED:";
@@ -85,6 +86,22 @@ pub struct Observability {
     pub repair_failures: usize,
     pub repair_escalations: usize,
     pub nudge_count: usize,
+    #[serde(default)]
+    pub plan_submissions: usize,
+    #[serde(default)]
+    pub plan_acceptances: usize,
+    #[serde(default)]
+    pub planned_requirements: usize,
+    #[serde(default)]
+    pub plan_compiled_tool_calls: usize,
+    #[serde(default)]
+    pub plan_execution_failures: usize,
+    #[serde(default)]
+    pub plan_rollbacks: usize,
+    #[serde(default)]
+    pub plan_commits: usize,
+    #[serde(default)]
+    pub plan_conflicts: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -210,6 +227,9 @@ pub struct DesignSession<C> {
     turn_state: Option<TurnState>,
     adaptive_turn: Option<AdaptiveTurnState>,
     adaptive_enabled: bool,
+    planned_enabled: bool,
+    planned_execution_attempts: u8,
+    planned_root_draft: Option<Draft>,
     brief_history: Vec<TurnBrief>,
 }
 
@@ -219,14 +239,23 @@ impl<C> DesignSession<C> {
     }
 
     pub fn with_config(client: C, config: SessionConfig) -> Self {
-        Self::build(client, config, false)
+        Self::build(client, config, false, false)
     }
 
     pub fn with_adaptive_config(client: C, config: SessionConfig) -> Self {
-        Self::build(client, config, true)
+        Self::build(client, config, true, false)
     }
 
-    fn build(client: C, config: SessionConfig, adaptive_enabled: bool) -> Self {
+    pub fn with_planned_config(client: C, config: SessionConfig) -> Self {
+        Self::build(client, config, true, true)
+    }
+
+    fn build(
+        client: C,
+        config: SessionConfig,
+        adaptive_enabled: bool,
+        planned_enabled: bool,
+    ) -> Self {
         let draft = Draft::new();
         let messages = vec![Message::system(DEFAULT_SYSTEM_PROMPT)];
         Self {
@@ -246,6 +275,9 @@ impl<C> DesignSession<C> {
             turn_state: None,
             adaptive_turn: None,
             adaptive_enabled,
+            planned_enabled,
+            planned_execution_attempts: 0,
+            planned_root_draft: None,
             brief_history: Vec::new(),
         }
     }
@@ -278,6 +310,10 @@ impl<C> DesignSession<C> {
         self.adaptive_enabled
     }
 
+    pub fn planned_enabled(&self) -> bool {
+        self.planned_enabled
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             schema_version: SESSION_SNAPSHOT_VERSION,
@@ -302,12 +338,30 @@ impl<C> DesignSession<C> {
         config: SessionConfig,
         snapshot: SessionSnapshot,
     ) -> Result<Self, SessionSnapshotError> {
+        Self::restore_with_mode(client, config, snapshot, false)
+    }
+
+    pub fn restore_planned(
+        client: C,
+        config: SessionConfig,
+        snapshot: SessionSnapshot,
+    ) -> Result<Self, SessionSnapshotError> {
+        Self::restore_with_mode(client, config, snapshot, true)
+    }
+
+    fn restore_with_mode(
+        client: C,
+        config: SessionConfig,
+        snapshot: SessionSnapshot,
+        planned_enabled: bool,
+    ) -> Result<Self, SessionSnapshotError> {
         validate_snapshot(&snapshot)?;
+        let adaptive_enabled = snapshot.adaptive_enabled || planned_enabled;
         Ok(Self {
             client,
             draft: snapshot.draft,
             messages: snapshot.messages,
-            tools: if snapshot.adaptive_enabled {
+            tools: if adaptive_enabled {
                 all_tool_definitions()
             } else {
                 legacy_tool_definitions()
@@ -319,7 +373,10 @@ impl<C> DesignSession<C> {
             repair_state: snapshot.repair_state,
             turn_state: snapshot.turn_state,
             adaptive_turn: snapshot.adaptive_turn,
-            adaptive_enabled: snapshot.adaptive_enabled,
+            adaptive_enabled,
+            planned_enabled,
+            planned_execution_attempts: 0,
+            planned_root_draft: None,
             brief_history: snapshot.brief_history,
         })
     }
@@ -391,6 +448,8 @@ impl<C> DesignSession<C> {
             gate_failures: 0,
         });
         self.adaptive_turn = self.adaptive_enabled.then(AdaptiveTurnState::default);
+        self.planned_execution_attempts = 0;
+        self.planned_root_draft = None;
     }
 
     fn turn_model_calls(&self) -> usize {
@@ -491,6 +550,39 @@ impl<C> DesignSession<C> {
         )
     }
 
+    fn awaiting_planned_submission(&self) -> bool {
+        self.planned_enabled
+            && self.adaptive_turn.as_ref().is_some_and(|state| {
+                state.phase == AdaptivePhase::Build
+                    && state.brief.as_ref().is_some_and(|brief| {
+                        brief.intent == TurnIntent::Build && brief.requirements.is_empty()
+                    })
+            })
+    }
+
+    fn consume_planned_response_failure(
+        &mut self,
+        attempts_before: u8,
+        error: Option<StructuredError>,
+    ) -> Option<BurstOutcome> {
+        if self.planned_execution_attempts == attempts_before {
+            self.planned_execution_attempts = self.planned_execution_attempts.saturating_add(1);
+        }
+        if let Some(error) = error {
+            let result = ToolResult::failure_from(&self.draft, error);
+            self.record_failure(None, &result);
+        }
+        if self.planned_execution_attempts >= 2 {
+            return Some(self.halt(
+                "PLAN_REPAIR_FAILED",
+                "The single automatic turn-plan repair failed",
+                None,
+            ));
+        }
+        self.add_nudge();
+        None
+    }
+
     fn dispatch_control_tool(
         &mut self,
         name: &str,
@@ -570,6 +662,73 @@ impl<C> DesignSession<C> {
                 });
                 (
                     ToolResult::success(&self.draft, "Recorded the current turn brief"),
+                    None,
+                )
+            }
+            "set_turn_plan" => {
+                if !self.planned_enabled {
+                    return (
+                        ToolResult::failure_from(
+                            &self.draft,
+                            StructuredError::new(
+                                "TURN_PLAN_MODE_REQUIRED",
+                                "tool.set_turn_plan",
+                                "Typed turn plans are not enabled for this session",
+                                "Use a planned design session before setting a turn plan",
+                            ),
+                        ),
+                        None,
+                    );
+                }
+                self.planned_execution_attempts = self.planned_execution_attempts.saturating_add(1);
+                let requirements = match parse_turn_plan(arguments) {
+                    Ok(requirements) => requirements,
+                    Err(error) => return (ToolResult::failure_from(&self.draft, error), None),
+                };
+                let Some(brief) = self
+                    .adaptive_turn
+                    .as_ref()
+                    .and_then(|state| state.brief.as_ref())
+                    .cloned()
+                else {
+                    return (
+                        ToolResult::failure_from(
+                            &self.draft,
+                            StructuredError::new(
+                                "TURN_BRIEF_REQUIRED",
+                                "tool.set_turn_plan",
+                                "No active turn brief exists",
+                                "Call set_turn_brief before setting the turn plan",
+                            ),
+                        ),
+                        None,
+                    );
+                };
+                let requirements = match normalize_turn_plan(&self.draft, &brief, requirements) {
+                    Ok(requirements) => requirements,
+                    Err(error) => {
+                        if frontier::is_plan_conflict_code(&error.code) {
+                            self.observability.plan_conflicts =
+                                self.observability.plan_conflicts.saturating_add(1);
+                        }
+                        return (ToolResult::failure_from(&self.draft, error), None);
+                    }
+                };
+                self.observability.plan_acceptances =
+                    self.observability.plan_acceptances.saturating_add(1);
+                self.observability.planned_requirements = self
+                    .observability
+                    .planned_requirements
+                    .saturating_add(requirements.len());
+                if let Some(brief) = self
+                    .adaptive_turn
+                    .as_mut()
+                    .and_then(|state| state.brief.as_mut())
+                {
+                    brief.requirements = requirements;
+                }
+                (
+                    ToolResult::success(&self.draft, "Accepted the deterministic turn plan"),
                     None,
                 )
             }
@@ -924,17 +1083,54 @@ impl<C: LlmClient> DesignSession<C> {
 
             match response {
                 LlmResponse::ToolCalls(calls) => {
+                    let awaiting_plan = self.awaiting_planned_submission();
+                    let plan_attempts_before = self.planned_execution_attempts;
                     if calls.is_empty() {
+                        if awaiting_plan {
+                            self.messages.push(Message::assistant(
+                                "TURN_PLAN_RESPONSE_REJECTED: empty tool call batch",
+                            ));
+                            let error = StructuredError::new(
+                                "TURN_PLAN_RESPONSE_REQUIRED",
+                                "turn.plan.response",
+                                "The planning response did not submit set_turn_plan",
+                                "Call the sole routed set_turn_plan tool with exact ordered requirements",
+                            );
+                            if let Some(outcome) = self
+                                .consume_planned_response_failure(plan_attempts_before, Some(error))
+                            {
+                                return outcome;
+                            }
+                            continue;
+                        }
                         return self.halt(
                             "EMPTY_TOOL_CALL_BATCH",
                             "The model returned an empty tool call batch",
                             None,
                         );
                     }
+                    if awaiting_plan && !valid_planned_tool_call_ids(&calls) {
+                        self.messages.push(Message::assistant(
+                            "TURN_PLAN_RESPONSE_REJECTED: invalid tool call identifiers",
+                        ));
+                        let error = StructuredError::new(
+                            "TURN_PLAN_RESPONSE_REJECTED",
+                            "turn.plan.response",
+                            "The planning response contained empty or duplicate tool call identifiers",
+                            "Return one set_turn_plan call with a non-empty unique identifier",
+                        );
+                        if let Some(outcome) =
+                            self.consume_planned_response_failure(plan_attempts_before, Some(error))
+                        {
+                            return outcome;
+                        }
+                        continue;
+                    }
                     self.prose_nudged = false;
                     self.messages
                         .push(Message::assistant_tool_calls(calls.clone()));
                     let mut failed = false;
+                    let mut submitted_plan = false;
                     for (index, call) in calls.iter().enumerate() {
                         if failed {
                             let result = self.not_executed_result();
@@ -955,6 +1151,10 @@ impl<C: LlmClient> DesignSession<C> {
                         let control = is_control_tool(&call.name);
                         let available = routed_tools.iter().any(|tool| tool.name == call.name)
                             && (control || tool_is_available(&self.draft, &call.name));
+                        if available && call.name == "set_turn_plan" {
+                            self.observability.plan_submissions =
+                                self.observability.plan_submissions.saturating_add(1);
+                        }
                         let (result, control_outcome) = if available && control {
                             self.dispatch_control_tool(&call.name, &call.arguments)
                         } else if available {
@@ -984,15 +1184,41 @@ impl<C: LlmClient> DesignSession<C> {
                         self.advance_adaptive_after_draft_tool(&call.name, result.is_ok());
                         self.record_failure(available.then_some(call.name.as_str()), &result);
                         let is_failure = !result.is_ok();
+                        if available && call.name == "set_turn_plan" && result.is_ok() {
+                            submitted_plan = true;
+                        }
                         self.messages
                             .push(Message::tool(call.id.clone(), result.as_json()));
+                        if call.name == "set_turn_plan"
+                            && !result.is_ok()
+                            && self.planned_execution_attempts >= 2
+                        {
+                            self.append_not_executed(&calls[index + 1..]);
+                            return self.halt(
+                                "PLAN_REPAIR_FAILED",
+                                "The single automatic turn-plan repair failed",
+                                None,
+                            );
+                        }
                         if self.adaptive_enabled
-                            && matches!(call.name.as_str(), "set_turn_brief" | "check_turn_scope")
+                            && matches!(
+                                call.name.as_str(),
+                                "set_turn_brief" | "set_turn_plan" | "check_turn_scope"
+                            )
                             && result.is_ok()
                         {
-                            if let Some(outcome) = self.run_automatic_adaptive_phases().await {
+                            let outcome = if call.name == "set_turn_plan" {
+                                self.run_automatic_planned_execution().await
+                            } else {
+                                self.run_automatic_adaptive_phases().await
+                            };
+                            if let Some(outcome) = outcome {
                                 self.append_phase_transition_not_executed(&calls[index + 1..]);
                                 return outcome;
+                            }
+                            if call.name == "set_turn_plan" {
+                                self.append_phase_transition_not_executed(&calls[index + 1..]);
+                                break;
                             }
                         }
                         if let Some(outcome) = control_outcome {
@@ -1025,12 +1251,35 @@ impl<C: LlmClient> DesignSession<C> {
                             break;
                         }
                     }
+                    if awaiting_plan && !submitted_plan {
+                        if let Some(outcome) =
+                            self.consume_planned_response_failure(plan_attempts_before, None)
+                        {
+                            return outcome;
+                        }
+                    }
                     if failed {
                         continue;
                     }
                 }
                 LlmResponse::Text(text) => {
+                    let awaiting_plan = self.awaiting_planned_submission();
+                    let plan_attempts_before = self.planned_execution_attempts;
                     self.messages.push(Message::assistant(text.clone()));
+                    if awaiting_plan {
+                        let error = StructuredError::new(
+                            "TURN_PLAN_RESPONSE_REQUIRED",
+                            "turn.plan.response",
+                            "The planning response returned prose instead of set_turn_plan",
+                            "Call the sole routed set_turn_plan tool with exact ordered requirements",
+                        );
+                        if let Some(outcome) =
+                            self.consume_planned_response_failure(plan_attempts_before, Some(error))
+                        {
+                            return outcome;
+                        }
+                        continue;
+                    }
                     if self.adaptive_enabled {
                         if !self.prose_nudged {
                             self.prose_nudged = true;
@@ -1080,4 +1329,11 @@ fn is_genuine_human_message(message: &Message) -> bool {
     message.role == MessageRole::User
         && message.content != NUDGE
         && !message.content.starts_with(REPAIR_REQUIRED_PREFIX)
+}
+
+fn valid_planned_tool_call_ids(calls: &[ToolCall]) -> bool {
+    let mut ids = BTreeSet::new();
+    calls
+        .iter()
+        .all(|call| !call.id.trim().is_empty() && ids.insert(call.id.as_str()))
 }
