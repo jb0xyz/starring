@@ -14,7 +14,7 @@ The CLI accepts a legacy plain-text prompt or a stateful document. Every scripte
 }
 ```
 
-Input schema version 2 selects the typed-plan lifecycle. It can start from an exact serialized Draft and can inject one deterministic `set_turn_plan` call for an isolated oracle experiment. Fixture references are expanded by the provider before the document reaches the CLI. Oracle injection occurs only when `set_turn_plan` is the sole exposed tool; all other model calls still use the configured gateway. If an injected plan is rejected, the oracle turn fails closed instead of delegating a replacement plan to the gateway. Passing oracle cases require exact injected, submitted, accepted, and committed plan provenance with no plan execution failure, rollback, or conflict.
+Input schema version 2 selects the typed-plan lifecycle. It can start from an exact serialized Draft and can inject optional deterministic `set_turn_brief` and `set_turn_plan` controls for an oracle experiment. An oracle plan requires a Build brief and is consumed strictly after that brief; a non-Build brief cannot carry an oracle plan. Fixture references are expanded by the provider before the document reaches the CLI. A configured control is injected only when it is the sole exposed tool. An unexpected frontier, repeated control, unconsumed control at turn end, or cross-turn reset makes the oracle turn fail closed. All unconfigured model calls still use the configured gateway. Passing oracle cases require exact control injection accounting and exact submitted, accepted, and committed plan provenance with no plan execution failure, rollback, or conflict.
 
 ```json
 {
@@ -25,6 +25,13 @@ Input schema version 2 selects the typed-plan lifecycle. It can start from an ex
     {
       "id": "resources",
       "input": "리소스 단계를 완성해줘",
+      "oracle_brief": {
+        "intent": "build",
+        "objective": "Complete the resource stage",
+        "requested_outcome": "draft_update",
+        "assumptions": [],
+        "validate": false
+      },
       "oracle_plan": { "$fixture": "studyroom_resources_plan" }
     }
   ]
@@ -33,7 +40,7 @@ Input schema version 2 selects the typed-plan lifecycle. It can start from an ex
 
 The version 2 report contains `turns`, cumulative observability, per-turn observability deltas, revision continuity, and elapsed time. Typed-plan observability separates submissions, accepted requirements, compiled tool calls, execution failures, rollbacks, commits, and conflicts. `actual_gates` reports stamps that the model really earned during the session. `postcheck` reports the evaluator's non-mutating validation and simulation checks. These are intentionally separate so a successful evaluator postcheck cannot be mistaken for a gate the model called.
 
-The cases cover a complete one-shot request, an ambiguous request that should ask one blocking question, multi-turn elaboration, additive and replacement revisions that must preserve earlier work, the complex StudyRoom one-shot stress test, and typed-plan StudyRoom one-shot, five-turn, resource, and finalize paths. Production typed-plan cases delegate every call to the configured model. Oracle cases inject only the declared plan calls and separately measure the remaining delegated model calls.
+The cases cover a complete one-shot request, an ambiguous request that should ask one blocking question, multi-turn elaboration, additive and replacement revisions that must preserve earlier work, the complex StudyRoom one-shot stress test, and typed-plan StudyRoom one-shot, five-turn, resource, and finalize paths. Production typed-plan cases delegate every call to the configured model. Oracle cases inject only their declared controls and separately measure the remaining delegated model calls.
 
 Run from the repository root:
 

@@ -246,6 +246,7 @@
           {
             "id": "submit-resources",
             "input": "기존 패널, 모달, open_modal 규칙을 정확히 보존해라. 이번 턴에는 key=submit_room 모달 제출 규칙과 다음 action만 순서대로 추가한다: ephemeral defer, key=member_role 역할(${input.room_name} members), key=room_channel 채널(study-${input.room_name}), 생성 채널에서 everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여. 이 턴은 draft_update이고 validate=false다. 패널 게시, 인스턴스 등록, validate, simulate는 하지 말고 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Complete the submit_room resource stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_resources_plan"}
           }
         ]
@@ -264,8 +265,8 @@
     expectedActions: 7
     expectedInitialRevision: 5
     expectedFinalRevision: 12
-    expectedInjectedControlCalls: 1
-    expectedInjectedCallsPerTurn: "1"
+    expectedInjectedControlCalls: 2
+    expectedInjectedCallsPerTurn: "2"
     expectedPlanAcceptancesPerTurn: "1"
     expectedPlanCommitsPerTurn: "1"
     requireOracleProvenance: true
@@ -310,6 +311,7 @@
           {
             "id": "submit-finalize",
             "input": "기존 설계와 submit_room의 6개 action을 정확히 보존해라. 그 뒤에 생성 채널의 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub의 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 순서대로 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널은 추가하지 말고 validate, simulate 없이 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Complete the submit_room finalize stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_finalize_plan"}
           }
         ]
@@ -328,8 +330,8 @@
     expectedActions: 11
     expectedInitialRevision: 12
     expectedFinalRevision: 16
-    expectedInjectedControlCalls: 1
-    expectedInjectedCallsPerTurn: "1"
+    expectedInjectedControlCalls: 2
+    expectedInjectedCallsPerTurn: "2"
     expectedPlanAcceptancesPerTurn: "1"
     expectedPlanCommitsPerTurn: "1"
     requireOracleProvenance: true
@@ -625,26 +627,31 @@
           {
             "id": "surface",
             "input": "Discord 스터디룸 자동화를 여러 턴에 걸쳐 조립할 거야. 이번 턴에는 표면 구조만 만들어라. study_hub 채널에 key=study_panel, content=Create a study room 패널을 선언하고 label=Create room, static key=create_study_room 버튼을 넣어라. 그리고 key=study_modal, title=Create study room 모달에 required short 필드 key=room_name, label=Room name을 둬라. 규칙이나 action은 아직 만들지 마라. 이 턴은 draft_update이고 validate=false다. validate나 simulate를 하지 말고 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Build the StudyRoom surface stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_surface_plan"}
           },
           {
             "id": "open-rule",
             "input": "기존 study_panel과 study_modal은 그대로 보존해라. 이번 턴에는 key=open_modal 규칙만 추가한다. 이 규칙은 create_study_room 버튼 클릭으로 시작하고 study_modal을 여는 action 하나만 가진다. 이 턴은 draft_update이고 validate=false다. validate나 simulate를 하지 말고 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Build the open_modal rule stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_open_rule_plan"}
           },
           {
             "id": "submit-resources",
             "input": "기존 설계는 모두 보존해라. 이번 턴에는 key=submit_room 규칙을 시작한다. 이 규칙은 study_modal 제출로 시작하고 순서대로 ephemeral defer, key=member_role 역할(${input.room_name} members) 생성, key=room_channel 채널(study-${input.room_name}) 생성, everyone의 view_channel 거부, member_role의 view_channel 허용, actor에게 member_role 부여를 추가한다. 여기까지만 하고 패널 게시나 인스턴스 등록은 하지 마라. 이 턴은 draft_update이고 validate=false다. validate나 simulate를 하지 말고 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Build the submit_room resource stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_resources_plan"}
           },
           {
             "id": "submit-finalize",
             "input": "submit_room 규칙에 이어서 나머지 action을 추가한다. 기존 action은 중복 추가하지 마라. 생성 채널에 key=welcome_panel, content=Welcome to ${input.room_name} 패널(Help static=study_help, Close instance action=close), study_hub에 key=hub_panel, content=${input.room_name} is open 패널(Join instance action=join), key=study_instance kind=study_room 등록(manifest alias member_role, room_channel, welcome_panel, hub_panel), Created ${input.room_name} 응답 수정을 완성해라. 이 턴은 draft_update이고 validate=false다. top-level 패널을 추가하지 말고 validate나 simulate 없이 progressed로 끝내라.",
+            "oracle_brief": {"intent":"build","objective":"Build the submit_room finalize stage","requested_outcome":"draft_update","assumptions":[],"validate":false},
             "oracle_plan": {"$fixture":"studyroom_finalize_plan"}
           },
           {
             "id": "validate-simulate",
-            "input": "이제 StudyRoom 설계가 끝났다. 더 이상 Draft를 바꾸지 마라. set_turn_brief를 intent=inspect, requested_outcome=validated_preview, validate=true로 설정하고 현재 revision을 validate한 뒤 StudyRoom golden trace로 simulate해서 미리보기 가능한 준비 상태로 끝내라. 질문하지 마라."
+            "input": "이제 StudyRoom 설계가 끝났다. 더 이상 Draft를 바꾸지 마라. set_turn_brief를 intent=inspect, requested_outcome=validated_preview, validate=true로 설정하고 현재 revision을 validate한 뒤 StudyRoom golden trace로 simulate해서 미리보기 가능한 준비 상태로 끝내라. 질문하지 마라.",
+            "oracle_brief": {"intent":"inspect","objective":"Verify the complete StudyRoom design","requested_outcome":"validated_preview","assumptions":[],"validate":true}
           }
         ]
       }
@@ -662,8 +669,8 @@
     expectedFinalRevision: 16
     expectedRevisionPath: "0>3,3>5,5>12,12>16,16>16"
     expectedLastTurnId: validate-simulate
-    expectedInjectedControlCalls: 4
-    expectedInjectedCallsPerTurn: "1,1,1,1,0"
+    expectedInjectedControlCalls: 9
+    expectedInjectedCallsPerTurn: "2,2,2,2,1"
     expectedPlanAcceptancesPerTurn: "1,1,1,1,0"
     expectedPlanCommitsPerTurn: "1,1,1,1,0"
     requireOracleProvenance: true

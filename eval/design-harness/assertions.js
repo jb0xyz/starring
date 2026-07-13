@@ -438,7 +438,7 @@ function oracleControlCalls(output, context) {
       const totalAcceptances = expectedAcceptances.reduce((sum, value) => sum + value, 0);
       const totalCommits = expectedCommits.reduce((sum, value) => sum + value, 0);
       const cumulative = [
-        ['plan_submissions', wanted],
+        ['plan_submissions', totalAcceptances],
         ['plan_acceptances', totalAcceptances],
         ['plan_commits', totalCommits],
         ['plan_execution_failures', 0],
@@ -453,11 +453,10 @@ function oracleControlCalls(output, context) {
       for (let index = 0; index < report.turns.length; index += 1) {
         const turn = report.turns[index];
         const delta = turn.observability_delta || {};
-        const expectedSubmission = expectedPerTurn[index];
         const expectedAcceptance = expectedAcceptances[index];
         const expectedCommit = expectedCommits[index];
         const turnMetrics = [
-          ['plan_submissions', expectedSubmission],
+          ['plan_submissions', expectedAcceptance],
           ['plan_acceptances', expectedAcceptance],
           ['plan_commits', expectedCommit],
           ['plan_execution_failures', 0],
@@ -493,7 +492,7 @@ function oracleControlCalls(output, context) {
     return result(
       failures.length === 0,
       failures.length === 0
-        ? `injected plan calls=${report.injected_control_calls}`
+        ? `injected control calls=${report.injected_control_calls}`
         : failures.join(', '),
     );
   });

@@ -78,7 +78,7 @@ test('provider accepts a positive timeout from the environment', async () => {
   }
 });
 
-test('provider hydrates exact Draft and oracle plan fixtures', () => {
+test('provider preserves oracle brief and hydrates exact Draft and plan fixtures', () => {
   const hydrated = JSON.parse(hydratePrompt(JSON.stringify({
     schema_version: 2,
     mode: 'typed_plan',
@@ -86,12 +86,21 @@ test('provider hydrates exact Draft and oracle plan fixtures', () => {
     turns: [{
       id: 'resources',
       input: 'Build resources',
+      oracle_brief: {
+        intent: 'build',
+        objective: 'Build resources',
+        requested_outcome: 'draft_update',
+        assumptions: [],
+        validate: false,
+      },
       oracle_plan: { $fixture: 'studyroom_resources_plan' },
     }],
   })));
 
   assert.equal(hydrated.initial_draft.draft_revision, 5);
   assert.equal(hydrated.initial_draft.ruleset.rules[0].key, 'open_modal');
+  assert.equal(hydrated.turns[0].oracle_brief.intent, 'build');
+  assert.equal(hydrated.turns[0].oracle_brief.validate, false);
   assert.equal(hydrated.turns[0].oracle_plan.requirements.length, 7);
   assert.equal(hydrated.turns[0].oracle_plan.requirements[4].action.deny[0], 'view_channel');
 });

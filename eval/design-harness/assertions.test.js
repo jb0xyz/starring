@@ -208,8 +208,8 @@ test('isolated resource assertions require exact semantics revisions and oracle 
     draft: { panels: 1, modals: 1, rules: 2, actions: 7, unresolved_references: [] },
     ruleset: structuredClone(fixtures.studyroom_before_finalize.ruleset),
     actual_gates: { validation_current: false, simulation_current: false },
-    injected_control_calls: 1,
-    delegated_model_calls: 2,
+    injected_control_calls: 2,
+    delegated_model_calls: 1,
     observability: {
       model_calls: 3,
       tool_calls: 10,
@@ -228,8 +228,8 @@ test('isolated resource assertions require exact semantics revisions and oracle 
       draft_revision_before: 5,
       draft_revision_after: 12,
       draft_changed: true,
-      injected_control_calls: 1,
-      delegated_model_calls: 2,
+      injected_control_calls: 2,
+      delegated_model_calls: 1,
       observability_delta: {
         model_calls: 3,
         tool_calls: 10,
@@ -252,8 +252,8 @@ test('isolated resource assertions require exact semantics revisions and oracle 
     expectedFinalRevision: 12,
     expectedRevisionPath: ['5>12'],
     expectedLastTurnId: 'submit-resources',
-    expectedInjectedControlCalls: 1,
-    expectedInjectedCallsPerTurn: ['1'],
+    expectedInjectedControlCalls: 2,
+    expectedInjectedCallsPerTurn: ['2'],
     expectedPlanAcceptancesPerTurn: ['1'],
     expectedPlanCommitsPerTurn: ['1'],
     requireOracleProvenance: true,
@@ -287,15 +287,15 @@ test('isolated resource assertions require exact semantics revisions and oracle 
     /submit-resources plan_execution_failures=1 expected=0/,
   );
   document.turns[0].observability_delta.plan_execution_failures = 0;
-  document.delegated_model_calls = 1;
-  document.turns[0].delegated_model_calls = 1;
+  document.delegated_model_calls = 0;
+  document.turns[0].delegated_model_calls = 0;
   assert.match(
     checks.oracleControlCalls(JSON.stringify(document), isolated).reason,
     /model_calls=3 accounted=2/,
   );
 });
 
-test('typed production assertions require zero injected plan calls', () => {
+test('typed production assertions require zero injected control calls', () => {
   const document = JSON.parse(statefulReport({
     input_schema_version: 2,
     mode: 'typed_plan',
@@ -342,15 +342,15 @@ test('typed production assertions require zero injected plan calls', () => {
   assert.equal(checks.oracleControlCalls(JSON.stringify(document), production).pass, false);
 });
 
-test('five-turn oracle assertions require four plans and a mutation-free inspect turn', () => {
+test('five-turn oracle assertions separate nine controls from four plans', () => {
   const path = [
-    ['surface', 0, 3, 1],
-    ['open-rule', 3, 5, 1],
-    ['submit-resources', 5, 12, 1],
-    ['submit-finalize', 12, 16, 1],
-    ['validate-simulate', 16, 16, 0],
+    ['surface', 0, 3, 2, 1],
+    ['open-rule', 3, 5, 2, 1],
+    ['submit-resources', 5, 12, 2, 1],
+    ['submit-finalize', 12, 16, 2, 1],
+    ['validate-simulate', 16, 16, 1, 0],
   ];
-  const turns = path.map(([id, before, after, injected]) => ({
+  const turns = path.map(([id, before, after, injected, plans]) => ({
     id,
     outcome: id === 'validate-simulate' ? 'ready' : 'progressed',
     question: null,
@@ -358,14 +358,14 @@ test('five-turn oracle assertions require four plans and a mutation-free inspect
     draft_revision_after: after,
     draft_changed: before !== after,
     injected_control_calls: injected,
-    delegated_model_calls: 2,
+    delegated_model_calls: 1,
     observability_delta: {
-      model_calls: 2 + injected,
+      model_calls: 1 + injected,
       tool_calls: 4,
       mutation_tool_calls: {},
-      plan_submissions: injected,
-      plan_acceptances: injected,
-      plan_commits: injected,
+      plan_submissions: plans,
+      plan_acceptances: plans,
+      plan_commits: plans,
       plan_execution_failures: 0,
       plan_rollbacks: 0,
       plan_conflicts: 0,
@@ -376,8 +376,8 @@ test('five-turn oracle assertions require four plans and a mutation-free inspect
     mode: 'typed_plan',
     outcome: 'ready',
     completed: true,
-    injected_control_calls: 4,
-    delegated_model_calls: 10,
+    injected_control_calls: 9,
+    delegated_model_calls: 5,
     observability: {
       model_calls: 14,
       tool_calls: 20,
@@ -398,8 +398,8 @@ test('five-turn oracle assertions require four plans and a mutation-free inspect
     expectedFinalRevision: 16,
     expectedRevisionPath: ['0>3', '3>5', '5>12', '12>16', '16>16'],
     expectedLastTurnId: 'validate-simulate',
-    expectedInjectedControlCalls: 4,
-    expectedInjectedCallsPerTurn: ['1', '1', '1', '1', '0'],
+    expectedInjectedControlCalls: 9,
+    expectedInjectedCallsPerTurn: ['2', '2', '2', '2', '1'],
     expectedPlanAcceptancesPerTurn: ['1', '1', '1', '1', '0'],
     expectedPlanCommitsPerTurn: ['1', '1', '1', '1', '0'],
     requireOracleProvenance: true,
@@ -426,6 +426,6 @@ test('five-turn oracle assertions require four plans and a mutation-free inspect
     /final_revision=17 expected=16/,
   );
   document.turns[4].draft_revision_after = 16;
-  document.turns[4].injected_control_calls = 1;
+  document.turns[4].injected_control_calls = 0;
   assert.equal(checks.oracleControlCalls(JSON.stringify(document), incremental).pass, false);
 });
