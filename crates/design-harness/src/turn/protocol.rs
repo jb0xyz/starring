@@ -144,7 +144,7 @@ pub fn control_tool_definitions() -> Vec<ToolDefinition> {
         ),
         definition::<SetTurnPlanInput>(
             "set_turn_plan",
-            "Declare the exact ordered Draft requirements for the current additive build turn",
+            "Declare exact ordered Draft requirements for additive work in the current build or modify-labeled turn",
         ),
         definition::<EmptyInput>(
             "check_turn_scope",

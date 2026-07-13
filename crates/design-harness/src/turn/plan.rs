@@ -21,12 +21,12 @@ pub(crate) fn normalize_turn_plan(
     brief: &TurnBrief,
     mut requirements: Vec<ScopeRequirement>,
 ) -> Result<Vec<ScopeRequirement>, StructuredError> {
-    if brief.intent != TurnIntent::Build {
+    if !matches!(brief.intent, TurnIntent::Build | TurnIntent::Modify) {
         return Err(plan_error(
             "TURN_PLAN_INTENT_UNSUPPORTED",
             "turn.plan.intent",
-            "Turn plans currently support additive build turns only",
-            "Use intent build for additive work or the existing modify workflow for edits and removals",
+            "Turn plans support additive build or modify-labeled turns only",
+            "Use a turn plan for additive work or the modify workflow for actual edits and removals",
         ));
     }
     if !brief.requirements.is_empty() {

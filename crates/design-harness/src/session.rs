@@ -30,7 +30,7 @@ use routing::{
 };
 use snapshot::validate_snapshot;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. When set_turn_plan is the only available tool, submit the exact ordered semantic requirements once; the harness executes them deterministically. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Modification requests must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. Classify adding new Draft structure as build and changing or removing existing structure as modify. Build turns use set_turn_plan for exact ordered semantic requirements. A modify turn may offer Draft-legal update or remove tools beside set_turn_plan; use set_turn_plan when the requested work is actually additive, and use update or remove only for a true edit or removal. After attempting set_turn_plan, repair only through set_turn_plan. The harness executes accepted plans deterministically. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Actual edits and removals must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
 
 const NUDGE: &str = "Call a design tool to change the Draft; use QUESTION: only for a blocking decision; use PROGRESSED: after useful changes when another user turn is appropriate; use READY: only after validate_draft passes on the current revision.";
 const REPAIR_REQUIRED_PREFIX: &str = "REPAIR_REQUIRED:";
@@ -555,9 +555,54 @@ impl<C> DesignSession<C> {
             && self.adaptive_turn.as_ref().is_some_and(|state| {
                 state.phase == AdaptivePhase::Build
                     && state.brief.as_ref().is_some_and(|brief| {
-                        brief.intent == TurnIntent::Build && brief.requirements.is_empty()
+                        brief.requirements.is_empty()
+                            && (brief.intent == TurnIntent::Build
+                                || brief.intent == TurnIntent::Modify
+                                    && self.planned_execution_attempts > 0)
                     })
             })
+    }
+
+    fn awaiting_planned_modify_choice(&self) -> bool {
+        self.planned_enabled
+            && self.planned_execution_attempts == 0
+            && self.adaptive_turn.as_ref().is_some_and(|state| {
+                state.phase == AdaptivePhase::Build
+                    && state.brief.as_ref().is_some_and(|brief| {
+                        brief.intent == TurnIntent::Modify && brief.requirements.is_empty()
+                    })
+            })
+            && self
+                .turn_state
+                .as_ref()
+                .is_some_and(|turn| turn.started_revision == self.draft.draft_revision)
+    }
+
+    fn reject_mixed_planned_modify_batch(&mut self, calls: &[ToolCall]) {
+        self.messages
+            .push(Message::assistant_tool_calls(calls.to_vec()));
+        self.planned_execution_attempts = self.planned_execution_attempts.saturating_add(1);
+        self.observability.plan_submissions = self.observability.plan_submissions.saturating_add(1);
+        let result = ToolResult::failure_from(
+            &self.draft,
+            StructuredError::new(
+                "TURN_PLAN_MIXED_EXECUTION_PATHS",
+                "turn.plan.response",
+                "A modify-labeled response combined set_turn_plan with another tool call",
+                "Submit exactly one set_turn_plan call for additive work, or use only update and remove tools for a true modification",
+            ),
+        );
+        self.record_failure(Some("set_turn_plan"), &result);
+        let mut reported = false;
+        for call in calls {
+            let content = if call.name == "set_turn_plan" && !reported {
+                reported = true;
+                result.as_json()
+            } else {
+                self.not_executed_result().as_json()
+            };
+            self.messages.push(Message::tool(call.id.clone(), content));
+        }
     }
 
     fn consume_planned_response_failure(
@@ -1084,6 +1129,8 @@ impl<C: LlmClient> DesignSession<C> {
             match response {
                 LlmResponse::ToolCalls(calls) => {
                     let awaiting_plan = self.awaiting_planned_submission();
+                    let modify_selects_plan = self.awaiting_planned_modify_choice()
+                        && calls.iter().any(|call| call.name == "set_turn_plan");
                     let plan_attempts_before = self.planned_execution_attempts;
                     if calls.is_empty() {
                         if awaiting_plan {
@@ -1109,7 +1156,9 @@ impl<C: LlmClient> DesignSession<C> {
                             None,
                         );
                     }
-                    if awaiting_plan && !valid_planned_tool_call_ids(&calls) {
+                    if (awaiting_plan || modify_selects_plan)
+                        && !valid_planned_tool_call_ids(&calls)
+                    {
                         self.messages.push(Message::assistant(
                             "TURN_PLAN_RESPONSE_REJECTED: invalid tool call identifiers",
                         ));
@@ -1124,6 +1173,11 @@ impl<C: LlmClient> DesignSession<C> {
                         {
                             return outcome;
                         }
+                        continue;
+                    }
+                    if modify_selects_plan && (calls.len() != 1 || calls[0].name != "set_turn_plan")
+                    {
+                        self.reject_mixed_planned_modify_batch(&calls);
                         continue;
                     }
                     self.prose_nudged = false;

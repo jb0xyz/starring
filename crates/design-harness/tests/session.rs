@@ -25,6 +25,11 @@ fn adaptive_system_prompt_assigns_automatic_gates_to_the_harness() {
     assert!(DEFAULT_SYSTEM_PROMPT.contains(
         "For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true"
     ));
+    assert!(DEFAULT_SYSTEM_PROMPT.contains(
+        "A modify turn may offer Draft-legal update or remove tools beside set_turn_plan"
+    ));
+    assert!(DEFAULT_SYSTEM_PROMPT
+        .contains("After attempting set_turn_plan, repair only through set_turn_plan"));
     assert!(!DEFAULT_SYSTEM_PROMPT.contains("render_preview for a validated preview"));
 }
 
@@ -3404,7 +3409,7 @@ fn planned_session_executes_an_exact_additive_plan_then_finishes_ready() {
 }
 
 #[test]
-fn planned_session_keeps_modify_turns_on_the_existing_adaptive_router() {
+fn planned_modify_misclassification_can_submit_an_additive_plan() {
     block_on(async {
         let client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(vec![call(
@@ -3419,11 +3424,18 @@ fn planned_session_keeps_modify_turns_on_the_existing_adaptive_router() {
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
-                "panel",
-                "add_panel",
-                json!({"key":"panel","channel":"study_hub","content":"Panel"}),
+                "plan",
+                "set_turn_plan",
+                json!({
+                    "requirements":[{
+                        "kind":"panel",
+                        "id":"panel",
+                        "key":"panel",
+                        "channel":"study_hub",
+                        "content":"Panel"
+                    }]
+                }),
             )]),
-            LlmResponse::ToolCalls(vec![call("scope", "check_turn_scope", json!({}))]),
             LlmResponse::ToolCalls(vec![call(
                 "finish",
                 "finish_turn",
@@ -3436,8 +3448,441 @@ fn planned_session_keeps_modify_turns_on_the_existing_adaptive_router() {
         let outcome = session.run_burst("Add a temporary panel").await;
 
         assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
-        assert!(probe.seen_tools()[1].contains(&"add_panel".to_string()));
-        assert!(!probe.seen_tools()[1].contains(&"set_turn_plan".to_string()));
+        assert_eq!(session.draft().ruleset.panels[0].key, "panel");
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_true_modify_routes_only_legal_edits_then_scope() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Update the existing panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "update",
+                "update_panel",
+                json!({"key":"panel","content":"Updated"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call("scope", "check_turn_scope", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Panel updated."}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"panel","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Update the existing panel").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.panels[0].content, "Updated");
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["update_panel", "remove_panel", "check_turn_scope"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_modify_failed_plan_locks_the_repair_route_to_plan() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Add a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"requirements":[]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "fallback",
+                "update_panel",
+                json!({"key":"existing","content":"Changed"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Add a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected locked plan repair halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(
+            report.last_error.unwrap().code,
+            "TOOL_NOT_AVAILABLE_FOR_DRAFT_STATE"
+        );
+        assert_eq!(session.draft().ruleset.panels[0].content, "Old");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_modify_mixed_edit_and_plan_batch_dispatches_neither_path() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Add a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "edit",
+                    "update_panel",
+                    json!({"key":"existing","content":"Changed"}),
+                ),
+                call(
+                    "mixed-plan",
+                    "set_turn_plan",
+                    json!({
+                        "requirements":[{
+                            "kind":"panel",
+                            "id":"new_panel",
+                            "key":"new_panel",
+                            "channel":"study_hub",
+                            "content":"New"
+                        }]
+                    }),
+                ),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "fallback",
+                "update_panel",
+                json!({"key":"existing","content":"Changed"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Add a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected mixed path repair halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().ruleset.panels[0].content, "Old");
+        assert_eq!(session.draft().ruleset.panels.len(), 1);
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 0);
+        let edit = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("edit"))
+            .unwrap();
+        assert!(edit.content.contains("NOT_EXECUTED_AFTER_PREVIOUS_FAILURE"));
+        let plan = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("mixed-plan"))
+            .unwrap();
+        assert!(plan.content.contains("TURN_PLAN_MIXED_EXECUTION_PATHS"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_modify_mixed_plan_and_edit_batch_dispatches_neither_path() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Add a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "mixed-plan",
+                    "set_turn_plan",
+                    json!({
+                        "requirements":[{
+                            "kind":"panel",
+                            "id":"new_panel",
+                            "key":"new_panel",
+                            "channel":"study_hub",
+                            "content":"New"
+                        }]
+                    }),
+                ),
+                call(
+                    "edit",
+                    "update_panel",
+                    json!({"key":"existing","content":"Changed"}),
+                ),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "fallback",
+                "update_panel",
+                json!({"key":"existing","content":"Changed"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Add a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected mixed path repair halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().ruleset.panels[0].content, "Old");
+        assert_eq!(session.draft().ruleset.panels.len(), 1);
+        assert_eq!(session.draft().draft_revision, 0);
+        let plan = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("mixed-plan"))
+            .unwrap();
+        assert!(plan.content.contains("TURN_PLAN_MIXED_EXECUTION_PATHS"));
+        let edit = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("edit"))
+            .unwrap();
+        assert!(edit.content.contains("NOT_EXECUTED_AFTER_PREVIOUS_FAILURE"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_modify_plan_selection_rejects_every_extra_call() {
+    block_on(async {
+        for (suffix, extra_name, extra_arguments) in [
+            ("duplicate", "set_turn_plan", json!({"requirements":[]})),
+            ("control", "check_turn_scope", json!({})),
+        ] {
+            let client = ScriptedClient::new(vec![
+                LlmResponse::ToolCalls(vec![call(
+                    "brief",
+                    "set_turn_brief",
+                    json!({
+                        "intent":"modify",
+                        "objective":"Add a panel",
+                        "requested_outcome":"draft_update",
+                        "assumptions":[],
+                        "validate":false
+                    }),
+                )]),
+                LlmResponse::ToolCalls(vec![
+                    call(
+                        "plan",
+                        "set_turn_plan",
+                        json!({
+                            "requirements":[{
+                                "kind":"panel",
+                                "id":"panel",
+                                "key":"panel",
+                                "channel":"study_hub",
+                                "content":"Panel"
+                            }]
+                        }),
+                    ),
+                    call(suffix, extra_name, extra_arguments),
+                ]),
+                LlmResponse::Text("I cannot repair the plan".to_string()),
+            ]);
+            let probe = client.clone();
+            let mut session = DesignSession::with_planned_config(client, large_config());
+
+            let outcome = session.run_burst("Add a panel").await;
+
+            let BurstOutcome::Halted(report) = outcome else {
+                panic!("expected extra plan call repair halt")
+            };
+            assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+            assert_eq!(session.draft().draft_revision, 0);
+            assert!(session.draft().ruleset.panels.is_empty());
+            let plan = session
+                .messages()
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("plan"))
+                .unwrap();
+            assert!(plan.content.contains("TURN_PLAN_MIXED_EXECUTION_PATHS"));
+            let extra = session
+                .messages()
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(suffix))
+                .unwrap();
+            assert!(extra
+                .content
+                .contains("NOT_EXECUTED_AFTER_PREVIOUS_FAILURE"));
+            assert_eq!(
+                probe.seen_tools(),
+                vec![
+                    names(&["set_turn_brief"]),
+                    names(&["set_turn_plan"]),
+                    names(&["set_turn_plan"])
+                ]
+            );
+        }
+    });
+}
+
+#[test]
+fn planned_modify_requested_validation_failure_rolls_back_and_locks_to_plan() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Add and validate a rule",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({
+                    "requirements":[{
+                        "kind":"rule",
+                        "id":"empty_rule",
+                        "key":"empty_rule",
+                        "trigger":{"kind":"instance_action","action":"empty"}
+                    }]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "fallback",
+                "update_panel",
+                json!({"key":"existing","content":"Changed"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, long_flow_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Add and validate a rule").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected modify validation repair halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.draft().ruleset.panels[0].content, "Old");
+        assert!(session.draft().ruleset.rules.is_empty());
+        assert_eq!(session.observability().validation_failures, 1);
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_execution_failures, 1);
+        assert_eq!(session.observability().plan_rollbacks, 1);
+        assert_eq!(session.observability().plan_commits, 0);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
     });
 }
 

@@ -43,7 +43,10 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
             .adaptive_turn
             .as_ref()
             .and_then(|state| state.brief.as_ref())
-            .filter(|brief| brief.intent == TurnIntent::Build && !brief.requirements.is_empty())
+            .filter(|brief| {
+                matches!(brief.intent, TurnIntent::Build | TurnIntent::Modify)
+                    && !brief.requirements.is_empty()
+            })
             .cloned()?;
         let remaining_calls = self
             .config

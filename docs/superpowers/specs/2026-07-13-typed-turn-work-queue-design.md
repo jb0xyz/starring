@@ -30,7 +30,7 @@ Assess
 → Reply
 ```
 
-Brainstorm and inspection turns keep their existing direct discussion and verification paths. Typed planning applies to Build turns first. Modify, remove, and absence postconditions remain on the legacy adaptive path until the typed patch contract is implemented and measured.
+Brainstorm and inspection turns keep their existing direct discussion and verification paths. Typed planning is the only path for Build turns. A Modify-labeled turn starts at a strategy-choice frontier containing only Draft-legal update and remove tools plus `set_turn_plan`. This lets an additive request recover from intent misclassification without reopening additive mutation tools. Typed patch, remove, and absence postconditions remain on the legacy direct-edit path until their typed contract is implemented and measured.
 
 ## Plan contract
 
@@ -86,7 +86,7 @@ exposed tools
 ∩ Draft-legal tools
 ```
 
-Before a plan is accepted, only `set_turn_plan` is exposed. Candidate execution is automatic and does not ask the model to repeat values already present in the plan. While a plan is pending, `check_turn_scope`, `finish_turn`, and broad mutation tools are unavailable.
+Before a Build plan is accepted, only `set_turn_plan` is exposed. Before a Modify strategy is chosen, only Draft-legal update and remove tools plus `set_turn_plan` are exposed. A response that selects the plan path must contain exactly one `set_turn_plan` call; mixed batches are rejected before dispatch. The first successful direct edit removes the plan option, while the first plan attempt locks repair routing to `set_turn_plan` only. Candidate execution is automatic and does not ask the model to repeat values already present in the plan. While a plan is pending, `check_turn_scope`, `finish_turn`, and mutation tools are unavailable.
 
 After candidate commit, scope completion and requested gates are automatic. The model receives `finish_turn` only in Reply.
 
@@ -143,6 +143,8 @@ Oracle-plan results separate execution capability from plan extraction:
 - both oracle failures indicate compiler, schema, or argument burden;
 - both oracle successes with broad-router failures indicate that model replacement is unnecessary.
 
-Oracle evaluation is fail-closed. An injected plan may not delegate a replacement plan to the live model, and a passing oracle sample requires exact injection, submission, acceptance, commit, and zero-failure provenance counts.
+Oracle evaluation is fail-closed and injects both the exact turn brief and plan. Its state machine allows only `BriefPending → PlanPending → Complete` or an inspect-only `BriefPending → Complete`. Unexpected frontiers, repeated controls, unconsumed controls, and live replacement plans fail the evaluation. A passing oracle sample requires exact control injection, plan submission, acceptance, commit, and zero-failure provenance counts.
+
+Mixed patch-and-add requests are not complete under this rollout. They must be split into separate turns until typed patch requirements exist; the harness must not claim full mixed-request completion from an additive plan alone.
 
 Legacy Qwen reports used older schemas and do not decide this comparison.

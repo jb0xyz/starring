@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::draft::Draft;
 use crate::tools::{tool_definitions, ToolDefinition};
-use crate::turn::{control_tool_definitions, required_mutation_tools, AdaptivePhase};
+use crate::turn::{control_tool_definitions, required_mutation_tools, AdaptivePhase, TurnIntent};
 
 use super::{DesignSession, RepairState};
 
@@ -33,21 +33,38 @@ impl<C> DesignSession<C> {
         match state.phase {
             AdaptivePhase::Assess => definitions_named(&self.tools, &["set_turn_brief"]),
             AdaptivePhase::Build => {
-                if self.planned_enabled
-                    && state
-                        .brief
-                        .as_ref()
-                        .is_some_and(|brief| brief.intent == crate::turn::TurnIntent::Build)
-                {
-                    let planned = state
-                        .brief
-                        .as_ref()
-                        .is_some_and(|brief| !brief.requirements.is_empty());
-                    return if planned {
-                        Vec::new()
-                    } else {
-                        definitions_named(&self.tools, &["set_turn_plan"])
-                    };
+                if self.planned_enabled {
+                    if let Some(brief) = state.brief.as_ref() {
+                        if brief.intent == TurnIntent::Build {
+                            return if brief.requirements.is_empty() {
+                                definitions_named(&self.tools, &["set_turn_plan"])
+                            } else {
+                                Vec::new()
+                            };
+                        }
+                        if brief.intent == TurnIntent::Modify {
+                            if !brief.requirements.is_empty() {
+                                return Vec::new();
+                            }
+                            if self.planned_execution_attempts > 0 {
+                                return definitions_named(&self.tools, &["set_turn_plan"]);
+                            }
+                            let mut names = routed_tool_definitions(&self.draft, &self.tools)
+                                .into_iter()
+                                .filter(|tool| is_edit_tool(&tool.name))
+                                .map(|tool| tool.name)
+                                .collect::<BTreeSet<_>>();
+                            let changed = self.turn_state.as_ref().is_some_and(|turn| {
+                                turn.started_revision < self.draft.draft_revision
+                            });
+                            if changed {
+                                names.insert("check_turn_scope".to_string());
+                            } else {
+                                names.insert("set_turn_plan".to_string());
+                            }
+                            return definitions_in_registry_order(&self.tools, &names);
+                        }
+                    }
                 }
                 let mut names = state
                     .brief
