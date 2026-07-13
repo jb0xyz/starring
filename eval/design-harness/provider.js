@@ -7,7 +7,7 @@ class DesignHarnessProvider {
   }
 
   id() {
-    const model = (this.config.model || 'default').replace(/[^a-zA-Z0-9_-]/g, '-');
+    const model = (this.config.model || process.env.STARRING_LLM_MODEL || 'default').replace(/[^a-zA-Z0-9_-]/g, '-');
     return `design-harness-${model}`;
   }
 

@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(config.max_model_calls, 12);
         assert_eq!(config.max_tool_calls, 24);
         assert_eq!(config.max_gate_failures, 4);
-        assert_eq!(config.context_char_budget, 16_000);
+        assert_eq!(config.context_char_budget, 44_000);
     }
 
     #[test]

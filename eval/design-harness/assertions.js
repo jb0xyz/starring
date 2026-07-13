@@ -10,12 +10,31 @@ function parseReport(output) {
   if (!report || typeof report !== 'object' || Array.isArray(report)) {
     throw new Error('invalid eval report: expected an object');
   }
-  if (report.schema_version !== 1) {
+  if (![1, 2].includes(report.schema_version)) {
     throw new Error(`invalid eval report: unsupported schema_version ${report.schema_version}`);
   }
-  for (const field of ['completed', 'final_validate_passed', 'final_simulate_passed']) {
-    if (typeof report[field] !== 'boolean') {
-      throw new Error(`invalid eval report: missing boolean ${field}`);
+  if (typeof report.completed !== 'boolean') {
+    throw new Error('invalid eval report: missing boolean completed');
+  }
+  if (report.schema_version === 1) {
+    for (const field of ['final_validate_passed', 'final_simulate_passed']) {
+      if (typeof report[field] !== 'boolean') {
+        throw new Error(`invalid eval report: missing boolean ${field}`);
+      }
+    }
+  } else {
+    if (!Array.isArray(report.turns) || report.turns.length === 0) {
+      throw new Error('invalid eval report: missing non-empty turns');
+    }
+    for (const field of ['actual_gates', 'postcheck']) {
+      if (!report[field] || typeof report[field] !== 'object' || Array.isArray(report[field])) {
+        throw new Error(`invalid eval report: missing object ${field}`);
+      }
+    }
+    for (const field of ['validate_passed', 'simulate_attempted', 'simulate_passed']) {
+      if (typeof report.postcheck[field] !== 'boolean') {
+        throw new Error(`invalid eval report: missing boolean postcheck.${field}`);
+      }
     }
   }
   if (typeof report.outcome !== 'string') {
@@ -37,6 +56,16 @@ function result(pass, reason, score = pass ? 1 : 0) {
   return { pass, score, reason };
 }
 
+function listVar(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return value.split(',').map((entry) => entry.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 function checked(output, assertion) {
   try {
     return assertion(parseReport(output));
@@ -47,7 +76,15 @@ function checked(output, assertion) {
 
 function terminalOutcome(output, context) {
   return checked(output, (report) => {
-    const scenario = vars(context).caseId;
+    const expected = vars(context);
+    const expectedOutcomes = listVar(expected.expectedOutcomes);
+    if (expectedOutcomes.length > 0) {
+      const pass = expectedOutcomes.includes(report.outcome);
+      return result(pass, pass
+        ? `terminal outcome=${report.outcome}`
+        : `expected one of ${expectedOutcomes.join(', ')}, received ${report.outcome}`);
+    }
+    const scenario = expected.caseId;
     if (scenario === 'studyroom_full') {
       const pass = report.outcome === 'completed' && report.completed === true;
       return result(pass, pass ? 'session completed' : `expected completed outcome, received ${report.outcome}`);
@@ -66,13 +103,92 @@ function terminalOutcome(output, context) {
 function finalGates(output, context) {
   return checked(output, (report) => {
     const expected = vars(context);
-    if (!report.final_validate_passed) {
-      return result(false, `final validation failed: ${JSON.stringify(report.final_validate_error)}`);
+    const validatePassed = report.schema_version === 1
+      ? report.final_validate_passed
+      : report.postcheck.validate_passed;
+    const validateError = report.schema_version === 1
+      ? report.final_validate_error
+      : report.postcheck.validate_error;
+    const simulatePassed = report.schema_version === 1
+      ? report.final_simulate_passed
+      : report.postcheck.simulate_passed;
+    const simulateError = report.schema_version === 1
+      ? report.final_simulate_error
+      : report.postcheck.simulate_error;
+    if (!validatePassed) {
+      return result(false, `final validation failed: ${JSON.stringify(validateError)}`);
     }
-    if (expected.requireSimulation === true && !report.final_simulate_passed) {
-      return result(false, `required simulation failed: ${JSON.stringify(report.final_simulate_error)}`);
+    if (expected.requireSimulation === true && !simulatePassed) {
+      return result(false, `required simulation failed: ${JSON.stringify(simulateError)}`);
     }
     return result(true, expected.requireSimulation === true ? 'validation and simulation passed' : 'validation passed');
+  });
+}
+
+function actualGateStamps(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const actual = report.schema_version === 1
+      ? {
+        validation_current: report.validation_current,
+        simulation_current: report.simulation_current,
+      }
+      : report.actual_gates;
+    const failures = [];
+    if (expected.requireActualValidation === true && actual.validation_current !== true) {
+      failures.push('validation is not current');
+    }
+    if (expected.requireActualSimulation === true && actual.simulation_current !== true) {
+      failures.push('simulation is not current');
+    }
+    return result(failures.length === 0, failures.length === 0 ? 'required actual gate stamps are current' : failures.join(', '));
+  });
+}
+
+function conversationFlow(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    if (report.schema_version !== 2) {
+      return result(false, 'stateful conversation assertions require schema_version 2');
+    }
+    const turns = report.turns;
+    const failures = [];
+    if (Number.isInteger(expected.inputTurnCount) && turns.length !== expected.inputTurnCount) {
+      failures.push(`turns=${turns.length} expected=${expected.inputTurnCount}`);
+    }
+    if (turns.some((turn) => turn.outcome === 'halted')) {
+      failures.push('conversation halted');
+    }
+    if (expected.firstTurnNeedsInput === true && !['awaiting_human', 'needs_input'].includes(turns[0]?.outcome)) {
+      failures.push(`first outcome=${turns[0]?.outcome} expected needs_input`);
+    }
+    if (expected.firstTurnNeedsInput === true && typeof turns[0]?.question !== 'string') {
+      failures.push('first turn did not include a question');
+    }
+    if (expected.requireDraftUnchanged === true && turns[0]?.draft_changed !== false) {
+      failures.push('clarification turn changed the Draft');
+    }
+    for (let index = 1; index < turns.length; index += 1) {
+      if (turns[index - 1].draft_revision_after !== turns[index].draft_revision_before) {
+        failures.push(`revision discontinuity at turn ${index + 1}`);
+      }
+    }
+    const changedTurns = turns.filter((turn) => turn.draft_changed === true).length;
+    if (Number.isInteger(expected.minChangedTurns) && changedTurns < expected.minChangedTurns) {
+      failures.push(`changed_turns=${changedTurns} minimum=${expected.minChangedTurns}`);
+    }
+    const lastMutationCalls = turns.at(-1)?.observability_delta?.mutation_tool_calls || {};
+    for (const tool of listVar(expected.requiredLastTurnMutationTools)) {
+      if (!Number.isInteger(lastMutationCalls[tool]) || lastMutationCalls[tool] < 1) {
+        failures.push(`last turn did not use required mutation tool ${tool}`);
+      }
+    }
+    for (const tool of listVar(expected.forbiddenLastTurnMutationTools)) {
+      if (Number.isInteger(lastMutationCalls[tool]) && lastMutationCalls[tool] > 0) {
+        failures.push(`last turn used forbidden mutation tool ${tool}`);
+      }
+    }
+    return result(failures.length === 0, failures.length === 0 ? `conversation processed ${turns.length} turns continuously` : failures.join(', '));
   });
 }
 
@@ -183,32 +299,49 @@ function expectedSimpleModal() {
   };
 }
 
+function expectedAdditiveRevision() {
+  const ruleset = expectedSimpleModal();
+  ruleset.panels.push({
+    key: 'welcome_panel',
+    channel: 'study_hub',
+    content: 'Welcome',
+    buttons: [{ label: 'Greet', route: { static: { key: 'greet' } } }],
+  });
+  ruleset.rules.push({
+    key: 'greet_user',
+    trigger: { type: 'button_click', component: 'greet' },
+    actions: [
+      { type: 'defer_ephemeral' },
+      { type: 'edit_response', content: 'Hello!' },
+    ],
+  });
+  return ruleset;
+}
+
+function expectedReplacementRevision() {
+  const ruleset = expectedSimpleModal();
+  ruleset.modals[0].title = 'Suggestions';
+  ruleset.modals[0].fields[0].label = 'Details';
+  ruleset.rules[0].actions[1].content = 'Received: ${input.message}';
+  return ruleset;
+}
+
 function taskSemantics(output, context) {
   return checked(output, (report) => {
     const scenario = vars(context).caseId;
     const expected = scenario === 'studyroom_full'
       ? expectedStudyRoom()
-      : scenario === 'simple_modal_ack'
+      : ['simple_modal_ack', 'complete_one_shot', 'multi_turn_elaboration'].includes(scenario)
         ? expectedSimpleModal()
-        : null;
+        : scenario === 'additive_revision'
+          ? expectedAdditiveRevision()
+          : scenario === 'replacement_revision'
+            ? expectedReplacementRevision()
+            : null;
     if (!expected) {
       return result(false, `unknown caseId ${scenario}`);
     }
     const actual = structuredClone(report.ruleset);
-    if (scenario === 'studyroom_full') {
-      const field = actual.modals?.find((modal) => modal.key === 'study_modal')?.fields?.find((value) => value.key === 'room_name');
-      if (field) {
-        field.label = 'Room name';
-      }
-      for (const action of actual.rules?.flatMap((rule) => rule.actions || []) || []) {
-        if (action.type === 'post_panel' && action.key === 'welcome_panel') {
-          action.content = 'Welcome to ${input.room_name}';
-        }
-        if (action.type === 'post_panel' && action.key === 'hub_panel') {
-          action.content = '${input.room_name} is open';
-        }
-      }
-    }
     const pass = isDeepStrictEqual(actual, expected);
     return result(pass, pass ? `${scenario} semantics match` : `${scenario} ruleset does not exactly match`);
   });
@@ -244,13 +377,37 @@ function callBudgets(output, context) {
   });
 }
 
+function perTurnBudgets(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    if (report.schema_version !== 2) {
+      return result(false, 'per-turn budgets require schema_version 2');
+    }
+    const failures = report.turns.flatMap((turn) => {
+      const delta = turn.observability_delta || {};
+      const over = [];
+      if (!Number.isInteger(delta.model_calls) || delta.model_calls > expected.maxModelCallsPerTurn) {
+        over.push(`model_calls=${delta.model_calls}/${expected.maxModelCallsPerTurn}`);
+      }
+      if (!Number.isInteger(delta.tool_calls) || delta.tool_calls > expected.maxToolCallsPerTurn) {
+        over.push(`tool_calls=${delta.tool_calls}/${expected.maxToolCallsPerTurn}`);
+      }
+      return over.length === 0 ? [] : [`${turn.id}: ${over.join(' ')}`];
+    });
+    return result(failures.length === 0, failures.length === 0 ? 'all turns stayed within call budgets' : failures.join(', '));
+  });
+}
+
 module.exports = {
+  actualGateStamps,
   callBudgets,
+  conversationFlow,
   distinctMutationTools,
   draftShape,
   finalGates,
   noExcessiveRepeatedErrors,
   parseReport,
+  perTurnBudgets,
   taskSemantics,
   terminalOutcome,
 };

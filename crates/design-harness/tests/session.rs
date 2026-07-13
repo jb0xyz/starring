@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use automation_state::{ActionSpec, InteractionRule, OverwriteTargetSpec, TriggerSpec};
 use design_harness::{
-    dispatch_tool, tool_definitions, BurstOutcome, DesignSession, Draft, LimitKind, LlmClient,
-    LlmError, LlmResponse, Message, MessageRole, RepairState, SessionConfig, SessionSnapshotError,
-    StructuredError, ToolCall, DEFAULT_SYSTEM_PROMPT,
+    dispatch_tool, tool_definitions, AdaptivePhase, BurstOutcome, DesignSession, Draft, LimitKind,
+    LlmClient, LlmError, LlmResponse, Message, MessageRole, RepairState, SessionConfig,
+    SessionSnapshotError, StructuredError, ToolCall, TurnPhase, DEFAULT_SYSTEM_PROMPT,
+    SESSION_SNAPSHOT_VERSION,
 };
 use futures::executor::block_on;
 use serde_json::{json, Value};
@@ -109,7 +110,8 @@ async fn fixable_validation_draft() -> Draft {
             "begin_rule",
             json!({
                 "key":"open_room",
-                "trigger":{"kind":"button_click","component":"open_room"}
+                "trigger_kind":"button_click",
+                "trigger_ref":"open_room"
             }),
         ),
         (
@@ -247,7 +249,7 @@ fn tool_calls_execute_serially_before_the_next_model_call() {
 
         assert!(matches!(
             outcome,
-            BurstOutcome::AwaitingHuman { ref question }
+            BurstOutcome::NeedsInput { ref question }
                 if question == "Which modal fields do you need?"
         ));
         assert_eq!(session.draft().ruleset.panels[0].buttons.len(), 1);
@@ -281,7 +283,7 @@ fn prompt_builder_fast_path_sends_the_exact_append_only_canonical_prefix() {
 
         let outcome = session.run_burst("Build a panel").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         let seen = probe.seen();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0][0], Message::system(DEFAULT_SYSTEM_PROMPT));
@@ -324,11 +326,14 @@ fn snapshot_json_roundtrip_restores_and_continues_the_session() {
         let mut first = DesignSession::with_config(first_client, large_config());
         assert!(matches!(
             first.run_burst("Start a panel").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         let canonical = first.messages().to_vec();
         let json = serde_json::to_string(&first.snapshot()).unwrap();
         let snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(first.snapshot().schema_version, SESSION_SNAPSHOT_VERSION);
+        assert_eq!(first.turn_state().unwrap().sequence, 1);
+        assert_eq!(first.turn_state().unwrap().phase, TurnPhase::NeedsInput);
         let second_client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(vec![call(
                 "panel",
@@ -342,10 +347,12 @@ fn snapshot_json_roundtrip_restores_and_continues_the_session() {
         assert_eq!(restored.messages(), canonical);
         assert!(matches!(
             restored.run_burst("Create a welcome panel").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(restored.draft().ruleset.panels[0].key, "welcome");
         assert_eq!(restored.observability().model_calls, 3);
+        assert_eq!(restored.turn_state().unwrap().sequence, 2);
+        assert_eq!(restored.turn_state().unwrap().phase, TurnPhase::NeedsInput);
         assert!(restored.messages().starts_with(&canonical));
     });
 }
@@ -415,6 +422,19 @@ fn snapshot_restore_rejects_versions_and_broken_invariants() {
         DesignSession::restore((), SessionConfig::default(), empty_id),
         Err(SessionSnapshotError::InvalidInvariant { .. })
     ));
+
+    let client = ScriptedClient::new(vec![LlmResponse::Text("QUESTION: Continue?".to_string())]);
+    let mut session = DesignSession::with_config(client, large_config());
+    assert!(matches!(
+        block_on(session.run_burst("Start")),
+        BurstOutcome::NeedsInput { .. }
+    ));
+    let mut invalid_turn = session.snapshot();
+    invalid_turn.turn_state.as_mut().unwrap().sequence = 0;
+    assert!(matches!(
+        DesignSession::restore((), SessionConfig::default(), invalid_turn),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
 }
 
 #[test]
@@ -438,7 +458,7 @@ fn expanded_anchor_carries_structure_aliases_and_failure_history() {
 
         assert!(matches!(
             session.run_burst("Keep the StudyRoom design").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         let seen = probe.seen();
         let anchor = seen[1]
@@ -507,7 +527,7 @@ fn argument_failure_gets_one_same_tool_repair_with_exact_schema() {
 
         let outcome = session.run_burst("Build a welcome panel").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.draft().ruleset.panels[0].key, "welcome");
         assert_eq!(session.observability().repair_attempts, 1);
         assert_eq!(session.observability().repair_successes, 1);
@@ -605,7 +625,7 @@ fn anchor_bounds_error_memory_on_character_boundaries_without_truncating_snapsho
 
         assert!(matches!(
             session.run_burst("Continue the design").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
 
         let seen = probe.seen();
@@ -673,7 +693,7 @@ fn second_argument_failure_halts_after_two_model_calls_and_human_can_resume() {
 
         assert!(matches!(
             restored.run_burst("Let me choose the content").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert!(restored.snapshot().repair_state.is_none());
         assert_eq!(restored.observability().repair_escalations, 1);
@@ -787,7 +807,7 @@ fn malformed_gate_arguments_use_argument_repair_without_counting_gate_failures()
 
         assert!(matches!(
             validate_session.run_burst("Validate it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(validate_session.observability().validation_failures, 0);
         assert_eq!(validate_session.observability().repair_successes, 1);
@@ -810,7 +830,7 @@ fn malformed_gate_arguments_use_argument_repair_without_counting_gate_failures()
 
         assert!(matches!(
             simulate_session.run_burst("Simulate it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(simulate_session.observability().simulation_failures, 0);
         assert_eq!(simulate_session.observability().repair_successes, 1);
@@ -1014,7 +1034,7 @@ fn validation_repair_routes_one_mutation_then_exact_validation() {
 
         let outcome = session.run_burst("Validate the launcher").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().repair_attempts, 1);
         assert_eq!(session.observability().repair_successes, 1);
         assert_eq!(session.observability().repair_failures, 0);
@@ -1106,7 +1126,7 @@ fn simulation_repair_forces_mutation_validation_and_simulation_in_order() {
 
         let outcome = session.run_burst("Repair the simulation").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().repair_attempts, 1);
         assert_eq!(session.observability().repair_successes, 1);
         assert_eq!(session.observability().simulation_failures, 1);
@@ -1122,6 +1142,92 @@ fn simulation_repair_forces_mutation_validation_and_simulation_in_order() {
         assert_eq!(probe.seen_tools()[3], names(&["simulate_draft"]));
         assert_eq!(probe.seen_tools()[4], simulation_tool_names());
         assert!(session.snapshot().last_error.is_none());
+    });
+}
+
+#[test]
+fn adaptive_simulation_repair_restamps_scope_before_ready() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Repair and verify the StudyRoom design",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "update-panel",
+                    "update_panel",
+                    json!({"key":"study_panel","content":"Create a private study room"}),
+                ),
+                call("scope", "check_turn_scope", json!({})),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "repair-overwrite",
+                "add_upsert_overwrite_action",
+                json!({
+                    "rule_key":"submit_room",
+                    "channel":{"kind":"created","name":"room_channel"},
+                    "target_kind":"everyone",
+                    "allow":[],
+                    "deny":["view_channel"]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({
+                    "kind":"ready",
+                    "message":"The repaired StudyRoom design is ready.",
+                    "question":null,
+                    "options":[],
+                    "assumptions":[],
+                    "changes":["Restored the required everyone overwrite"]
+                }),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
+        let mut draft = fixable_simulation_draft().await;
+        draft.validated_revision = None;
+        *session.draft_mut() = draft;
+
+        let outcome = session
+            .run_burst("Repair and finish the StudyRoom design")
+            .await;
+
+        assert!(
+            matches!(
+                outcome,
+                BurstOutcome::Ready { ref summary }
+                    if summary == "The repaired StudyRoom design is ready."
+            ),
+            "{outcome:?}"
+        );
+        let revision = session.draft().draft_revision;
+        let adaptive = session.adaptive_turn().unwrap();
+        assert_eq!(adaptive.scoped_revision, Some(revision));
+        assert_eq!(adaptive.previewed_revision, Some(revision));
+        assert_eq!(session.draft().validated_revision, Some(revision));
+        assert_eq!(session.draft().simulated_revision, Some(revision));
+        assert_eq!(session.observability().repair_successes, 1);
+        assert_eq!(session.observability().repair_attempts, 1);
+        assert_eq!(session.observability().simulation_failures, 1);
+        assert_eq!(session.observability().model_calls, 4);
+        assert!(probe.seen_tools()[2].contains(&"add_upsert_overwrite_action".to_string()));
+        assert_eq!(probe.seen_tools()[3], names(&["finish_turn"]));
+        assert!(!probe.seen_tools().iter().flatten().any(|name| {
+            matches!(
+                name.as_str(),
+                "validate_draft" | "simulate_draft" | "render_preview"
+            )
+        }));
     });
 }
 
@@ -1147,7 +1253,7 @@ fn repair_question_escalates_and_internal_directive_never_replaces_human_intent(
 
         assert!(matches!(
             session.run_burst("Build my welcome panel").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(session.observability().repair_attempts, 0);
         assert_eq!(session.observability().repair_escalations, 1);
@@ -1171,7 +1277,7 @@ fn repair_question_escalates_and_internal_directive_never_replaces_human_intent(
 
         assert!(matches!(
             session.run_burst("Use a short greeting").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(session.observability().repair_escalations, 1);
         assert!(session.snapshot().last_error.is_none());
@@ -1211,7 +1317,7 @@ fn not_executed_batch_results_never_record_failures_or_open_tickets() {
 
         assert!(matches!(
             session.run_burst("Build it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
 
         assert_eq!(session.observability().failure_signatures.len(), 1);
@@ -1247,12 +1353,12 @@ fn anchor_separates_bounded_current_intent_from_prior_intents() {
 
         assert!(matches!(
             session.run_burst("First intent").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         let long_intent = "x".repeat(300);
         assert!(matches!(
             session.run_burst(&long_intent).await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
 
         let seen = probe.seen();
@@ -1302,7 +1408,8 @@ fn router_sends_exact_structure_and_rule_design_subsets() {
                 "begin_rule",
                 json!({
                     "key":"open_rule",
-                    "trigger":{"kind":"button_click","component":"open"}
+                    "trigger_kind":"button_click",
+                    "trigger_ref":"open"
                 }),
             )]),
             LlmResponse::Text("QUESTION: Continue?".to_string()),
@@ -1312,7 +1419,7 @@ fn router_sends_exact_structure_and_rule_design_subsets() {
 
         assert!(matches!(
             resolved.run_burst("Build it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(
             resolved_probe.seen_tools(),
@@ -1330,7 +1437,8 @@ fn router_sends_exact_structure_and_rule_design_subsets() {
                 "begin_rule",
                 json!({
                     "key":"missing_button",
-                    "trigger":{"kind":"button_click","component":"missing"}
+                    "trigger_kind":"button_click",
+                    "trigger_ref":"missing"
                 }),
             )]),
             LlmResponse::Text("QUESTION: Which button?".to_string()),
@@ -1340,7 +1448,7 @@ fn router_sends_exact_structure_and_rule_design_subsets() {
 
         assert!(matches!(
             unresolved.run_burst("Build it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert_eq!(
             unresolved_probe.seen_tools(),
@@ -1379,7 +1487,7 @@ fn same_batch_add_panel_does_not_unlock_an_unexposed_add_button() {
 
         let outcome = session.run_burst("Build a panel").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert!(session.draft().ruleset.panels[0].buttons.is_empty());
         assert!(session.messages().iter().any(|message| {
             message.role == MessageRole::Tool
@@ -1404,7 +1512,8 @@ fn created_role_unlocks_grant_register_and_validate_on_the_next_call() {
                 "begin_rule",
                 json!({
                     "key":"create_role",
-                    "trigger":{"kind":"instance_action","action":"create"}
+                    "trigger_kind":"instance_action",
+                    "trigger_ref":"create"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -1424,7 +1533,7 @@ fn created_role_unlocks_grant_register_and_validate_on_the_next_call() {
 
         let outcome = session.run_burst("Create a role").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(
             probe.seen_tools(),
             vec![
@@ -1445,7 +1554,8 @@ fn validate_stays_hidden_until_every_rule_has_an_action() {
                 "begin_rule",
                 json!({
                     "key":"join",
-                    "trigger":{"kind":"instance_action","action":"join"}
+                    "trigger_kind":"instance_action",
+                    "trigger_ref":"join"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call("validate", "validate_draft", json!({}))]),
@@ -1461,7 +1571,7 @@ fn validate_stays_hidden_until_every_rule_has_an_action() {
 
         let outcome = session.run_burst("Build join").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().validation_failures, 0);
         assert!(session.messages().iter().any(|message| {
             message.role == MessageRole::Tool
@@ -1497,7 +1607,7 @@ fn router_keeps_mutations_available_after_simulation() {
 
         let outcome = session.run_burst("Simulate it").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(
             probe.seen_tools(),
             vec![simulation_tool_names(), simulation_tool_names()]
@@ -1540,7 +1650,7 @@ fn failed_simulation_keeps_mutation_tools_available_for_repair() {
 
         let outcome = session.run_burst("Simulate it").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().simulation_failures, 1);
         assert_eq!(
             probe.seen_tools(),
@@ -1564,7 +1674,7 @@ fn hidden_tool_calls_fail_structurally_before_dispatch() {
 
         let outcome = session.run_burst("Validate it").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.draft().draft_revision, 0);
         assert_eq!(session.observability().validation_failures, 0);
         assert!(session.messages().iter().any(|message| {
@@ -1609,7 +1719,7 @@ fn routed_schemas_fit_a_budget_that_the_full_registry_cannot() {
 
         let outcome = session.run_burst("Build").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().model_calls, 1);
         assert_eq!(probe.seen_tools(), vec![structure_tool_names(false)]);
     });
@@ -1644,7 +1754,7 @@ fn one_tool_per_model_call_completes_the_full_golden_flow() {
 
         let outcome = session.run_burst("Build StudyRoom").await;
 
-        assert!(matches!(outcome, BurstOutcome::Completed { .. }));
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
         assert_eq!(session.observability().model_calls, 19);
         assert_eq!(session.observability().tool_calls, 18);
         assert_eq!(probe.seen_tools().len(), 19);
@@ -1679,7 +1789,8 @@ fn one_tool_per_model_call_builds_and_validates_a_simple_modal() {
                 "begin_rule",
                 json!({
                     "key":"submit_feedback",
-                    "trigger":{"kind":"modal_submit","modal":"feedback"}
+                    "trigger_kind":"modal_submit",
+                    "trigger_ref":"feedback"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -1704,7 +1815,7 @@ fn one_tool_per_model_call_builds_and_validates_a_simple_modal() {
 
         let outcome = session.run_burst("Build a feedback modal").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(
             session.draft().validated_revision,
             Some(session.draft().draft_revision)
@@ -1745,7 +1856,8 @@ fn one_tool_per_model_call_can_add_new_structure_after_a_rule() {
                 "begin_rule",
                 json!({
                     "key":"open_rule",
-                    "trigger":{"kind":"button_click","component":"open"}
+                    "trigger_kind":"button_click",
+                    "trigger_ref":"open"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -1774,7 +1886,7 @@ fn one_tool_per_model_call_can_add_new_structure_after_a_rule() {
 
         let outcome = session.run_burst("Build in steps").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.draft().ruleset.panels.len(), 2);
         assert_eq!(session.draft().ruleset.modals.len(), 1);
         assert_eq!(session.draft().ruleset.panels[1].buttons.len(), 1);
@@ -1825,7 +1937,7 @@ fn validated_add_panel_keeps_add_button_available_on_the_next_call() {
 
         let outcome = session.run_burst("Add another panel").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         let panel = session
             .draft()
             .ruleset
@@ -1866,11 +1978,11 @@ fn simulated_draft_accepts_a_mutation_after_a_human_question() {
 
         assert!(matches!(
             session.run_burst("Review it").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
         assert!(matches!(
             session.run_burst("Add another panel").await,
-            BurstOutcome::AwaitingHuman { .. }
+            BurstOutcome::NeedsInput { .. }
         ));
 
         assert!(session
@@ -1906,7 +2018,7 @@ fn same_batch_mutation_blocks_simulate_after_state_changes() {
 
         let outcome = session.run_burst("Change and simulate").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.draft().validated_revision, None);
         assert_eq!(session.draft().simulated_revision, None);
         assert_eq!(session.observability().simulation_failures, 0);
@@ -1935,7 +2047,7 @@ fn same_batch_newly_opened_tool_stays_blocked_when_not_exposed() {
 
         let outcome = session.run_burst("Validate and simulate").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(
             session.draft().validated_revision,
             Some(session.draft().draft_revision)
@@ -1977,7 +2089,7 @@ fn failed_tool_stops_the_remaining_batch() {
 
         let outcome = session.run_burst("Continue").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert!(session.draft().ruleset.modals.is_empty());
         assert_eq!(session.observability().tool_calls, 1);
         assert!(session.messages().iter().any(|message| {
@@ -2012,7 +2124,7 @@ fn repeated_failure_signatures_are_counted_across_model_calls() {
 
         let outcome = session.run_burst("Continue").await;
 
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().repeated_errors, 1);
         assert_eq!(session.observability().failure_signatures.len(), 1);
         assert_eq!(
@@ -2031,7 +2143,7 @@ fn question_and_current_done_end_the_burst() {
         let mut question_session = DesignSession::with_config(question_client, large_config());
         assert!(matches!(
             question_session.run_burst("Build it").await,
-            BurstOutcome::AwaitingHuman { ref question }
+            BurstOutcome::NeedsInput { ref question }
                 if question == "What should the room be called?"
         ));
         assert_eq!(question_session.observability().clarification_count, 1);
@@ -2064,7 +2176,7 @@ fn question_and_current_done_end_the_burst() {
 
         assert!(matches!(
             outcome,
-            BurstOutcome::Completed { ref summary }
+            BurstOutcome::Ready { ref summary }
                 if summary == "StudyRoom design is complete"
         ));
         assert_eq!(
@@ -2072,7 +2184,162 @@ fn question_and_current_done_end_the_burst() {
             Some(done_session.draft().draft_revision)
         );
         assert_eq!(done_session.draft().ruleset, expected.ruleset);
-        assert!(done_session.observability().distinct_mutation_tools.len() >= 2);
+    });
+}
+
+#[test]
+fn progressed_yields_after_a_draft_change_and_the_session_continues() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "panel",
+                "add_panel",
+                json!({"key":"welcome","channel":"lobby","content":"Welcome"}),
+            )]),
+            LlmResponse::Text("PROGRESSED: Added the welcome panel".to_string()),
+            LlmResponse::Text("QUESTION: What should the button say?".to_string()),
+        ]);
+        let mut session = DesignSession::with_config(client, large_config());
+
+        let first = session.run_burst("Create a welcome flow").await;
+
+        assert!(matches!(
+            first,
+            BurstOutcome::Progressed { ref summary }
+                if summary == "Added the welcome panel"
+        ));
+        assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Progressed);
+        assert_eq!(session.turn_state().unwrap().model_calls, 2);
+        assert_eq!(session.turn_state().unwrap().tool_calls, 1);
+
+        let second = session.run_burst("Continue").await;
+
+        assert!(matches!(second, BurstOutcome::NeedsInput { .. }));
+        assert_eq!(session.turn_state().unwrap().sequence, 2);
+        assert_eq!(session.turn_state().unwrap().phase, TurnPhase::NeedsInput);
+        assert_eq!(session.observability().model_calls, 3);
+    });
+}
+
+#[test]
+fn ready_requires_current_validation_but_not_mutation_tool_diversity_or_simulation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("validate", "validate_draft", json!({}))]),
+            LlmResponse::Text("READY: Preview is ready".to_string()),
+        ]);
+        let mut session = DesignSession::with_config(client, long_flow_config());
+        *session.draft_mut() = support::golden_draft().await;
+
+        let outcome = session.run_burst("Show me the finished preview").await;
+
+        assert!(matches!(
+            outcome,
+            BurstOutcome::Ready { ref summary } if summary == "Preview is ready"
+        ));
+        assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Ready);
+        assert_eq!(
+            session.draft().validated_revision,
+            Some(session.draft().draft_revision)
+        );
+        assert_eq!(session.draft().simulated_revision, None);
+        assert!(session.observability().distinct_mutation_tools.is_empty());
+    });
+}
+
+#[test]
+fn model_and_tool_limits_reset_each_turn_while_observability_accumulates() {
+    block_on(async {
+        let model_client = ScriptedClient::new(vec![
+            LlmResponse::Text("QUESTION: First decision?".to_string()),
+            LlmResponse::Text("QUESTION: Second decision?".to_string()),
+        ]);
+        let mut model_session = DesignSession::with_config(
+            model_client,
+            SessionConfig {
+                max_model_calls: 1,
+                context_char_budget: 100_000,
+                ..SessionConfig::default()
+            },
+        );
+
+        assert!(matches!(
+            model_session.run_burst("First").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert!(matches!(
+            model_session.run_burst("Second").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(model_session.observability().model_calls, 2);
+        assert_eq!(model_session.turn_state().unwrap().model_calls, 1);
+
+        let tool_client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "panel",
+                "add_panel",
+                json!({"key":"p","channel":"lobby","content":"Panel"}),
+            )]),
+            LlmResponse::Text("PROGRESSED: Added a panel".to_string()),
+            LlmResponse::ToolCalls(vec![call(
+                "modal",
+                "add_modal",
+                json!({"key":"m","title":"Modal","fields":[]}),
+            )]),
+            LlmResponse::Text("PROGRESSED: Added a modal".to_string()),
+        ]);
+        let mut tool_session = DesignSession::with_config(
+            tool_client,
+            SessionConfig {
+                max_tool_calls: 1,
+                context_char_budget: 100_000,
+                ..SessionConfig::default()
+            },
+        );
+
+        assert!(matches!(
+            tool_session.run_burst("Panel").await,
+            BurstOutcome::Progressed { .. }
+        ));
+        assert!(matches!(
+            tool_session.run_burst("Modal").await,
+            BurstOutcome::Progressed { .. }
+        ));
+        assert_eq!(tool_session.observability().tool_calls, 2);
+        assert_eq!(tool_session.turn_state().unwrap().tool_calls, 1);
+    });
+}
+
+#[test]
+fn gate_failure_limit_resets_each_turn_while_failures_accumulate() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call("validate-1", "validate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Fix the missing button?".to_string()),
+            LlmResponse::ToolCalls(vec![call("validate-2", "validate_draft", json!({}))]),
+            LlmResponse::Text("QUESTION: Still fix the missing button?".to_string()),
+        ]);
+        let mut session = DesignSession::with_config(
+            client,
+            SessionConfig {
+                max_gate_failures: 2,
+                context_char_budget: 100_000,
+                ..SessionConfig::default()
+            },
+        );
+        *session.draft_mut() = fixable_validation_draft().await;
+
+        assert!(matches!(
+            session.run_burst("Validate once").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(session.turn_state().unwrap().gate_failures, 1);
+        assert!(matches!(
+            session.run_burst("Validate again").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(session.observability().validation_failures, 2);
+        assert_eq!(session.turn_state().unwrap().gate_failures, 1);
     });
 }
 
@@ -2085,7 +2352,7 @@ fn stale_done_and_unstructured_prose_use_the_nudge_protocol() {
         ]);
         let mut stale_session = DesignSession::with_config(stale_client, large_config());
         let stale_outcome = stale_session.run_burst("Build it").await;
-        assert!(matches!(stale_outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(stale_outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(stale_session.observability().nudge_count, 1);
 
         let prose_client = ScriptedClient::new(vec![
@@ -2113,7 +2380,7 @@ fn session_observes_revision_invalidation_and_blocks_premature_simulate() {
         ]);
         let mut session = DesignSession::with_config(client, large_config());
         let outcome = session.run_burst("Simulate").await;
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         assert_eq!(session.observability().simulation_failures, 0);
         assert!(session.messages().iter().any(|message| message
             .content
@@ -2189,7 +2456,8 @@ fn model_tool_and_gate_failure_limits_halt_the_session() {
                 "begin_rule",
                 json!({
                     "key":"broken",
-                    "trigger":{"kind":"button_click","component":"missing"}
+                    "trigger_kind":"button_click",
+                    "trigger_ref":"missing"
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -2271,7 +2539,7 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
             },
         );
         let outcome = session.run_burst("Build panels").await;
-        assert!(matches!(outcome, BurstOutcome::AwaitingHuman { .. }));
+        assert!(matches!(outcome, BurstOutcome::NeedsInput { .. }));
         let seen = probe.seen();
         let second_tool_results = seen[1]
             .iter()
@@ -2323,5 +2591,436 @@ fn context_trims_old_tool_results_and_halts_when_the_anchor_cannot_fit() {
         };
         assert_eq!(report.exhausted_limit, Some(LimitKind::ContextChars));
         assert_eq!(impossible.observability().model_calls, 0);
+    });
+}
+
+#[test]
+fn adaptive_complete_request_builds_checks_validates_previews_and_returns_ready() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Create a feedback modal acknowledgement",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "modal",
+                    "add_modal",
+                    json!({"key":"feedback_modal","title":"Feedback","fields":[{"key":"message","label":"Message","style":"paragraph","required":true}]}),
+                ),
+                call(
+                    "rule",
+                    "begin_rule",
+                    json!({"key":"ack_feedback","trigger_kind":"modal_submit","trigger_ref":"feedback_modal"}),
+                ),
+            ]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "defer",
+                    "add_interaction_action",
+                    json!({"kind":"defer_ephemeral","rule_key":"ack_feedback"}),
+                ),
+                call(
+                    "edit",
+                    "add_interaction_action",
+                    json!({"kind":"edit_response","rule_key":"ack_feedback","content":"Thanks, ${input.message}"}),
+                ),
+                call("scope", "check_turn_scope", json!({})),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({
+                    "kind":"ready",
+                    "message":"The feedback automation is ready for review.",
+                    "question":null,
+                    "options":[],
+                    "assumptions":[],
+                    "changes":["Added the feedback modal and acknowledgement rule"]
+                }),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
+
+        let outcome = session
+            .run_burst("Create a Feedback modal and acknowledge its message")
+            .await;
+
+        assert!(matches!(
+            outcome,
+            BurstOutcome::Ready { ref summary }
+                if summary == "The feedback automation is ready for review."
+        ));
+        assert_eq!(session.draft().validated_revision, Some(4));
+        let adaptive = session.adaptive_turn().unwrap();
+        assert_eq!(adaptive.phase, AdaptivePhase::Reply);
+        assert_eq!(adaptive.scoped_revision, Some(4));
+        assert_eq!(adaptive.previewed_revision, Some(4));
+        assert_eq!(session.observability().model_calls, 4);
+        assert_eq!(probe.seen_tools()[3], names(&["finish_turn"]));
+        assert!(!probe.seen_tools().iter().flatten().any(|name| {
+            matches!(
+                name.as_str(),
+                "validate_draft" | "simulate_draft" | "render_preview"
+            )
+        }));
+    });
+}
+
+#[test]
+fn adaptive_ambiguous_request_asks_one_structural_question_without_mutating() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"brainstorm",
+                    "objective":"Design a study room automation",
+                    "requested_outcome":"discussion",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({
+                    "kind":"needs_input",
+                    "message":"I need one structural decision.",
+                    "question":"Should rooms be private or publicly visible?",
+                    "options":["private","public"],
+                    "assumptions":[],
+                    "changes":[]
+                }),
+            )]),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(client, large_config());
+
+        let outcome = session.run_burst("Make a study room feature").await;
+
+        assert!(matches!(
+            outcome,
+            BurstOutcome::NeedsInput { ref question }
+                if question == "Should rooms be private or publicly visible?"
+        ));
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.observability().clarification_count, 1);
+        assert_eq!(
+            session
+                .adaptive_turn()
+                .unwrap()
+                .brief
+                .as_ref()
+                .unwrap()
+                .verification
+                .simulation,
+            design_harness::SimulationProfile::None
+        );
+    });
+}
+
+#[test]
+fn adaptive_simulation_profile_uses_only_the_full_current_human_turn() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "first-brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"brainstorm",
+                    "objective":"Discuss the requested design",
+                    "requested_outcome":"discussion",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "first-finish",
+                "finish_turn",
+                json!({
+                    "kind":"needs_input",
+                    "message":"Choose a direction.",
+                    "question":"Which direction?",
+                    "options":["one","two"],
+                    "assumptions":[],
+                    "changes":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "second-brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"brainstorm",
+                    "objective":"Continue the regular design",
+                    "requested_outcome":"discussion",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "second-finish",
+                "finish_turn",
+                json!({
+                    "kind":"needs_input",
+                    "message":"Choose one option.",
+                    "question":"Which option?",
+                    "options":["one","two"],
+                    "assumptions":[],
+                    "changes":[]
+                }),
+            )]),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(client, large_config());
+        let first_message = format!("{}sTuDyRoOm", "prefix ".repeat(80));
+
+        assert!(matches!(
+            session.run_burst(&first_message).await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(
+            session
+                .adaptive_turn()
+                .unwrap()
+                .brief
+                .as_ref()
+                .unwrap()
+                .verification
+                .simulation,
+            design_harness::SimulationProfile::StudyRoom
+        );
+
+        assert!(matches!(
+            session
+                .run_burst("Continue without that named profile")
+                .await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(
+            session
+                .adaptive_turn()
+                .unwrap()
+                .brief
+                .as_ref()
+                .unwrap()
+                .verification
+                .simulation,
+            design_harness::SimulationProfile::None
+        );
+    });
+}
+
+#[test]
+fn adaptive_studyroom_profile_requires_model_selected_validation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![LlmResponse::ToolCalls(vec![call(
+            "brief",
+            "set_turn_brief",
+            json!({
+                "intent":"build",
+                "objective":"Build the requested automation",
+                "requested_outcome":"draft_update",
+                "assumptions":[],
+                "validate":false
+            }),
+        )])]);
+        let mut session = DesignSession::with_adaptive_config(
+            client,
+            SessionConfig {
+                max_model_calls: 1,
+                context_char_budget: 100_000,
+                ..SessionConfig::default()
+            },
+        );
+
+        assert!(matches!(
+            session.run_burst("Build StudyRoom now").await,
+            BurstOutcome::Halted(_)
+        ));
+        assert!(session.messages().iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.content.contains("SIMULATION_REQUIRES_VALIDATION")
+        }));
+        assert!(session
+            .adaptive_turn()
+            .is_some_and(|state| state.brief.is_none()));
+    });
+}
+
+#[test]
+fn adaptive_modification_uses_stable_action_update_and_revalidates() {
+    block_on(async {
+        let mut draft = Draft::new();
+        for (name, arguments) in [
+            (
+                "add_modal",
+                json!({"key":"feedback_modal","title":"Feedback","fields":[{"key":"message","label":"Message","style":"paragraph","required":true}]}),
+            ),
+            (
+                "begin_rule",
+                json!({"key":"ack_feedback","trigger_kind":"modal_submit","trigger_ref":"feedback_modal"}),
+            ),
+            (
+                "add_interaction_action",
+                json!({"kind":"defer_ephemeral","rule_key":"ack_feedback"}),
+            ),
+            (
+                "add_interaction_action",
+                json!({"kind":"edit_response","rule_key":"ack_feedback","content":"Old"}),
+            ),
+        ] {
+            assert!(dispatch_tool(&mut draft, name, &arguments.to_string())
+                .await
+                .is_ok());
+        }
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Change the acknowledgement text",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "update",
+                    "update_action",
+                    json!({
+                        "rule_key":"ack_feedback",
+                        "selector":{"kind":"by_kind","action":"edit_response","occurrence":0},
+                        "patch":{"kind":"edit_response","content":"Thanks, ${input.message}"}
+                    }),
+                ),
+                call("scope", "check_turn_scope", json!({})),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Updated.","question":null,"options":[],"assumptions":[],"changes":["Changed acknowledgement text"]}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
+        *session.draft_mut() = draft;
+
+        let outcome = session
+            .run_burst("Change the reply to include the message")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        let actions = &session.draft().ruleset.rules[0].actions;
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[1],
+            ActionSpec::EditResponse { content } if content == "Thanks, ${input.message}"
+        ));
+        assert!(probe.seen_tools()[1].contains(&"update_action".to_string()));
+    });
+}
+
+#[test]
+fn adaptive_phase_transition_stops_the_remaining_stale_batch() {
+    block_on(async {
+        let mut draft = Draft::new();
+        for (name, arguments) in [
+            (
+                "add_modal",
+                json!({"key":"feedback_modal","title":"Feedback","fields":[{"key":"message","label":"Message","style":"paragraph","required":true}]}),
+            ),
+            (
+                "begin_rule",
+                json!({"key":"ack_feedback","trigger_kind":"modal_submit","trigger_ref":"feedback_modal"}),
+            ),
+            (
+                "add_interaction_action",
+                json!({"kind":"defer_ephemeral","rule_key":"ack_feedback"}),
+            ),
+            (
+                "add_interaction_action",
+                json!({"kind":"edit_response","rule_key":"ack_feedback","content":"Thanks, ${input.message}"}),
+            ),
+        ] {
+            assert!(dispatch_tool(&mut draft, name, &arguments.to_string())
+                .await
+                .is_ok());
+        }
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Review the existing feedback design",
+                    "requested_outcome":"validated_preview",
+                    "assumptions":[],
+                    "validate":true
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "update",
+                    "update_modal",
+                    json!({"key":"feedback_modal","title":"Feedback Form"}),
+                ),
+                call("scope", "check_turn_scope", json!({})),
+                call(
+                    "stale",
+                    "add_modal",
+                    json!({"key":"duplicate","title":"Duplicate","fields":[]}),
+                ),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Ready.","question":null,"options":[],"assumptions":[],"changes":[]}),
+            )]),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(client, long_flow_config());
+        *session.draft_mut() = draft;
+
+        let outcome = session.run_burst("Review it").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.modals.len(), 1);
+        assert_eq!(session.draft().ruleset.modals[0].title, "Feedback Form");
+        let stale_result = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("stale"))
+            .unwrap();
+        assert!(stale_result
+            .content
+            .contains("NOT_EXECUTED_AFTER_PHASE_TRANSITION"));
+    });
+}
+
+#[test]
+fn adaptive_session_rejects_legacy_ready_text_without_scope() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::Text("READY: skipped".to_string()),
+            LlmResponse::Text("READY: skipped again".to_string()),
+        ]);
+        let mut session = DesignSession::with_adaptive_config(client, large_config());
+
+        let outcome = session.run_burst("Change the existing design").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected adaptive text rejection")
+        };
+        assert_eq!(report.code, "UNSTRUCTURED_MODEL_TEXT");
+        assert_eq!(session.draft().draft_revision, 0);
     });
 }

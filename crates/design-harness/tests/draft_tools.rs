@@ -33,7 +33,7 @@ fn schema_has_kind_variant(schema: &Value, variant: &str) -> bool {
 }
 
 #[test]
-fn tool_registry_contains_the_locked_twelve_tools() {
+fn tool_registry_contains_the_locked_design_tools() {
     let definitions = tool_definitions();
     let names: Vec<&str> = definitions
         .iter()
@@ -53,6 +53,16 @@ fn tool_registry_contains_the_locked_twelve_tools() {
             "add_interaction_action",
             "add_post_panel_action",
             "set_register_instance",
+            "update_panel",
+            "remove_panel",
+            "update_button",
+            "remove_button",
+            "update_modal",
+            "remove_modal",
+            "update_rule",
+            "remove_rule",
+            "update_action",
+            "remove_action",
             "validate_draft",
             "simulate_draft",
         ]
@@ -70,10 +80,6 @@ fn model_facing_reference_schemas_are_tagged() {
     let definitions = tool_definitions();
     let expected = [
         ("add_button", &["static", "instance_action"][..]),
-        (
-            "begin_rule",
-            &["button_click", "modal_submit", "instance_action"][..],
-        ),
         ("add_grant_role_action", &["created", "existing"][..]),
         ("add_upsert_overwrite_action", &["created", "existing"][..]),
         (
@@ -91,6 +97,27 @@ fn model_facing_reference_schemas_are_tagged() {
             assert!(schema_has_kind_variant(&definition.parameters, variant));
         }
     }
+}
+
+#[test]
+fn begin_rule_schema_is_flat() {
+    let definitions = tool_definitions();
+    let begin_rule = definitions
+        .iter()
+        .find(|definition| definition.name == "begin_rule")
+        .unwrap();
+    let properties = begin_rule.parameters["properties"].as_object().unwrap();
+
+    assert_eq!(properties.len(), 3);
+    assert!(properties.contains_key("key"));
+    assert!(properties.contains_key("trigger_kind"));
+    assert!(properties.contains_key("trigger_ref"));
+    assert!(!properties.contains_key("trigger"));
+    assert_eq!(
+        begin_rule.parameters["$defs"]["TriggerKindInput"]["enum"],
+        json!(["button_click", "modal_submit", "instance_action"])
+    );
+    assert_eq!(begin_rule.parameters["additionalProperties"], false);
 }
 
 #[test]
@@ -188,7 +215,8 @@ fn structure_dtos_normalize_to_state_types() {
         "begin_rule",
         json!({
             "key":"open_modal",
-            "trigger":{"kind":"button_click","component":"create_study_room"}
+            "trigger_kind":"button_click",
+            "trigger_ref":"create_study_room"
         }),
     )
     .is_ok());
@@ -230,7 +258,8 @@ fn grouped_action_dtos_normalize_and_register_finalizes_footprint() {
         "begin_rule",
         json!({
             "key":"submit_room",
-            "trigger":{"kind":"modal_submit","modal":"study_modal"}
+            "trigger_kind":"modal_submit",
+            "trigger_ref":"study_modal"
         }),
     )
     .is_ok());
@@ -431,7 +460,8 @@ fn open_modal_and_instance_trigger_dtos_normalize() {
         "begin_rule",
         json!({
             "key":"open",
-            "trigger":{"kind":"button_click","component":"open_button"}
+            "trigger_kind":"button_click",
+            "trigger_ref":"open_button"
         }),
     )
     .is_ok());
@@ -443,11 +473,24 @@ fn open_modal_and_instance_trigger_dtos_normalize() {
     .is_ok());
     assert!(call(
         &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"open","kind":"respond_ephemeral","content":"Done"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
         "begin_rule",
         json!({
             "key":"join",
-            "trigger":{"kind":"instance_action","action":"join"}
+            "trigger_kind":"instance_action",
+            "trigger_ref":"join"
         }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"join","kind":"teardown_instance"}),
     )
     .is_ok());
 
@@ -456,8 +499,18 @@ fn open_modal_and_instance_trigger_dtos_normalize() {
         ActionSpec::OpenModal { ref modal } if modal == "m"
     ));
     assert!(matches!(
+        draft.ruleset.rules[0].actions[1],
+        ActionSpec::RespondEphemeral { ref content } if content == "Done"
+    ));
+    assert!(matches!(
         draft.ruleset.rules[1].trigger,
         TriggerSpec::InstanceAction { ref action } if action == "join"
+    ));
+    assert!(matches!(
+        draft.ruleset.rules[1].actions[0],
+        ActionSpec::TeardownInstance {
+            instance: InstanceRef::Event
+        }
     ));
 }
 
@@ -469,7 +522,8 @@ fn incomplete_register_manifest_is_structured_and_non_mutating() {
         "begin_rule",
         json!({
             "key":"submit",
-            "trigger":{"kind":"button_click","component":"submit"}
+            "trigger_kind":"button_click",
+            "trigger_ref":"submit"
         }),
     )
     .is_ok());
@@ -534,26 +588,46 @@ fn missing_required_field_returns_expected_shape() {
 }
 
 #[test]
-fn invalid_kind_returns_schema_kind_choices() {
+fn invalid_flat_trigger_kind_returns_schema_choices() {
     let mut draft = Draft::new();
     let result = call(
         &mut draft,
         "begin_rule",
         json!({
             "key":"join",
-            "trigger":{"kind":"join_button","action":"join"}
+            "trigger_kind":"join_button",
+            "trigger_ref":"join"
         }),
     );
 
     let failure = result.failure().unwrap();
-    assert_eq!(failure.code, "INVALID_KIND");
+    assert_eq!(failure.code, "INVALID_TOOL_ARGUMENTS");
     assert_eq!(failure.location, "tool.begin_rule.arguments");
-    assert_eq!(failure.message, "kind join_button is not valid");
+    assert_eq!(failure.message, "value join_button is not allowed");
     assert!(failure.hint.contains("button_click"));
     assert!(failure.hint.contains("modal_submit"));
     assert!(failure.hint.contains("instance_action"));
-    assert!(failure.hint.contains("kind must be one of"));
+    assert!(!failure.hint.contains("kind must be one of"));
     assert!(!failure.hint.contains("unknown variant"));
+}
+
+#[test]
+fn begin_rule_rejects_the_legacy_nested_trigger_shape() {
+    let mut draft = Draft::new();
+    let result = call(
+        &mut draft,
+        "begin_rule",
+        json!({
+            "key":"join",
+            "trigger":{"kind":"instance_action","action":"join"}
+        }),
+    );
+
+    let failure = result.failure().unwrap();
+    assert_eq!(failure.code, "UNKNOWN_FIELD");
+    assert_eq!(failure.location, "tool.begin_rule.arguments.trigger");
+    assert_eq!(draft.draft_revision, 0);
+    assert!(draft.ruleset.rules.is_empty());
 }
 
 #[test]
@@ -626,7 +700,8 @@ fn register_rejects_an_empty_ownable_footprint() {
         "begin_rule",
         json!({
             "key":"empty",
-            "trigger":{"kind":"button_click","component":"empty"}
+            "trigger_kind":"button_click",
+            "trigger_ref":"empty"
         }),
     )
     .is_ok());
@@ -647,4 +722,296 @@ fn register_rejects_an_empty_ownable_footprint() {
 
     assert_eq!(result.failure().unwrap().code, "EMPTY_INSTANCE_RESOURCES");
     assert_eq!(draft.draft_revision, revision);
+}
+
+#[test]
+fn structure_updates_keep_stable_keys_and_invalidate_gates() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_panel",
+        json!({"key":"panel","channel":"study_hub","content":"Before"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({"key":"modal","title":"Before","fields":[]}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"rule","trigger_kind":"instance_action","trigger_ref":"join"}),
+    )
+    .is_ok());
+    draft.validated_revision = Some(draft.draft_revision);
+    draft.simulated_revision = Some(draft.draft_revision);
+    let revision = draft.draft_revision;
+
+    assert!(call(
+        &mut draft,
+        "update_panel",
+        json!({"key":"panel","content":"After"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "update_modal",
+        json!({
+            "key":"modal",
+            "title":"After",
+            "fields":[{"key":"name","label":"Name","style":"short","required":true}]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "update_rule",
+        json!({"key":"rule","trigger":{"kind":"instance_action","action":"leave"}}),
+    )
+    .is_ok());
+
+    assert_eq!(draft.draft_revision, revision + 3);
+    assert_eq!(draft.validated_revision, None);
+    assert_eq!(draft.simulated_revision, None);
+    assert_eq!(draft.ruleset.panels[0].key, "panel");
+    assert_eq!(draft.ruleset.panels[0].content, "After");
+    assert_eq!(draft.ruleset.modals[0].key, "modal");
+    assert_eq!(draft.ruleset.modals[0].title, "After");
+    assert!(matches!(
+        draft.ruleset.rules[0].trigger,
+        TriggerSpec::InstanceAction { ref action } if action == "leave"
+    ));
+}
+
+#[test]
+fn button_edits_use_route_selector_and_reject_dangling_trigger() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_panel",
+        json!({"key":"panel","channel":"study_hub","content":"Panel"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_button",
+        json!({
+            "panel_key":"panel",
+            "label":"Before",
+            "route":{"kind":"static","key":"open"}
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"open_rule","trigger_kind":"button_click","trigger_ref":"open"}),
+    )
+    .is_ok());
+
+    assert!(call(
+        &mut draft,
+        "update_button",
+        json!({
+            "panel_key":"panel",
+            "selector":{"kind":"static","key":"open"},
+            "label":"After"
+        }),
+    )
+    .is_ok());
+    assert_eq!(draft.ruleset.panels[0].buttons[0].label, "After");
+    let revision = draft.draft_revision;
+    draft.validated_revision = Some(revision);
+
+    let result = call(
+        &mut draft,
+        "remove_button",
+        json!({
+            "panel_key":"panel",
+            "selector":{"kind":"static","key":"open"}
+        }),
+    );
+
+    assert_eq!(result.failure().unwrap().code, "UNKNOWN_BUTTON_REFERENCE");
+    assert_eq!(draft.draft_revision, revision);
+    assert_eq!(draft.validated_revision, Some(revision));
+    assert_eq!(draft.ruleset.panels[0].buttons.len(), 1);
+}
+
+#[test]
+fn modal_field_update_rejects_new_template_dangling_reference() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({
+            "key":"modal",
+            "title":"Modal",
+            "fields":[{"key":"name","label":"Name","style":"short","required":true}]
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"submit","trigger_kind":"modal_submit","trigger_ref":"modal"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({
+            "rule_key":"submit",
+            "kind":"create_role",
+            "key":"role",
+            "name":"${input.name}"
+        }),
+    )
+    .is_ok());
+    let revision = draft.draft_revision;
+
+    let result = call(
+        &mut draft,
+        "update_modal",
+        json!({"key":"modal","fields":[]}),
+    );
+
+    assert_eq!(result.failure().unwrap().code, "UNKNOWN_TEMPLATE_INPUT");
+    assert_eq!(draft.draft_revision, revision);
+    assert_eq!(draft.ruleset.modals[0].fields.len(), 1);
+}
+
+#[test]
+fn action_updates_support_stable_keys_and_deterministic_occurrences() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"rule","trigger_kind":"instance_action","trigger_ref":"join"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({"rule_key":"rule","kind":"create_role","key":"role","name":"Before"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"rule","kind":"respond_ephemeral","content":"First"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_interaction_action",
+        json!({"rule_key":"rule","kind":"respond_ephemeral","content":"Second"}),
+    )
+    .is_ok());
+
+    assert!(call(
+        &mut draft,
+        "update_action",
+        json!({
+            "rule_key":"rule",
+            "selector":{"kind":"by_key","key":"role"},
+            "patch":{"kind":"create_role","name":"After"}
+        }),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "update_action",
+        json!({
+            "rule_key":"rule",
+            "selector":{"kind":"by_kind","action":"respond_ephemeral","occurrence":1},
+            "patch":{"kind":"respond_ephemeral","content":"Updated second"}
+        }),
+    )
+    .is_ok());
+
+    assert!(matches!(
+        draft.ruleset.rules[0].actions[0],
+        ActionSpec::CreateRole { ref name, .. } if name == "After"
+    ));
+    assert!(matches!(
+        draft.ruleset.rules[0].actions[2],
+        ActionSpec::RespondEphemeral { ref content } if content == "Updated second"
+    ));
+}
+
+#[test]
+fn action_remove_rejects_dangling_created_reference_without_mutation() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"rule","trigger_kind":"instance_action","trigger_ref":"join"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_resource_action",
+        json!({"rule_key":"rule","kind":"create_role","key":"role","name":"Role"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_grant_role_action",
+        json!({
+            "rule_key":"rule",
+            "role":{"kind":"created","name":"role"},
+            "target":"actor"
+        }),
+    )
+    .is_ok());
+    let revision = draft.draft_revision;
+
+    let result = call(
+        &mut draft,
+        "remove_action",
+        json!({
+            "rule_key":"rule",
+            "selector":{"kind":"by_key","key":"role"}
+        }),
+    );
+
+    assert_eq!(
+        result.failure().unwrap().code,
+        "UNRESOLVED_CREATED_REFERENCE"
+    );
+    assert_eq!(draft.draft_revision, revision);
+    assert_eq!(draft.ruleset.rules[0].actions.len(), 2);
+}
+
+#[test]
+fn unreferenced_structures_and_rules_can_be_removed() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_panel",
+        json!({"key":"panel","channel":"study_hub","content":"Panel"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({"key":"modal","title":"Modal","fields":[]}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"rule","trigger_kind":"instance_action","trigger_ref":"join"}),
+    )
+    .is_ok());
+
+    assert!(call(&mut draft, "remove_panel", json!({"key":"panel"})).is_ok());
+    assert!(call(&mut draft, "remove_modal", json!({"key":"modal"})).is_ok());
+    assert!(call(&mut draft, "remove_rule", json!({"key":"rule"})).is_ok());
+    assert_eq!(draft.summary().panels, 0);
+    assert_eq!(draft.summary().modals, 0);
+    assert_eq!(draft.summary().rules, 0);
 }

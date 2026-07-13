@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use design_harness::{SessionSnapshot, SESSION_SNAPSHOT_VERSION};
+use design_harness::{SessionSnapshot, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION};
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
@@ -81,7 +81,7 @@ impl SessionStore {
         let Some(snapshot_json) = snapshot_json else {
             return Ok(None);
         };
-        let value =
+        let mut value =
             serde_json::from_str::<serde_json::Value>(&snapshot_json).map_err(|source| {
                 StoreError::CorruptSnapshot {
                     session_id: session_id.to_string(),
@@ -95,7 +95,9 @@ impl SessionStore {
             .ok_or_else(|| StoreError::CorruptSnapshotSchemaVersion {
                 session_id: session_id.to_string(),
             })?;
-        if found != SESSION_SNAPSHOT_VERSION {
+        if matches!(found, 2 | 3) {
+            migrate_snapshot(&mut value, found);
+        } else if found != SESSION_SNAPSHOT_VERSION {
             return Err(StoreError::UnsupportedSnapshotVersion {
                 expected: SESSION_SNAPSHOT_VERSION,
                 found,
@@ -132,6 +134,40 @@ impl SessionStore {
     }
 }
 
+fn migrate_snapshot(value: &mut serde_json::Value, found: u32) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    root.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(SESSION_SNAPSHOT_VERSION),
+    );
+    root.entry("turn_state".to_string())
+        .or_insert(serde_json::Value::Null);
+    root.entry("adaptive_turn".to_string())
+        .or_insert(serde_json::Value::Null);
+    root.insert(
+        "adaptive_enabled".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    root.entry("brief_history".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(system) = root
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|messages| messages.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        system.insert(
+            "content".to_string(),
+            serde_json::Value::String(DEFAULT_SYSTEM_PROMPT.to_string()),
+        );
+    }
+    if found == 2 {
+        root.insert("turn_state".to_string(), serde_json::Value::Null);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to access the session database filesystem: {0}")]
@@ -159,7 +195,9 @@ pub enum StoreError {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use design_harness::DesignSession;
+    use design_harness::{
+        DesignSession, SessionConfig, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
+    };
 
     use super::{SessionStore, StoreError};
 
@@ -250,10 +288,69 @@ mod tests {
         assert!(matches!(
             store.load("legacy"),
             Err(StoreError::UnsupportedSnapshotVersion {
-                expected: 2,
+                expected: SESSION_SNAPSHOT_VERSION,
                 found: 1
             })
         ));
+    }
+
+    #[test]
+    fn version_two_and_three_snapshots_migrate_to_adaptive_sessions() {
+        for version in [2, 3] {
+            let store = SessionStore::open_in_memory().unwrap();
+            let mut value = serde_json::to_value(DesignSession::new(()).snapshot()).unwrap();
+            let root = value.as_object_mut().unwrap();
+            root.insert("schema_version".to_string(), version.into());
+            root.remove("adaptive_turn");
+            root.remove("adaptive_enabled");
+            root.remove("brief_history");
+            if version == 2 {
+                root.remove("turn_state");
+            }
+            root.get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+                .map(|messages| {
+                    messages
+                        .first_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                        .unwrap()
+                        .insert(
+                            "content".to_string(),
+                            serde_json::Value::String("legacy prompt".to_string()),
+                        );
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": concat!(
+                            "DRAFT_STATE:{\"revision\":0,\"validated_revision\":null,",
+                            "\"simulated_revision\":null,\"panels\":[],\"modals\":[],",
+                            "\"rules\":[],\"created_aliases\":{\"roles\":[],",
+                            "\"channels\":[],\"messages\":[],\"instances\":[]},",
+                            "\"unresolved_references\":[],\"failure_signatures\":{},",
+                            "\"last_error\":null,\"repair_state\":null,",
+                            "\"current_human_intent\":null,\"recent_human_intent\":[]}"
+                        )
+                    }));
+                })
+                .unwrap();
+            let id = format!("v{version}");
+            store
+                .connection
+                .execute(
+                    "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at) VALUES (?1, ?2, 0)",
+                    [id.as_str(), value.to_string().as_str()],
+                )
+                .unwrap();
+
+            let migrated = store.load(&id).unwrap().unwrap();
+
+            assert_eq!(migrated.schema_version, SESSION_SNAPSHOT_VERSION);
+            assert!(migrated.adaptive_enabled);
+            assert!(migrated.adaptive_turn.is_none());
+            assert!(migrated.brief_history.is_empty());
+            assert_eq!(migrated.messages[0].content, DEFAULT_SYSTEM_PROMPT);
+            assert_eq!(migrated.messages.len(), 2);
+            assert!(DesignSession::restore((), SessionConfig::default(), migrated).is_ok());
+        }
     }
 
     #[test]

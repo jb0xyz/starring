@@ -33,7 +33,8 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             "begin_rule",
             json!({
                 "key":"open_modal",
-                "trigger":{"kind":"button_click","component":"create_study_room"}
+                "trigger_kind":"button_click",
+                "trigger_ref":"create_study_room"
             }),
         ),
         (
@@ -44,7 +45,8 @@ pub fn golden_calls() -> Vec<(&'static str, Value)> {
             "begin_rule",
             json!({
                 "key":"submit_room",
-                "trigger":{"kind":"modal_submit","modal":"study_modal"}
+                "trigger_kind":"modal_submit",
+                "trigger_ref":"study_modal"
             }),
         ),
         (

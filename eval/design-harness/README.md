@@ -2,7 +2,21 @@
 
 This benchmark executes the real `design-harness-cli --eval-json` loop against the configured OpenAI-compatible gateway. It does not recreate the agent loop in JavaScript and it never reads or writes Discord, deployment, or production database state.
 
-The full StudyRoom case requires both existing gates. The small modal case requires final validation only because the current simulator is deliberately a StudyRoom golden trace, not a general RuleSet simulator.
+The CLI accepts a legacy plain-text prompt or a stateful document. Every scripted turn in a stateful document runs on the same `DesignSession`. `AwaitingHuman`, `NeedsInput`, `Progressed`, `Completed`, and `Ready`-like outcomes return control to the script so the next human turn can run. Only `Halted` stops the script early.
+
+```json
+{
+  "schema_version": 1,
+  "turns": [
+    { "id": "idea", "input": "피드백 자동화를 만들고 싶어" },
+    { "id": "details", "input": "긴 글 모달로 받고 감사 메시지를 보내줘" }
+  ]
+}
+```
+
+The version 2 report contains `turns`, cumulative observability, per-turn observability deltas, revision continuity, and elapsed time. `actual_gates` reports stamps that the model really earned during the session. `postcheck` reports the evaluator's non-mutating validation and simulation checks. These are intentionally separate so a successful evaluator postcheck cannot be mistaken for a gate the model called.
+
+The cases cover a complete one-shot request, an ambiguous request that should ask one blocking question, multi-turn elaboration, additive and replacement revisions that must preserve earlier work, and the complex StudyRoom one-shot stress test.
 
 Run from the repository root:
 
@@ -12,13 +26,10 @@ npm --prefix eval/design-harness ci
 mkdir -p eval/design-harness/results
 STARRING_LLM_BASE_URL=http://127.0.0.1:18080/v1 \
 STARRING_LLM_API_KEY="$STARRING_LLM_API_KEY" \
+STARRING_LLM_MODEL=gemma4:12b-mlx \
 npm --prefix eval/design-harness run eval -- \
-  --repeat 3 \
-  --output results/run.json \
-  --output results/run.html
-npm --prefix eval/design-harness run summarize -- results/run.json
+  --output results/gemma-stateful.json
+npm --prefix eval/design-harness run summarize -- results/gemma-stateful.json
 ```
 
-`STARRING_LLM_MODEL` defaults to `gemma4:12b-mlx`. A provider entry can set another model for comparison when its gateway honors the requested model. Keep concurrency at one for the current single-model server and keep `--no-cache` so repeated runs measure Gemma.
-
-The JSON report includes terminal outcome, final gate results, exact RuleSet semantics, Draft shape, distinct mutation tools, model and tool calls, repeated error signatures, and elapsed time. The command disables Promptfoo telemetry and its hidden result store; requested raw output stays under the ignored `results/` directory.
+Run Qwen against the gateway that serves it by changing `STARRING_LLM_BASE_URL` and `STARRING_LLM_MODEL=qwen3.5:9b-mlx`. The provider no longer overrides `STARRING_LLM_MODEL`, and its identifier includes the selected model. Keep concurrency at one for the current single-model server and keep `--no-cache` so repeated runs measure the model.

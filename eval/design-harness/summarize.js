@@ -48,6 +48,20 @@ function vars(row) {
   return row.vars || row.testCase?.vars || {};
 }
 
+function postcheck(report, gate) {
+  if (report?.schema_version === 2) {
+    return report.postcheck?.[`${gate}_passed`] === true;
+  }
+  return report?.[`final_${gate}_passed`] === true;
+}
+
+function actualGate(report, gate) {
+  if (report?.schema_version === 2) {
+    return report.actual_gates?.[`${gate}_current`] === true;
+  }
+  return report?.[`${gate}_current`] === true;
+}
+
 function summarize(document) {
   const groups = new Map();
   for (const row of rowsFrom(document)) {
@@ -71,6 +85,10 @@ function summarize(document) {
     const repairSuccesses = reports.map((report) => Number(report.observability?.repair_successes ?? 0));
     const repairFailures = reports.map((report) => Number(report.observability?.repair_failures ?? 0));
     const repairEscalations = reports.map((report) => Number(report.observability?.repair_escalations ?? 0));
+    const turns = reports.flatMap((report) => Array.isArray(report.turns) ? report.turns : []);
+    const turnElapsed = turns.map((turn) => Number(turn.elapsed_ms));
+    const turnModelCalls = turns.map((turn) => Number(turn.observability_delta?.model_calls));
+    const turnToolCalls = turns.map((turn) => Number(turn.observability_delta?.tool_calls));
     return {
       provider: group.provider,
       case_id: group.caseId,
@@ -80,10 +98,14 @@ function summarize(document) {
       provider_error_rate: group.rows.filter((entry) => !entry.report || entry.row.response?.error).length / group.rows.length,
       pass_rate: group.rows.filter((entry) => entry.row.success === true).length / group.rows.length,
       completion_rate: group.rows.filter((entry) => entry.report?.completed === true).length / group.rows.length,
-      validation_rate: group.rows.filter((entry) => entry.report?.final_validate_passed === true).length / group.rows.length,
+      validation_rate: group.rows.filter((entry) => postcheck(entry.report, 'validate')).length / group.rows.length,
       required_simulation_rate: requiredSimulation
-        ? group.rows.filter((entry) => entry.report?.final_simulate_passed === true).length / group.rows.length
+        ? group.rows.filter((entry) => postcheck(entry.report, 'simulate')).length / group.rows.length
         : null,
+      actual_validation_current_rate: group.rows.filter((entry) => actualGate(entry.report, 'validation')).length / group.rows.length,
+      actual_simulation_current_rate: group.rows.filter((entry) => actualGate(entry.report, 'simulation')).length / group.rows.length,
+      ready_rate: group.rows.filter((entry) => ['ready', 'completed'].includes(entry.report?.outcome)).length / group.rows.length,
+      clarification_rate: group.rows.filter((entry) => entry.report?.turns?.some((turn) => ['needs_input', 'awaiting_human'].includes(turn.outcome))).length / group.rows.length,
       repeated_error_rate: group.rows.filter((entry) => Number(entry.report?.max_repeat_count) > 1).length / group.rows.length,
       mean_max_repeat_count: mean(repeatCounts),
       maximum_repeat_count: finiteValues(repeatCounts).length === 0 ? null : Math.max(...finiteValues(repeatCounts)),
@@ -96,6 +118,13 @@ function summarize(document) {
       mean_repair_successes: mean(repairSuccesses),
       mean_repair_failures: mean(repairFailures),
       mean_repair_escalations: mean(repairEscalations),
+      mean_turns: mean(reports.map((report) => Number(report.turns?.length))),
+      changed_turn_rate: turns.length === 0 ? null : turns.filter((turn) => turn.draft_changed === true).length / turns.length,
+      needs_input_turn_rate: turns.length === 0 ? null : turns.filter((turn) => ['needs_input', 'awaiting_human'].includes(turn.outcome)).length / turns.length,
+      mean_turn_elapsed_ms: mean(turnElapsed) === null ? null : Math.round(mean(turnElapsed)),
+      p95_turn_elapsed_ms: percentile(turnElapsed, 0.95),
+      mean_turn_model_calls: mean(turnModelCalls),
+      mean_turn_tool_calls: mean(turnToolCalls),
     };
   });
 }

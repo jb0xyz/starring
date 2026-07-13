@@ -88,3 +88,54 @@ test('summary aggregates repair observability', () => {
   assert.equal(row.mean_repair_failures, 1 / 3);
   assert.equal(row.mean_repair_escalations, 1 / 3);
 });
+
+test('summary aggregates stateful turn and actual gate metrics separately', () => {
+  const report = {
+    schema_version: 2,
+    outcome: 'ready',
+    completed: true,
+    elapsed_ms: 50,
+    max_repeat_count: 0,
+    actual_gates: { validation_current: true, simulation_current: false },
+    postcheck: { validate_passed: true, simulate_passed: true },
+    observability: { model_calls: 4, tool_calls: 5, distinct_mutation_tools: ['a'] },
+    turns: [
+      {
+        outcome: 'needs_input',
+        draft_changed: false,
+        elapsed_ms: 10,
+        observability_delta: { model_calls: 1, tool_calls: 0 },
+      },
+      {
+        outcome: 'ready',
+        draft_changed: true,
+        elapsed_ms: 40,
+        observability_delta: { model_calls: 3, tool_calls: 5 },
+      },
+    ],
+  };
+  const document = {
+    results: [{
+      provider: { label: 'qwen' },
+      vars: { caseId: 'stateful', requireSimulation: true },
+      success: true,
+      response: { metadata: report },
+    }],
+  };
+
+  const [row] = summarize(document);
+
+  assert.equal(row.validation_rate, 1);
+  assert.equal(row.required_simulation_rate, 1);
+  assert.equal(row.actual_validation_current_rate, 1);
+  assert.equal(row.actual_simulation_current_rate, 0);
+  assert.equal(row.ready_rate, 1);
+  assert.equal(row.clarification_rate, 1);
+  assert.equal(row.mean_turns, 2);
+  assert.equal(row.changed_turn_rate, 0.5);
+  assert.equal(row.needs_input_turn_rate, 0.5);
+  assert.equal(row.mean_turn_elapsed_ms, 25);
+  assert.equal(row.p95_turn_elapsed_ms, 40);
+  assert.equal(row.mean_turn_model_calls, 2);
+  assert.equal(row.mean_turn_tool_calls, 2.5);
+});
