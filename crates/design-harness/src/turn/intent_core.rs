@@ -208,12 +208,15 @@ fn normalize_core(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    if input.request_mode == IntentRequestModeV2::Discussion && !input.detail_facets.is_empty() {
+    if !input.detail_facets.is_empty()
+        && (input.request_mode != IntentRequestModeV2::Build
+            || input.automation_kind != IntentAutomationKindV2::ManagedPrivateStudyRoom)
+    {
         return Err(core_error(
             "INCONSISTENT_INTENT_CORE",
             "intent.core.detail_facets",
-            "A discussion request cannot carry recipe detail requirements",
-            "Use an empty detail_facets array for discussion",
+            "Recipe detail facets require a managed private study-room build",
+            "Use detail facets only for explicit copy, naming, or control customization of that recipe",
         ));
     }
     input.boundary_requests = input

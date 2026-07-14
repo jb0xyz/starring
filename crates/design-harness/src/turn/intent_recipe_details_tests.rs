@@ -7,9 +7,12 @@ use super::{
     IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
+const CORE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn valid_copy_details() -> Value {
     json!({
         "expected_revision": 0,
+        "core_semantic_digest": CORE_DIGEST,
         "copy": {
             "create_button_label": "Start focus room",
             "welcome_content": {"prefix": "Welcome to ", "suffix": ""}
@@ -31,6 +34,7 @@ fn detail_frontier_is_one_closed_recipe_specific_tool() {
             "controls",
             "copy",
             "covered_facets",
+            "core_semantic_digest",
             "expected_revision",
             "naming",
             "unmapped_facets",
@@ -68,6 +72,8 @@ fn detail_parser_accepts_exact_selected_facets_and_null_unselected_objects() {
     let parsed = parse_private_study_room_details(
         &valid_copy_details().to_string(),
         &[IntentRecipeDetailFacetV3::Copy],
+        0,
+        CORE_DIGEST,
     )
     .unwrap();
     assert_eq!(parsed.expected_revision(), 0);
@@ -82,7 +88,9 @@ fn detail_parser_accepts_exact_selected_facets_and_null_unselected_objects() {
     value["controls"] = Value::Null;
     assert!(parse_private_study_room_details(
         &value.to_string(),
-        &[IntentRecipeDetailFacetV3::Copy]
+        &[IntentRecipeDetailFacetV3::Copy],
+        0,
+        CORE_DIGEST
     )
     .is_ok());
 }
@@ -92,27 +100,42 @@ fn detail_parser_requires_exact_coverage_and_nonempty_selected_values() {
     let mut value = valid_copy_details();
     value["covered_facets"] = json!([]);
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "RECIPE_DETAIL_COVERAGE_MISMATCH"
     );
 
     value = valid_copy_details();
     value["copy"] = json!({});
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "EMPTY_REQUIRED_RECIPE_DETAIL"
     );
 
     value = valid_copy_details();
     value["unmapped_facets"] = json!(["copy"]);
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "UNMAPPED_RECIPE_DETAIL_FACET"
     );
 }
@@ -124,23 +147,33 @@ fn detail_parser_rejects_unrequested_values_duplicates_and_empty_ticket() {
         "channel_name": {"prefix": "focus-", "suffix": ""}
     });
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "UNREQUESTED_RECIPE_DETAIL"
     );
 
     value = valid_copy_details();
     value["covered_facets"] = json!(["copy", "copy"]);
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "DUPLICATE_RECIPE_DETAIL_FACET"
     );
 
     assert_eq!(
-        parse_private_study_room_details(&valid_copy_details().to_string(), &[])
+        parse_private_study_room_details(&valid_copy_details().to_string(), &[], 0, CORE_DIGEST)
             .unwrap_err()
             .code,
         "EMPTY_RECIPE_DETAIL_REQUEST"
@@ -152,9 +185,14 @@ fn detail_parser_reuses_recipe_text_and_template_guards() {
     let mut value = valid_copy_details();
     value["copy"]["create_button_label"] = json!("${raw}");
     assert_eq!(
-        parse_private_study_room_details(&value.to_string(), &[IntentRecipeDetailFacetV3::Copy])
-            .unwrap_err()
-            .code,
+        parse_private_study_room_details(
+            &value.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
         "RAW_INTENT_TEMPLATE_FORBIDDEN"
     );
 
@@ -167,9 +205,37 @@ fn detail_parser_reuses_recipe_text_and_template_guards() {
             IntentRecipeDetailFacetV3::Controls,
             IntentRecipeDetailFacetV3::Copy,
         ],
+        0,
+        CORE_DIGEST,
     )
     .unwrap();
     assert_eq!(parsed.controls().help_label.as_deref(), Some("Guide"));
+}
+
+#[test]
+fn detail_parser_binds_revision_and_core_digest() {
+    assert_eq!(
+        parse_private_study_room_details(
+            &valid_copy_details().to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            1,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
+        "STALE_RECIPE_DETAIL_REVISION"
+    );
+    assert_eq!(
+        parse_private_study_room_details(
+            &valid_copy_details().to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap_err()
+        .code,
+        "RECIPE_DETAIL_CORE_DIGEST_MISMATCH"
+    );
 }
 
 fn property_names(schema: &Value) -> BTreeSet<String> {

@@ -19,6 +19,8 @@ pub const EXTRACT_PRIVATE_STUDY_ROOM_DETAILS: &str = "extract_private_study_room
 #[serde(deny_unknown_fields)]
 struct ExtractPrivateStudyRoomDetailsWireV1 {
     expected_revision: u64,
+    #[schemars(length(min = 64, max = 64))]
+    core_semantic_digest: String,
     #[serde(deserialize_with = "deserialize_default_on_null")]
     copy: PrivateStudyRoomCopyProposalV1,
     #[serde(deserialize_with = "deserialize_default_on_null")]
@@ -41,6 +43,10 @@ impl PrivateStudyRoomDetailsV1 {
 
     pub fn copy(&self) -> &PrivateStudyRoomCopyProposalV1 {
         &self.0.copy
+    }
+
+    pub fn core_semantic_digest(&self) -> &str {
+        &self.0.core_semantic_digest
     }
 
     pub fn naming(&self) -> &PrivateStudyRoomNamingProposalV1 {
@@ -67,6 +73,8 @@ pub fn private_study_room_details_frontier() -> [ToolDefinition; 1] {
 pub fn parse_private_study_room_details(
     arguments: &str,
     required_facets: &[IntentRecipeDetailFacetV3],
+    expected_revision: u64,
+    expected_core_semantic_digest: &str,
 ) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
     let mut input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsWireV1>(arguments)
         .map_err(|error| {
@@ -77,8 +85,36 @@ pub fn parse_private_study_room_details(
             )
         })?;
     normalize_private_study_room_details(&mut input.copy, &mut input.naming, &mut input.controls)?;
+    validate_binding(&input, expected_revision, expected_core_semantic_digest)?;
     validate_facets(&input, required_facets)?;
     Ok(PrivateStudyRoomDetailsV1(input))
+}
+
+fn validate_binding(
+    input: &ExtractPrivateStudyRoomDetailsWireV1,
+    expected_revision: u64,
+    expected_core_semantic_digest: &str,
+) -> Result<(), StructuredError> {
+    if input.expected_revision != expected_revision {
+        return Err(detail_error(
+            "STALE_RECIPE_DETAIL_REVISION",
+            "intent.details.expected_revision",
+            format!(
+                "Recipe detail revision {} does not match the active revision {expected_revision}",
+                input.expected_revision
+            ),
+            format!("Retry with expected_revision {expected_revision}"),
+        ));
+    }
+    if input.core_semantic_digest != expected_core_semantic_digest {
+        return Err(detail_error(
+            "RECIPE_DETAIL_CORE_DIGEST_MISMATCH",
+            "intent.details.core_semantic_digest",
+            "Recipe details are not bound to the active Core IR",
+            "Copy the exact harness-provided Core semantic digest",
+        ));
+    }
+    Ok(())
 }
 
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>

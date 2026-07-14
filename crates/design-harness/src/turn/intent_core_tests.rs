@@ -156,6 +156,19 @@ fn core_parser_preserves_and_sorts_explicit_recipe_detail_facets() {
 }
 
 #[test]
+fn core_parser_rejects_details_outside_the_pinned_recipe_shape() {
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["detail_facets"] = json!(["copy"]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INCONSISTENT_INTENT_CORE"
+    );
+}
+
+#[test]
 fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     let mut value = valid_core();
     value["copy"] = json!({"launcher_content": "hidden"});
