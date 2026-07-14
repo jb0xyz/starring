@@ -33,6 +33,10 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     let [tool] = interpret_intent_core_frontier();
     assert_eq!(tool.name, INTERPRET_INTENT_CORE);
     assert_eq!(
+        tool.description,
+        "Extract bounded routing semantics from the human request"
+    );
+    assert_eq!(
         required_names(&tool.parameters),
         strings([
             "automation_kind",
@@ -70,6 +74,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         tool.parameters.get("additionalProperties"),
         Some(&Value::Bool(false))
     );
+    let schema_text = tool.parameters.to_string();
+    assert!(!schema_text.contains("$defs"));
+    assert!(!schema_text.contains("$ref"));
     let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
     let structured_bytes = serde_json::to_vec(&json!({
         "tools": [{

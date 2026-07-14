@@ -168,7 +168,7 @@ impl IntentCoreInterpretationV3 {
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: INTERPRET_INTENT_CORE.to_string(),
-        description: "Extract one bounded Core IR from the human turn. Preserve every runtime, authorization, lifecycle, external-effect, safety-boundary, and explicit recipe-detail requirement without choosing routes, capability identifiers, recipes, actions, or deployment operations".to_string(),
+        description: "Extract bounded routing semantics from the human request".to_string(),
         parameters: schema_value::<InterpretIntentCoreWireV3>(),
     }]
 }
@@ -409,8 +409,15 @@ fn normalize_requirements(
 
 fn schema_value<T: JsonSchema>() -> Value {
     let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
+    let definitions = value
+        .get("$defs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    inline_schema_references(&mut value, &definitions);
     if let Some(root) = value.as_object_mut() {
         root.remove("$schema");
+        root.remove("$defs");
         root.remove("title");
         if let Some(expected_revision) = root
             .get_mut("properties")
@@ -423,6 +430,33 @@ fn schema_value<T: JsonSchema>() -> Value {
         }
     }
     value
+}
+
+fn inline_schema_references(value: &mut Value, definitions: &serde_json::Map<String, Value>) {
+    let replacement = value
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+        .and_then(|name| definitions.get(name))
+        .cloned();
+    if let Some(mut replacement) = replacement {
+        inline_schema_references(&mut replacement, definitions);
+        *value = replacement;
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                inline_schema_references(value, definitions);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                inline_schema_references(value, definitions);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn core_error(
