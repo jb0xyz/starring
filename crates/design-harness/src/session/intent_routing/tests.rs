@@ -71,6 +71,7 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 #[test]
 fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("other_unmapped_required_capabilities"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("shortest exact phrase from the human text"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("scope-preservation or anti-weakening instructions"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("validation_gate"));

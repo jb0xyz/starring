@@ -51,6 +51,7 @@ pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V3: &str = concat!(
     " other_unmapped_required_capabilities contains only distinct capabilities the automation must execute or enforce that no closed field represents.",
     " It is not a summary and excludes objective behavior, scope-preservation or anti-weakening instructions, and anything represented by another field.",
     " Keep every positive required capability absent from closed fields here even when objective also mentions it.",
+    " Preserve each such capability as the shortest exact phrase from the human text, never as a synthesized identifier.",
     " Map a validated preview request to requested_outcome=validated_preview, another build to working_draft, and discussion to discussion.",
     " Every build response is empty.",
     " Preserve only otherwise unrepresented positive authorization, lifecycle, runtime, or external-effect capabilities there.",

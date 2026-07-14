@@ -343,6 +343,13 @@ function expectedBoundaries(expected) {
   return list(expected.expectedBoundaryViolations).sort();
 }
 
+function expectedUnclassifiedRequirements(expected) {
+  if (!Object.hasOwn(expected, 'expectedUnclassifiedRequirements')) {
+    return [];
+  }
+  return list(expected.expectedUnclassifiedRequirements).sort();
+}
+
 function routeKind(route) {
   return route === 'resolve_intent_decision' ? 'private_study_room' : route;
 }
@@ -728,6 +735,7 @@ function intentAdjudicationDecision(output, context) {
     const routes = list(expected.expectedRoutePath);
     const expectedBlockerSet = expectedBlockers(expected);
     const expectedBoundarySet = expectedBoundaries(expected);
+    const expectedUnclassifiedSet = expectedUnclassifiedRequirements(expected);
     const failures = [];
     if (routes.length !== report.turns.length) {
       failures.push(`decision route path length=${report.turns.length} expected=${routes.length}`);
@@ -750,8 +758,9 @@ function intentAdjudicationDecision(output, context) {
       if (!sameJson(actualBoundaries, expectedBoundarySet)) {
         failures.push(`${turn.id} boundaries=${JSON.stringify(actualBoundaries)} expected=${JSON.stringify(expectedBoundarySet)}`);
       }
-      if (decision.unclassified_requirements.length !== 0) {
-        failures.push(`${turn.id} has unexpected unclassified requirements`);
+      const actualUnclassified = [...decision.unclassified_requirements].sort();
+      if (!sameJson(actualUnclassified, expectedUnclassifiedSet)) {
+        failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected=${JSON.stringify(expectedUnclassifiedSet)}`);
       }
       if (decision.kind === 'private_study_room') {
         if (!sameJson(decision.route_target, {

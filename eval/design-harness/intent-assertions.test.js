@@ -186,6 +186,7 @@ function context(overrides = {}) {
       expectedRestartCount: 0,
       expectedBlockers: '',
       expectedBoundaryViolations: '',
+      expectedUnclassifiedRequirements: '',
       ...overrides,
     },
   };
@@ -485,6 +486,39 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(missing), statefulExpected).reason,
     /blockers=/,
+  );
+});
+
+test('adjudication assertion preserves exact unclassified capability evidence', () => {
+  const unknown = blocker('unclassified_intent_requirement', 'unclassified');
+  unknown.evidence = [evidence(
+    'intent.core.unclassified_requirements.0',
+    'external consensus lease',
+  )];
+  const routeDecision = decision('capability_gap', {
+    blockers: [unknown],
+    unclassified_requirements: ['external consensus lease'],
+  });
+  const message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external consensus lease. I did not build a partial or weakened version.';
+  const expected = context({
+    expectedOutcomes: 'routed',
+    expectedStagePath: 'empty>empty',
+    expectedRoutePath: 'capability_gap',
+    expectedFinalStatus: 'empty',
+    expectedCompiledOperations: undefined,
+    completeRequest: false,
+    expectedBlockers: 'unclassified_intent_requirement|unclassified|',
+    expectedUnclassifiedRequirements: 'external consensus lease',
+  });
+  const document = routedDocument(routeDecision, message, 'external-capability');
+  assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
+
+  const changed = JSON.parse(document);
+  changed.turns[0].route_decision.unclassified_requirements = ['different lease'];
+  changed.final_intent.route_decision = changed.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(JSON.stringify(changed), expected).reason,
+    /unclassified=/,
   );
 });
 
