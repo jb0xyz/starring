@@ -90,6 +90,13 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("Custom Help, Join, or Close labels and their responses map to custom_controls"));
+    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
+        .contains("launcher create-button label to copy.create_button_label"));
+    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
+        .contains("created channel or member-role name affixes"));
+    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
+        .contains("controls.help_label, controls.help_response"));
+    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3.contains("Omit an explicitly empty affix"));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
