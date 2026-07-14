@@ -1,4 +1,7 @@
 mod execution;
+mod intent_interpretation;
+#[cfg(test)]
+mod intent_interpretation_tests;
 mod intent_protocol;
 mod plan;
 mod plan_input;
@@ -7,6 +10,13 @@ mod scope;
 
 pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
+};
+pub use intent_interpretation::{
+    interpret_intent_turn_frontier, parse_interpret_intent_turn, CloseAuthorizationV2,
+    EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2, IntentInterpretationV2,
+    IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2,
+    PrivateStudyRoomControlsInterpretationV2, RuntimeRequirementsV2, TimerRequirementV2,
+    INTERPRET_INTENT_TURN,
 };
 pub use intent_protocol::{
     parse_resolve_intent_decision, parse_route_intent_turn, resolve_intent_decision_frontier,
