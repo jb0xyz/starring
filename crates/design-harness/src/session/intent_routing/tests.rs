@@ -211,10 +211,7 @@ fn private_room_with_copy_details(
         "details",
         "extract_private_study_room_details",
         json!({
-            "copy": {"create_button_label": "Start exact focus"},
-            "naming": {},
-            "controls": {},
-            "unmapped_facets": []
+            "copy": {"create_button_label": "Start exact focus"}
         }),
     );
     (interpretation_call("interpret", value), details)

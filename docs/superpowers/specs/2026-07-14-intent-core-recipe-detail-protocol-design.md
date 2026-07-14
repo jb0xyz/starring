@@ -138,6 +138,8 @@ Unrequested objects may be omitted. Each requested facet must have at least one 
 
 The active detail router derives a per-request schema from the canonical selected facets. It removes every unselected object and `unmapped_facets`, then marks every remaining facet object as required. An extractor that cannot map a selected facet must return its required object empty, which the parser rejects without mutation. The broad public parser schema remains compatible with omitted objects and explicit `unmapped_facets`, but the serving frontier exposes only the closed active subset.
 
+The serving wire flattens every pattern into sibling `*_prefix` and `*_suffix` string fields before converting it to the typed recipe pattern. It never asks the model to alternate between scalar literals and nested `{prefix,suffix}` objects. Supplying either affix creates the pattern and an omitted counterpart becomes the empty string. The broad public parser retains the original nested typed pattern shape.
+
 The optional second model request uses a bounded isolated context containing only the detail system prompt, the current `INTENT_HUMAN` envelope, and the current `INTENT_DETAIL_STATE` anchor. The append-only durable transcript still records both accepted tool calls and results, but the extractor does not receive the Core tool arguments, Core tool result, or unrelated prior conversation.
 
 The detail result is rejected without mutation when:

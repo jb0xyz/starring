@@ -36,6 +36,7 @@ pub use intent_protocol::{
     route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,
     RouteIntentTurnInputV1,
 };
+pub(crate) use intent_recipe_details::parse_private_study_room_details_for_serving;
 pub(crate) use intent_recipe_details::private_study_room_details_frontier_for;
 pub use intent_recipe_details::{
     parse_private_study_room_details, private_study_room_details_frontier,

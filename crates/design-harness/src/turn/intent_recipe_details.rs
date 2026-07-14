@@ -5,7 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::errors::{translate_tool_arguments_error, StructuredError};
-use crate::intent::{PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1};
+use crate::intent::{
+    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, RoomNamePatternV1,
+};
 use crate::tools::ToolDefinition;
 
 use super::intent_core::IntentRecipeDetailFacetV3;
@@ -27,6 +29,62 @@ struct ExtractPrivateStudyRoomDetailsWireV1 {
     controls: PrivateStudyRoomControlsInterpretationV2,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     #[schemars(length(max = 3))]
+    unmapped_facets: Vec<IntentRecipeDetailFacetV3>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExtractPrivateStudyRoomDetailsServingWireV2 {
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    copy: PrivateStudyRoomCopyServingWireV2,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    naming: PrivateStudyRoomNamingServingWireV2,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    controls: PrivateStudyRoomControlsInterpretationV2,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrivateStudyRoomCopyServingWireV2 {
+    #[serde(default)]
+    launcher_content: Option<String>,
+    #[serde(default)]
+    create_button_label: Option<String>,
+    #[serde(default)]
+    modal_title: Option<String>,
+    #[serde(default)]
+    room_name_label: Option<String>,
+    #[serde(default)]
+    welcome_content_prefix: Option<String>,
+    #[serde(default)]
+    welcome_content_suffix: Option<String>,
+    #[serde(default)]
+    hub_announcement_prefix: Option<String>,
+    #[serde(default)]
+    hub_announcement_suffix: Option<String>,
+    #[serde(default)]
+    completed_response_prefix: Option<String>,
+    #[serde(default)]
+    completed_response_suffix: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrivateStudyRoomNamingServingWireV2 {
+    #[serde(default)]
+    channel_name_prefix: Option<String>,
+    #[serde(default)]
+    channel_name_suffix: Option<String>,
+    #[serde(default)]
+    member_role_name_prefix: Option<String>,
+    #[serde(default)]
+    member_role_name_suffix: Option<String>,
+}
+
+struct PrivateStudyRoomDetailsCandidateV1 {
+    copy: PrivateStudyRoomCopyProposalV1,
+    naming: PrivateStudyRoomNamingProposalV1,
+    controls: PrivateStudyRoomControlsInterpretationV2,
     unmapped_facets: Vec<IntentRecipeDetailFacetV3>,
 }
 
@@ -89,7 +147,7 @@ pub(crate) fn private_study_room_details_frontier_for(
         .into_iter()
         .map(facet_name)
         .collect::<BTreeSet<_>>();
-    let mut parameters = inline_schema_value::<ExtractPrivateStudyRoomDetailsWireV1>();
+    let mut parameters = inline_schema_value::<ExtractPrivateStudyRoomDetailsServingWireV2>();
     let root = parameters.as_object_mut().ok_or_else(|| {
         detail_error(
             "INVALID_RECIPE_DETAIL_SCHEMA",
@@ -110,6 +168,14 @@ pub(crate) fn private_study_room_details_frontier_for(
             )
         })?;
     properties.retain(|name, _| required_names.contains(name.as_str()));
+    if properties.len() != required_names.len() {
+        return Err(detail_error(
+            "INVALID_RECIPE_DETAIL_SCHEMA",
+            "intent.details.schema.properties",
+            "The routed recipe detail schema is missing an active facet",
+            "Keep every closed detail facet aligned with its serving wire field",
+        ));
+    }
     root.insert(
         "required".to_string(),
         Value::Array(
@@ -121,7 +187,7 @@ pub(crate) fn private_study_room_details_frontier_for(
     );
     Ok([detail_tool(
         parameters,
-        "Extract one nonempty object for every exposed private StudyRoom detail facet using only exact literals from the original human turn. Never author bindings, routes, authorization, actions, permissions, recipe identity, or deployment operations",
+        "Extract one nonempty object for every exposed private StudyRoom detail facet using only exact literals from the original human turn. Pattern affixes use flat fields ending in _prefix and _suffix. Never author bindings, routes, authorization, actions, permissions, recipe identity, or deployment operations",
     )])
 }
 
@@ -139,14 +205,61 @@ pub fn parse_private_study_room_details(
     expected_revision: u64,
     expected_core_semantic_digest: &str,
 ) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
-    let mut input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsWireV1>(arguments)
-        .map_err(|error| {
+    let input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsWireV1>(arguments).map_err(
+        |error| {
             translate_tool_arguments_error(
                 EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
                 &error,
                 &inline_schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
             )
+        },
+    )?;
+    finalize_private_study_room_details(
+        PrivateStudyRoomDetailsCandidateV1 {
+            copy: input.copy,
+            naming: input.naming,
+            controls: input.controls,
+            unmapped_facets: input.unmapped_facets,
+        },
+        required_facets,
+        expected_revision,
+        expected_core_semantic_digest,
+    )
+}
+
+pub(crate) fn parse_private_study_room_details_for_serving(
+    arguments: &str,
+    required_facets: &[IntentRecipeDetailFacetV3],
+    expected_revision: u64,
+    expected_core_semantic_digest: &str,
+) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
+    let input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsServingWireV2>(arguments)
+        .map_err(|error| {
+            translate_tool_arguments_error(
+                EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+                &error,
+                &inline_schema_value::<ExtractPrivateStudyRoomDetailsServingWireV2>(),
+            )
         })?;
+    finalize_private_study_room_details(
+        PrivateStudyRoomDetailsCandidateV1 {
+            copy: serving_copy(input.copy),
+            naming: serving_naming(input.naming),
+            controls: input.controls,
+            unmapped_facets: Vec::new(),
+        },
+        required_facets,
+        expected_revision,
+        expected_core_semantic_digest,
+    )
+}
+
+fn finalize_private_study_room_details(
+    mut input: PrivateStudyRoomDetailsCandidateV1,
+    required_facets: &[IntentRecipeDetailFacetV3],
+    expected_revision: u64,
+    expected_core_semantic_digest: &str,
+) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
     normalize_private_study_room_details(&mut input.copy, &mut input.naming, &mut input.controls)?;
     let covered_facets = validate_facets(&input, required_facets)?;
     Ok(PrivateStudyRoomDetailsV1 {
@@ -159,6 +272,47 @@ pub fn parse_private_study_room_details(
     })
 }
 
+fn serving_copy(value: PrivateStudyRoomCopyServingWireV2) -> PrivateStudyRoomCopyProposalV1 {
+    PrivateStudyRoomCopyProposalV1 {
+        launcher_content: value.launcher_content,
+        create_button_label: value.create_button_label,
+        modal_title: value.modal_title,
+        room_name_label: value.room_name_label,
+        welcome_content: serving_pattern(
+            value.welcome_content_prefix,
+            value.welcome_content_suffix,
+        ),
+        hub_announcement: serving_pattern(
+            value.hub_announcement_prefix,
+            value.hub_announcement_suffix,
+        ),
+        completed_response: serving_pattern(
+            value.completed_response_prefix,
+            value.completed_response_suffix,
+        ),
+    }
+}
+
+fn serving_naming(value: PrivateStudyRoomNamingServingWireV2) -> PrivateStudyRoomNamingProposalV1 {
+    PrivateStudyRoomNamingProposalV1 {
+        channel_name: serving_pattern(value.channel_name_prefix, value.channel_name_suffix),
+        member_role_name: serving_pattern(
+            value.member_role_name_prefix,
+            value.member_role_name_suffix,
+        ),
+    }
+}
+
+fn serving_pattern(prefix: Option<String>, suffix: Option<String>) -> Option<RoomNamePatternV1> {
+    if prefix.is_none() && suffix.is_none() {
+        return None;
+    }
+    Some(RoomNamePatternV1 {
+        prefix: prefix.unwrap_or_default(),
+        suffix: suffix.unwrap_or_default(),
+    })
+}
+
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -168,7 +322,7 @@ where
 }
 
 fn validate_facets(
-    input: &ExtractPrivateStudyRoomDetailsWireV1,
+    input: &PrivateStudyRoomDetailsCandidateV1,
     required_facets: &[IntentRecipeDetailFacetV3],
 ) -> Result<Vec<IntentRecipeDetailFacetV3>, StructuredError> {
     let required = exact_facet_set(required_facets, "intent.details.required_facets")?;

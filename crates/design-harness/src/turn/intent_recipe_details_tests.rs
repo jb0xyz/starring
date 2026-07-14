@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use super::{
-    parse_private_study_room_details, private_study_room_details_frontier,
-    private_study_room_details_frontier_for, IntentRecipeDetailFacetV3,
-    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    parse_private_study_room_details, parse_private_study_room_details_for_serving,
+    private_study_room_details_frontier, private_study_room_details_frontier_for,
+    IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 const CORE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -41,10 +41,78 @@ fn active_detail_frontier_exposes_and_requires_only_selected_facets() {
             .collect()
     );
     assert!(!tool.parameters.to_string().contains("unmapped_facets"));
+    let copy_properties = property_names(&tool.parameters["properties"]["copy"]);
+    assert!(copy_properties.contains("welcome_content_prefix"));
+    assert!(copy_properties.contains("welcome_content_suffix"));
+    assert!(!copy_properties.contains("welcome_content"));
     let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
     assert!(
         schema_bytes < 1_800,
         "routed detail schema is {schema_bytes} bytes"
+    );
+}
+
+#[test]
+fn serving_detail_parser_flattens_patterns_and_stamps_all_facets() {
+    let arguments = json!({
+        "copy": {"create_button_label": "Start focus room"},
+        "naming": {"channel_name_prefix": "focus-", "channel_name_suffix": ""},
+        "controls": {"help_label": "Guide", "help_response": "Read this first"}
+    });
+    let parsed = parse_private_study_room_details_for_serving(
+        &arguments.to_string(),
+        &[
+            IntentRecipeDetailFacetV3::Controls,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Copy,
+        ],
+        9,
+        CORE_DIGEST,
+    )
+    .unwrap();
+    assert_eq!(parsed.expected_revision(), 9);
+    assert_eq!(
+        parsed.copy().create_button_label.as_deref(),
+        Some("Start focus room")
+    );
+    let channel_name = parsed.naming().channel_name.as_ref().unwrap();
+    assert_eq!(channel_name.prefix, "focus-");
+    assert_eq!(channel_name.suffix, "");
+    assert_eq!(parsed.controls().help_label.as_deref(), Some("Guide"));
+    assert_eq!(
+        parsed.controls().help_response.as_deref(),
+        Some("Read this first")
+    );
+    assert_eq!(
+        parsed.covered_facets(),
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Controls,
+        ]
+    );
+}
+
+#[test]
+fn serving_detail_parser_uses_empty_counterpart_and_rejects_nested_patterns() {
+    let parsed = parse_private_study_room_details_for_serving(
+        &json!({"naming": {"channel_name_prefix": "focus-"}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Naming],
+        0,
+        CORE_DIGEST,
+    )
+    .unwrap();
+    assert_eq!(parsed.naming().channel_name.as_ref().unwrap().suffix, "");
+    assert_eq!(
+        parse_private_study_room_details_for_serving(
+            &json!({"naming": {"channel_name": {"prefix": "focus-", "suffix": ""}}}).to_string(),
+            &[IntentRecipeDetailFacetV3::Naming],
+            0,
+            CORE_DIGEST,
+        )
+        .unwrap_err()
+        .code,
+        "UNKNOWN_FIELD"
     );
 }
 
