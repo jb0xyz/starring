@@ -927,8 +927,9 @@ fn discussion_alone_surfaces_model_prose_and_never_creates_build_findings() {
         );
         let root = session.draft.clone();
 
-        let BurstOutcome::Routed { fallback, decision } =
-            session.run_burst("Help me compare game designs").await
+        let BurstOutcome::Routed { fallback, decision } = session
+            .run_burst("Help me compare game designs that require an external consensus lease")
+            .await
         else {
             panic!("expected discussion")
         };
