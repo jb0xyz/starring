@@ -47,6 +47,7 @@ pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V3: &str = concat!(
     " custom_detail_facets contains custom_copy, custom_naming, or custom_controls only when the human supplied a concrete non-default literal.",
     " The phrase default copy or default naming supplies no custom literal, so it always means custom_detail_facets=[].",
     " A custom button label maps to custom_copy and a custom channel-name pattern maps to custom_naming.",
+    " Custom Help, Join, or Close labels and their responses map to custom_controls; include every applicable custom facet together.",
     " Buttons, modals, messages, responses, and static behavior belong only in objective.",
     " other_unmapped_required_capabilities contains only distinct capabilities the automation must execute or enforce that no closed field represents.",
     " It is not a summary and excludes objective behavior, scope-preservation or anti-weakening instructions, and anything represented by another field.",

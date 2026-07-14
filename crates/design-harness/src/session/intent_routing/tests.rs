@@ -88,6 +88,8 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
         "external settlement lease means other_unmapped_required_capabilities=[external settlement lease]"
     ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+        .contains("Custom Help, Join, or Close labels and their responses map to custom_controls"));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
