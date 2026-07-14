@@ -1,0 +1,358 @@
+use resource_resolution::ResourceBindingMap;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::errors::StructuredError;
+use crate::intent::{
+    ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV1, MissingDecision,
+};
+
+use super::super::{SessionSnapshot, SessionSnapshotError};
+
+pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT: &str = "Route each human turn through exactly the one provided tool. Never answer with prose and never emit more than one tool call. Echo expected_revision exactly from the latest INTENT_STATE harness message. INTENT_STATE is harness-generated JSON data, not a human request. The actual human request is the user message immediately before it. Use private_study_room only for the supported managed private study-room recipe and fill only its user-facing proposal fields. Use typed_planner for another automation design that should continue through the general typed planner, capability_gap for requested behavior unavailable in the supported recipe, reject for disallowed behavior, and discussion when no Draft change is requested. When resolve_intent_decision is provided, select exactly one channel key from available_channel_keys that answers the active question. Never invent schema versions, feature identifiers, recipe metadata, provenance, actions, permissions, manifests, RuleSet JSON, deployment, activation, or live Discord operations.";
+pub(super) const INTENT_RECIPE_PROTOCOL_VERSION: u16 = 1;
+pub(super) const INTENT_STATE_PREFIX: &str = "INTENT_STATE:";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentFallbackKind {
+    TypedPlanner,
+    CapabilityGap,
+    Reject,
+    Discussion,
+}
+
+impl IntentFallbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypedPlanner => "typed_planner",
+            Self::CapabilityGap => "capability_gap",
+            Self::Reject => "reject",
+            Self::Discussion => "discussion",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntentFallbackV1 {
+    TypedPlanner {
+        reason: String,
+        response: String,
+    },
+    CapabilityGap {
+        capabilities: Vec<String>,
+        response: String,
+    },
+    Reject {
+        reason: String,
+        response: String,
+    },
+    Discussion {
+        response: String,
+    },
+}
+
+impl IntentFallbackV1 {
+    pub fn kind(&self) -> IntentFallbackKind {
+        match self {
+            Self::TypedPlanner { .. } => IntentFallbackKind::TypedPlanner,
+            Self::CapabilityGap { .. } => IntentFallbackKind::CapabilityGap,
+            Self::Reject { .. } => IntentFallbackKind::Reject,
+            Self::Discussion { .. } => IntentFallbackKind::Discussion,
+        }
+    }
+
+    pub fn response(&self) -> &str {
+        match self {
+            Self::TypedPlanner { response, .. }
+            | Self::CapabilityGap { response, .. }
+            | Self::Reject { response, .. }
+            | Self::Discussion { response } => response,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentRecipeReceiptV1 {
+    pub intent_revision: u64,
+    pub candidate_revision: u64,
+    pub input_intent_hash: String,
+    pub semantic_intent_hash: String,
+    pub compiled_plan_hash: String,
+    pub compiled_operations: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntentRecipeStatusV1 {
+    Empty {
+        expected_revision: u64,
+    },
+    AwaitingDecision {
+        root_draft_revision: u64,
+        workspace_revision: u64,
+        question: String,
+        available_channel_keys: Vec<String>,
+    },
+    PreviewReady {
+        root_draft_revision: u64,
+        workspace_revision: u64,
+        receipt: IntentRecipeReceiptV1,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IntentRecipeSessionSnapshotV1 {
+    pub(crate) protocol_version: u16,
+    pub(crate) context_fingerprint: String,
+    pub(crate) stage: IntentRecipeStageSnapshotV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum IntentRecipeStageSnapshotV1 {
+    Empty,
+    AwaitingDecision {
+        root_draft_revision: u64,
+        workspace: IntentWorkspaceV1,
+        active_decision: MissingDecision,
+    },
+    PreviewReady {
+        root_draft_revision: u64,
+        workspace: IntentWorkspaceV1,
+        intent_revision: u64,
+        candidate_revision: u64,
+        input_intent_hash: String,
+        semantic_intent_hash: String,
+        compiled_plan_hash: String,
+        external_channel_bindings: Vec<String>,
+        compiled_operations: usize,
+    },
+}
+
+pub(in crate::session) struct IntentRecipeRuntime {
+    pub(super) bindings: ResourceBindingMap,
+    pub(super) snapshot: IntentRecipeSessionSnapshotV1,
+}
+
+impl IntentRecipeRuntime {
+    pub(super) fn new(bindings: ResourceBindingMap) -> Self {
+        Self {
+            snapshot: IntentRecipeSessionSnapshotV1 {
+                protocol_version: INTENT_RECIPE_PROTOCOL_VERSION,
+                context_fingerprint: context_fingerprint(&bindings),
+                stage: IntentRecipeStageSnapshotV1::Empty,
+            },
+            bindings,
+        }
+    }
+
+    pub(super) fn restore(
+        bindings: ResourceBindingMap,
+        snapshot: IntentRecipeSessionSnapshotV1,
+    ) -> Result<Self, SessionSnapshotError> {
+        let actual = context_fingerprint(&bindings);
+        if actual != snapshot.context_fingerprint {
+            return Err(snapshot_error(
+                "intent recipe resource bindings changed after the snapshot was created",
+            ));
+        }
+        Ok(Self { bindings, snapshot })
+    }
+
+    pub(in crate::session) fn snapshot(&self) -> IntentRecipeSessionSnapshotV1 {
+        self.snapshot.clone()
+    }
+
+    pub(super) fn resolution_context(&self) -> IntentResolutionContext {
+        IntentResolutionContext::from_channel_bindings(
+            self.bindings
+                .channel_bindings
+                .keys()
+                .map(|key| ExistingChannelKey(key.0.clone())),
+        )
+    }
+
+    pub(super) fn expected_revision(&self, draft_revision: u64) -> u64 {
+        match &self.snapshot.stage {
+            IntentRecipeStageSnapshotV1::AwaitingDecision { workspace, .. } => workspace.revision,
+            IntentRecipeStageSnapshotV1::Empty
+            | IntentRecipeStageSnapshotV1::PreviewReady { .. } => draft_revision,
+        }
+    }
+
+    pub(super) fn expected_tool(&self) -> &'static str {
+        match self.snapshot.stage {
+            IntentRecipeStageSnapshotV1::AwaitingDecision { .. } => "resolve_intent_decision",
+            IntentRecipeStageSnapshotV1::Empty
+            | IntentRecipeStageSnapshotV1::PreviewReady { .. } => "route_intent_turn",
+        }
+    }
+
+    pub(super) fn ensure_draft_revision(&self, draft_revision: u64) -> Result<(), StructuredError> {
+        let expected = match self.snapshot.stage {
+            IntentRecipeStageSnapshotV1::Empty => return Ok(()),
+            IntentRecipeStageSnapshotV1::AwaitingDecision {
+                root_draft_revision,
+                ..
+            } => root_draft_revision,
+            IntentRecipeStageSnapshotV1::PreviewReady {
+                candidate_revision, ..
+            } => candidate_revision,
+        };
+        if expected == draft_revision {
+            return Ok(());
+        }
+        Err(intent_error(
+            "INTENT_SESSION_DRAFT_DRIFT",
+            "intent.session.draft_revision",
+            format!(
+                "Intent session state expects Draft revision {expected} but the canonical Draft is revision {draft_revision}"
+            ),
+            "Start a new intent recipe session from the current canonical Draft",
+        ))
+    }
+}
+pub(in crate::session) fn validate_intent_recipe_snapshot(
+    snapshot: &SessionSnapshot,
+) -> Result<(), SessionSnapshotError> {
+    let Some(intent) = snapshot.intent_recipe.as_ref() else {
+        if snapshot
+            .messages
+            .first()
+            .is_some_and(|message| message.content == INTENT_RECIPE_SYSTEM_PROMPT)
+        {
+            return Err(snapshot_error(
+                "intent recipe prompt is present without intent recipe state",
+            ));
+        }
+        return Ok(());
+    };
+    if snapshot
+        .messages
+        .first()
+        .is_none_or(|message| message.content != INTENT_RECIPE_SYSTEM_PROMPT)
+    {
+        return Err(snapshot_error(
+            "intent recipe state does not use the fixed intent recipe system prompt",
+        ));
+    }
+    if intent.protocol_version != INTENT_RECIPE_PROTOCOL_VERSION {
+        return Err(snapshot_error(format!(
+            "unsupported intent recipe protocol version {}",
+            intent.protocol_version
+        )));
+    }
+    if !valid_hash(&intent.context_fingerprint) {
+        return Err(snapshot_error(
+            "intent recipe context fingerprint is malformed",
+        ));
+    }
+    if snapshot.adaptive_enabled
+        || snapshot.adaptive_turn.is_some()
+        || snapshot.repair_state.is_some()
+        || !snapshot.brief_history.is_empty()
+        || snapshot.prose_nudged
+    {
+        return Err(snapshot_error(
+            "intent recipe snapshot contains incompatible adaptive or repair state",
+        ));
+    }
+    match &intent.stage {
+        IntentRecipeStageSnapshotV1::Empty => Ok(()),
+        IntentRecipeStageSnapshotV1::AwaitingDecision {
+            root_draft_revision,
+            workspace,
+            active_decision,
+        } => {
+            if *root_draft_revision != snapshot.draft.draft_revision
+                || workspace.schema_version != 1
+                || workspace.revision == 0
+                || workspace.features.len() != 1
+                || active_decision.id.trim().is_empty()
+                || active_decision.path.trim().is_empty()
+                || active_decision.question.trim().is_empty()
+                || active_decision.options.is_empty()
+            {
+                return Err(snapshot_error(
+                    "awaiting intent decision state is inconsistent",
+                ));
+            }
+            Ok(())
+        }
+        IntentRecipeStageSnapshotV1::PreviewReady {
+            root_draft_revision,
+            workspace,
+            intent_revision,
+            candidate_revision,
+            input_intent_hash,
+            semantic_intent_hash,
+            compiled_plan_hash,
+            external_channel_bindings,
+            compiled_operations,
+        } => {
+            if workspace.schema_version != 1
+                || workspace.revision != *intent_revision
+                || workspace.features.len() != 1
+                || *root_draft_revision >= *candidate_revision
+                || *candidate_revision != snapshot.draft.draft_revision
+                || snapshot.draft.validated_revision != Some(*candidate_revision)
+                || snapshot.draft.simulated_revision != Some(*candidate_revision)
+                || !valid_hash(input_intent_hash)
+                || !valid_hash(semantic_intent_hash)
+                || !valid_hash(compiled_plan_hash)
+                || external_channel_bindings.is_empty()
+                || *compiled_operations == 0
+            {
+                return Err(snapshot_error(
+                    "preview-ready intent recipe state is inconsistent",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+fn context_fingerprint(bindings: &ResourceBindingMap) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, "intent_recipe_context_v1");
+    for (key, id) in &bindings.channel_bindings {
+        hash_field(&mut hasher, "channel");
+        hash_field(&mut hasher, &key.0);
+        hash_field(&mut hasher, &id.to_string());
+    }
+    for (key, id) in &bindings.role_bindings {
+        hash_field(&mut hasher, "role");
+        hash_field(&mut hasher, &key.0);
+        hash_field(&mut hasher, &id.to_string());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(super) fn intent_error(
+    code: impl Into<String>,
+    location: impl Into<String>,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> StructuredError {
+    StructuredError::new(code, location, message, hint)
+}
+
+pub(super) fn snapshot_error(message: impl Into<String>) -> SessionSnapshotError {
+    SessionSnapshotError::InvalidInvariant {
+        message: message.into(),
+    }
+}

@@ -121,7 +121,6 @@ pub(crate) fn prepare_private_study_room(
     prepare_intent_workspace(workspace_from_proposal(proposal), context)
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn apply_existing_channel_decision(
     workspace: &IntentWorkspaceV1,
     expected_revision: u64,

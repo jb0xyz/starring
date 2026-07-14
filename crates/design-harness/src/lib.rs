@@ -14,8 +14,10 @@ pub use errors::{
 };
 pub use gates::{simulate_draft, validate_draft};
 pub use llm::{LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall};
+pub use resource_resolution::ResourceBindingMap;
 pub use session::{
-    BurstOutcome, DesignSession, HaltReport, LimitKind, Observability, RepairKind, RepairState,
+    BurstOutcome, DesignSession, HaltReport, IntentFallbackKind, IntentFallbackV1,
+    IntentRecipeReceiptV1, IntentRecipeStatusV1, LimitKind, Observability, RepairKind, RepairState,
     RepairTicket, SessionConfig, SessionSnapshot, SessionSnapshotError, TurnPhase, TurnState,
     DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
 };

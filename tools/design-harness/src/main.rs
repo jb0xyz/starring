@@ -77,6 +77,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 write_draft(&mut output, &session.draft().summary()).await?;
                 write_observability(&mut output, session.observability()).await?;
             }
+            BurstOutcome::Routed { fallback } => {
+                write_line(&mut output, &format!("assistant> {}", fallback.response())).await?;
+            }
             BurstOutcome::Halted(report) => {
                 write_halt(&mut output, &report).await?;
                 break;

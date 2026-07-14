@@ -5,6 +5,7 @@ use crate::tools::tool_definitions;
 use crate::turn::AdaptivePhase;
 
 use super::context::{is_anchor, DraftStateMemory};
+use super::intent_routing::{validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT};
 use super::repair::{has_matching_repair_directive, is_argument_failure};
 use super::routing::{is_mutation_tool, routed_tool_definitions};
 use super::{
@@ -25,7 +26,7 @@ pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), Sessio
     if system.role != MessageRole::System
         || !matches!(
             system.content.as_str(),
-            DEFAULT_SYSTEM_PROMPT | PLANNED_SYSTEM_PROMPT
+            DEFAULT_SYSTEM_PROMPT | PLANNED_SYSTEM_PROMPT | INTENT_RECIPE_SYSTEM_PROMPT
         )
     {
         return Err(snapshot_invariant(
@@ -66,6 +67,7 @@ pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), Sessio
     validate_turn_snapshot(snapshot)?;
     validate_adaptive_turn_snapshot(snapshot)?;
     validate_repair_snapshot(snapshot)?;
+    validate_intent_recipe_snapshot(snapshot)?;
     validate_message_pairing(&snapshot.messages, snapshot.draft.draft_revision)
 }
 
