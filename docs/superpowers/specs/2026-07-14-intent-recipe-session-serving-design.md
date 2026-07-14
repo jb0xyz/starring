@@ -120,7 +120,7 @@ A one-shot request may resolve at revision 1 with `ModelExtracted` provenance wh
 
 Fallbacks are explicit outcomes, not successful recipe builds.
 
-- `typed_planner` hands a supported custom automation to the existing atomic typed planner;
+- `typed_planner` classifies a supported custom automation for a future handoff to the existing atomic typed planner; the current checkpoint returns `Routed` without transferring sessions;
 - `capability_gap` reports required runtime capabilities that do not exist;
 - `reject` records a safety-boundary refusal;
 - `discussion` continues product brainstorming without Draft mutation.
@@ -156,7 +156,7 @@ Intent mode adds cumulative and per-turn counters for:
 - fallback routes by kind;
 - deterministic compiled operations.
 
-Every live report records the exact model, context limit, gateway identity, commit, run order, start and end timestamps, turn latency, model calls, model tool calls, deterministic operations, hashes, actual validation and simulation stamps, and postcheck results.
+The implemented checkpoint report records the requested and gateway-reported model tag, provider-declared context policy, URL-derived opaque gateway identifier, source and binary identity, run order, timestamps, turn latency, model calls, model tool calls, deterministic operations, hashes, and actual validation and simulation stamps. It does not record a model-artifact digest, a gateway-observed context limit, or an independent Intent V3 semantic postcheck.
 
 ## Commercial runtime hardening
 
@@ -175,7 +175,7 @@ The first five items prevent deterministic input and rendering failures from cre
 
 ## Evaluation
 
-Gemma evaluation includes repeated runs of:
+The complete commercial evaluation design requires repeated runs of:
 
 - complete private StudyRoom one-shot;
 - the identical design split across a hub clarification;
@@ -190,7 +190,9 @@ Gemma evaluation includes repeated runs of:
 - restart while awaiting a decision;
 - concurrent persistence writers where exactly one commit succeeds.
 
-Acceptance requires 100% deterministic compiler, validation, simulation, provenance coverage, one-shot and multi-turn structural equivalence, missing-decision behavior, rollback safety, and persistence conflict safety. Known-recipe selection must be at least 9 of 10 runs, complete-request unnecessary questions must be zero, repeated identical error loops must be zero, and the normal known-recipe path must use one model call per user turn.
+The current close-disabled checkpoint implements the one-shot, hub clarification, SQLite close/reopen, Korean and English, discussion-to-build, fallback, capability-gap, and rejection cases. It does not yet implement live target-conflict, stale-revision, concurrent-writer, independent semantic-oracle, or external-failure cases. `CURRENT_STATE.md` and the checkpoint handoff are authoritative for the implemented subset.
+
+The target acceptance contract requires 100% deterministic compiler, validation, simulation, provenance coverage, one-shot and multi-turn structural equivalence, missing-decision behavior, rollback safety, and persistence conflict safety. Known-recipe selection must be at least 9 of 10 runs, complete-request unnecessary questions must be zero, repeated identical error loops must be zero, and the normal known-recipe path must use one model call per user turn. The implemented checkpoint measures only the assertions explicitly listed in its README and handoff.
 
 Latency targets remain end-to-preview P50 below 8 seconds and P95 below 20 seconds, with a 60-second safe halt boundary. Measurements below the required sample count or with mixed models are diagnostic only and cannot support a commercial-ready claim.
 
