@@ -4,6 +4,8 @@ use crate::turn::{
     TurnBrief, TurnIntent, TurnVerification,
 };
 
+use super::normalize::PreparedIntentWorkspaceV1;
+use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
 use super::{
     compile_intent, propose_private_study_room, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
     IntentProposalOutcomeV1, IntentRequestedOutcome, IntentResolutionContext,
@@ -20,10 +22,30 @@ fn intent(
     close_policy: Option<ClosePolicyV1>,
     launcher_content: Option<&str>,
 ) -> ValidatedIntentV1 {
-    let proposal = PrivateStudyRoomProposalV1 {
+    let proposal = proposal(
+        requested_outcome,
+        close_policy,
+        launcher_content,
+        Some(ExistingChannelKey("study_hub".to_string())),
+    );
+    let IntentProposalOutcomeV1::Resolved { intent, .. } =
+        propose_private_study_room(proposal, &context()).expect("proposal should resolve")
+    else {
+        panic!("expected a resolved intent");
+    };
+    intent
+}
+
+fn proposal(
+    requested_outcome: IntentRequestedOutcome,
+    close_policy: Option<ClosePolicyV1>,
+    launcher_content: Option<&str>,
+    hub_channel: Option<ExistingChannelKey>,
+) -> PrivateStudyRoomProposalV1 {
+    PrivateStudyRoomProposalV1 {
         objective: "Create a private study room".to_string(),
         requested_outcome,
-        hub_channel: Some(ExistingChannelKey("study_hub".to_string())),
+        hub_channel,
         locale: Some(IntentLocaleV1::En),
         copy: PrivateStudyRoomCopyProposalV1 {
             launcher_content: launcher_content.map(str::to_string),
@@ -34,11 +56,32 @@ fn intent(
             close_policy,
             ..PrivateStudyRoomControlsProposalV1::default()
         },
-    };
-    let IntentProposalOutcomeV1::Resolved { intent, .. } =
-        propose_private_study_room(proposal, &context()).expect("proposal should resolve")
+    }
+}
+
+fn resumed_intent() -> ValidatedIntentV1 {
+    let prepared = prepare_private_study_room(
+        proposal(IntentRequestedOutcome::ValidatedPreview, None, None, None),
+        &context(),
+    )
+    .expect("incomplete proposal should prepare");
+    let PreparedIntentWorkspaceV1::NeedsInput {
+        workspace,
+        decisions,
+    } = prepared
     else {
-        panic!("expected a resolved intent");
+        panic!("expected a pending hub decision");
+    };
+    assert_eq!(decisions.len(), 1);
+    let expected_revision = workspace.revision;
+    let PreparedIntentWorkspaceV1::Resolved { intent, .. } = apply_existing_channel_decision(
+        &workspace,
+        expected_revision,
+        ExistingChannelKey("study_hub".to_string()),
+        &context(),
+    )
+    .expect("confirmed hub decision should resolve") else {
+        panic!("expected a resolved resumed intent");
     };
     intent
 }
@@ -98,6 +141,7 @@ fn disabled_close_compiles_deterministically_without_dead_controls() {
     assert!(!first.manifest.generated_objects.contains_key("close_room"));
     assert_eq!(first.manifest.registry_digest.len(), 64);
     assert_eq!(first.manifest.input_intent_hash.len(), 64);
+    assert_eq!(first.manifest.semantic_intent_hash.len(), 64);
     assert_eq!(first.manifest.compiled_plan_hash.len(), 64);
     assert_eq!(
         first.manifest.compiled_plan_hash,
@@ -190,6 +234,10 @@ fn copy_changes_plan_hash_without_changing_generated_ownership() {
         second.manifest.input_intent_hash
     );
     assert_ne!(
+        first.manifest.semantic_intent_hash,
+        second.manifest.semantic_intent_hash
+    );
+    assert_ne!(
         first.manifest.compiled_plan_hash,
         second.manifest.compiled_plan_hash
     );
@@ -197,4 +245,28 @@ fn copy_changes_plan_hash_without_changing_generated_ownership() {
         first.manifest.generated_objects,
         second.manifest.generated_objects
     );
+}
+
+#[test]
+fn semantic_hash_ignores_revision_and_value_provenance() {
+    let one_shot = intent(IntentRequestedOutcome::ValidatedPreview, None, None);
+    let resumed = resumed_intent();
+    assert_eq!(one_shot.revision(), 1);
+    assert_eq!(resumed.revision(), 2);
+
+    let one_shot = compile_intent(&one_shot).expect("one-shot intent should compile");
+    let resumed = compile_intent(&resumed).expect("resumed intent should compile");
+    assert_ne!(
+        one_shot.manifest.input_intent_hash,
+        resumed.manifest.input_intent_hash
+    );
+    assert_eq!(
+        one_shot.manifest.semantic_intent_hash,
+        resumed.manifest.semantic_intent_hash
+    );
+    assert_eq!(
+        one_shot.manifest.compiled_plan_hash,
+        resumed.manifest.compiled_plan_hash
+    );
+    assert_eq!(one_shot.requirements, resumed.requirements);
 }

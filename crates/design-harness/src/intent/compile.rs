@@ -14,6 +14,7 @@ use super::model::{IntentRequestedOutcome, ResolvedFeatureConfigurationV1};
 use super::normalize::ValidatedIntentV1;
 use super::private_study_room::compile_private_study_room;
 use super::provenance::{IntentCoverageV1, ProvenanceBuilder, RequirementProvenanceV1};
+use super::semantic::semantic_intent_hash;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +32,7 @@ pub struct CompilationManifestV1 {
     pub compiler_revision: u32,
     pub registry_digest: String,
     pub input_intent_hash: String,
+    pub semantic_intent_hash: String,
     pub compiled_plan_hash: String,
     pub feature_id: String,
     pub recipe_id: String,
@@ -119,6 +121,7 @@ fn finalize_compilation(
         compiler_revision: COMPILER_REVISION,
         registry_digest: stable_hash(&descriptor, "intent.compiler.registry")?,
         input_intent_hash: stable_hash(intent, "intent.compiler.input")?,
+        semantic_intent_hash: semantic_intent_hash(intent)?,
         compiled_plan_hash: stable_hash(&requirements, "intent.compiler.requirements")?,
         feature_id,
         recipe_id: descriptor.id.to_string(),

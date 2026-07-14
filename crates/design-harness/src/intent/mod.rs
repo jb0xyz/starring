@@ -9,6 +9,7 @@ mod normalize;
 mod private_study_room;
 mod proposal;
 mod provenance;
+mod semantic;
 mod simulation;
 #[cfg(test)]
 mod tests;
