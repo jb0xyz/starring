@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use design_harness::{
-    simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, Observability, ToolFailure,
-    ToolResult,
+    simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, IntentRecipeStatusV1,
+    Observability, SessionConfig, ToolFailure, ToolResult, SESSION_SNAPSHOT_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -43,6 +43,163 @@ pub fn turn_report(input: TurnReportInput<'_>) -> Value {
         "injected_control_calls": input.injected_control_calls_after.saturating_sub(input.injected_control_calls_before),
         "delegated_model_calls": input.delegated_model_calls_after.saturating_sub(input.delegated_model_calls_before),
         "elapsed_ms": input.elapsed.as_millis()
+    })
+}
+
+pub struct IntentTurnReportInput<'a> {
+    pub id: &'a str,
+    pub input: &'a str,
+    pub before: &'a Draft,
+    pub after: &'a Draft,
+    pub status_before: &'a IntentRecipeStatusV1,
+    pub status_after: &'a IntentRecipeStatusV1,
+    pub observability_before: &'a Observability,
+    pub observability_after: &'a Observability,
+    pub outcome: &'a BurstOutcome,
+    pub elapsed: Duration,
+    pub restart_after: bool,
+    pub restart_performed: bool,
+}
+
+pub fn intent_turn_report(input: IntentTurnReportInput<'_>) -> Value {
+    let outcome = outcome_fields(input.outcome);
+    let model_calls = input
+        .observability_after
+        .model_calls
+        .saturating_sub(input.observability_before.model_calls);
+    let model_tool_calls = input
+        .observability_after
+        .tool_calls
+        .saturating_sub(input.observability_before.tool_calls);
+    let deterministic_operations = input
+        .observability_after
+        .intent_compiled_operations
+        .saturating_sub(input.observability_before.intent_compiled_operations);
+    json!({
+        "id": input.id,
+        "input": input.input,
+        "outcome": outcome.name,
+        "completed": outcome.completed,
+        "message": outcome.message,
+        "question": outcome.question,
+        "halt_code": outcome.halt_code,
+        "last_error": outcome.last_error,
+        "elapsed_ms": input.elapsed.as_millis(),
+        "model_calls": model_calls,
+        "model_tool_calls": model_tool_calls,
+        "deterministic_operations": deterministic_operations,
+        "intent_counters": intent_observability_delta(
+            input.observability_before,
+            input.observability_after
+        ),
+        "stage_before": intent_stage(input.status_before),
+        "stage_after": intent_stage(input.status_after),
+        "intent_revision_before": intent_revision(input.status_before),
+        "intent_revision_after": intent_revision(input.status_after),
+        "draft_revision_before": input.before.draft_revision,
+        "draft_revision_after": input.after.draft_revision,
+        "draft_changed": input.before != input.after,
+        "actual_gates": actual_gates(input.after),
+        "restart_after": input.restart_after,
+        "restart_performed": input.restart_performed
+    })
+}
+
+pub struct IntentReportMetadata<'a> {
+    pub gateway_id: &'a str,
+    pub declared_context_tokens: u64,
+    pub source_commit: &'a str,
+    pub source_dirty: bool,
+    pub build_source_commit: &'a str,
+    pub build_source_dirty: bool,
+    pub binary_sha256: &'a str,
+    pub run_id: &'a str,
+    pub run_order: u64,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub requested_model: &'a str,
+    pub session_config: &'a SessionConfig,
+}
+
+pub struct IntentPersistenceEvidence {
+    pub store_writes: usize,
+    pub connection_reopens: usize,
+    pub final_generation: u64,
+}
+
+pub fn intent_report<C>(
+    session: &DesignSession<C>,
+    turns: Vec<Value>,
+    elapsed: Duration,
+    persistence: IntentPersistenceEvidence,
+    metadata: IntentReportMetadata<'_>,
+) -> Value {
+    let draft = session.draft();
+    let status = session.intent_recipe_status();
+    let receipt = status.as_ref().and_then(|status| match status {
+        IntentRecipeStatusV1::PreviewReady { receipt, .. } => Some(receipt),
+        IntentRecipeStatusV1::Empty { .. } | IntentRecipeStatusV1::AwaitingDecision { .. } => None,
+    });
+    let final_stage = status.as_ref().map(intent_stage);
+    let terminal = turns.last();
+    let served_model = (session.observability().tool_calls > 0).then_some(metadata.requested_model);
+    json!({
+        "schema_version": 3,
+        "input_schema_version": 3,
+        "mode": "intent_recipe",
+        "requested_model": metadata.requested_model,
+        "served_model": served_model,
+        "gateway_id": metadata.gateway_id,
+        "declared_context_tokens": metadata.declared_context_tokens,
+        "context_declaration_source": "evaluation_provider",
+        "gateway_context_observed_tokens": Value::Null,
+        "provenance": {
+            "source_commit": metadata.source_commit,
+            "source_dirty": metadata.source_dirty,
+            "build_source_commit": metadata.build_source_commit,
+            "build_source_dirty": metadata.build_source_dirty,
+            "binary_sha256": metadata.binary_sha256,
+            "attestation_kind": "local_unsigned",
+            "run_id": metadata.run_id,
+            "run_order": metadata.run_order,
+            "started_at_unix_ms": metadata.started_at_unix_ms,
+            "ended_at_unix_ms": metadata.ended_at_unix_ms
+        },
+        "oracle": {
+            "enabled": false,
+            "injected_control_calls": 0
+        },
+        "session_config": {
+            "max_model_calls": metadata.session_config.max_model_calls,
+            "max_tool_calls": metadata.session_config.max_tool_calls,
+            "max_gate_failures": metadata.session_config.max_gate_failures,
+            "context_char_budget": metadata.session_config.context_char_budget
+        },
+        "outcome": terminal.and_then(|turn| turn.get("outcome")).cloned().unwrap_or(Value::Null),
+        "completed": terminal.and_then(|turn| turn.get("completed")).and_then(Value::as_bool).unwrap_or(false),
+        "message": terminal.and_then(|turn| turn.get("message")).cloned().unwrap_or(Value::Null),
+        "question": terminal.and_then(|turn| turn.get("question")).cloned().unwrap_or(Value::Null),
+        "halt_code": terminal.and_then(|turn| turn.get("halt_code")).cloned().unwrap_or(Value::Null),
+        "turns": turns,
+        "draft_revision": draft.draft_revision,
+        "ruleset": &draft.ruleset,
+        "actual_gates": actual_gates(draft),
+        "observability": session.observability(),
+        "final_intent": {
+            "status": final_stage,
+            "public_status": status,
+            "receipt": receipt,
+            "binding_fingerprint": session.intent_recipe_binding_fingerprint()
+        },
+        "persistence": {
+            "backend": "sqlite_file",
+            "store_writes": persistence.store_writes,
+            "connection_reopen_count": persistence.connection_reopens,
+            "final_generation": persistence.final_generation,
+            "snapshot_schema_version": SESSION_SNAPSHOT_VERSION,
+            "roundtrip_verified": persistence.connection_reopens > 0
+        },
+        "elapsed_ms": elapsed.as_millis()
     })
 }
 
@@ -224,6 +381,49 @@ fn observability_delta(before: &Observability, after: &Observability) -> Value {
     })
 }
 
+fn intent_observability_delta(before: &Observability, after: &Observability) -> Value {
+    let fallback_routes = after
+        .intent_fallback_routes
+        .iter()
+        .filter_map(|(kind, count)| {
+            let delta =
+                count.saturating_sub(*before.intent_fallback_routes.get(kind).unwrap_or(&0));
+            (delta > 0).then_some((kind.clone(), delta))
+        })
+        .collect::<BTreeMap<_, _>>();
+    json!({
+        "route_calls": after.intent_route_calls.saturating_sub(before.intent_route_calls),
+        "proposal_acceptances": after.intent_proposal_acceptances.saturating_sub(before.intent_proposal_acceptances),
+        "resolution_acceptances": after.intent_resolution_acceptances.saturating_sub(before.intent_resolution_acceptances),
+        "compile_attempts": after.intent_compile_attempts.saturating_sub(before.intent_compile_attempts),
+        "compile_successes": after.intent_compile_successes.saturating_sub(before.intent_compile_successes),
+        "commits": after.intent_commits.saturating_sub(before.intent_commits),
+        "rollbacks": after.intent_rollbacks.saturating_sub(before.intent_rollbacks),
+        "conflicts": after.intent_conflicts.saturating_sub(before.intent_conflicts),
+        "stale_revision_rejections": after.intent_stale_revision_rejections.saturating_sub(before.intent_stale_revision_rejections),
+        "extraction_failures": after.intent_extraction_failures.saturating_sub(before.intent_extraction_failures),
+        "fallback_routes": fallback_routes
+    })
+}
+
+fn intent_stage(status: &IntentRecipeStatusV1) -> &'static str {
+    match status {
+        IntentRecipeStatusV1::Empty { .. } => "empty",
+        IntentRecipeStatusV1::AwaitingDecision { .. } => "awaiting_decision",
+        IntentRecipeStatusV1::PreviewReady { .. } => "preview_ready",
+    }
+}
+
+fn intent_revision(status: &IntentRecipeStatusV1) -> u64 {
+    match status {
+        IntentRecipeStatusV1::Empty { expected_revision } => *expected_revision,
+        IntentRecipeStatusV1::AwaitingDecision {
+            workspace_revision, ..
+        } => *workspace_revision,
+        IntentRecipeStatusV1::PreviewReady { receipt, .. } => receipt.intent_revision,
+    }
+}
+
 fn failure(result: &ToolResult) -> Option<&ToolFailure> {
     result.failure()
 }
@@ -232,9 +432,55 @@ fn failure(result: &ToolResult) -> Option<&ToolFailure> {
 mod tests {
     use std::time::Duration;
 
-    use design_harness::{BurstOutcome, DesignSession};
+    use design_harness::{BurstOutcome, DesignSession, ResourceBindingMap, SessionConfig};
 
-    use super::{report, turn_report, TurnReportInput};
+    use super::{
+        intent_report, report, turn_report, IntentPersistenceEvidence, IntentReportMetadata,
+        TurnReportInput,
+    };
+
+    #[test]
+    fn intent_report_uses_v3_oracle_free_contract_and_null_model_without_calls() {
+        let session = DesignSession::with_intent_recipe((), ResourceBindingMap::default());
+        let session_config = SessionConfig::default();
+        let document = intent_report(
+            &session,
+            Vec::new(),
+            Duration::from_millis(9),
+            IntentPersistenceEvidence {
+                store_writes: 0,
+                connection_reopens: 0,
+                final_generation: 0,
+            },
+            IntentReportMetadata {
+                gateway_id: "test-gateway",
+                declared_context_tokens: 16_384,
+                source_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                source_dirty: false,
+                build_source_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                build_source_dirty: false,
+                binary_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                run_id: "run-1",
+                run_order: 1,
+                started_at_unix_ms: 10,
+                ended_at_unix_ms: 19,
+                requested_model: "gemma4:12b-mlx",
+                session_config: &session_config,
+            },
+        );
+
+        assert_eq!(document["schema_version"], 3);
+        assert_eq!(document["mode"], "intent_recipe");
+        assert_eq!(document["served_model"], serde_json::Value::Null);
+        assert_eq!(document["oracle"]["enabled"], false);
+        assert_eq!(document["oracle"]["injected_control_calls"], 0);
+        assert_eq!(document["final_intent"]["status"], "empty");
+        assert_eq!(document["final_intent"]["public_status"]["status"], "empty");
+        assert_eq!(document["final_intent"]["receipt"], serde_json::Value::Null);
+        assert!(document["final_intent"]["binding_fingerprint"].is_string());
+        assert_eq!(document["persistence"]["connection_reopen_count"], 0);
+        assert_eq!(document["persistence"]["roundtrip_verified"], false);
+    }
 
     #[tokio::test]
     async fn report_separates_actual_gate_stamps_from_postchecks() {

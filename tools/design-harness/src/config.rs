@@ -47,6 +47,12 @@ impl EdgeConfig {
     }
 }
 
+pub fn intent_bindings_from_env() -> Result<ResourceBindingMap, ConfigError> {
+    let document = env::var("STARRING_HARNESS_BINDINGS_JSON")
+        .map_err(|_| ConfigError::MissingIntentBindings)?;
+    parse_bindings(&document)
+}
+
 fn edge_config_from<F>(mut value: F) -> Result<EdgeConfig, ConfigError>
 where
     F: FnMut(&str) -> Option<String>,

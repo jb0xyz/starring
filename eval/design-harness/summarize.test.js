@@ -195,3 +195,83 @@ test('summary separates oracle injections from delegated model calls and semanti
   assert.equal(row.mean_plan_commits, 1);
   assert.equal(row.mean_plan_conflicts, 0);
 });
+
+test('summary exposes Gemma intent cohort boundaries, isolation, operations, and latency', () => {
+  const report = {
+    schema_version: 3,
+    outcome: 'ready',
+    completed: true,
+    elapsed_ms: 7000,
+    requested_model: 'gemma4:12b-mlx',
+    served_model: 'gemma4:12b-mlx',
+    declared_context_tokens: 16384,
+    context_declaration_source: 'evaluation_provider',
+    gateway_context_observed_tokens: null,
+    gateway_id: `sha256-${'1'.repeat(64)}`,
+    provenance: {
+      source_commit: 'a'.repeat(40),
+      source_dirty: false,
+      build_source_commit: 'a'.repeat(40),
+      build_source_dirty: false,
+      binary_sha256: 'b'.repeat(64),
+      attestation_kind: 'local_unsigned',
+      run_id: 'intent-run',
+      run_order: 4,
+      started_at_unix_ms: 100,
+      ended_at_unix_ms: 7100,
+    },
+    session_config: {
+      max_model_calls: 12,
+      max_tool_calls: 24,
+      max_gate_failures: 4,
+      context_char_budget: 44000,
+    },
+    oracle: { enabled: false, injected_control_calls: 0 },
+    actual_gates: { validation_current: true, simulation_current: true },
+    final_intent: {
+      status: 'preview_ready',
+      receipt: { compiled_operations: 22 },
+    },
+    observability: { model_calls: 1, tool_calls: 1, distinct_mutation_tools: [] },
+    turns: [{
+      outcome: 'ready',
+      draft_changed: true,
+      elapsed_ms: 7000,
+      model_calls: 1,
+      model_tool_calls: 1,
+      deterministic_operations: 22,
+    }],
+  };
+  const document = {
+    results: {
+      results: [{
+        provider: { label: 'gemma-intent' },
+        vars: { caseId: 'intent', cohort: 'intent_recipe', requireSimulation: true },
+        success: true,
+        response: { metadata: report },
+      }],
+    },
+  };
+
+  const [row] = summarize(document);
+
+  assert.equal(row.cohort, 'intent_recipe');
+  assert.equal(row.validation_rate, 1);
+  assert.equal(row.required_simulation_rate, 1);
+  assert.equal(row.recipe_selection_rate, 1);
+  assert.equal(row.oracle_isolation_rate, 1);
+  assert.equal(row.clean_source_rate, 1);
+  assert.equal(row.metadata_boundary_count, 1);
+  assert.equal(row.metadata_mixed, false);
+  assert.deepEqual(row.requested_models, ['gemma4:12b-mlx']);
+  assert.deepEqual(row.declared_context_tokens, [16384]);
+  assert.equal(row.gateway_context_observed, false);
+  assert.equal(row.first_run_order, 4);
+  assert.equal(row.last_run_order, 4);
+  assert.equal(row.p50_elapsed_ms, 7000);
+  assert.equal(row.p50_turn_elapsed_ms, 7000);
+  assert.equal(row.mean_turn_model_calls, 1);
+  assert.equal(row.mean_turn_tool_calls, 1);
+  assert.equal(row.mean_turn_deterministic_operations, 22);
+  assert.equal(row.mean_compiled_operations, 22);
+});

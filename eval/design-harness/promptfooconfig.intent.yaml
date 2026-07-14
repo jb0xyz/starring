@@ -1,0 +1,23 @@
+description: Starring Gemma4 oracle-free close-disabled intent checkpoint
+prompts:
+  - label: intent-request
+    raw: "{{request}}"
+providers:
+  - id: file://provider.js
+    label: gemma4-12b-mlx-intent
+    config:
+      intentOnly: true
+      model: gemma4:12b-mlx
+      timeoutMs: 60000
+      maxOutputBytes: 4194304
+      bindings:
+        schema_version: 1
+        channel_bindings:
+          - key: community_hub
+            id: "700000000000000001"
+          - key: games_hub
+            id: "700000000000000002"
+          - key: study_hub
+            id: "700000000000000003"
+        role_bindings: []
+tests: file://intent-cases.yaml

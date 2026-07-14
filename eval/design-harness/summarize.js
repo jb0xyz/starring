@@ -49,6 +49,9 @@ function vars(row) {
 }
 
 function postcheck(report, gate) {
+  if (report?.schema_version === 3) {
+    return report.actual_gates?.[`${gate === 'validate' ? 'validation' : 'simulation'}_current`] === true;
+  }
   if (report?.schema_version === 2) {
     return report.postcheck?.[`${gate}_passed`] === true;
   }
@@ -56,6 +59,9 @@ function postcheck(report, gate) {
 }
 
 function actualGate(report, gate) {
+  if (report?.schema_version === 3) {
+    return report.actual_gates?.[`${gate}_current`] === true;
+  }
   if (report?.schema_version === 2) {
     return report.actual_gates?.[`${gate}_current`] === true;
   }
@@ -106,12 +112,38 @@ function summarize(document) {
     const planConflicts = reports.map((report) => Number(report.observability?.plan_conflicts ?? 0));
     const turns = reports.flatMap((report) => Array.isArray(report.turns) ? report.turns : []);
     const turnElapsed = turns.map((turn) => Number(turn.elapsed_ms));
-    const turnModelCalls = turns.map((turn) => Number(turn.observability_delta?.model_calls));
-    const turnToolCalls = turns.map((turn) => Number(turn.observability_delta?.tool_calls));
+    const turnModelCalls = turns.map((turn) => Number(turn.model_calls ?? turn.observability_delta?.model_calls));
+    const turnToolCalls = turns.map((turn) => Number(turn.model_tool_calls ?? turn.observability_delta?.tool_calls));
+    const turnDeterministicOperations = turns.map((turn) => Number(turn.deterministic_operations));
+    const intentReports = reports.filter((report) => report.schema_version === 3);
+    const metadataBoundaries = new Set(intentReports.map((report) => [
+      report.requested_model,
+      report.served_model,
+      report.declared_context_tokens,
+      report.gateway_id,
+      report.provenance?.source_commit,
+      report.provenance?.binary_sha256,
+      report.final_intent?.binding_fingerprint,
+      JSON.stringify(report.session_config),
+      report.provenance?.run_id,
+    ].join('::')));
+    const requestedModels = [...new Set(intentReports.map((report) => report.requested_model))];
+    const servedModels = [...new Set(intentReports.map((report) => report.served_model))];
+    const gatewayIds = [...new Set(intentReports.map((report) => report.gateway_id))];
+    const declaredContextTokens = [...new Set(intentReports.map((report) => report.declared_context_tokens))];
+    const sourceCommits = [...new Set(intentReports.map((report) => report.provenance?.source_commit))];
+    const runIds = [...new Set(intentReports.map((report) => report.provenance?.run_id))];
+    const binaryDigests = [...new Set(intentReports.map((report) => report.provenance?.binary_sha256))];
+    const bindingFingerprints = [...new Set(intentReports.map((report) => report.final_intent?.binding_fingerprint))];
+    const runOrders = intentReports.map((report) => Number(report.provenance?.run_order));
+    const started = intentReports.map((report) => Number(report.provenance?.started_at_unix_ms));
+    const ended = intentReports.map((report) => Number(report.provenance?.ended_at_unix_ms));
+    const receiptOperations = intentReports.map((report) => Number(report.final_intent?.receipt?.compiled_operations));
     const semanticRows = group.rows.filter((entry) => assertionPassed(entry.row, 'taskSemantics') !== null);
     return {
       provider: group.provider,
       case_id: group.caseId,
+      cohort: intentReports.length > 0 ? 'intent_recipe' : 'legacy',
       runs: group.rows.length,
       valid_reports: reports.length,
       valid_report_rate: reports.length / group.rows.length,
@@ -133,6 +165,7 @@ function summarize(document) {
       mean_max_repeat_count: mean(repeatCounts),
       maximum_repeat_count: finiteValues(repeatCounts).length === 0 ? null : Math.max(...finiteValues(repeatCounts)),
       mean_elapsed_ms: mean(elapsed) === null ? null : Math.round(mean(elapsed)),
+      p50_elapsed_ms: percentile(elapsed, 0.5),
       p95_elapsed_ms: percentile(elapsed, 0.95),
       mean_model_calls: mean(modelCalls),
       mean_tool_calls: mean(toolCalls),
@@ -155,9 +188,37 @@ function summarize(document) {
       changed_turn_rate: turns.length === 0 ? null : turns.filter((turn) => turn.draft_changed === true).length / turns.length,
       needs_input_turn_rate: turns.length === 0 ? null : turns.filter((turn) => ['needs_input', 'awaiting_human'].includes(turn.outcome)).length / turns.length,
       mean_turn_elapsed_ms: mean(turnElapsed) === null ? null : Math.round(mean(turnElapsed)),
+      p50_turn_elapsed_ms: percentile(turnElapsed, 0.5),
       p95_turn_elapsed_ms: percentile(turnElapsed, 0.95),
       mean_turn_model_calls: mean(turnModelCalls),
       mean_turn_tool_calls: mean(turnToolCalls),
+      mean_turn_deterministic_operations: mean(turnDeterministicOperations),
+      mean_compiled_operations: mean(receiptOperations),
+      recipe_selection_rate: intentReports.length === 0
+        ? null
+        : intentReports.filter((report) => report.final_intent?.status === 'preview_ready').length / group.rows.length,
+      oracle_isolation_rate: intentReports.length === 0
+        ? null
+        : intentReports.filter((report) => report.oracle?.enabled === false && report.oracle?.injected_control_calls === 0).length / group.rows.length,
+      clean_source_rate: intentReports.length === 0
+        ? null
+        : intentReports.filter((report) => report.provenance?.source_dirty === false
+          && report.provenance?.build_source_dirty === false).length / group.rows.length,
+      metadata_boundary_count: intentReports.length === 0 ? null : metadataBoundaries.size,
+      metadata_mixed: intentReports.length === 0 ? null : metadataBoundaries.size !== 1,
+      requested_models: requestedModels,
+      served_models: servedModels,
+      gateway_ids: gatewayIds,
+      declared_context_tokens: declaredContextTokens,
+      gateway_context_observed: intentReports.some((report) => report.gateway_context_observed_tokens !== null),
+      source_commits: sourceCommits,
+      binary_sha256: binaryDigests,
+      binding_fingerprints: bindingFingerprints,
+      run_ids: runIds,
+      first_run_order: finiteValues(runOrders).length === 0 ? null : Math.min(...finiteValues(runOrders)),
+      last_run_order: finiteValues(runOrders).length === 0 ? null : Math.max(...finiteValues(runOrders)),
+      started_at_unix_ms: finiteValues(started).length === 0 ? null : Math.min(...finiteValues(started)),
+      ended_at_unix_ms: finiteValues(ended).length === 0 ? null : Math.max(...finiteValues(ended)),
     };
   });
 }
