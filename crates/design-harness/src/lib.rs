@@ -1,6 +1,7 @@
 pub mod draft;
 pub mod errors;
 pub mod gates;
+pub mod intent;
 pub mod llm;
 pub mod session;
 pub mod tools;

@@ -129,6 +129,7 @@ pub struct IntentValue<T> {
 }
 
 pub enum IntentValueSource {
+    ModelExtracted,
     UserExplicit,
     UserConfirmed,
     ContextDerived,
@@ -136,7 +137,7 @@ pub enum IntentValueSource {
 }
 ```
 
-The model never submits `schema_version`, `revision`, `feature_id`, recipe identity, or `IntentValueSource`. Narrow recipe-specific input types accept semantic values only. The harness owns revision increments, allocates identifiers, selects the exact registered recipe, and stamps provenance according to whether a value came from the current user turn, a confirmed decision, deterministic context, or the recipe default. Durable workspace JSON is never used directly as a Gemma tool schema.
+The model never submits `schema_version`, `revision`, `feature_id`, recipe identity, or `IntentValueSource`. Narrow recipe-specific input types accept semantic values only. The first input is `PrivateStudyRoomProposalV1`, containing the objective, requested outcome, optional hub and locale, and optional copy, naming, and control overrides. The harness owns revision increments, allocates identifiers, selects the exact registered recipe, and stamps provenance according to whether a value was model-extracted from the user turn, explicitly confirmed by the user, supplied by deterministic context, or materialized from the recipe default. `ModelExtracted` is not treated as user confirmation. Durable workspace JSON is never used directly as a Gemma tool schema.
 
 Only fields with no safe deterministic value remain absent in the partial workspace. Resolution returns either an opaque `ValidatedIntentV1` or a stable ordered list of `MissingDecision` values. The compiler accepts only the opaque value issued by normalization, so callers cannot construct a resolved value and bypass validation. A discussion outcome is never compilable and cannot mutate the Draft.
 
