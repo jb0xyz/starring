@@ -1,4 +1,7 @@
 mod candidate;
+mod capability;
+#[cfg(test)]
+mod capability_tests;
 mod catalog;
 mod compile;
 #[cfg(test)]
@@ -19,6 +22,15 @@ mod workspace_tests;
 pub use candidate::{
     prepare_intent_candidate, CommittedIntentCandidateV1, IntentExecutionReportV1,
     PreparedIntentCandidateV1,
+};
+pub use capability::{
+    assess_intent_capabilities_v2, intent_capability_manifest_digest_v2,
+    intent_capability_manifest_v2, CapabilityDescriptorV2, CapabilityManifestV2,
+    CapabilityPolicyIdV2, CapabilityStatusV2, IntentCapabilityAssessmentV2,
+    IntentCapabilityBlockerV2, IntentCapabilityIdV2, IntentCapabilityRequirementV2,
+    IntentRequirementEvidenceV2, IntentRouteEffectV2, IntentSafetyBoundaryIdV2,
+    IntentSafetyBoundaryRequestV2, IntentSafetyBoundaryViolationV2, LocalizedIntentLabelV2,
+    SafetyBoundaryDescriptorV2, INTENT_CAPABILITY_MANIFEST_VERSION_V2,
 };
 pub use compile::{
     compile_intent, CompilationManifestV1, CompilationVerificationV1, CompiledIntentV1,
