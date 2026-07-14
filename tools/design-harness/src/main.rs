@@ -1718,8 +1718,8 @@ mod tests {
                     "language": "en",
                     "close_policy": "disabled",
                     "runtime_requirements": [],
-                    "boundary_requests": [],
-                    "unclassified_requirements": [],
+                    "explicit_boundary_requests": [],
+                    "other_unmapped_hard_requirements": [],
                     "custom_detail_facets": [],
                     "response": ""
                 })
@@ -1843,8 +1843,8 @@ mod tests {
                     "language": "en",
                     "close_policy": "disabled",
                     "runtime_requirements": [],
-                    "boundary_requests": [],
-                    "unclassified_requirements": [],
+                    "explicit_boundary_requests": [],
+                    "other_unmapped_hard_requirements": [],
                     "custom_detail_facets": [],
                     "response": "I already deployed this automation."
                 })

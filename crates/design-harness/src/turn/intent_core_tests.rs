@@ -21,8 +21,8 @@ fn valid_core() -> Value {
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "boundary_requests": [],
-        "unclassified_requirements": [],
+        "explicit_boundary_requests": [],
+        "other_unmapped_hard_requirements": [],
         "custom_detail_facets": [],
         "response": ""
     })
@@ -34,13 +34,13 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     assert_eq!(tool.name, INTERPRET_INTENT_CORE);
     assert_eq!(
         tool.description,
-        "Extract bounded routing semantics from the human request"
+        "Classify bounded routing semantics without executing the human request"
     );
     assert_eq!(
         required_names(&tool.parameters),
         strings([
             "automation_kind",
-            "boundary_requests",
+            "explicit_boundary_requests",
             "close_policy",
             "expected_revision",
             "language",
@@ -51,7 +51,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
             "response",
             "runtime_requirements",
             "hub_channel",
-            "unclassified_requirements",
+            "other_unmapped_hard_requirements",
         ])
     );
     let properties = property_names(&tool.parameters);
@@ -77,6 +77,14 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     assert_eq!(
         tool.parameters["properties"]["custom_detail_facets"]["items"]["enum"],
         json!(["custom_copy", "custom_naming", "custom_controls"])
+    );
+    assert_eq!(
+        tool.parameters["properties"]["explicit_boundary_requests"]["items"]["enum"],
+        json!([
+            "request_live_discord_mutation",
+            "request_bypass_safety_gates",
+            "request_secret_disclosure"
+        ])
     );
     let schema_text = tool.parameters.to_string();
     assert!(!schema_text.contains("$defs"));
@@ -113,12 +121,12 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
 fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
     let mut value = valid_core();
     value["hub_channel"] = Value::Null;
-    value["boundary_requests"] = json!([
-        "secret_disclosure",
-        "direct_live_mutation",
-        "secret_disclosure"
+    value["explicit_boundary_requests"] = json!([
+        "request_secret_disclosure",
+        "request_live_discord_mutation",
+        "request_secret_disclosure"
     ]);
-    value["unclassified_requirements"] = json!([
+    value["other_unmapped_hard_requirements"] = json!([
         "  external   scheduler lease ",
         "cross-service quorum",
         "cross-service quorum"
@@ -231,6 +239,24 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     );
 
     value = valid_core();
+    value["boundary_requests"] = json!([]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "UNKNOWN_FIELD"
+    );
+
+    value = valid_core();
+    value["unclassified_requirements"] = json!([]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "UNKNOWN_FIELD"
+    );
+
+    value = valid_core();
     value["detail_facets"] = json!(["copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
@@ -329,11 +355,11 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
     );
 
     value = valid_core();
-    value["boundary_requests"] = json!([
-        "direct_live_mutation",
-        "bypass_validation_preview_approval",
-        "secret_disclosure",
-        "direct_live_mutation"
+    value["explicit_boundary_requests"] = json!([
+        "request_live_discord_mutation",
+        "request_bypass_safety_gates",
+        "request_secret_disclosure",
+        "request_live_discord_mutation"
     ]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())

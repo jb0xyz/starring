@@ -25,8 +25,8 @@ fn core_value() -> Value {
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "boundary_requests": [],
-        "unclassified_requirements": [],
+        "explicit_boundary_requests": [],
+        "other_unmapped_hard_requirements": [],
         "custom_detail_facets": [],
         "response": ""
     })
@@ -273,7 +273,7 @@ fn v3_safety_and_capability_precedence_terminate_before_details() {
     );
 
     let mut boundary = core_value();
-    boundary["boundary_requests"] = json!(["direct_live_mutation"]);
+    boundary["explicit_boundary_requests"] = json!(["request_live_discord_mutation"]);
     boundary["custom_detail_facets"] = json!(["custom_copy"]);
     let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&boundary) else {
         panic!("boundary request must terminate");

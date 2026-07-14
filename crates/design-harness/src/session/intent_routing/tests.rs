@@ -88,8 +88,8 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "boundary_requests": [],
-        "unclassified_requirements": [],
+        "explicit_boundary_requests": [],
+        "other_unmapped_hard_requirements": [],
         "custom_detail_facets": [],
         "response": ""
     })
@@ -137,7 +137,8 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
 fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["runtime_requirements"] = json!(["restart_persistent"]);
-    value["boundary_requests"] = json!(["secret_disclosure", "direct_live_mutation"]);
+    value["explicit_boundary_requests"] =
+        json!(["request_secret_disclosure", "request_live_discord_mutation"]);
     value["custom_detail_facets"] = json!(["custom_copy"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
@@ -155,7 +156,7 @@ fn discussion(expected_revision: u64, response: &str) -> LlmResponse {
         "persistent_economy",
         "event_time_llm"
     ]);
-    value["unclassified_requirements"] = json!(["external consensus lease"]);
+    value["other_unmapped_hard_requirements"] = json!(["external consensus lease"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }

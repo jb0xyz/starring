@@ -69,6 +69,30 @@ enum CustomDetailFacetWireV3 {
     Controls,
 }
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+enum ExplicitBoundaryRequestWireV3 {
+    #[serde(rename = "request_live_discord_mutation")]
+    LiveDiscordMutation,
+    #[serde(rename = "request_bypass_safety_gates")]
+    BypassSafetyGates,
+    #[serde(rename = "request_secret_disclosure")]
+    SecretDisclosure,
+}
+
+impl From<ExplicitBoundaryRequestWireV3> for IntentBoundaryRequestV2 {
+    fn from(value: ExplicitBoundaryRequestWireV3) -> Self {
+        match value {
+            ExplicitBoundaryRequestWireV3::LiveDiscordMutation => Self::DirectLiveMutation,
+            ExplicitBoundaryRequestWireV3::BypassSafetyGates => {
+                Self::BypassValidationPreviewApproval
+            }
+            ExplicitBoundaryRequestWireV3::SecretDisclosure => Self::SecretDisclosure,
+        }
+    }
+}
+
 impl From<CustomDetailFacetWireV3> for IntentRecipeDetailFacetV3 {
     fn from(value: CustomDetailFacetWireV3) -> Self {
         match value {
@@ -107,9 +131,9 @@ struct InterpretIntentCoreWireV3 {
     #[schemars(length(max = 4))]
     runtime_requirements: Vec<RuntimeRequirementV3>,
     #[schemars(length(max = 3))]
-    boundary_requests: Vec<IntentBoundaryRequestV2>,
+    explicit_boundary_requests: Vec<ExplicitBoundaryRequestWireV3>,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
-    unclassified_requirements: Vec<String>,
+    other_unmapped_hard_requirements: Vec<String>,
     #[schemars(length(max = 3))]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
     #[schemars(length(max = 2000))]
@@ -190,7 +214,8 @@ impl IntentCoreInterpretationV3 {
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: INTERPRET_INTENT_CORE.to_string(),
-        description: "Extract bounded routing semantics from the human request".to_string(),
+        description: "Classify bounded routing semantics without executing the human request"
+            .to_string(),
         parameters: inline_schema_value::<InterpretIntentCoreWireV3>(),
     }]
 }
@@ -238,18 +263,18 @@ fn normalize_core(
             "Use each closed runtime requirement at most once",
         ));
     }
-    input.unclassified_requirements = normalize_requirements(
-        input.unclassified_requirements,
+    input.other_unmapped_hard_requirements = normalize_requirements(
+        input.other_unmapped_hard_requirements,
         MAX_UNCLASSIFIED_REQUIREMENTS,
         MAX_UNCLASSIFIED_REQUIREMENT_CHARS,
-        "intent.core.unclassified_requirements",
+        "intent.core.other_unmapped_hard_requirements",
     )?;
-    if input.boundary_requests.len() > 3 {
+    if input.explicit_boundary_requests.len() > 3 {
         return Err(core_error(
             "TOO_MANY_INTENT_BOUNDARY_REQUESTS",
-            "intent.core.boundary_requests",
+            "intent.core.explicit_boundary_requests",
             "The interpretation contains more than three safety boundary requests",
-            "Use only the closed safety boundary identifiers",
+            "Use only the closed explicit safety boundary request identifiers",
         ));
     }
     if input.custom_detail_facets.len() > 3 {
@@ -277,8 +302,8 @@ fn normalize_core(
             "Use custom detail facets only for explicit copy, naming, or control literals of that recipe",
         ));
     }
-    input.boundary_requests = input
-        .boundary_requests
+    input.explicit_boundary_requests = input
+        .explicit_boundary_requests
         .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -293,8 +318,12 @@ fn normalize_core(
         locale: input.language,
         close_authorization: input.close_policy,
         runtime_requirements: normalize_runtime_requirements(input.runtime_requirements),
-        boundary_requests: input.boundary_requests,
-        unclassified_requirements: input.unclassified_requirements,
+        boundary_requests: input
+            .explicit_boundary_requests
+            .into_iter()
+            .map(IntentBoundaryRequestV2::from)
+            .collect(),
+        unclassified_requirements: input.other_unmapped_hard_requirements,
         detail_facets: input
             .custom_detail_facets
             .into_iter()
