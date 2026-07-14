@@ -1,8 +1,10 @@
+mod execution;
 mod plan;
 mod plan_input;
 mod protocol;
 mod scope;
 
+pub(crate) use execution::{execute_plan_atomically, ExecutionRecord};
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
     assign_repeat_targets as assign_turn_plan_repeat_targets,
