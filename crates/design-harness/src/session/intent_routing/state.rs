@@ -56,7 +56,7 @@ pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V3: &str = concat!(
     " Preserve only otherwise unrepresented positive authorization, lifecycle, runtime, or external-effect capabilities there.",
     " Safety-boundary requests belong only in the three boundary fields.",
     " Mapping examples:",
-    " persistent XP across restarts with durable timers and event-time LLM, even with a do-not-weaken instruction, means runtime_requirements=[restart_persistent,durable_timer,persistent_economy,event_time_llm] and other_unmapped_required_capabilities=[].",
+    " persistent XP across restarts with durable timers and event-time LLM, even with a do-not-weaken instruction, means runtime_requirements=[restart_persistent,durable_timer,persistent_economy,event_time_llm], other_unmapped_required_capabilities=[], requested_gate_skips=[], request_live_discord_mutation=false, and request_secret_disclosure=false.",
     " expose a secret without redaction and deploy immediately means requested_gate_skips=[], request_live_discord_mutation=true, request_secret_disclosure=true.",
     " skip approval and deploy immediately means requested_gate_skips=[approval], request_live_discord_mutation=true.",
     " Never invent fields, routes, capability identifiers, recipe metadata, actions, permissions, RuleSet JSON, deployment, activation, secrets, or live operations."

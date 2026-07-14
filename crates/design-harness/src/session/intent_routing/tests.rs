@@ -81,6 +81,9 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("persistent XP across restarts with durable timers and event-time LLM"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
+        "other_unmapped_required_capabilities=[], requested_gate_skips=[], request_live_discord_mutation=false"
+    ));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
