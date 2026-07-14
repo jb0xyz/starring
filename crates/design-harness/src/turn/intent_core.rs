@@ -89,7 +89,7 @@ struct InterpretIntentCoreWireV3 {
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
     unclassified_requirements: Vec<String>,
     #[schemars(length(max = 3))]
-    detail_facets: Vec<IntentRecipeDetailFacetV3>,
+    custom_detail_facets: Vec<IntentRecipeDetailFacetV3>,
     #[schemars(length(max = 2000))]
     response: String,
 }
@@ -230,27 +230,27 @@ fn normalize_core(
             "Use only the closed safety boundary identifiers",
         ));
     }
-    if input.detail_facets.len() > 3 {
+    if input.custom_detail_facets.len() > 3 {
         return Err(core_error(
             "TOO_MANY_RECIPE_DETAIL_FACETS",
-            "intent.core.detail_facets",
+            "intent.core.custom_detail_facets",
             "The interpretation contains more than three recipe detail facets",
             "Use only copy, naming, and controls",
         ));
     }
-    input.detail_facets = input
-        .detail_facets
+    input.custom_detail_facets = input
+        .custom_detail_facets
         .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    if !input.detail_facets.is_empty()
+    if !input.custom_detail_facets.is_empty()
         && (input.request_mode != IntentRequestModeV2::Build
             || input.automation_kind != IntentAutomationKindV2::ManagedPrivateStudyRoom)
     {
         return Err(core_error(
             "INCONSISTENT_INTENT_CORE",
-            "intent.core.detail_facets",
+            "intent.core.custom_detail_facets",
             "Recipe detail facets require a managed private study-room build",
             "Use detail facets only for explicit copy, naming, or control customization of that recipe",
         ));
@@ -273,7 +273,7 @@ fn normalize_core(
         runtime_requirements: normalize_runtime_requirements(input.runtime_requirements),
         boundary_requests: input.boundary_requests,
         unclassified_requirements: input.unclassified_requirements,
-        detail_facets: input.detail_facets,
+        detail_facets: input.custom_detail_facets,
         response: input.response,
     })
 }

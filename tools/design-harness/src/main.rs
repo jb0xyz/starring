@@ -1720,7 +1720,7 @@ mod tests {
                     "runtime_requirements": [],
                     "boundary_requests": [],
                     "unclassified_requirements": [],
-                    "detail_facets": [],
+                    "custom_detail_facets": [],
                     "response": ""
                 })
                 .to_string(),
@@ -1845,7 +1845,7 @@ mod tests {
                     "runtime_requirements": [],
                     "boundary_requests": [],
                     "unclassified_requirements": [],
-                    "detail_facets": [],
+                    "custom_detail_facets": [],
                     "response": "I already deployed this automation."
                 })
                 .to_string(),

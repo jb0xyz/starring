@@ -27,7 +27,7 @@ fn core_value() -> Value {
         "runtime_requirements": [],
         "boundary_requests": [],
         "unclassified_requirements": [],
-        "detail_facets": [],
+        "custom_detail_facets": [],
         "response": ""
     })
 }
@@ -143,7 +143,7 @@ fn v3_digest_is_transport_independent_and_detail_sensitive() {
     );
 
     let mut detailed = core_value();
-    detailed["detail_facets"] = json!(["copy"]);
+    detailed["custom_detail_facets"] = json!(["copy"]);
     let detailed = core_decision(&detailed);
     assert_ne!(baseline.semantic_ir_digest(), detailed.semantic_ir_digest());
     assert_ne!(
@@ -157,7 +157,7 @@ fn v3_digest_is_transport_independent_and_detail_sensitive() {
 #[test]
 fn v3_detail_path_binds_core_and_preserves_exact_literals() {
     let mut value = core_value();
-    value["detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["copy"]);
     let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&value) else {
         panic!("expected private study-room selection");
     };
@@ -195,7 +195,7 @@ fn v3_detail_path_binds_core_and_preserves_exact_literals() {
 #[test]
 fn v3_missing_spurious_and_contradictory_details_fail_closed() {
     let mut custom = core_value();
-    custom["detail_facets"] = json!(["controls"]);
+    custom["custom_detail_facets"] = json!(["controls"]);
     let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&custom) else {
         panic!("expected private study-room selection");
     };
@@ -259,7 +259,7 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
 fn v3_safety_and_capability_precedence_terminate_before_details() {
     let mut creator = core_value();
     creator["close_policy"] = json!("creator_only");
-    creator["detail_facets"] = json!(["controls"]);
+    creator["custom_detail_facets"] = json!(["controls"]);
     let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&creator) else {
         panic!("creator-only must terminate");
     };
@@ -274,7 +274,7 @@ fn v3_safety_and_capability_precedence_terminate_before_details() {
 
     let mut boundary = core_value();
     boundary["boundary_requests"] = json!(["direct_live_mutation"]);
-    boundary["detail_facets"] = json!(["copy"]);
+    boundary["custom_detail_facets"] = json!(["copy"]);
     let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&boundary) else {
         panic!("boundary request must terminate");
     };

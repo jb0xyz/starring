@@ -23,7 +23,7 @@ fn valid_core() -> Value {
         "runtime_requirements": [],
         "boundary_requests": [],
         "unclassified_requirements": [],
-        "detail_facets": [],
+        "custom_detail_facets": [],
         "response": ""
     })
 }
@@ -45,7 +45,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
             "expected_revision",
             "language",
             "objective",
-            "detail_facets",
+            "custom_detail_facets",
             "request_mode",
             "requested_outcome",
             "response",
@@ -145,7 +145,7 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
 #[test]
 fn core_parser_preserves_and_sorts_explicit_recipe_detail_facets() {
     let mut value = valid_core();
-    value["detail_facets"] = json!(["naming", "copy", "controls"]);
+    value["custom_detail_facets"] = json!(["naming", "copy", "controls"]);
     let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
     assert_eq!(parsed.recipe_detail_facets().len(), 3);
     assert_eq!(
@@ -206,7 +206,7 @@ fn core_parser_discards_build_response_deterministically() {
 fn core_parser_rejects_details_outside_the_pinned_recipe_shape() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
-    value["detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -219,6 +219,15 @@ fn core_parser_rejects_details_outside_the_pinned_recipe_shape() {
 fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     let mut value = valid_core();
     value["copy"] = json!({"launcher_content": "hidden"});
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "UNKNOWN_FIELD"
+    );
+
+    value = valid_core();
+    value["detail_facets"] = json!(["copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -240,7 +249,7 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     value["automation_kind"] = json!("none");
     value["requested_outcome"] = json!("discussion");
     value["response"] = json!("Let us compare the tradeoffs.");
-    value["detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -348,7 +357,7 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
 #[test]
 fn core_parser_enforces_detail_and_text_bounds() {
     let mut value = valid_core();
-    value["detail_facets"] = json!(["behavior"]);
+    value["custom_detail_facets"] = json!(["behavior"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -357,7 +366,7 @@ fn core_parser_enforces_detail_and_text_bounds() {
     );
 
     value = valid_core();
-    value["detail_facets"] = json!(["copy", "naming", "controls", "copy"]);
+    value["custom_detail_facets"] = json!(["copy", "naming", "controls", "copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
