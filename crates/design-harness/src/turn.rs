@@ -1,4 +1,5 @@
 mod execution;
+mod intent_protocol;
 mod plan;
 mod plan_input;
 mod protocol;
@@ -6,6 +7,11 @@ mod scope;
 
 pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
+};
+pub use intent_protocol::{
+    parse_resolve_intent_decision, parse_route_intent_turn, resolve_intent_decision_frontier,
+    route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,
+    RouteIntentTurnInputV1,
 };
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
