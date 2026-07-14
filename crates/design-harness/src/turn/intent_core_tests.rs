@@ -74,6 +74,10 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         tool.parameters.get("additionalProperties"),
         Some(&Value::Bool(false))
     );
+    assert_eq!(
+        tool.parameters["properties"]["custom_detail_facets"]["items"]["enum"],
+        json!(["custom_copy", "custom_naming", "custom_controls"])
+    );
     let schema_text = tool.parameters.to_string();
     assert!(!schema_text.contains("$defs"));
     assert!(!schema_text.contains("$ref"));
@@ -145,7 +149,7 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
 #[test]
 fn core_parser_preserves_and_sorts_explicit_recipe_detail_facets() {
     let mut value = valid_core();
-    value["custom_detail_facets"] = json!(["naming", "copy", "controls"]);
+    value["custom_detail_facets"] = json!(["custom_naming", "custom_copy", "custom_controls"]);
     let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
     assert_eq!(parsed.recipe_detail_facets().len(), 3);
     assert_eq!(
@@ -206,7 +210,7 @@ fn core_parser_discards_build_response_deterministically() {
 fn core_parser_rejects_details_outside_the_pinned_recipe_shape() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
-    value["custom_detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["custom_copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -249,7 +253,7 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     value["automation_kind"] = json!("none");
     value["requested_outcome"] = json!("discussion");
     value["response"] = json!("Let us compare the tradeoffs.");
-    value["custom_detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["custom_copy"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -357,7 +361,7 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
 #[test]
 fn core_parser_enforces_detail_and_text_bounds() {
     let mut value = valid_core();
-    value["custom_detail_facets"] = json!(["behavior"]);
+    value["custom_detail_facets"] = json!(["custom_behavior"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -366,7 +370,12 @@ fn core_parser_enforces_detail_and_text_bounds() {
     );
 
     value = valid_core();
-    value["custom_detail_facets"] = json!(["copy", "naming", "controls", "copy"]);
+    value["custom_detail_facets"] = json!([
+        "custom_copy",
+        "custom_naming",
+        "custom_controls",
+        "custom_copy"
+    ]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()

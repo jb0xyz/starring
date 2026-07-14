@@ -13,6 +13,7 @@ mod intent_text;
 mod plan;
 mod plan_input;
 mod protocol;
+mod schema;
 mod scope;
 
 pub(crate) use execution::{

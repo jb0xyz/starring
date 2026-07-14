@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 
-use schemars::{schema_for, JsonSchema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Value};
 
 use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1};
@@ -12,6 +11,7 @@ use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_interpretation::{
     normalize_private_study_room_details, PrivateStudyRoomControlsInterpretationV2,
 };
+use super::schema::inline_schema_value;
 
 pub const EXTRACT_PRIVATE_STUDY_ROOM_DETAILS: &str = "extract_private_study_room_details";
 
@@ -66,7 +66,7 @@ pub fn private_study_room_details_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: EXTRACT_PRIVATE_STUDY_ROOM_DETAILS.to_string(),
         description: "Extract only the requested private StudyRoom copy, naming, and control details from the original human turn. Cover every active detail facet exactly once, leave unrequested objects empty, and never author routes, authorization, actions, permissions, recipe identity, or deployment operations".to_string(),
-        parameters: schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
+        parameters: inline_schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
     }]
 }
 
@@ -81,7 +81,7 @@ pub fn parse_private_study_room_details(
             translate_tool_arguments_error(
                 EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
                 &error,
-                &schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
+                &inline_schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
             )
         })?;
     normalize_private_study_room_details(&mut input.copy, &mut input.naming, &mut input.controls)?;
@@ -242,24 +242,6 @@ fn facet_name(value: IntentRecipeDetailFacetV3) -> &'static str {
         IntentRecipeDetailFacetV3::Naming => "naming",
         IntentRecipeDetailFacetV3::Controls => "controls",
     }
-}
-
-fn schema_value<T: JsonSchema>() -> Value {
-    let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
-    if let Some(root) = value.as_object_mut() {
-        root.remove("$schema");
-        root.remove("title");
-        if let Some(expected_revision) = root
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .and_then(|properties| properties.get_mut("expected_revision"))
-            .and_then(Value::as_object_mut)
-        {
-            expected_revision.remove("format");
-            expected_revision.remove("minimum");
-        }
-    }
-    value
 }
 
 fn detail_error(

@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use schemars::{schema_for, JsonSchema, Schema, SchemaGenerator};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{json, Value};
 
 use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
@@ -15,6 +14,7 @@ use super::intent_interpretation::{
     TimerRequirementV2,
 };
 use super::intent_text::{normalized_required_text, validate_text_shape};
+use super::schema::inline_schema_value;
 
 pub const INTERPRET_INTENT_CORE: &str = "interpret_intent_core";
 
@@ -60,6 +60,28 @@ pub enum IntentRecipeDetailFacetV3 {
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
+enum CustomDetailFacetWireV3 {
+    #[serde(rename = "custom_copy")]
+    Copy,
+    #[serde(rename = "custom_naming")]
+    Naming,
+    #[serde(rename = "custom_controls")]
+    Controls,
+}
+
+impl From<CustomDetailFacetWireV3> for IntentRecipeDetailFacetV3 {
+    fn from(value: CustomDetailFacetWireV3) -> Self {
+        match value {
+            CustomDetailFacetWireV3::Copy => Self::Copy,
+            CustomDetailFacetWireV3::Naming => Self::Naming,
+            CustomDetailFacetWireV3::Controls => Self::Controls,
+        }
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeRequirementV3 {
     RestartPersistent,
@@ -89,7 +111,7 @@ struct InterpretIntentCoreWireV3 {
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
     unclassified_requirements: Vec<String>,
     #[schemars(length(max = 3))]
-    custom_detail_facets: Vec<IntentRecipeDetailFacetV3>,
+    custom_detail_facets: Vec<CustomDetailFacetWireV3>,
     #[schemars(length(max = 2000))]
     response: String,
 }
@@ -169,7 +191,7 @@ pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: INTERPRET_INTENT_CORE.to_string(),
         description: "Extract bounded routing semantics from the human request".to_string(),
-        parameters: schema_value::<InterpretIntentCoreWireV3>(),
+        parameters: inline_schema_value::<InterpretIntentCoreWireV3>(),
     }]
 }
 
@@ -180,7 +202,7 @@ pub fn parse_interpret_intent_core(
         translate_tool_arguments_error(
             INTERPRET_INTENT_CORE,
             &error,
-            &schema_value::<InterpretIntentCoreWireV3>(),
+            &inline_schema_value::<InterpretIntentCoreWireV3>(),
         )
     })?;
     normalize_core(input)
@@ -235,7 +257,7 @@ fn normalize_core(
             "TOO_MANY_RECIPE_DETAIL_FACETS",
             "intent.core.custom_detail_facets",
             "The interpretation contains more than three recipe detail facets",
-            "Use only copy, naming, and controls",
+            "Use only custom_copy, custom_naming, and custom_controls",
         ));
     }
     input.custom_detail_facets = input
@@ -252,7 +274,7 @@ fn normalize_core(
             "INCONSISTENT_INTENT_CORE",
             "intent.core.custom_detail_facets",
             "Recipe detail facets require a managed private study-room build",
-            "Use detail facets only for explicit copy, naming, or control customization of that recipe",
+            "Use custom detail facets only for explicit copy, naming, or control literals of that recipe",
         ));
     }
     input.boundary_requests = input
@@ -273,7 +295,11 @@ fn normalize_core(
         runtime_requirements: normalize_runtime_requirements(input.runtime_requirements),
         boundary_requests: input.boundary_requests,
         unclassified_requirements: input.unclassified_requirements,
-        detail_facets: input.custom_detail_facets,
+        detail_facets: input
+            .custom_detail_facets
+            .into_iter()
+            .map(IntentRecipeDetailFacetV3::from)
+            .collect(),
         response: input.response,
     })
 }
@@ -405,58 +431,6 @@ fn normalize_requirements(
         )?);
     }
     Ok(normalized.into_iter().collect())
-}
-
-fn schema_value<T: JsonSchema>() -> Value {
-    let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
-    let definitions = value
-        .get("$defs")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    inline_schema_references(&mut value, &definitions);
-    if let Some(root) = value.as_object_mut() {
-        root.remove("$schema");
-        root.remove("$defs");
-        root.remove("title");
-        if let Some(expected_revision) = root
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .and_then(|properties| properties.get_mut("expected_revision"))
-            .and_then(Value::as_object_mut)
-        {
-            expected_revision.remove("format");
-            expected_revision.remove("minimum");
-        }
-    }
-    value
-}
-
-fn inline_schema_references(value: &mut Value, definitions: &serde_json::Map<String, Value>) {
-    let replacement = value
-        .get("$ref")
-        .and_then(Value::as_str)
-        .and_then(|reference| reference.strip_prefix("#/$defs/"))
-        .and_then(|name| definitions.get(name))
-        .cloned();
-    if let Some(mut replacement) = replacement {
-        inline_schema_references(&mut replacement, definitions);
-        *value = replacement;
-        return;
-    }
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                inline_schema_references(value, definitions);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values_mut() {
-                inline_schema_references(value, definitions);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn core_error(

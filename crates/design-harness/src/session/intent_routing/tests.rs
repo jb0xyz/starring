@@ -114,7 +114,7 @@ fn custom_static(expected_revision: u64, response: &str) -> LlmResponse {
 fn creator_only(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["close_policy"] = json!("creator_only");
-    value["custom_detail_facets"] = json!(["controls"]);
+    value["custom_detail_facets"] = json!(["custom_controls"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -138,7 +138,7 @@ fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["runtime_requirements"] = json!(["restart_persistent"]);
     value["boundary_requests"] = json!(["secret_disclosure", "direct_live_mutation"]);
-    value["custom_detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["custom_copy"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -171,7 +171,7 @@ fn private_room_with_copy_details(
     hub: Option<&str>,
 ) -> (LlmResponse, LlmResponse) {
     let mut value = private_room_value(expected_revision, hub);
-    value["custom_detail_facets"] = json!(["copy"]);
+    value["custom_detail_facets"] = json!(["custom_copy"]);
     let core = parse_interpret_intent_core(&value.to_string()).unwrap();
     let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) =
         adjudicate_intent_core_v3(core).unwrap()

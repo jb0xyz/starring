@@ -60,6 +60,9 @@ fn detail_frontier_is_one_closed_recipe_specific_tool() {
         tool.parameters.get("additionalProperties"),
         Some(&Value::Bool(false))
     );
+    let schema_text = tool.parameters.to_string();
+    assert!(!schema_text.contains("$defs"));
+    assert!(!schema_text.contains("$ref"));
     let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
     assert!(
         schema_bytes <= 2_400,
