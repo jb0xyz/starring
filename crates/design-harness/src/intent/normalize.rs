@@ -44,12 +44,25 @@ impl ValidatedIntentV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg(test)]
 pub(super) enum IntentResolutionV1 {
     NeedsInput {
         workspace: IntentWorkspaceV1,
         decisions: Vec<MissingDecision>,
     },
     Resolved {
+        intent: ValidatedIntentV1,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedIntentWorkspaceV1 {
+    NeedsInput {
+        workspace: IntentWorkspaceV1,
+        decisions: Vec<MissingDecision>,
+    },
+    Resolved {
+        workspace: IntentWorkspaceV1,
         intent: ValidatedIntentV1,
     },
 }
@@ -63,10 +76,29 @@ const MAX_BUTTON_LABEL_CHARS: usize = 80;
 const MAX_MODAL_TEXT_CHARS: usize = 45;
 const MAX_NAME_AFFIX_CHARS: usize = 80;
 
+#[cfg(test)]
 pub(super) fn resolve_intent_workspace(
-    mut workspace: IntentWorkspaceV1,
+    workspace: IntentWorkspaceV1,
     context: &IntentResolutionContext,
 ) -> Result<IntentResolutionV1, StructuredError> {
+    match prepare_intent_workspace(workspace, context)? {
+        PreparedIntentWorkspaceV1::NeedsInput {
+            workspace,
+            decisions,
+        } => Ok(IntentResolutionV1::NeedsInput {
+            workspace,
+            decisions,
+        }),
+        PreparedIntentWorkspaceV1::Resolved { intent, .. } => {
+            Ok(IntentResolutionV1::Resolved { intent })
+        }
+    }
+}
+
+pub(crate) fn prepare_intent_workspace(
+    mut workspace: IntentWorkspaceV1,
+    context: &IntentResolutionContext,
+) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
     if workspace.schema_version != INTENT_SCHEMA_VERSION {
         return Err(intent_error(
             "UNSUPPORTED_INTENT_SCHEMA_VERSION",
@@ -139,18 +171,25 @@ pub(super) fn resolve_intent_workspace(
         }
     }
 
+    decisions.sort_by(|left, right| {
+        left.feature_id
+            .cmp(&right.feature_id)
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    decisions.truncate(1);
+
     if decisions.is_empty() {
-        Ok(IntentResolutionV1::Resolved {
-            intent: ValidatedIntentV1(ResolvedIntentV1 {
-                schema_version: workspace.schema_version,
-                revision: workspace.revision,
-                objective: workspace.objective,
-                requested_outcome: workspace.requested_outcome,
-                features: resolved_features,
-            }),
-        })
+        let intent = ValidatedIntentV1(ResolvedIntentV1 {
+            schema_version: workspace.schema_version,
+            revision: workspace.revision,
+            objective: workspace.objective.clone(),
+            requested_outcome: workspace.requested_outcome,
+            features: resolved_features,
+        });
+        Ok(PreparedIntentWorkspaceV1::Resolved { workspace, intent })
     } else {
-        Ok(IntentResolutionV1::NeedsInput {
+        Ok(PreparedIntentWorkspaceV1::NeedsInput {
             workspace,
             decisions,
         })
@@ -219,14 +258,20 @@ fn resolve_private_room(
 ) -> Result<Option<ResolvedManagedPrivateRoomV1>, StructuredError> {
     normalize_private_room(configuration, feature_path)?;
     let Some(hub_channel) = configuration.hub_channel.clone() else {
+        let (question, reason) = missing_hub_copy(
+            configuration
+                .locale
+                .as_ref()
+                .map(|locale| locale.value)
+                .unwrap_or(IntentLocaleV1::En),
+        );
         decisions.push(MissingDecision {
             id: format!("{}.hub_channel", feature_id.as_str()),
             feature_id: feature_id.clone(),
             path: format!("{feature_path}.configuration.parameters.hub_channel"),
             kind: MissingDecisionKind::ExistingChannel,
-            question: "Which existing channel should host the study-room launcher?".to_string(),
-            reason: "The recipe must bind its launcher and discovery panel to one existing channel"
-                .to_string(),
+            question: question.to_string(),
+            reason: reason.to_string(),
             options: context
                 .channel_bindings
                 .iter()
@@ -262,6 +307,19 @@ fn resolve_private_room(
         naming: resolve_naming(naming, &defaults),
         controls: resolve_controls(controls, &defaults, feature_path)?,
     }))
+}
+
+fn missing_hub_copy(locale: IntentLocaleV1) -> (&'static str, &'static str) {
+    match locale {
+        IntentLocaleV1::En => (
+            "Which existing channel should host the study-room launcher?",
+            "The recipe must bind its launcher and discovery panel to one existing channel",
+        ),
+        IntentLocaleV1::Ko => (
+            "스터디룸 실행 패널을 어느 기존 채널에 둘까요?",
+            "레시피가 실행 패널과 탐색 패널을 배치할 기존 채널 하나를 지정해야 합니다",
+        ),
+    }
 }
 
 fn normalize_private_room(

@@ -11,7 +11,7 @@ use super::model::{
     MissingDecision, RecipeRef, RoomNamePatternV1, INTENT_SCHEMA_VERSION,
     PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
 };
-use super::normalize::{resolve_intent_workspace, IntentResolutionV1, ValidatedIntentV1};
+use super::normalize::{prepare_intent_workspace, PreparedIntentWorkspaceV1, ValidatedIntentV1};
 
 const INITIAL_INTENT_REVISION: u64 = 1;
 const PRIVATE_STUDY_ROOM_FEATURE_ID: &str = "private_study_room";
@@ -97,7 +97,76 @@ pub fn propose_private_study_room(
     proposal: PrivateStudyRoomProposalV1,
     context: &IntentResolutionContext,
 ) -> Result<IntentProposalOutcomeV1, StructuredError> {
-    let workspace = IntentWorkspaceV1 {
+    match prepare_private_study_room(proposal, context)? {
+        PreparedIntentWorkspaceV1::NeedsInput {
+            workspace,
+            decisions,
+        } => Ok(IntentProposalOutcomeV1::NeedsInput {
+            revision: workspace.revision,
+            decisions,
+        }),
+        PreparedIntentWorkspaceV1::Resolved { intent, .. } => {
+            Ok(IntentProposalOutcomeV1::Resolved {
+                revision: intent.revision(),
+                intent,
+            })
+        }
+    }
+}
+
+pub(crate) fn prepare_private_study_room(
+    proposal: PrivateStudyRoomProposalV1,
+    context: &IntentResolutionContext,
+) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
+    prepare_intent_workspace(workspace_from_proposal(proposal), context)
+}
+
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn apply_existing_channel_decision(
+    workspace: &IntentWorkspaceV1,
+    expected_revision: u64,
+    channel: ExistingChannelKey,
+    context: &IntentResolutionContext,
+) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
+    if workspace.revision != expected_revision {
+        return Err(StructuredError::new(
+            "STALE_INTENT_WORKSPACE_REVISION",
+            "intent.revision",
+            format!(
+                "Intent workspace revision {} does not match expected revision {expected_revision}",
+                workspace.revision
+            ),
+            format!("Retry with current revision {}", workspace.revision),
+        ));
+    }
+    let next_revision = workspace.revision.checked_add(1).ok_or_else(|| {
+        StructuredError::new(
+            "INTENT_WORKSPACE_REVISION_OVERFLOW",
+            "intent.revision",
+            "Intent workspace revision cannot be incremented",
+            "Start a new intent workspace",
+        )
+    })?;
+    let mut updated = workspace.clone();
+    let Some(feature) = updated.features.first_mut() else {
+        return prepare_intent_workspace(updated, context);
+    };
+    let FeatureConfigurationV1::ManagedPrivateRoom(configuration) = &mut feature.configuration;
+    if configuration.hub_channel.is_some() {
+        return Err(StructuredError::new(
+            "INTENT_DECISION_NOT_PENDING",
+            "intent.features.0.configuration.parameters.hub_channel",
+            "The existing-channel decision is not pending",
+            "Apply only the active missing decision",
+        ));
+    }
+    configuration.hub_channel = Some(IntentValue::new(channel, IntentValueSource::UserConfirmed));
+    updated.revision = next_revision;
+    prepare_intent_workspace(updated, context)
+}
+
+fn workspace_from_proposal(proposal: PrivateStudyRoomProposalV1) -> IntentWorkspaceV1 {
+    IntentWorkspaceV1 {
         schema_version: INTENT_SCHEMA_VERSION,
         revision: INITIAL_INTENT_REVISION,
         objective: proposal.objective,
@@ -135,19 +204,6 @@ pub fn propose_private_study_room(
                 },
             }),
         }],
-    };
-    match resolve_intent_workspace(workspace, context)? {
-        IntentResolutionV1::NeedsInput {
-            workspace,
-            decisions,
-        } => Ok(IntentProposalOutcomeV1::NeedsInput {
-            revision: workspace.revision,
-            decisions,
-        }),
-        IntentResolutionV1::Resolved { intent } => Ok(IntentProposalOutcomeV1::Resolved {
-            revision: intent.revision(),
-            intent,
-        }),
     }
 }
 

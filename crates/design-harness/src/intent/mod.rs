@@ -12,6 +12,8 @@ mod provenance;
 mod simulation;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workspace_tests;
 
 pub use candidate::{
     prepare_intent_candidate, CommittedIntentCandidateV1, IntentExecutionReportV1,
