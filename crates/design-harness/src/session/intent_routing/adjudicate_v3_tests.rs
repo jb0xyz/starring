@@ -22,6 +22,24 @@ fn core_value() -> Value {
         "objective": "Create private study rooms",
         "requested_outcome": "validated_preview",
         "hub_channel": "community_hub",
+        "language": "en",
+        "close_policy": "disabled",
+        "runtime_requirements": [],
+        "boundary_requests": [],
+        "unclassified_requirements": [],
+        "detail_facets": [],
+        "response": ""
+    })
+}
+
+fn v2_value() -> Value {
+    json!({
+        "expected_revision": 0,
+        "request_mode": "build",
+        "automation_kind": "managed_private_study_room",
+        "objective": "Create private study rooms",
+        "requested_outcome": "validated_preview",
+        "hub_channel": "community_hub",
         "locale": "en",
         "close_authorization": "disabled",
         "runtime_requirements": {
@@ -32,16 +50,9 @@ fn core_value() -> Value {
         },
         "boundary_requests": [],
         "unclassified_requirements": [],
-        "detail_facets": [],
-        "response": ""
+        "response": "",
+        "response_locale": "en"
     })
-}
-
-fn v2_value() -> Value {
-    let mut value = core_value();
-    value.as_object_mut().unwrap().remove("detail_facets");
-    value["response_locale"] = json!("en");
-    value
 }
 
 fn adjudicate_core(value: &Value) -> IntentCoreAdjudicationV3 {
@@ -247,7 +258,7 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
 #[test]
 fn v3_safety_and_capability_precedence_terminate_before_details() {
     let mut creator = core_value();
-    creator["close_authorization"] = json!("creator_only");
+    creator["close_policy"] = json!("creator_only");
     creator["detail_facets"] = json!(["controls"]);
     let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&creator) else {
         panic!("creator-only must terminate");

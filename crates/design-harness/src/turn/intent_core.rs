@@ -10,8 +10,9 @@ use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
 use super::intent_interpretation::{
-    CloseAuthorizationV2, IntentAutomationKindV2, IntentBoundaryRequestV2, IntentLocaleHintV2,
-    IntentRequestModeV2, RuntimeRequirementsV2,
+    CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
+    IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
+    TimerRequirementV2,
 };
 use super::intent_text::{normalized_required_text, validate_text_shape};
 
@@ -22,6 +23,7 @@ const MAX_RESPONSE_CHARS: usize = 2_000;
 const MAX_UNCLASSIFIED_REQUIREMENTS: usize = 8;
 const MAX_UNCLASSIFIED_REQUIREMENT_CHARS: usize = 160;
 const MAX_BINDING_KEY_CHARS: usize = 64;
+const MAX_RUNTIME_REQUIREMENTS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -55,6 +57,17 @@ pub enum IntentRecipeDetailFacetV3 {
     Controls,
 }
 
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeRequirementV3 {
+    RestartPersistent,
+    DurableTimer,
+    PersistentEconomy,
+    EventTimeLlm,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InterpretIntentCoreWireV3 {
@@ -67,9 +80,10 @@ struct InterpretIntentCoreWireV3 {
     #[serde(deserialize_with = "deserialize_required_nullable_channel")]
     #[schemars(required)]
     hub_channel: RequiredNullableChannelV3,
-    locale: IntentLocaleHintV2,
-    close_authorization: CloseAuthorizationV2,
-    runtime_requirements: RuntimeRequirementsV2,
+    language: IntentLocaleHintV2,
+    close_policy: CloseAuthorizationV2,
+    #[schemars(length(max = 4))]
+    runtime_requirements: Vec<RuntimeRequirementV3>,
     #[schemars(length(max = 3))]
     boundary_requests: Vec<IntentBoundaryRequestV2>,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
@@ -81,59 +95,73 @@ struct InterpretIntentCoreWireV3 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IntentCoreInterpretationV3(InterpretIntentCoreWireV3);
+pub struct IntentCoreInterpretationV3 {
+    expected_revision: u64,
+    request_mode: IntentRequestModeV2,
+    automation_kind: IntentAutomationKindV2,
+    objective: String,
+    requested_outcome: IntentRequestedOutcome,
+    hub_channel: RequiredNullableChannelV3,
+    locale: IntentLocaleHintV2,
+    close_authorization: CloseAuthorizationV2,
+    runtime_requirements: RuntimeRequirementsV2,
+    boundary_requests: Vec<IntentBoundaryRequestV2>,
+    unclassified_requirements: Vec<String>,
+    detail_facets: Vec<IntentRecipeDetailFacetV3>,
+    response: String,
+}
 
 impl IntentCoreInterpretationV3 {
     pub fn expected_revision(&self) -> u64 {
-        self.0.expected_revision
+        self.expected_revision
     }
 
     pub fn request_mode(&self) -> IntentRequestModeV2 {
-        self.0.request_mode
+        self.request_mode
     }
 
     pub fn automation_kind(&self) -> IntentAutomationKindV2 {
-        self.0.automation_kind
+        self.automation_kind
     }
 
     pub fn objective(&self) -> &str {
-        &self.0.objective
+        &self.objective
     }
 
     pub fn requested_outcome(&self) -> IntentRequestedOutcome {
-        self.0.requested_outcome
+        self.requested_outcome
     }
 
     pub fn selected_existing_channel(&self) -> Option<&ExistingChannelKey> {
-        self.0.hub_channel.0.as_ref()
+        self.hub_channel.0.as_ref()
     }
 
     pub fn locale(&self) -> IntentLocaleHintV2 {
-        self.0.locale
+        self.locale
     }
 
     pub fn close_authorization(&self) -> CloseAuthorizationV2 {
-        self.0.close_authorization
+        self.close_authorization
     }
 
     pub fn runtime_requirements(&self) -> &RuntimeRequirementsV2 {
-        &self.0.runtime_requirements
+        &self.runtime_requirements
     }
 
     pub fn boundary_requests(&self) -> &[IntentBoundaryRequestV2] {
-        &self.0.boundary_requests
+        &self.boundary_requests
     }
 
     pub fn unclassified_requirements(&self) -> &[String] {
-        &self.0.unclassified_requirements
+        &self.unclassified_requirements
     }
 
     pub fn recipe_detail_facets(&self) -> &[IntentRecipeDetailFacetV3] {
-        &self.0.detail_facets
+        &self.detail_facets
     }
 
     pub fn response(&self) -> &str {
-        &self.0.response
+        &self.response
     }
 }
 
@@ -155,7 +183,7 @@ pub fn parse_interpret_intent_core(
             &schema_value::<InterpretIntentCoreWireV3>(),
         )
     })?;
-    normalize_core(input).map(IntentCoreInterpretationV3)
+    normalize_core(input)
 }
 
 fn deserialize_required_nullable_channel<'de, D>(
@@ -169,7 +197,7 @@ where
 
 fn normalize_core(
     mut input: InterpretIntentCoreWireV3,
-) -> Result<InterpretIntentCoreWireV3, StructuredError> {
+) -> Result<IntentCoreInterpretationV3, StructuredError> {
     validate_mode_outcome(&input)?;
     input.objective = normalized_required_text(
         &input.objective,
@@ -180,6 +208,14 @@ fn normalize_core(
     )?;
     input.response = normalized_response(&input.response, input.request_mode)?;
     normalize_channel(&mut input.hub_channel)?;
+    if input.runtime_requirements.len() > MAX_RUNTIME_REQUIREMENTS {
+        return Err(core_error(
+            "TOO_MANY_RUNTIME_REQUIREMENTS",
+            "intent.core.runtime_requirements",
+            "The interpretation contains more than four runtime requirements",
+            "Use each closed runtime requirement at most once",
+        ));
+    }
     input.unclassified_requirements = normalize_requirements(
         input.unclassified_requirements,
         MAX_UNCLASSIFIED_REQUIREMENTS,
@@ -225,7 +261,21 @@ fn normalize_core(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    Ok(input)
+    Ok(IntentCoreInterpretationV3 {
+        expected_revision: input.expected_revision,
+        request_mode: input.request_mode,
+        automation_kind: input.automation_kind,
+        objective: input.objective,
+        requested_outcome: input.requested_outcome,
+        hub_channel: input.hub_channel,
+        locale: input.language,
+        close_authorization: input.close_policy,
+        runtime_requirements: normalize_runtime_requirements(input.runtime_requirements),
+        boundary_requests: input.boundary_requests,
+        unclassified_requirements: input.unclassified_requirements,
+        detail_facets: input.detail_facets,
+        response: input.response,
+    })
 }
 
 fn validate_mode_outcome(input: &InterpretIntentCoreWireV3) -> Result<(), StructuredError> {
@@ -264,8 +314,11 @@ fn normalized_response(
     value: &str,
     request_mode: IntentRequestModeV2,
 ) -> Result<String, StructuredError> {
+    if request_mode == IntentRequestModeV2::Build {
+        return Ok(String::new());
+    }
     let normalized = value.trim().to_string();
-    if request_mode == IntentRequestModeV2::Discussion && normalized.is_empty() {
+    if normalized.is_empty() {
         return Err(core_error(
             "EMPTY_INTENT_TEXT",
             "intent.core.response",
@@ -281,6 +334,28 @@ fn normalized_response(
         "intent.core.response",
     )?;
     Ok(normalized)
+}
+
+fn normalize_runtime_requirements(values: Vec<RuntimeRequirementV3>) -> RuntimeRequirementsV2 {
+    let values = values.into_iter().collect::<BTreeSet<_>>();
+    RuntimeRequirementsV2 {
+        persistence: if values.contains(&RuntimeRequirementV3::RestartPersistent) {
+            PersistenceRequirementV2::RestartPersistent
+        } else {
+            PersistenceRequirementV2::None
+        },
+        timers: if values.contains(&RuntimeRequirementV3::DurableTimer) {
+            TimerRequirementV2::Durable
+        } else {
+            TimerRequirementV2::None
+        },
+        economy: if values.contains(&RuntimeRequirementV3::PersistentEconomy) {
+            EconomyRequirementV2::PersistentLedger
+        } else {
+            EconomyRequirementV2::None
+        },
+        event_time_llm: values.contains(&RuntimeRequirementV3::EventTimeLlm),
+    }
 }
 
 fn normalize_channel(channel: &mut RequiredNullableChannelV3) -> Result<(), StructuredError> {

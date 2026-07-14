@@ -5,8 +5,9 @@ use serde_json::{json, Value};
 use crate::intent::ExistingChannelKey;
 
 use super::{
-    interpret_intent_core_frontier, parse_interpret_intent_core, IntentBoundaryRequestV2,
-    IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
+    interpret_intent_core_frontier, parse_interpret_intent_core, EconomyRequirementV2,
+    IntentBoundaryRequestV2, IntentRecipeDetailFacetV3, PersistenceRequirementV2,
+    TimerRequirementV2, INTERPRET_INTENT_CORE,
 };
 
 fn valid_core() -> Value {
@@ -17,14 +18,9 @@ fn valid_core() -> Value {
         "objective": "Create private study rooms",
         "requested_outcome": "validated_preview",
         "hub_channel": "community_hub",
-        "locale": "en",
-        "close_authorization": "disabled",
-        "runtime_requirements": {
-            "persistence": "none",
-            "timers": "none",
-            "economy": "none",
-            "event_time_llm": false
-        },
+        "language": "en",
+        "close_policy": "disabled",
+        "runtime_requirements": [],
         "boundary_requests": [],
         "unclassified_requirements": [],
         "detail_facets": [],
@@ -41,9 +37,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         strings([
             "automation_kind",
             "boundary_requests",
-            "close_authorization",
+            "close_policy",
             "expected_revision",
-            "locale",
+            "language",
             "objective",
             "detail_facets",
             "request_mode",
@@ -156,6 +152,50 @@ fn core_parser_preserves_and_sorts_explicit_recipe_detail_facets() {
 }
 
 #[test]
+fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
+    let mut value = valid_core();
+    value["runtime_requirements"] = json!([
+        "persistent_economy",
+        "event_time_llm",
+        "restart_persistent",
+        "durable_timer"
+    ]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::RestartPersistent
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::Durable
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::PersistentLedger
+    );
+    assert!(parsed.runtime_requirements().event_time_llm);
+
+    value["runtime_requirements"] = json!(["restart_persistent", "restart_persistent"]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::RestartPersistent
+    );
+}
+
+#[test]
+fn core_parser_discards_build_response_deterministically() {
+    let mut value = valid_core();
+    value["response"] = json!("This model-authored build response is ignored.");
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap()
+            .response(),
+        ""
+    );
+}
+
+#[test]
 fn core_parser_rejects_details_outside_the_pinned_recipe_shape() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
@@ -180,7 +220,7 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     );
 
     value = valid_core();
-    value["locale"] = Value::Null;
+    value["language"] = Value::Null;
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -199,6 +239,41 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
             .unwrap_err()
             .code,
         "INCONSISTENT_INTENT_CORE"
+    );
+}
+
+#[test]
+fn core_parser_rejects_legacy_nested_and_mistyped_wire_fields() {
+    let mut value = valid_core();
+    value["locale"] = json!("en");
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "UNKNOWN_FIELD"
+    );
+
+    value = valid_core();
+    value["runtime_requirements"] = json!({
+        "persistence": "restart_persistent",
+        "timers": "none",
+        "economy": "none",
+        "event_time_llm": false
+    });
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INVALID_FIELD_TYPE"
+    );
+
+    value = valid_core();
+    value["runtime_requirements"] = json!(["durable"]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INVALID_TOOL_ARGUMENTS"
     );
 }
 
@@ -223,6 +298,16 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
         "INVALID_TOOL_ARGUMENTS"
     );
 
+    let duplicate = valid_core().to_string().replacen(
+        "\"language\":\"en\"",
+        "\"language\":\"en\",\"language\":\"ko\"",
+        1,
+    );
+    assert_eq!(
+        parse_interpret_intent_core(&duplicate).unwrap_err().code,
+        "INVALID_TOOL_ARGUMENTS"
+    );
+
     value = valid_core();
     value["boundary_requests"] = json!([
         "direct_live_mutation",
@@ -235,6 +320,21 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
             .unwrap_err()
             .code,
         "TOO_MANY_INTENT_BOUNDARY_REQUESTS"
+    );
+
+    value = valid_core();
+    value["runtime_requirements"] = json!([
+        "restart_persistent",
+        "durable_timer",
+        "persistent_economy",
+        "event_time_llm",
+        "event_time_llm"
+    ]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "TOO_MANY_RUNTIME_REQUIREMENTS"
     );
 }
 
@@ -260,6 +360,29 @@ fn core_parser_enforces_detail_and_text_bounds() {
 
     value = valid_core();
     value["objective"] = json!("x".repeat(2_049));
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INTENT_TEXT_TOO_LONG"
+    );
+}
+
+#[test]
+fn core_parser_requires_a_bounded_discussion_response() {
+    let mut value = valid_core();
+    value["request_mode"] = json!("discussion");
+    value["automation_kind"] = json!("none");
+    value["requested_outcome"] = json!("discussion");
+    value["response"] = json!("   ");
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "EMPTY_INTENT_TEXT"
+    );
+
+    value["response"] = json!("x".repeat(2_001));
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()

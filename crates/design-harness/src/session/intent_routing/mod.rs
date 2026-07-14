@@ -42,7 +42,7 @@ pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;
 use state::{
     intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_DETAIL_STATE_PREFIX,
-    INTENT_STATE_PREFIX,
+    INTENT_HUMAN_PREFIX, INTENT_STATE_PREFIX,
 };
 pub(super) use state::{
     validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT, INTENT_RECIPE_SYSTEM_PROMPT_V1,
@@ -70,6 +70,10 @@ struct IntentDetailStateAnchorV3<'a> {
     recipe_id: &'static str,
     recipe_version: u32,
     detail_facets: &'a [IntentRecipeDetailFacetV3],
+}
+
+fn intent_human_envelope(human_message: &str) -> String {
+    format!("{INTENT_HUMAN_PREFIX}{}", json!({"text": human_message}))
 }
 
 enum IntentToolRequestFailure {
@@ -340,7 +344,8 @@ impl<C: LlmClient> DesignSession<C> {
     ) -> super::BurstOutcome {
         self.begin_turn(human_message);
         self.current_human_message_index = Some(self.messages.len());
-        self.messages.push(Message::user(human_message));
+        self.messages
+            .push(Message::user(intent_human_envelope(human_message)));
         self.prose_nudged = false;
 
         let revision_check = self
