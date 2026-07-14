@@ -459,6 +459,77 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
 }
 
 #[test]
+fn ungrounded_recipe_detail_halts_before_digest_compile_or_commit() {
+    block_on(async {
+        let (core, _) = private_room_with_copy_details(0, Some("community_hub"));
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({"copy": {"create_button_label": "Invented button"}}),
+        );
+        let client = ScriptedClient::new(vec![Ok(core), Ok(details)]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root_draft = session.draft.clone();
+        let root_stage = session.snapshot().intent_recipe.unwrap().stage;
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst("Create private rooms with a custom button")
+            .await
+        else {
+            panic!("expected ungrounded detail halt")
+        };
+        assert_eq!(report.code, "UNGROUNDED_RECIPE_DETAIL_LITERAL");
+        assert_eq!(session.draft, root_draft);
+        assert_eq!(session.snapshot().intent_recipe.unwrap().stage, root_stage);
+        assert_eq!(session.observability.model_calls, 2);
+        assert_eq!(session.observability.tool_calls, 2);
+        assert_eq!(session.observability.intent_extraction_failures, 1);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_compile_successes, 0);
+        assert_eq!(session.observability.intent_commits, 0);
+    });
+}
+
+#[test]
+fn recipe_detail_cannot_reuse_a_literal_from_an_earlier_human_turn() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client.clone(), bindings("community_hub", "700"));
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Build default private rooms in community_hub. Do not use Invented button."
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let revision = session.draft.draft_revision;
+        let (core, _) = private_room_with_copy_details(revision, Some("community_hub"));
+        client.push(Ok(core));
+        client.push(Ok(tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({"copy": {"create_button_label": "Invented button"}}),
+        )));
+        let root_draft = session.draft.clone();
+        let root_stage = session.snapshot().intent_recipe.unwrap().stage;
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst("Keep the same design but customize its button")
+            .await
+        else {
+            panic!("expected current-turn grounding halt")
+        };
+        assert_eq!(report.code, "UNGROUNDED_RECIPE_DETAIL_LITERAL");
+        assert_eq!(session.draft, root_draft);
+        assert_eq!(session.snapshot().intent_recipe.unwrap().stage, root_stage);
+    });
+}
+
+#[test]
 fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
     block_on(async {
         let client = ScriptedClient::new(vec![

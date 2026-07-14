@@ -20,7 +20,7 @@ fn private_study_room_descriptor_pins_every_component_and_bound() {
     let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
     assert_eq!(descriptor.id, PRIVATE_STUDY_ROOM_RECIPE_ID);
     assert_eq!(descriptor.version, PRIVATE_STUDY_ROOM_RECIPE_VERSION);
-    assert_eq!(descriptor.extractor_revision, 2);
+    assert_eq!(descriptor.extractor_revision, 3);
     assert_eq!(descriptor.normalizer_revision, 1);
     assert_eq!(descriptor.compiler_revision, COMPILER_REVISION);
     assert_eq!(descriptor.simulator_revision, 1);
@@ -39,11 +39,11 @@ fn selected_descriptor_and_full_registry_have_distinct_stable_digests() {
     assert_ne!(selected, registry);
     assert_eq!(
         selected,
-        "22b8659171189a061108dfd0306bc90b4c5789c2c101db2ef3f1520f414ae64b"
+        "d4c8743682def30de2da32ccea03e696408fea3d103ab6dde7d8d487b538f9e6"
     );
     assert_eq!(
         registry,
-        "2284385c2203f32f5b90eb836f2a5f53c4f4d2859bc6522fe8195959b2e10506"
+        "60a6887fd38e5334d53c24b388832a15693e469ed994a3863588f77708e096d6"
     );
     assert_eq!(
         selected,

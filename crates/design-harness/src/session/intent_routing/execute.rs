@@ -357,6 +357,7 @@ impl<C> DesignSession<C> {
         &mut self,
         selection: Box<PrivateStudyRoomSelectionV3>,
         arguments: &str,
+        human_message: &str,
     ) -> Result<IntentTurnSuccess, StructuredError> {
         let expected_revision = selection.expected_revision();
         let core_semantic_digest = selection.semantic_ir_digest().to_string();
@@ -366,6 +367,7 @@ impl<C> DesignSession<C> {
             &detail_facets,
             expected_revision,
             &core_semantic_digest,
+            human_message,
         )
         .inspect_err(|_| {
             self.record_intent_extraction_failure();

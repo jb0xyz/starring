@@ -68,6 +68,7 @@ fn serving_detail_parser_flattens_patterns_and_stamps_all_facets() {
         ],
         9,
         CORE_DIGEST,
+        "Start focus room focus- Guide Read this first",
     )
     .unwrap();
     assert_eq!(parsed.expected_revision(), 9);
@@ -100,6 +101,7 @@ fn serving_detail_parser_uses_empty_counterpart_and_rejects_nested_patterns() {
         &[IntentRecipeDetailFacetV3::Naming],
         0,
         CORE_DIGEST,
+        "focus-",
     )
     .unwrap();
     assert_eq!(parsed.naming().channel_name.as_ref().unwrap().suffix, "");
@@ -109,11 +111,152 @@ fn serving_detail_parser_uses_empty_counterpart_and_rejects_nested_patterns() {
             &[IntentRecipeDetailFacetV3::Naming],
             0,
             CORE_DIGEST,
+            "focus-",
         )
         .unwrap_err()
         .code,
         "UNKNOWN_FIELD"
     );
+}
+
+#[test]
+fn serving_detail_parser_grounds_every_literal_family_in_the_current_human_turn() {
+    let arguments = json!({
+        "copy": {
+            "launcher_content": "Launch text",
+            "create_button_label": "Create label",
+            "modal_title": "Modal title",
+            "room_name_label": "Room label",
+            "welcome_content_prefix": "Welcome prefix",
+            "welcome_content_suffix": "Welcome suffix",
+            "hub_announcement_prefix": "Hub prefix",
+            "hub_announcement_suffix": "Hub suffix",
+            "completed_response_prefix": "Done prefix",
+            "completed_response_suffix": "Done suffix"
+        },
+        "naming": {
+            "channel_name_prefix": "channel-",
+            "channel_name_suffix": "-room",
+            "member_role_name_prefix": "member-",
+            "member_role_name_suffix": "-role"
+        },
+        "controls": {
+            "help_label": "Help label",
+            "help_response": "Help response",
+            "join_label": "Join label",
+            "joined_response": "Joined response",
+            "close_label": "Close label",
+            "closed_response": "Closed response"
+        }
+    });
+    let human = "Launch text Create label Modal title Room label Welcome prefix Welcome suffix Hub prefix Hub suffix Done prefix Done suffix channel- -room member- -role Help label Help response Join label Joined response Close label Closed response";
+    assert!(parse_private_study_room_details_for_serving(
+        &arguments.to_string(),
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Controls,
+        ],
+        0,
+        CORE_DIGEST,
+        human,
+    )
+    .is_ok());
+}
+
+#[test]
+fn serving_detail_parser_rejects_ungrounded_literals_without_echoing_them() {
+    let cases = [
+        (
+            json!({"copy": {"create_button_label": "Invented scalar"}}),
+            IntentRecipeDetailFacetV3::Copy,
+            "intent.details.copy.create_button_label",
+        ),
+        (
+            json!({"copy": {"welcome_content_prefix": "Invented prefix"}}),
+            IntentRecipeDetailFacetV3::Copy,
+            "intent.details.copy.welcome_content.prefix",
+        ),
+        (
+            json!({"naming": {"channel_name_suffix": "Invented suffix"}}),
+            IntentRecipeDetailFacetV3::Naming,
+            "intent.details.naming.channel_name.suffix",
+        ),
+        (
+            json!({"controls": {"help_response": "Invented response"}}),
+            IntentRecipeDetailFacetV3::Controls,
+            "intent.details.controls.help_response",
+        ),
+    ];
+    for (arguments, facet, location) in cases {
+        let error = parse_private_study_room_details_for_serving(
+            &arguments.to_string(),
+            &[facet],
+            0,
+            CORE_DIGEST,
+            "The current turn contains none of those values",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "UNGROUNDED_RECIPE_DETAIL_LITERAL");
+        assert_eq!(error.location, location);
+        assert!(!error.message.contains("Invented"));
+        assert!(!error.hint.contains("Invented"));
+    }
+}
+
+#[test]
+fn serving_detail_grounding_is_exact_and_normalizes_only_crlf_pairs() {
+    let trimmed = parse_private_study_room_details_for_serving(
+        &json!({"controls": {"help_label": " Guide "}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Controls],
+        0,
+        CORE_DIGEST,
+        "Use Guide as the label",
+    )
+    .unwrap();
+    assert_eq!(trimmed.controls().help_label.as_deref(), Some("Guide"));
+
+    let crlf = parse_private_study_room_details_for_serving(
+        &json!({"controls": {"help_response": "Line one\nLine two"}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Controls],
+        0,
+        CORE_DIGEST,
+        "Reply with Line one\r\nLine two exactly",
+    )
+    .unwrap();
+    assert_eq!(
+        crlf.controls().help_response.as_deref(),
+        Some("Line one\nLine two")
+    );
+
+    for (candidate, human) in [("Guide", "guide"), ("Two spaces", "Two  spaces")] {
+        assert_eq!(
+            parse_private_study_room_details_for_serving(
+                &json!({"controls": {"help_label": candidate}}).to_string(),
+                &[IntentRecipeDetailFacetV3::Controls],
+                0,
+                CORE_DIGEST,
+                human,
+            )
+            .unwrap_err()
+            .code,
+            "UNGROUNDED_RECIPE_DETAIL_LITERAL"
+        );
+    }
+}
+
+#[test]
+fn serving_detail_parser_rejects_a_present_empty_pattern() {
+    let error = parse_private_study_room_details_for_serving(
+        &json!({"naming": {"channel_name_prefix": "", "channel_name_suffix": ""}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Naming],
+        0,
+        CORE_DIGEST,
+        "Use an empty name pattern",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "EMPTY_RECIPE_DETAIL_PATTERN");
+    assert_eq!(error.location, "intent.details.naming.channel_name");
 }
 
 #[test]

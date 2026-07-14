@@ -457,7 +457,11 @@ impl<C: LlmClient> DesignSession<C> {
                             Err(failure) => return self.finish_intent_request_failure(failure),
                         };
                         let result = self
-                            .execute_intent_details(selection, &detail_call.arguments)
+                            .execute_intent_details(
+                                selection,
+                                &detail_call.arguments,
+                                human_message,
+                            )
                             .await;
                         self.finish_intent_tool_execution(detail_call, result)
                     }

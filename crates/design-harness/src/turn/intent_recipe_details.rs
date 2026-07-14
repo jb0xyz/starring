@@ -122,6 +122,88 @@ impl PrivateStudyRoomDetailsV1 {
     pub fn covered_facets(&self) -> &[IntentRecipeDetailFacetV3] {
         &self.covered_facets
     }
+
+    pub(crate) fn validate_human_literals(
+        &self,
+        human_message: &str,
+    ) -> Result<(), StructuredError> {
+        let human_message = human_message.replace("\r\n", "\n");
+        validate_optional_literal(
+            self.copy.launcher_content.as_deref(),
+            &human_message,
+            "intent.details.copy.launcher_content",
+        )?;
+        validate_optional_literal(
+            self.copy.create_button_label.as_deref(),
+            &human_message,
+            "intent.details.copy.create_button_label",
+        )?;
+        validate_optional_literal(
+            self.copy.modal_title.as_deref(),
+            &human_message,
+            "intent.details.copy.modal_title",
+        )?;
+        validate_optional_literal(
+            self.copy.room_name_label.as_deref(),
+            &human_message,
+            "intent.details.copy.room_name_label",
+        )?;
+        validate_optional_pattern(
+            self.copy.welcome_content.as_ref(),
+            &human_message,
+            "intent.details.copy.welcome_content",
+        )?;
+        validate_optional_pattern(
+            self.copy.hub_announcement.as_ref(),
+            &human_message,
+            "intent.details.copy.hub_announcement",
+        )?;
+        validate_optional_pattern(
+            self.copy.completed_response.as_ref(),
+            &human_message,
+            "intent.details.copy.completed_response",
+        )?;
+        validate_optional_pattern(
+            self.naming.channel_name.as_ref(),
+            &human_message,
+            "intent.details.naming.channel_name",
+        )?;
+        validate_optional_pattern(
+            self.naming.member_role_name.as_ref(),
+            &human_message,
+            "intent.details.naming.member_role_name",
+        )?;
+        validate_optional_literal(
+            self.controls.help_label.as_deref(),
+            &human_message,
+            "intent.details.controls.help_label",
+        )?;
+        validate_optional_literal(
+            self.controls.help_response.as_deref(),
+            &human_message,
+            "intent.details.controls.help_response",
+        )?;
+        validate_optional_literal(
+            self.controls.join_label.as_deref(),
+            &human_message,
+            "intent.details.controls.join_label",
+        )?;
+        validate_optional_literal(
+            self.controls.joined_response.as_deref(),
+            &human_message,
+            "intent.details.controls.joined_response",
+        )?;
+        validate_optional_literal(
+            self.controls.close_label.as_deref(),
+            &human_message,
+            "intent.details.controls.close_label",
+        )?;
+        validate_optional_literal(
+            self.controls.closed_response.as_deref(),
+            &human_message,
+            "intent.details.controls.closed_response",
+        )
+    }
 }
 
 pub fn private_study_room_details_frontier() -> [ToolDefinition; 1] {
@@ -232,6 +314,7 @@ pub(crate) fn parse_private_study_room_details_for_serving(
     required_facets: &[IntentRecipeDetailFacetV3],
     expected_revision: u64,
     expected_core_semantic_digest: &str,
+    human_message: &str,
 ) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
     let input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsServingWireV2>(arguments)
         .map_err(|error| {
@@ -241,7 +324,7 @@ pub(crate) fn parse_private_study_room_details_for_serving(
                 &inline_schema_value::<ExtractPrivateStudyRoomDetailsServingWireV2>(),
             )
         })?;
-    finalize_private_study_room_details(
+    let details = finalize_private_study_room_details(
         PrivateStudyRoomDetailsCandidateV1 {
             copy: serving_copy(input.copy),
             naming: serving_naming(input.naming),
@@ -251,7 +334,9 @@ pub(crate) fn parse_private_study_room_details_for_serving(
         required_facets,
         expected_revision,
         expected_core_semantic_digest,
-    )
+    )?;
+    details.validate_human_literals(human_message)?;
+    Ok(details)
 }
 
 fn finalize_private_study_room_details(
@@ -311,6 +396,55 @@ fn serving_pattern(prefix: Option<String>, suffix: Option<String>) -> Option<Roo
         prefix: prefix.unwrap_or_default(),
         suffix: suffix.unwrap_or_default(),
     })
+}
+
+fn validate_optional_literal(
+    value: Option<&str>,
+    human_message: &str,
+    location: &str,
+) -> Result<(), StructuredError> {
+    if value.is_some_and(|value| !human_message.contains(value)) {
+        return Err(detail_error(
+            "UNGROUNDED_RECIPE_DETAIL_LITERAL",
+            location,
+            "A recipe detail literal is not present in the current human turn",
+            "Use one exact case-sensitive contiguous literal from the current human turn",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_pattern(
+    value: Option<&RoomNamePatternV1>,
+    human_message: &str,
+    location: &str,
+) -> Result<(), StructuredError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.prefix.is_empty() && value.suffix.is_empty() {
+        return Err(detail_error(
+            "EMPTY_RECIPE_DETAIL_PATTERN",
+            location,
+            "A recipe detail pattern contains no literal affix",
+            "Provide one exact non-empty prefix or suffix from the current human turn",
+        ));
+    }
+    if !value.prefix.is_empty() {
+        validate_optional_literal(
+            Some(&value.prefix),
+            human_message,
+            &format!("{location}.prefix"),
+        )?;
+    }
+    if !value.suffix.is_empty() {
+        validate_optional_literal(
+            Some(&value.suffix),
+            human_message,
+            &format!("{location}.suffix"),
+        )?;
+    }
+    Ok(())
 }
 
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>

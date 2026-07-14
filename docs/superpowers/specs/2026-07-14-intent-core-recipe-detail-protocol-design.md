@@ -127,6 +127,8 @@ Only a pinned StudyRoom with nonempty `detail_facets` exposes `extract_private_s
 
 The harness retains the pinned recipe identity, Core semantic digest, and current revision outside the model frontier. The model receives the original human request and harness-owned detail facets. It cannot change route, recipe, requested outcome, selected binding, locale, authorization, runtime requirements, or safety boundaries.
 
+The broad public V1 parser retains this compatibility shape:
+
 ```text
 copy?
 naming?
@@ -138,14 +140,18 @@ Unrequested objects may be omitted. Each requested facet must have at least one 
 
 The active detail router derives a per-request schema from the canonical selected facets. It removes every unselected object and `unmapped_facets`, then marks every remaining facet object as required. An extractor that cannot map a selected facet must return its required object empty, which the parser rejects without mutation. The broad public parser schema remains compatible with omitted objects and explicit `unmapped_facets`, but the serving frontier exposes only the closed active subset.
 
-The serving wire flattens every pattern into sibling `*_prefix` and `*_suffix` string fields before converting it to the typed recipe pattern. It never asks the model to alternate between scalar literals and nested `{prefix,suffix}` objects. Supplying either affix creates the pattern and an omitted counterpart becomes the empty string. The broad public parser retains the original nested typed pattern shape.
+The active serving V2 wire keeps only the selected `copy`, `naming`, and `controls` objects and flattens every pattern into sibling `*_prefix` and `*_suffix` string fields before converting it to the typed recipe pattern. It never asks the model to alternate between scalar literals and nested `{prefix,suffix}` objects. Supplying either nonempty affix creates the pattern and an omitted counterpart becomes the empty string. A present pattern with two empty affixes fails closed. The broad public parser retains the original nested typed pattern shape.
 
 The optional second model request uses a bounded isolated context containing only the detail system prompt, the current `INTENT_HUMAN` envelope, and the current `INTENT_DETAIL_STATE` anchor. The append-only durable transcript still records both accepted tool calls and results, but the extractor does not receive the Core tool arguments, Core tool result, or unrelated prior conversation.
+
+After normalization and facet validation, every nonempty scalar and pattern affix must be an exact case-sensitive contiguous substring of the current raw human turn. CRLF pairs are compared as LF so accepted multiline values remain grounded. The check does not search prior turns and runs before the detail digest, evidence creation, recipe finalization, preparation, or compilation. This proves literal membership, not semantic field attribution when the same literal legitimately appears in more than one place.
 
 The detail result is rejected without mutation when:
 
 - a selected facet is missing, duplicated in the harness ticket, unknown, empty, or mapped to another facet;
 - an unmapped facet remains;
+- a present pattern has no nonempty affix;
+- a nonempty literal is absent from the current human turn;
 - a value exceeds the existing recipe bounds;
 - a control contradicts the adjudicated close authorization;
 - the response changes a Core field or supplies an unsupported field;
