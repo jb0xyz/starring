@@ -589,12 +589,26 @@ function intentReceipt(output, context) {
   });
 }
 
-function intentOneCallTurns(output) {
+function intentOneCallTurns(output, context) {
   return checked(output, (report) => {
+    const expected = vars(context);
+    const expectedModelCalls = Object.hasOwn(expected, 'expectedModelCallsPerTurn')
+      ? list(expected.expectedModelCallsPerTurn).map(Number)
+      : report.turns.map(() => 1);
+    const expectedToolCalls = Object.hasOwn(expected, 'expectedToolCallsPerTurn')
+      ? list(expected.expectedToolCallsPerTurn).map(Number)
+      : report.turns.map(() => 1);
     const failures = [];
-    for (const turn of report.turns) {
-      if (turn.model_calls !== 1 || turn.model_tool_calls !== 1) {
-        failures.push(`${turn.id} calls=${turn.model_calls}/${turn.model_tool_calls} expected=1/1`);
+    if (expectedModelCalls.length !== report.turns.length
+      || expectedToolCalls.length !== report.turns.length
+      || expectedModelCalls.some((value) => !Number.isInteger(value) || value < 1 || value > 2)
+      || expectedToolCalls.some((value) => !Number.isInteger(value) || value < 1 || value > 2)) {
+      failures.push('expected per-turn call paths must contain one bounded value per turn');
+    }
+    for (const [index, turn] of report.turns.entries()) {
+      if (turn.model_calls !== expectedModelCalls[index]
+        || turn.model_tool_calls !== expectedToolCalls[index]) {
+        failures.push(`${turn.id} calls=${turn.model_calls}/${turn.model_tool_calls} expected=${expectedModelCalls[index]}/${expectedToolCalls[index]}`);
       }
     }
     const modelCalls = report.turns.reduce((sum, turn) => sum + turn.model_calls, 0);
@@ -606,8 +620,47 @@ function intentOneCallTurns(output) {
       failures.push(`cumulative tool_calls=${report.observability.tool_calls} expected=${modelToolCalls}`);
     }
     return result(failures.length === 0, failures.length === 0
-      ? 'every ordinary turn used one model call and one frontier call'
+      ? 'every turn used its exact bounded model and frontier call path'
       : failures.join(', '));
+  });
+}
+
+function intentRulesetStringValues(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    if (!Object.hasOwn(expected, 'expectedRulesetStringValues')) {
+      return result(true, 'no exact RuleSet string values requested');
+    }
+    let values;
+    try {
+      values = Array.isArray(expected.expectedRulesetStringValues)
+        ? expected.expectedRulesetStringValues
+        : JSON.parse(expected.expectedRulesetStringValues);
+    } catch {
+      return result(false, 'expectedRulesetStringValues is not a JSON string array');
+    }
+    if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+      return result(false, 'expectedRulesetStringValues is not a JSON string array');
+    }
+    const actual = [];
+    const visit = (value) => {
+      if (typeof value === 'string') {
+        actual.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      if (value !== null && typeof value === 'object') {
+        Object.values(value).forEach(visit);
+      }
+    };
+    visit(report.ruleset);
+    const missing = values.filter((value) => !actual.includes(value));
+    return result(missing.length === 0, missing.length === 0
+      ? 'every exact custom literal reached the canonical RuleSet'
+      : `missing RuleSet string values=${JSON.stringify(missing)}`);
   });
 }
 
@@ -854,6 +907,7 @@ module.exports = {
   intentProvenance,
   intentReceipt,
   intentRestartContinuity,
+  intentRulesetStringValues,
   intentRouteStage,
   parseReport,
 };

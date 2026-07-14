@@ -667,3 +667,55 @@
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe extracts custom StudyRoom copy naming and controls in two calls
+  vars:
+    caseId: intent_private_study_room_custom_details
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "custom-details",
+            "input": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedModelCallsPerTurn: "2"
+    expectedToolCallsPerTurn: "2"
+    expectedRulesetStringValues: '["Start focus room","focus-${input.room_name}","Guide","Read this first"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetStringValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency

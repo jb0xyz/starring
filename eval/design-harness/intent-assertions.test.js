@@ -262,6 +262,38 @@ test('one-shot intent report satisfies provenance, route, receipt, call, and iso
   assert.equal(checks.intentHardLatency(document, expected).pass, true);
 });
 
+test('detail-path assertions require two calls and preserve exact RuleSet strings', () => {
+  const custom = JSON.parse(report());
+  custom.turns[0].model_calls = 2;
+  custom.turns[0].model_tool_calls = 2;
+  custom.observability.model_calls = 2;
+  custom.observability.tool_calls = 2;
+  custom.ruleset = {
+    version: 1,
+    panels: [{ buttons: [{ label: 'Start focus room' }] }],
+    modals: [],
+    rules: [{ actions: [{ name: 'focus-${input.room_name}' }, { content: 'Read this first' }] }],
+  };
+  const expected = context({
+    expectedModelCallsPerTurn: '2',
+    expectedToolCallsPerTurn: '2',
+    expectedRulesetStringValues: JSON.stringify([
+      'Start focus room',
+      'focus-${input.room_name}',
+      'Read this first',
+    ]),
+  });
+  const document = JSON.stringify(custom);
+  assert.equal(checks.intentOneCallTurns(document, expected).pass, true);
+  assert.equal(checks.intentRulesetStringValues(document, expected).pass, true);
+
+  custom.ruleset.rules[0].actions.pop();
+  assert.match(
+    checks.intentRulesetStringValues(JSON.stringify(custom), expected).reason,
+    /missing RuleSet string values=/,
+  );
+});
+
 test('structural assertions ignore key order and reject contract drift', () => {
   const reordered = JSON.parse(report());
   reordered.session_config = {
