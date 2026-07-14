@@ -76,6 +76,11 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("requested_gate_skips"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
+        "expose a secret without redaction and deploy immediately means requested_gate_skips=[]"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+        .contains("persistent XP across restarts with durable timers and event-time LLM"));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
