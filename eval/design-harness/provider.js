@@ -1,5 +1,32 @@
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+const fixtures = require('./fixtures.json');
+
+function hydrateFixtures(value) {
+  if (Array.isArray(value)) {
+    return value.map(hydrateFixtures);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const keys = Object.keys(value);
+  if (keys.length === 1 && keys[0] === '$fixture') {
+    const name = value.$fixture;
+    if (typeof name !== 'string' || !Object.hasOwn(fixtures, name)) {
+      throw new Error(`unknown evaluation fixture ${String(name)}`);
+    }
+    return structuredClone(fixtures[name]);
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, hydrateFixtures(entry)]));
+}
+
+function hydratePrompt(prompt) {
+  const trimmed = prompt.trim();
+  if (!trimmed.startsWith('{')) {
+    return prompt;
+  }
+  return JSON.stringify(hydrateFixtures(JSON.parse(trimmed)));
+}
 
 class DesignHarnessProvider {
   constructor(options = {}) {
@@ -17,6 +44,12 @@ class DesignHarnessProvider {
     }
     if (!process.env.STARRING_LLM_API_KEY) {
       return { error: 'STARRING_LLM_API_KEY is required' };
+    }
+    let hydratedPrompt;
+    try {
+      hydratedPrompt = hydratePrompt(prompt);
+    } catch (error) {
+      return { error: `invalid evaluation fixture: ${error.message}` };
     }
     const root = path.resolve(__dirname, '..', '..');
     const binary = process.env.STARRING_HARNESS_BIN
@@ -96,9 +129,10 @@ class DesignHarnessProvider {
         }
       });
       child.stdin.on('error', () => {});
-      child.stdin.end(prompt);
+      child.stdin.end(hydratedPrompt);
     });
   }
 }
 
 module.exports = DesignHarnessProvider;
+module.exports.hydratePrompt = hydratePrompt;

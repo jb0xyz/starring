@@ -95,7 +95,7 @@ impl SessionStore {
             .ok_or_else(|| StoreError::CorruptSnapshotSchemaVersion {
                 session_id: session_id.to_string(),
             })?;
-        if matches!(found, 2 | 3) {
+        if matches!(found, 2..=4) {
             migrate_snapshot(&mut value, found);
         } else if found != SESSION_SNAPSHOT_VERSION {
             return Err(StoreError::UnsupportedSnapshotVersion {
@@ -142,6 +142,9 @@ fn migrate_snapshot(value: &mut serde_json::Value, found: u32) {
         "schema_version".to_string(),
         serde_json::Value::from(SESSION_SNAPSHOT_VERSION),
     );
+    if found == 4 {
+        return;
+    }
     root.entry("turn_state".to_string())
         .or_insert(serde_json::Value::Null);
     root.entry("adaptive_turn".to_string())
@@ -206,6 +209,8 @@ mod tests {
         let mut store = SessionStore::open_in_memory().unwrap();
         let snapshot = DesignSession::new(()).snapshot();
 
+        assert_eq!(SESSION_SNAPSHOT_VERSION, 5);
+        assert_eq!(snapshot.schema_version, SESSION_SNAPSHOT_VERSION);
         store.save("study", &snapshot).unwrap();
 
         assert_eq!(store.load("study").unwrap(), Some(snapshot.clone()));
@@ -213,6 +218,9 @@ mod tests {
         updated.prose_nudged = true;
         store.save("study", &updated).unwrap();
         assert_eq!(store.load("study").unwrap(), Some(updated));
+        let planned = DesignSession::with_planned_config((), SessionConfig::default()).snapshot();
+        store.save("planned", &planned).unwrap();
+        assert_eq!(store.load("planned").unwrap(), Some(planned));
         assert_eq!(store.load("missing").unwrap(), None);
     }
 
@@ -258,6 +266,19 @@ mod tests {
         assert!(matches!(
             store.save("future", &snapshot),
             Err(StoreError::UnsupportedSnapshotVersion { .. })
+        ));
+        store
+            .connection
+            .execute(
+                "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at) VALUES (?1, ?2, 0)",
+                ["future-load", serde_json::to_string(&snapshot).unwrap().as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load("future-load"),
+            Err(StoreError::UnsupportedSnapshotVersion { expected, found })
+                if expected == SESSION_SNAPSHOT_VERSION
+                    && found == SESSION_SNAPSHOT_VERSION + 1
         ));
     }
 
@@ -350,6 +371,46 @@ mod tests {
             assert_eq!(migrated.messages[0].content, DEFAULT_SYSTEM_PROMPT);
             assert_eq!(migrated.messages.len(), 2);
             assert!(DesignSession::restore((), SessionConfig::default(), migrated).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_four_snapshots_migrate_without_rewriting_session_mode_content() {
+        for planned in [false, true] {
+            let store = SessionStore::open_in_memory().unwrap();
+            let session = if planned {
+                DesignSession::with_planned_config((), SessionConfig::default())
+            } else {
+                DesignSession::new(())
+            };
+            let snapshot = session.snapshot();
+            let expected_prompt = snapshot.messages[0].content.clone();
+            let expected_adaptive = snapshot.adaptive_enabled;
+            let mut value = serde_json::to_value(snapshot).unwrap();
+            value["schema_version"] = serde_json::json!(4);
+            let id = if planned { "v4-planned" } else { "v4-default" };
+            store
+                .connection
+                .execute(
+                    "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at) VALUES (?1, ?2, 0)",
+                    [id, value.to_string().as_str()],
+                )
+                .unwrap();
+
+            let migrated = store.load(id).unwrap().unwrap();
+
+            assert_eq!(migrated.schema_version, SESSION_SNAPSHOT_VERSION);
+            assert_eq!(migrated.messages[0].content, expected_prompt);
+            assert_eq!(migrated.adaptive_enabled, expected_adaptive);
+            if planned {
+                assert!(
+                    DesignSession::restore_planned((), SessionConfig::default(), migrated)
+                        .unwrap()
+                        .planned_enabled()
+                );
+            } else {
+                assert!(DesignSession::restore((), SessionConfig::default(), migrated).is_ok());
+            }
         }
     }
 

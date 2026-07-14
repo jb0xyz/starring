@@ -141,6 +141,12 @@ function actualGateStamps(output, context) {
     if (expected.requireActualSimulation === true && actual.simulation_current !== true) {
       failures.push('simulation is not current');
     }
+    if (expected.forbidActualValidation === true && actual.validation_current === true) {
+      failures.push('validation unexpectedly became current');
+    }
+    if (expected.forbidActualSimulation === true && actual.simulation_current === true) {
+      failures.push('simulation unexpectedly became current');
+    }
     return result(failures.length === 0, failures.length === 0 ? 'required actual gate stamps are current' : failures.join(', '));
   });
 }
@@ -155,6 +161,30 @@ function conversationFlow(output, context) {
     const failures = [];
     if (Number.isInteger(expected.inputTurnCount) && turns.length !== expected.inputTurnCount) {
       failures.push(`turns=${turns.length} expected=${expected.inputTurnCount}`);
+    }
+    if (Number.isInteger(expected.expectedInitialRevision)
+      && turns[0]?.draft_revision_before !== expected.expectedInitialRevision) {
+      failures.push(`initial_revision=${turns[0]?.draft_revision_before} expected=${expected.expectedInitialRevision}`);
+    }
+    if (Number.isInteger(expected.expectedFinalRevision)
+      && turns.at(-1)?.draft_revision_after !== expected.expectedFinalRevision) {
+      failures.push(`final_revision=${turns.at(-1)?.draft_revision_after} expected=${expected.expectedFinalRevision}`);
+    }
+    if (typeof expected.expectedLastTurnId === 'string'
+      && turns.at(-1)?.id !== expected.expectedLastTurnId) {
+      failures.push(`last_turn=${turns.at(-1)?.id} expected=${expected.expectedLastTurnId}`);
+    }
+    const expectedRevisionPath = listVar(expected.expectedRevisionPath);
+    if (expectedRevisionPath.length > 0) {
+      if (turns.length !== expectedRevisionPath.length) {
+        failures.push(`revision_path_turns=${turns.length} expected=${expectedRevisionPath.length}`);
+      }
+      for (let index = 0; index < Math.min(turns.length, expectedRevisionPath.length); index += 1) {
+        const actual = `${turns[index].draft_revision_before}>${turns[index].draft_revision_after}`;
+        if (actual !== expectedRevisionPath[index]) {
+          failures.push(`${turns[index].id} revision=${actual} expected=${expectedRevisionPath[index]}`);
+        }
+      }
     }
     if (turns.some((turn) => turn.outcome === 'halted')) {
       failures.push('conversation halted');
@@ -299,6 +329,12 @@ function expectedSimpleModal() {
   };
 }
 
+function expectedStudyRoomResources() {
+  const ruleset = expectedStudyRoom();
+  ruleset.rules[1].actions = ruleset.rules[1].actions.slice(0, 6);
+  return ruleset;
+}
+
 function expectedAdditiveRevision() {
   const ruleset = expectedSimpleModal();
   ruleset.panels.push({
@@ -329,8 +365,18 @@ function expectedReplacementRevision() {
 function taskSemantics(output, context) {
   return checked(output, (report) => {
     const scenario = vars(context).caseId;
-    const expected = ['studyroom_full', 'studyroom_incremental'].includes(scenario)
+    const expected = [
+      'studyroom_full',
+      'studyroom_incremental',
+      'studyroom_finalize_oracle',
+      'studyroom_finalize_typed',
+      'studyroom_incremental_oracle',
+      'studyroom_incremental_typed',
+      'studyroom_full_typed',
+    ].includes(scenario)
       ? expectedStudyRoom()
+      : ['studyroom_resources_oracle', 'studyroom_resources_typed'].includes(scenario)
+        ? expectedStudyRoomResources()
       : ['simple_modal_ack', 'complete_one_shot', 'multi_turn_elaboration'].includes(scenario)
         ? expectedSimpleModal()
         : scenario === 'additive_revision'
@@ -344,6 +390,111 @@ function taskSemantics(output, context) {
     const actual = structuredClone(report.ruleset);
     const pass = isDeepStrictEqual(actual, expected);
     return result(pass, pass ? `${scenario} semantics match` : `${scenario} ruleset does not exactly match`);
+  });
+}
+
+function oracleControlCalls(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const wanted = expected.expectedInjectedControlCalls;
+    const requireProvenance = expected.requireOracleProvenance === true || wanted > 0;
+    const failures = [];
+    if (report.input_schema_version !== 2) {
+      failures.push(`input_schema_version=${report.input_schema_version} expected=2`);
+    }
+    if (report.mode !== 'typed_plan') {
+      failures.push(`mode=${report.mode} expected=typed_plan`);
+    }
+    if (!Number.isInteger(report.injected_control_calls) || report.injected_control_calls !== wanted) {
+      failures.push(`injected_control_calls=${report.injected_control_calls} expected=${wanted}`);
+    }
+    const turnInjected = report.turns.reduce(
+      (sum, turn) => sum + (Number.isInteger(turn.injected_control_calls) ? turn.injected_control_calls : 0),
+      0,
+    );
+    if (turnInjected !== report.injected_control_calls) {
+      failures.push(`turn_injected_control_calls=${turnInjected} total=${report.injected_control_calls}`);
+    }
+    const expectedPerTurn = listVar(expected.expectedInjectedCallsPerTurn).map(Number);
+    if (expectedPerTurn.length > 0) {
+      if (expectedPerTurn.length !== report.turns.length) {
+        failures.push(`injected_turns=${report.turns.length} expected=${expectedPerTurn.length}`);
+      }
+      for (let index = 0; index < Math.min(expectedPerTurn.length, report.turns.length); index += 1) {
+        if (report.turns[index].injected_control_calls !== expectedPerTurn[index]) {
+          failures.push(`${report.turns[index].id} injected_control_calls=${report.turns[index].injected_control_calls} expected=${expectedPerTurn[index]}`);
+        }
+      }
+    }
+    if (requireProvenance) {
+      const expectedAcceptances = listVar(expected.expectedPlanAcceptancesPerTurn).map(Number);
+      const expectedCommits = listVar(expected.expectedPlanCommitsPerTurn).map(Number);
+      if (expectedAcceptances.length !== report.turns.length) {
+        failures.push(`expected acceptance turns=${expectedAcceptances.length} actual=${report.turns.length}`);
+      }
+      if (expectedCommits.length !== report.turns.length) {
+        failures.push(`expected commit turns=${expectedCommits.length} actual=${report.turns.length}`);
+      }
+      const totalAcceptances = expectedAcceptances.reduce((sum, value) => sum + value, 0);
+      const totalCommits = expectedCommits.reduce((sum, value) => sum + value, 0);
+      const cumulative = [
+        ['plan_submissions', totalAcceptances],
+        ['plan_acceptances', totalAcceptances],
+        ['plan_commits', totalCommits],
+        ['plan_execution_failures', 0],
+        ['plan_rollbacks', 0],
+        ['plan_conflicts', 0],
+      ];
+      for (const [metric, value] of cumulative) {
+        if (report.observability[metric] !== value) {
+          failures.push(`${metric}=${report.observability[metric]} expected=${value}`);
+        }
+      }
+      for (let index = 0; index < report.turns.length; index += 1) {
+        const turn = report.turns[index];
+        const delta = turn.observability_delta || {};
+        const expectedAcceptance = expectedAcceptances[index];
+        const expectedCommit = expectedCommits[index];
+        const turnMetrics = [
+          ['plan_submissions', expectedAcceptance],
+          ['plan_acceptances', expectedAcceptance],
+          ['plan_commits', expectedCommit],
+          ['plan_execution_failures', 0],
+          ['plan_rollbacks', 0],
+          ['plan_conflicts', 0],
+        ];
+        for (const [metric, value] of turnMetrics) {
+          if (delta[metric] !== value) {
+            failures.push(`${turn.id} ${metric}=${delta[metric]} expected=${value}`);
+          }
+        }
+      }
+    }
+    const delegatedByTurn = report.turns.reduce(
+      (sum, turn) => sum + (Number.isInteger(turn.delegated_model_calls) ? turn.delegated_model_calls : 0),
+      0,
+    );
+    if (!Number.isInteger(report.delegated_model_calls)
+      || report.delegated_model_calls !== delegatedByTurn) {
+      failures.push(`delegated_model_calls=${report.delegated_model_calls} turn_total=${delegatedByTurn}`);
+    }
+    const accountedModelCalls = report.injected_control_calls + report.delegated_model_calls;
+    if (report.observability.model_calls !== accountedModelCalls) {
+      failures.push(`model_calls=${report.observability.model_calls} accounted=${accountedModelCalls}`);
+    }
+    for (const turn of report.turns) {
+      const modelCalls = turn.observability_delta?.model_calls;
+      const accounted = turn.injected_control_calls + turn.delegated_model_calls;
+      if (modelCalls !== accounted) {
+        failures.push(`${turn.id} model_calls=${modelCalls} accounted=${accounted}`);
+      }
+    }
+    return result(
+      failures.length === 0,
+      failures.length === 0
+        ? `injected control calls=${report.injected_control_calls}`
+        : failures.join(', '),
+    );
   });
 }
 
@@ -406,6 +557,7 @@ module.exports = {
   draftShape,
   finalGates,
   noExcessiveRepeatedErrors,
+  oracleControlCalls,
   parseReport,
   perTurnBudgets,
   taskSemantics,

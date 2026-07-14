@@ -205,7 +205,7 @@ pub enum ScopeAction {
 }
 
 impl ScopeAction {
-    fn kind(&self) -> ActionKind {
+    pub(crate) fn kind(&self) -> ActionKind {
         match self {
             Self::GrantRole { .. } => ActionKind::GrantRole,
             Self::RespondEphemeral { .. } => ActionKind::RespondEphemeral,
@@ -330,7 +330,7 @@ pub fn required_mutation_tools(brief: &TurnBrief) -> BTreeSet<String> {
     tools
 }
 
-fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool {
+pub(crate) fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool {
     match requirement {
         ScopeRequirement::Panel {
             key,
@@ -396,7 +396,7 @@ fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool 
     }
 }
 
-fn action_matches(action: &ActionSpec, required: &ScopeAction) -> bool {
+pub(crate) fn action_matches(action: &ActionSpec, required: &ScopeAction) -> bool {
     match (action, required) {
         (
             ActionSpec::GrantRole { role, target },
@@ -498,6 +498,42 @@ fn action_matches(action: &ActionSpec, required: &ScopeAction) -> bool {
     }
 }
 
+pub(crate) fn action_is_repeatable(action: &ScopeAction) -> bool {
+    matches!(
+        action,
+        ScopeAction::GrantRole { .. }
+            | ScopeAction::RespondEphemeral { .. }
+            | ScopeAction::OpenModal { .. }
+            | ScopeAction::UpsertOverwrite { .. }
+            | ScopeAction::TeardownInstance { .. }
+    )
+}
+
+pub(crate) fn scope_actions_equivalent(left: &ScopeAction, right: &ScopeAction) -> bool {
+    match (left, right) {
+        (
+            ScopeAction::UpsertOverwrite {
+                channel,
+                target,
+                allow,
+                deny,
+            },
+            ScopeAction::UpsertOverwrite {
+                channel: other_channel,
+                target: other_target,
+                allow: other_allow,
+                deny: other_deny,
+            },
+        ) => {
+            channel == other_channel
+                && target == other_target
+                && permission_bits(allow) == permission_bits(other_allow)
+                && permission_bits(deny) == permission_bits(other_deny)
+        }
+        _ => left == right,
+    }
+}
+
 fn action_target_matches(target: &ActionTarget, expected: ScopeActionTarget) -> bool {
     matches!(
         (target, expected),
@@ -505,7 +541,7 @@ fn action_target_matches(target: &ActionTarget, expected: ScopeActionTarget) -> 
     )
 }
 
-fn resource_ref_matches(reference: &ChannelRef, expected: &ScopeResourceRef) -> bool {
+pub(crate) fn resource_ref_matches(reference: &ChannelRef, expected: &ScopeResourceRef) -> bool {
     match (reference, expected) {
         (ChannelRef::Created(reference), ScopeResourceRef::Created { name }) => {
             reference.created == *name
@@ -542,7 +578,10 @@ fn instance_ref_matches(reference: &InstanceRef, expected: &ScopeInstanceRef) ->
     }
 }
 
-fn overwrite_target_matches(target: &OverwriteTargetSpec, expected: &ScopeOverwriteTarget) -> bool {
+pub(crate) fn overwrite_target_matches(
+    target: &OverwriteTargetSpec,
+    expected: &ScopeOverwriteTarget,
+) -> bool {
     match (target, expected) {
         (OverwriteTargetSpec::Everyone, ScopeOverwriteTarget::Everyone) => true,
         (OverwriteTargetSpec::Role(role), ScopeOverwriteTarget::Role { role: expected }) => {

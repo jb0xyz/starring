@@ -2,9 +2,12 @@ use std::collections::BTreeSet;
 
 use crate::draft::Draft;
 use crate::tools::{tool_definitions, ToolDefinition};
-use crate::turn::{control_tool_definitions, required_mutation_tools, AdaptivePhase};
+use crate::turn::{
+    control_tool_definitions, plan_packet_definition, plan_review_definition,
+    planned_control_tool_definitions, required_mutation_tools, AdaptivePhase, TurnIntent,
+};
 
-use super::{DesignSession, RepairState};
+use super::{DesignSession, PlanAssembly, RepairState};
 
 impl<C> DesignSession<C> {
     pub(super) fn routed_tools(&self) -> Vec<ToolDefinition> {
@@ -33,6 +36,79 @@ impl<C> DesignSession<C> {
         match state.phase {
             AdaptivePhase::Assess => definitions_named(&self.tools, &["set_turn_brief"]),
             AdaptivePhase::Build => {
+                if self.planned_enabled {
+                    if let Some(brief) = state.brief.as_ref() {
+                        if brief.intent == TurnIntent::Build {
+                            return if brief.requirements.is_empty() {
+                                self.plan_assembly.as_ref().map_or_else(
+                                    || definitions_named(&self.tools, &["set_turn_plan"]),
+                                    |assembly| match assembly.frontier_name() {
+                                        "set_turn_plan" => {
+                                            coverage_extension_definitions(&self.tools, assembly)
+                                        }
+                                        "review_turn_plan" => {
+                                            vec![plan_review_definition(
+                                                &self.draft,
+                                                &assembly.requirements,
+                                            )]
+                                        }
+                                        _ => {
+                                            vec![plan_packet_definition(
+                                                &self.draft,
+                                                &assembly.requirements,
+                                                assembly.current_packet(),
+                                            )]
+                                        }
+                                    },
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                        }
+                        if brief.intent == TurnIntent::Modify {
+                            if !brief.requirements.is_empty() {
+                                return Vec::new();
+                            }
+                            if let Some(assembly) = self.plan_assembly.as_ref() {
+                                return match assembly.frontier_name() {
+                                    "set_turn_plan" => {
+                                        coverage_extension_definitions(&self.tools, assembly)
+                                    }
+                                    "review_turn_plan" => {
+                                        vec![plan_review_definition(
+                                            &self.draft,
+                                            &assembly.requirements,
+                                        )]
+                                    }
+                                    _ => {
+                                        vec![plan_packet_definition(
+                                            &self.draft,
+                                            &assembly.requirements,
+                                            assembly.current_packet(),
+                                        )]
+                                    }
+                                };
+                            }
+                            if self.planned_execution_attempts > 0 {
+                                return definitions_named(&self.tools, &["set_turn_plan"]);
+                            }
+                            let mut names = routed_tool_definitions(&self.draft, &self.tools)
+                                .into_iter()
+                                .filter(|tool| is_edit_tool(&tool.name))
+                                .map(|tool| tool.name)
+                                .collect::<BTreeSet<_>>();
+                            let changed = self.turn_state.as_ref().is_some_and(|turn| {
+                                turn.started_revision < self.draft.draft_revision
+                            });
+                            if changed {
+                                names.insert("check_turn_scope".to_string());
+                            } else {
+                                names.insert("set_turn_plan".to_string());
+                            }
+                            return definitions_in_registry_order(&self.tools, &names);
+                        }
+                    }
+                }
                 let mut names = state
                     .brief
                     .as_ref()
@@ -60,6 +136,21 @@ impl<C> DesignSession<C> {
             AdaptivePhase::Reply => definitions_named(&self.tools, &["finish_turn"]),
         }
     }
+}
+
+fn coverage_extension_definitions(
+    registry: &[ToolDefinition],
+    assembly: &PlanAssembly,
+) -> Vec<ToolDefinition> {
+    let mut definitions = definitions_named(registry, &["set_turn_plan"]);
+    if let Some(definition) = definitions.first_mut() {
+        definition.description = format!(
+            "Submit only the concrete missing operations. Do not repeat or replace retained operations. {}. {}",
+            assembly.coverage_extension_context(),
+            definition.description
+        );
+    }
+    definitions
 }
 
 pub(super) fn definitions_named(
@@ -171,13 +262,23 @@ pub(super) fn is_mutation_tool(name: &str) -> bool {
 pub(super) fn is_control_tool(name: &str) -> bool {
     matches!(
         name,
-        "set_turn_brief" | "check_turn_scope" | "render_preview" | "finish_turn"
+        "set_turn_brief"
+            | "set_turn_plan"
+            | "review_turn_plan"
+            | "fill_turn_plan_packet"
+            | "check_turn_scope"
+            | "render_preview"
+            | "finish_turn"
     )
 }
 
-pub(super) fn all_tool_definitions() -> Vec<ToolDefinition> {
+pub(super) fn all_tool_definitions(planned: bool) -> Vec<ToolDefinition> {
     let mut definitions = tool_definitions();
-    definitions.extend(control_tool_definitions());
+    definitions.extend(if planned {
+        planned_control_tool_definitions()
+    } else {
+        control_tool_definitions()
+    });
     definitions
 }
 

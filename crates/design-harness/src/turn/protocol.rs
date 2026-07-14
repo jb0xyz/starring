@@ -6,7 +6,10 @@ use crate::draft::{Draft, DraftSummary};
 use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::tools::ToolDefinition;
 
-use super::scope::ScopeRequirement;
+use super::{
+    plan_input::{self, PlanOutlineItem, TurnPlanSubmission},
+    scope::ScopeRequirement,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -130,12 +133,84 @@ struct SetTurnBriefInput {
     validate: bool,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetTurnPlanInput {
+    requirements: Vec<ScopeRequirement>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TurnStrategyInput {
+    AdditivePlan,
+    EditExisting,
+    Brainstorm,
+    Inspect,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlannedSetTurnBriefInput {
+    strategy: TurnStrategyInput,
+    objective: String,
+    requested_outcome: RequestedOutcome,
+    assumptions: Vec<String>,
+    validate: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySetTurnBriefInput {
+    intent: TurnIntent,
+    objective: String,
+    requested_outcome: RequestedOutcome,
+    assumptions: Vec<String>,
+    validate: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CompatibleSetTurnBriefInput {
+    Current(PlannedSetTurnBriefInput),
+    Legacy(LegacySetTurnBriefInput),
+}
+
 pub fn control_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         definition::<SetTurnBriefInput>(
             "set_turn_brief",
             "Classify the current user turn with a concise objective and verification plan",
         ),
+        definition::<SetTurnPlanInput>(
+            "set_turn_plan",
+            "Declare exact ordered Draft requirements for additive work in the current build or modify-labeled turn",
+        ),
+        definition::<EmptyInput>(
+            "check_turn_scope",
+            "Check the current Draft against the active turn requirements",
+        ),
+        definition::<EmptyInput>(
+            "render_preview",
+            "Render the current validated Draft for human review",
+        ),
+        definition::<FinishTurn>(
+            "finish_turn",
+            "Finish the human turn with kind needs_input, progressed, or ready; include question only for needs_input",
+        ),
+    ]
+}
+
+pub(crate) fn planned_control_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        definition::<PlannedSetTurnBriefInput>(
+            "set_turn_brief",
+            "Choose additive_plan for every request that adds a new panel, button, modal, rule, or action, including additions to an existing Draft. Choose edit_existing only for updating or removing a target that already exists. Choose brainstorm or inspect only when no Draft mutation is requested. Record a concise objective and verification choice",
+        ),
+        ToolDefinition {
+            name: "set_turn_plan".to_string(),
+            description: "Declare the complete ordered additive outline using exactly {\"steps\":[{\"op\":\"post_panel\",\"owner\":\"submit_room\",\"goal\":\"post panel key join_panel in the created channel with its complete embedded button list\"}]}. Include only missing mutations and omit existing objects or actions mentioned only to preserve them. Every step must include owner: draft for panel, modal, and rule; its panel key for button; its parent rule key for every action. Never use a role, channel, modal, action target, or resource key as an action owner. A post_panel step contains its complete embedded buttons in its later packet; never add separate button steps for them. The button op is only for a persistent top-level panel declared with panel. Every op must be one exact string from the schema enum; there is no generic action op. Never send type or action fields, a nested op object, or typed action arguments here; fill_turn_plan_packet receives typed values later. Use one step and literal-value goal per new requested declaration or action. A rule is trigger-only and every action is separate. Put every new top-level button immediately after its panel and every action immediately after its rule".to_string(),
+            parameters: plan_input::outline_schema(),
+        },
         definition::<EmptyInput>(
             "check_turn_scope",
             "Check the current Draft against the active turn requirements",
@@ -164,6 +239,93 @@ pub fn parse_turn_brief(arguments: &str) -> Result<TurnBrief, StructuredError> {
             simulation: SimulationProfile::None,
         },
     })
+}
+
+pub(crate) fn parse_planned_turn_brief(arguments: &str) -> Result<TurnBrief, StructuredError> {
+    let parameters = definition::<PlannedSetTurnBriefInput>("set_turn_brief", "").parameters;
+    let input = serde_json::from_str::<CompatibleSetTurnBriefInput>(arguments)
+        .map_err(|error| translate_tool_arguments_error("set_turn_brief", &error, &parameters))?;
+    let (intent, objective, requested_outcome, assumptions, validate) = match input {
+        CompatibleSetTurnBriefInput::Current(input) => {
+            let intent = match input.strategy {
+                TurnStrategyInput::AdditivePlan => TurnIntent::Build,
+                TurnStrategyInput::EditExisting => TurnIntent::Modify,
+                TurnStrategyInput::Brainstorm => TurnIntent::Brainstorm,
+                TurnStrategyInput::Inspect => TurnIntent::Inspect,
+            };
+            (
+                intent,
+                input.objective,
+                input.requested_outcome,
+                input.assumptions,
+                input.validate,
+            )
+        }
+        CompatibleSetTurnBriefInput::Legacy(input) => (
+            input.intent,
+            input.objective,
+            input.requested_outcome,
+            input.assumptions,
+            input.validate,
+        ),
+    };
+    Ok(TurnBrief {
+        intent,
+        objective,
+        requested_outcome,
+        requirements: Vec::new(),
+        assumptions,
+        blocking_decisions: Vec::new(),
+        verification: TurnVerification {
+            validate,
+            simulation: SimulationProfile::None,
+        },
+    })
+}
+
+pub(crate) fn parse_turn_plan(arguments: &str) -> Result<TurnPlanSubmission, StructuredError> {
+    if let Ok(input) = serde_json::from_str::<SetTurnPlanInput>(arguments) {
+        return Ok(TurnPlanSubmission::Complete(input.requirements));
+    }
+    plan_input::parse_submission(arguments)
+}
+
+pub(crate) fn plan_packet_definition(
+    draft: &Draft,
+    requirements: &[ScopeRequirement],
+    items: &[PlanOutlineItem],
+) -> ToolDefinition {
+    plan_input::packet_definition_for_state(draft, requirements, items)
+}
+
+pub(crate) fn plan_review_definition(
+    draft: &Draft,
+    requirements: &[ScopeRequirement],
+) -> ToolDefinition {
+    plan_input::review_definition(draft, requirements)
+}
+
+pub(crate) fn parse_turn_plan_review(
+    requirements: &[ScopeRequirement],
+    arguments: &str,
+) -> Result<(), StructuredError> {
+    plan_input::parse_review(requirements, arguments)
+}
+
+pub(crate) fn parse_turn_plan_review_oracle(
+    requirements: &[ScopeRequirement],
+    arguments: &str,
+) -> Result<(), StructuredError> {
+    plan_input::parse_review_oracle(requirements, arguments)
+}
+
+pub(crate) fn parse_turn_plan_packet_scoped(
+    draft: &Draft,
+    requirements: &[ScopeRequirement],
+    items: &[PlanOutlineItem],
+    arguments: &str,
+) -> Result<Vec<ScopeRequirement>, plan_input::PlanPacketFailure> {
+    plan_input::parse_packet_for_state_scoped(draft, requirements, items, arguments)
 }
 
 pub fn parse_finish_turn(arguments: &str) -> Result<FinishTurn, StructuredError> {
@@ -233,6 +395,19 @@ mod tests {
         assert!(!parsed.verification.validate);
         assert_eq!(parsed.verification.simulation, SimulationProfile::None);
         assert!(parse_turn_brief(
+            r#"{"strategy":"brainstorm","objective":"game","requested_outcome":"discussion","assumptions":[],"validate":false}"#
+        )
+        .is_err());
+        let planned = parse_planned_turn_brief(
+            r#"{"strategy":"additive_plan","objective":"room","requested_outcome":"draft_update","assumptions":[],"validate":false}"#,
+        )
+        .unwrap();
+        assert_eq!(planned.intent, TurnIntent::Build);
+        assert!(parse_planned_turn_brief(
+            r#"{"intent":"build","objective":"room","requested_outcome":"draft_update","assumptions":[],"validate":false}"#
+        )
+        .is_ok());
+        assert!(parse_turn_brief(
             r#"{"intent":"brainstorm","objective":"game","requested_outcome":"discussion","assumptions":[],"validate":false,"simulation":"study_room"}"#
         )
         .is_err());
@@ -241,8 +416,54 @@ mod tests {
             .find(|tool| tool.name == "set_turn_brief")
             .unwrap()
             .parameters;
+        assert!(schema.pointer("/properties/strategy").is_none());
+        assert!(schema.pointer("/properties/intent").is_some());
         assert!(schema.pointer("/properties/validate").is_some());
         assert!(schema.pointer("/properties/simulation").is_none());
+        let planned_schema = planned_control_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "set_turn_brief")
+            .unwrap()
+            .parameters;
+        assert!(planned_schema.pointer("/properties/strategy").is_some());
+        assert!(planned_schema.pointer("/properties/intent").is_none());
+        let plan_definition = planned_control_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "set_turn_plan")
+            .unwrap();
+        assert!(plan_definition
+            .description
+            .contains("{\"steps\":[{\"op\":\"post_panel\""));
+        assert!(plan_definition
+            .description
+            .contains("Never send type or action fields"));
+        assert!(plan_definition
+            .description
+            .contains("Include only missing mutations"));
+        assert!(plan_definition
+            .description
+            .contains("its parent rule key for every action"));
+        let adaptive_plan = control_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "set_turn_plan")
+            .unwrap();
+        assert!(adaptive_plan
+            .parameters
+            .pointer("/properties/requirements")
+            .is_some());
+        assert!(adaptive_plan
+            .parameters
+            .pointer("/properties/steps")
+            .is_none());
+        let plan = parse_turn_plan(
+            r#"{"requirements":[{"kind":"no_unresolved_references","id":"refs"}]}"#,
+        )
+        .unwrap();
+        let TurnPlanSubmission::Complete(requirements) = plan else {
+            panic!("expected complete plan")
+        };
+        assert_eq!(requirements.len(), 1);
+        assert!(parse_turn_plan(r#"{"requirements":[],"extra":true}"#).is_err());
         assert!(parse_finish_turn(
             r#"{"kind":"needs_input","message":"Choose a genre","question":"Which genre?"}"#
         )
@@ -280,6 +501,7 @@ mod tests {
             finish_schema["$defs"]["FinishTurnKind"]["enum"],
             json!(["needs_input", "progressed", "ready"])
         );
-        assert_eq!(control_tool_definitions().len(), 4);
+        assert_eq!(control_tool_definitions().len(), 5);
+        assert_eq!(planned_control_tool_definitions().len(), 5);
     }
 }

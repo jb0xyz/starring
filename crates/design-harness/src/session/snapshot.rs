@@ -9,7 +9,7 @@ use super::repair::{has_matching_repair_directive, is_argument_failure};
 use super::routing::{is_mutation_tool, routed_tool_definitions};
 use super::{
     RepairKind, RepairState, SessionSnapshot, SessionSnapshotError, TurnPhase,
-    DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
+    DEFAULT_SYSTEM_PROMPT, PLANNED_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
 };
 
 pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotError> {
@@ -22,7 +22,12 @@ pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), Sessio
     let Some(system) = snapshot.messages.first() else {
         return Err(snapshot_invariant("canonical messages are empty"));
     };
-    if system.role != MessageRole::System || system.content != DEFAULT_SYSTEM_PROMPT {
+    if system.role != MessageRole::System
+        || !matches!(
+            system.content.as_str(),
+            DEFAULT_SYSTEM_PROMPT | PLANNED_SYSTEM_PROMPT
+        )
+    {
         return Err(snapshot_invariant(
             "canonical messages do not begin with the fixed system prompt",
         ));

@@ -1,6 +1,6 @@
 # Serving measurements
 
-All rows use Promptfoo cache disabled, concurrency one, the local OpenAI-compatible gateway at `127.0.0.1`, and `gemma4:12b-mlx`. Elapsed values are end-to-end harness burst time. Raw reports are kept locally under the ignored `results/` directory.
+All rows use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1`. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Elapsed values are end-to-end harness burst time. Raw reports are kept locally under the ignored `results/` directory.
 
 ## Baseline
 
@@ -78,7 +78,7 @@ The per-turn `New distinct` column reports mutation tool names first introduced 
 | 1 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
 | 2 | surface | progressed | 154,465 | 8 | 8 | 3: add_panel, add_button, add_modal | add_panel×1, add_button×1, add_modal×1 | p1/m1/r0/a0 | none |
 | 2 | open-rule | progressed | 302,962 | 7 | 7 | 2: begin_rule, add_interaction_action | begin_rule×1, add_interaction_action×1 | p1/m1/r1/a1 | none |
-| 2 | submit-resources | progressed | 560,580 | 12 | 12 | 3: add_resource_action, add_upsert_overwrite_action, add_grant_role_action | begin_rule×1, add_interaction_action×1, add_resource_action×2, add_upsert_overwrite_action×2, add_grant_role_action×1 | p1/m1/r2/a7 | none |
+| 2 | submit-resources | progressed | 560,580 | 12 | 12 | 3: add_resource_action, add_upsert_overwrite_action, add_grant_role_action | begin_rule×1, add_interaction_action×1, add_resource_action×2, add_upsert_overwrite_action×2, add_grant_role_action×1 | p1/m1/r2/a7 | structural count reached, but role/channel names and both overwrites differed from the requested semantics |
 | 2 | submit-finalize | halted | 645,363 | 12 | 12 | 0 | add_panel×8, add_button×2 | p9/m1/r2/a7 | `MODEL_CALL_LIMIT_EXHAUSTED`: used top-level panel tools instead of `add_post_panel_action` |
 | 2 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
 | 3 | surface | progressed | 150,413 | 7 | 8 | 3: add_panel, add_button, add_modal | add_panel×1, add_button×1, add_modal×1 | p1/m1/r0/a0 | none |
@@ -87,6 +87,104 @@ The per-turn `New distinct` column reports mutation tool names first introduced 
 | 3 | submit-finalize | halted | 647,327 | 12 | 12 | 0 | add_panel×8, add_button×2 | p9/m1/r2/a7 | `MODEL_CALL_LIMIT_EXHAUSTED`: used top-level panel tools instead of `add_post_panel_action` |
 | 3 | validate-simulate | not reached | n/a | n/a | n/a | n/a | n/a | n/a | prior turn halted |
 
-The first two turns completed in all three runs. The seven-mutation third turn completed in two of three runs. Both runs that reached the fourth turn confused runtime panel actions with top-level panel construction and exhausted the per-turn model-call budget after adding duplicate panels. The first run failed earlier while repairing the first resource action. This locates two independent stalls: the seven-tool resource turn remains marginal, and the four-tool finalize turn needs a more discriminating tool route or a smaller split around runtime panel posting.
+The first two turns completed in all three runs. The seven-mutation third turn returned `progressed` in two of three runs, but only run 3 matched the requested StudyRoom resource semantics. Run 2 used different role and channel names, referenced unrelated channels in both overwrites, and targeted everyone twice. Both runs that reached the fourth turn confused runtime panel actions with top-level panel construction and exhausted the per-turn model-call budget after adding duplicate panels. The first run failed earlier while repairing the first resource action. This locates three failures: the resource turn can halt, it can silently satisfy only the structural counts with wrong semantics, and the finalize turn needs an intent-bound tool route rather than broad Draft-state availability.
 
-The prior one-shot `studyroom_full` sample in section 4 also had 0% pass and 0% completion across three runs. The five-turn `studyroom_incremental` experiment therefore did not improve complex StudyRoom completion above the known one-shot 0% result. It did make the stall boundary observable and allowed two runs to reach the correct cumulative structure through seven actions, but that is partial progress, not completion. The hypothesis that this exact five-turn decomposition makes complex StudyRoom viable on local Gemma 12B is rejected by this sample.
+The prior one-shot `studyroom_full` sample in section 4 also had 0% pass and 0% completion across three runs. The five-turn `studyroom_incremental` experiment therefore did not improve complex StudyRoom completion above the known one-shot 0% result. It made the stall boundary observable, but only one run reached the exact requested cumulative semantics through seven actions. The other structurally complete resource turn was semantically wrong. This is partial progress, not completion. The hypothesis that this exact five-turn decomposition makes complex StudyRoom viable on local Gemma 12B is rejected by this sample.
+
+## 6. Typed turn work queue
+
+Measured 2026-07-14 while developing the typed outline → packet → independent review → atomic commit path. Every checkpoint row below is one diagnostic run against a different harness revision. These are development checkpoints, not independent repetitions, so their latency and pass/fail values must not be treated as reliability rates or causal performance comparisons. Promptfoo cache was disabled and concurrency was one. Elapsed values below are harness-reported end-to-end time.
+
+| Checkpoint | Scope and outcome | Harness ms | Model/tool calls | Canonical revision | Commits/rollbacks | Raw report |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Strict structured reviewer | Surface halted because the reviewer returned a natural object shape that failed the exact field type contract | 97,754 | 6/6 | 0→0 | 0/0 | `results/gemma-incremental-typed-structural-final.json` |
+| Tolerant reviewer parser | Surface committed; open-rule then halted because the model did not echo every exact reference-audit token | 252,200 | 11/14 | 0→3 | 1/0 | `results/gemma-incremental-typed-tolerant-review.json` |
+| Evidence verdict reviewer | Surface and open-rule committed; the resource packet halted after malformed packet fields and a prose response | 983,353 | 24/27 | 0→5 | 2/0 | `results/gemma-incremental-typed-reference-verdict.json` |
+| Normalized resource packets | Isolated resource turn passed, producing the exact resource prefix with five distinct mutation tools | 331,494 | 11/17 | 5→12 | 1/0 | `results/gemma-isolated-resources-normalized-packets.json` |
+| Reference-verdict finalize | Isolated finalize turn passed, adding four actions with exact panel targets and derived instance manifest | 306,048 | 10/13 | 12→16 | 1/0 | `results/gemma-isolated-finalize-reference-verdict.json` |
+| First full normalized run | Surface, open-rule, and resources committed; finalize halted before mutation because the initial candidate omitted its instance registration | 1,467,301 | 30/41 | 0→12 | 3/0 | `results/gemma-incremental-typed-normalized-full.json` |
+| Response-format-only transport | Isolated resources halted at the brief frontier because Gemma returned empty text twice when the sole tool was removed from the upstream request | 25,733 | 2/0 | 5→5 | 0/0 | `results/gemma-isolated-resources-response-format-only.json` |
+| Optional overwrite sides | Isolated resources passed after empty allow or deny lists became safely omittable, avoiding the observed Gemma `<nil>` tool-call serialization | 323,135 | 10/17 | 5→12 | 1/0 | `results/gemma-isolated-resources-optional-overwrite.json` |
+| First hardened full run | All five turns were injected; four mutation turns committed, then final validation found a malformed channel-name template and its one repair call failed | 1,356,560 | 29/44 | 0→15 | 4/0 | `results/gemma-incremental-typed-hardened-full.json` |
+| Template and new-rule hardening | Surface committed a panel and modal without the requested button; open-rule then repeated an unknown button reference and halted | 444,410 | 13/14 | 0→2 | 1/0 | `results/gemma-incremental-typed-template-hardened-full.json` |
+| Operation inventory and semantic reference replan | Surface committed the exact panel, button, and modal; open-rule then halted after two reviewer sentinel field-type errors | 288,294 | 11/14 | 0→3 | 1/0 | `results/gemma-incremental-typed-inventory-replan-full.json` |
+| Natural reviewer sentinel normalization | All five turns completed with exact StudyRoom semantics and current validation and simulation stamps | 2,060,168 | 38/56 | 0→16 | 4/0 | `results/gemma-incremental-typed-review-normalized-full.json` |
+| Follow-up edge hardening rerun | Surface again committed exactly; open-rule then halted after two review responses failed the exact seven-field shape | 289,467 | 11/14 | 0→3 | 1/0 | `results/gemma-incremental-typed-edge-hardened-full.json` |
+| Four-field review contract rerun | Surface committed exactly through the reduced review contract; open-rule semantic replan then submitted the same invalid post-panel owner twice | 298,446 | 11/14 | 0→3 | 1/0 | `results/gemma-incremental-typed-review-discriminated-full.json` |
+| Four-field review Qwen rerun | The exact first three prefixes committed; finalize halted after schema-invalid packet-fill calls and a terminal response without exactly one packet-fill call | 1,092,274 | 29/40 | 0→12 | 3/0 | `results/qwen35-9b-incremental-typed-review-discriminated-full.json` |
+| Reviewer-isolated Ornith rerun | Surface committed the panel and modal but omitted the requested button; open-rule then repeated the unknown button reference and halted | 236,033 | 11/13 | 0→2 | 1/0 | `results/ornith-9b-incremental-typed-review-isolated-full.json` |
+
+The isolated resource and finalize results are each one pass from one run. They establish that those paths can succeed, but they do not meet the planned 3/3 reliability threshold.
+
+The response-format-only transport experiment tried to bypass Ollama's Gemma tool-call parser by sending only the sole frontier's strict JSON schema and adapting JSON content back into the routed call. The model returned empty content on both attempts before planning began. The experiment was rejected and the upstream `tools` contract was restored.
+
+Making the empty permission side optional removed the exact `<nil>` pressure without weakening overwrite semantics: both sides empty and overlapping permissions are rejected deterministically. The isolated resource turn then produced the exact rev5→12 prefix with seven compiled mutations and no Ollama tool-call parsing warning. This is one pass, not a reliability rate.
+
+The next full run reached all five turns. Its revision path was `0→3→5→12→15→15`: resource construction succeeded, while finalize omitted `edit_response` and the resource turn had already committed the malformed channel template `study-${input.room_name`. Final validation reported `BAD_TEMPLATE`; the single repair attempted `update_action` with invalid arguments and halted. Canonical revision 15 was preserved. This moves the observed stall from packet serialization to an earlier missing template-syntax check plus one omitted finalize action; it is still a failed full run.
+
+Template syntax and modal-input availability are now checked while typed packets are assembled, and every newly created rule must carry at least one same-candidate action. The next diagnostic run exposed a separate semantic boundary: the surface reviewer approved a candidate that omitted the requested button, and the following turn repeatedly referenced that nonexistent button. Adding an atomic operation inventory made the surface review exact in the subsequent run, while a full-candidate semantic reference failure now discards the assembly and spends the one semantic replan instead of retrying an impossible packet frontier. That run stopped at the next transport boundary because a no-issue reviewer response used natural `null` and object values for required string sentinels.
+
+At that checkpoint, the production parser required the same exact seven review field names and rejected legacy shapes before normalizing values. For `none` or `missing`, natural `null` issue identifiers and an object-valued empty expected JSON were converted to the advertised internal sentinels. Mismatch evidence remained strict about candidate id, JSON Pointer, different value, and equal JSON type. With that normalization, one full incremental run reached the exact StudyRoom target and passed every Promptfoo assertion.
+
+### First complete typed run
+
+| Turn | Outcome | Elapsed ms | Model/tool calls | Revision | Commit/rollback | Draft after | Stall |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| surface | progressed | 114,019 | 6/9 | 0→3 | 1/0 | p1/m1/r0/a0 | none |
+| open-rule | progressed | 179,143 | 5/7 | 3→5 | 1/0 | p1/m1/r1/a1 | none |
+| submit-resources | progressed | 593,459 | 12/19 | 5→12 | 1/0 | p1/m1/r2/a7 | none |
+| submit-finalize | progressed | 923,783 | 12/15 | 12→16 | 1/0 | p1/m1/r2/a11 | none |
+| validate-simulate | ready | 249,757 | 3/6 | 16→16 | 0/0 | p1/m1/r2/a11 | none |
+
+The final Draft had one panel, one modal, two rules, eleven actions, no unresolved references, and all ten required distinct mutation tools. Both actual gate stamps were current at revision 16, and the independent postchecks passed validation and the golden-trace StudyRoom simulation. The run used 38 model calls and 56 tool calls, made four atomic commits with no rollback, and stayed within the configured per-turn and total evaluation budgets. Its maximum identical error count was two.
+
+This is the first observed complete complex typed run, so it establishes feasibility for local `gemma4:12b-mlx`; it does not establish reliability. It took 2,060,168 harness milliseconds and 34 minutes 21 seconds wall time. The slowest turn was `submit-finalize` at 923,783 ms, and later model calls reached roughly 80–88 seconds as context accumulated. This latency is not acceptable for an interactive commercial path without further work. The live binary for this checkpoint preceded the follow-up deterministic edge hardening for explicit extra-mutation review, independent reviewer/structural extension flags, and prior-template-dependency replan escalation; those changes are covered by deterministic tests rather than this live row.
+
+The immediate rerun after those three edge changes did not reproduce the full completion. Surface again committed the exact rev0→3 structure in 121,800 ms, but open-rule produced two responses that did not contain the exact seven advertised review fields and halted with `PLAN_REPAIR_FAILED`. The canonical Draft stayed at revision 3; no validation or simulation stamp was current. Across these two adjacent but not identical harness checkpoints, complex completion is one observed pass and one observed fail. They are not a same-revision 1/2 reliability sample, but the failed rerun confirms that reviewer serialization remains a live reliability boundary. The follow-up contract therefore keeps one review tool but requires only `covered_ids`, `reference_verdict`, `issue_kind`, and `detail`; mismatch and extra evidence fields are conditionally required, while the old seven-field sentinel form remains compatible. The next diagnostic row exercises that contract.
+
+The first live run with the four-field contract passed the surface review and again committed the exact panel, button, and modal at revision 3. The open-rule turn then referenced a nonexistent component, correctly triggered the one full-candidate semantic replan, and used both replacement attempts on a `post_panel` outline whose owner `submit_room` was not an existing rule. It halted before review with `INVALID_TOOL_ARGUMENTS@tool.set_turn_plan.arguments.steps.0.owner`; canonical revision 3 was preserved. This run clears the previous review-shape boundary but fails at a different Gemma planning boundary. Repeatedly changing the review interface cannot resolve that model variance.
+
+The Qwen rerun used the same four-field contract and the then-current deterministic harness revision. It committed the exact surface, open-modal rule, and resource prefix along `0→3→5→12`, then halted during `submit-finalize`. The finalize flow produced schema-invalid packet-fill calls before a terminal response failed the contract requiring exactly one `fill_turn_plan_packet` call, so no finalize mutation executed and canonical revision 12 remained intact. The run stopped after four of five turns with `PLAN_REPAIR_FAILED`, used 29 model calls and 40 tool calls, and took 1,092,274 harness milliseconds. Validation correctly reported the still-incomplete `submit_room` rule and simulation was not attempted. This is a deeper failed trace than the adjacent Gemma rerun, not a completion or a reliability estimate. The subsequent reviewer-state prompt-injection isolation is covered by deterministic tests and was not exercised by this live row.
+
+The Ornith run exercised the reviewer-state isolation on `ornith:9b`, a Qwen 3.5-family 9B Q4_K_M model, with the gateway capped to the same 16K context as the other samples. Its surface candidate contained the requested panel and modal but omitted the requested static button; the independent reviewer accepted that incomplete operation inventory and committed revision `0→2`. The open-rule turn then referenced the absent `create_study_room` button twice and halted with `PLAN_REPAIR_FAILED`, preserving revision 2. No actual validation or simulation stamp was current. The evaluator's non-mutating validation passed the structurally valid but incomplete Draft, while the golden-trace postcheck correctly failed with `GOLDEN_TRACE_OPEN_BUTTON_MISSING`. The run took 236,033 milliseconds with 11 model calls and 13 tool calls. It was faster only because it stopped after two turns, so this sample is not evidence of a latency advantage.
+
+### First full-run boundary
+
+| Turn | Outcome | Elapsed ms | Model/tool calls | Revision | Commit/rollback | Draft after | Stall |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| surface | progressed | 112,138 | 6/9 | 0→3 | 1/0 | p1/m1/r0/a0 | none |
+| open-rule | progressed | 188,057 | 5/7 | 3→5 | 1/0 | p1/m1/r1/a1 | none |
+| submit-resources | progressed | 607,123 | 12/19 | 5→12 | 1/0 | p1/m1/r2/a7 | none |
+| submit-finalize | halted | 559,978 | 7/6 | 12→12 | 0/0 | p1/m1/r2/a7 | `PLAN_REPAIR_FAILED` after two `TURN_PLAN_INSTANCE_OWNER_AMBIGUOUS` errors |
+
+The first three turns produced the exact cumulative resource prefix and committed atomically. In the fourth turn, the candidate contained instance-routed `post_panel` actions but initially omitted `register_instance`. Owner resolution ran before the coverage reviewer and treated the zero-registration case as ambiguous. It returned `TURN_PLAN_INSTANCE_OWNER_AMBIGUOUS` twice, the one semantic replan failed, and the canonical Draft remained unchanged at revision 12. No validation or simulation was attempted; the postcheck correctly reported `DEFER_MISSING_EDIT`. This run therefore did not complete StudyRoom.
+
+### Structural coverage extension
+
+The resolver now gathers every rule whose instance-routed panel lacks a registration. Multiple registrations in one rule remain `TURN_PLAN_INSTANCE_OWNER_AMBIGUOUS`. The harness retains the typed candidate and packet cursor, then exposes one deterministic extension that accepts exactly one `register_instance` for every listed owner and rejects missing, duplicate, extra-owner, or unrelated operations. A session-level guard prevents any second coverage extension in the same human turn. Owner resolution, manifest derivation, independent review, and atomic execution run only after the obligation is satisfied.
+
+The deterministic regressions cover both one missing owner and two missing owners in the same extension. The two-owner path is:
+
+`set_turn_brief → set_turn_plan → fill_turn_plan_packet ×2 → set_turn_plan(extension) → fill_turn_plan_packet(extension) → review_turn_plan → finish_turn`
+
+It ends at revision 6 with two rules, two `post_panel` actions, and two `register_instance` actions in canonical order, with two plan submissions, one acceptance, one commit, zero rollbacks, and one nudge. The second-incomplete-review regression halts with the canonical revision unchanged. These results prove the deterministic harness route; they are not live-model evidence.
+
+### Live model comparison
+
+| Model | Raw report | Runs | Full result | Final revision and structure | Gates | Harness ms | Model/tool calls | Commits/rollbacks |
+| --- | --- | ---: | --- | --- | --- | ---: | ---: | ---: |
+| `gemma4:12b-mlx` | `results/gemma-incremental-typed-structural-extension-final.json` | 1 | evaluator fail; halted at `submit-resources` 3/5 with `PLAN_REPAIR_FAILED` | rev5; p1/m1/r1/a1 | validation not current; simulation not current | 866,742 | 22/25 | 2/0 |
+| `qwen3.5:9b-mlx` | `results/qwen35-9b-incremental-typed-structural-extension-final.json` | 1 | evaluator fail; halted at `submit-resources` 3/5 with `PLAN_REPAIR_FAILED` | rev4; p1/m1/r1/a0 | validation not current; simulation not current | 649,885 | 22/26 | 2/0 |
+| `gemma4:12b-mlx` | `results/gemma-incremental-typed-review-discriminated-full.json` | 1 | evaluator fail; halted at `open-rule` 2/5 after two invalid replacement outlines | rev3; p1/m1/r0/a0 | validation not current; simulation not current | 298,446 | 11/14 | 1/0 |
+| `qwen3.5:9b-mlx` | `results/qwen35-9b-incremental-typed-review-discriminated-full.json` | 1 | evaluator fail; halted at `submit-finalize` 4/5 after packet schema errors and a terminal response-shape error | rev12; p1/m1/r2/a7 | validation not current; simulation not current | 1,092,274 | 29/40 | 3/0 |
+| `ornith:9b` | `results/ornith-9b-incremental-typed-review-isolated-full.json` | 1 | evaluator fail; halted at `open-rule` 2/5 after repeating an unknown button reference | rev2; p1/m1/r0/a0 | validation not current; simulation not current | 236,033 | 11/13 | 1/0 |
+
+Gemma committed the exact first two prefixes and preserved rev5 when the resource packet failed. The packet boundary and field-type errors were refined, but the last two Ollama responses contained malformed Gemma tool-call arguments and arrived at the harness as empty text. This run never reached the structural instance-registration extension, so it is not evidence that the extension failed.
+
+Qwen also committed the first two turns, but its open-rule candidate omitted the requested `open_modal` action and the independent reviewer accepted that incomplete candidate. During the resource turn the reviewer twice reported mismatch evidence whose expected value already equaled the candidate value; the harness rejected both reviews and preserved rev4. Qwen had no Ollama tool-call parsing warnings in this run. Its lower elapsed time is one failed sample and does not establish a latency or quality advantage.
+
+Under the later four-field review contract, the Gemma diagnostic stopped earlier on invalid outline ownership while Qwen reached the exact revision-12 resource prefix and then failed the finalize packet transport contract. The Qwen trace was 3.7 times slower by harness elapsed time and used substantially more model calls, but the two rows are single stochastic runs and cannot establish a model ranking. Neither final-contract run completed or produced current validation and simulation stamps.
+
+The later Ornith diagnostic stopped at the same turn number as the four-field Gemma row but preserved only revision 2 because its surface review missed the requested button. Its shorter elapsed time reflects less completed work. All three model rows remain single stochastic diagnostics; Qwen reached the deepest exact prefix in these samples, while none completed StudyRoom. Only the Ornith row exercised the final reviewer-state isolation.
+
+Each live-model row is one run. They are diagnostic traces, not reliability estimates, and must not be pooled with the historical samples. The historical one-shot StudyRoom result remains 0/3 completion, and the earlier adaptive five-turn experiment remains 0/3 completion. A single successful typed run, if obtained, demonstrates feasibility only. Default promotion still requires the full acceptance matrix: 3/3 isolated resources, 3/3 isolated finalize, 3/3 incremental turn five, at least 2/3 validate/simulate, and 9/10 product regressions.

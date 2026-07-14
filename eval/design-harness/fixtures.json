@@ -1,0 +1,693 @@
+{
+  "studyroom_before_resources": {
+    "ruleset": {
+      "version": 1,
+      "panels": [
+        {
+          "key": "study_panel",
+          "channel": "study_hub",
+          "content": "Create a study room",
+          "buttons": [
+            {
+              "label": "Create room",
+              "route": {
+                "static": {
+                  "key": "create_study_room"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "modals": [
+        {
+          "key": "study_modal",
+          "title": "Create study room",
+          "fields": [
+            {
+              "key": "room_name",
+              "label": "Room name",
+              "style": "short",
+              "required": true
+            }
+          ]
+        }
+      ],
+      "rules": [
+        {
+          "key": "open_modal",
+          "trigger": {
+            "type": "button_click",
+            "component": "create_study_room"
+          },
+          "actions": [
+            {
+              "type": "open_modal",
+              "modal": "study_modal"
+            }
+          ]
+        }
+      ]
+    },
+    "draft_revision": 5,
+    "validated_revision": null,
+    "simulated_revision": null
+  },
+  "studyroom_before_finalize": {
+    "ruleset": {
+      "version": 1,
+      "panels": [
+        {
+          "key": "study_panel",
+          "channel": "study_hub",
+          "content": "Create a study room",
+          "buttons": [
+            {
+              "label": "Create room",
+              "route": {
+                "static": {
+                  "key": "create_study_room"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "modals": [
+        {
+          "key": "study_modal",
+          "title": "Create study room",
+          "fields": [
+            {
+              "key": "room_name",
+              "label": "Room name",
+              "style": "short",
+              "required": true
+            }
+          ]
+        }
+      ],
+      "rules": [
+        {
+          "key": "open_modal",
+          "trigger": {
+            "type": "button_click",
+            "component": "create_study_room"
+          },
+          "actions": [
+            {
+              "type": "open_modal",
+              "modal": "study_modal"
+            }
+          ]
+        },
+        {
+          "key": "submit_room",
+          "trigger": {
+            "type": "modal_submit",
+            "modal": "study_modal"
+          },
+          "actions": [
+            {
+              "type": "defer_ephemeral"
+            },
+            {
+              "type": "create_role",
+              "key": "member_role",
+              "name": "${input.room_name} members"
+            },
+            {
+              "type": "create_channel",
+              "key": "room_channel",
+              "name": "study-${input.room_name}"
+            },
+            {
+              "type": "upsert_overwrite",
+              "channel": {
+                "created": "room_channel"
+              },
+              "target": "everyone",
+              "allow": "0",
+              "deny": "1024"
+            },
+            {
+              "type": "upsert_overwrite",
+              "channel": {
+                "created": "room_channel"
+              },
+              "target": {
+                "role": {
+                  "created": "member_role"
+                }
+              },
+              "allow": "1024",
+              "deny": "0"
+            },
+            {
+              "type": "grant_role",
+              "role": {
+                "created": "member_role"
+              },
+              "target": "actor"
+            }
+          ]
+        }
+      ]
+    },
+    "draft_revision": 12,
+    "validated_revision": null,
+    "simulated_revision": null
+  },
+  "studyroom_surface_plan": {
+    "requirements": [
+      {
+        "kind": "panel",
+        "id": "study_panel",
+        "key": "study_panel",
+        "channel": "study_hub",
+        "content": "Create a study room"
+      },
+      {
+        "kind": "button",
+        "id": "create_button",
+        "panel_key": "study_panel",
+        "label": "Create room",
+        "route": {
+          "kind": "static",
+          "key": "create_study_room"
+        }
+      },
+      {
+        "kind": "modal",
+        "id": "study_modal",
+        "key": "study_modal",
+        "title": "Create study room",
+        "fields": [
+          {
+            "key": "room_name",
+            "label": "Room name",
+            "style": "short",
+            "required": true
+          }
+        ]
+      }
+    ]
+  },
+  "studyroom_open_rule_plan": {
+    "requirements": [
+      {
+        "kind": "rule",
+        "id": "open_rule",
+        "key": "open_modal",
+        "trigger": {
+          "kind": "button_click",
+          "component": "create_study_room"
+        }
+      },
+      {
+        "kind": "action",
+        "id": "open_modal_action",
+        "rule_key": "open_modal",
+        "action": {
+          "kind": "open_modal",
+          "modal": "study_modal"
+        },
+        "minimum": 1
+      }
+    ]
+  },
+  "studyroom_resources_plan": {
+    "requirements": [
+      {
+        "kind": "rule",
+        "id": "submit_rule",
+        "key": "submit_room",
+        "trigger": {
+          "kind": "modal_submit",
+          "modal": "study_modal"
+        }
+      },
+      {
+        "kind": "action",
+        "id": "defer",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "defer_ephemeral"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "member_role",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "create_role",
+          "key": "member_role",
+          "name": "${input.room_name} members"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "room_channel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "create_channel",
+          "key": "room_channel",
+          "name": "study-${input.room_name}"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "deny_everyone_view",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "upsert_overwrite",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "target": {
+            "kind": "everyone"
+          },
+          "allow": [],
+          "deny": [
+            "view_channel"
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "allow_member_view",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "upsert_overwrite",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "target": {
+            "kind": "role",
+            "role": {
+              "kind": "created",
+              "name": "member_role"
+            }
+          },
+          "allow": [
+            "view_channel"
+          ],
+          "deny": []
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "grant_actor",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "grant_role",
+          "role": {
+            "kind": "created",
+            "name": "member_role"
+          },
+          "target": "actor"
+        },
+        "minimum": 1
+      }
+    ]
+  },
+  "studyroom_finalize_plan": {
+    "requirements": [
+      {
+        "kind": "action",
+        "id": "welcome_panel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "post_panel",
+          "key": "welcome_panel",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "content": "Welcome to ${input.room_name}",
+          "buttons": [
+            {
+              "label": "Help",
+              "route": {
+                "kind": "static",
+                "key": "study_help"
+              }
+            },
+            {
+              "label": "Close",
+              "route": {
+                "kind": "instance_action",
+                "instance": {
+                  "kind": "created",
+                  "name": "study_instance"
+                },
+                "action": "close"
+              }
+            }
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "hub_panel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "post_panel",
+          "key": "hub_panel",
+          "channel": {
+            "kind": "existing",
+            "name": "study_hub"
+          },
+          "content": "${input.room_name} is open",
+          "buttons": [
+            {
+              "label": "Join",
+              "route": {
+                "kind": "instance_action",
+                "instance": {
+                  "kind": "created",
+                  "name": "study_instance"
+                },
+                "action": "join"
+              }
+            }
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "study_instance",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "register_instance",
+          "key": "study_instance",
+          "instance_kind": "study_room",
+          "resources": {
+            "roles": [
+              {
+                "alias": "member_role",
+                "created": "member_role"
+              }
+            ],
+            "channels": [
+              {
+                "alias": "room_channel",
+                "created": "room_channel"
+              }
+            ],
+            "messages": [
+              {
+                "alias": "welcome_panel",
+                "created": "welcome_panel"
+              },
+              {
+                "alias": "hub_panel",
+                "created": "hub_panel"
+              }
+            ]
+          }
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "edit_response",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "edit_response",
+          "content": "Created ${input.room_name}"
+        },
+        "minimum": 1
+      }
+    ]
+  },
+  "studyroom_full_plan": {
+    "requirements": [
+      {
+        "kind": "panel",
+        "id": "study_panel",
+        "key": "study_panel",
+        "channel": "study_hub",
+        "content": "Create a study room"
+      },
+      {
+        "kind": "button",
+        "id": "create_button",
+        "panel_key": "study_panel",
+        "label": "Create room",
+        "route": {
+          "kind": "static",
+          "key": "create_study_room"
+        }
+      },
+      {
+        "kind": "modal",
+        "id": "study_modal",
+        "key": "study_modal",
+        "title": "Create study room",
+        "fields": [
+          {
+            "key": "room_name",
+            "label": "Room name",
+            "style": "short",
+            "required": true
+          }
+        ]
+      },
+      {
+        "kind": "rule",
+        "id": "open_rule",
+        "key": "open_modal",
+        "trigger": {
+          "kind": "button_click",
+          "component": "create_study_room"
+        }
+      },
+      {
+        "kind": "action",
+        "id": "open_modal_action",
+        "rule_key": "open_modal",
+        "action": {
+          "kind": "open_modal",
+          "modal": "study_modal"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "rule",
+        "id": "submit_rule",
+        "key": "submit_room",
+        "trigger": {
+          "kind": "modal_submit",
+          "modal": "study_modal"
+        }
+      },
+      {
+        "kind": "action",
+        "id": "defer",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "defer_ephemeral"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "member_role",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "create_role",
+          "key": "member_role",
+          "name": "${input.room_name} members"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "room_channel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "create_channel",
+          "key": "room_channel",
+          "name": "study-${input.room_name}"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "deny_everyone_view",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "upsert_overwrite",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "target": {
+            "kind": "everyone"
+          },
+          "allow": [],
+          "deny": [
+            "view_channel"
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "allow_member_view",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "upsert_overwrite",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "target": {
+            "kind": "role",
+            "role": {
+              "kind": "created",
+              "name": "member_role"
+            }
+          },
+          "allow": [
+            "view_channel"
+          ],
+          "deny": []
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "grant_actor",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "grant_role",
+          "role": {
+            "kind": "created",
+            "name": "member_role"
+          },
+          "target": "actor"
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "welcome_panel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "post_panel",
+          "key": "welcome_panel",
+          "channel": {
+            "kind": "created",
+            "name": "room_channel"
+          },
+          "content": "Welcome to ${input.room_name}",
+          "buttons": [
+            {
+              "label": "Help",
+              "route": {
+                "kind": "static",
+                "key": "study_help"
+              }
+            },
+            {
+              "label": "Close",
+              "route": {
+                "kind": "instance_action",
+                "instance": {
+                  "kind": "created",
+                  "name": "study_instance"
+                },
+                "action": "close"
+              }
+            }
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "hub_panel",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "post_panel",
+          "key": "hub_panel",
+          "channel": {
+            "kind": "existing",
+            "name": "study_hub"
+          },
+          "content": "${input.room_name} is open",
+          "buttons": [
+            {
+              "label": "Join",
+              "route": {
+                "kind": "instance_action",
+                "instance": {
+                  "kind": "created",
+                  "name": "study_instance"
+                },
+                "action": "join"
+              }
+            }
+          ]
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "study_instance",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "register_instance",
+          "key": "study_instance",
+          "instance_kind": "study_room",
+          "resources": {
+            "roles": [
+              {
+                "alias": "member_role",
+                "created": "member_role"
+              }
+            ],
+            "channels": [
+              {
+                "alias": "room_channel",
+                "created": "room_channel"
+              }
+            ],
+            "messages": [
+              {
+                "alias": "welcome_panel",
+                "created": "welcome_panel"
+              },
+              {
+                "alias": "hub_panel",
+                "created": "hub_panel"
+              }
+            ]
+          }
+        },
+        "minimum": 1
+      },
+      {
+        "kind": "action",
+        "id": "edit_response",
+        "rule_key": "submit_room",
+        "action": {
+          "kind": "edit_response",
+          "content": "Created ${input.room_name}"
+        },
+        "minimum": 1
+      }
+    ]
+  }
+}

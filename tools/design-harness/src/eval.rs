@@ -16,6 +16,10 @@ pub struct TurnReportInput<'a> {
     pub observability_after: &'a Observability,
     pub outcome: &'a BurstOutcome,
     pub elapsed: Duration,
+    pub injected_control_calls_before: usize,
+    pub injected_control_calls_after: usize,
+    pub delegated_model_calls_before: usize,
+    pub delegated_model_calls_after: usize,
 }
 
 pub fn turn_report(input: TurnReportInput<'_>) -> Value {
@@ -36,11 +40,21 @@ pub fn turn_report(input: TurnReportInput<'_>) -> Value {
         "draft_after": draft_state(input.after),
         "actual_gates": actual_gates(input.after),
         "observability_delta": observability_delta(input.observability_before, input.observability_after),
+        "injected_control_calls": input.injected_control_calls_after.saturating_sub(input.injected_control_calls_before),
+        "delegated_model_calls": input.delegated_model_calls_after.saturating_sub(input.delegated_model_calls_before),
         "elapsed_ms": input.elapsed.as_millis()
     })
 }
 
-pub async fn report<C>(session: &DesignSession<C>, turns: Vec<Value>, elapsed: Duration) -> Value {
+pub async fn report<C>(
+    session: &DesignSession<C>,
+    turns: Vec<Value>,
+    elapsed: Duration,
+    input_schema_version: u32,
+    mode: &str,
+    injected_control_calls: usize,
+    delegated_model_calls: usize,
+) -> Value {
     let draft = session.draft();
     let mut checked_draft = draft.clone();
     let final_validation = validate_draft(&mut checked_draft);
@@ -59,6 +73,8 @@ pub async fn report<C>(session: &DesignSession<C>, turns: Vec<Value>, elapsed: D
 
     json!({
         "schema_version": 2,
+        "input_schema_version": input_schema_version,
+        "mode": mode,
         "outcome": terminal.and_then(|turn| turn.get("outcome")).cloned().unwrap_or(Value::Null),
         "completed": terminal.and_then(|turn| turn.get("completed")).and_then(Value::as_bool).unwrap_or(false),
         "message": terminal.and_then(|turn| turn.get("message")).cloned().unwrap_or(Value::Null),
@@ -70,6 +86,8 @@ pub async fn report<C>(session: &DesignSession<C>, turns: Vec<Value>, elapsed: D
         "ruleset": &draft.ruleset,
         "actual_gates": actual_gates(draft),
         "observability": session.observability(),
+        "injected_control_calls": injected_control_calls,
+        "delegated_model_calls": delegated_model_calls,
         "postcheck": {
             "validate_passed": final_validation.is_ok(),
             "validate_error": failure(&final_validation),
@@ -186,7 +204,15 @@ fn observability_delta(before: &Observability, after: &Observability) -> Value {
         "repair_successes": after.repair_successes.saturating_sub(before.repair_successes),
         "repair_failures": after.repair_failures.saturating_sub(before.repair_failures),
         "repair_escalations": after.repair_escalations.saturating_sub(before.repair_escalations),
-        "nudge_count": after.nudge_count.saturating_sub(before.nudge_count)
+        "nudge_count": after.nudge_count.saturating_sub(before.nudge_count),
+        "plan_submissions": after.plan_submissions.saturating_sub(before.plan_submissions),
+        "plan_acceptances": after.plan_acceptances.saturating_sub(before.plan_acceptances),
+        "planned_requirements": after.planned_requirements.saturating_sub(before.planned_requirements),
+        "plan_compiled_tool_calls": after.plan_compiled_tool_calls.saturating_sub(before.plan_compiled_tool_calls),
+        "plan_execution_failures": after.plan_execution_failures.saturating_sub(before.plan_execution_failures),
+        "plan_rollbacks": after.plan_rollbacks.saturating_sub(before.plan_rollbacks),
+        "plan_commits": after.plan_commits.saturating_sub(before.plan_commits),
+        "plan_conflicts": after.plan_conflicts.saturating_sub(before.plan_conflicts)
     })
 }
 
@@ -219,15 +245,32 @@ mod tests {
             observability_after: session.observability(),
             outcome: &outcome,
             elapsed: Duration::from_millis(7),
+            injected_control_calls_before: 0,
+            injected_control_calls_after: 0,
+            delegated_model_calls_before: 0,
+            delegated_model_calls_after: 0,
         });
 
-        let document = report(&session, vec![turn], Duration::from_millis(17)).await;
+        let document = report(
+            &session,
+            vec![turn],
+            Duration::from_millis(17),
+            1,
+            "adaptive",
+            0,
+            0,
+        )
+        .await;
 
         assert_eq!(document["schema_version"], 2);
         assert_eq!(document["outcome"], "needs_input");
         assert_eq!(document["turns"][0]["question"], "Need a name?");
         assert_eq!(document["turns"][0]["elapsed_ms"], 7);
         assert_eq!(document["elapsed_ms"], 17);
+        assert_eq!(document["input_schema_version"], 1);
+        assert_eq!(document["mode"], "adaptive");
+        assert_eq!(document["injected_control_calls"], 0);
+        assert_eq!(document["delegated_model_calls"], 0);
         assert!(document["postcheck"]["validate_passed"].is_boolean());
         assert!(document["postcheck"]["simulate_passed"].is_boolean());
         assert_eq!(document["actual_gates"]["validation_current"], false);
@@ -262,6 +305,10 @@ mod tests {
             observability_after: &after_observability,
             outcome: &outcome,
             elapsed: Duration::from_millis(11),
+            injected_control_calls_before: 1,
+            injected_control_calls_after: 2,
+            delegated_model_calls_before: 7,
+            delegated_model_calls_after: 7,
         });
 
         assert_eq!(document["draft_revision_before"], 0);
@@ -269,6 +316,10 @@ mod tests {
         assert_eq!(document["draft_changed"], true);
         assert_eq!(document["observability_delta"]["model_calls"], 2);
         assert_eq!(document["observability_delta"]["tool_calls"], 4);
+        assert_eq!(document["injected_control_calls"], 1);
+        assert_eq!(document["delegated_model_calls"], 0);
+        assert_eq!(document["observability_delta"]["plan_submissions"], 0);
+        assert_eq!(document["observability_delta"]["plan_commits"], 0);
         assert_eq!(
             document["observability_delta"]["distinct_mutation_tools"][0],
             "add_modal"
