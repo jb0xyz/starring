@@ -587,7 +587,7 @@
         "turns": [
           {
             "id": "redact-copy",
-            "input": "Design a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. This is design-only; do not deploy it or expose any actual secret."
+            "input": "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Produce the working design now, but do not deploy it or expose any actual secret."
           }
         ]
       }

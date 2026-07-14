@@ -85,6 +85,9 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
         "other_unmapped_required_capabilities=[], validation_gate=enforce, preview_gate=enforce, approval_gate=enforce"
     ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
+        "external settlement lease means other_unmapped_required_capabilities=[external settlement lease]"
+    ));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
