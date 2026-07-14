@@ -5,29 +5,33 @@ use serde::Serialize;
 
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, ToolCall};
-use crate::turn::{resolve_intent_decision_frontier, route_intent_turn_frontier};
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
 
-#[allow(dead_code)]
 mod adjudicate;
 #[cfg(test)]
 mod adjudicate_tests;
 mod decision;
 mod execute;
+mod frontier;
 mod state;
+mod state_binding;
 #[cfg(test)]
 mod tests;
 
 pub use decision::{
     IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
-    INTENT_ADJUDICATOR_VERSION_V2,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V2,
 };
 use execute::IntentTurnSuccess;
+use frontier::IntentFrontierV2;
 pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;
 use state::{intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_STATE_PREFIX};
-pub(super) use state::{validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT};
+pub(super) use state::{
+    validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT, INTENT_RECIPE_SYSTEM_PROMPT_V1,
+    INTENT_RECIPE_SYSTEM_PROMPT_V2,
+};
 pub use state::{
     IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
 };
@@ -96,6 +100,12 @@ impl<C> DesignSession<C> {
             .map(|runtime| runtime.snapshot.context_fingerprint.as_str())
     }
 
+    pub fn intent_recipe_route_decision(&self) -> Option<&IntentRouteDecisionV2> {
+        self.intent_recipe
+            .as_ref()
+            .and_then(IntentRecipeRuntime::route_decision)
+    }
+
     pub fn intent_recipe_status(&self) -> Option<IntentRecipeStatusV1> {
         let runtime = self.intent_recipe.as_ref()?;
         Some(match &runtime.snapshot.stage {
@@ -106,6 +116,7 @@ impl<C> DesignSession<C> {
                 root_draft_revision,
                 workspace,
                 active_decision,
+                ..
             } => IntentRecipeStatusV1::AwaitingDecision {
                 root_draft_revision: *root_draft_revision,
                 workspace_revision: workspace.revision,
@@ -137,15 +148,18 @@ impl<C> DesignSession<C> {
         })
     }
 
-    fn intent_frontier(&self) -> Vec<crate::tools::ToolDefinition> {
-        match self
-            .intent_recipe
+    fn intent_frontier(&self) -> Result<IntentFrontierV2, StructuredError> {
+        self.intent_recipe
             .as_ref()
-            .map(IntentRecipeRuntime::expected_tool)
-        {
-            Some("resolve_intent_decision") => resolve_intent_decision_frontier().into(),
-            _ => route_intent_turn_frontier().into(),
-        }
+            .map(IntentRecipeRuntime::frontier)
+            .ok_or_else(|| {
+                intent_error(
+                    "INTENT_SESSION_DISABLED",
+                    "intent.session",
+                    "Intent recipe mode is not enabled",
+                    "Construct the session with resource bindings",
+                )
+            })
     }
 
     fn append_intent_state_anchor(&mut self) -> Result<(), StructuredError> {
@@ -209,7 +223,7 @@ impl<C> DesignSession<C> {
                 self.needs_input(question)
             }
             IntentTurnSuccess::Ready { summary, .. } => self.ready(summary),
-            IntentTurnSuccess::Routed(fallback) => self.routed(fallback),
+            IntentTurnSuccess::Routed { fallback, decision } => self.routed(fallback, decision),
         }
     }
 
@@ -273,7 +287,11 @@ impl<C: LlmClient> DesignSession<C> {
         if let Err(error) = self.append_intent_state_anchor() {
             return self.fail_intent(error);
         }
-        let tools = self.intent_frontier();
+        let frontier = match self.intent_frontier() {
+            Ok(frontier) => frontier,
+            Err(error) => return self.fail_intent(error),
+        };
+        let tools = frontier.tools();
         let Some(messages) = self.fit_intent_context(&tools) else {
             return self.fail_intent_with_limit(
                 intent_error(
@@ -285,11 +303,7 @@ impl<C: LlmClient> DesignSession<C> {
                 LimitKind::ContextChars,
             );
         };
-        let expected_tool = self
-            .intent_recipe
-            .as_ref()
-            .map(IntentRecipeRuntime::expected_tool)
-            .unwrap_or("route_intent_turn");
+        let expected_tool = frontier.name();
         self.record_model_call();
         let response = match self.client.complete(&messages, &tools).await {
             Ok(response) => response,
@@ -316,25 +330,6 @@ impl<C: LlmClient> DesignSession<C> {
             LlmResponse::ToolCalls(calls) => calls,
         };
         if calls.len() != 1 || !valid_tool_call_ids(&calls) {
-            if valid_tool_call_ids(&calls) && !calls.is_empty() {
-                self.messages
-                    .push(Message::assistant_tool_calls(calls.clone()));
-                let error = intent_error(
-                    "INTENT_FRONTIER_VIOLATION",
-                    "intent.response",
-                    format!(
-                        "The model returned {} tool calls instead of exactly one {expected_tool}",
-                        calls.len()
-                    ),
-                    format!("Call exactly one {expected_tool} tool"),
-                );
-                let result = ToolResult::failure_from(&self.draft, error.clone()).as_json();
-                for call in &calls {
-                    self.messages.push(Message::tool(&call.id, result.clone()));
-                }
-                self.record_intent_extraction_failure();
-                return self.fail_intent(error);
-            }
             self.messages.push(Message::assistant(format!(
                 "INTENT_RESPONSE_REJECTED: expected exactly one {expected_tool} call with a non-empty unique identifier"
             )));
@@ -342,13 +337,14 @@ impl<C: LlmClient> DesignSession<C> {
             return self.fail_intent(intent_error(
                 "INTENT_FRONTIER_VIOLATION",
                 "intent.response",
-                format!("The model did not return one valid {expected_tool} call"),
+                format!(
+                    "The model returned {} calls instead of one valid {expected_tool} call",
+                    calls.len()
+                ),
                 format!("Call exactly one {expected_tool} tool with a non-empty identifier"),
             ));
         }
         let call = calls.into_iter().next().expect("single call was checked");
-        self.messages
-            .push(Message::assistant_tool_calls(vec![call.clone()]));
         if call.name != expected_tool {
             let error = intent_error(
                 "INTENT_FRONTIER_VIOLATION",
@@ -359,11 +355,15 @@ impl<C: LlmClient> DesignSession<C> {
                 ),
                 format!("Call exactly one {expected_tool} tool"),
             );
-            let result = ToolResult::failure_from(&self.draft, error.clone());
-            self.messages.push(Message::tool(call.id, result.as_json()));
+            self.messages.push(Message::assistant(format!(
+                "INTENT_RESPONSE_REJECTED: expected {expected_tool}, received {}",
+                call.name
+            )));
             self.record_intent_extraction_failure();
             return self.fail_intent(error);
         }
+        self.messages
+            .push(Message::assistant_tool_calls(vec![call.clone()]));
         if self.turn_tool_calls() >= self.config.max_tool_calls {
             let error = intent_error(
                 "TOOL_CALL_LIMIT_EXHAUSTED",
@@ -376,9 +376,11 @@ impl<C: LlmClient> DesignSession<C> {
             return self.fail_intent_with_limit(error, LimitKind::ToolCalls);
         }
         self.record_tool_call();
-        let result = match expected_tool {
-            "resolve_intent_decision" => self.execute_intent_resolution(&call.arguments).await,
-            _ => self.execute_intent_route(&call.arguments).await,
+        let result = match frontier {
+            IntentFrontierV2::Interpret => {
+                self.execute_intent_interpretation(&call.arguments).await
+            }
+            IntentFrontierV2::Resolve => self.execute_intent_resolution(&call.arguments).await,
         };
         match result {
             Ok(success) => {

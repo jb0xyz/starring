@@ -1,6 +1,7 @@
 use crate::errors::StructuredError;
 use crate::intent::{
-    assess_intent_capabilities_v2, ClosePolicyV1, IntentCapabilityAssessmentV2,
+    assess_intent_capabilities_v2, intent_capability_manifest_digest_v2,
+    intent_capability_manifest_v2, ClosePolicyV1, IntentCapabilityAssessmentV2,
     IntentCapabilityIdV2, IntentCapabilityRequirementV2, IntentLocaleV1, IntentRequestedOutcome,
     IntentRequirementEvidenceV2, IntentResolutionContext, IntentSafetyBoundaryIdV2,
     IntentSafetyBoundaryRequestV2, PreparedIntentWorkspaceV1, PrivateStudyRoomControlsProposalV1,
@@ -38,6 +39,7 @@ pub(super) struct PrivateStudyRoomPermitV2 {
 }
 
 impl PrivateStudyRoomPermitV2 {
+    #[cfg(test)]
     pub(super) fn decision(&self) -> &IntentRouteDecisionV2 {
         &self.decision
     }
@@ -59,18 +61,22 @@ pub(super) struct TypedPlannerPermitV2 {
 }
 
 impl TypedPlannerPermitV2 {
+    #[cfg(test)]
     pub(super) fn objective(&self) -> &str {
         &self.objective
     }
 
+    #[cfg(test)]
     pub(super) fn requested_outcome(&self) -> IntentRequestedOutcome {
         self.requested_outcome
     }
 
+    #[cfg(test)]
     pub(super) fn decision(&self) -> &IntentRouteDecisionV2 {
         &self.decision
     }
 
+    #[cfg(test)]
     pub(super) fn response(&self) -> &str {
         &self.response
     }
@@ -98,12 +104,9 @@ pub(super) struct TerminalIntentPermitV2 {
 }
 
 impl TerminalIntentPermitV2 {
+    #[cfg(test)]
     pub(super) fn decision(&self) -> &IntentRouteDecisionV2 {
         &self.decision
-    }
-
-    pub(super) fn response(&self) -> &str {
-        &self.response
     }
 
     pub(super) fn into_parts(self) -> (IntentRouteDecisionV2, String) {
@@ -418,6 +421,67 @@ fn validate_decision_shape(
         "The deterministic route decision has an impossible combination of findings and target",
         "Construct the decision through the route-specific adjudicator branch",
     ))
+}
+
+pub(super) fn validate_persisted_private_study_room_decision_v2(
+    decision: &IntentRouteDecisionV2,
+) -> Result<(), StructuredError> {
+    let manifest = intent_capability_manifest_v2();
+    let manifest_digest = intent_capability_manifest_digest_v2(&manifest)?;
+    validate_decision_shape(
+        decision.kind(),
+        decision.blockers(),
+        decision.boundary_violations(),
+        decision.unclassified_requirements(),
+        decision.route_target(),
+    )?;
+    let digests_are_hex = [
+        decision.semantic_ir_digest(),
+        decision.manifest_digest(),
+        decision.adjudication_digest(),
+    ]
+    .into_iter()
+    .all(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    });
+    if decision.kind() != IntentRouteDecisionKindV2::PrivateStudyRoom
+        || decision.decision_source() != IntentDecisionSourceV2::DeterministicIntentAdjudicator
+        || decision.adjudicator_version() != INTENT_ADJUDICATOR_VERSION_V2
+        || decision.manifest_version() != manifest.version
+        || decision.manifest_digest() != manifest_digest
+        || !digests_are_hex
+    {
+        return Err(adjudication_error(
+            "INVALID_PERSISTED_INTENT_DECISION",
+            "intent.adjudication",
+            "The persisted private study-room decision does not match the current deterministic contract",
+            "Restart the intent with the current protocol and capability manifest",
+        ));
+    }
+    let expected_digest = adjudication_digest_v2(AdjudicationDigestInputV2 {
+        decision_source: decision.decision_source().as_str(),
+        adjudicator_version: decision.adjudicator_version(),
+        kind: decision.kind().as_str(),
+        semantic_ir_digest: decision.semantic_ir_digest(),
+        manifest_version: decision.manifest_version(),
+        manifest_digest: decision.manifest_digest(),
+        blockers: decision.blockers(),
+        boundary_violations: decision.boundary_violations(),
+        unclassified_requirements: decision.unclassified_requirements(),
+        route_target: decision.route_target(),
+    })?;
+    if decision.adjudication_digest() != expected_digest {
+        return Err(adjudication_error(
+            "INVALID_PERSISTED_INTENT_DECISION_DIGEST",
+            "intent.adjudication.adjudication_digest",
+            "The persisted adjudication digest does not match its canonical decision fields",
+            "Discard the tampered snapshot and resume from a trusted intent decision",
+        ));
+    }
+    Ok(())
 }
 
 fn private_study_room_proposal(

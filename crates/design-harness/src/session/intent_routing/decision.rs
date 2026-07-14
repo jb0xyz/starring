@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::intent::{IntentCapabilityBlockerV2, IntentSafetyBoundaryViolationV2};
 
 pub const INTENT_ADJUDICATOR_VERSION_V2: u16 = 1;
+pub const INTENT_RECIPE_PROTOCOL_VERSION_V2: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

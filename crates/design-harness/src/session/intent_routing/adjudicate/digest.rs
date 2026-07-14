@@ -14,10 +14,9 @@ use crate::turn::{
     TimerRequirementV2,
 };
 
-use super::super::decision::PinnedIntentRecipeV2;
+use super::super::decision::{PinnedIntentRecipeV2, INTENT_RECIPE_PROTOCOL_VERSION_V2};
 use super::adjudication_error;
 
-const INTENT_RECIPE_PROTOCOL_VERSION_V2: u16 = 2;
 const SEMANTIC_IR_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.semantic_ir.v2\0";
 const ADJUDICATION_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.adjudication.v2\0";
 

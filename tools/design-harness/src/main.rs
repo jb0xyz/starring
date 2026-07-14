@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 write_draft(&mut output, &session.draft().summary()).await?;
                 write_observability(&mut output, session.observability()).await?;
             }
-            BurstOutcome::Routed { fallback } => {
+            BurstOutcome::Routed { fallback, .. } => {
                 write_line(&mut output, &format!("assistant> {}", fallback.response())).await?;
             }
             BurstOutcome::Halted(report) => {
@@ -1701,16 +1701,27 @@ mod tests {
     async fn intent_eval_restarts_without_oracle_and_reports_public_receipt() {
         let responses = VecDeque::from([
             LlmResponse::ToolCalls(vec![ToolCall {
-                id: "route".to_string(),
-                name: "route_intent_turn".to_string(),
+                id: "interpret".to_string(),
+                name: "interpret_intent_turn".to_string(),
                 arguments: json!({
                     "expected_revision": 0,
-                    "route": "private_study_room",
-                    "proposal": {
-                        "objective": "Create managed private study rooms",
-                        "requested_outcome": "validated_preview",
-                        "locale": "en"
-                    }
+                    "request_mode": "build",
+                    "automation_kind": "managed_private_study_room",
+                    "objective": "Create managed private study rooms",
+                    "requested_outcome": "validated_preview",
+                    "hub_channel": null,
+                    "locale": "en",
+                    "close_authorization": "disabled",
+                    "runtime_requirements": {
+                        "persistence": "none",
+                        "timers": "none",
+                        "economy": "none",
+                        "event_time_llm": false
+                    },
+                    "boundary_requests": [],
+                    "unclassified_requirements": [],
+                    "response": "",
+                    "response_locale": "en"
                 })
                 .to_string(),
             }]),
@@ -1793,7 +1804,7 @@ mod tests {
         assert_eq!(
             probe.calls.lock().unwrap().clone(),
             vec![
-                vec!["route_intent_turn".to_string()],
+                vec!["interpret_intent_turn".to_string()],
                 vec!["resolve_intent_decision".to_string()]
             ]
         );

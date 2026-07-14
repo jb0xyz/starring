@@ -18,6 +18,7 @@ pub use intent_interpretation::{
     PrivateStudyRoomControlsInterpretationV2, RuntimeRequirementsV2, TimerRequirementV2,
     INTERPRET_INTENT_TURN,
 };
+pub(crate) use intent_protocol::RESOLVE_INTENT_DECISION;
 pub use intent_protocol::{
     parse_resolve_intent_decision, parse_route_intent_turn, resolve_intent_decision_frontier,
     route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,

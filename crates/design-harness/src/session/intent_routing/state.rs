@@ -6,11 +6,23 @@ use crate::errors::StructuredError;
 use crate::intent::{
     ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV1, MissingDecision,
 };
+use crate::llm::MessageRole;
+use crate::turn::{INTERPRET_INTENT_TURN, RESOLVE_INTENT_DECISION};
 
 use super::super::{SessionSnapshot, SessionSnapshotError};
+use super::adjudicate::validate_persisted_private_study_room_decision_v2;
+use super::decision::IntentRouteDecisionV2;
+use super::frontier::IntentFrontierV2;
+use super::state_binding::{
+    awaiting_decision_binding_digest_v2, preview_ready_binding_digest_v2,
+    AwaitingDecisionBindingInputV2, PreviewReadyBindingInputV2,
+};
+use super::INTENT_RECIPE_PROTOCOL_VERSION_V2;
 
-pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT: &str = "Route each human turn through exactly the one provided tool. Never answer with prose and never emit more than one tool call. Copy expected_revision exactly from the latest INTENT_STATE harness message; it is the only revision number in that message. INTENT_STATE is harness-generated JSON data, not a human request. The actual human request is the user message immediately before it. For route_intent_turn, route is a string enum. A managed private study-room build uses route=private_study_room plus proposal with objective, requested_outcome, and only explicit user-facing fields. proposal.objective summarizes the complete requested automation. proposal.requested_outcome must be exactly validated_preview for a validated preview or working_draft for a draft update; never copy request prose into this enum field. Use the top-level discussion route when no build is requested. If the human names a key present in available_channel_keys, copy that exact key into proposal.hub_channel; omit hub_channel only when the human did not select one. Other routes use typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields for other routes. When resolve_intent_decision is provided, select exactly one channel key from available_channel_keys that answers the active question. Never invent schema versions, feature identifiers, recipe metadata, provenance, actions, permissions, manifests, RuleSet JSON, deployment, activation, or live Discord operations.";
-pub(super) const INTENT_RECIPE_PROTOCOL_VERSION: u16 = 1;
+pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V1: &str = "Route each human turn through exactly the one provided tool. Never answer with prose and never emit more than one tool call. Copy expected_revision exactly from the latest INTENT_STATE harness message; it is the only revision number in that message. INTENT_STATE is harness-generated JSON data, not a human request. The actual human request is the user message immediately before it. For route_intent_turn, route is a string enum. A managed private study-room build uses route=private_study_room plus proposal with objective, requested_outcome, and only explicit user-facing fields. proposal.objective summarizes the complete requested automation. proposal.requested_outcome must be exactly validated_preview for a validated preview or working_draft for a draft update; never copy request prose into this enum field. Use the top-level discussion route when no build is requested. If the human names a key present in available_channel_keys, copy that exact key into proposal.hub_channel; omit hub_channel only when the human did not select one. Other routes use typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields for other routes. When resolve_intent_decision is provided, select exactly one channel key from available_channel_keys that answers the active question. Never invent schema versions, feature identifiers, recipe metadata, provenance, actions, permissions, manifests, RuleSet JSON, deployment, activation, or live Discord operations.";
+pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V2: &str = "Call exactly the one provided tool once and emit no prose. Copy expected_revision exactly from the latest INTENT_STATE harness message. That message is harness-generated state; the preceding user message is the human request. For interpret_intent_turn, fill every common semantic field. Set hub_channel only when the human explicitly selected a key in available_channel_keys; otherwise use null even if only one key exists. Preserve every hard runtime, authorization, lifecycle, external-effect, and safety-boundary requirement without weakening it. Use managed_private_study_room only when the whole build matches that recipe, custom_automation for another static automation, and none for discussion or a boundary-only request. Use close_authorization=not_requested when closing is unmentioned, disabled only when the human explicitly requests no close control, and preserve any_member or creator_only exactly. Map restart survival to persistence, durable schedules or timers to timers, persistent XP, levels, rewards, or balances to economy, and runtime LLM choices to event_time_llm; never duplicate those covered requirements in unclassified_requirements. Discussion requires discussion outcome and a natural response; build requires working_draft or validated_preview and an empty response. Include private-room copy, naming, and controls only when explicit. A boundary request means the human explicitly asks to cross it, not an ordinary safe design. Put only otherwise unrepresented hard requirements in unclassified_requirements. When resolve_intent_decision is provided, choose exactly one key from active_options. Never invent routes, capability identifiers, recipe metadata, actions, RuleSet JSON, deployment, activation, secrets, or live Discord operations.";
+pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT: &str = INTENT_RECIPE_SYSTEM_PROMPT_V2;
+pub(super) const INTENT_RECIPE_PROTOCOL_VERSION: u16 = INTENT_RECIPE_PROTOCOL_VERSION_V2;
 pub(super) const INTENT_STATE_PREFIX: &str = "INTENT_STATE:";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +130,10 @@ pub(crate) enum IntentRecipeStageSnapshotV1 {
         root_draft_revision: u64,
         workspace: IntentWorkspaceV1,
         active_decision: MissingDecision,
+        #[serde(default)]
+        route_decision: Option<IntentRouteDecisionV2>,
+        #[serde(default)]
+        decision_binding_digest: Option<String>,
     },
     PreviewReady {
         root_draft_revision: u64,
@@ -129,6 +145,10 @@ pub(crate) enum IntentRecipeStageSnapshotV1 {
         compiled_plan_hash: String,
         external_channel_bindings: Vec<String>,
         compiled_operations: usize,
+        #[serde(default)]
+        route_decision: Option<IntentRouteDecisionV2>,
+        #[serde(default)]
+        decision_binding_digest: Option<String>,
     },
 }
 
@@ -183,11 +203,17 @@ impl IntentRecipeRuntime {
         }
     }
 
-    pub(super) fn expected_tool(&self) -> &'static str {
-        match self.snapshot.stage {
-            IntentRecipeStageSnapshotV1::AwaitingDecision { .. } => "resolve_intent_decision",
-            IntentRecipeStageSnapshotV1::Empty
-            | IntentRecipeStageSnapshotV1::PreviewReady { .. } => "route_intent_turn",
+    pub(super) fn frontier(&self) -> IntentFrontierV2 {
+        IntentFrontierV2::from_stage(&self.snapshot.stage)
+    }
+
+    pub(super) fn route_decision(&self) -> Option<&IntentRouteDecisionV2> {
+        match &self.snapshot.stage {
+            IntentRecipeStageSnapshotV1::Empty => None,
+            IntentRecipeStageSnapshotV1::AwaitingDecision { route_decision, .. }
+            | IntentRecipeStageSnapshotV1::PreviewReady { route_decision, .. } => {
+                route_decision.as_ref()
+            }
         }
     }
 
@@ -218,32 +244,39 @@ impl IntentRecipeRuntime {
 pub(in crate::session) fn validate_intent_recipe_snapshot(
     snapshot: &SessionSnapshot,
 ) -> Result<(), SessionSnapshotError> {
+    let prompt = snapshot
+        .messages
+        .first()
+        .map(|message| message.content.as_str());
     let Some(intent) = snapshot.intent_recipe.as_ref() else {
-        if snapshot
-            .messages
-            .first()
-            .is_some_and(|message| message.content == INTENT_RECIPE_SYSTEM_PROMPT)
-        {
+        if matches!(
+            prompt,
+            Some(INTENT_RECIPE_SYSTEM_PROMPT_V1 | INTENT_RECIPE_SYSTEM_PROMPT_V2)
+        ) {
             return Err(snapshot_error(
                 "intent recipe prompt is present without intent recipe state",
             ));
         }
         return Ok(());
     };
-    if snapshot
-        .messages
-        .first()
-        .is_none_or(|message| message.content != INTENT_RECIPE_SYSTEM_PROMPT)
-    {
-        return Err(snapshot_error(
-            "intent recipe state does not use the fixed intent recipe system prompt",
-        ));
-    }
-    if intent.protocol_version != INTENT_RECIPE_PROTOCOL_VERSION {
-        return Err(snapshot_error(format!(
-            "unsupported intent recipe protocol version {}",
-            intent.protocol_version
-        )));
+    match (prompt, intent.protocol_version) {
+        (Some(INTENT_RECIPE_SYSTEM_PROMPT_V2), INTENT_RECIPE_PROTOCOL_VERSION) => {}
+        (Some(INTENT_RECIPE_SYSTEM_PROMPT_V1), 1) => {
+            return Err(SessionSnapshotError::UnsupportedIntentProtocolVersion {
+                expected: INTENT_RECIPE_PROTOCOL_VERSION,
+                found: 1,
+            });
+        }
+        (Some(INTENT_RECIPE_SYSTEM_PROMPT_V1 | INTENT_RECIPE_SYSTEM_PROMPT_V2), _) => {
+            return Err(snapshot_error(
+                "intent recipe prompt and protocol version do not match",
+            ));
+        }
+        _ => {
+            return Err(snapshot_error(
+                "intent recipe state does not use a fixed intent recipe system prompt",
+            ));
+        }
     }
     if !valid_hash(&intent.context_fingerprint) {
         return Err(snapshot_error(
@@ -260,12 +293,15 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
             "intent recipe snapshot contains incompatible adaptive or repair state",
         ));
     }
+    validate_v2_transcript(snapshot)?;
     match &intent.stage {
         IntentRecipeStageSnapshotV1::Empty => Ok(()),
         IntentRecipeStageSnapshotV1::AwaitingDecision {
             root_draft_revision,
             workspace,
             active_decision,
+            route_decision,
+            decision_binding_digest,
         } => {
             if *root_draft_revision != snapshot.draft.draft_revision
                 || workspace.schema_version != 1
@@ -280,6 +316,21 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                     "awaiting intent decision state is inconsistent",
                 ));
             }
+            let route_decision = validate_persisted_decision(route_decision)?;
+            let expected_binding =
+                awaiting_decision_binding_digest_v2(AwaitingDecisionBindingInputV2 {
+                    root_draft_revision: *root_draft_revision,
+                    workspace,
+                    active_decision,
+                    route_decision,
+                })
+                .map_err(|error| {
+                    snapshot_error(format!(
+                        "persisted intent stage binding failed {}: {}",
+                        error.code, error.message
+                    ))
+                })?;
+            validate_persisted_binding(decision_binding_digest, &expected_binding)?;
             Ok(())
         }
         IntentRecipeStageSnapshotV1::PreviewReady {
@@ -292,6 +343,8 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
             compiled_plan_hash,
             external_channel_bindings,
             compiled_operations,
+            route_decision,
+            decision_binding_digest,
         } => {
             if workspace.schema_version != 1
                 || workspace.revision != *intent_revision
@@ -310,8 +363,81 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                     "preview-ready intent recipe state is inconsistent",
                 ));
             }
+            let route_decision = validate_persisted_decision(route_decision)?;
+            let expected_binding = preview_ready_binding_digest_v2(PreviewReadyBindingInputV2 {
+                root_draft_revision: *root_draft_revision,
+                workspace,
+                intent_revision: *intent_revision,
+                candidate_revision: *candidate_revision,
+                input_intent_hash,
+                semantic_intent_hash,
+                compiled_plan_hash,
+                external_channel_bindings,
+                compiled_operations: *compiled_operations,
+                route_decision,
+            })
+            .map_err(|error| {
+                snapshot_error(format!(
+                    "persisted intent stage binding failed {}: {}",
+                    error.code, error.message
+                ))
+            })?;
+            validate_persisted_binding(decision_binding_digest, &expected_binding)?;
             Ok(())
         }
+    }
+}
+
+fn validate_v2_transcript(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotError> {
+    let valid = snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .all(|message| {
+            message.tool_calls.is_empty()
+                || (message.tool_calls.len() == 1
+                    && matches!(
+                        message.tool_calls[0].name.as_str(),
+                        INTERPRET_INTENT_TURN | RESOLVE_INTENT_DECISION
+                    ))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(snapshot_error(
+            "intent recipe protocol v2 transcript contains a legacy or unrelated tool call",
+        ))
+    }
+}
+
+fn validate_persisted_decision(
+    decision: &Option<IntentRouteDecisionV2>,
+) -> Result<&IntentRouteDecisionV2, SessionSnapshotError> {
+    let decision = decision.as_ref().ok_or_else(|| {
+        snapshot_error("intent recipe protocol v2 state is missing its route decision")
+    })?;
+    validate_persisted_private_study_room_decision_v2(decision).map_err(|error| {
+        snapshot_error(format!(
+            "persisted intent route decision failed {}: {}",
+            error.code, error.message
+        ))
+    })?;
+    Ok(decision)
+}
+
+fn validate_persisted_binding(
+    binding: &Option<String>,
+    expected: &str,
+) -> Result<(), SessionSnapshotError> {
+    let binding = binding.as_deref().ok_or_else(|| {
+        snapshot_error("intent recipe protocol v2 state is missing its decision binding")
+    })?;
+    if valid_hash(binding) && binding == expected {
+        Ok(())
+    } else {
+        Err(snapshot_error(
+            "persisted intent stage does not match its route decision binding",
+        ))
     }
 }
 fn context_fingerprint(bindings: &ResourceBindingMap) -> String {

@@ -293,7 +293,7 @@ fn outcome_fields(outcome: &BurstOutcome) -> OutcomeFields<'_> {
             halt_code: None,
             last_error: None,
         },
-        BurstOutcome::Routed { fallback } => OutcomeFields {
+        BurstOutcome::Routed { fallback, .. } => OutcomeFields {
             name: "routed",
             message: fallback.response(),
             question: None,

@@ -7,7 +7,9 @@ use crate::intent::{
 };
 use crate::turn::parse_interpret_intent_turn;
 
-use super::adjudicate::{adjudicate_intent_v2, IntentAdjudicationV2};
+use super::adjudicate::{
+    adjudicate_intent_v2, validate_persisted_private_study_room_decision_v2, IntentAdjudicationV2,
+};
 use super::decision::{IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2};
 
 const MANIFEST_DIGEST: &str = "68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53";
@@ -504,4 +506,15 @@ fn public_decision_json_roundtrip_preserves_the_audit_record() {
     let json = serde_json::to_string(permit.decision()).unwrap();
     let restored = serde_json::from_str::<IntentRouteDecisionV2>(&json).unwrap();
     assert_eq!(&restored, permit.decision());
+    validate_persisted_private_study_room_decision_v2(&restored).unwrap();
+
+    let mut tampered = serde_json::to_value(&restored).unwrap();
+    tampered["adjudication_digest"] = Value::String("0".repeat(64));
+    let tampered = serde_json::from_value::<IntentRouteDecisionV2>(tampered).unwrap();
+    assert_eq!(
+        validate_persisted_private_study_room_decision_v2(&tampered)
+            .unwrap_err()
+            .code,
+        "INVALID_PERSISTED_INTENT_DECISION_DIGEST"
+    );
 }
