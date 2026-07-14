@@ -4,6 +4,7 @@ use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ChannelRef, InstanceRef, InstanceResourceRefs,
     ModalFieldStyle, OverwriteTargetSpec, RoleRef, TriggerSpec,
 };
+use resource_resolution::ResourceBindingMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -280,10 +281,26 @@ pub struct ScopeCheck {
 }
 
 pub fn check_scope(draft: &Draft, brief: &TurnBrief) -> ScopeCheck {
+    check_scope_for_bindings(draft, brief, None)
+}
+
+pub(crate) fn check_scope_with_bindings(
+    draft: &Draft,
+    brief: &TurnBrief,
+    bindings: &ResourceBindingMap,
+) -> ScopeCheck {
+    check_scope_for_bindings(draft, brief, Some(bindings))
+}
+
+fn check_scope_for_bindings(
+    draft: &Draft,
+    brief: &TurnBrief,
+    bindings: Option<&ResourceBindingMap>,
+) -> ScopeCheck {
     let mut satisfied = Vec::new();
     let mut missing = Vec::new();
     for requirement in &brief.requirements {
-        let complete = requirement_satisfied(draft, requirement);
+        let complete = requirement_satisfied_for_bindings(draft, requirement, bindings);
         if complete {
             satisfied.push(requirement.id().to_string());
         } else {
@@ -331,6 +348,14 @@ pub fn required_mutation_tools(brief: &TurnBrief) -> BTreeSet<String> {
 }
 
 pub(crate) fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequirement) -> bool {
+    requirement_satisfied_for_bindings(draft, requirement, None)
+}
+
+fn requirement_satisfied_for_bindings(
+    draft: &Draft,
+    requirement: &ScopeRequirement,
+    bindings: Option<&ResourceBindingMap>,
+) -> bool {
     match requirement {
         ScopeRequirement::Panel {
             key,
@@ -390,9 +415,13 @@ pub(crate) fn requirement_satisfied(draft: &Draft, requirement: &ScopeRequiremen
                     .count()
                     >= *minimum
             }),
-        ScopeRequirement::NoUnresolvedReferences { .. } => {
-            draft.summary().unresolved_references.is_empty()
-        }
+        ScopeRequirement::NoUnresolvedReferences { .. } => bindings
+            .map_or_else(
+                || draft.summary(),
+                |bindings| draft.summary_with_bindings(bindings),
+            )
+            .unresolved_references
+            .is_empty(),
     }
 }
 
@@ -804,6 +833,34 @@ mod tests {
         );
         assert!(result.ok);
         assert_eq!(result.satisfied, ["panel", "role", "refs"]);
+    }
+
+    #[test]
+    fn scope_guard_uses_explicit_channel_bindings() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version": 1,
+            "panels": [{
+                "key": "panel",
+                "channel": "community_hub",
+                "content": "Rooms",
+                "buttons": []
+            }],
+            "modals": [],
+            "rules": []
+        }))
+        .unwrap();
+        let mut bindings = ResourceBindingMap::default();
+        bindings.channel_bindings.insert(
+            serde_json::from_value(json!("community_hub")).unwrap(),
+            "700".parse().unwrap(),
+        );
+        let requirements = vec![ScopeRequirement::NoUnresolvedReferences {
+            id: "refs".to_string(),
+        }];
+
+        assert!(!check_scope(&draft, &brief(requirements.clone())).ok);
+        assert!(check_scope_with_bindings(&draft, &brief(requirements), &bindings).ok);
     }
 
     #[test]

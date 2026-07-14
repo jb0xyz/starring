@@ -1,14 +1,15 @@
 use automation_state::{ActionSpec, ButtonRoute, ChannelRef, InstanceRef};
+use resource_resolution::ResourceBindingMap;
 use serde_json::{json, Map, Value};
 
 use crate::draft::Draft;
 use crate::errors::{StructuredError, ToolResult};
 use crate::tools::dispatch_tool;
 use crate::turn::{
-    check_scope, validate_final_planned_action_order, AdaptivePhase, RequestedOutcome, ScopeAction,
-    ScopeButtonRoute, ScopeInstanceRef, ScopeOverwriteTarget, ScopePostPanelButton,
-    ScopePostPanelButtonRoute, ScopeRequirement, ScopeResourceRef, ScopeRoleRef, ScopeTrigger,
-    TurnBrief, TurnIntent,
+    check_scope, check_scope_with_bindings, validate_final_planned_action_order, AdaptivePhase,
+    RequestedOutcome, ScopeAction, ScopeButtonRoute, ScopeInstanceRef, ScopeOverwriteTarget,
+    ScopePostPanelButton, ScopePostPanelButtonRoute, ScopeRequirement, ScopeResourceRef,
+    ScopeRoleRef, ScopeTrigger, TurnBrief, TurnIntent,
 };
 
 use super::routing::is_mutation_tool;
@@ -211,11 +212,20 @@ pub(super) async fn execute_plan_atomically(
     brief: &TurnBrief,
     max_calls: usize,
 ) -> Result<PlannedExecution, PlannedExecutionFailure> {
+    execute_plan_atomically_for_bindings(draft, brief, None, max_calls).await
+}
+
+async fn execute_plan_atomically_for_bindings(
+    draft: &Draft,
+    brief: &TurnBrief,
+    bindings: Option<&ResourceBindingMap>,
+    max_calls: usize,
+) -> Result<PlannedExecution, PlannedExecutionFailure> {
     let mut candidate = draft.clone();
     let mut records = Vec::new();
     for requirement in &brief.requirements {
         loop {
-            match requirement_state(&candidate, brief, requirement) {
+            match requirement_state(&candidate, brief, requirement, bindings) {
                 RequirementState::Exact | RequirementState::Provisional => break,
                 RequirementState::Conflict => {
                     return Err(PlannedExecutionFailure {
@@ -277,7 +287,7 @@ pub(super) async fn execute_plan_atomically(
                     records,
                 });
             }
-            match requirement_state(&candidate, brief, requirement) {
+            match requirement_state(&candidate, brief, requirement, bindings) {
                 RequirementState::Exact | RequirementState::Provisional => {}
                 RequirementState::Missing if repeatable_requirement(requirement) => continue,
                 RequirementState::Missing | RequirementState::Conflict => {
@@ -294,7 +304,10 @@ pub(super) async fn execute_plan_atomically(
             }
         }
     }
-    let scope = check_scope(&candidate, brief);
+    let scope = bindings.map_or_else(
+        || check_scope(&candidate, brief),
+        |bindings| check_scope_with_bindings(&candidate, brief, bindings),
+    );
     if !scope.ok {
         return Err(PlannedExecutionFailure {
             error: StructuredError::new(
@@ -542,8 +555,9 @@ fn requirement_state(
     draft: &Draft,
     brief: &TurnBrief,
     requirement: &ScopeRequirement,
+    bindings: Option<&ResourceBindingMap>,
 ) -> RequirementState {
-    if exact_requirement_satisfied(draft, brief, requirement) {
+    if exact_requirement_satisfied(draft, brief, requirement, bindings) {
         return RequirementState::Exact;
     }
     if provisional_post_panel_satisfied(draft, requirement) {
@@ -559,10 +573,14 @@ fn exact_requirement_satisfied(
     draft: &Draft,
     brief: &TurnBrief,
     requirement: &ScopeRequirement,
+    bindings: Option<&ResourceBindingMap>,
 ) -> bool {
     let mut single = brief.clone();
     single.requirements = vec![requirement.clone()];
-    check_scope(draft, &single).ok
+    bindings.map_or_else(
+        || check_scope(draft, &single).ok,
+        |bindings| check_scope_with_bindings(draft, &single, bindings).ok,
+    )
 }
 
 fn stable_target_exists(draft: &Draft, requirement: &ScopeRequirement) -> bool {

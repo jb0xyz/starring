@@ -25,6 +25,7 @@ pub(crate) use protocol::{
     parse_turn_plan_review, parse_turn_plan_review_oracle, plan_packet_definition,
     plan_review_definition, planned_control_tool_definitions,
 };
+pub(crate) use scope::check_scope_with_bindings;
 
 pub use protocol::{
     control_tool_definitions, parse_empty_control, parse_finish_turn, parse_turn_brief,

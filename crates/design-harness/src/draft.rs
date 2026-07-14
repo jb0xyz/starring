@@ -5,6 +5,7 @@ use automation_state::{
     ActionSpec, ButtonRoute, ChannelRef, InstanceRef, InteractionRuleSet, OverwriteTargetSpec,
     RoleRef, TriggerSpec,
 };
+use resource_resolution::ResourceBindingMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +32,14 @@ impl Draft {
     }
 
     pub fn summary(&self) -> DraftSummary {
+        self.summary_for_bindings(None)
+    }
+
+    pub(crate) fn summary_with_bindings(&self, bindings: &ResourceBindingMap) -> DraftSummary {
+        self.summary_for_bindings(Some(bindings))
+    }
+
+    fn summary_for_bindings(&self, bindings: Option<&ResourceBindingMap>) -> DraftSummary {
         DraftSummary {
             panels: self.ruleset.panels.len(),
             modals: self.ruleset.modals.len(),
@@ -41,7 +50,7 @@ impl Draft {
                 .iter()
                 .map(|rule| rule.actions.len())
                 .sum(),
-            unresolved_references: unresolved_references(&self.ruleset),
+            unresolved_references: unresolved_references(&self.ruleset, bindings),
         }
     }
 
@@ -68,8 +77,10 @@ impl Draft {
     }
 
     pub(crate) fn newly_unresolved_after(&self, candidate: &Self) -> Vec<String> {
-        let before: BTreeSet<String> = unresolved_references(&self.ruleset).into_iter().collect();
-        unresolved_references(&candidate.ruleset)
+        let before: BTreeSet<String> = unresolved_references(&self.ruleset, None)
+            .into_iter()
+            .collect();
+        unresolved_references(&candidate.ruleset, None)
             .into_iter()
             .filter(|reference| !before.contains(reference))
             .collect()
@@ -102,10 +113,13 @@ pub struct DraftSummary {
     pub unresolved_references: Vec<String>,
 }
 
-fn unresolved_references(ruleset: &InteractionRuleSet) -> Vec<String> {
+fn unresolved_references(
+    ruleset: &InteractionRuleSet,
+    bindings: Option<&ResourceBindingMap>,
+) -> Vec<String> {
     let mut unresolved = BTreeSet::new();
     for panel in &ruleset.panels {
-        if panel.channel.0 != "study_hub" {
+        if !channel_is_bound(&panel.channel.0, bindings) {
             unresolved.insert(panel.channel.0.clone());
         }
     }
@@ -174,7 +188,7 @@ fn unresolved_references(ruleset: &InteractionRuleSet) -> Vec<String> {
                 ActionSpec::RegisterInstance { .. } => {}
                 _ => {}
             }
-            collect_action_references(action, &created, &modal_keys, &mut unresolved);
+            collect_action_references(action, &created, &modal_keys, bindings, &mut unresolved);
         }
     }
     unresolved.into_iter().collect()
@@ -206,25 +220,26 @@ fn collect_action_references(
     action: &ActionSpec,
     created: &BTreeMap<&str, &str>,
     modal_keys: &BTreeSet<&str>,
+    bindings: Option<&ResourceBindingMap>,
     unresolved: &mut BTreeSet<String>,
 ) {
     match action {
-        ActionSpec::GrantRole { role, .. } => collect_role_ref(role, created, unresolved),
+        ActionSpec::GrantRole { role, .. } => collect_role_ref(role, created, bindings, unresolved),
         ActionSpec::OpenModal { modal } if !modal_keys.contains(modal.as_str()) => {
             unresolved.insert(modal.clone());
         }
         ActionSpec::UpsertOverwrite {
             channel, target, ..
         } => {
-            collect_channel_ref(channel, created, unresolved);
+            collect_channel_ref(channel, created, bindings, unresolved);
             if let OverwriteTargetSpec::Role(role) = target {
-                collect_role_ref(role, created, unresolved);
+                collect_role_ref(role, created, bindings, unresolved);
             }
         }
         ActionSpec::PostPanel {
             channel, buttons, ..
         } => {
-            collect_channel_ref(channel, created, unresolved);
+            collect_channel_ref(channel, created, bindings, unresolved);
             for button in buttons {
                 if let ButtonRoute::InstanceAction { instance, .. } = &button.route {
                     collect_instance_ref(instance, created, unresolved);
@@ -253,6 +268,7 @@ fn collect_action_references(
 fn collect_role_ref(
     reference: &RoleRef,
     created: &BTreeMap<&str, &str>,
+    bindings: Option<&ResourceBindingMap>,
     unresolved: &mut BTreeSet<String>,
 ) {
     match reference {
@@ -260,16 +276,19 @@ fn collect_role_ref(
             unresolved.insert(reference.created.clone());
         }
         RoleRef::Instance { instance, .. } => collect_instance_ref(instance, created, unresolved),
-        RoleRef::Existing(key) => {
+        RoleRef::Existing(key)
+            if !bindings.is_some_and(|bindings| bindings.role_bindings.contains_key(key)) =>
+        {
             unresolved.insert(key.0.clone());
         }
-        RoleRef::Created(_) => {}
+        RoleRef::Existing(_) | RoleRef::Created(_) => {}
     }
 }
 
 fn collect_channel_ref(
     reference: &ChannelRef,
     created: &BTreeMap<&str, &str>,
+    bindings: Option<&ResourceBindingMap>,
     unresolved: &mut BTreeSet<String>,
 ) {
     match reference {
@@ -279,11 +298,20 @@ fn collect_channel_ref(
             }
         }
         ChannelRef::Existing(key) => {
-            if key.0 != "study_hub" {
+            if !channel_is_bound(&key.0, bindings) {
                 unresolved.insert(key.0.clone());
             }
         }
     }
+}
+
+fn channel_is_bound(key: &str, bindings: Option<&ResourceBindingMap>) -> bool {
+    bindings.map_or(key == "study_hub", |bindings| {
+        bindings
+            .channel_bindings
+            .keys()
+            .any(|candidate| candidate.0 == key)
+    })
 }
 
 fn collect_instance_ref(
@@ -295,5 +323,75 @@ fn collect_instance_ref(
         if created.get(reference.created.as_str()) != Some(&"instance") {
             unresolved.insert(reference.created.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn explicit_bindings_resolve_arbitrary_channels_and_roles() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version": 1,
+            "panels": [{
+                "key": "panel",
+                "channel": "community_hub",
+                "content": "Rooms",
+                "buttons": []
+            }],
+            "modals": [],
+            "rules": [{
+                "key": "join",
+                "trigger": {"type": "instance_action", "action": "join"},
+                "actions": [{
+                    "type": "grant_role",
+                    "role": "existing_member",
+                    "target": "actor"
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            draft.summary().unresolved_references,
+            ["community_hub", "existing_member"]
+        );
+
+        let mut bindings = ResourceBindingMap::default();
+        bindings.channel_bindings.insert(
+            serde_json::from_value(json!("community_hub")).unwrap(),
+            "700".parse().unwrap(),
+        );
+        bindings.role_bindings.insert(
+            serde_json::from_value(json!("existing_member")).unwrap(),
+            "701".parse().unwrap(),
+        );
+
+        assert!(draft
+            .summary_with_bindings(&bindings)
+            .unresolved_references
+            .is_empty());
+    }
+
+    #[test]
+    fn legacy_summary_keeps_the_study_hub_binding() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version": 1,
+            "panels": [{
+                "key": "panel",
+                "channel": "study_hub",
+                "content": "Rooms",
+                "buttons": []
+            }],
+            "modals": [],
+            "rules": []
+        }))
+        .unwrap();
+
+        assert!(draft.summary().unresolved_references.is_empty());
     }
 }
