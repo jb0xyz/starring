@@ -53,6 +53,62 @@ fn active_detail_frontier_exposes_and_requires_only_selected_facets() {
 }
 
 #[test]
+fn active_detail_frontier_is_canonical_for_every_nonempty_facet_subset() {
+    let all = [
+        IntentRecipeDetailFacetV3::Copy,
+        IntentRecipeDetailFacetV3::Naming,
+        IntentRecipeDetailFacetV3::Controls,
+    ];
+    let mut largest_schema = 0;
+    for mask in 1..8 {
+        let canonical = all
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, facet)| *facet)
+            .collect::<Vec<_>>();
+        let reversed = canonical.iter().rev().copied().collect::<Vec<_>>();
+        let [canonical_tool] = private_study_room_details_frontier_for(&canonical).unwrap();
+        let [reversed_tool] = private_study_room_details_frontier_for(&reversed).unwrap();
+        assert_eq!(canonical_tool.parameters, reversed_tool.parameters);
+
+        let names = canonical
+            .iter()
+            .map(|facet| match facet {
+                IntentRecipeDetailFacetV3::Copy => "copy",
+                IntentRecipeDetailFacetV3::Naming => "naming",
+                IntentRecipeDetailFacetV3::Controls => "controls",
+            })
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(property_names(&canonical_tool.parameters), names);
+        assert_eq!(required_names(&canonical_tool.parameters), names);
+        assert_eq!(
+            canonical_tool.parameters.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        for name in property_names(&canonical_tool.parameters) {
+            assert_eq!(
+                canonical_tool.parameters["properties"][&name].get("additionalProperties"),
+                Some(&Value::Bool(false))
+            );
+        }
+        let schema_text = canonical_tool.parameters.to_string();
+        assert!(!schema_text.contains("$defs"));
+        assert!(!schema_text.contains("$ref"));
+        largest_schema = largest_schema.max(
+            serde_json::to_vec(&canonical_tool.parameters)
+                .unwrap()
+                .len(),
+        );
+    }
+    assert!(
+        largest_schema < 1_800,
+        "largest routed detail schema is {largest_schema} bytes"
+    );
+}
+
+#[test]
 fn serving_detail_parser_flattens_patterns_and_stamps_all_facets() {
     let arguments = json!({
         "copy": {"create_button_label": "Start focus room"},
@@ -257,6 +313,38 @@ fn serving_detail_parser_rejects_a_present_empty_pattern() {
     .unwrap_err();
     assert_eq!(error.code, "EMPTY_RECIPE_DETAIL_PATTERN");
     assert_eq!(error.location, "intent.details.naming.channel_name");
+}
+
+#[test]
+fn serving_detail_parser_enforces_the_active_root_frontier() {
+    for arguments in [
+        json!({}),
+        json!({
+            "copy": {"create_button_label": "Start focus room"},
+            "controls": {}
+        }),
+    ] {
+        let error = parse_private_study_room_details_for_serving(
+            &arguments.to_string(),
+            &[IntentRecipeDetailFacetV3::Copy],
+            0,
+            CORE_DIGEST,
+            "Use Start focus room",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_FRONTIER_MISMATCH");
+        assert_eq!(error.location, "intent.details.arguments");
+    }
+
+    let error = parse_private_study_room_details_for_serving(
+        &json!({"copy": null}).to_string(),
+        &[IntentRecipeDetailFacetV3::Copy],
+        0,
+        CORE_DIGEST,
+        "Use Start focus room",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "EMPTY_REQUIRED_RECIPE_DETAIL");
 }
 
 #[test]

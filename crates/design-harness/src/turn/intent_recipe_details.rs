@@ -216,6 +216,16 @@ pub fn private_study_room_details_frontier() -> [ToolDefinition; 1] {
 pub(crate) fn private_study_room_details_frontier_for(
     required_facets: &[IntentRecipeDetailFacetV3],
 ) -> Result<[ToolDefinition; 1], StructuredError> {
+    let parameters = private_study_room_details_serving_schema(required_facets)?;
+    Ok([detail_tool(
+        parameters,
+        "Extract one nonempty object for every exposed private StudyRoom detail facet using only exact literals from the original human turn. Pattern affixes use flat fields ending in _prefix and _suffix. Never author bindings, routes, authorization, actions, permissions, recipe identity, or deployment operations",
+    )])
+}
+
+fn private_study_room_details_serving_schema(
+    required_facets: &[IntentRecipeDetailFacetV3],
+) -> Result<Value, StructuredError> {
     let required = exact_facet_set(required_facets, "intent.details.required_facets")?;
     if required.is_empty() {
         return Err(detail_error(
@@ -267,10 +277,7 @@ pub(crate) fn private_study_room_details_frontier_for(
                 .collect(),
         ),
     );
-    Ok([detail_tool(
-        parameters,
-        "Extract one nonempty object for every exposed private StudyRoom detail facet using only exact literals from the original human turn. Pattern affixes use flat fields ending in _prefix and _suffix. Never author bindings, routes, authorization, actions, permissions, recipe identity, or deployment operations",
-    )])
+    Ok(parameters)
 }
 
 fn detail_tool(parameters: Value, description: &str) -> ToolDefinition {
@@ -316,13 +323,14 @@ pub(crate) fn parse_private_study_room_details_for_serving(
     expected_core_semantic_digest: &str,
     human_message: &str,
 ) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
-    let input = serde_json::from_str::<ExtractPrivateStudyRoomDetailsServingWireV2>(arguments)
+    let parameters = private_study_room_details_serving_schema(required_facets)?;
+    let value = serde_json::from_str::<Value>(arguments).map_err(|error| {
+        translate_tool_arguments_error(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &error, &parameters)
+    })?;
+    validate_serving_root_keys(&value, required_facets)?;
+    let input = serde_json::from_value::<ExtractPrivateStudyRoomDetailsServingWireV2>(value)
         .map_err(|error| {
-            translate_tool_arguments_error(
-                EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
-                &error,
-                &inline_schema_value::<ExtractPrivateStudyRoomDetailsServingWireV2>(),
-            )
+            translate_tool_arguments_error(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &error, &parameters)
         })?;
     let details = finalize_private_study_room_details(
         PrivateStudyRoomDetailsCandidateV1 {
@@ -337,6 +345,29 @@ pub(crate) fn parse_private_study_room_details_for_serving(
     )?;
     details.validate_human_literals(human_message)?;
     Ok(details)
+}
+
+fn validate_serving_root_keys(
+    value: &Value,
+    required_facets: &[IntentRecipeDetailFacetV3],
+) -> Result<(), StructuredError> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    let expected = exact_facet_set(required_facets, "intent.details.required_facets")?
+        .into_iter()
+        .map(facet_name)
+        .collect::<BTreeSet<_>>();
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(detail_error(
+            "RECIPE_DETAIL_FRONTIER_MISMATCH",
+            "intent.details.arguments",
+            "The recipe detail arguments do not match the active facet frontier",
+            "Provide every exposed facet object exactly once and no unexposed facet object",
+        ));
+    }
+    Ok(())
 }
 
 fn finalize_private_study_room_details(
