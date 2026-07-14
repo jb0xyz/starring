@@ -17,27 +17,30 @@ use crate::draft::Draft;
 use crate::errors::{translate_run_error, translate_validation_error, StructuredError, ToolResult};
 
 pub fn validate_draft(draft: &mut Draft) -> ToolResult {
-    let mut bindings = ResourceBindingMap::default();
-    let key = match serde_json::from_value(Value::String("study_hub".to_string())) {
-        Ok(key) => key,
-        Err(_) => return ToolResult::failure_from(draft, binding_setup_error()),
+    let bindings = match fixed_study_hub_bindings() {
+        Ok(bindings) => bindings,
+        Err(error) => return ToolResult::failure_from(draft, error),
     };
-    let channel = match "700".parse() {
-        Ok(channel) => channel,
-        Err(_) => return ToolResult::failure_from(draft, binding_setup_error()),
-    };
-    bindings.channel_bindings.insert(key, channel);
+    match validate_candidate_with_bindings(draft, &bindings) {
+        Ok(()) => ToolResult::success(draft, "Draft validation passed"),
+        Err(error) => ToolResult::failure_from(draft, error),
+    }
+}
 
-    match validate(&draft.ruleset, &bindings) {
+pub(crate) fn validate_candidate_with_bindings(
+    draft: &mut Draft,
+    bindings: &ResourceBindingMap,
+) -> Result<(), StructuredError> {
+    match validate(&draft.ruleset, bindings) {
         Ok(()) => {
             draft.validated_revision = Some(draft.draft_revision);
             draft.simulated_revision = None;
-            ToolResult::success(draft, "Draft validation passed")
+            Ok(())
         }
         Err(errors) => {
             draft.validated_revision = None;
             draft.simulated_revision = None;
-            let error = errors
+            Err(errors
                 .first()
                 .map(|error| translate_validation_error(&draft.ruleset, error))
                 .unwrap_or_else(|| {
@@ -47,13 +50,23 @@ pub fn validate_draft(draft: &mut Draft) -> ToolResult {
                         "Draft validation failed",
                         "Review the Draft summary and correct the latest change",
                     )
-                });
-            ToolResult::failure_from(draft, error)
+                }))
         }
     }
 }
 
 pub async fn simulate_draft(draft: &mut Draft) -> ToolResult {
+    let bindings = match fixed_study_hub_bindings() {
+        Ok(bindings) => bindings,
+        Err(error) => return ToolResult::failure_from(draft, error),
+    };
+    simulate_draft_with_bindings(draft, &bindings).await
+}
+
+pub(crate) async fn simulate_draft_with_bindings(
+    draft: &mut Draft,
+    bindings: &ResourceBindingMap,
+) -> ToolResult {
     if draft.validated_revision != Some(draft.draft_revision) {
         return ToolResult::failure_from(
             draft,
@@ -66,7 +79,7 @@ pub async fn simulate_draft(draft: &mut Draft) -> ToolResult {
         );
     }
 
-    match run_golden_trace(draft).await {
+    match run_golden_trace_with_bindings(draft, bindings).await {
         Ok(()) => {
             draft.simulated_revision = Some(draft.draft_revision);
             ToolResult::success(draft, "Golden StudyRoom trace passed")
@@ -78,15 +91,10 @@ pub async fn simulate_draft(draft: &mut Draft) -> ToolResult {
     }
 }
 
-async fn run_golden_trace(draft: &Draft) -> Result<(), StructuredError> {
-    let mut bindings = ResourceBindingMap::default();
-    let binding_key = serde_json::from_value(Value::String("study_hub".to_string()))
-        .map_err(|_| binding_setup_error())?;
-    let binding_channel = "700".parse().map_err(|_| binding_setup_error())?;
-    bindings
-        .channel_bindings
-        .insert(binding_key, binding_channel);
-
+pub(crate) async fn run_golden_trace_with_bindings(
+    draft: &Draft,
+    bindings: &ResourceBindingMap,
+) -> Result<(), StructuredError> {
     let button = find_open_button(draft)?;
     let modal = find_submit_modal(draft)?;
     let identity = RunningRuleSetIdentity {
@@ -111,7 +119,7 @@ async fn run_golden_trace(draft: &Draft) -> Result<(), StructuredError> {
         actor: "42".parse().map_err(|_| identity_setup_error())?,
         kind: EventKind::ButtonClick { component: button },
     };
-    let open_plan = interpret(&open_event, &draft.ruleset, &bindings).ok_or_else(|| {
+    let open_plan = interpret(&open_event, &draft.ruleset, bindings).ok_or_else(|| {
         StructuredError::new(
             "GOLDEN_TRACE_RULE_NOT_FOUND",
             "simulation.open_modal",
@@ -132,7 +140,7 @@ async fn run_golden_trace(draft: &Draft) -> Result<(), StructuredError> {
             inputs: BTreeMap::from([("room_name".to_string(), "algebra".to_string())]),
         },
     };
-    let submit_plan = interpret(&submit_event, &draft.ruleset, &bindings).ok_or_else(|| {
+    let submit_plan = interpret(&submit_event, &draft.ruleset, bindings).ok_or_else(|| {
         StructuredError::new(
             "GOLDEN_TRACE_RULE_NOT_FOUND",
             "simulation.modal_submit",
@@ -148,6 +156,15 @@ async fn run_golden_trace(draft: &Draft) -> Result<(), StructuredError> {
     assert_mutation_trace(&mutation.calls())?;
     assert_instance_manifest(&instances).await?;
     Ok(())
+}
+
+fn fixed_study_hub_bindings() -> Result<ResourceBindingMap, StructuredError> {
+    let mut bindings = ResourceBindingMap::default();
+    let key = serde_json::from_value(Value::String("study_hub".to_string()))
+        .map_err(|_| binding_setup_error())?;
+    let channel = "700".parse().map_err(|_| binding_setup_error())?;
+    bindings.channel_bindings.insert(key, channel);
+    Ok(bindings)
 }
 
 fn find_open_button(draft: &Draft) -> Result<String, StructuredError> {
@@ -331,4 +348,39 @@ fn identity_setup_error() -> StructuredError {
         "The fixed golden trace identity could not be created",
         "Stop the session and report the harness configuration error",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn validation_accepts_an_explicit_nonlegacy_channel_binding() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version": 1,
+            "panels": [{
+                "key": "panel",
+                "channel": "community_hub",
+                "content": "Rooms",
+                "buttons": []
+            }],
+            "modals": [],
+            "rules": []
+        }))
+        .unwrap();
+        draft.draft_revision = 1;
+        let mut bindings = ResourceBindingMap::default();
+        bindings.channel_bindings.insert(
+            serde_json::from_value(json!("community_hub")).unwrap(),
+            "700".parse().unwrap(),
+        );
+
+        validate_candidate_with_bindings(&mut draft, &bindings).unwrap();
+
+        assert_eq!(draft.validated_revision, Some(1));
+        assert_eq!(draft.simulated_revision, None);
+    }
 }

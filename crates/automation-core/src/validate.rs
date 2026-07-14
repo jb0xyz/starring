@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use automation_state::{
     ActionSpec, ButtonRoute, ChannelRef, InstanceRef, InstanceResourceRefs, InteractionRule,
-    InteractionRuleSet, OverwriteTargetSpec, RoleRef, TriggerSpec,
+    InteractionRuleSet, OverwriteTargetSpec, RoleRef, TriggerSpec, DISCORD_MODAL_INPUT_MAX_LENGTH,
 };
 use desired_state::ResourceKey;
 use resource_resolution::ResourceBindingMap;
@@ -32,6 +32,22 @@ pub enum ValidationError {
     DuplicateModalFieldKey {
         modal: String,
         field: String,
+    },
+    InvalidModalFieldMinLength {
+        modal: String,
+        field: String,
+        min_length: u16,
+    },
+    InvalidModalFieldMaxLength {
+        modal: String,
+        field: String,
+        max_length: u16,
+    },
+    InvalidModalFieldLengthRange {
+        modal: String,
+        field: String,
+        min_length: u16,
+        max_length: u16,
     },
     UnknownModalRef {
         rule: String,
@@ -223,6 +239,34 @@ pub fn validate_structural(ruleset: &InteractionRuleSet) -> Result<(), Vec<Valid
                     modal: modal.key.clone(),
                     field: field.key.clone(),
                 });
+            }
+            if let Some(min_length) = field.min_length {
+                if min_length > DISCORD_MODAL_INPUT_MAX_LENGTH {
+                    errors.push(ValidationError::InvalidModalFieldMinLength {
+                        modal: modal.key.clone(),
+                        field: field.key.clone(),
+                        min_length,
+                    });
+                }
+            }
+            if let Some(max_length) = field.max_length {
+                if max_length == 0 || max_length > DISCORD_MODAL_INPUT_MAX_LENGTH {
+                    errors.push(ValidationError::InvalidModalFieldMaxLength {
+                        modal: modal.key.clone(),
+                        field: field.key.clone(),
+                        max_length,
+                    });
+                }
+            }
+            if let (Some(min_length), Some(max_length)) = (field.min_length, field.max_length) {
+                if min_length > max_length {
+                    errors.push(ValidationError::InvalidModalFieldLengthRange {
+                        modal: modal.key.clone(),
+                        field: field.key.clone(),
+                        min_length,
+                        max_length,
+                    });
+                }
             }
         }
         modal_fields.insert(modal.key.clone(), field_keys);

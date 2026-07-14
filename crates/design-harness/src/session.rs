@@ -26,12 +26,17 @@ use crate::turn::{
 mod adaptive;
 mod context;
 mod frontier;
+mod intent_routing;
 mod repair;
 mod routing;
 mod snapshot;
 
 use adaptive::simulation_profile_for_current_human_turn;
 use context::compact_text;
+use intent_routing::IntentRecipeRuntime;
+pub use intent_routing::{
+    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
+};
 use repair::is_argument_failure;
 use routing::{
     all_tool_definitions, is_control_tool, is_mutation_tool, legacy_tool_definitions,
@@ -54,7 +59,7 @@ const MAX_INTENT_MEMORY_CHARS: usize = 240;
 const MAX_ERROR_MEMORY_CHARS: usize = 360;
 const MAX_REVIEW_RETRY_ERROR_FIELD_CHARS: usize = 448;
 
-pub const SESSION_SNAPSHOT_VERSION: u32 = 5;
+pub const SESSION_SNAPSHOT_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -117,6 +122,30 @@ pub struct Observability {
     pub plan_commits: usize,
     #[serde(default)]
     pub plan_conflicts: usize,
+    #[serde(default)]
+    pub intent_route_calls: usize,
+    #[serde(default)]
+    pub intent_proposal_acceptances: usize,
+    #[serde(default)]
+    pub intent_resolution_acceptances: usize,
+    #[serde(default)]
+    pub intent_compile_attempts: usize,
+    #[serde(default)]
+    pub intent_compile_successes: usize,
+    #[serde(default)]
+    pub intent_commits: usize,
+    #[serde(default)]
+    pub intent_rollbacks: usize,
+    #[serde(default)]
+    pub intent_conflicts: usize,
+    #[serde(default)]
+    pub intent_stale_revision_rejections: usize,
+    #[serde(default)]
+    pub intent_extraction_failures: usize,
+    #[serde(default)]
+    pub intent_fallback_routes: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub intent_compiled_operations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -134,6 +163,7 @@ pub enum BurstOutcome {
     NeedsInput { question: String },
     Progressed { summary: String },
     Ready { summary: String },
+    Routed { fallback: IntentFallbackV1 },
     Halted(Box<HaltReport>),
 }
 
@@ -144,6 +174,7 @@ pub enum TurnPhase {
     NeedsInput,
     Progressed,
     Ready,
+    Routed,
     Halted,
 }
 
@@ -219,6 +250,8 @@ pub struct SessionSnapshot {
     pub adaptive_enabled: bool,
     #[serde(default)]
     pub brief_history: Vec<TurnBrief>,
+    #[serde(default)]
+    pub(crate) intent_recipe: Option<intent_routing::IntentRecipeSessionSnapshotV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -595,6 +628,7 @@ pub struct DesignSession<C> {
     plan_assembly: Option<PlanAssembly>,
     current_human_message_index: Option<usize>,
     brief_history: Vec<TurnBrief>,
+    intent_recipe: Option<IntentRecipeRuntime>,
 }
 
 impl<C> DesignSession<C> {
@@ -662,6 +696,7 @@ impl<C> DesignSession<C> {
             plan_assembly: None,
             current_human_message_index: None,
             brief_history: Vec::new(),
+            intent_recipe: None,
         }
     }
 
@@ -713,6 +748,10 @@ impl<C> DesignSession<C> {
             adaptive_turn: self.adaptive_turn.clone(),
             adaptive_enabled: self.adaptive_enabled,
             brief_history: self.brief_history.clone(),
+            intent_recipe: self
+                .intent_recipe
+                .as_ref()
+                .map(IntentRecipeRuntime::snapshot),
         }
     }
 
@@ -739,6 +778,11 @@ impl<C> DesignSession<C> {
         planned_enabled: bool,
     ) -> Result<Self, SessionSnapshotError> {
         validate_snapshot(&snapshot)?;
+        if snapshot.intent_recipe.is_some() {
+            return Err(SessionSnapshotError::InvalidInvariant {
+                message: "intent recipe snapshots require restore_intent_recipe with the original resource bindings".to_string(),
+            });
+        }
         let adaptive_enabled = snapshot.adaptive_enabled || planned_enabled;
         let prompt = if planned_enabled {
             PLANNED_SYSTEM_PROMPT
@@ -785,6 +829,7 @@ impl<C> DesignSession<C> {
             plan_assembly: None,
             current_human_message_index: None,
             brief_history: snapshot.brief_history,
+            intent_recipe: None,
         })
     }
 
@@ -982,6 +1027,11 @@ impl<C> DesignSession<C> {
     fn ready(&mut self, summary: String) -> BurstOutcome {
         self.finish_turn(TurnPhase::Ready);
         BurstOutcome::Ready { summary }
+    }
+
+    fn routed(&mut self, fallback: IntentFallbackV1) -> BurstOutcome {
+        self.finish_turn(TurnPhase::Routed);
+        BurstOutcome::Routed { fallback }
     }
 
     fn halt(
@@ -2114,6 +2164,9 @@ impl<C> DesignSession<C> {
 
 impl<C: LlmClient> DesignSession<C> {
     pub async fn run_burst(&mut self, human_message: &str) -> BurstOutcome {
+        if self.intent_recipe.is_some() {
+            return self.run_intent_recipe_burst(human_message).await;
+        }
         self.begin_turn(human_message);
         if matches!(self.repair_state, Some(RepairState::Failed(_))) {
             self.repair_state = None;

@@ -1,8 +1,18 @@
+mod execution;
+mod intent_protocol;
 mod plan;
 mod plan_input;
 mod protocol;
 mod scope;
 
+pub(crate) use execution::{
+    execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
+};
+pub use intent_protocol::{
+    parse_resolve_intent_decision, parse_route_intent_turn, resolve_intent_decision_frontier,
+    route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,
+    RouteIntentTurnInputV1,
+};
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
     assign_repeat_targets as assign_turn_plan_repeat_targets,
@@ -23,8 +33,9 @@ pub(crate) use plan_input::{
 pub(crate) use protocol::{
     parse_planned_turn_brief, parse_turn_plan, parse_turn_plan_packet_scoped,
     parse_turn_plan_review, parse_turn_plan_review_oracle, plan_packet_definition,
-    plan_review_definition, planned_control_tool_definitions,
+    plan_review_definition, planned_control_tool_definitions, render_preview_with_bindings,
 };
+pub(crate) use scope::check_scope_with_bindings;
 
 pub use protocol::{
     control_tool_definitions, parse_empty_control, parse_finish_turn, parse_turn_brief,

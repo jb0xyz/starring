@@ -5,7 +5,14 @@ use design_harness::{SessionSnapshot, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VE
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: u32 = 1;
+const STORE_SCHEMA_VERSION: u32 = 2;
+const LATEST_MIGRATABLE_SNAPSHOT_VERSION: u32 = 5;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedSession {
+    pub generation: u64,
+    pub snapshot: SessionSnapshot,
+}
 
 pub struct SessionStore {
     connection: Connection,
@@ -27,17 +34,12 @@ impl SessionStore {
         Self::initialize(Connection::open_in_memory()?)
     }
 
-    fn initialize(connection: Connection) -> Result<Self, StoreError> {
+    fn initialize(mut connection: Connection) -> Result<Self, StoreError> {
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS harness_metadata (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS harness_sessions (
-                 session_id TEXT PRIMARY KEY NOT NULL,
-                 snapshot_json TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
              );",
         )?;
         let current = connection
@@ -52,67 +54,88 @@ impl SessionStore {
                 let found = value
                     .parse::<u32>()
                     .map_err(|_| StoreError::CorruptSchemaVersion { value })?;
-                if found != STORE_SCHEMA_VERSION {
-                    return Err(StoreError::UnsupportedSchemaVersion {
-                        expected: STORE_SCHEMA_VERSION,
-                        found,
-                    });
+                match found {
+                    1 => migrate_store_v1_to_v2(&mut connection)?,
+                    STORE_SCHEMA_VERSION => {}
+                    _ => {
+                        return Err(StoreError::UnsupportedSchemaVersion {
+                            expected: STORE_SCHEMA_VERSION,
+                            found,
+                        });
+                    }
                 }
             }
             None => {
-                connection.execute(
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS harness_sessions (
+                         session_id TEXT PRIMARY KEY NOT NULL,
+                         snapshot_json TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL,
+                         generation INTEGER NOT NULL DEFAULT 1
+                     );",
+                )?;
+                if !has_generation_column(&transaction)? {
+                    transaction.execute(
+                        "ALTER TABLE harness_sessions
+                         ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+                        [],
+                    )?;
+                }
+                transaction.execute(
                     "INSERT INTO harness_metadata (key, value) VALUES ('schema_version', ?1)",
                     [STORE_SCHEMA_VERSION.to_string()],
                 )?;
+                transaction.commit()?;
             }
         }
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
     pub fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, StoreError> {
-        let snapshot_json = self
-            .connection
-            .query_row(
-                "SELECT snapshot_json FROM harness_sessions WHERE session_id = ?1",
-                [session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(snapshot_json) = snapshot_json else {
-            return Ok(None);
-        };
-        let mut value =
-            serde_json::from_str::<serde_json::Value>(&snapshot_json).map_err(|source| {
-                StoreError::CorruptSnapshot {
-                    session_id: session_id.to_string(),
-                    source,
-                }
-            })?;
-        let found = value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|version| u32::try_from(version).ok())
-            .ok_or_else(|| StoreError::CorruptSnapshotSchemaVersion {
-                session_id: session_id.to_string(),
-            })?;
-        if matches!(found, 2..=4) {
-            migrate_snapshot(&mut value, found);
-        } else if found != SESSION_SNAPSHOT_VERSION {
-            return Err(StoreError::UnsupportedSnapshotVersion {
-                expected: SESSION_SNAPSHOT_VERSION,
-                found,
-            });
-        }
-        let snapshot = serde_json::from_value::<SessionSnapshot>(value).map_err(|source| {
-            StoreError::CorruptSnapshot {
-                session_id: session_id.to_string(),
-                source,
-            }
-        })?;
-        Ok(Some(snapshot))
+        Ok(self
+            .load_versioned(session_id)?
+            .map(|loaded| loaded.snapshot))
     }
 
+    pub fn load_versioned(&self, session_id: &str) -> Result<Option<LoadedSession>, StoreError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT generation, snapshot_json
+                 FROM harness_sessions
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((generation, snapshot_json)) = stored else {
+            return Ok(None);
+        };
+        let generation = parse_generation(session_id, generation)?;
+        let snapshot = decode_snapshot(session_id, &snapshot_json)?;
+        Ok(Some(LoadedSession {
+            generation,
+            snapshot,
+        }))
+    }
+
+    #[cfg(test)]
     pub fn save(&mut self, session_id: &str, snapshot: &SessionSnapshot) -> Result<(), StoreError> {
+        let expected_generation = self
+            .load_versioned(session_id)?
+            .map_or(0, |loaded| loaded.generation);
+        self.save_compare_and_swap(session_id, expected_generation, snapshot)?;
+        Ok(())
+    }
+
+    pub fn save_compare_and_swap(
+        &mut self,
+        session_id: &str,
+        expected_generation: u64,
+        snapshot: &SessionSnapshot,
+    ) -> Result<u64, StoreError> {
         if snapshot.schema_version != SESSION_SNAPSHOT_VERSION {
             return Err(StoreError::UnsupportedSnapshotVersion {
                 expected: SESSION_SNAPSHOT_VERSION,
@@ -121,17 +144,164 @@ impl SessionStore {
         }
         let snapshot_json = serde_json::to_string(snapshot)?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at)
-             VALUES (?1, ?2, unixepoch())
-             ON CONFLICT(session_id) DO UPDATE SET
-                 snapshot_json = excluded.snapshot_json,
-                 updated_at = excluded.updated_at",
-            params![session_id, snapshot_json],
-        )?;
+        let next_generation = if expected_generation == 0 {
+            let affected = transaction.execute(
+                "INSERT INTO harness_sessions (
+                     session_id,
+                     snapshot_json,
+                     updated_at,
+                     generation
+                 )
+                 VALUES (?1, ?2, unixepoch(), 1)
+                 ON CONFLICT(session_id) DO NOTHING",
+                params![session_id, snapshot_json],
+            )?;
+            if affected == 1 {
+                1
+            } else {
+                return Err(generation_conflict(
+                    &transaction,
+                    session_id,
+                    expected_generation,
+                )?);
+            }
+        } else {
+            let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+                StoreError::GenerationOverflow {
+                    session_id: session_id.to_string(),
+                    generation: expected_generation,
+                }
+            })?;
+            let expected_generation_sql = generation_to_sql(session_id, expected_generation)?;
+            let next_generation_sql = generation_to_sql(session_id, next_generation)?;
+            let affected = transaction.execute(
+                "UPDATE harness_sessions
+                 SET snapshot_json = ?2,
+                     updated_at = unixepoch(),
+                     generation = ?3
+                 WHERE session_id = ?1 AND generation = ?4",
+                params![
+                    session_id,
+                    snapshot_json,
+                    next_generation_sql,
+                    expected_generation_sql
+                ],
+            )?;
+            if affected == 1 {
+                next_generation
+            } else {
+                return Err(generation_conflict(
+                    &transaction,
+                    session_id,
+                    expected_generation,
+                )?);
+            }
+        };
         transaction.commit()?;
-        Ok(())
+        Ok(next_generation)
     }
+}
+
+fn migrate_store_v1_to_v2(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "ALTER TABLE harness_sessions
+         ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE harness_metadata SET value = ?1 WHERE key = 'schema_version'",
+        [STORE_SCHEMA_VERSION.to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn has_generation_column(transaction: &rusqlite::Transaction<'_>) -> Result<bool, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM pragma_table_info('harness_sessions')
+             WHERE name = 'generation'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn decode_snapshot(session_id: &str, snapshot_json: &str) -> Result<SessionSnapshot, StoreError> {
+    let mut value = serde_json::from_str::<serde_json::Value>(snapshot_json).map_err(|source| {
+        StoreError::CorruptSnapshot {
+            session_id: session_id.to_string(),
+            source,
+        }
+    })?;
+    let found = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| StoreError::CorruptSnapshotSchemaVersion {
+            session_id: session_id.to_string(),
+        })?;
+    if found != SESSION_SNAPSHOT_VERSION {
+        if (2..=LATEST_MIGRATABLE_SNAPSHOT_VERSION).contains(&found) {
+            migrate_snapshot(&mut value, found);
+        } else {
+            return Err(StoreError::UnsupportedSnapshotVersion {
+                expected: SESSION_SNAPSHOT_VERSION,
+                found,
+            });
+        }
+    }
+    let snapshot = serde_json::from_value::<SessionSnapshot>(value).map_err(|source| {
+        StoreError::CorruptSnapshot {
+            session_id: session_id.to_string(),
+            source,
+        }
+    })?;
+    Ok(snapshot)
+}
+
+fn parse_generation(session_id: &str, generation: i64) -> Result<u64, StoreError> {
+    let generation = u64::try_from(generation).map_err(|_| StoreError::CorruptGeneration {
+        session_id: session_id.to_string(),
+        value: generation,
+    })?;
+    if generation == 0 {
+        return Err(StoreError::CorruptGeneration {
+            session_id: session_id.to_string(),
+            value: 0,
+        });
+    }
+    Ok(generation)
+}
+
+fn generation_to_sql(session_id: &str, generation: u64) -> Result<i64, StoreError> {
+    i64::try_from(generation).map_err(|_| StoreError::GenerationOverflow {
+        session_id: session_id.to_string(),
+        generation,
+    })
+}
+
+fn generation_conflict(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    expected_generation: u64,
+) -> Result<StoreError, StoreError> {
+    let actual = transaction
+        .query_row(
+            "SELECT generation FROM harness_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|generation| parse_generation(session_id, generation))
+        .transpose()?;
+    Ok(StoreError::GenerationConflict {
+        session_id: session_id.to_string(),
+        expected_generation,
+        actual_generation: actual,
+    })
 }
 
 fn migrate_snapshot(value: &mut serde_json::Value, found: u32) {
@@ -142,7 +312,9 @@ fn migrate_snapshot(value: &mut serde_json::Value, found: u32) {
         "schema_version".to_string(),
         serde_json::Value::from(SESSION_SNAPSHOT_VERSION),
     );
-    if found == 4 {
+    root.entry("intent_recipe".to_string())
+        .or_insert(serde_json::Value::Null);
+    if found >= 4 {
         return;
     }
     root.entry("turn_state".to_string())
@@ -183,6 +355,18 @@ pub enum StoreError {
     CorruptSchemaVersion { value: String },
     #[error("unsupported session database schema version {found}; expected {expected}")]
     UnsupportedSchemaVersion { expected: u32, found: u32 },
+    #[error(
+        "session {session_id} generation conflict: expected {expected_generation}, actual {actual_generation:?}"
+    )]
+    GenerationConflict {
+        session_id: String,
+        expected_generation: u64,
+        actual_generation: Option<u64>,
+    },
+    #[error("session {session_id} contains corrupt generation {value}")]
+    CorruptGeneration { session_id: String, value: i64 },
+    #[error("session {session_id} generation {generation} cannot be incremented or stored")]
+    GenerationOverflow { session_id: String, generation: u64 },
     #[error("session {session_id} contains a corrupt snapshot: {source}")]
     CorruptSnapshot {
         session_id: String,
@@ -201,22 +385,40 @@ mod tests {
     use design_harness::{
         DesignSession, SessionConfig, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
     };
+    use rusqlite::Connection;
 
-    use super::{SessionStore, StoreError};
+    use super::{SessionStore, StoreError, STORE_SCHEMA_VERSION};
+
+    fn temporary_database(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "starring-design-harness-{label}-{}-{unique}.sqlite3",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn in_memory_store_roundtrips_snapshot() {
         let mut store = SessionStore::open_in_memory().unwrap();
         let snapshot = DesignSession::new(()).snapshot();
 
-        assert_eq!(SESSION_SNAPSHOT_VERSION, 5);
         assert_eq!(snapshot.schema_version, SESSION_SNAPSHOT_VERSION);
         store.save("study", &snapshot).unwrap();
 
+        let loaded = store.load_versioned("study").unwrap().unwrap();
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.snapshot, snapshot);
         assert_eq!(store.load("study").unwrap(), Some(snapshot.clone()));
         let mut updated = snapshot;
         updated.prose_nudged = true;
         store.save("study", &updated).unwrap();
+        assert_eq!(
+            store.load_versioned("study").unwrap().unwrap().generation,
+            2
+        );
         assert_eq!(store.load("study").unwrap(), Some(updated));
         let planned = DesignSession::with_planned_config((), SessionConfig::default()).snapshot();
         store.save("planned", &planned).unwrap();
@@ -226,23 +428,246 @@ mod tests {
 
     #[test]
     fn file_store_survives_close_and_reopen() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "starring-design-harness-{}-{unique}.sqlite3",
-            std::process::id()
-        ));
+        let path = temporary_database("reopen");
+        let mut snapshot = DesignSession::new(()).snapshot();
+        {
+            let mut store = SessionStore::open(&path).unwrap();
+            assert_eq!(
+                store.save_compare_and_swap("study", 0, &snapshot).unwrap(),
+                1
+            );
+            snapshot.prose_nudged = true;
+            assert_eq!(
+                store.save_compare_and_swap("study", 1, &snapshot).unwrap(),
+                2
+            );
+        }
+        let reopened = SessionStore::open(&path).unwrap();
+        let loaded = reopened.load_versioned("study").unwrap().unwrap();
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.snapshot, snapshot);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn schema_one_migrates_rows_generations_and_metadata_in_place() {
+        let path = temporary_database("migration");
+        let snapshot = DesignSession::new(()).snapshot();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE harness_metadata (
+                         key TEXT PRIMARY KEY NOT NULL,
+                         value TEXT NOT NULL
+                     );
+                     CREATE TABLE harness_sessions (
+                         session_id TEXT PRIMARY KEY NOT NULL,
+                         snapshot_json TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO harness_metadata (key, value)
+                     VALUES ('schema_version', '1'), ('retained', 'yes');",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at)
+                     VALUES (?1, ?2, 17)",
+                    ["study", serde_json::to_string(&snapshot).unwrap().as_str()],
+                )
+                .unwrap();
+        }
+
+        let mut store = SessionStore::open(&path).unwrap();
+        let loaded = store.load_versioned("study").unwrap().unwrap();
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.snapshot, snapshot);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT value FROM harness_metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            STORE_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT value FROM harness_metadata WHERE key = 'retained'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "yes"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT updated_at FROM harness_sessions WHERE session_id = 'study'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            17
+        );
+        assert_eq!(
+            store
+                .save_compare_and_swap("study", loaded.generation, &snapshot)
+                .unwrap(),
+            2
+        );
+        drop(store);
+        let reopened = SessionStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .load_versioned("study")
+                .unwrap()
+                .unwrap()
+                .generation,
+            2
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_metadata_recovers_a_legacy_session_table_atomically() {
+        let path = temporary_database("metadata-recovery");
+        let snapshot = DesignSession::new(()).snapshot();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE harness_sessions (
+                         session_id TEXT PRIMARY KEY NOT NULL,
+                         snapshot_json TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at)
+                     VALUES (?1, ?2, 29)",
+                    [
+                        "recovered",
+                        serde_json::to_string(&snapshot).unwrap().as_str(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        let loaded = store.load_versioned("recovered").unwrap().unwrap();
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.snapshot, snapshot);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT value FROM harness_metadata WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            STORE_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT updated_at FROM harness_sessions WHERE session_id = 'recovered'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            29
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn independent_writers_allow_exactly_one_generation_winner() {
+        let path = temporary_database("cas-race");
         let snapshot = DesignSession::new(()).snapshot();
         {
             let mut store = SessionStore::open(&path).unwrap();
-            store.save("study", &snapshot).unwrap();
+            assert_eq!(
+                store.save_compare_and_swap("study", 0, &snapshot).unwrap(),
+                1
+            );
         }
-        let reopened = SessionStore::open(&path).unwrap();
-        assert_eq!(reopened.load("study").unwrap(), Some(snapshot));
-        drop(reopened);
+        let mut first = SessionStore::open(&path).unwrap();
+        let mut second = SessionStore::open(&path).unwrap();
+        let first_loaded = first.load_versioned("study").unwrap().unwrap();
+        let second_loaded = second.load_versioned("study").unwrap().unwrap();
+        assert_eq!(first_loaded.generation, second_loaded.generation);
+        let mut first_snapshot = first_loaded.snapshot;
+        first_snapshot.prose_nudged = true;
+        let mut stale_snapshot = second_loaded.snapshot;
+        stale_snapshot.adaptive_enabled = false;
+
+        assert_eq!(
+            first
+                .save_compare_and_swap("study", first_loaded.generation, &first_snapshot)
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            second.save_compare_and_swap("study", second_loaded.generation, &stale_snapshot),
+            Err(StoreError::GenerationConflict {
+                expected_generation: 1,
+                actual_generation: Some(2),
+                ..
+            })
+        ));
+        let final_value = second.load_versioned("study").unwrap().unwrap();
+        assert_eq!(final_value.generation, 2);
+        assert_eq!(final_value.snapshot, first_snapshot);
+        assert_ne!(final_value.snapshot, stale_snapshot);
+
+        drop(first);
+        drop(second);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn generation_conflicts_report_presence_and_absence_without_writing() {
+        let mut store = SessionStore::open_in_memory().unwrap();
+        let snapshot = DesignSession::new(()).snapshot();
+        assert!(matches!(
+            store.save_compare_and_swap("missing", 4, &snapshot),
+            Err(StoreError::GenerationConflict {
+                expected_generation: 4,
+                actual_generation: None,
+                ..
+            })
+        ));
+        assert!(store.load_versioned("missing").unwrap().is_none());
+        assert_eq!(
+            store.save_compare_and_swap("study", 0, &snapshot).unwrap(),
+            1
+        );
+        assert!(matches!(
+            store.save_compare_and_swap("study", 0, &snapshot),
+            Err(StoreError::GenerationConflict {
+                expected_generation: 0,
+                actual_generation: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(
+            store.load_versioned("study").unwrap().unwrap().generation,
+            1
+        );
     }
 
     #[test]
@@ -415,21 +840,54 @@ mod tests {
     }
 
     #[test]
+    fn version_five_snapshots_default_the_intent_recipe_state() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let mut value = serde_json::to_value(DesignSession::new(()).snapshot()).unwrap();
+        value["schema_version"] = serde_json::json!(5);
+        value.as_object_mut().unwrap().remove("intent_recipe");
+        let observability = value["observability"].as_object_mut().unwrap();
+        for field in [
+            "intent_route_calls",
+            "intent_proposal_acceptances",
+            "intent_resolution_acceptances",
+            "intent_compile_attempts",
+            "intent_compile_successes",
+            "intent_commits",
+            "intent_rollbacks",
+            "intent_conflicts",
+            "intent_stale_revision_rejections",
+            "intent_extraction_failures",
+            "intent_fallback_routes",
+            "intent_compiled_operations",
+        ] {
+            observability.remove(field);
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO harness_sessions (session_id, snapshot_json, updated_at)
+                 VALUES (?1, ?2, 0)",
+                ["v5", value.to_string().as_str()],
+            )
+            .unwrap();
+
+        let migrated = store.load("v5").unwrap().unwrap();
+        let migrated_value = serde_json::to_value(&migrated).unwrap();
+        assert_eq!(migrated.schema_version, SESSION_SNAPSHOT_VERSION);
+        assert_eq!(migrated_value["intent_recipe"], serde_json::Value::Null);
+        assert_eq!(migrated.observability.intent_route_calls, 0);
+        assert!(migrated.observability.intent_fallback_routes.is_empty());
+    }
+
+    #[test]
     fn database_schema_version_mismatch_is_typed() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "starring-design-harness-schema-{}-{unique}.sqlite3",
-            std::process::id()
-        ));
+        let path = temporary_database("schema");
         {
             let store = SessionStore::open(&path).unwrap();
             store
                 .connection
                 .execute(
-                    "UPDATE harness_metadata SET value = '2' WHERE key = 'schema_version'",
+                    "UPDATE harness_metadata SET value = '3' WHERE key = 'schema_version'",
                     [],
                 )
                 .unwrap();
@@ -437,8 +895,8 @@ mod tests {
         assert!(matches!(
             SessionStore::open(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                expected: 1,
-                found: 2
+                expected: 2,
+                found: 3
             })
         ));
         std::fs::remove_file(path).unwrap();

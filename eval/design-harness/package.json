@@ -3,10 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "check": "npm test && node --check provider.js && node --check assertions.js && node --check summarize.js && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate -c promptfooconfig.yaml",
+    "accept:intent": "node acceptance.js",
+    "check": "npm test && node --check provider.js && node --check assertions.js && node --check intent-assertions.js && node --check acceptance.js && node --check summarize.js && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate -c promptfooconfig.yaml && PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo validate -c promptfooconfig.intent.yaml",
     "eval": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval -c promptfooconfig.yaml -j 1 --no-cache --no-share --no-write",
+    "eval:intent": "PROMPTFOO_DISABLE_TELEMETRY=1 promptfoo eval -c promptfooconfig.intent.yaml -j 1 --no-cache --no-share --no-write",
     "summarize": "node summarize.js",
-    "test": "node --test assertions.test.js provider.test.js summarize.test.js"
+    "test": "node --test acceptance.test.js assertions.test.js intent-assertions.test.js provider.test.js summarize.test.js"
   },
   "devDependencies": {
     "promptfoo": "0.121.18"

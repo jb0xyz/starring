@@ -22,6 +22,12 @@ jobs:
           cache: false
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: eval/design-harness/package-lock.json
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build workspace
@@ -32,6 +38,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build unsafe development activation
         run: cargo build -p interaction-smoke --features unsafe-dev-activation
+      - name: Install design harness evaluation dependencies
+        run: npm --prefix eval/design-harness ci
+      - name: Check design harness evaluations
+        run: npm --prefix eval/design-harness run check
 
   postgres:
     runs-on: ubuntu-latest

@@ -182,6 +182,14 @@ enum ReferenceInput {
     Existing { name: String },
 }
 
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RoleReferenceInput {
+    Created { name: String },
+    Existing { name: String },
+    InstanceEvent { alias: String },
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum OverwriteTargetKindInput {
@@ -193,7 +201,7 @@ enum OverwriteTargetKindInput {
 #[serde(deny_unknown_fields)]
 struct AddGrantRoleActionInput {
     rule_key: String,
-    role: ReferenceInput,
+    role: RoleReferenceInput,
     target: ActorTargetInput,
 }
 
@@ -263,7 +271,7 @@ enum ActionPatchInput {
         name: String,
     },
     GrantRole {
-        role: ReferenceInput,
+        role: RoleReferenceInput,
         target: ActorTargetInput,
     },
     RespondEphemeral {

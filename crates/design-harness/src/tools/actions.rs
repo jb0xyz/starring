@@ -12,7 +12,7 @@ use super::{
     ActionSelectorInput, ActorTargetInput, AddGrantRoleActionInput, AddPostPanelActionInput,
     AddUpsertOverwriteActionInput, ButtonRouteInput, InteractionActionInput,
     OverwriteTargetKindInput, ReferenceInput, RemoveActionInput, ResourceActionInput,
-    UpdateActionInput, PENDING_INSTANCE_REFERENCE,
+    RoleReferenceInput, UpdateActionInput, PENDING_INSTANCE_REFERENCE,
 };
 
 pub(super) fn add_resource_action(
@@ -310,12 +310,16 @@ fn pending_button_route(input: ButtonRouteInput) -> ButtonRoute {
     }
 }
 
-fn role_reference(input: ReferenceInput) -> Result<RoleRef, StructuredError> {
+fn role_reference(input: RoleReferenceInput) -> Result<RoleRef, StructuredError> {
     match input {
-        ReferenceInput::Created { name } => Ok(RoleRef::Created(CreatedRef { created: name })),
-        ReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
+        RoleReferenceInput::Created { name } => Ok(RoleRef::Created(CreatedRef { created: name })),
+        RoleReferenceInput::Existing { name } => serde_json::from_value(Value::String(name))
             .map(RoleRef::Existing)
             .map_err(reference_conversion_error),
+        RoleReferenceInput::InstanceEvent { alias } => Ok(RoleRef::Instance {
+            instance: InstanceRef::Event,
+            alias,
+        }),
     }
 }
 

@@ -1,9 +1,12 @@
 pub mod adapter;
 pub mod event;
+mod execution;
 pub mod interpret;
 pub mod mock;
+pub mod modal_input;
 pub mod plan;
 pub mod policy;
+mod prepare;
 pub mod run;
 pub mod template;
 pub mod validate;
@@ -21,6 +24,7 @@ pub use mock::{
     MockInstanceTeardownService, MockInteractionResponder, MockMutationAdapter, MutationCall,
     ResponderCall,
 };
+pub use modal_input::{normalize_modal_submit_inputs, ModalInputError};
 pub use plan::{
     ActionPlan, CreatedResource, ModalPresentation, PlannedAction, PlannedChannel,
     PlannedOverwriteTarget, PlannedRole, ResponseDeliveryOutcome, RunResult, TeardownActionResult,

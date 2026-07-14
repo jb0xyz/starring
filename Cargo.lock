@@ -590,6 +590,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
@@ -598,10 +599,13 @@ name = "design-harness-cli"
 version = "0.1.0"
 dependencies = [
  "design-harness",
+ "desired-state",
+ "discord-model",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
 ]

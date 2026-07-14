@@ -30,6 +30,9 @@ fn modal() -> ModalSpec {
             label: "Room".to_string(),
             style: ModalFieldStyle::Short,
             required: true,
+            min_length: None,
+            max_length: None,
+            input_policy: automation_state::ModalInputPolicy::Preserve,
         }],
     }
 }
