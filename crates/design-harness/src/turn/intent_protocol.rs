@@ -3,7 +3,10 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use crate::errors::{translate_tool_arguments_error, StructuredError};
-use crate::intent::{ExistingChannelKey, PrivateStudyRoomProposalV1};
+use crate::intent::{
+    ExistingChannelKey, IntentLocaleV1, IntentRequestedOutcome, PrivateStudyRoomControlsProposalV1,
+    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1,
+};
 use crate::tools::ToolDefinition;
 
 const ROUTE_INTENT_TURN: &str = "route_intent_turn";
@@ -49,19 +52,66 @@ enum IntentRouteKindV1 {
     Discussion,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PrivateStudyRoomRequestedOutcomeV1 {
+    WorkingDraft,
+    ValidatedPreview,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrivateStudyRoomProposalWireV1 {
+    #[schemars(description = "Concise summary of the complete requested automation")]
+    objective: String,
+    #[schemars(description = "Exact build result: working_draft or validated_preview")]
+    requested_outcome: PrivateStudyRoomRequestedOutcomeV1,
+    #[serde(default)]
+    #[schemars(description = "Exact available channel key explicitly selected by the human")]
+    hub_channel: Option<ExistingChannelKey>,
+    #[serde(default)]
+    locale: Option<IntentLocaleV1>,
+    #[serde(default)]
+    copy: PrivateStudyRoomCopyProposalV1,
+    #[serde(default)]
+    naming: PrivateStudyRoomNamingProposalV1,
+    #[serde(default)]
+    controls: PrivateStudyRoomControlsProposalV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RouteIntentTurnWireV1 {
     expected_revision: u64,
     route: IntentRouteKindV1,
     #[serde(default)]
-    proposal: Option<Box<PrivateStudyRoomProposalV1>>,
+    proposal: Option<Box<PrivateStudyRoomProposalWireV1>>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     response: Option<String>,
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteIntentTurnShapeProbeV1 {
+    #[serde(rename = "expected_revision")]
+    _expected_revision: Value,
+    route: Value,
+    #[serde(default)]
+    #[serde(rename = "proposal")]
+    _proposal: Option<Value>,
+    #[serde(default)]
+    #[serde(rename = "reason")]
+    _reason: Option<Value>,
+    #[serde(default)]
+    #[serde(rename = "response")]
+    _response: Option<Value>,
+    #[serde(default)]
+    #[serde(rename = "capabilities")]
+    _capabilities: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -74,7 +124,7 @@ pub struct ResolveIntentDecisionInputV1 {
 pub fn route_intent_turn_frontier() -> [ToolDefinition; 1] {
     [definition::<RouteIntentTurnWireV1>(
         ROUTE_INTENT_TURN,
-        "Route this user turn exactly once. Set route to private_study_room and proposal to the user-facing study-room fields for the managed recipe. Summarize the full automation in proposal.objective. Set proposal.requested_outcome to exactly discussion, working_draft, or validated_preview. Otherwise set route to typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields that do not belong to the selected route",
+        "Route this user turn exactly once. Set route to private_study_room and proposal to the user-facing study-room fields for the managed recipe. Summarize the full automation in proposal.objective. Set proposal.requested_outcome to exactly working_draft or validated_preview. Use the top-level discussion route when no build is requested. Otherwise set route to typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields that do not belong to the selected route",
     )]
 }
 
@@ -86,23 +136,25 @@ pub fn resolve_intent_decision_frontier() -> [ToolDefinition; 1] {
 }
 
 pub fn parse_route_intent_turn(arguments: &str) -> Result<RouteIntentTurnInputV1, StructuredError> {
-    let value = serde_json::from_str::<Value>(arguments).map_err(|error| {
-        translate_tool_arguments_error(
-            ROUTE_INTENT_TURN,
-            &error,
-            &schema_value::<RouteIntentTurnWireV1>(),
-        )
-    })?;
-    if value.get("route").is_some_and(Value::is_object) {
-        return serde_json::from_value::<RouteIntentTurnInputV1>(value).map_err(|error| {
+    let probe =
+        serde_json::from_str::<RouteIntentTurnShapeProbeV1>(arguments).map_err(|error| {
+            translate_tool_arguments_error(
+                ROUTE_INTENT_TURN,
+                &error,
+                &schema_value::<RouteIntentTurnWireV1>(),
+            )
+        })?;
+    if probe.route.is_object() {
+        let input = serde_json::from_str::<RouteIntentTurnInputV1>(arguments).map_err(|error| {
             translate_tool_arguments_error(
                 ROUTE_INTENT_TURN,
                 &error,
                 &schema_value::<RouteIntentTurnInputV1>(),
             )
-        });
+        })?;
+        return ensure_build_outcome(input);
     }
-    let wire = serde_json::from_value::<RouteIntentTurnWireV1>(value).map_err(|error| {
+    let wire = serde_json::from_str::<RouteIntentTurnWireV1>(arguments).map_err(|error| {
         translate_tool_arguments_error(
             ROUTE_INTENT_TURN,
             &error,
@@ -153,7 +205,7 @@ impl RouteIntentTurnWireV1 {
         } = self;
         let route = match route {
             IntentRouteKindV1::PrivateStudyRoom => IntentRouteInputV1::PrivateStudyRoom {
-                proposal: required_route_field(proposal, "proposal")?,
+                proposal: Box::new((*required_route_field(proposal, "proposal")?).into()),
             },
             IntentRouteKindV1::TypedPlanner => IntentRouteInputV1::TypedPlanner {
                 reason: required_route_field(reason, "reason")?,
@@ -216,6 +268,45 @@ impl RouteIntentTurnWireV1 {
             "Omit payload fields for other routes",
         ))
     }
+}
+
+impl From<PrivateStudyRoomProposalWireV1> for PrivateStudyRoomProposalV1 {
+    fn from(value: PrivateStudyRoomProposalWireV1) -> Self {
+        Self {
+            objective: value.objective,
+            requested_outcome: match value.requested_outcome {
+                PrivateStudyRoomRequestedOutcomeV1::WorkingDraft => {
+                    IntentRequestedOutcome::WorkingDraft
+                }
+                PrivateStudyRoomRequestedOutcomeV1::ValidatedPreview => {
+                    IntentRequestedOutcome::ValidatedPreview
+                }
+            },
+            hub_channel: value.hub_channel,
+            locale: value.locale,
+            copy: value.copy,
+            naming: value.naming,
+            controls: value.controls,
+        }
+    }
+}
+
+fn ensure_build_outcome(
+    input: RouteIntentTurnInputV1,
+) -> Result<RouteIntentTurnInputV1, StructuredError> {
+    if matches!(
+        &input.route,
+        IntentRouteInputV1::PrivateStudyRoom { proposal }
+            if proposal.requested_outcome == IntentRequestedOutcome::Discussion
+    ) {
+        return Err(StructuredError::new(
+            "INVALID_ROUTE_PAYLOAD",
+            format!("tool.{ROUTE_INTENT_TURN}.arguments.proposal.requested_outcome"),
+            "private_study_room requires a build outcome",
+            "Use working_draft or validated_preview, or use the top-level discussion route",
+        ));
+    }
+    Ok(input)
 }
 
 fn required_route_field<T>(value: Option<T>, field: &str) -> Result<T, StructuredError> {
@@ -286,6 +377,13 @@ mod tests {
                 "typed_planner".to_string(),
             ])
         );
+        assert_eq!(
+            enum_strings(
+                find_property(&frontier[0].parameters, "requested_outcome").unwrap(),
+                &frontier[0].parameters,
+            ),
+            BTreeSet::from(["validated_preview".to_string(), "working_draft".to_string(),])
+        );
     }
 
     #[test]
@@ -344,6 +442,37 @@ mod tests {
             parsed.route,
             IntentRouteInputV1::PrivateStudyRoom { .. }
         ));
+    }
+
+    #[test]
+    fn route_parser_rejects_duplicate_fields_before_shape_detection() {
+        for arguments in [
+            r#"{"expected_revision":0,"expected_revision":1,"route":"discussion","response":"ok"}"#,
+            r#"{"expected_revision":0,"route":"discussion","route":"reject","response":"ok"}"#,
+            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"objective":"room","objective":"other","requested_outcome":"working_draft"}}"#,
+            r#"{"expected_revision":0,"route":{"kind":"discussion","kind":"reject","response":"ok"}}"#,
+        ] {
+            assert_eq!(
+                parse_route_intent_turn(arguments).unwrap_err().code,
+                "INVALID_TOOL_ARGUMENTS"
+            );
+        }
+    }
+
+    #[test]
+    fn private_room_discussion_outcome_is_not_a_build_route() {
+        let flat = parse_route_intent_turn(
+            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"objective":"compare options","requested_outcome":"discussion"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(flat.code, "INVALID_TOOL_ARGUMENTS");
+
+        let nested = parse_route_intent_turn(
+            r#"{"expected_revision":0,"route":{"kind":"private_study_room","proposal":{"objective":"compare options","requested_outcome":"discussion"}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(nested.code, "INVALID_ROUTE_PAYLOAD");
+        assert!(nested.location.ends_with(".proposal.requested_outcome"));
     }
 
     #[test]
@@ -448,6 +577,21 @@ mod tests {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect()
+    }
+
+    fn find_property<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+        if let Some(property) = value
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(name))
+        {
+            return Some(property);
+        }
+        match value {
+            Value::Array(values) => values.iter().find_map(|value| find_property(value, name)),
+            Value::Object(values) => values.values().find_map(|value| find_property(value, name)),
+            _ => None,
+        }
     }
 
     fn collect_property_names(value: &Value, names: &mut BTreeSet<String>) {

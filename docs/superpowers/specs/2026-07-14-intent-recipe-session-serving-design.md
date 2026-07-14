@@ -32,7 +32,7 @@ reject
 discussion
 ```
 
-The model-facing wire uses a top-level string `route` and sibling payload fields. A private-room proposal is `{expected_revision, route: "private_study_room", proposal}`. Fallback routes use only their matching `reason`, `response`, or `capabilities` fields. The parser accepts the earlier nested route object for snapshot and client compatibility, but the generated frontier contains no `oneOf` and never asks Gemma to construct the nested form.
+The model-facing wire uses a top-level string `route` and sibling payload fields. A private-room proposal is `{expected_revision, route: "private_study_room", proposal}` and its outcome is limited to `working_draft` or `validated_preview`; non-mutating conversation uses the top-level `discussion` route. Fallback routes use only their matching `reason`, `response`, or `capabilities` fields. The parser accepts the earlier nested route object for snapshot and client compatibility, but the generated frontier contains no `oneOf` and never asks Gemma to construct the nested form. Shape detection must preserve strict JSON semantics: duplicate fields at the top level or inside either wire form are rejected before execution.
 
 The only model-facing harness state is `expected_revision`. The schema never contains the intent schema version, durable workspace, feature identifier, recipe identifier, provenance, raw actions, permission bits, instance manifests, RuleSet JSON, publication, approval, deployment, or activation fields.
 
