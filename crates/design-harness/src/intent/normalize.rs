@@ -36,6 +36,10 @@ impl ValidatedIntentV1 {
     pub fn requested_outcome(&self) -> super::model::IntentRequestedOutcome {
         self.0.requested_outcome
     }
+
+    pub(super) fn resolved(&self) -> &ResolvedIntentV1 {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]

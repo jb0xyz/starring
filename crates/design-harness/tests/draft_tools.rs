@@ -80,7 +80,10 @@ fn model_facing_reference_schemas_are_tagged() {
     let definitions = tool_definitions();
     let expected = [
         ("add_button", &["static", "instance_action"][..]),
-        ("add_grant_role_action", &["created", "existing"][..]),
+        (
+            "add_grant_role_action",
+            &["created", "existing", "instance_event"][..],
+        ),
         ("add_upsert_overwrite_action", &["created", "existing"][..]),
         (
             "add_post_panel_action",
@@ -121,7 +124,7 @@ fn begin_rule_schema_is_flat() {
 }
 
 #[test]
-fn permission_tool_schemas_are_flat_and_share_reference_shape() {
+fn permission_tool_schemas_are_flat_and_bound_instance_roles_to_grants() {
     let definitions = tool_definitions();
     let grant = definitions
         .iter()
@@ -145,13 +148,48 @@ fn permission_tool_schemas_are_flat_and_share_reference_shape() {
     assert!(overwrite_properties.contains_key("role"));
     assert!(!overwrite_properties.contains_key("kind"));
 
-    let schema = format!("{}{}", grant.parameters, overwrite.parameters);
-    assert!(schema.contains("\"name\""));
-    assert!(schema.contains("\"everyone\""));
-    assert!(schema.contains("\"role\""));
-    assert!(!schema.contains("\"alias\""));
-    assert!(!schema.contains("\"binding\""));
-    assert!(!schema.contains("OverwriteTargetInput"));
+    let grant_schema = grant.parameters.to_string();
+    let overwrite_schema = overwrite.parameters.to_string();
+    assert!(grant_schema.contains("\"name\""));
+    assert!(grant_schema.contains("\"alias\""));
+    assert!(grant_schema.contains("\"instance_event\""));
+    assert!(overwrite_schema.contains("\"everyone\""));
+    assert!(overwrite_schema.contains("\"role\""));
+    assert!(!overwrite_schema.contains("\"alias\""));
+    assert!(!overwrite_schema.contains("\"instance_event\""));
+    assert!(!overwrite_schema.contains("\"binding\""));
+    assert!(!overwrite_schema.contains("OverwriteTargetInput"));
+}
+
+#[test]
+fn grant_role_accepts_only_the_current_instance_event_alias() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "begin_rule",
+        json!({"key":"join_room","trigger_kind":"instance_action","trigger_ref":"join"}),
+    )
+    .is_ok());
+    assert!(call(
+        &mut draft,
+        "add_grant_role_action",
+        json!({
+            "rule_key":"join_room",
+            "role":{"kind":"instance_event","alias":"member_role"},
+            "target":"actor"
+        }),
+    )
+    .is_ok());
+    assert!(matches!(
+        &draft.ruleset.rules[0].actions[0],
+        ActionSpec::GrantRole {
+            role: RoleRef::Instance {
+                instance: InstanceRef::Event,
+                alias,
+            },
+            ..
+        } if alias == "member_role"
+    ));
 }
 
 #[test]

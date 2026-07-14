@@ -416,6 +416,18 @@ fn validate_dependencies(
         .iter()
         .map(|rule| rule.key.clone())
         .collect::<BTreeSet<_>>();
+    let mut instance_action_rules = draft
+        .ruleset
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            matches!(
+                &rule.trigger,
+                automation_state::TriggerSpec::InstanceAction { .. }
+            )
+            .then_some(rule.key.clone())
+        })
+        .collect::<BTreeSet<_>>();
     let mut button_components = draft
         .ruleset
         .panels
@@ -474,6 +486,9 @@ fn validate_dependencies(
                     )?,
                     ScopeTrigger::InstanceAction { .. } => {}
                 }
+                if matches!(trigger, ScopeTrigger::InstanceAction { .. }) {
+                    instance_action_rules.insert(key.clone());
+                }
                 rules.insert(key.clone());
             }
             ScopeRequirement::Action {
@@ -489,9 +504,12 @@ fn validate_dependencies(
                     index,
                     rule_key,
                     action,
-                    &modals,
-                    &resources,
-                    &registrations,
+                    ActionDependencyContext {
+                        modals: &modals,
+                        resources: &resources,
+                        registrations: &registrations,
+                        instance_action_rules: &instance_action_rules,
+                    },
                 )?;
                 if let ScopeAction::PostPanel { buttons, .. } = action {
                     for button in buttons {
@@ -508,30 +526,40 @@ fn validate_dependencies(
     Ok(())
 }
 
+struct ActionDependencyContext<'a> {
+    modals: &'a BTreeSet<String>,
+    resources: &'a BTreeMap<String, RuleResources>,
+    registrations: &'a BTreeMap<String, PlannedRegistration>,
+    instance_action_rules: &'a BTreeSet<String>,
+}
+
 fn validate_action_dependencies(
     requirement: &ScopeRequirement,
     requirement_index: usize,
     rule_key: &str,
     action: &ScopeAction,
-    modals: &BTreeSet<String>,
-    resources: &BTreeMap<String, RuleResources>,
-    registrations: &BTreeMap<String, PlannedRegistration>,
+    context: ActionDependencyContext<'_>,
 ) -> Result<(), StructuredError> {
     let empty = RuleResources::default();
-    let available = resources.get(rule_key).unwrap_or(&empty);
+    let available = context.resources.get(rule_key).unwrap_or(&empty);
     match action {
         ScopeAction::OpenModal { modal } => require_symbol(
-            modals.contains(modal),
+            context.modals.contains(modal),
             requirement,
             format!("modal {modal}"),
         )?,
-        ScopeAction::GrantRole { role, .. } => require_role(requirement, role, available)?,
+        ScopeAction::GrantRole { role, .. } => require_role(
+            requirement,
+            role,
+            available,
+            context.instance_action_rules.contains(rule_key),
+        )?,
         ScopeAction::UpsertOverwrite {
             channel, target, ..
         } => {
             require_channel(requirement, channel, available)?;
             if let ScopeOverwriteTarget::Role { role } = target {
-                require_role(requirement, role, available)?;
+                require_role(requirement, role, available, false)?;
             }
         }
         ScopeAction::PostPanel {
@@ -545,7 +573,7 @@ fn validate_action_dependencies(
                         requirement_index,
                         rule_key,
                         instance,
-                        registrations,
+                        context.registrations,
                     )?;
                 }
             }
@@ -1028,6 +1056,7 @@ fn require_role(
     requirement: &ScopeRequirement,
     reference: &ScopeRoleRef,
     resources: &RuleResources,
+    allow_instance_event: bool,
 ) -> Result<(), StructuredError> {
     match reference {
         ScopeRoleRef::Created { name } => require_symbol(
@@ -1040,11 +1069,33 @@ fn require_role(
             requirement,
             "a non-empty existing role".to_string(),
         ),
-        ScopeRoleRef::Instance { .. } => Err(unsupported_reference(
+        ScopeRoleRef::Instance {
+            instance: ScopeInstanceRef::Event,
+            alias,
+        } if allow_instance_event && valid_instance_alias(alias) => Ok(()),
+        ScopeRoleRef::Instance {
+            instance: ScopeInstanceRef::Event,
+            ..
+        } => Err(unsupported_reference(
             requirement,
-            "instance role references are not supported by additive plan compilation",
+            "an instance-event role alias is valid only in an instance-action rule and must contain 1 to 32 ASCII letters, digits, underscores, or hyphens",
+        )),
+        ScopeRoleRef::Instance {
+            instance: ScopeInstanceRef::Created { .. },
+            ..
+        } => Err(unsupported_reference(
+            requirement,
+            "created instance role references are not supported by additive plan compilation",
         )),
     }
+}
+
+fn valid_instance_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 32
+        && alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 fn require_post_panel_instance(
@@ -1623,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_references_the_existing_add_tools_cannot_compile() {
+    fn plan_allows_only_instance_event_roles_in_instance_action_rules() {
         let mut draft = Draft::new();
         draft.ruleset = serde_json::from_value(json!({
             "version":1,
@@ -1650,8 +1701,63 @@ mod tests {
             },
             "minimum":1
         }))];
+        let normalized = normalize_turn_plan(&draft, &brief(), instance_role)
+            .expect("instance event role should normalize in an instance action rule");
+        assert_eq!(normalized.len(), 2);
+
+        let invalid_alias = vec![requirement(json!({
+            "kind":"action",
+            "id":"grant",
+            "rule_key":"room",
+            "action":{
+                "kind":"grant_role",
+                "role":{"kind":"instance","instance":{"kind":"event"},"alias":"bad alias"},
+                "target":"actor"
+            },
+            "minimum":1
+        }))];
         assert_eq!(
-            normalize_turn_plan(&draft, &brief(), instance_role)
+            normalize_turn_plan(&draft, &brief(), invalid_alias)
+                .unwrap_err()
+                .code,
+            "TURN_PLAN_UNSUPPORTED_REFERENCE"
+        );
+
+        let mut non_instance_draft = draft.clone();
+        non_instance_draft.ruleset.rules[0].trigger = automation_state::TriggerSpec::ButtonClick {
+            component: "join".to_string(),
+        };
+        let non_instance_role = vec![requirement(json!({
+            "kind":"action",
+            "id":"grant",
+            "rule_key":"room",
+            "action":{
+                "kind":"grant_role",
+                "role":{"kind":"instance","instance":{"kind":"event"},"alias":"member_role"},
+                "target":"actor"
+            },
+            "minimum":1
+        }))];
+        assert_eq!(
+            normalize_turn_plan(&non_instance_draft, &brief(), non_instance_role)
+                .unwrap_err()
+                .code,
+            "TURN_PLAN_UNSUPPORTED_REFERENCE"
+        );
+
+        let created_instance = vec![requirement(json!({
+            "kind":"action",
+            "id":"grant",
+            "rule_key":"room",
+            "action":{
+                "kind":"grant_role",
+                "role":{"kind":"instance","instance":{"kind":"created","name":"room_instance"},"alias":"member_role"},
+                "target":"actor"
+            },
+            "minimum":1
+        }))];
+        assert_eq!(
+            normalize_turn_plan(&draft, &brief(), created_instance)
                 .unwrap_err()
                 .code,
             "TURN_PLAN_UNSUPPORTED_REFERENCE"

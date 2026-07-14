@@ -472,9 +472,17 @@ fn role_reference(
     match reference {
         ScopeRoleRef::Created { name } => Ok(json!({"kind":"created","name":name})),
         ScopeRoleRef::Existing { name } => Ok(json!({"kind":"existing","name":name})),
-        ScopeRoleRef::Instance { .. } => {
-            Err(unsupported(requirement_id, "instance role reference"))
-        }
+        ScopeRoleRef::Instance {
+            instance: ScopeInstanceRef::Event,
+            alias,
+        } => Ok(json!({"kind":"instance_event","alias":alias})),
+        ScopeRoleRef::Instance {
+            instance: ScopeInstanceRef::Created { .. },
+            ..
+        } => Err(unsupported(
+            requirement_id,
+            "created instance role reference",
+        )),
     }
 }
 
@@ -733,8 +741,8 @@ mod tests {
     use serde_json::json;
 
     use crate::turn::{
-        RequestedOutcome, ScopeInstanceResources, ScopeManifestEntry, ScopePermission,
-        SimulationProfile, TurnVerification,
+        RequestedOutcome, ScopeActionTarget, ScopeInstanceResources, ScopeManifestEntry,
+        ScopePermission, SimulationProfile, TurnVerification,
     };
 
     use super::*;
@@ -822,6 +830,67 @@ mod tests {
         .unwrap();
         draft.draft_revision = 2;
         draft
+    }
+
+    #[test]
+    fn atomic_plan_lowers_the_bounded_instance_event_role_reference() {
+        block_on(async {
+            let draft = Draft::new();
+            let brief = brief(vec![
+                ScopeRequirement::Rule {
+                    id: "join_rule".to_string(),
+                    key: "join_room".to_string(),
+                    trigger: ScopeTrigger::InstanceAction {
+                        action: "join".to_string(),
+                    },
+                },
+                ScopeRequirement::Action {
+                    id: "join_defer".to_string(),
+                    rule_key: "join_room".to_string(),
+                    action: ScopeAction::DeferEphemeral,
+                    minimum: 1,
+                },
+                ScopeRequirement::Action {
+                    id: "join_grant".to_string(),
+                    rule_key: "join_room".to_string(),
+                    action: ScopeAction::GrantRole {
+                        role: ScopeRoleRef::Instance {
+                            instance: ScopeInstanceRef::Event,
+                            alias: "member_role".to_string(),
+                        },
+                        target: ScopeActionTarget::Actor,
+                    },
+                    minimum: 1,
+                },
+                ScopeRequirement::Action {
+                    id: "join_response".to_string(),
+                    rule_key: "join_room".to_string(),
+                    action: ScopeAction::EditResponse {
+                        content: "Joined".to_string(),
+                    },
+                    minimum: 1,
+                },
+                ScopeRequirement::NoUnresolvedReferences {
+                    id: "refs".to_string(),
+                },
+            ]);
+
+            let execution = execute_plan_atomically(&draft, &brief, 4)
+                .await
+                .expect("bounded instance event role should lower");
+
+            assert!(check_scope(&execution.draft, &brief).ok);
+            assert!(matches!(
+                &execution.draft.ruleset.rules[0].actions[1],
+                ActionSpec::GrantRole {
+                    role: automation_state::RoleRef::Instance {
+                        instance: InstanceRef::Event,
+                        alias,
+                    },
+                    ..
+                } if alias == "member_role"
+            ));
+        });
     }
 
     #[test]
