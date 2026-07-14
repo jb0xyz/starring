@@ -125,23 +125,20 @@ The existing workspace preparation, compiler, validator, simulator, atomic candi
 
 Only a pinned StudyRoom with nonempty `detail_facets` exposes `extract_private_study_room_details`.
 
-The harness supplies the pinned recipe identity, Core semantic digest, current revision, original human request, and harness-owned detail facets. The model cannot change route, recipe, requested outcome, selected binding, locale, authorization, runtime requirements, or safety boundaries.
+The harness retains the pinned recipe identity, Core semantic digest, and current revision outside the model frontier. The model receives the original human request and harness-owned detail facets. It cannot change route, recipe, requested outcome, selected binding, locale, authorization, runtime requirements, or safety boundaries.
 
 ```text
-expected_revision
-core_semantic_digest
-copy
-naming
-controls
-covered_facets[]
-unmapped_facets[]
+copy?
+naming?
+controls?
+unmapped_facets[]?
 ```
 
-Each selected facet must appear exactly once in either `covered_facets` or `unmapped_facets`.
+Unrequested objects may be omitted. Each requested facet must have at least one normalized value in its matching object. A nonempty `unmapped_facets` list fails closed. After structural validation, the harness stamps the active revision, Core semantic digest, and canonical selected facets into the internal detail object. The model never authors binding or coverage metadata.
 
 The detail result is rejected without mutation when:
 
-- a selected facet is missing, duplicated, unknown, or mapped to another facet;
+- a selected facet is missing, duplicated in the harness ticket, unknown, empty, or mapped to another facet;
 - an unmapped facet remains;
 - a value exceeds the existing recipe bounds;
 - a control contradicts the adjudicated close authorization;
@@ -150,7 +147,7 @@ The detail result is rejected without mutation when:
 
 Defaults may fill unrequested fields. Defaults never fill a requested but missing detail.
 
-The first generated StudyRoom detail schema is 2,218 bytes and must remain at or below 2,400 bytes.
+The reduced StudyRoom detail schema is 2,024 bytes and must remain at or below 2,100 bytes.
 
 ## State and atomicity
 

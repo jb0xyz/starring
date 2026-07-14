@@ -200,7 +200,7 @@ fn private_room_with_copy_details(
     let mut value = private_room_value(expected_revision, hub);
     value["custom_detail_facets"] = json!(["custom_copy"]);
     let core = parse_interpret_intent_core(&value.to_string()).unwrap();
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) =
+    let IntentCoreAdjudicationV3::PrivateStudyRoom(_selection) =
         adjudicate_intent_core_v3(core).unwrap()
     else {
         panic!("expected private study-room selection")
@@ -209,12 +209,9 @@ fn private_room_with_copy_details(
         "details",
         "extract_private_study_room_details",
         json!({
-            "expected_revision": expected_revision,
-            "core_semantic_digest": selection.semantic_ir_digest(),
             "copy": {"create_button_label": "Start exact focus"},
             "naming": {},
             "controls": {},
-            "covered_facets": ["copy"],
             "unmapped_facets": []
         }),
     );
@@ -393,19 +390,22 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(detail_anchor["expected_revision"], 0);
-        assert_eq!(detail_anchor["detail_facets"], json!(["copy"]));
+        assert_eq!(detail_anchor, json!({"detail_facets": ["copy"]}));
+        let detail_request_result: serde_json::Value =
+            serde_json::from_str(&calls[1].0[calls[1].0.len() - 2].content).unwrap();
         assert_eq!(
-            detail_anchor["core_semantic_digest"]
-                .as_str()
-                .unwrap()
-                .len(),
-            64
+            detail_request_result,
+            json!({
+                "detail_facets": ["copy"],
+                "ok": true,
+                "status": "details_required"
+            })
         );
         assert_eq!(session.observability.model_calls, 2);
         assert_eq!(session.observability.tool_calls, 2);
         assert_eq!(session.observability.intent_commits, 1);
-        let snapshot = serde_json::to_value(session.snapshot()).unwrap();
+        let durable_snapshot = session.snapshot();
+        let snapshot = serde_json::to_value(&durable_snapshot).unwrap();
         assert_eq!(
             snapshot["intent_recipe"]["stage"]["recipe_evidence"]["extraction_mode"],
             "model_detail"
@@ -414,6 +414,15 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
             snapshot["intent_recipe"]["stage"]["recipe_evidence"]["detail_facets"],
             json!(["copy"])
         );
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            durable_snapshot,
+            bindings("community_hub", "700"),
+        )
+        .unwrap();
+        assert_eq!(restored.draft, session.draft);
+        assert_eq!(receipt(&restored), receipt(&session));
     });
 }
 

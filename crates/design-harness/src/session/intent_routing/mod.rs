@@ -5,7 +5,6 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::errors::{StructuredError, ToolResult};
-use crate::intent::{PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION};
 use crate::llm::{LlmClient, LlmResponse, Message, ToolCall};
 use crate::turn::{
     private_study_room_details_frontier, IntentRecipeDetailFacetV3,
@@ -66,10 +65,6 @@ struct IntentStateAnchorV1 {
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct IntentDetailStateAnchorV3<'a> {
-    expected_revision: u64,
-    core_semantic_digest: &'a str,
-    recipe_id: &'static str,
-    recipe_version: u32,
     detail_facets: &'a [IntentRecipeDetailFacetV3],
 }
 
@@ -298,10 +293,6 @@ impl<C> DesignSession<C> {
         selection: &'a PrivateStudyRoomSelectionV3,
     ) -> Result<(IntentDetailStateAnchorV3<'a>, String), StructuredError> {
         let state = IntentDetailStateAnchorV3 {
-            expected_revision: selection.expected_revision(),
-            core_semantic_digest: selection.semantic_ir_digest(),
-            recipe_id: PRIVATE_STUDY_ROOM_RECIPE_ID,
-            recipe_version: PRIVATE_STUDY_ROOM_RECIPE_VERSION,
             detail_facets: selection.detail_facets(),
         };
         let content = serde_json::to_string(&state).map_err(|error| {
@@ -413,10 +404,6 @@ impl<C: LlmClient> DesignSession<C> {
                             json!({
                                 "ok": true,
                                 "status": "details_required",
-                                "expected_revision": detail_state.expected_revision,
-                                "core_semantic_digest": detail_state.core_semantic_digest,
-                                "recipe_id": detail_state.recipe_id,
-                                "recipe_version": detail_state.recipe_version,
                                 "detail_facets": detail_state.detail_facets,
                             })
                             .to_string(),

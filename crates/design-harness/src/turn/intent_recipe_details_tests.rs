@@ -11,16 +11,10 @@ const CORE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 fn valid_copy_details() -> Value {
     json!({
-        "expected_revision": 0,
-        "core_semantic_digest": CORE_DIGEST,
         "copy": {
             "create_button_label": "Start focus room",
             "welcome_content": {"prefix": "Welcome to ", "suffix": ""}
-        },
-        "naming": {},
-        "controls": {},
-        "covered_facets": ["copy"],
-        "unmapped_facets": []
+        }
     })
 }
 
@@ -28,18 +22,7 @@ fn valid_copy_details() -> Value {
 fn detail_frontier_is_one_closed_recipe_specific_tool() {
     let [tool] = private_study_room_details_frontier();
     assert_eq!(tool.name, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS);
-    assert_eq!(
-        required_names(&tool.parameters),
-        strings([
-            "controls",
-            "copy",
-            "covered_facets",
-            "core_semantic_digest",
-            "expected_revision",
-            "naming",
-            "unmapped_facets",
-        ])
-    );
+    assert_eq!(required_names(&tool.parameters), BTreeSet::new());
     let properties = property_names(&tool.parameters);
     for forbidden in [
         "route",
@@ -48,6 +31,9 @@ fn detail_frontier_is_one_closed_recipe_specific_tool() {
         "locale",
         "close_authorization",
         "runtime_requirements",
+        "expected_revision",
+        "core_semantic_digest",
+        "covered_facets",
         "capabilities",
         "recipe",
         "actions",
@@ -65,7 +51,7 @@ fn detail_frontier_is_one_closed_recipe_specific_tool() {
     assert!(!schema_text.contains("$ref"));
     let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
     assert!(
-        schema_bytes <= 2_400,
+        schema_bytes <= 2_100,
         "detail schema is {schema_bytes} bytes"
     );
 }
@@ -80,6 +66,7 @@ fn detail_parser_accepts_exact_selected_facets_and_null_unselected_objects() {
     )
     .unwrap();
     assert_eq!(parsed.expected_revision(), 0);
+    assert_eq!(parsed.core_semantic_digest(), CORE_DIGEST);
     assert_eq!(
         parsed.copy().create_button_label.as_deref(),
         Some("Start focus room")
@@ -99,22 +86,8 @@ fn detail_parser_accepts_exact_selected_facets_and_null_unselected_objects() {
 }
 
 #[test]
-fn detail_parser_requires_exact_coverage_and_nonempty_selected_values() {
+fn detail_parser_requires_nonempty_selected_values_and_no_unmapped_facets() {
     let mut value = valid_copy_details();
-    value["covered_facets"] = json!([]);
-    assert_eq!(
-        parse_private_study_room_details(
-            &value.to_string(),
-            &[IntentRecipeDetailFacetV3::Copy],
-            0,
-            CORE_DIGEST,
-        )
-        .unwrap_err()
-        .code,
-        "RECIPE_DETAIL_COVERAGE_MISMATCH"
-    );
-
-    value = valid_copy_details();
     value["copy"] = json!({});
     assert_eq!(
         parse_private_study_room_details(
@@ -161,12 +134,13 @@ fn detail_parser_rejects_unrequested_values_duplicates_and_empty_ticket() {
         "UNREQUESTED_RECIPE_DETAIL"
     );
 
-    value = valid_copy_details();
-    value["covered_facets"] = json!(["copy", "copy"]);
     assert_eq!(
         parse_private_study_room_details(
-            &value.to_string(),
-            &[IntentRecipeDetailFacetV3::Copy],
+            &valid_copy_details().to_string(),
+            &[
+                IntentRecipeDetailFacetV3::Copy,
+                IntentRecipeDetailFacetV3::Copy,
+            ],
             0,
             CORE_DIGEST,
         )
@@ -201,7 +175,6 @@ fn detail_parser_reuses_recipe_text_and_template_guards() {
 
     value = valid_copy_details();
     value["controls"] = json!({"help_label": " Guide "});
-    value["covered_facets"] = json!(["copy", "controls"]);
     let parsed = parse_private_study_room_details(
         &value.to_string(),
         &[
@@ -216,29 +189,38 @@ fn detail_parser_reuses_recipe_text_and_template_guards() {
 }
 
 #[test]
-fn detail_parser_binds_revision_and_core_digest() {
-    assert_eq!(
-        parse_private_study_room_details(
-            &valid_copy_details().to_string(),
-            &[IntentRecipeDetailFacetV3::Copy],
-            1,
-            CORE_DIGEST,
-        )
-        .unwrap_err()
-        .code,
-        "STALE_RECIPE_DETAIL_REVISION"
-    );
-    assert_eq!(
-        parse_private_study_room_details(
-            &valid_copy_details().to_string(),
-            &[IntentRecipeDetailFacetV3::Copy],
-            0,
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .unwrap_err()
-        .code,
-        "RECIPE_DETAIL_CORE_DIGEST_MISMATCH"
-    );
+fn detail_parser_stamps_harness_binding_and_rejects_model_authored_metadata() {
+    let digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let parsed = parse_private_study_room_details(
+        &valid_copy_details().to_string(),
+        &[IntentRecipeDetailFacetV3::Copy],
+        7,
+        digest,
+    )
+    .unwrap();
+    assert_eq!(parsed.expected_revision(), 7);
+    assert_eq!(parsed.core_semantic_digest(), digest);
+    assert_eq!(parsed.covered_facets(), &[IntentRecipeDetailFacetV3::Copy]);
+
+    for field in [
+        ("expected_revision", json!(7)),
+        ("core_semantic_digest", json!(digest)),
+        ("covered_facets", json!(["copy"])),
+    ] {
+        let mut value = valid_copy_details();
+        value[field.0] = field.1;
+        assert_eq!(
+            parse_private_study_room_details(
+                &value.to_string(),
+                &[IntentRecipeDetailFacetV3::Copy],
+                7,
+                digest,
+            )
+            .unwrap_err()
+            .code,
+            "UNKNOWN_FIELD"
+        );
+    }
 }
 
 fn property_names(schema: &Value) -> BTreeSet<String> {
@@ -261,8 +243,4 @@ fn required_names(schema: &Value) -> BTreeSet<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn strings<const N: usize>(values: [&str; N]) -> BTreeSet<String> {
-    values.into_iter().map(str::to_string).collect()
 }

@@ -165,14 +165,10 @@ fn v3_detail_path_binds_core_and_preserves_exact_literals() {
     let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&value) else {
         panic!("expected private study-room selection");
     };
-    let route_digest = selection.semantic_ir_digest().to_string();
     let arguments = json!({
-        "expected_revision": selection.expected_revision(),
-        "core_semantic_digest": route_digest,
         "copy": {"create_button_label": "Start exact focus"},
         "naming": {},
         "controls": {},
-        "covered_facets": ["copy"],
         "unmapped_facets": []
     });
     let details = parse_private_study_room_details(
@@ -183,7 +179,10 @@ fn v3_detail_path_binds_core_and_preserves_exact_literals() {
     )
     .unwrap();
     let detail_digest = selection.details_digest(&details).unwrap();
-    assert_ne!(detail_digest, selection.semantic_ir_digest());
+    assert_eq!(
+        detail_digest,
+        "0ed1ce0bb9c25a51b06d0efed8ae9e04e1f8fdd02e7ced7bb1f379f5b13a8771"
+    );
     let permit = selection.finalize(Some(details)).unwrap();
     let (_, PreparedIntentWorkspaceV1::Resolved { intent, .. }) =
         permit.prepare(&context()).unwrap()
@@ -214,12 +213,9 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
         panic!("expected private study-room selection");
     };
     let arguments = json!({
-        "expected_revision": 0,
-        "core_semantic_digest": default_selection.semantic_ir_digest(),
         "copy": {"create_button_label": "Spurious"},
         "naming": {},
         "controls": {},
-        "covered_facets": ["copy"],
         "unmapped_facets": []
     });
     let details = parse_private_study_room_details(
@@ -238,12 +234,9 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
         panic!("expected private study-room selection");
     };
     let arguments = json!({
-        "expected_revision": 0,
-        "core_semantic_digest": selection.semantic_ir_digest(),
         "copy": {},
         "naming": {},
         "controls": {"close_label": "Close now"},
-        "covered_facets": ["controls"],
         "unmapped_facets": []
     });
     let details = parse_private_study_room_details(

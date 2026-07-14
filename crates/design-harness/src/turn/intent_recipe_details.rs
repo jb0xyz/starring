@@ -18,54 +18,57 @@ pub const EXTRACT_PRIVATE_STUDY_ROOM_DETAILS: &str = "extract_private_study_room
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExtractPrivateStudyRoomDetailsWireV1 {
-    expected_revision: u64,
-    #[schemars(length(min = 64, max = 64))]
-    core_semantic_digest: String,
-    #[serde(deserialize_with = "deserialize_default_on_null")]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     copy: PrivateStudyRoomCopyProposalV1,
-    #[serde(deserialize_with = "deserialize_default_on_null")]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     naming: PrivateStudyRoomNamingProposalV1,
-    #[serde(deserialize_with = "deserialize_default_on_null")]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     controls: PrivateStudyRoomControlsInterpretationV2,
-    #[schemars(length(max = 3))]
-    covered_facets: Vec<IntentRecipeDetailFacetV3>,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     #[schemars(length(max = 3))]
     unmapped_facets: Vec<IntentRecipeDetailFacetV3>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrivateStudyRoomDetailsV1(ExtractPrivateStudyRoomDetailsWireV1);
+pub struct PrivateStudyRoomDetailsV1 {
+    expected_revision: u64,
+    core_semantic_digest: String,
+    copy: PrivateStudyRoomCopyProposalV1,
+    naming: PrivateStudyRoomNamingProposalV1,
+    controls: PrivateStudyRoomControlsInterpretationV2,
+    covered_facets: Vec<IntentRecipeDetailFacetV3>,
+}
 
 impl PrivateStudyRoomDetailsV1 {
     pub fn expected_revision(&self) -> u64 {
-        self.0.expected_revision
+        self.expected_revision
     }
 
     pub fn copy(&self) -> &PrivateStudyRoomCopyProposalV1 {
-        &self.0.copy
+        &self.copy
     }
 
     pub fn core_semantic_digest(&self) -> &str {
-        &self.0.core_semantic_digest
+        &self.core_semantic_digest
     }
 
     pub fn naming(&self) -> &PrivateStudyRoomNamingProposalV1 {
-        &self.0.naming
+        &self.naming
     }
 
     pub fn controls(&self) -> &PrivateStudyRoomControlsInterpretationV2 {
-        &self.0.controls
+        &self.controls
     }
 
     pub fn covered_facets(&self) -> &[IntentRecipeDetailFacetV3] {
-        &self.0.covered_facets
+        &self.covered_facets
     }
 }
 
 pub fn private_study_room_details_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: EXTRACT_PRIVATE_STUDY_ROOM_DETAILS.to_string(),
-        description: "Extract only the requested private StudyRoom copy, naming, and control details from the original human turn. Cover every active detail facet exactly once, leave unrequested objects empty, and never author routes, authorization, actions, permissions, recipe identity, or deployment operations".to_string(),
+        description: "Extract only the requested private StudyRoom copy, naming, and control literals from the original human turn. Omit unrequested objects, report a facet as unmapped instead of inventing a value, and never author bindings, routes, authorization, actions, permissions, recipe identity, or deployment operations".to_string(),
         parameters: inline_schema_value::<ExtractPrivateStudyRoomDetailsWireV1>(),
     }]
 }
@@ -85,36 +88,15 @@ pub fn parse_private_study_room_details(
             )
         })?;
     normalize_private_study_room_details(&mut input.copy, &mut input.naming, &mut input.controls)?;
-    validate_binding(&input, expected_revision, expected_core_semantic_digest)?;
-    validate_facets(&input, required_facets)?;
-    Ok(PrivateStudyRoomDetailsV1(input))
-}
-
-fn validate_binding(
-    input: &ExtractPrivateStudyRoomDetailsWireV1,
-    expected_revision: u64,
-    expected_core_semantic_digest: &str,
-) -> Result<(), StructuredError> {
-    if input.expected_revision != expected_revision {
-        return Err(detail_error(
-            "STALE_RECIPE_DETAIL_REVISION",
-            "intent.details.expected_revision",
-            format!(
-                "Recipe detail revision {} does not match the active revision {expected_revision}",
-                input.expected_revision
-            ),
-            format!("Retry with expected_revision {expected_revision}"),
-        ));
-    }
-    if input.core_semantic_digest != expected_core_semantic_digest {
-        return Err(detail_error(
-            "RECIPE_DETAIL_CORE_DIGEST_MISMATCH",
-            "intent.details.core_semantic_digest",
-            "Recipe details are not bound to the active Core IR",
-            "Copy the exact harness-provided Core semantic digest",
-        ));
-    }
-    Ok(())
+    let covered_facets = validate_facets(&input, required_facets)?;
+    Ok(PrivateStudyRoomDetailsV1 {
+        expected_revision,
+        core_semantic_digest: expected_core_semantic_digest.to_string(),
+        copy: input.copy,
+        naming: input.naming,
+        controls: input.controls,
+        covered_facets,
+    })
 }
 
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -128,7 +110,7 @@ where
 fn validate_facets(
     input: &ExtractPrivateStudyRoomDetailsWireV1,
     required_facets: &[IntentRecipeDetailFacetV3],
-) -> Result<(), StructuredError> {
+) -> Result<Vec<IntentRecipeDetailFacetV3>, StructuredError> {
     let required = exact_facet_set(required_facets, "intent.details.required_facets")?;
     if required.is_empty() {
         return Err(detail_error(
@@ -138,7 +120,6 @@ fn validate_facets(
             "Use the deterministic default path when no detail facet is requested",
         ));
     }
-    let covered = exact_facet_set(&input.covered_facets, "intent.details.covered_facets")?;
     let unmapped = exact_facet_set(&input.unmapped_facets, "intent.details.unmapped_facets")?;
     if !unmapped.is_empty() {
         return Err(detail_error(
@@ -146,14 +127,6 @@ fn validate_facets(
             "intent.details.unmapped_facets",
             "At least one requested recipe detail facet was not mapped",
             "Map every selected copy, naming, or controls facet",
-        ));
-    }
-    if covered != required {
-        return Err(detail_error(
-            "RECIPE_DETAIL_COVERAGE_MISMATCH",
-            "intent.details.covered_facets",
-            "The covered recipe detail facets do not exactly match the active facets",
-            "Cover each active facet exactly once and no other facet",
         ));
     }
     for facet in [
@@ -186,7 +159,7 @@ fn validate_facets(
             (true, true) | (false, false) => {}
         }
     }
-    Ok(())
+    Ok(required.into_iter().collect())
 }
 
 fn exact_facet_set(
