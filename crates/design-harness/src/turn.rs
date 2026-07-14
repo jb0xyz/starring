@@ -4,7 +4,9 @@ mod plan_input;
 mod protocol;
 mod scope;
 
-pub(crate) use execution::{execute_plan_atomically, ExecutionRecord};
+pub(crate) use execution::{
+    execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
+};
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
     assign_repeat_targets as assign_turn_plan_repeat_targets,
@@ -25,7 +27,7 @@ pub(crate) use plan_input::{
 pub(crate) use protocol::{
     parse_planned_turn_brief, parse_turn_plan, parse_turn_plan_packet_scoped,
     parse_turn_plan_review, parse_turn_plan_review_oracle, plan_packet_definition,
-    plan_review_definition, planned_control_tool_definitions,
+    plan_review_definition, planned_control_tool_definitions, render_preview_with_bindings,
 };
 pub(crate) use scope::check_scope_with_bindings;
 

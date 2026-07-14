@@ -1,3 +1,4 @@
+mod candidate;
 mod catalog;
 mod compile;
 #[cfg(test)]
@@ -8,9 +9,14 @@ mod normalize;
 mod private_study_room;
 mod proposal;
 mod provenance;
+mod simulation;
 #[cfg(test)]
 mod tests;
 
+pub use candidate::{
+    prepare_intent_candidate, CommittedIntentCandidateV1, IntentExecutionReportV1,
+    PreparedIntentCandidateV1,
+};
 pub use compile::{
     compile_intent, CompilationManifestV1, CompilationVerificationV1, CompiledIntentV1,
 };

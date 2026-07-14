@@ -48,6 +48,15 @@ pub(crate) async fn execute_plan_atomically(
     execute_plan_atomically_for_bindings(draft, brief, None, max_calls).await
 }
 
+pub(crate) async fn execute_plan_atomically_with_bindings(
+    draft: &Draft,
+    brief: &TurnBrief,
+    bindings: &ResourceBindingMap,
+    max_calls: usize,
+) -> Result<PlannedExecution, PlannedExecutionFailure> {
+    execute_plan_atomically_for_bindings(draft, brief, Some(bindings), max_calls).await
+}
+
 async fn execute_plan_atomically_for_bindings(
     draft: &Draft,
     brief: &TurnBrief,

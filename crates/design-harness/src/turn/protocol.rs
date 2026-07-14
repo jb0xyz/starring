@@ -1,3 +1,4 @@
+use resource_resolution::ResourceBindingMap;
 use schemars::{schema_for, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -342,6 +343,25 @@ pub fn render_preview(draft: &Draft) -> DraftPreview {
         draft: draft.summary(),
         ruleset: serde_json::to_value(&draft.ruleset).unwrap_or(Value::Null),
     }
+}
+
+pub(crate) fn render_preview_with_bindings(
+    draft: &Draft,
+    bindings: &ResourceBindingMap,
+) -> Result<DraftPreview, StructuredError> {
+    let ruleset = serde_json::to_value(&draft.ruleset).map_err(|error| {
+        StructuredError::new(
+            "PREVIEW_SERIALIZATION_FAILED",
+            "draft.preview",
+            format!("The candidate Draft could not be serialized: {error}"),
+            "Keep the canonical Draft unchanged and report the candidate serialization failure",
+        )
+    })?;
+    Ok(DraftPreview {
+        revision: draft.draft_revision,
+        draft: draft.summary_with_bindings(bindings),
+        ruleset,
+    })
 }
 
 fn definition<T: JsonSchema>(name: &str, description: &str) -> ToolDefinition {
