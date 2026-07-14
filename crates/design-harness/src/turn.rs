@@ -3,6 +3,7 @@ mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
 mod intent_protocol;
+mod intent_text;
 mod plan;
 mod plan_input;
 mod protocol;
