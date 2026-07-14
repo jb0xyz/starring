@@ -278,6 +278,7 @@ be pooled into one reliability rate.
 | Four contrast cases | three repetitions per case | 12/12 | not summarized here | 1/1 | Boundary, capability, and contrast routing sample |
 | Full copy+naming+controls detail | three repetitions | 3/3 | mean 19,209 ms; P95 19,811 ms | 2/2 | Exact custom literals, 22 operations, current validation and simulation |
 | Copy-only reduced frontier | one repetition | 1/1 | 21,610 ms | 2/2 | Only launcher copy changed; naming and control defaults remained; Close stayed absent |
+| Post-refactor default+contrast regression | one repetition per case | 14/14 | mean 10,827 ms; P95 17,737 ms | one or two calls per report | Five ready paths preserved 22 operations and current gates; nine routed paths stayed mutation-free |
 
 The corresponding local result files are:
 
@@ -286,6 +287,7 @@ eval/design-harness/results/v3-full10-explicit-gates-1run.json
 eval/design-harness/results/v3-contrast4-grounded-3run.json
 eval/design-harness/results/v3-custom-details-grounded-3run.json
 eval/design-harness/results/v3-copy-only-1run.json
+eval/design-harness/results/v3-precustom-final-regression-1run.json
 ```
 
 `eval/design-harness/results/` is ignored by Git. A fresh clone will not contain
@@ -317,6 +319,12 @@ does not replace the final branch gate run. Before publishing, rerun the whole
 Rust workspace tests, workspace clippy with warnings denied, formatting check,
 the 44 JavaScript tests and both Promptfoo configuration validations, then rely
 on GitHub Actions for an independent clean-environment result.
+
+The post-refactor report came from clean source and matching build commit
+`c1e9a37266df0ae460748c5220402c48be7f5755`. It had no provider error, served
+only `gemma4:12b-mlx`, and passed every assertion. This single sample verifies
+that the responsibility split preserved the measured default and contrast
+paths; it does not change the repeated-acceptance requirement.
 
 ## Semantic identity gap
 

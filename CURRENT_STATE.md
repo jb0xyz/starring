@@ -235,8 +235,9 @@ Stated as capabilities (durable across the phase numbering):
 - An evaluation framework with local-unsigned source/binary identity checks and
   clean-source acceptance for the fixed Gemma checkpoint. Current live samples
   include a 10/10 one-repetition baseline, 12/12 contrast results across three
-  repetitions per case, 3/3 full custom-detail results, and one copy-only pass.
-  The required ten-repeat-per-case live cohort is not yet complete.
+  repetitions per case, 3/3 full custom-detail results, one copy-only pass, and
+  a 14/14 clean-source post-refactor regression over the default and contrast
+  cases. The required ten-repeat-per-case live cohort is not yet complete.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
