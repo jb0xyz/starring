@@ -1707,7 +1707,7 @@ mod tests {
         let responses = VecDeque::from([
             LlmResponse::ToolCalls(vec![ToolCall {
                 id: "interpret".to_string(),
-                name: "interpret_intent_turn".to_string(),
+                name: "interpret_intent_core".to_string(),
                 arguments: json!({
                     "expected_revision": 0,
                     "request_mode": "build",
@@ -1725,8 +1725,8 @@ mod tests {
                     },
                     "boundary_requests": [],
                     "unclassified_requirements": [],
-                    "response": "",
-                    "response_locale": "en"
+                    "detail_facets": [],
+                    "response": ""
                 })
                 .to_string(),
             }]),
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(
             probe.calls.lock().unwrap().clone(),
             vec![
-                vec!["interpret_intent_turn".to_string()],
+                vec!["interpret_intent_core".to_string()],
                 vec!["resolve_intent_decision".to_string()]
             ]
         );
@@ -1837,7 +1837,7 @@ mod tests {
         let responses = VecDeque::from([
             LlmResponse::ToolCalls(vec![ToolCall {
                 id: "interpret".to_string(),
-                name: "interpret_intent_turn".to_string(),
+                name: "interpret_intent_core".to_string(),
                 arguments: json!({
                     "expected_revision": 0,
                     "request_mode": "build",
@@ -1855,8 +1855,8 @@ mod tests {
                     },
                     "boundary_requests": [],
                     "unclassified_requirements": [],
-                    "response": "I already deployed this automation.",
-                    "response_locale": "en"
+                    "detail_facets": [],
+                    "response": "I already deployed this automation."
                 })
                 .to_string(),
             }]),

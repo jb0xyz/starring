@@ -114,7 +114,7 @@ function routeDecision(value, location) {
     throw new Error(`invalid intent eval report: ${location}.kind is invalid`);
   }
   if (value.decision_source !== 'deterministic_intent_adjudicator'
-    || value.adjudicator_version !== 1) {
+    || value.adjudicator_version !== 2) {
     throw new Error(`invalid intent eval report: ${location} has invalid adjudicator identity`);
   }
   if (!SHA256.test(value.semantic_ir_digest) || !SHA256.test(value.adjudication_digest)) {

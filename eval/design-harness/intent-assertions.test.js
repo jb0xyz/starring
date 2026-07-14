@@ -34,7 +34,7 @@ function decision(kind = 'private_study_room', overrides = {}) {
   return {
     kind,
     decision_source: 'deterministic_intent_adjudicator',
-    adjudicator_version: 1,
+    adjudicator_version: 2,
     semantic_ir_digest: 'a'.repeat(64),
     manifest_version: 1,
     manifest_digest: MANIFEST_DIGEST,
