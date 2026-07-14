@@ -21,7 +21,9 @@ fn valid_core() -> Value {
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "explicit_boundary_requests": [],
+        "requested_gate_skips": [],
+        "request_live_discord_mutation": false,
+        "request_secret_disclosure": false,
         "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
@@ -40,7 +42,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         required_names(&tool.parameters),
         strings([
             "automation_kind",
-            "explicit_boundary_requests",
+            "requested_gate_skips",
+            "request_live_discord_mutation",
+            "request_secret_disclosure",
             "close_policy",
             "expected_revision",
             "language",
@@ -79,12 +83,8 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         json!(["custom_copy", "custom_naming", "custom_controls"])
     );
     assert_eq!(
-        tool.parameters["properties"]["explicit_boundary_requests"]["items"]["enum"],
-        json!([
-            "request_live_discord_mutation",
-            "request_skip_validation_preview_or_approval",
-            "request_secret_disclosure"
-        ])
+        tool.parameters["properties"]["requested_gate_skips"]["items"]["enum"],
+        json!(["validation", "preview", "approval"])
     );
     let schema_text = tool.parameters.to_string();
     assert!(!schema_text.contains("$defs"));
@@ -121,11 +121,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
 fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
     let mut value = valid_core();
     value["hub_channel"] = Value::Null;
-    value["explicit_boundary_requests"] = json!([
-        "request_secret_disclosure",
-        "request_live_discord_mutation",
-        "request_secret_disclosure"
-    ]);
+    value["requested_gate_skips"] = json!(["approval", "validation", "approval"]);
+    value["request_live_discord_mutation"] = json!(true);
+    value["request_secret_disclosure"] = json!(true);
     value["other_unmapped_required_capabilities"] = json!([
         "  external   scheduler lease ",
         "cross-service quorum",
@@ -137,6 +135,7 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
         parsed.boundary_requests(),
         &[
             IntentBoundaryRequestV2::DirectLiveMutation,
+            IntentBoundaryRequestV2::BypassValidationPreviewApproval,
             IntentBoundaryRequestV2::SecretDisclosure
         ]
     );
@@ -276,7 +275,7 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     );
 
     value = valid_core();
-    value["explicit_boundary_requests"] = json!(["request_bypass_safety_gates"]);
+    value["requested_gate_skips"] = json!(["safety"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -374,17 +373,12 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
     );
 
     value = valid_core();
-    value["explicit_boundary_requests"] = json!([
-        "request_live_discord_mutation",
-        "request_skip_validation_preview_or_approval",
-        "request_secret_disclosure",
-        "request_live_discord_mutation"
-    ]);
+    value["requested_gate_skips"] = json!(["validation", "preview", "approval", "validation"]);
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
             .code,
-        "TOO_MANY_INTENT_BOUNDARY_REQUESTS"
+        "TOO_MANY_GATE_SKIP_REQUESTS"
     );
 
     value = valid_core();

@@ -73,7 +73,7 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("other_unmapped_required_capabilities"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("scope-preservation or anti-weakening instructions"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("request_skip_validation_preview_or_approval"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("requested_gate_skips"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
 }
@@ -98,7 +98,9 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "explicit_boundary_requests": [],
+        "requested_gate_skips": [],
+        "request_live_discord_mutation": false,
+        "request_secret_disclosure": false,
         "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
@@ -147,8 +149,8 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
 fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["runtime_requirements"] = json!(["restart_persistent"]);
-    value["explicit_boundary_requests"] =
-        json!(["request_secret_disclosure", "request_live_discord_mutation"]);
+    value["request_live_discord_mutation"] = json!(true);
+    value["request_secret_disclosure"] = json!(true);
     value["custom_detail_facets"] = json!(["custom_copy"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)

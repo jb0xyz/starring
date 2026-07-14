@@ -1718,7 +1718,9 @@ mod tests {
                     "language": "en",
                     "close_policy": "disabled",
                     "runtime_requirements": [],
-                    "explicit_boundary_requests": [],
+                    "requested_gate_skips": [],
+                    "request_live_discord_mutation": false,
+                    "request_secret_disclosure": false,
                     "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": ""
@@ -1843,7 +1845,9 @@ mod tests {
                     "language": "en",
                     "close_policy": "disabled",
                     "runtime_requirements": [],
-                    "explicit_boundary_requests": [],
+                    "requested_gate_skips": [],
+                    "request_live_discord_mutation": false,
+                    "request_secret_disclosure": false,
                     "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": "I already deployed this automation."

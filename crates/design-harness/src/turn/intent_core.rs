@@ -72,25 +72,11 @@ enum CustomDetailFacetWireV3 {
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
-enum ExplicitBoundaryRequestWireV3 {
-    #[serde(rename = "request_live_discord_mutation")]
-    LiveDiscordMutation,
-    #[serde(rename = "request_skip_validation_preview_or_approval")]
-    SkipValidationPreviewOrApproval,
-    #[serde(rename = "request_secret_disclosure")]
-    SecretDisclosure,
-}
-
-impl From<ExplicitBoundaryRequestWireV3> for IntentBoundaryRequestV2 {
-    fn from(value: ExplicitBoundaryRequestWireV3) -> Self {
-        match value {
-            ExplicitBoundaryRequestWireV3::LiveDiscordMutation => Self::DirectLiveMutation,
-            ExplicitBoundaryRequestWireV3::SkipValidationPreviewOrApproval => {
-                Self::BypassValidationPreviewApproval
-            }
-            ExplicitBoundaryRequestWireV3::SecretDisclosure => Self::SecretDisclosure,
-        }
-    }
+#[serde(rename_all = "snake_case")]
+enum RequestedGateSkipWireV3 {
+    Validation,
+    Preview,
+    Approval,
 }
 
 impl From<CustomDetailFacetWireV3> for IntentRecipeDetailFacetV3 {
@@ -131,7 +117,9 @@ struct InterpretIntentCoreWireV3 {
     #[schemars(length(max = 4))]
     runtime_requirements: Vec<RuntimeRequirementV3>,
     #[schemars(length(max = 3))]
-    explicit_boundary_requests: Vec<ExplicitBoundaryRequestWireV3>,
+    requested_gate_skips: Vec<RequestedGateSkipWireV3>,
+    request_live_discord_mutation: bool,
+    request_secret_disclosure: bool,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
     other_unmapped_required_capabilities: Vec<String>,
     #[schemars(length(max = 3))]
@@ -278,12 +266,12 @@ fn normalize_core(
     input
         .other_unmapped_required_capabilities
         .retain(|value| !runtime_requirement_is_redundant(value, &input.runtime_requirements));
-    if input.explicit_boundary_requests.len() > 3 {
+    if input.requested_gate_skips.len() > 3 {
         return Err(core_error(
-            "TOO_MANY_INTENT_BOUNDARY_REQUESTS",
-            "intent.core.explicit_boundary_requests",
-            "The interpretation contains more than three safety boundary requests",
-            "Use only the closed explicit safety boundary request identifiers",
+            "TOO_MANY_GATE_SKIP_REQUESTS",
+            "intent.core.requested_gate_skips",
+            "The interpretation contains more than three gate-skip requests",
+            "Use validation, preview, and approval at most once each",
         ));
     }
     if input.custom_detail_facets.len() > 3 {
@@ -311,12 +299,22 @@ fn normalize_core(
             "Use custom detail facets only for explicit copy, naming, or control literals of that recipe",
         ));
     }
-    input.explicit_boundary_requests = input
-        .explicit_boundary_requests
+    input.requested_gate_skips = input
+        .requested_gate_skips
         .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let mut boundary_requests = BTreeSet::new();
+    if !input.requested_gate_skips.is_empty() {
+        boundary_requests.insert(IntentBoundaryRequestV2::BypassValidationPreviewApproval);
+    }
+    if input.request_live_discord_mutation {
+        boundary_requests.insert(IntentBoundaryRequestV2::DirectLiveMutation);
+    }
+    if input.request_secret_disclosure {
+        boundary_requests.insert(IntentBoundaryRequestV2::SecretDisclosure);
+    }
     Ok(IntentCoreInterpretationV3 {
         expected_revision: input.expected_revision,
         request_mode: input.request_mode,
@@ -327,11 +325,7 @@ fn normalize_core(
         locale: input.language,
         close_authorization: input.close_policy,
         runtime_requirements: normalize_runtime_requirements(input.runtime_requirements),
-        boundary_requests: input
-            .explicit_boundary_requests
-            .into_iter()
-            .map(IntentBoundaryRequestV2::from)
-            .collect(),
+        boundary_requests: boundary_requests.into_iter().collect(),
         unclassified_requirements: input.other_unmapped_required_capabilities,
         detail_facets: input
             .custom_detail_facets
