@@ -1,5 +1,5 @@
 use automation_core::{AdapterError, InteractionResponder, ModalPresentation};
-use automation_state::ModalFieldStyle;
+use automation_state::{ModalFieldSpec, ModalFieldStyle};
 use discord_model::GuildId;
 use twilight_http::Client;
 use twilight_model::application::interaction::Interaction;
@@ -72,17 +72,7 @@ impl InteractionResponder for TwilightInteractionResponder<'_> {
                     id: None,
                     label: field.label.clone(),
                     description: None,
-                    component: Box::new(Component::TextInput(TextInput {
-                        id: None,
-                        custom_id: field.key.clone(),
-                        label: None,
-                        max_length: None,
-                        min_length: None,
-                        placeholder: None,
-                        required: Some(field.required),
-                        style: text_input_style(field.style),
-                        value: None,
-                    })),
+                    component: Box::new(Component::TextInput(text_input(field))),
                 })
             })
             .collect();
@@ -128,5 +118,46 @@ fn text_input_style(style: ModalFieldStyle) -> TextInputStyle {
     match style {
         ModalFieldStyle::Short => TextInputStyle::Short,
         ModalFieldStyle::Paragraph => TextInputStyle::Paragraph,
+    }
+}
+
+#[allow(deprecated)]
+fn text_input(field: &ModalFieldSpec) -> TextInput {
+    TextInput {
+        id: None,
+        custom_id: field.key.clone(),
+        label: None,
+        max_length: field.max_length,
+        min_length: field.min_length,
+        placeholder: None,
+        required: Some(field.required),
+        style: text_input_style(field.style),
+        value: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use automation_state::ModalInputPolicy;
+
+    use super::*;
+
+    #[test]
+    fn text_input_forwards_bounded_contract_to_discord() {
+        let input = text_input(&ModalFieldSpec {
+            key: "room_name".to_string(),
+            label: "Room name".to_string(),
+            style: ModalFieldStyle::Paragraph,
+            required: true,
+            min_length: Some(2),
+            max_length: Some(40),
+            input_policy: ModalInputPolicy::TrimUnicodeWhitespace,
+        });
+
+        assert_eq!(input.custom_id, "room_name");
+        assert_eq!(input.style, TextInputStyle::Paragraph);
+        assert_eq!(input.required, Some(true));
+        assert_eq!(input.min_length, Some(2));
+        assert_eq!(input.max_length, Some(40));
     }
 }

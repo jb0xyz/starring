@@ -853,6 +853,9 @@ fn studyroom_ruleset(variant: FixtureVariant) -> InteractionRuleSet {
                 label: "Room name".to_string(),
                 style: ModalFieldStyle::Short,
                 required: true,
+                min_length: None,
+                max_length: None,
+                input_policy: automation_state::ModalInputPolicy::Preserve,
             }],
         }],
         rules: vec![

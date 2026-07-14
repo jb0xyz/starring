@@ -1,6 +1,6 @@
 use automation_state::{
-    ActionSpec, ButtonRoute, ChannelRef, InstanceRef, ModalFieldStyle, OverwriteTargetSpec,
-    RoleRef, TriggerSpec,
+    ActionSpec, ButtonRoute, ChannelRef, InstanceRef, ModalFieldStyle, ModalInputPolicy,
+    OverwriteTargetSpec, RoleRef, TriggerSpec,
 };
 use design_harness::{dispatch_tool, tool_definitions, Draft, ToolResult};
 use futures::executor::block_on;
@@ -821,6 +821,43 @@ fn structure_updates_keep_stable_keys_and_invalidate_gates() {
         draft.ruleset.rules[0].trigger,
         TriggerSpec::InstanceAction { ref action } if action == "leave"
     ));
+}
+
+#[test]
+fn modal_field_update_preserves_existing_input_contract() {
+    let mut draft = Draft::new();
+    assert!(call(
+        &mut draft,
+        "add_modal",
+        json!({
+            "key":"modal",
+            "title":"Before",
+            "fields":[{"key":"name","label":"Before","style":"short","required":true}]
+        }),
+    )
+    .is_ok());
+    let field = &mut draft.ruleset.modals[0].fields[0];
+    field.min_length = Some(2);
+    field.max_length = Some(40);
+    field.input_policy = ModalInputPolicy::TrimUnicodeWhitespace;
+
+    assert!(call(
+        &mut draft,
+        "update_modal",
+        json!({
+            "key":"modal",
+            "fields":[{"key":"name","label":"After","style":"paragraph","required":false}]
+        }),
+    )
+    .is_ok());
+
+    let field = &draft.ruleset.modals[0].fields[0];
+    assert_eq!(field.label, "After");
+    assert_eq!(field.style, ModalFieldStyle::Paragraph);
+    assert!(!field.required);
+    assert_eq!(field.min_length, Some(2));
+    assert_eq!(field.max_length, Some(40));
+    assert_eq!(field.input_policy, ModalInputPolicy::TrimUnicodeWhitespace);
 }
 
 #[test]

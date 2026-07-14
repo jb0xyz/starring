@@ -197,6 +197,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_modal_definition_preserves_wire_shape_and_content_hash() {
+        let legacy = r#"{"version":1,"panels":[],"modals":[{"key":"room","title":"Room","fields":[{"key":"name","label":"Name","style":"short","required":true}]}],"rules":[]}"#;
+        let raw_definition: Value = serde_json::from_str(legacy).unwrap();
+        let definition: InteractionRuleSet = serde_json::from_str(legacy).unwrap();
+        let raw_input = serde_json::json!({
+            "schema_version": CURRENT_RULESET_SCHEMA_VERSION,
+            "definition": raw_definition.clone(),
+        });
+        let raw_bytes = serde_json::to_vec(&canonicalize(raw_input)).unwrap();
+        let expected = RuleSetContentHash(Sha256::digest(raw_bytes).into());
+
+        assert_eq!(serde_json::to_value(&definition).unwrap(), raw_definition);
+        assert_eq!(
+            content_hash(CURRENT_RULESET_SCHEMA_VERSION, &definition).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn hex_roundtrip_and_validation() {
         let h = content_hash(CURRENT_RULESET_SCHEMA_VERSION, &ruleset(vec![grant()])).unwrap();
         let hex = h.to_hex();

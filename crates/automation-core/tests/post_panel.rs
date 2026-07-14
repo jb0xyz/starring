@@ -36,6 +36,9 @@ fn modal() -> ModalSpec {
             label: "R".to_string(),
             style: ModalFieldStyle::Short,
             required: true,
+            min_length: None,
+            max_length: None,
+            input_policy: automation_state::ModalInputPolicy::Preserve,
         }],
     }
 }

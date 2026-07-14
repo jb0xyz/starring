@@ -34,6 +34,9 @@ fn modal() -> ModalSpec {
             label: "Room name".to_string(),
             style: ModalFieldStyle::Short,
             required: true,
+            min_length: None,
+            max_length: None,
+            input_policy: automation_state::ModalInputPolicy::Preserve,
         }],
     }
 }
@@ -105,6 +108,61 @@ fn valid_modal_ruleset_passes() {
 }
 
 #[test]
+fn modal_field_min_length_above_discord_limit_fails() {
+    let mut set = ruleset();
+    set.modals[0].fields[0].min_length = Some(4_001);
+    let errors = validate(&set, &ResourceBindingMap::default()).unwrap_err();
+    assert!(
+        errors.contains(&ValidationError::InvalidModalFieldMinLength {
+            modal: "study_room_modal".to_string(),
+            field: "room_name".to_string(),
+            min_length: 4_001,
+        })
+    );
+}
+
+#[test]
+fn modal_field_discord_length_boundaries_pass() {
+    let mut set = ruleset();
+    set.modals[0].fields[0].min_length = Some(0);
+    set.modals[0].fields[0].max_length = Some(4_000);
+
+    assert!(validate(&set, &ResourceBindingMap::default()).is_ok());
+}
+
+#[test]
+fn modal_field_max_length_outside_discord_range_fails() {
+    for max_length in [0, 4_001] {
+        let mut set = ruleset();
+        set.modals[0].fields[0].max_length = Some(max_length);
+        let errors = validate(&set, &ResourceBindingMap::default()).unwrap_err();
+        assert!(
+            errors.contains(&ValidationError::InvalidModalFieldMaxLength {
+                modal: "study_room_modal".to_string(),
+                field: "room_name".to_string(),
+                max_length,
+            })
+        );
+    }
+}
+
+#[test]
+fn modal_field_min_length_must_not_exceed_max_length() {
+    let mut set = ruleset();
+    set.modals[0].fields[0].min_length = Some(5);
+    set.modals[0].fields[0].max_length = Some(4);
+    let errors = validate(&set, &ResourceBindingMap::default()).unwrap_err();
+    assert!(
+        errors.contains(&ValidationError::InvalidModalFieldLengthRange {
+            modal: "study_room_modal".to_string(),
+            field: "room_name".to_string(),
+            min_length: 5,
+            max_length: 4,
+        })
+    );
+}
+
+#[test]
 fn duplicate_modal_key_fails() {
     let mut set = ruleset();
     set.modals.push(modal());
@@ -122,6 +180,9 @@ fn duplicate_modal_field_key_fails() {
         label: "again".to_string(),
         style: ModalFieldStyle::Short,
         required: false,
+        min_length: None,
+        max_length: None,
+        input_policy: automation_state::ModalInputPolicy::Preserve,
     });
     let errors = validate(&set, &ResourceBindingMap::default()).unwrap_err();
     assert!(errors.contains(&ValidationError::DuplicateModalFieldKey {
@@ -284,6 +345,152 @@ fn mock_responder_runs_open_modal() {
         responder.calls(),
         vec![ResponderCall::OpenModal {
             modal: "study_room_modal".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn invalid_modal_inputs_stop_before_any_runtime_effect() {
+    let cases = [
+        (BTreeMap::new(), "MODAL_INPUT_MISSING"),
+        (
+            BTreeMap::from([("room_name".to_string(), String::new())]),
+            "MODAL_INPUT_MISSING",
+        ),
+        (
+            BTreeMap::from([
+                ("room_name".to_string(), "ok".to_string()),
+                ("admin".to_string(), "true".to_string()),
+            ]),
+            "MODAL_INPUT_UNEXPECTED",
+        ),
+        (
+            BTreeMap::from([("room_name".to_string(), "a".to_string())]),
+            "MODAL_INPUT_TOO_SHORT",
+        ),
+        (
+            BTreeMap::from([("room_name".to_string(), "abcde".to_string())]),
+            "MODAL_INPUT_TOO_LONG",
+        ),
+        (
+            BTreeMap::from([("room_name".to_string(), "😀😀😀".to_string())]),
+            "MODAL_INPUT_TOO_LONG",
+        ),
+    ];
+
+    for (inputs, code) in cases {
+        let mut set = ruleset();
+        set.modals[0].fields[0].min_length = Some(2);
+        set.modals[0].fields[0].max_length = Some(4);
+        set.rules[1].actions = vec![
+            ActionSpec::DeferEphemeral,
+            ActionSpec::CreateRole {
+                key: "room_role".to_string(),
+                name: "${input.room_name}".to_string(),
+            },
+            ActionSpec::EditResponse {
+                content: "ready".to_string(),
+            },
+        ];
+        let mutation = MockMutationAdapter::new();
+        let responder = MockInteractionResponder::new();
+        let event = RuntimeEvent {
+            guild_id: GuildId(1),
+            actor: UserId(42),
+            kind: EventKind::ModalSubmit {
+                modal: "study_room_modal".to_string(),
+                inputs,
+            },
+        };
+        let error = block_on(handle_event(
+            &event,
+            &set,
+            &ResourceBindingMap::default(),
+            &AutomationServices {
+                mutation: &mutation,
+                responder: &responder,
+                instances: &InMemoryInstanceStore::new(),
+                instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+                teardown: &automation_core::MockInstanceTeardownService::new(),
+            },
+            "failed",
+            &identity("test"),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.kind, AdapterErrorKind::BadRequest);
+        assert!(error.message.starts_with(code));
+        assert!(mutation.calls().is_empty());
+        assert!(responder.calls().is_empty());
+    }
+}
+
+#[test]
+fn unicode_input_at_utf16_boundary_reaches_mutation() {
+    let mut set = ruleset();
+    set.modals[0].fields[0].min_length = Some(4);
+    set.modals[0].fields[0].max_length = Some(4);
+    set.rules[1].actions = vec![ActionSpec::CreateRole {
+        key: "room_role".to_string(),
+        name: "${input.room_name}".to_string(),
+    }];
+    let mutation = MockMutationAdapter::new();
+    let responder = MockInteractionResponder::new();
+
+    let outcome = block_on(handle_event(
+        &modal_event("study_room_modal", "😀😀"),
+        &set,
+        &ResourceBindingMap::default(),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
+        },
+        "failed",
+        &identity("test"),
+    ))
+    .unwrap();
+
+    assert_eq!(outcome, HandleOutcome::Executed);
+    assert_eq!(mutation.calls().len(), 1);
+    assert!(responder.calls().is_empty());
+}
+
+#[test]
+fn explicit_trim_policy_updates_runtime_context_before_rendering() {
+    let mut set = ruleset();
+    set.modals[0].fields[0].input_policy =
+        automation_state::ModalInputPolicy::TrimUnicodeWhitespace;
+    set.modals[0].fields[0].min_length = Some(2);
+    set.rules[1].actions = vec![ActionSpec::RespondEphemeral {
+        content: "${input.room_name}".to_string(),
+    }];
+    let mutation = MockMutationAdapter::new();
+    let responder = MockInteractionResponder::new();
+
+    block_on(handle_event(
+        &modal_event("study_room_modal", "  방a  "),
+        &set,
+        &ResourceBindingMap::default(),
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
+        },
+        "failed",
+        &identity("test"),
+    ))
+    .unwrap();
+
+    assert!(mutation.calls().is_empty());
+    assert_eq!(
+        responder.calls(),
+        vec![ResponderCall::RespondEphemeral {
+            content: "방a".to_string(),
         }]
     );
 }

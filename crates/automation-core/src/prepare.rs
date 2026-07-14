@@ -4,6 +4,7 @@ use resource_resolution::ResourceBindingMap;
 use crate::adapter::{AdapterError, AdapterErrorKind};
 use crate::event::{EventKind, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent};
 use crate::interpret::interpret;
+use crate::modal_input::normalize_modal_submit_inputs;
 use crate::plan::{ActionPlan, PlannedAction};
 
 pub(crate) struct PreparedEventExecution {
@@ -24,7 +25,12 @@ pub(crate) fn prepare_event_execution(
             "InstanceAction must be dispatched via automation-ruleset-dispatch",
         ));
     }
-    let context = RuntimeContext::from_event(event, identity);
+    let normalized_inputs = normalize_modal_submit_inputs(event, ruleset)
+        .map_err(|error| AdapterError::new(AdapterErrorKind::BadRequest, error.to_string()))?;
+    let mut context = RuntimeContext::from_event(event, identity);
+    if let Some(inputs) = normalized_inputs {
+        context.inputs = inputs;
+    }
     let Some(plan) = interpret(event, ruleset, bindings) else {
         return Ok(None);
     };
@@ -47,7 +53,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use automation_instance::InstanceRuleSetVersion;
-    use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
+    use automation_state::{
+        ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
+        ModalInputPolicy, ModalSpec, TriggerSpec,
+    };
     use discord_model::{GuildId, UserId};
 
     use super::*;
@@ -74,7 +83,19 @@ mod tests {
         InteractionRuleSet {
             version: 1,
             panels: vec![],
-            modals: vec![],
+            modals: vec![ModalSpec {
+                key: "room".to_string(),
+                title: "Room".to_string(),
+                fields: vec![ModalFieldSpec {
+                    key: "room_name".to_string(),
+                    label: "Room name".to_string(),
+                    style: ModalFieldStyle::Short,
+                    required: true,
+                    min_length: None,
+                    max_length: None,
+                    input_policy: ModalInputPolicy::Preserve,
+                }],
+            }],
             rules: vec![InteractionRule {
                 key: "submit".to_string(),
                 trigger: TriggerSpec::ModalSubmit {

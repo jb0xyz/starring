@@ -132,7 +132,11 @@ pub(super) fn add_modal(
     draft.ruleset.modals.push(ModalSpec {
         key: key.clone(),
         title: input.title,
-        fields: input.fields.into_iter().map(modal_field).collect(),
+        fields: input
+            .fields
+            .into_iter()
+            .map(|field| modal_field(field, None))
+            .collect(),
     });
     Ok(format!("Added modal {key}"))
 }
@@ -154,7 +158,16 @@ pub(super) fn update_modal(
         modal.title = title;
     }
     if let Some(fields) = input.fields {
-        modal.fields = fields.into_iter().map(modal_field).collect();
+        let existing_fields = modal.fields.clone();
+        modal.fields = fields
+            .into_iter()
+            .map(|field| {
+                let existing = existing_fields
+                    .iter()
+                    .find(|existing| existing.key == field.key);
+                modal_field(field, existing)
+            })
+            .collect();
     }
     Ok(format!("Updated modal {}", input.key))
 }
@@ -209,7 +222,7 @@ pub(super) fn remove_rule(
     Ok(format!("Removed rule {}", input.key))
 }
 
-fn modal_field(input: ModalFieldInput) -> ModalFieldSpec {
+fn modal_field(input: ModalFieldInput, existing: Option<&ModalFieldSpec>) -> ModalFieldSpec {
     ModalFieldSpec {
         key: input.key,
         label: input.label,
@@ -218,6 +231,11 @@ fn modal_field(input: ModalFieldInput) -> ModalFieldSpec {
             ModalFieldStyleInput::Paragraph => ModalFieldStyle::Paragraph,
         },
         required: input.required,
+        min_length: existing.and_then(|field| field.min_length),
+        max_length: existing.and_then(|field| field.max_length),
+        input_policy: existing
+            .map(|field| field.input_policy)
+            .unwrap_or(automation_state::ModalInputPolicy::Preserve),
     }
 }
 

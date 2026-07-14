@@ -442,6 +442,39 @@ pub fn translate_validation_error(
             format!("Modal field {field} is repeated"),
             "Use a unique key for every modal field",
         ),
+        ValidationError::InvalidModalFieldMinLength {
+            modal,
+            field,
+            min_length,
+        } => StructuredError::new(
+            "INVALID_MODAL_FIELD_MIN_LENGTH",
+            format!("modal.{modal}.field.{field}.min_length"),
+            format!("Modal field {field} has minimum length {min_length}"),
+            "Use a minimum length from 0 through 4000",
+        ),
+        ValidationError::InvalidModalFieldMaxLength {
+            modal,
+            field,
+            max_length,
+        } => StructuredError::new(
+            "INVALID_MODAL_FIELD_MAX_LENGTH",
+            format!("modal.{modal}.field.{field}.max_length"),
+            format!("Modal field {field} has maximum length {max_length}"),
+            "Use a maximum length from 1 through 4000",
+        ),
+        ValidationError::InvalidModalFieldLengthRange {
+            modal,
+            field,
+            min_length,
+            max_length,
+        } => StructuredError::new(
+            "INVALID_MODAL_FIELD_LENGTH_RANGE",
+            format!("modal.{modal}.field.{field}"),
+            format!(
+                "Modal field {field} minimum length {min_length} exceeds maximum length {max_length}"
+            ),
+            "Use a minimum length less than or equal to the maximum length",
+        ),
         ValidationError::UnknownButtonRef { rule, component } => StructuredError::new(
             "UNKNOWN_BUTTON_REFERENCE",
             format!("rule.{rule}.trigger"),
@@ -707,5 +740,61 @@ fn instance_ref_key(reference: &InstanceRef) -> Option<&str> {
     match reference {
         InstanceRef::Created(reference) => Some(reference.created.as_str()),
         InstanceRef::Event => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use automation_state::InteractionRuleSet;
+
+    use super::*;
+
+    fn ruleset() -> InteractionRuleSet {
+        InteractionRuleSet {
+            version: 1,
+            panels: vec![],
+            modals: vec![],
+            rules: vec![],
+        }
+    }
+
+    #[test]
+    fn modal_length_contract_errors_have_stable_codes_and_locations() {
+        let cases = [
+            (
+                ValidationError::InvalidModalFieldMinLength {
+                    modal: "room".to_string(),
+                    field: "name".to_string(),
+                    min_length: 4001,
+                },
+                "INVALID_MODAL_FIELD_MIN_LENGTH",
+                "modal.room.field.name.min_length",
+            ),
+            (
+                ValidationError::InvalidModalFieldMaxLength {
+                    modal: "room".to_string(),
+                    field: "name".to_string(),
+                    max_length: 0,
+                },
+                "INVALID_MODAL_FIELD_MAX_LENGTH",
+                "modal.room.field.name.max_length",
+            ),
+            (
+                ValidationError::InvalidModalFieldLengthRange {
+                    modal: "room".to_string(),
+                    field: "name".to_string(),
+                    min_length: 5,
+                    max_length: 4,
+                },
+                "INVALID_MODAL_FIELD_LENGTH_RANGE",
+                "modal.room.field.name",
+            ),
+        ];
+
+        for (error, code, location) in cases {
+            let translated = translate_validation_error(&ruleset(), &error);
+            assert_eq!(translated.code, code);
+            assert_eq!(translated.location, location);
+        }
     }
 }
