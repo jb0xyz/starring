@@ -150,6 +150,8 @@ The detail result is rejected without mutation when:
 
 Defaults may fill unrequested fields. Defaults never fill a requested but missing detail.
 
+The first generated StudyRoom detail schema is 2,218 bytes and must remain at or below 2,400 bytes.
+
 ## State and atomicity
 
 The detail extraction stage is transient inside one burst. The durable stages remain empty, awaiting a user decision, and preview ready.

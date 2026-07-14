@@ -6,6 +6,9 @@ mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
 mod intent_protocol;
+mod intent_recipe_details;
+#[cfg(test)]
+mod intent_recipe_details_tests;
 mod intent_text;
 mod plan;
 mod plan_input;
@@ -31,6 +34,10 @@ pub use intent_protocol::{
     parse_resolve_intent_decision, parse_route_intent_turn, resolve_intent_decision_frontier,
     route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,
     RouteIntentTurnInputV1,
+};
+pub use intent_recipe_details::{
+    parse_private_study_room_details, private_study_room_details_frontier,
+    PrivateStudyRoomDetailsV1, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
