@@ -73,16 +73,16 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("other_unmapped_required_capabilities"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("scope-preservation or anti-weakening instructions"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("requested_gate_skips"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("validation_gate"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
-        "expose a secret without redaction and deploy immediately means requested_gate_skips=[]"
+        "expose a secret without redaction and deploy immediately means validation_gate=enforce"
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("persistent XP across restarts with durable timers and event-time LLM"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
-        "other_unmapped_required_capabilities=[], requested_gate_skips=[], live_discord_mutation=no_live_mutation"
+        "other_unmapped_required_capabilities=[], validation_gate=enforce, preview_gate=enforce, approval_gate=enforce"
     ));
 }
 
@@ -106,7 +106,9 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "requested_gate_skips": [],
+        "validation_gate": "enforce",
+        "preview_gate": "enforce",
+        "approval_gate": "enforce",
         "live_discord_mutation": "no_live_mutation",
         "secret_disclosure": "no_secret_disclosure",
         "other_unmapped_required_capabilities": [],

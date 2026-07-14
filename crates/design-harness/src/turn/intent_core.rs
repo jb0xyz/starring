@@ -69,14 +69,11 @@ enum CustomDetailFacetWireV3 {
     Controls,
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum RequestedGateSkipWireV3 {
-    Validation,
-    Preview,
-    Approval,
+enum GateDispositionWireV3 {
+    Enforce,
+    Skip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -132,8 +129,9 @@ struct InterpretIntentCoreWireV3 {
     close_policy: CloseAuthorizationV2,
     #[schemars(length(max = 4))]
     runtime_requirements: Vec<RuntimeRequirementV3>,
-    #[schemars(length(max = 3))]
-    requested_gate_skips: Vec<RequestedGateSkipWireV3>,
+    validation_gate: GateDispositionWireV3,
+    preview_gate: GateDispositionWireV3,
+    approval_gate: GateDispositionWireV3,
     live_discord_mutation: LiveDiscordMutationWireV3,
     secret_disclosure: SecretDisclosureWireV3,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
@@ -282,14 +280,6 @@ fn normalize_core(
     input
         .other_unmapped_required_capabilities
         .retain(|value| !runtime_requirement_is_redundant(value, &input.runtime_requirements));
-    if input.requested_gate_skips.len() > 3 {
-        return Err(core_error(
-            "TOO_MANY_GATE_SKIP_REQUESTS",
-            "intent.core.requested_gate_skips",
-            "The interpretation contains more than three gate-skip requests",
-            "Use validation, preview, and approval at most once each",
-        ));
-    }
     if input.custom_detail_facets.len() > 3 {
         return Err(core_error(
             "TOO_MANY_RECIPE_DETAIL_FACETS",
@@ -315,14 +305,14 @@ fn normalize_core(
             "Use custom detail facets only for explicit copy, naming, or control literals of that recipe",
         ));
     }
-    input.requested_gate_skips = input
-        .requested_gate_skips
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
     let mut boundary_requests = BTreeSet::new();
-    if !input.requested_gate_skips.is_empty() {
+    if [
+        input.validation_gate,
+        input.preview_gate,
+        input.approval_gate,
+    ]
+    .contains(&GateDispositionWireV3::Skip)
+    {
         boundary_requests.insert(IntentBoundaryRequestV2::BypassValidationPreviewApproval);
     }
     if input.live_discord_mutation == LiveDiscordMutationWireV3::MutateLiveNow {

@@ -21,7 +21,9 @@ fn valid_core() -> Value {
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "requested_gate_skips": [],
+        "validation_gate": "enforce",
+        "preview_gate": "enforce",
+        "approval_gate": "enforce",
         "live_discord_mutation": "no_live_mutation",
         "secret_disclosure": "no_secret_disclosure",
         "other_unmapped_required_capabilities": [],
@@ -42,7 +44,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         required_names(&tool.parameters),
         strings([
             "automation_kind",
-            "requested_gate_skips",
+            "validation_gate",
+            "preview_gate",
+            "approval_gate",
             "live_discord_mutation",
             "secret_disclosure",
             "close_policy",
@@ -82,10 +86,12 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         tool.parameters["properties"]["custom_detail_facets"]["items"]["enum"],
         json!(["custom_copy", "custom_naming", "custom_controls"])
     );
-    assert_eq!(
-        tool.parameters["properties"]["requested_gate_skips"]["items"]["enum"],
-        json!(["validation", "preview", "approval"])
-    );
+    for field in ["validation_gate", "preview_gate", "approval_gate"] {
+        assert_eq!(
+            tool.parameters["properties"][field]["enum"],
+            json!(["enforce", "skip"])
+        );
+    }
     assert_eq!(
         tool.parameters["properties"]["live_discord_mutation"]["enum"],
         json!(["no_live_mutation", "mutate_live_now"])
@@ -129,7 +135,8 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
 fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
     let mut value = valid_core();
     value["hub_channel"] = Value::Null;
-    value["requested_gate_skips"] = json!(["approval", "validation", "approval"]);
+    value["validation_gate"] = json!("skip");
+    value["approval_gate"] = json!("skip");
     value["live_discord_mutation"] = json!("mutate_live_now");
     value["secret_disclosure"] = json!("disclose_secret_value");
     value["other_unmapped_required_capabilities"] = json!([
@@ -283,7 +290,7 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
     );
 
     value = valid_core();
-    value["requested_gate_skips"] = json!(["safety"]);
+    value["approval_gate"] = json!("safety");
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -378,15 +385,6 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
     assert_eq!(
         parse_interpret_intent_core(&duplicate).unwrap_err().code,
         "INVALID_TOOL_ARGUMENTS"
-    );
-
-    value = valid_core();
-    value["requested_gate_skips"] = json!(["validation", "preview", "approval", "validation"]);
-    assert_eq!(
-        parse_interpret_intent_core(&value.to_string())
-            .unwrap_err()
-            .code,
-        "TOO_MANY_GATE_SKIP_REQUESTS"
     );
 
     value = valid_core();
