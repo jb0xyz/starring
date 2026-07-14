@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, ToolCall};
 use crate::turn::{
-    private_study_room_details_frontier, IntentRecipeDetailFacetV3,
+    private_study_room_details_frontier_for, IntentRecipeDetailFacetV3,
     EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
@@ -399,6 +399,14 @@ impl<C: LlmClient> DesignSession<C> {
                                     return self.finish_intent_tool_execution(call, Err(error));
                                 }
                             };
+                        let tools: Vec<_> = match private_study_room_details_frontier_for(
+                            selection.detail_facets(),
+                        ) {
+                            Ok(frontier) => frontier.into(),
+                            Err(error) => {
+                                return self.finish_intent_tool_execution(call, Err(error));
+                            }
+                        };
                         self.messages.push(Message::tool(
                             call.id,
                             json!({
@@ -409,7 +417,6 @@ impl<C: LlmClient> DesignSession<C> {
                             .to_string(),
                         ));
                         self.messages.push(Message::user(detail_anchor));
-                        let tools: Vec<_> = private_study_room_details_frontier().into();
                         let detail_call = match self
                             .request_intent_tool_once(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &tools)
                             .await

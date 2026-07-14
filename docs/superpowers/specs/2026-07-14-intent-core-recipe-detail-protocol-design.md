@@ -136,6 +136,8 @@ unmapped_facets[]?
 
 Unrequested objects may be omitted. Each requested facet must have at least one normalized value in its matching object. A nonempty `unmapped_facets` list fails closed. After structural validation, the harness stamps the active revision, Core semantic digest, and canonical selected facets into the internal detail object. The model never authors binding or coverage metadata.
 
+The active detail router derives a per-request schema from the canonical selected facets. It removes every unselected object and `unmapped_facets`, then marks every remaining facet object as required. An extractor that cannot map a selected facet must return its required object empty, which the parser rejects without mutation. The broad public parser schema remains compatible with omitted objects and explicit `unmapped_facets`, but the serving frontier exposes only the closed active subset.
+
 The detail result is rejected without mutation when:
 
 - a selected facet is missing, duplicated in the harness ticket, unknown, empty, or mapped to another facet;

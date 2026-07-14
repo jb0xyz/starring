@@ -374,6 +374,16 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
         assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert_eq!(calls[1].1.len(), 1);
         assert_eq!(calls[1].1[0].name, "extract_private_study_room_details");
+        assert_eq!(calls[1].1[0].parameters["required"], json!(["copy"]));
+        assert_eq!(
+            calls[1].1[0].parameters["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["copy"]
+        );
         assert!(calls[1]
             .0
             .last()

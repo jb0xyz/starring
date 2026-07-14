@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 
 use super::{
     parse_private_study_room_details, private_study_room_details_frontier,
-    IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    private_study_room_details_frontier_for, IntentRecipeDetailFacetV3,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 const CORE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -16,6 +17,54 @@ fn valid_copy_details() -> Value {
             "welcome_content": {"prefix": "Welcome to ", "suffix": ""}
         }
     })
+}
+
+#[test]
+fn active_detail_frontier_exposes_and_requires_only_selected_facets() {
+    let [tool] = private_study_room_details_frontier_for(&[
+        IntentRecipeDetailFacetV3::Controls,
+        IntentRecipeDetailFacetV3::Copy,
+    ])
+    .unwrap();
+    assert_eq!(
+        property_names(&tool.parameters),
+        ["controls", "copy"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    assert_eq!(
+        required_names(&tool.parameters),
+        ["controls", "copy"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    assert!(!tool.parameters.to_string().contains("unmapped_facets"));
+    let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
+    assert!(
+        schema_bytes < 1_800,
+        "routed detail schema is {schema_bytes} bytes"
+    );
+}
+
+#[test]
+fn active_detail_frontier_rejects_empty_and_duplicate_tickets() {
+    assert_eq!(
+        private_study_room_details_frontier_for(&[])
+            .unwrap_err()
+            .code,
+        "EMPTY_RECIPE_DETAIL_REQUEST"
+    );
+    assert_eq!(
+        private_study_room_details_frontier_for(&[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Copy,
+        ])
+        .unwrap_err()
+        .code,
+        "DUPLICATE_RECIPE_DETAIL_FACET"
+    );
 }
 
 #[test]
