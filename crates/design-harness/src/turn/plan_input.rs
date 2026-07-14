@@ -1103,10 +1103,14 @@ fn parse_review_with_mode(
         == submitted_reference_tokens.len()
         && (submitted_reference_tokens == expected_reference_tokens
             || submitted_reference_tokens == legacy_expected_reference_tokens);
-    if legacy_clauses && (legacy_reference_audit || input.reference_verdict.is_some())
-        || !legacy_clauses && legacy_reference_audit && !submitted_reference_coverage_matches
-        || !legacy_clauses && !legacy_reference_audit && input.reference_verdict.is_none()
-    {
+    let invalid_reference_coverage = if legacy_clauses {
+        legacy_reference_audit || input.reference_verdict.is_some()
+    } else if legacy_reference_audit {
+        !submitted_reference_coverage_matches
+    } else {
+        input.reference_verdict.is_none()
+    };
+    if invalid_reference_coverage {
         return Err(StructuredError::new(
             "TURN_PLAN_REVIEW_REFERENCE_COVERAGE_INVALID",
             "tool.review_turn_plan.arguments.reference_verdict",
