@@ -204,6 +204,26 @@ impl IntentCoreInterpretationV3 {
         &self.unclassified_requirements
     }
 
+    pub fn validate_human_evidence(&self, human_message: &str) -> Result<(), StructuredError> {
+        let human_message = human_message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self
+            .unclassified_requirements
+            .iter()
+            .all(|value| human_message.contains(value))
+        {
+            return Ok(());
+        }
+        Err(core_error(
+            "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "An unmapped capability is not an exact phrase from the human request",
+            "Copy a contiguous human phrase without synthesizing an identifier",
+        ))
+    }
+
     pub fn recipe_detail_facets(&self) -> &[IntentRecipeDetailFacetV3] {
         &self.detail_facets
     }

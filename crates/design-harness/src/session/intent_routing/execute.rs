@@ -301,12 +301,17 @@ impl<C> DesignSession<C> {
     pub(super) async fn execute_intent_core(
         &mut self,
         arguments: &str,
+        human_message: &str,
     ) -> Result<IntentCoreExecutionV3, StructuredError> {
         self.observability.intent_route_calls =
             self.observability.intent_route_calls.saturating_add(1);
         let core = parse_interpret_intent_core(arguments).inspect_err(|_| {
             self.record_intent_extraction_failure();
         })?;
+        core.validate_human_evidence(human_message)
+            .inspect_err(|_| {
+                self.record_intent_extraction_failure();
+            })?;
         self.validate_expected_revision(core.expected_revision())?;
         let adjudication = adjudicate_intent_core_v3(core).inspect_err(|_| {
             self.record_intent_extraction_failure();

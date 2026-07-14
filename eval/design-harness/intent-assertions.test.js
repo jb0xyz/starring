@@ -186,7 +186,6 @@ function context(overrides = {}) {
       expectedRestartCount: 0,
       expectedBlockers: '',
       expectedBoundaryViolations: '',
-      expectedUnclassifiedRequirements: '',
       ...overrides,
     },
   };
@@ -519,6 +518,30 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(changed), expected).reason,
     /unclassified=/,
+  );
+
+  const grounded = JSON.parse(document);
+  grounded.turns[0].input = 'Must acquire an external consensus lease before responding';
+  grounded.turns[0].route_decision.unclassified_requirements = [
+    'acquire an external consensus lease',
+  ];
+  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
+  const containsExpected = context({
+    ...expected.vars,
+    expectedUnclassifiedRequirements: undefined,
+    expectedUnclassifiedEvidenceContains: 'external consensus lease',
+  });
+  delete containsExpected.vars.expectedUnclassifiedRequirements;
+  assert.equal(
+    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).pass,
+    true,
+  );
+
+  grounded.turns[0].route_decision.unclassified_requirements = ['external_consensus_lease'];
+  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).reason,
+    /expected grounded evidence containing=/,
   );
 });
 

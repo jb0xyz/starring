@@ -393,7 +393,9 @@ impl<C: LlmClient> DesignSession<C> {
                 self.finish_intent_tool_execution(call, result)
             }
             IntentFrontierV3::InterpretCore => {
-                let result = self.execute_intent_core(&call.arguments).await;
+                let result = self
+                    .execute_intent_core(&call.arguments, human_message)
+                    .await;
                 match result {
                     Ok(IntentCoreExecutionV3::Complete(success)) => {
                         self.finish_intent_tool_execution(call, Ok(*success))

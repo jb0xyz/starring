@@ -344,10 +344,13 @@ function expectedBoundaries(expected) {
 }
 
 function expectedUnclassifiedRequirements(expected) {
-  if (!Object.hasOwn(expected, 'expectedUnclassifiedRequirements')) {
-    return [];
+  if (Object.hasOwn(expected, 'expectedUnclassifiedRequirements')) {
+    return { exact: list(expected.expectedUnclassifiedRequirements).sort(), contains: [] };
   }
-  return list(expected.expectedUnclassifiedRequirements).sort();
+  if (Object.hasOwn(expected, 'expectedUnclassifiedEvidenceContains')) {
+    return { exact: null, contains: list(expected.expectedUnclassifiedEvidenceContains).sort() };
+  }
+  return { exact: [], contains: [] };
 }
 
 function routeKind(route) {
@@ -735,7 +738,7 @@ function intentAdjudicationDecision(output, context) {
     const routes = list(expected.expectedRoutePath);
     const expectedBlockerSet = expectedBlockers(expected);
     const expectedBoundarySet = expectedBoundaries(expected);
-    const expectedUnclassifiedSet = expectedUnclassifiedRequirements(expected);
+    const expectedUnclassified = expectedUnclassifiedRequirements(expected);
     const failures = [];
     if (routes.length !== report.turns.length) {
       failures.push(`decision route path length=${report.turns.length} expected=${routes.length}`);
@@ -759,8 +762,20 @@ function intentAdjudicationDecision(output, context) {
         failures.push(`${turn.id} boundaries=${JSON.stringify(actualBoundaries)} expected=${JSON.stringify(expectedBoundarySet)}`);
       }
       const actualUnclassified = [...decision.unclassified_requirements].sort();
-      if (!sameJson(actualUnclassified, expectedUnclassifiedSet)) {
-        failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected=${JSON.stringify(expectedUnclassifiedSet)}`);
+      if (expectedUnclassified.exact !== null
+        && !sameJson(actualUnclassified, expectedUnclassified.exact)) {
+        failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected=${JSON.stringify(expectedUnclassified.exact)}`);
+      }
+      if (expectedUnclassified.exact === null) {
+        const grounded = actualUnclassified.every((value) => turn.input.includes(value));
+        const containsEvery = expectedUnclassified.contains.every((expectedValue) => (
+          actualUnclassified.some((actualValue) => actualValue.includes(expectedValue))
+        ));
+        if (actualUnclassified.length !== expectedUnclassified.contains.length
+          || !grounded
+          || !containsEvery) {
+          failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected grounded evidence containing=${JSON.stringify(expectedUnclassified.contains)}`);
+        }
       }
       if (decision.kind === 'private_study_room') {
         if (!sameJson(decision.route_target, {

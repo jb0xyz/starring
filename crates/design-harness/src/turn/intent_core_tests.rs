@@ -227,6 +227,31 @@ fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
 }
 
 #[test]
+fn core_capability_evidence_must_be_grounded_in_the_human_request() {
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!(["acquire an external consensus lease"]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    parsed
+        .validate_human_evidence(
+            "Build a flow that must  acquire an external consensus lease before responding.",
+        )
+        .unwrap();
+
+    value["other_unmapped_required_capabilities"] = json!(["external_consensus_lease"]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed
+            .validate_human_evidence(
+                "Build a flow that must acquire an external consensus lease before responding.",
+            )
+            .unwrap_err()
+            .code,
+        "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE"
+    );
+}
+
+#[test]
 fn core_parser_discards_build_response_deterministically() {
     let mut value = valid_core();
     value["response"] = json!("This model-authored build response is ignored.");
