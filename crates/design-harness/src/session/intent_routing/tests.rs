@@ -11,8 +11,9 @@ use crate::{dispatch_tool, BurstOutcome, LlmClient, Message, ToolCall, ToolDefin
 
 use super::adjudicate::{adjudicate_intent_core_v3, IntentCoreAdjudicationV3};
 use super::state::{
-    INTENT_HUMAN_PREFIX, INTENT_RECIPE_SYSTEM_PROMPT_V1, INTENT_RECIPE_SYSTEM_PROMPT_V2,
-    INTENT_RECIPE_SYSTEM_PROMPT_V3,
+    INTENT_HUMAN_PREFIX, INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V1,
+    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
 };
 use super::*;
 
@@ -227,6 +228,7 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
 
         let calls = probe.calls();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
         assert_eq!(calls[0].1.len(), 1);
         assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert!(calls[0]
@@ -342,6 +344,8 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
 
         let calls = probe.calls();
         assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
+        assert_eq!(calls[1].0[0].content, INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3);
         assert_eq!(calls[0].1.len(), 1);
         assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert_eq!(calls[1].1.len(), 1);
@@ -426,6 +430,10 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
             BurstOutcome::Ready { .. }
         ));
         assert_eq!(probe.calls().len(), 2);
+        assert_eq!(
+            probe.calls()[1].0[0].content,
+            INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3
+        );
         assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
         assert_eq!(probe.calls()[1].1[0].name, "resolve_intent_decision");
         assert_eq!(

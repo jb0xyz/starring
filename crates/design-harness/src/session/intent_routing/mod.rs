@@ -42,7 +42,8 @@ pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;
 use state::{
     intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_DETAIL_STATE_PREFIX,
-    INTENT_HUMAN_PREFIX, INTENT_STATE_PREFIX,
+    INTENT_HUMAN_PREFIX, INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3, INTENT_STATE_PREFIX,
 };
 pub(super) use state::{
     validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT, INTENT_RECIPE_SYSTEM_PROMPT_V1,
@@ -243,11 +244,21 @@ impl<C> DesignSession<C> {
         Ok(())
     }
 
-    fn fit_intent_context(&self, tools: &[crate::tools::ToolDefinition]) -> Option<Vec<Message>> {
-        let message_chars = serde_json::to_string(&self.messages).ok()?.len();
+    fn fit_intent_context(
+        &self,
+        tools: &[crate::tools::ToolDefinition],
+        system_prompt: &str,
+    ) -> Option<Vec<Message>> {
+        let mut messages = self.messages.clone();
+        let system = messages.first_mut()?;
+        if system.role != crate::llm::MessageRole::System {
+            return None;
+        }
+        system.content = system_prompt.to_string();
+        let message_chars = serde_json::to_string(&messages).ok()?.len();
         let tool_chars = serde_json::to_string(tools).ok()?.len();
         (message_chars.saturating_add(tool_chars) <= self.config.context_char_budget)
-            .then(|| self.messages.clone())
+            .then_some(messages)
     }
 
     fn finish_intent_success(&mut self, success: IntentTurnSuccess) -> super::BurstOutcome {
@@ -455,7 +466,12 @@ impl<C: LlmClient> DesignSession<C> {
                 LimitKind::ToolCalls,
             ));
         }
-        let Some(messages) = self.fit_intent_context(tools) else {
+        let system_prompt = match expected_tool {
+            EXTRACT_PRIVATE_STUDY_ROOM_DETAILS => INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3,
+            crate::turn::RESOLVE_INTENT_DECISION => INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
+            _ => INTENT_RECIPE_SYSTEM_PROMPT_V3,
+        };
+        let Some(messages) = self.fit_intent_context(tools, system_prompt) else {
             return Err(IntentToolRequestFailure::Limit(
                 intent_error(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
