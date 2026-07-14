@@ -53,27 +53,26 @@ request_mode
 automation_kind
 objective
 requested_outcome
-selected_existing_channel
+hub_channel
 locale
 close_authorization
 runtime_requirements
 boundary_requests
 unclassified_requirements
-recipe_detail_requests
+detail_facets
 response
 ```
 
-The first twelve fields retain the successful diagnostic semantics. `recipe_detail_requests` is the only addition. It is a bounded array of closed facets and bounded requirements.
+The first twelve fields retain the successful diagnostic semantics. `detail_facets` is the only addition. It is a bounded array containing at most three closed facets.
 
 ```text
-recipe_detail_requests[]:
-  facet: copy | naming | controls
-  requirement: normalized natural-language requirement
+detail_facets[]:
+  copy | naming | controls
 ```
 
-The model cannot put behavior, permissions, actions, identifiers, manifests, or raw templates in this array. Those are either represented by the closed Core IR, routed to the typed planner, or preserved as an unclassified hard requirement.
+The original human message remains the authority for the exact custom literals passed to the recipe-specific extractor. The model cannot put behavior, permissions, actions, identifiers, manifests, or raw templates in `detail_facets`. Those are either represented by the closed Core IR, routed to the typed planner, or preserved as an unclassified hard requirement.
 
-`selected_existing_channel` is a generic binding slot. The selected recipe adapter decides whether it is a StudyRoom discovery hub. A future recipe that needs multiple binding roles must use its own detail extractor rather than growing the Core IR.
+`hub_channel` retains the field name that produced native tool calls in the fifteen-call diagnostic. The selected recipe adapter owns its meaning. A future recipe that needs multiple binding roles must use its own detail extractor rather than growing the Core IR.
 
 `locale` controls deterministic default recipe copy and deterministic fallback wording. V3 removes the redundant model-facing `response_locale`. The model `response` is surfaced only for discussion; it has no authority on build, capability, recipe, or rejection facts.
 
@@ -85,14 +84,13 @@ Normalization:
 
 - trims and bounds the objective, response, and requirements;
 - sorts and deduplicates boundary and unclassified requirements;
-- assigns deterministic IDs to recipe detail requests after canonical facet ordering;
-- rejects duplicate normalized detail requirements;
+- sorts and deduplicates the bounded detail facets;
 - rejects recipe details on discussion and boundary-only requests;
 - rejects build requests with `automation_kind=none` unless a boundary or capability finding explains the terminal route;
 - treats explicit default copy or naming as no customization requirement;
 - never drops a hard runtime, authorization, lifecycle, external-effect, or safety-boundary requirement.
 
-Schema size is a tested product invariant. The serialized Core tool schema must remain below 2,400 bytes and combined `tools` plus `response_format` structured metadata must remain below 5,600 bytes. A field addition requires an explicit design and updated measured budget.
+Schema size is a tested product invariant. The first generated V3 Core schema is 2,397 bytes and its combined `tools` plus `response_format` structured metadata is 5,285 bytes. The schema must remain at or below 2,400 bytes and combined metadata at or below 5,600 bytes. A field addition requires an explicit design and updated measured budget.
 
 ## Deterministic adjudication
 
@@ -110,13 +108,13 @@ Capability and safety adjudication runs before recipe-detail extraction. A creat
 
 ## Default fast path
 
-A pinned StudyRoom uses deterministic defaults when `recipe_detail_requests` is empty.
+A pinned StudyRoom uses deterministic defaults when `detail_facets` is empty.
 
 The adapter constructs the existing `PrivateStudyRoomProposalV1` from:
 
 - Core objective;
 - requested outcome;
-- selected existing channel;
+- selected hub channel;
 - locale;
 - supported close authorization;
 - existing deterministic copy, naming, and control defaults.
@@ -125,9 +123,9 @@ The existing workspace preparation, compiler, validator, simulator, atomic candi
 
 ## Recipe detail path
 
-Only a pinned StudyRoom with nonempty `recipe_detail_requests` exposes `extract_private_study_room_details`.
+Only a pinned StudyRoom with nonempty `detail_facets` exposes `extract_private_study_room_details`.
 
-The harness supplies the pinned recipe identity, Core semantic digest, current revision, original human request, and harness-owned detail request IDs. The model cannot change route, recipe, requested outcome, selected binding, locale, authorization, runtime requirements, or safety boundaries.
+The harness supplies the pinned recipe identity, Core semantic digest, current revision, original human request, and harness-owned detail facets. The model cannot change route, recipe, requested outcome, selected binding, locale, authorization, runtime requirements, or safety boundaries.
 
 ```text
 expected_revision
@@ -135,16 +133,16 @@ core_semantic_digest
 copy
 naming
 controls
-coverage[]
-unmapped_request_ids[]
+covered_facets[]
+unmapped_facets[]
 ```
 
-Each coverage entry contains one harness-owned detail request ID and one matching facet. Every request ID must appear exactly once in either coverage or `unmapped_request_ids`.
+Each selected facet must appear exactly once in either `covered_facets` or `unmapped_facets`.
 
 The detail result is rejected without mutation when:
 
-- a request ID is missing, duplicated, unknown, or mapped to another facet;
-- an unmapped request remains;
+- a selected facet is missing, duplicated, unknown, or mapped to another facet;
+- an unmapped facet remains;
 - a value exceeds the existing recipe bounds;
 - a control contradicts the adjudicated close authorization;
 - the response changes a Core field or supplies an unsupported field;

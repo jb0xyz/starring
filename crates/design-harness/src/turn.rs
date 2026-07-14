@@ -1,4 +1,7 @@
 mod execution;
+mod intent_core;
+#[cfg(test)]
+mod intent_core_tests;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
@@ -11,6 +14,10 @@ mod scope;
 
 pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
+};
+pub use intent_core::{
+    interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV3,
+    IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
 };
 pub use intent_interpretation::{
     interpret_intent_turn_frontier, parse_interpret_intent_turn, CloseAuthorizationV2,
