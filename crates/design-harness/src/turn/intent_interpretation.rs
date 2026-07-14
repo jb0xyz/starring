@@ -324,6 +324,16 @@ fn normalize_interpretation(
 }
 
 fn validate_mode_outcome(input: &InterpretIntentTurnWireV2) -> Result<(), StructuredError> {
+    if input.request_mode == IntentRequestModeV2::Discussion
+        && input.automation_kind != IntentAutomationKindV2::None
+    {
+        return Err(intent_error(
+            "INCONSISTENT_INTENT_INTERPRETATION",
+            "intent.interpretation.automation_kind",
+            "A discussion request cannot select a build automation kind",
+            "Set automation_kind to none for discussion",
+        ));
+    }
     match (input.request_mode, input.requested_outcome) {
         (IntentRequestModeV2::Discussion, IntentRequestedOutcome::Discussion)
         | (

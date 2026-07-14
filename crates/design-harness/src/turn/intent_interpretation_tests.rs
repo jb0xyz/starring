@@ -306,6 +306,13 @@ fn mode_outcome_and_discussion_response_are_consistent() {
     assert_eq!(
         parse_interpret_intent_turn(&value.to_string())
             .unwrap_err()
+            .location,
+        "intent.interpretation.automation_kind"
+    );
+    value["automation_kind"] = Value::String("none".to_string());
+    assert_eq!(
+        parse_interpret_intent_turn(&value.to_string())
+            .unwrap_err()
             .code,
         "EMPTY_INTENT_TEXT"
     );

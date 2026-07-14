@@ -35,7 +35,9 @@ use adaptive::simulation_profile_for_current_human_turn;
 use context::compact_text;
 use intent_routing::IntentRecipeRuntime;
 pub use intent_routing::{
-    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
+    IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1,
+    IntentRecipeStatusV1, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
+    INTENT_ADJUDICATOR_VERSION_V2,
 };
 use repair::is_argument_failure;
 use routing::{

@@ -9,11 +9,20 @@ use crate::turn::{resolve_intent_decision_frontier, route_intent_turn_frontier};
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
 
+#[allow(dead_code)]
+mod adjudicate;
+#[cfg(test)]
+mod adjudicate_tests;
+mod decision;
 mod execute;
 mod state;
 #[cfg(test)]
 mod tests;
 
+pub use decision::{
+    IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
+    INTENT_ADJUDICATOR_VERSION_V2,
+};
 use execute::IntentTurnSuccess;
 pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;

@@ -40,6 +40,7 @@ pub use model::{
     ClosePolicyV1, ExistingChannelKey, FeatureId, IntentLocaleV1, IntentRequestedOutcome,
     IntentResolutionContext, MissingDecision, MissingDecisionKind, RoomNamePatternV1,
 };
+pub(crate) use model::{PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION};
 pub(crate) use normalize::PreparedIntentWorkspaceV1;
 pub use normalize::ValidatedIntentV1;
 pub(crate) use proposal::{apply_existing_channel_decision, prepare_private_study_room};
