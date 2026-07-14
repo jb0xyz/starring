@@ -5,6 +5,7 @@ mod compiler_tests;
 mod keyspace;
 mod model;
 mod normalize;
+mod private_study_room;
 mod proposal;
 mod provenance;
 #[cfg(test)]
