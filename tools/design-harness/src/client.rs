@@ -266,6 +266,9 @@ fn build_request_body(
         let body = body
             .as_object_mut()
             .ok_or_else(|| LlmError::Client("request body is not an object".to_string()))?;
+        body.remove("tools");
+        body.remove("tool_choice");
+        body.remove("parallel_tool_calls");
         body.insert(
             "response_format".to_string(),
             serde_json::json!({
@@ -671,9 +674,9 @@ mod tests {
             definitions[0].parameters
         );
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["parallel_tool_calls"], false);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
         assert_eq!(body["temperature"], 0.1);
         assert_eq!(body["seed"], 0);
         assert_eq!(body["stream"], false);
@@ -715,6 +718,36 @@ mod tests {
                 LlmResponse::Text(content.to_string())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sole_frontier_transport_sends_only_the_schema_and_promotes_content() {
+        let (address, server) = spawn_capture_server(
+            200,
+            r#"{"model":"test-model","choices":[{"message":{"content":"{\"key\":\"panel\"}"}}]}"#,
+        );
+        let definitions = vec![tool_definitions().remove(0)];
+
+        let response = test_client(address)
+            .complete(&[Message::user("build")], &definitions)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response,
+            LlmResponse::ToolCalls(vec![ToolCall {
+                id: "call-adapted-1".to_string(),
+                name: "add_panel".to_string(),
+                arguments: r#"{"key":"panel"}"#.to_string(),
+            }])
+        );
+        let request = server.join().unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(body).unwrap();
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["response_format"]["type"], "json_schema");
     }
 
     #[test]
