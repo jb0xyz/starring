@@ -22,7 +22,7 @@ fn valid_core() -> Value {
         "close_policy": "disabled",
         "runtime_requirements": [],
         "explicit_boundary_requests": [],
-        "other_unmapped_hard_requirements": [],
+        "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
     })
@@ -51,7 +51,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
             "response",
             "runtime_requirements",
             "hub_channel",
-            "other_unmapped_hard_requirements",
+            "other_unmapped_required_capabilities",
         ])
     );
     let properties = property_names(&tool.parameters);
@@ -82,7 +82,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         tool.parameters["properties"]["explicit_boundary_requests"]["items"]["enum"],
         json!([
             "request_live_discord_mutation",
-            "request_bypass_safety_gates",
+            "request_skip_validation_preview_or_approval",
             "request_secret_disclosure"
         ])
     );
@@ -126,7 +126,7 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
         "request_live_discord_mutation",
         "request_secret_disclosure"
     ]);
-    value["other_unmapped_hard_requirements"] = json!([
+    value["other_unmapped_required_capabilities"] = json!([
         "  external   scheduler lease ",
         "cross-service quorum",
         "cross-service quorum"
@@ -203,7 +203,7 @@ fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
 
     value = valid_core();
     value["runtime_requirements"] = json!(["persistent_economy"]);
-    value["other_unmapped_hard_requirements"] =
+    value["other_unmapped_required_capabilities"] =
         json!(["persistent_economy", "external settlement lease"]);
     let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
     assert_eq!(
@@ -273,6 +273,15 @@ fn core_parser_rejects_unknown_types_and_inconsistent_discussion() {
             .unwrap_err()
             .code,
         "UNKNOWN_FIELD"
+    );
+
+    value = valid_core();
+    value["explicit_boundary_requests"] = json!(["request_bypass_safety_gates"]);
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INVALID_TOOL_ARGUMENTS"
     );
 
     value = valid_core();
@@ -367,7 +376,7 @@ fn core_parser_rejects_missing_duplicate_and_oversized_closed_sets() {
     value = valid_core();
     value["explicit_boundary_requests"] = json!([
         "request_live_discord_mutation",
-        "request_bypass_safety_gates",
+        "request_skip_validation_preview_or_approval",
         "request_secret_disclosure",
         "request_live_discord_mutation"
     ]);

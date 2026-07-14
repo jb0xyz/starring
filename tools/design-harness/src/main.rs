@@ -1719,7 +1719,7 @@ mod tests {
                     "close_policy": "disabled",
                     "runtime_requirements": [],
                     "explicit_boundary_requests": [],
-                    "other_unmapped_hard_requirements": [],
+                    "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": ""
                 })
@@ -1844,7 +1844,7 @@ mod tests {
                     "close_policy": "disabled",
                     "runtime_requirements": [],
                     "explicit_boundary_requests": [],
-                    "other_unmapped_hard_requirements": [],
+                    "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": "I already deployed this automation."
                 })

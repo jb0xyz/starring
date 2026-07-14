@@ -68,6 +68,16 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
     }])
 }
 
+#[test]
+fn v3_prompt_separates_required_capabilities_from_gate_skips() {
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("other_unmapped_required_capabilities"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+        .contains("scope-preservation or anti-weakening instructions"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("request_skip_validation_preview_or_approval"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+        .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
+}
+
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
     let mut bindings = ResourceBindingMap::default();
     bindings.channel_bindings.insert(
@@ -89,7 +99,7 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "close_policy": "disabled",
         "runtime_requirements": [],
         "explicit_boundary_requests": [],
-        "other_unmapped_hard_requirements": [],
+        "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
     })
@@ -156,7 +166,7 @@ fn discussion(expected_revision: u64, response: &str) -> LlmResponse {
         "persistent_economy",
         "event_time_llm"
     ]);
-    value["other_unmapped_hard_requirements"] = json!(["external consensus lease"]);
+    value["other_unmapped_required_capabilities"] = json!(["external consensus lease"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }

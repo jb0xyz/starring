@@ -75,8 +75,8 @@ enum CustomDetailFacetWireV3 {
 enum ExplicitBoundaryRequestWireV3 {
     #[serde(rename = "request_live_discord_mutation")]
     LiveDiscordMutation,
-    #[serde(rename = "request_bypass_safety_gates")]
-    BypassSafetyGates,
+    #[serde(rename = "request_skip_validation_preview_or_approval")]
+    SkipValidationPreviewOrApproval,
     #[serde(rename = "request_secret_disclosure")]
     SecretDisclosure,
 }
@@ -85,7 +85,7 @@ impl From<ExplicitBoundaryRequestWireV3> for IntentBoundaryRequestV2 {
     fn from(value: ExplicitBoundaryRequestWireV3) -> Self {
         match value {
             ExplicitBoundaryRequestWireV3::LiveDiscordMutation => Self::DirectLiveMutation,
-            ExplicitBoundaryRequestWireV3::BypassSafetyGates => {
+            ExplicitBoundaryRequestWireV3::SkipValidationPreviewOrApproval => {
                 Self::BypassValidationPreviewApproval
             }
             ExplicitBoundaryRequestWireV3::SecretDisclosure => Self::SecretDisclosure,
@@ -133,7 +133,7 @@ struct InterpretIntentCoreWireV3 {
     #[schemars(length(max = 3))]
     explicit_boundary_requests: Vec<ExplicitBoundaryRequestWireV3>,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
-    other_unmapped_hard_requirements: Vec<String>,
+    other_unmapped_required_capabilities: Vec<String>,
     #[schemars(length(max = 3))]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
     #[schemars(length(max = 2000))]
@@ -269,14 +269,14 @@ fn normalize_core(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    input.other_unmapped_hard_requirements = normalize_requirements(
-        input.other_unmapped_hard_requirements,
+    input.other_unmapped_required_capabilities = normalize_requirements(
+        input.other_unmapped_required_capabilities,
         MAX_UNCLASSIFIED_REQUIREMENTS,
         MAX_UNCLASSIFIED_REQUIREMENT_CHARS,
-        "intent.core.other_unmapped_hard_requirements",
+        "intent.core.other_unmapped_required_capabilities",
     )?;
     input
-        .other_unmapped_hard_requirements
+        .other_unmapped_required_capabilities
         .retain(|value| !runtime_requirement_is_redundant(value, &input.runtime_requirements));
     if input.explicit_boundary_requests.len() > 3 {
         return Err(core_error(
@@ -332,7 +332,7 @@ fn normalize_core(
             .into_iter()
             .map(IntentBoundaryRequestV2::from)
             .collect(),
-        unclassified_requirements: input.other_unmapped_hard_requirements,
+        unclassified_requirements: input.other_unmapped_required_capabilities,
         detail_facets: input
             .custom_detail_facets
             .into_iter()
