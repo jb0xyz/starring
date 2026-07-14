@@ -3,6 +3,8 @@ mod capability;
 #[cfg(test)]
 mod capability_tests;
 mod catalog;
+#[cfg(test)]
+mod catalog_tests;
 mod compile;
 #[cfg(test)]
 mod compiler_tests;
@@ -31,6 +33,10 @@ pub use capability::{
     IntentRequirementEvidenceV2, IntentRouteEffectV2, IntentSafetyBoundaryIdV2,
     IntentSafetyBoundaryRequestV2, IntentSafetyBoundaryViolationV2, LocalizedIntentLabelV2,
     SafetyBoundaryDescriptorV2, INTENT_CAPABILITY_MANIFEST_VERSION_V2,
+};
+pub use catalog::{
+    recipe_descriptor_digest_v1, recipe_descriptor_v1, recipe_registry_digest_v1,
+    recipe_registry_v1, RecipeDescriptorV1, RecipeKindV1,
 };
 pub use compile::{
     compile_intent, CompilationManifestV1, CompilationVerificationV1, CompiledIntentV1,
