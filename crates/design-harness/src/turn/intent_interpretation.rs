@@ -291,7 +291,7 @@ fn normalize_interpretation(
     )?;
     input.response = normalized_response(&input.response, input.request_mode)?;
     normalize_channel(&mut input.hub_channel)?;
-    normalize_private_overrides(&mut input)?;
+    normalize_private_study_room_details(&mut input.copy, &mut input.naming, &mut input.controls)?;
     if input.unclassified_requirements.len() > MAX_UNCLASSIFIED_REQUIREMENTS {
         return Err(intent_error(
             "TOO_MANY_UNCLASSIFIED_INTENT_REQUIREMENTS",
@@ -401,95 +401,97 @@ fn normalize_channel(channel: &mut RequiredNullableChannelV2) -> Result<(), Stru
     ))
 }
 
-fn normalize_private_overrides(
-    input: &mut InterpretIntentTurnWireV2,
+pub(super) fn normalize_private_study_room_details(
+    copy: &mut PrivateStudyRoomCopyProposalV1,
+    naming: &mut PrivateStudyRoomNamingProposalV1,
+    controls: &mut PrivateStudyRoomControlsInterpretationV2,
 ) -> Result<(), StructuredError> {
     normalize_optional_text(
-        &mut input.copy.launcher_content,
+        &mut copy.launcher_content,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.copy.launcher_content",
     )?;
     normalize_optional_text(
-        &mut input.copy.create_button_label,
+        &mut copy.create_button_label,
         MAX_BUTTON_LABEL_CHARS,
         false,
         "intent.interpretation.copy.create_button_label",
     )?;
     normalize_optional_text(
-        &mut input.copy.modal_title,
+        &mut copy.modal_title,
         MAX_MODAL_TEXT_CHARS,
         false,
         "intent.interpretation.copy.modal_title",
     )?;
     normalize_optional_text(
-        &mut input.copy.room_name_label,
+        &mut copy.room_name_label,
         MAX_MODAL_TEXT_CHARS,
         false,
         "intent.interpretation.copy.room_name_label",
     )?;
     normalize_optional_pattern(
-        &mut input.copy.welcome_content,
+        &mut copy.welcome_content,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.copy.welcome_content",
     )?;
     normalize_optional_pattern(
-        &mut input.copy.hub_announcement,
+        &mut copy.hub_announcement,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.copy.hub_announcement",
     )?;
     normalize_optional_pattern(
-        &mut input.copy.completed_response,
+        &mut copy.completed_response,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.copy.completed_response",
     )?;
     normalize_optional_pattern(
-        &mut input.naming.channel_name,
+        &mut naming.channel_name,
         MAX_NAME_AFFIX_CHARS,
         false,
         "intent.interpretation.naming.channel_name",
     )?;
     normalize_optional_pattern(
-        &mut input.naming.member_role_name,
+        &mut naming.member_role_name,
         MAX_NAME_AFFIX_CHARS,
         false,
         "intent.interpretation.naming.member_role_name",
     )?;
     normalize_optional_text(
-        &mut input.controls.help_label,
+        &mut controls.help_label,
         MAX_BUTTON_LABEL_CHARS,
         false,
         "intent.interpretation.controls.help_label",
     )?;
     normalize_optional_text(
-        &mut input.controls.help_response,
+        &mut controls.help_response,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.controls.help_response",
     )?;
     normalize_optional_text(
-        &mut input.controls.join_label,
+        &mut controls.join_label,
         MAX_BUTTON_LABEL_CHARS,
         false,
         "intent.interpretation.controls.join_label",
     )?;
     normalize_optional_text(
-        &mut input.controls.joined_response,
+        &mut controls.joined_response,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.controls.joined_response",
     )?;
     normalize_optional_text(
-        &mut input.controls.close_label,
+        &mut controls.close_label,
         MAX_BUTTON_LABEL_CHARS,
         false,
         "intent.interpretation.controls.close_label",
     )?;
     normalize_optional_text(
-        &mut input.controls.closed_response,
+        &mut controls.closed_response,
         MAX_RESPONSE_CHARS,
         true,
         "intent.interpretation.controls.closed_response",
