@@ -599,6 +599,8 @@ name = "design-harness-cli"
 version = "0.1.0"
 dependencies = [
  "design-harness",
+ "desired-state",
+ "discord-model",
  "reqwest",
  "rusqlite",
  "serde",

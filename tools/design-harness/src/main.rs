@@ -11,43 +11,81 @@ use std::time::Instant;
 
 use design_harness::{
     parse_turn_brief, BurstOutcome, DesignSession, Draft, DraftSummary, HaltReport, LimitKind,
-    LlmClient, LlmError, LlmResponse, Message, Observability, SessionConfig, SessionSnapshot,
-    SessionSnapshotError, StructuredError, ToolCall, ToolDefinition, TurnIntent,
+    LlmClient, LlmError, LlmResponse, Message, Observability, ResourceBindingMap, SessionConfig,
+    SessionSnapshot, SessionSnapshotError, StructuredError, ToolCall, ToolDefinition, TurnIntent,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::GemmaClient;
-use crate::config::{EdgeConfig, PersistenceConfig};
-use crate::store::SessionStore;
+use crate::config::{EdgeConfig, HarnessMode, PersistenceConfig};
+use crate::store::{SessionStore, StoreError};
 
 fn create_interactive_session<C>(
     client: C,
     config: SessionConfig,
     snapshot: Option<SessionSnapshot>,
-    planned: bool,
+    mode: HarnessMode,
+    bindings: Option<ResourceBindingMap>,
 ) -> Result<DesignSession<C>, SessionSnapshotError> {
-    match (snapshot, planned) {
-        (Some(snapshot), true) => DesignSession::restore_planned(client, config, snapshot),
-        (Some(snapshot), false) => DesignSession::restore(client, config, snapshot),
-        (None, true) => Ok(DesignSession::with_planned_config(client, config)),
-        (None, false) => Ok(DesignSession::with_adaptive_config(client, config)),
+    match (snapshot, mode) {
+        (Some(snapshot), HarnessMode::Adaptive) => DesignSession::restore(client, config, snapshot),
+        (Some(snapshot), HarnessMode::TypedPlan) => {
+            DesignSession::restore_planned(client, config, snapshot)
+        }
+        (Some(snapshot), HarnessMode::IntentRecipe) => DesignSession::restore_intent_recipe(
+            client,
+            config,
+            snapshot,
+            required_intent_bindings(bindings)?,
+        ),
+        (None, HarnessMode::Adaptive) => Ok(DesignSession::with_adaptive_config(client, config)),
+        (None, HarnessMode::TypedPlan) => Ok(DesignSession::with_planned_config(client, config)),
+        (None, HarnessMode::IntentRecipe) => Ok(DesignSession::with_intent_recipe_config(
+            client,
+            config,
+            required_intent_bindings(bindings)?,
+        )),
     }
+}
+
+fn required_intent_bindings(
+    bindings: Option<ResourceBindingMap>,
+) -> Result<ResourceBindingMap, SessionSnapshotError> {
+    bindings.ok_or_else(|| SessionSnapshotError::InvalidInvariant {
+        message: "intent recipe mode requires the configured resource bindings".to_string(),
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = EdgeConfig::from_env()?;
-    let client = GemmaClient::new(config.base_url, config.api_key, config.model)?;
     if env::args().nth(1).as_deref() == Some("--eval-json") {
+        let client = GemmaClient::new(config.base_url, config.api_key, config.model)?;
         return run_eval(client, config.session_config).await;
     }
     let persistence = PersistenceConfig::from_env()?;
+    let client = match persistence.mode {
+        HarnessMode::IntentRecipe => {
+            let client = GemmaClient::new_intent_serving(config.base_url, config.api_key)?;
+            client.preflight_model().await?;
+            client
+        }
+        HarnessMode::Adaptive | HarnessMode::TypedPlan => {
+            GemmaClient::new(config.base_url, config.api_key, config.model)?
+        }
+    };
     let mut store = SessionStore::open(&persistence.db_path)?;
-    let snapshot = store.load(&persistence.session_id)?;
-    let mut session =
-        create_interactive_session(client, config.session_config, snapshot, persistence.planned)?;
+    let loaded = store.load_versioned(&persistence.session_id)?;
+    let mut generation = loaded.as_ref().map_or(0, |loaded| loaded.generation);
+    let mut session = create_interactive_session(
+        client.clone(),
+        config.session_config.clone(),
+        loaded.map(|loaded| loaded.snapshot),
+        persistence.mode,
+        persistence.bindings.clone(),
+    )?;
     let mut lines = BufReader::new(io::stdin()).lines();
     let mut output = io::stdout();
 
@@ -62,7 +100,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
         let outcome = session.run_burst(line).await;
-        store.save(&persistence.session_id, &session.snapshot())?;
+        generation = match store.save_compare_and_swap(
+            &persistence.session_id,
+            generation,
+            &session.snapshot(),
+        ) {
+            Ok(generation) => generation,
+            Err(StoreError::GenerationConflict { .. }) => {
+                let loaded = store.load_versioned(&persistence.session_id)?;
+                generation = loaded.as_ref().map_or(0, |loaded| loaded.generation);
+                session = create_interactive_session(
+                    client.clone(),
+                    config.session_config.clone(),
+                    loaded.map(|loaded| loaded.snapshot),
+                    persistence.mode,
+                    persistence.bindings.clone(),
+                )?;
+                write_line(
+                    &mut output,
+                    "conflict> session changed concurrently; submit the request again",
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         match outcome {
             BurstOutcome::NeedsInput { question } => {
                 write_line(&mut output, &format!("assistant> {question}")).await?;
@@ -592,14 +654,14 @@ mod tests {
 
     use design_harness::{
         simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, LlmClient, LlmError,
-        LlmResponse, Message, SessionConfig, ToolCall, ToolDefinition,
+        LlmResponse, Message, ResourceBindingMap, SessionConfig, ToolCall, ToolDefinition,
     };
     use serde_json::json;
 
     use super::{
         clear_oracle_controls, create_interactive_session, delegated_model_calls,
         injected_control_calls, parse_eval_input, prepare_oracle_controls, EvalClient, EvalMode,
-        OracleState,
+        HarnessMode, OracleState,
     };
 
     struct StubClient;
@@ -626,21 +688,62 @@ mod tests {
     #[test]
     fn interactive_session_selection_covers_fresh_and_restored_modes() {
         let config = SessionConfig::default();
-        let adaptive_fresh =
-            create_interactive_session(StubClient, config.clone(), None, false).unwrap();
-        let planned_fresh =
-            create_interactive_session(StubClient, config.clone(), None, true).unwrap();
+        let adaptive_fresh = create_interactive_session(
+            StubClient,
+            config.clone(),
+            None,
+            HarnessMode::Adaptive,
+            None,
+        )
+        .unwrap();
+        let planned_fresh = create_interactive_session(
+            StubClient,
+            config.clone(),
+            None,
+            HarnessMode::TypedPlan,
+            None,
+        )
+        .unwrap();
+        let intent_fresh = create_interactive_session(
+            StubClient,
+            config.clone(),
+            None,
+            HarnessMode::IntentRecipe,
+            Some(ResourceBindingMap::default()),
+        )
+        .unwrap();
         assert!(!adaptive_fresh.planned_enabled());
         assert!(planned_fresh.planned_enabled());
+        assert!(intent_fresh.intent_recipe_enabled());
 
         let snapshot = adaptive_fresh.snapshot();
-        let adaptive_restored =
-            create_interactive_session(StubClient, config.clone(), Some(snapshot.clone()), false)
-                .unwrap();
-        let planned_restored =
-            create_interactive_session(StubClient, config, Some(snapshot), true).unwrap();
+        let adaptive_restored = create_interactive_session(
+            StubClient,
+            config.clone(),
+            Some(snapshot.clone()),
+            HarnessMode::Adaptive,
+            None,
+        )
+        .unwrap();
+        let planned_restored = create_interactive_session(
+            StubClient,
+            config.clone(),
+            Some(snapshot),
+            HarnessMode::TypedPlan,
+            None,
+        )
+        .unwrap();
+        let intent_restored = create_interactive_session(
+            StubClient,
+            config,
+            Some(intent_fresh.snapshot()),
+            HarnessMode::IntentRecipe,
+            Some(ResourceBindingMap::default()),
+        )
+        .unwrap();
         assert!(!adaptive_restored.planned_enabled());
         assert!(planned_restored.planned_enabled());
+        assert!(intent_restored.intent_recipe_enabled());
     }
 
     impl LlmClient for QueueClient {

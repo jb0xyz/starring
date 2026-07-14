@@ -1,5 +1,8 @@
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -10,28 +13,112 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const INTENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const LEGACY_HTTP_RETRIES: usize = 1;
+const INTENT_HTTP_RETRIES: usize = 0;
+pub const INTENT_SERVING_MODEL: &str = crate::config::SERVING_MODEL;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportPolicy {
+    request_timeout: Duration,
+    max_http_retries: usize,
+    redact_request_errors: bool,
+}
+
+impl TransportPolicy {
+    const LEGACY: Self = Self {
+        request_timeout: LEGACY_REQUEST_TIMEOUT,
+        max_http_retries: LEGACY_HTTP_RETRIES,
+        redact_request_errors: false,
+    };
+
+    const INTENT_SERVING: Self = Self {
+        request_timeout: INTENT_REQUEST_TIMEOUT,
+        max_http_retries: INTENT_HTTP_RETRIES,
+        redact_request_errors: true,
+    };
+}
+
+#[derive(Clone)]
 pub struct GemmaClient {
     http: reqwest::Client,
     endpoint: String,
+    models_endpoint: String,
     api_key: String,
     model: String,
-    adapted_call_sequence: AtomicU64,
+    transport_policy: TransportPolicy,
+    adapted_call_sequence: Arc<AtomicU64>,
 }
 
 impl GemmaClient {
     pub fn new(base_url: String, api_key: String, model: String) -> Result<Self, LlmError> {
+        Self::with_policy(base_url, api_key, model, TransportPolicy::LEGACY)
+    }
+
+    pub fn new_intent_serving(base_url: String, api_key: String) -> Result<Self, LlmError> {
+        Self::with_policy(
+            base_url,
+            api_key,
+            INTENT_SERVING_MODEL.to_string(),
+            TransportPolicy::INTENT_SERVING,
+        )
+    }
+
+    fn with_policy(
+        base_url: String,
+        api_key: String,
+        model: String,
+        transport_policy: TransportPolicy,
+    ) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(transport_policy.request_timeout)
             .build()
             .map_err(|error| LlmError::Client(error.to_string()))?;
+        let base_url = base_url.trim_end_matches('/');
         Ok(Self {
             http,
-            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            endpoint: format!("{base_url}/chat/completions"),
+            models_endpoint: format!("{base_url}/models"),
             api_key,
             model,
-            adapted_call_sequence: AtomicU64::new(0),
+            transport_policy,
+            adapted_call_sequence: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub async fn preflight_model(&self) -> Result<(), LlmError> {
+        let response = self
+            .http
+            .get(&self.models_endpoint)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|_| LlmError::Client("model preflight request failed".to_string()))?;
+        if !response.status().is_success() {
+            return Err(LlmError::Client(format!(
+                "model preflight returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let catalog = response.json::<ModelsResponse>().await.map_err(|_| {
+            LlmError::Client("model preflight returned an invalid catalog".to_string())
+        })?;
+        if !catalog.data.iter().any(|entry| entry.id == self.model) {
+            return Err(LlmError::Client(format!(
+                "required model {} is unavailable",
+                self.model
+            )));
+        }
+        Ok(())
+    }
+
+    fn request_error(&self, error: reqwest::Error) -> LlmError {
+        if self.transport_policy.redact_request_errors {
+            LlmError::Client("model request failed".to_string())
+        } else {
+            LlmError::Client(error.to_string())
+        }
     }
 }
 
@@ -42,7 +129,7 @@ impl LlmClient for GemmaClient {
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, LlmError> {
         let body = build_request_body(messages, tools, &self.model)?;
-        for attempt in 0..=1 {
+        for attempt in 0..=self.transport_policy.max_http_retries {
             let response = self
                 .http
                 .post(&self.endpoint)
@@ -52,14 +139,19 @@ impl LlmClient for GemmaClient {
                 .await;
             let response = match response {
                 Ok(response) => response,
-                Err(error) if attempt == 0 && is_transient_transport_error(&error) => {
+                Err(error)
+                    if attempt < self.transport_policy.max_http_retries
+                        && is_transient_transport_error(&error) =>
+                {
                     tokio::time::sleep(RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(error) => return Err(LlmError::Client(error.to_string())),
+                Err(error) => return Err(self.request_error(error)),
             };
             if !response.status().is_success() {
-                if attempt == 0 && is_retryable_status(response.status()) {
+                if attempt < self.transport_policy.max_http_retries
+                    && is_retryable_status(response.status())
+                {
                     tokio::time::sleep(RETRY_BACKOFF).await;
                     continue;
                 }
@@ -71,7 +163,7 @@ impl LlmClient for GemmaClient {
             let value = response
                 .json::<Value>()
                 .await
-                .map_err(|error| LlmError::Client(error.to_string()))?;
+                .map_err(|error| self.request_error(error))?;
             let response = parse_response_value(value, &self.model)?;
             return Ok(adapt_single_frontier_response(
                 response,
@@ -264,6 +356,16 @@ struct ChatCompletionResponse {
 }
 
 #[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct ResponseChoice {
     message: ResponseMessage,
 }
@@ -336,10 +438,10 @@ mod tests {
 
     use super::{
         adapt_single_frontier_response, build_request_body, is_retryable_status,
-        parse_response_value, GemmaClient,
+        parse_response_value, GemmaClient, TransportPolicy, INTENT_SERVING_MODEL,
     };
 
-    fn read_request(stream: &mut TcpStream) {
+    fn read_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -368,6 +470,7 @@ mod tests {
                 break;
             }
         }
+        String::from_utf8(request).unwrap()
     }
 
     fn spawn_server(
@@ -379,7 +482,7 @@ mod tests {
             let mut requests = 0;
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                read_request(&mut stream);
+                let _ = read_request(&mut stream);
                 let reason = match status {
                     200 => "OK",
                     400 => "Bad Request",
@@ -404,10 +507,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            read_request(&mut first);
+            let _ = read_request(&mut first);
             drop(first);
             let (mut second, _) = listener.accept().unwrap();
-            read_request(&mut second);
+            let _ = read_request(&mut second);
             let body = success_response();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -423,6 +526,44 @@ mod tests {
         r#"{"model":"test-model","choices":[{"message":{"content":"done"}}]}"#
     }
 
+    fn spawn_capture_server(
+        status: u16,
+        body: &'static str,
+    ) -> (SocketAddr, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        (address, handle)
+    }
+
+    fn spawn_delayed_server(delay: Duration) -> (SocketAddr, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            thread::sleep(delay);
+            let body = r#"{"model":"gemma4:12b-mlx","choices":[{"message":{"content":"late"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            1
+        });
+        (address, handle)
+    }
+
     fn test_client(address: SocketAddr) -> GemmaClient {
         GemmaClient::new(
             format!("http://{address}"),
@@ -430,6 +571,10 @@ mod tests {
             "test-model".to_string(),
         )
         .unwrap()
+    }
+
+    fn intent_client(address: SocketAddr) -> GemmaClient {
+        GemmaClient::new_intent_serving(format!("http://{address}"), "secret".to_string()).unwrap()
     }
 
     #[test]
@@ -654,6 +799,74 @@ mod tests {
     }
 
     #[test]
+    fn intent_serving_policy_is_fixed_to_gemma_with_a_bounded_single_attempt() {
+        let client = GemmaClient::new_intent_serving(
+            "http://127.0.0.1:1/v1/".to_string(),
+            "secret".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(client.model, INTENT_SERVING_MODEL);
+        assert_eq!(client.endpoint, "http://127.0.0.1:1/v1/chat/completions");
+        assert_eq!(client.models_endpoint, "http://127.0.0.1:1/v1/models");
+        assert_eq!(client.transport_policy, TransportPolicy::INTENT_SERVING);
+        assert_eq!(
+            client.transport_policy.request_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(client.transport_policy.max_http_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn intent_model_preflight_is_authenticated_and_requires_an_exact_catalog_id() {
+        let (address, server) = spawn_capture_server(
+            200,
+            r#"{"object":"list","data":[{"id":"gemma4:12b-mlx"},{"id":"gemma4:12b"}]}"#,
+        );
+        let client = intent_client(address);
+
+        client.preflight_model().await.unwrap();
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /models HTTP/1.1\r\n"));
+        assert!(request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer secret")));
+    }
+
+    #[tokio::test]
+    async fn intent_model_preflight_rejects_near_matches() {
+        let (address, server) = spawn_capture_server(
+            200,
+            r#"{"data":[{"id":"gemma4:12b-mlx-latest"},{"id":"Gemma4:12b-mlx"}]}"#,
+        );
+        let client = intent_client(address);
+
+        let error = client.preflight_model().await.unwrap_err();
+
+        let LlmError::Client(message) = error;
+        assert_eq!(message, "required model gemma4:12b-mlx is unavailable");
+        let _ = server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn intent_model_preflight_errors_do_not_expose_credentials_or_gateway() {
+        let (address, server) = spawn_capture_server(401, r#"{"error":"denied"}"#);
+        let gateway = format!("http://{address}/private-gateway");
+        let client =
+            GemmaClient::new_intent_serving(gateway.clone(), "key-marker".to_string()).unwrap();
+
+        let error = client.preflight_model().await.unwrap_err();
+
+        let LlmError::Client(message) = error;
+        assert_eq!(message, "model preflight returned HTTP 401");
+        assert!(!message.contains("key-marker"));
+        assert!(!message.contains(&gateway));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /private-gateway/models HTTP/1.1\r\n"));
+    }
+
+    #[test]
     fn only_rate_limits_and_server_errors_are_retryable_statuses() {
         assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_status(
@@ -713,5 +926,38 @@ mod tests {
         let LlmError::Client(message) = error;
         assert_eq!(message, "gateway returned HTTP 503");
         assert_eq!(server.join().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn intent_serving_does_not_retry_retryable_http_statuses() {
+        let (address, server) = spawn_server(vec![(503, r#"{"error":"transient"}"#)]);
+
+        let error = intent_client(address).complete(&[], &[]).await.unwrap_err();
+
+        let LlmError::Client(message) = error;
+        assert_eq!(message, "gateway returned HTTP 503");
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn intent_transport_policy_enforces_its_request_timeout() {
+        let (address, server) = spawn_delayed_server(Duration::from_millis(150));
+        let client = GemmaClient::with_policy(
+            format!("http://{address}"),
+            "secret".to_string(),
+            INTENT_SERVING_MODEL.to_string(),
+            TransportPolicy {
+                request_timeout: Duration::from_millis(25),
+                max_http_retries: 0,
+                redact_request_errors: true,
+            },
+        )
+        .unwrap();
+
+        let error = client.complete(&[], &[]).await.unwrap_err();
+
+        let LlmError::Client(message) = error;
+        assert_eq!(message, "model request failed");
+        assert_eq!(server.join().unwrap(), 1);
     }
 }

@@ -92,6 +92,7 @@ impl SessionStore {
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
     pub fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, StoreError> {
         Ok(self
             .load_versioned(session_id)?
@@ -120,6 +121,7 @@ impl SessionStore {
         }))
     }
 
+    #[cfg(test)]
     pub fn save(&mut self, session_id: &str, snapshot: &SessionSnapshot) -> Result<(), StoreError> {
         let expected_generation = self
             .load_versioned(session_id)?
