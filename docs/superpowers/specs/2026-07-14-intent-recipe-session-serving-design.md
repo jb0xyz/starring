@@ -20,7 +20,7 @@ The model used by live evaluation and production acceptance is `gemma4:12b-mlx`.
 
 ## One-call frontier
 
-The OpenAI-compatible Gemma client enables strict `response_format` and promotes JSON text to a tool call only when exactly one tool definition is present. Intent mode therefore exposes one tagged-union tool rather than several competing tools.
+The OpenAI-compatible Gemma client enables strict `response_format` and promotes JSON text to a tool call only when exactly one tool definition is present. Intent mode therefore exposes one flat discriminated tool rather than several competing tools or a nested JSON Schema union.
 
 The initial frontier is `route_intent_turn`.
 
@@ -31,6 +31,8 @@ capability_gap
 reject
 discussion
 ```
+
+The model-facing wire uses a top-level string `route` and sibling payload fields. A private-room proposal is `{expected_revision, route: "private_study_room", proposal}`. Fallback routes use only their matching `reason`, `response`, or `capabilities` fields. The parser accepts the earlier nested route object for snapshot and client compatibility, but the generated frontier contains no `oneOf` and never asks Gemma to construct the nested form.
 
 The only model-facing harness state is `expected_revision`. The schema never contains the intent schema version, durable workspace, feature identifier, recipe identifier, provenance, raw actions, permission bits, instance manifests, RuleSet JSON, publication, approval, deployment, or activation fields.
 
@@ -71,7 +73,7 @@ The system prompt and selected tool schema form an immutable prefix. Human messa
 
 The current state anchor is appended immediately before the model call. Old anchors remain immutable transcript evidence. Context compaction may remove complete old interaction groups only after their semantic result is represented in durable state. It must never orphan an assistant tool call from its result.
 
-The anchor contains only bounded state needed for the current extraction:
+The anchor contains only bounded state needed for the current extraction. It has no protocol or Draft revision number that could compete with `expected_revision` during extraction:
 
 - current expected revision;
 - stage;

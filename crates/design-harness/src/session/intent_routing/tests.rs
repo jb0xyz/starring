@@ -129,6 +129,32 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
             .unwrap()
             .content
             .starts_with(INTENT_STATE_PREFIX));
+        let anchor: serde_json::Value = serde_json::from_str(
+            calls[0]
+                .0
+                .last()
+                .unwrap()
+                .content
+                .strip_prefix(INTENT_STATE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            anchor
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "active_options".to_string(),
+                "active_question".to_string(),
+                "available_channel_keys".to_string(),
+                "expected_revision".to_string(),
+                "stage".to_string(),
+            ])
+        );
+        assert_eq!(anchor["expected_revision"], 0);
         assert_eq!(session.observability.model_calls, 1);
         assert_eq!(session.observability.tool_calls, 1);
         assert_eq!(session.observability.plan_compiled_tool_calls, 0);

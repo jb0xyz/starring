@@ -17,10 +17,7 @@ mod tests;
 use execute::IntentTurnSuccess;
 pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;
-use state::{
-    intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_RECIPE_PROTOCOL_VERSION,
-    INTENT_STATE_PREFIX,
-};
+use state::{intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_STATE_PREFIX};
 pub(super) use state::{validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT};
 pub use state::{
     IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
@@ -29,10 +26,8 @@ pub use state::{
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct IntentStateAnchorV1 {
-    protocol_version: u16,
     stage: &'static str,
     expected_revision: u64,
-    draft_revision: u64,
     available_channel_keys: Vec<String>,
     active_question: Option<String>,
     active_options: Vec<String>,
@@ -171,10 +166,8 @@ impl<C> DesignSession<C> {
             .map(|key| key.0.clone())
             .collect();
         let anchor = IntentStateAnchorV1 {
-            protocol_version: INTENT_RECIPE_PROTOCOL_VERSION,
             stage,
             expected_revision: runtime.expected_revision(self.draft.draft_revision),
-            draft_revision: self.draft.draft_revision,
             available_channel_keys,
             active_question,
             active_options,

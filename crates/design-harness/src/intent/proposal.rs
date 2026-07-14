@@ -19,9 +19,14 @@ const PRIVATE_STUDY_ROOM_FEATURE_ID: &str = "private_study_room";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateStudyRoomProposalV1 {
+    #[schemars(description = "Concise summary of the complete requested automation")]
     pub objective: String,
+    #[schemars(
+        description = "Exact requested result: discussion, working_draft, or validated_preview"
+    )]
     pub requested_outcome: IntentRequestedOutcome,
     #[serde(default)]
+    #[schemars(description = "Exact available channel key explicitly selected by the human")]
     pub hub_channel: Option<ExistingChannelKey>,
     #[serde(default)]
     pub locale: Option<IntentLocaleV1>,
