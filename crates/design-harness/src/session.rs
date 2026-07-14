@@ -35,7 +35,10 @@ use adaptive::simulation_profile_for_current_human_turn;
 use context::compact_text;
 use intent_routing::IntentRecipeRuntime;
 pub use intent_routing::{
-    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
+    IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1,
+    IntentRecipeStatusV1, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
 };
 use repair::is_argument_failure;
 use routing::{
@@ -160,10 +163,19 @@ pub struct HaltReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BurstOutcome {
-    NeedsInput { question: String },
-    Progressed { summary: String },
-    Ready { summary: String },
-    Routed { fallback: IntentFallbackV1 },
+    NeedsInput {
+        question: String,
+    },
+    Progressed {
+        summary: String,
+    },
+    Ready {
+        summary: String,
+    },
+    Routed {
+        fallback: IntentFallbackV1,
+        decision: Box<IntentRouteDecisionV2>,
+    },
     Halted(Box<HaltReport>),
 }
 
@@ -258,6 +270,8 @@ pub struct SessionSnapshot {
 pub enum SessionSnapshotError {
     #[error("unsupported session snapshot version {found}; expected {expected}")]
     UnsupportedVersion { expected: u32, found: u32 },
+    #[error("unsupported intent protocol version {found}; expected {expected}")]
+    UnsupportedIntentProtocolVersion { expected: u16, found: u16 },
     #[error("invalid session snapshot: {message}")]
     InvalidInvariant { message: String },
 }
@@ -1029,9 +1043,16 @@ impl<C> DesignSession<C> {
         BurstOutcome::Ready { summary }
     }
 
-    fn routed(&mut self, fallback: IntentFallbackV1) -> BurstOutcome {
+    fn routed(
+        &mut self,
+        fallback: IntentFallbackV1,
+        decision: IntentRouteDecisionV2,
+    ) -> BurstOutcome {
         self.finish_turn(TurnPhase::Routed);
-        BurstOutcome::Routed { fallback }
+        BurstOutcome::Routed {
+            fallback,
+            decision: Box::new(decision),
+        }
     }
 
     fn halt(

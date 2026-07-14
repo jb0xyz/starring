@@ -1,8 +1,204 @@
+const INTENT_MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+const SHA256 = /^[0-9a-f]{64}$/;
+const DECISION_KINDS = new Set([
+  'private_study_room',
+  'typed_planner',
+  'capability_gap',
+  'reject',
+  'discussion',
+]);
+const CAPABILITY_CONTRACTS = {
+  durable_timer: ['unavailable', null],
+  event_time_llm_decision: ['forbidden_policy', 'event_time_llm_execution_forbidden_v1'],
+  instance_creator_teardown_authorization: ['unavailable', null],
+  persistent_economy_ledger: ['unavailable', null],
+  restart_persistent_state: ['unavailable', null],
+  unclassified_intent_requirement: ['unclassified', null],
+};
+const BOUNDARY_IDS = new Set([
+  'bypass_validation_preview_approval',
+  'direct_live_mutation',
+  'secret_disclosure',
+]);
+const CAPABILITY_LABELS = {
+  durable_timer: ['Durable timers', '영속 타이머'],
+  event_time_llm_decision: ['Event-time LLM decisions', '이벤트 시점 LLM 결정'],
+  instance_creator_teardown_authorization: [
+    'Creator-only room teardown authorization',
+    '방 생성자 전용 종료 권한',
+  ],
+  persistent_economy_ledger: ['Persistent economy ledger', '영속 경제 원장'],
+  restart_persistent_state: ['State preserved across restarts', '재시작 후에도 보존되는 상태'],
+  unclassified_intent_requirement: ['Unclassified hard requirement', '분류되지 않은 필수 요구사항'],
+};
+const CAPABILITY_STATUSES = {
+  available: ['available', '사용 가능'],
+  unavailable: ['unavailable', '사용 불가'],
+  forbidden_policy: ['forbidden by policy', '정책상 금지'],
+  unclassified: ['unclassified', '미분류'],
+};
+const BOUNDARY_LABELS = {
+  bypass_validation_preview_approval: [
+    'Bypass validation, preview, and approval',
+    '검증, 미리보기, 승인 우회',
+  ],
+  direct_live_mutation: ['Direct live mutation', '직접 라이브 변경'],
+  secret_disclosure: ['Secret disclosure', '비밀정보 노출'],
+};
+
 function object(value, location) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`invalid intent eval report: missing object ${location}`);
   }
   return value;
+}
+
+function exactKeys(value, keys, location) {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (!sameJson(actual, expected)) {
+    throw new Error(`invalid intent eval report: ${location} has invalid fields`);
+  }
+}
+
+function nonEmptyString(value, location) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`invalid intent eval report: ${location} must be a non-empty string`);
+  }
+  return value;
+}
+
+function sortedUnique(values, location) {
+  const sorted = [...values].sort();
+  if (!sameJson(values, sorted) || new Set(values).size !== values.length) {
+    throw new Error(`invalid intent eval report: ${location} must be sorted and unique`);
+  }
+}
+
+function evidence(value, location) {
+  object(value, location);
+  exactKeys(value, ['semantic_path', 'description'], location);
+  nonEmptyString(value.semantic_path, `${location}.semantic_path`);
+  nonEmptyString(value.description, `${location}.description`);
+  return value;
+}
+
+function evidenceList(value, location) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`invalid intent eval report: ${location} must be a non-empty array`);
+  }
+  value.forEach((entry, index) => evidence(entry, `${location}[${index}]`));
+  const identities = value.map((entry) => `${entry.semantic_path}\u0000${entry.description}`);
+  sortedUnique(identities, location);
+}
+
+function routeDecision(value, location) {
+  if (value === null) {
+    return null;
+  }
+  object(value, location);
+  exactKeys(value, [
+    'kind',
+    'decision_source',
+    'adjudicator_version',
+    'semantic_ir_digest',
+    'manifest_version',
+    'manifest_digest',
+    'adjudication_digest',
+    'blockers',
+    'boundary_violations',
+    'unclassified_requirements',
+    'route_target',
+  ], location);
+  if (!DECISION_KINDS.has(value.kind)) {
+    throw new Error(`invalid intent eval report: ${location}.kind is invalid`);
+  }
+  if (value.decision_source !== 'deterministic_intent_adjudicator'
+    || value.adjudicator_version !== 2) {
+    throw new Error(`invalid intent eval report: ${location} has invalid adjudicator identity`);
+  }
+  if (!SHA256.test(value.semantic_ir_digest) || !SHA256.test(value.adjudication_digest)) {
+    throw new Error(`invalid intent eval report: ${location} has invalid decision hashes`);
+  }
+  if (value.manifest_version !== 1 || value.manifest_digest !== INTENT_MANIFEST_DIGEST) {
+    throw new Error(`invalid intent eval report: ${location} has invalid capability manifest identity`);
+  }
+  if (!Array.isArray(value.blockers)) {
+    throw new Error(`invalid intent eval report: ${location}.blockers must be an array`);
+  }
+  for (const [index, blocker] of value.blockers.entries()) {
+    const blockerLocation = `${location}.blockers[${index}]`;
+    object(blocker, blockerLocation);
+    exactKeys(blocker, ['id', 'status', 'policy_id', 'evidence'], blockerLocation);
+    const contract = CAPABILITY_CONTRACTS[blocker.id];
+    if (!contract || blocker.status !== contract[0] || blocker.policy_id !== contract[1]) {
+      throw new Error(`invalid intent eval report: ${blockerLocation} contradicts the capability manifest`);
+    }
+    evidenceList(blocker.evidence, `${blockerLocation}.evidence`);
+  }
+  sortedUnique(value.blockers.map((blocker) => blocker.id), `${location}.blockers`);
+  if (!Array.isArray(value.boundary_violations)) {
+    throw new Error(`invalid intent eval report: ${location}.boundary_violations must be an array`);
+  }
+  for (const [index, violation] of value.boundary_violations.entries()) {
+    const violationLocation = `${location}.boundary_violations[${index}]`;
+    object(violation, violationLocation);
+    exactKeys(violation, ['id', 'evidence'], violationLocation);
+    if (!BOUNDARY_IDS.has(violation.id)) {
+      throw new Error(`invalid intent eval report: ${violationLocation}.id is invalid`);
+    }
+    evidenceList(violation.evidence, `${violationLocation}.evidence`);
+  }
+  sortedUnique(
+    value.boundary_violations.map((violation) => violation.id),
+    `${location}.boundary_violations`,
+  );
+  if (!Array.isArray(value.unclassified_requirements)) {
+    throw new Error(`invalid intent eval report: ${location}.unclassified_requirements must be an array`);
+  }
+  value.unclassified_requirements.forEach((entry, index) => {
+    nonEmptyString(entry, `${location}.unclassified_requirements[${index}]`);
+  });
+  sortedUnique(value.unclassified_requirements, `${location}.unclassified_requirements`);
+  if (value.route_target === null) {
+    if (value.kind === 'private_study_room') {
+      throw new Error(`invalid intent eval report: ${location} is missing its pinned recipe`);
+    }
+  } else {
+    object(value.route_target, `${location}.route_target`);
+    exactKeys(value.route_target, ['recipe_id', 'recipe_version'], `${location}.route_target`);
+    if (value.kind !== 'private_study_room'
+      || value.route_target.recipe_id !== 'starring.private_study_room'
+      || value.route_target.recipe_version !== 1) {
+      throw new Error(`invalid intent eval report: ${location}.route_target is invalid`);
+    }
+  }
+  if (value.kind === 'capability_gap'
+    && (value.blockers.length === 0 || value.boundary_violations.length !== 0)) {
+    throw new Error(`invalid intent eval report: ${location} has an invalid capability-gap shape`);
+  }
+  if (value.kind === 'reject' && value.boundary_violations.length === 0) {
+    throw new Error(`invalid intent eval report: ${location} has an invalid reject shape`);
+  }
+  if (['private_study_room', 'typed_planner', 'discussion'].includes(value.kind)
+    && (value.blockers.length !== 0 || value.boundary_violations.length !== 0)) {
+    throw new Error(`invalid intent eval report: ${location} has blockers on a non-blocking route`);
+  }
+  return value;
+}
+
+function stable(value) {
+  if (Array.isArray(value)) {
+    return value.map(stable);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
 }
 
 function integer(value, location) {
@@ -48,6 +244,10 @@ function parseReport(output) {
   if (!/^[0-9a-f]{64}$/.test(report.final_intent.binding_fingerprint)) {
     throw new Error('invalid intent eval report: binding fingerprint must be a SHA-256 hash');
   }
+  if (!Object.hasOwn(report.final_intent, 'route_decision')) {
+    throw new Error('invalid intent eval report: final_intent.route_decision is required');
+  }
+  routeDecision(report.final_intent.route_decision, 'final_intent.route_decision');
   integer(report.draft_revision, 'draft_revision');
   integer(report.elapsed_ms, 'elapsed_ms');
   integer(report.persistence.store_writes, 'persistence.store_writes');
@@ -63,6 +263,10 @@ function parseReport(output) {
     object(turn.intent_counters, `turns[${index}].intent_counters`);
     object(turn.intent_counters.fallback_routes, `turns[${index}].intent_counters.fallback_routes`);
     object(turn.actual_gates, `turns[${index}].actual_gates`);
+    if (!Object.hasOwn(turn, 'route_decision')) {
+      throw new Error(`invalid intent eval report: turns[${index}].route_decision is required`);
+    }
+    routeDecision(turn.route_decision, `turns[${index}].route_decision`);
     if (typeof turn.id !== 'string'
       || typeof turn.outcome !== 'string'
       || typeof turn.stage_before !== 'string'
@@ -114,6 +318,90 @@ function list(value) {
   }
   if (typeof value === 'string') {
     return value.split(',').map((entry) => entry.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function expectedBlockers(expected) {
+  if (!Object.hasOwn(expected, 'expectedBlockers')) {
+    throw new Error('expectedBlockers is required for intent adjudication assertions');
+  }
+  const parsed = list(expected.expectedBlockers).map((entry) => {
+    const parts = entry.split('|');
+    if (parts.length !== 3 || parts[0].length === 0 || parts[1].length === 0) {
+      throw new Error(`invalid expectedBlockers entry=${entry}`);
+    }
+    return [parts[0], parts[1], parts[2] || null];
+  });
+  return parsed.sort((left, right) => left[0].localeCompare(right[0]));
+}
+
+function expectedBoundaries(expected) {
+  if (!Object.hasOwn(expected, 'expectedBoundaryViolations')) {
+    throw new Error('expectedBoundaryViolations is required for intent adjudication assertions');
+  }
+  return list(expected.expectedBoundaryViolations).sort();
+}
+
+function expectedUnclassifiedRequirements(expected) {
+  if (Object.hasOwn(expected, 'expectedUnclassifiedRequirements')) {
+    return { exact: list(expected.expectedUnclassifiedRequirements).sort(), contains: [] };
+  }
+  if (Object.hasOwn(expected, 'expectedUnclassifiedEvidenceContains')) {
+    return { exact: null, contains: list(expected.expectedUnclassifiedEvidenceContains).sort() };
+  }
+  return { exact: [], contains: [] };
+}
+
+function routeKind(route) {
+  return route === 'resolve_intent_decision' ? 'private_study_room' : route;
+}
+
+function blockerProjection(decision) {
+  return decision.blockers.map((blocker) => [blocker.id, blocker.status, blocker.policy_id]);
+}
+
+function deterministicCapabilityResponse(decision, localeIndex) {
+  const labels = decision.blockers.map((blocker) => {
+    const label = CAPABILITY_LABELS[blocker.id][localeIndex];
+    const status = CAPABILITY_STATUSES[blocker.status][localeIndex];
+    const base = `${label} (${status})`;
+    if (blocker.id !== 'unclassified_intent_requirement') {
+      return base;
+    }
+    return `${base}: ${blocker.evidence.map((entry) => entry.description).join(', ')}`;
+  }).join(', ');
+  if (localeIndex === 1) {
+    return `요청을 그대로 보존했지만 다음 필수 역량을 현재 제공할 수 없어 컴파일하지 않았습니다: ${labels}. 일부만 만들거나 요구사항을 약화하지 않았습니다.`;
+  }
+  return `I preserved the request, but did not compile it because these required capabilities are not currently supported: ${labels}. I did not build a partial or weakened version.`;
+}
+
+function deterministicRejectResponse(decision, localeIndex) {
+  const labels = decision.boundary_violations
+    .map((violation) => BOUNDARY_LABELS[violation.id][localeIndex])
+    .join(', ');
+  if (localeIndex === 1) {
+    return `안전한 설계는 도울 수 있지만 다음 요청된 안전 경계는 넘을 수 없습니다: ${labels}. 검증, 미리보기, 사용자 승인, 비밀정보 보호는 계속 적용됩니다.`;
+  }
+  return `I can help with a safe design, but cannot cross these requested safety boundaries: ${labels}. Validation, preview, user approval, and secret protection remain enforced.`;
+}
+
+function deterministicResponses(decision) {
+  if (decision.kind === 'typed_planner') {
+    return [
+      'I routed this supported custom static automation to the typed planner. No live system was changed.',
+      '지원되는 정적 커스텀 자동화로 분류해 타입 기반 플래너로 전달했습니다. 라이브 시스템은 변경하지 않았습니다.',
+    ];
+  }
+  if (decision.kind === 'capability_gap') {
+    return [
+      deterministicCapabilityResponse(decision, 0),
+      deterministicCapabilityResponse(decision, 1),
+    ];
+  }
+  if (decision.kind === 'reject') {
+    return [deterministicRejectResponse(decision, 0), deterministicRejectResponse(decision, 1)];
   }
   return [];
 }
@@ -180,7 +468,7 @@ function intentProvenance(output) {
       || provenance.ended_at_unix_ms < provenance.started_at_unix_ms) {
       failures.push('provenance timestamps are invalid');
     }
-    if (JSON.stringify(report.session_config) !== JSON.stringify({
+    if (!sameJson(report.session_config, {
       max_model_calls: 12,
       max_tool_calls: 24,
       max_gate_failures: 4,
@@ -277,7 +565,7 @@ function intentReceipt(output, context) {
         if (receipt.candidate_revision !== report.draft_revision) {
           failures.push(`candidate_revision=${receipt.candidate_revision} draft_revision=${report.draft_revision}`);
         }
-        if (JSON.stringify(report.final_intent.public_status.receipt) !== JSON.stringify(receipt)) {
+        if (!sameJson(report.final_intent.public_status.receipt, receipt)) {
           failures.push('public status receipt differs from the top-level intent receipt');
         }
       }
@@ -301,12 +589,26 @@ function intentReceipt(output, context) {
   });
 }
 
-function intentOneCallTurns(output) {
+function intentOneCallTurns(output, context) {
   return checked(output, (report) => {
+    const expected = vars(context);
+    const expectedModelCalls = Object.hasOwn(expected, 'expectedModelCallsPerTurn')
+      ? list(expected.expectedModelCallsPerTurn).map(Number)
+      : report.turns.map(() => 1);
+    const expectedToolCalls = Object.hasOwn(expected, 'expectedToolCallsPerTurn')
+      ? list(expected.expectedToolCallsPerTurn).map(Number)
+      : report.turns.map(() => 1);
     const failures = [];
-    for (const turn of report.turns) {
-      if (turn.model_calls !== 1 || turn.model_tool_calls !== 1) {
-        failures.push(`${turn.id} calls=${turn.model_calls}/${turn.model_tool_calls} expected=1/1`);
+    if (expectedModelCalls.length !== report.turns.length
+      || expectedToolCalls.length !== report.turns.length
+      || expectedModelCalls.some((value) => !Number.isInteger(value) || value < 1 || value > 2)
+      || expectedToolCalls.some((value) => !Number.isInteger(value) || value < 1 || value > 2)) {
+      failures.push('expected per-turn call paths must contain one bounded value per turn');
+    }
+    for (const [index, turn] of report.turns.entries()) {
+      if (turn.model_calls !== expectedModelCalls[index]
+        || turn.model_tool_calls !== expectedToolCalls[index]) {
+        failures.push(`${turn.id} calls=${turn.model_calls}/${turn.model_tool_calls} expected=${expectedModelCalls[index]}/${expectedToolCalls[index]}`);
       }
     }
     const modelCalls = report.turns.reduce((sum, turn) => sum + turn.model_calls, 0);
@@ -318,7 +620,117 @@ function intentOneCallTurns(output) {
       failures.push(`cumulative tool_calls=${report.observability.tool_calls} expected=${modelToolCalls}`);
     }
     return result(failures.length === 0, failures.length === 0
-      ? 'every ordinary turn used one model call and one frontier call'
+      ? 'every turn used its exact bounded model and frontier call path'
+      : failures.join(', '));
+  });
+}
+
+function intentRulesetStringValues(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    if (!Object.hasOwn(expected, 'expectedRulesetStringValues')) {
+      return result(true, 'no exact RuleSet string values requested');
+    }
+    let values;
+    try {
+      values = Array.isArray(expected.expectedRulesetStringValues)
+        ? expected.expectedRulesetStringValues
+        : JSON.parse(expected.expectedRulesetStringValues);
+    } catch {
+      return result(false, 'expectedRulesetStringValues is not a JSON string array');
+    }
+    if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+      return result(false, 'expectedRulesetStringValues is not a JSON string array');
+    }
+    const actual = [];
+    const visit = (value) => {
+      if (typeof value === 'string') {
+        actual.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      if (value !== null && typeof value === 'object') {
+        Object.values(value).forEach(visit);
+      }
+    };
+    visit(report.ruleset);
+    const missing = values.filter((value) => !actual.includes(value));
+    return result(missing.length === 0, missing.length === 0
+      ? 'every exact custom literal reached the canonical RuleSet'
+      : `missing RuleSet string values=${JSON.stringify(missing)}`);
+  });
+}
+
+function parseExpectedJson(expected, field, kind) {
+  if (!Object.hasOwn(expected, field)) {
+    return null;
+  }
+  let value;
+  try {
+    value = typeof expected[field] === 'string'
+      ? JSON.parse(expected[field])
+      : expected[field];
+  } catch {
+    throw new Error(`${field} is not valid JSON`);
+  }
+  if (kind === 'object' && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(`${field} is not a JSON object`);
+  }
+  if (kind === 'string-array'
+    && (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string'))) {
+    throw new Error(`${field} is not a JSON string array`);
+  }
+  return value;
+}
+
+function resolveJsonPointer(root, pointer) {
+  if (pointer === '') {
+    return { found: true, value: root };
+  }
+  if (typeof pointer !== 'string' || !pointer.startsWith('/')) {
+    throw new Error(`invalid RuleSet JSON Pointer=${pointer}`);
+  }
+  let current = root;
+  for (const encoded of pointer.slice(1).split('/')) {
+    const token = encoded.replace(/~1/g, '/').replace(/~0/g, '~');
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(token) || Number(token) >= current.length) {
+        return { found: false, value: undefined };
+      }
+      current = current[Number(token)];
+    } else if (current !== null && typeof current === 'object' && Object.hasOwn(current, token)) {
+      current = current[token];
+    } else {
+      return { found: false, value: undefined };
+    }
+  }
+  return { found: true, value: current };
+}
+
+function intentRulesetPathValues(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const values = parseExpectedJson(expected, 'expectedRulesetPathValues', 'object') || {};
+    const absent = parseExpectedJson(expected, 'expectedRulesetAbsentPaths', 'string-array') || [];
+    const failures = [];
+    for (const [pointer, value] of Object.entries(values)) {
+      const actual = resolveJsonPointer(report.ruleset, pointer);
+      if (!actual.found) {
+        failures.push(`missing RuleSet path=${pointer}`);
+      } else if (!sameJson(actual.value, value)) {
+        failures.push(`RuleSet path=${pointer} value=${JSON.stringify(actual.value)} expected=${JSON.stringify(value)}`);
+      }
+    }
+    for (const pointer of absent) {
+      if (resolveJsonPointer(report.ruleset, pointer).found) {
+        failures.push(`unexpected RuleSet path=${pointer}`);
+      }
+    }
+    return result(failures.length === 0, failures.length === 0
+      ? 'custom copy and untouched recipe defaults match their exact RuleSet paths'
       : failures.join(', '));
   });
 }
@@ -444,6 +856,109 @@ function intentNoMutationFallback(output, context) {
   });
 }
 
+function intentAdjudicationDecision(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const routes = list(expected.expectedRoutePath);
+    const expectedBlockerSet = expectedBlockers(expected);
+    const expectedBoundarySet = expectedBoundaries(expected);
+    const expectedUnclassified = expectedUnclassifiedRequirements(expected);
+    const failures = [];
+    if (routes.length !== report.turns.length) {
+      failures.push(`decision route path length=${report.turns.length} expected=${routes.length}`);
+    }
+    for (const [index, turn] of report.turns.entries()) {
+      const decision = turn.route_decision;
+      const expectedKind = routeKind(routes[index]);
+      if (!decision) {
+        failures.push(`${turn.id} has no deterministic route decision`);
+        continue;
+      }
+      if (expectedKind && decision.kind !== expectedKind) {
+        failures.push(`${turn.id} decision=${decision.kind} expected=${expectedKind}`);
+      }
+      const actualBlockers = blockerProjection(decision);
+      if (!sameJson(actualBlockers, expectedBlockerSet)) {
+        failures.push(`${turn.id} blockers=${JSON.stringify(actualBlockers)} expected=${JSON.stringify(expectedBlockerSet)}`);
+      }
+      const actualBoundaries = decision.boundary_violations.map((violation) => violation.id);
+      if (!sameJson(actualBoundaries, expectedBoundarySet)) {
+        failures.push(`${turn.id} boundaries=${JSON.stringify(actualBoundaries)} expected=${JSON.stringify(expectedBoundarySet)}`);
+      }
+      const actualUnclassified = [...decision.unclassified_requirements].sort();
+      if (expectedUnclassified.exact !== null
+        && !sameJson(actualUnclassified, expectedUnclassified.exact)) {
+        failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected=${JSON.stringify(expectedUnclassified.exact)}`);
+      }
+      if (expectedUnclassified.exact === null) {
+        const grounded = actualUnclassified.every((value) => turn.input.includes(value));
+        const containsEvery = expectedUnclassified.contains.every((expectedValue) => (
+          actualUnclassified.some((actualValue) => actualValue.includes(expectedValue))
+        ));
+        if (actualUnclassified.length !== expectedUnclassified.contains.length
+          || !grounded
+          || !containsEvery) {
+          failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected grounded evidence containing=${JSON.stringify(expectedUnclassified.contains)}`);
+        }
+      }
+      if (decision.kind === 'private_study_room') {
+        if (!sameJson(decision.route_target, {
+          recipe_id: 'starring.private_study_room',
+          recipe_version: 1,
+        })) {
+          failures.push(`${turn.id} did not pin the private StudyRoom recipe`);
+        }
+      } else if (decision.route_target !== null) {
+        failures.push(`${turn.id} non-recipe route has a recipe target`);
+      }
+      if (['typed_planner', 'capability_gap', 'reject', 'discussion'].includes(decision.kind)) {
+        const counters = turn.intent_counters;
+        if (turn.outcome !== 'routed'
+          || turn.completed !== false
+          || turn.question !== null
+          || turn.draft_changed !== false
+          || turn.draft_revision_before !== turn.draft_revision_after
+          || turn.deterministic_operations !== 0
+          || counters.compile_attempts !== 0
+          || counters.compile_successes !== 0
+          || counters.commits !== 0
+          || counters.rollbacks !== 0
+          || counters.conflicts !== 0) {
+          failures.push(`${turn.id} terminal route compiled or mutated canonical state`);
+        }
+        const responses = deterministicResponses(decision);
+        if (decision.kind !== 'discussion' && !responses.includes(turn.message)) {
+          failures.push(`${turn.id} surfaced a non-deterministic terminal response`);
+        }
+      }
+    }
+    for (let index = 0; index + 1 < report.turns.length; index += 1) {
+      const pending = report.turns[index];
+      const resolved = report.turns[index + 1];
+      if (pending.stage_after === 'awaiting_decision') {
+        if (resolved.stage_before !== 'awaiting_decision'
+          || !sameJson(pending.route_decision, resolved.route_decision)) {
+          failures.push(`${pending.id} pending route decision changed during resolution`);
+        }
+      }
+    }
+    const terminal = report.turns[report.turns.length - 1];
+    const decisions = report.turns
+      .map((turn) => turn.route_decision)
+      .filter((decision) => decision !== null);
+    const lastDecision = decisions.length > 0 ? decisions[decisions.length - 1] : null;
+    if (!sameJson(report.final_intent.route_decision, lastDecision)) {
+      failures.push('final route decision differs from the last reported decision');
+    }
+    if (report.message !== terminal.message) {
+      failures.push('top-level response differs from the terminal turn response');
+    }
+    return result(failures.length === 0, failures.length === 0
+      ? 'deterministic adjudication, exact blockers, and durable decision identity match'
+      : failures.join(', '));
+  });
+}
+
 function intentHardLatency(output) {
   return checked(output, (report) => {
     const overLimit = report.turns.filter((turn) => turn.elapsed_ms > 60000);
@@ -454,6 +969,7 @@ function intentHardLatency(output) {
 }
 
 module.exports = {
+  intentAdjudicationDecision,
   intentDecisionFlow,
   intentHardLatency,
   intentNoMutationFallback,
@@ -462,6 +978,8 @@ module.exports = {
   intentProvenance,
   intentReceipt,
   intentRestartContinuity,
+  intentRulesetPathValues,
+  intentRulesetStringValues,
   intentRouteStage,
   parseReport,
 };

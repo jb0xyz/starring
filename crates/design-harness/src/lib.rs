@@ -16,20 +16,30 @@ pub use gates::{simulate_draft, validate_draft};
 pub use llm::{LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall};
 pub use resource_resolution::ResourceBindingMap;
 pub use session::{
-    BurstOutcome, DesignSession, HaltReport, IntentFallbackKind, IntentFallbackV1,
-    IntentRecipeReceiptV1, IntentRecipeStatusV1, LimitKind, Observability, RepairKind, RepairState,
+    BurstOutcome, DesignSession, HaltReport, IntentDecisionSourceV2, IntentFallbackKind,
+    IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1, IntentRouteDecisionKindV2,
+    IntentRouteDecisionV2, LimitKind, Observability, PinnedIntentRecipeV2, RepairKind, RepairState,
     RepairTicket, SessionConfig, SessionSnapshot, SessionSnapshotError, TurnPhase, TurnState,
-    DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
+    DEFAULT_SYSTEM_PROMPT, INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3, SESSION_SNAPSHOT_VERSION,
 };
 pub use tools::{dispatch_tool, tool_definitions, ToolDefinition};
 pub use turn::{
-    check_scope, control_tool_definitions, parse_finish_turn, parse_resolve_intent_decision,
-    parse_route_intent_turn, parse_turn_brief, render_preview, resolve_intent_decision_frontier,
-    route_intent_turn_frontier, ActionKind, AdaptivePhase, AdaptiveTurnState, BlockingDecision,
-    DraftPreview, FinishTurn, FinishTurnKind, IntentRouteInputV1, RequestedOutcome,
-    ResolveIntentDecisionInputV1, RouteIntentTurnInputV1, ScopeAction, ScopeActionTarget,
-    ScopeButtonRoute, ScopeCheck, ScopeInstanceRef, ScopeInstanceResources, ScopeManifestEntry,
-    ScopeModalField, ScopeModalFieldStyle, ScopeOverwriteTarget, ScopePermission,
-    ScopePostPanelButton, ScopePostPanelButtonRoute, ScopeRequirement, ScopeResourceRef,
-    ScopeRoleRef, ScopeTrigger, SimulationProfile, TurnBrief, TurnIntent, TurnVerification,
+    check_scope, control_tool_definitions, interpret_intent_core_frontier,
+    interpret_intent_turn_frontier, parse_finish_turn, parse_interpret_intent_core,
+    parse_interpret_intent_turn, parse_private_study_room_details, parse_resolve_intent_decision,
+    parse_route_intent_turn, parse_turn_brief, private_study_room_details_frontier, render_preview,
+    resolve_intent_decision_frontier, route_intent_turn_frontier, ActionKind, AdaptivePhase,
+    AdaptiveTurnState, BlockingDecision, CloseAuthorizationV2, DraftPreview, EconomyRequirementV2,
+    FinishTurn, FinishTurnKind, IntentAutomationKindV2, IntentBoundaryRequestV2,
+    IntentCoreInterpretationV3, IntentInterpretationV2, IntentLocaleHintV2,
+    IntentRecipeDetailFacetV3, IntentRequestModeV2, IntentRouteInputV1, PersistenceRequirementV2,
+    PrivateStudyRoomControlsInterpretationV2, PrivateStudyRoomDetailsV1, RequestedOutcome,
+    ResolveIntentDecisionInputV1, RouteIntentTurnInputV1, RuntimeRequirementsV2, ScopeAction,
+    ScopeActionTarget, ScopeButtonRoute, ScopeCheck, ScopeInstanceRef, ScopeInstanceResources,
+    ScopeManifestEntry, ScopeModalField, ScopeModalFieldStyle, ScopeOverwriteTarget,
+    ScopePermission, ScopePostPanelButton, ScopePostPanelButtonRoute, ScopeRequirement,
+    ScopeResourceRef, ScopeRoleRef, ScopeTrigger, SimulationProfile, TimerRequirementV2, TurnBrief,
+    TurnIntent, TurnVerification, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, INTERPRET_INTENT_CORE,
+    INTERPRET_INTENT_TURN,
 };

@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use design_harness::{
     simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, IntentRecipeStatusV1,
-    Observability, SessionConfig, ToolFailure, ToolResult, SESSION_SNAPSHOT_VERSION,
+    IntentRouteDecisionV2, Observability, SessionConfig, ToolFailure, ToolResult,
+    SESSION_SNAPSHOT_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -56,6 +57,7 @@ pub struct IntentTurnReportInput<'a> {
     pub observability_before: &'a Observability,
     pub observability_after: &'a Observability,
     pub outcome: &'a BurstOutcome,
+    pub route_decision: Option<&'a IntentRouteDecisionV2>,
     pub elapsed: Duration,
     pub restart_after: bool,
     pub restart_performed: bool,
@@ -96,6 +98,7 @@ pub fn intent_turn_report(input: IntentTurnReportInput<'_>) -> Value {
         "stage_after": intent_stage(input.status_after),
         "intent_revision_before": intent_revision(input.status_before),
         "intent_revision_after": intent_revision(input.status_after),
+        "route_decision": input.route_decision,
         "draft_revision_before": input.before.draft_revision,
         "draft_revision_after": input.after.draft_revision,
         "draft_changed": input.before != input.after,
@@ -142,6 +145,15 @@ pub fn intent_report<C>(
     });
     let final_stage = status.as_ref().map(intent_stage);
     let terminal = turns.last();
+    let final_route_decision = turns
+        .iter()
+        .rev()
+        .find_map(|turn| {
+            turn.get("route_decision")
+                .filter(|decision| !decision.is_null())
+                .cloned()
+        })
+        .unwrap_or_else(|| json!(session.intent_recipe_route_decision()));
     let served_model = (session.observability().tool_calls > 0).then_some(metadata.requested_model);
     json!({
         "schema_version": 3,
@@ -189,6 +201,7 @@ pub fn intent_report<C>(
             "status": final_stage,
             "public_status": status,
             "receipt": receipt,
+            "route_decision": final_route_decision,
             "binding_fingerprint": session.intent_recipe_binding_fingerprint()
         },
         "persistence": {
@@ -293,7 +306,7 @@ fn outcome_fields(outcome: &BurstOutcome) -> OutcomeFields<'_> {
             halt_code: None,
             last_error: None,
         },
-        BurstOutcome::Routed { fallback } => OutcomeFields {
+        BurstOutcome::Routed { fallback, .. } => OutcomeFields {
             name: "routed",
             message: fallback.response(),
             question: None,
@@ -477,6 +490,10 @@ mod tests {
         assert_eq!(document["final_intent"]["status"], "empty");
         assert_eq!(document["final_intent"]["public_status"]["status"], "empty");
         assert_eq!(document["final_intent"]["receipt"], serde_json::Value::Null);
+        assert_eq!(
+            document["final_intent"]["route_decision"],
+            serde_json::Value::Null
+        );
         assert!(document["final_intent"]["binding_fingerprint"].is_string());
         assert_eq!(document["persistence"]["connection_reopen_count"], 0);
         assert_eq!(document["persistence"]["roundtrip_verified"], false);

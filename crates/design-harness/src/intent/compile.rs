@@ -9,7 +9,10 @@ use crate::turn::{
     ScopeAction, ScopeButtonRoute, ScopePostPanelButtonRoute, ScopeRequirement, ScopeTrigger,
 };
 
-use super::catalog::{RecipeDescriptor, COMPILER_REVISION, MAX_COMPILED_REQUIREMENTS};
+use super::catalog::{
+    recipe_registry_digest_v1, registered_recipe_kind_v1, RecipeDescriptorV1, RecipeKindV1,
+    MAX_COMPILED_REQUIREMENTS,
+};
 use super::model::{IntentRequestedOutcome, ResolvedFeatureConfigurationV1};
 use super::normalize::ValidatedIntentV1;
 use super::private_study_room::compile_private_study_room;
@@ -51,7 +54,7 @@ pub struct CompilationVerificationV1 {
 }
 
 pub(super) struct RecipeExpansion {
-    pub(super) descriptor: RecipeDescriptor,
+    pub(super) descriptor: RecipeDescriptorV1,
     pub(super) feature_id: String,
     pub(super) requirements: Vec<ScopeRequirement>,
     pub(super) provenance: ProvenanceBuilder,
@@ -77,11 +80,14 @@ pub fn compile_intent(intent: &ValidatedIntentV1) -> Result<CompiledIntentV1, St
             "Resolve a single-feature Intent V1 before compilation",
         ));
     };
-    let ResolvedFeatureConfigurationV1::ManagedPrivateRoom(room) = &feature.configuration;
-    finalize_compilation(
-        intent,
-        compile_private_study_room(feature.feature_id.as_str(), room),
-    )
+    let recipe_kind = registered_recipe_kind_v1(&feature.recipe.id, feature.recipe.version)?;
+    let expansion = match recipe_kind {
+        RecipeKindV1::PrivateStudyRoomV1 => {
+            let ResolvedFeatureConfigurationV1::ManagedPrivateRoom(room) = &feature.configuration;
+            compile_private_study_room(feature.feature_id.as_str(), room)
+        }
+    };
+    finalize_compilation(intent, expansion)
 }
 
 fn finalize_compilation(
@@ -96,6 +102,23 @@ fn finalize_compilation(
         generated_objects,
         external_channel_bindings,
     } = expansion;
+    if requirements.len() < descriptor.min_requirements
+        || requirements.len() > descriptor.max_requirements
+    {
+        return Err(compile_error(
+            "INTENT_RECIPE_REQUIREMENT_BOUND_EXCEEDED",
+            "intent.compiler.recipe_requirements",
+            format!(
+                "Recipe {} version {} emitted {} requirements outside its pinned bounds {}..={}",
+                descriptor.id,
+                descriptor.version,
+                requirements.len(),
+                descriptor.min_requirements,
+                descriptor.max_requirements
+            ),
+            "Correct the registered compiler or revise the pinned recipe descriptor",
+        ));
+    }
     if requirements.len() > MAX_COMPILED_REQUIREMENTS {
         return Err(compile_error(
             "COMPILED_INTENT_TOO_LARGE",
@@ -105,6 +128,15 @@ fn finalize_compilation(
                 requirements.len()
             ),
             "Reduce the recipe footprint or split it into bounded transactions",
+        ));
+    }
+    let registered_kind = registered_recipe_kind_v1(descriptor.id, descriptor.version)?;
+    if registered_kind != descriptor.kind {
+        return Err(compile_error(
+            "INTENT_RECIPE_DESCRIPTOR_UNREGISTERED",
+            "intent.compiler.recipe_descriptor",
+            "The recipe expansion descriptor does not match the closed registry",
+            "Compile through the exact registered recipe kind",
         ));
     }
     let verification = verify_compilation(&requirements)?;
@@ -118,8 +150,8 @@ fn finalize_compilation(
         ));
     }
     let manifest = CompilationManifestV1 {
-        compiler_revision: COMPILER_REVISION,
-        registry_digest: stable_hash(&descriptor, "intent.compiler.registry")?,
+        compiler_revision: descriptor.compiler_revision,
+        registry_digest: recipe_registry_digest_v1()?,
         input_intent_hash: stable_hash(intent, "intent.compiler.input")?,
         semantic_intent_hash: semantic_intent_hash(intent)?,
         compiled_plan_hash: stable_hash(&requirements, "intent.compiler.requirements")?,

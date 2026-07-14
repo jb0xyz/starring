@@ -74,12 +74,23 @@ including RuleSet rollback and approval-bound activation, and is guarded by CI.
 
 The design-time authoring layer supports complete one-shot requests and bounded
 multi-turn conversation for the supported recipe: one hub-channel decision or
-a discussion followed by an explicit build turn. Gemma makes one bounded route
-or decision extraction per ordinary user turn. For the supported
+a discussion followed by an explicit build turn. Intent protocol V3 uses one
+bounded Gemma Core extraction for default, discussion, fallback, gap, and
+rejection paths. A successful private-study-room request with explicit copy,
+naming, or controls customization uses exactly one additional isolated detail
+extraction, for two model calls and two model tool calls total. For the
 `starring.private_study_room@1` capability, deterministic Rust code owns
-normalization, defaults, recipe versioning, generated keys, permission policy,
-references, action order, instance manifests, validation, simulation, and
-preview. The model never assembles the low-level RuleSet for this path.
+capability and safety adjudication, recipe selection, normalization, defaults,
+recipe versioning, generated keys, permission policy, references, action order,
+instance manifests, validation, simulation, and preview. The model never
+assembles the low-level RuleSet for this path.
+
+The active detail router exposes only the selected `copy`, `naming`, and
+`controls` roots. Its flat serving wire and parser share the same dynamically
+derived schema. The isolated second request sees only the current human turn
+and harness-owned detail state, and every accepted custom scalar or pattern
+affix must occur as an exact case-sensitive literal in that current turn before
+compilation.
 
 The layer currently exists as the pure `design-harness` crate and the
 SQLite/HTTP `design-harness-cli` edge. It is a CLI and evaluation checkpoint,
@@ -88,9 +99,11 @@ study room recipe. Typed-planner fallback is classified but not yet handed off
 to an actual typed-planner session. No Layer 3 authoring path publishes or
 activates a design.
 
-The detailed checkpoint, evidence, limitations, server snapshot, and ordered
-continuation plan are recorded in
-`docs/superpowers/handoffs/2026-07-14-intent-recipe-checkpoint-handoff.md`.
+The current V3 implementation, evidence, limitations, and ordered continuation
+plan are recorded in
+`docs/superpowers/handoffs/2026-07-15-gemma-intent-cohort-handoff.md`. The
+2026-07-14 handoff remains background for the original Intent IR, Recipe
+Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
@@ -186,7 +199,7 @@ skips approval but keeps every technical safeguard.
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
   job (six adapter packages' ignored integration tests, serial). No live Discord
   or LLM in CI.
-- **Test volume**: the complete Rust workspace suite, 34 design-harness
+- **Test volume**: the complete Rust workspace suite, 44 design-harness
   JavaScript tests, two Promptfoo configuration validations, and the ignored
   PostgreSQL integration suites for contention, CAS, lease, partial-unique, and
   reconnect behavior.
@@ -211,14 +224,20 @@ Stated as capabilities (durable across the phase numbering):
   fresh-readiness-at-apply).
 - Pure conversational Intent IR and deterministic Recipe Compiler for the first
   private-study-room recipe.
-- One-call Gemma route and decision frontiers with strict model pinning,
-  fail-closed parsing, binding-aware atomic candidates, exact recipe simulation,
-  durable SQLite generation CAS, and resumable pending decisions.
+- Bounded Gemma Intent frontiers with strict model pinning: default paths use
+  one call, while an explicit private-room detail path uses exactly two calls.
+  Dynamic facet routing, an isolated flat detail wire, exact current-turn
+  literal grounding, fail-closed parsing, binding-aware atomic candidates,
+  exact recipe simulation, durable SQLite generation CAS, and resumable pending
+  decisions remain harness-owned.
 - Modal input contracts and server-side normalization before interaction
   effects.
 - An evaluation framework with local-unsigned source/binary identity checks and
-  clean-source acceptance for the fixed Gemma checkpoint. The repeated live
-  cohort itself is not yet complete.
+  clean-source acceptance for the fixed Gemma checkpoint. Current live samples
+  include a 10/10 one-repetition baseline, 12/12 contrast results across three
+  repetitions per case, 3/3 full custom-detail results, one copy-only pass, and
+  a 14/14 clean-source post-refactor regression over the default and contrast
+  cases. The required ten-repeat-per-case live cohort is not yet complete.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -235,7 +254,10 @@ Stated as capabilities (durable across the phase numbering):
 - Any non-Discord adapter.
 - Any product recipe beyond `starring.private_study_room@1`.
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
-  and recompilation, and bounded Intent transcript compression.
+  and recompilation, typed multi-turn preference accumulation, and bounded
+  Intent transcript compression.
+- A versioned separation between authoritative semantic identity and
+  non-authoritative model-authored objective or display prose.
 - Whole-action-plan deterministic preflight before the first Discord side
   effect.
 - Provisioning-state persistence, compensation, reconciliation, and replay
@@ -254,10 +276,16 @@ Stated as capabilities (durable across the phase numbering):
 - Discord and DB are not jointly atomic; the guarantees are "no durable
   incomplete state" and idempotent convergence, not distributed transactions.
 - Layer 1's live end-to-end maturity is not certified here.
-- The first recipe checkpoint does not certify commercial readiness. It excludes
-  the Close variant, custom copy and naming, independent V3 postchecks,
-  separate-process restart, concurrent load, throughput, and external Discord
-  failure recovery.
+- The first recipe checkpoint does not certify commercial readiness. Custom
+  copy, naming, and controls now have bounded live samples, but the repeated
+  acceptance matrix, separate-process restart, concurrent load, throughput,
+  soak recovery, production API and identity boundary, and external Discord
+  failure recovery remain incomplete.
+- The three full-detail repetitions produced one RuleSet and one compiled-plan
+  identity, but two input-intent and semantic-intent hash variants. The likely
+  source is equivalent freeform model-authored objectives. Protocol V4 must
+  separate authoritative recipe identity from non-authoritative display prose
+  instead of silently weakening the V3 hash.
 - The checkpoint verifies structural consistency, routing, gates, equivalence,
   call counts, and latency assertions, but has no independent oracle for the
   requested hub, locale, objective, or copy. Its model check pins the exact
@@ -281,21 +309,27 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Run the exact clean-source Gemma checkpoint with at least ten samples for
-   each of the ten cases, without weakening assertions or mixing models.
-2. Add whole-plan deterministic preflight before the first side effect.
-3. Release a versioned private-room Recipe V2 with bounded modal inputs,
-   downstream template and name budgets, and instance-scoped resource names.
-4. Add provisioning state, compensation, reconciliation, and replay
-   idempotency for uncertain external effects.
-5. Complete typed-planner handoff, structured brainstorming, recipe edit and
-   recompile, and context compression.
-6. Add authenticated API/UI, guild-binding authority, and the existing
-   approval/publication/activation integration.
-7. Measure queueing and load on the Gemma-only Mac mini deployment before
-   setting a commercial SLO.
-8. Expand the recipe catalog, then begin the separate `StatefulSpec` runtime arc
-   for state, conditions, timers, sessions, and games.
+1. Design and implement a versioned Intent protocol V4 that gives known recipes
+   a harness-owned canonical semantic identity and keeps model-authored display
+   prose out of authoritative hashes. Define snapshot compatibility and digest
+   revisions before changing code.
+2. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
+   edit and recompile with explicit `keep`, `set`, and `reset_default`
+   semantics.
+3. Complete the actual typed-planner handoff for supported custom static
+   automation while preserving the same candidate gates and no-deploy boundary.
+4. Run the exact clean-source Gemma checkpoint with at least ten samples for
+   every acceptance case, without weakening assertions or mixing models.
+5. Add an authenticated authoring API/UI, guild-binding authority, session
+   ownership, and the existing approval/publication/activation integration.
+6. Measure queueing, concurrency, saturation, and recovery on the Gemma-only
+   Mac mini before setting a commercial SLO.
+7. Add whole-plan deterministic preflight before the first side effect, then
+   provisioning state, compensation, reconciliation, and replay idempotency for
+   uncertain external effects.
+8. Release a bounded next private-room recipe, expand the recipe catalog, then
+   begin the separate `StatefulSpec` runtime arc for state, conditions, timers,
+   sessions, and games.
 
 The handoff document linked above is authoritative for the detailed ordering,
 current evidence, commands, and known maintenance debt.
@@ -304,7 +338,10 @@ current evidence, commands, and known maintenance debt.
 
 - Design specs, plans, and runbooks: `docs/superpowers/{specs,plans,runbooks}/`
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
-- Current Intent/Recipe checkpoint handoff:
+- Current Gemma Intent/Recipe checkpoint handoff:
+  `docs/superpowers/handoffs/2026-07-15-gemma-intent-cohort-handoff.md`.
+- Original Intent IR, Recipe Compiler, persistence, runtime, and server
+  checkpoint:
   `docs/superpowers/handoffs/2026-07-14-intent-recipe-checkpoint-handoff.md`.
 - Historical, superseded design docs (kept for context, flagged as outdated):
   `docs/discord_ai_control_plane_architecture_oci.md`, `docs/repo-structure.md`.

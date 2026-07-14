@@ -265,7 +265,7 @@ function cohortBoundary(entry) {
     report.provenance?.source_commit,
     report.provenance?.binary_sha256,
     report.final_intent?.binding_fingerprint,
-    JSON.stringify(report.session_config),
+    JSON.stringify(stable(report.session_config)),
     report.provenance?.run_id,
   ].join('::');
 }

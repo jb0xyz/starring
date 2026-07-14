@@ -44,6 +44,16 @@ function providerName(row) {
   return row.provider?.label || row.provider?.id || (typeof row.provider === 'string' ? row.provider : 'unknown');
 }
 
+function stable(value) {
+  if (Array.isArray(value)) {
+    return value.map(stable);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+}
+
 function vars(row) {
   return row.vars || row.testCase?.vars || {};
 }
@@ -124,7 +134,7 @@ function summarize(document) {
       report.provenance?.source_commit,
       report.provenance?.binary_sha256,
       report.final_intent?.binding_fingerprint,
-      JSON.stringify(report.session_config),
+      JSON.stringify(stable(report.session_config)),
       report.provenance?.run_id,
     ].join('::')));
     const requestedModels = [...new Set(intentReports.map((report) => report.requested_model))];

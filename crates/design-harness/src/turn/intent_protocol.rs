@@ -10,7 +10,7 @@ use crate::intent::{
 use crate::tools::ToolDefinition;
 
 const ROUTE_INTENT_TURN: &str = "route_intent_turn";
-const RESOLVE_INTENT_DECISION: &str = "resolve_intent_decision";
+pub(crate) const RESOLVE_INTENT_DECISION: &str = "resolve_intent_decision";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

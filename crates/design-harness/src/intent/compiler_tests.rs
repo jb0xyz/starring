@@ -7,10 +7,11 @@ use crate::turn::{
 use super::normalize::PreparedIntentWorkspaceV1;
 use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
 use super::{
-    compile_intent, propose_private_study_room, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
+    compile_intent, propose_private_study_room, recipe_descriptor_digest_v1,
+    recipe_registry_digest_v1, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
     IntentProposalOutcomeV1, IntentRequestedOutcome, IntentResolutionContext,
     PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
-    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1, ValidatedIntentV1,
+    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1, RecipeKindV1, ValidatedIntentV1,
 };
 
 fn context() -> IntentResolutionContext {
@@ -140,6 +141,15 @@ fn disabled_close_compiles_deterministically_without_dead_controls() {
     assert!(!first.manifest.generated_objects.contains_key("close"));
     assert!(!first.manifest.generated_objects.contains_key("close_room"));
     assert_eq!(first.manifest.registry_digest.len(), 64);
+    assert_eq!(
+        first.manifest.registry_digest,
+        recipe_registry_digest_v1().expect("registry should hash")
+    );
+    assert_ne!(
+        first.manifest.registry_digest,
+        recipe_descriptor_digest_v1(RecipeKindV1::PrivateStudyRoomV1)
+            .expect("descriptor should hash")
+    );
     assert_eq!(first.manifest.input_intent_hash.len(), 64);
     assert_eq!(first.manifest.semantic_intent_hash.len(), 64);
     assert_eq!(first.manifest.compiled_plan_hash.len(), 64);

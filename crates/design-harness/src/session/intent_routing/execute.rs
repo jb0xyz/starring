@@ -1,23 +1,35 @@
-use std::collections::BTreeSet;
-
 use serde_json::json;
 
 use crate::errors::StructuredError;
 use crate::intent::{
-    apply_existing_channel_decision, prepare_intent_candidate, prepare_private_study_room,
-    IntentWorkspaceV1, MissingDecision, PreparedIntentWorkspaceV1,
+    apply_existing_channel_decision, prepare_intent_candidate, IntentWorkspaceV1, MissingDecision,
+    PreparedIntentWorkspaceV1,
 };
-use crate::turn::{parse_resolve_intent_decision, parse_route_intent_turn, IntentRouteInputV1};
+use crate::turn::{
+    parse_interpret_intent_core, parse_private_study_room_details_for_serving,
+    parse_resolve_intent_decision,
+};
 
 use super::super::DesignSession;
+use super::adjudicate::{
+    adjudicate_intent_core_v3, IntentCoreAdjudicationV3, PrivateStudyRoomPermitV2,
+    PrivateStudyRoomSelectionV3,
+};
+use super::decision::{IntentRouteDecisionKindV2, IntentRouteDecisionV2};
+use super::evidence::IntentRecipeEvidenceV3;
 use super::state::{
     intent_error, IntentFallbackV1, IntentRecipeRuntime, IntentRecipeStageSnapshotV1,
 };
+use super::state_binding::{
+    awaiting_decision_binding_digest_v3, preview_ready_binding_digest_v3,
+    AwaitingDecisionBindingInputV3, PreviewReadyBindingInputV3,
+};
+use super::INTENT_RECIPE_PROTOCOL_VERSION_V3;
 
-const MAX_FALLBACK_TEXT_CHARS: usize = 2_000;
-const MAX_FALLBACK_REASON_CHARS: usize = 512;
-const MAX_CAPABILITY_ITEMS: usize = 16;
-const MAX_CAPABILITY_CHARS: usize = 64;
+pub(super) enum IntentCoreExecutionV3 {
+    Complete(Box<IntentTurnSuccess>),
+    NeedsDetails(Box<PrivateStudyRoomSelectionV3>),
+}
 
 pub(super) enum IntentTurnSuccess {
     NeedsInput {
@@ -33,7 +45,10 @@ pub(super) enum IntentTurnSuccess {
         compiled_plan_hash: String,
         compiled_operations: usize,
     },
-    Routed(IntentFallbackV1),
+    Routed {
+        fallback: IntentFallbackV1,
+        decision: IntentRouteDecisionV2,
+    },
 }
 
 impl IntentTurnSuccess {
@@ -63,7 +78,7 @@ impl IntentTurnSuccess {
                 "compiled_plan_hash": compiled_plan_hash,
                 "compiled_operations": compiled_operations,
             }),
-            Self::Routed(fallback) => json!({
+            Self::Routed { fallback, .. } => json!({
                 "ok": true,
                 "status": "routed",
                 "fallback_kind": fallback.kind().as_str(),
@@ -114,10 +129,34 @@ impl<C> DesignSession<C> {
         root_draft_revision: u64,
         workspace: IntentWorkspaceV1,
         active_decision: MissingDecision,
+        route_decision: IntentRouteDecisionV2,
+        recipe_evidence: IntentRecipeEvidenceV3,
     ) -> Result<IntentTurnSuccess, StructuredError> {
         let options = active_decision.options.clone();
         let question = active_decision.question.clone();
         let revision = workspace.revision;
+        let context_fingerprint = self
+            .intent_recipe
+            .as_ref()
+            .map(|runtime| runtime.snapshot.context_fingerprint.clone())
+            .ok_or_else(|| {
+                intent_error(
+                    "INTENT_SESSION_DISABLED",
+                    "intent.session",
+                    "Intent recipe mode is not enabled",
+                    "Construct the session with resource bindings",
+                )
+            })?;
+        let decision_binding_digest =
+            awaiting_decision_binding_digest_v3(AwaitingDecisionBindingInputV3 {
+                protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+                context_fingerprint: &context_fingerprint,
+                root_draft_revision,
+                workspace: &workspace,
+                active_decision: &active_decision,
+                route_decision: &route_decision,
+                recipe_evidence: &recipe_evidence,
+            })?;
         let runtime = self.intent_recipe.as_mut().ok_or_else(|| {
             intent_error(
                 "INTENT_SESSION_DISABLED",
@@ -130,6 +169,9 @@ impl<C> DesignSession<C> {
             root_draft_revision,
             workspace,
             active_decision,
+            route_decision: Some(route_decision),
+            recipe_evidence: Some(recipe_evidence),
+            decision_binding_digest: Some(decision_binding_digest),
         };
         Ok(IntentTurnSuccess::NeedsInput {
             question,
@@ -142,11 +184,18 @@ impl<C> DesignSession<C> {
         &mut self,
         workspace: IntentWorkspaceV1,
         intent: crate::intent::ValidatedIntentV1,
+        route_decision: IntentRouteDecisionV2,
+        recipe_evidence: IntentRecipeEvidenceV3,
     ) -> Result<IntentTurnSuccess, StructuredError> {
-        let bindings = self
+        let (bindings, context_fingerprint) = self
             .intent_recipe
             .as_ref()
-            .map(|runtime| runtime.bindings.clone())
+            .map(|runtime| {
+                (
+                    runtime.bindings.clone(),
+                    runtime.snapshot.context_fingerprint.clone(),
+                )
+            })
             .ok_or_else(|| {
                 intent_error(
                     "INTENT_SESSION_DISABLED",
@@ -179,14 +228,30 @@ impl<C> DesignSession<C> {
             .clone();
         let compiled_operations = prepared.execution().compiled_operations;
         let intent_revision = intent.revision();
-        let committed = match prepared.commit(&mut self.draft) {
-            Ok(committed) => committed,
+        let candidate_revision = prepared.execution().candidate_revision;
+        let decision_binding_digest =
+            preview_ready_binding_digest_v3(PreviewReadyBindingInputV3 {
+                protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+                context_fingerprint: &context_fingerprint,
+                root_draft_revision: root_revision,
+                workspace: &workspace,
+                intent_revision,
+                candidate_revision,
+                input_intent_hash: &input_intent_hash,
+                semantic_intent_hash: &semantic_intent_hash,
+                compiled_plan_hash: &compiled_plan_hash,
+                external_channel_bindings: &external_channel_bindings,
+                compiled_operations,
+                route_decision: &route_decision,
+                recipe_evidence: &recipe_evidence,
+            })?;
+        match prepared.commit(&mut self.draft) {
+            Ok(_) => {}
             Err(error) => {
                 self.record_intent_rollback(&error);
                 return Err(error);
             }
-        };
-        let candidate_revision = committed.execution.candidate_revision;
+        }
         self.observability.intent_commits = self.observability.intent_commits.saturating_add(1);
         self.observability.intent_compiled_operations = self
             .observability
@@ -210,6 +275,9 @@ impl<C> DesignSession<C> {
             compiled_plan_hash: compiled_plan_hash.clone(),
             external_channel_bindings,
             compiled_operations,
+            route_decision: Some(route_decision),
+            recipe_evidence: Some(recipe_evidence),
+            decision_binding_digest: Some(decision_binding_digest),
         };
         Ok(IntentTurnSuccess::Ready {
             summary: format!(
@@ -231,101 +299,137 @@ impl<C> DesignSession<C> {
         }
     }
 
-    pub(super) async fn execute_intent_route(
+    pub(super) async fn execute_intent_core(
         &mut self,
         arguments: &str,
-    ) -> Result<IntentTurnSuccess, StructuredError> {
+        human_message: &str,
+    ) -> Result<IntentCoreExecutionV3, StructuredError> {
         self.observability.intent_route_calls =
             self.observability.intent_route_calls.saturating_add(1);
-        let input = parse_route_intent_turn(arguments).inspect_err(|_| {
+        let core = parse_interpret_intent_core(arguments).inspect_err(|_| {
             self.record_intent_extraction_failure();
         })?;
-        self.validate_expected_revision(input.expected_revision)?;
-        match input.route {
-            IntentRouteInputV1::PrivateStudyRoom { proposal } => {
-                let context = self
-                    .intent_recipe
-                    .as_ref()
-                    .map(IntentRecipeRuntime::resolution_context)
-                    .ok_or_else(|| {
-                        intent_error(
-                            "INTENT_SESSION_DISABLED",
-                            "intent.session",
-                            "Intent recipe mode is not enabled",
-                            "Construct the session with resource bindings",
-                        )
-                    })?;
-                let prepared = match prepare_private_study_room(*proposal, &context) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
+        core.validate_human_evidence(human_message)
+            .inspect_err(|_| {
+                self.record_intent_extraction_failure();
+            })?;
+        self.validate_expected_revision(core.expected_revision())?;
+        let adjudication = adjudicate_intent_core_v3(core).inspect_err(|_| {
+            self.record_intent_extraction_failure();
+        })?;
+        match adjudication {
+            IntentCoreAdjudicationV3::PrivateStudyRoom(selection) => {
+                if selection.detail_facets().is_empty() {
+                    let recipe_evidence = IntentRecipeEvidenceV3::deterministic_default(
+                        selection.semantic_ir_digest(),
+                    )?;
+                    let permit = selection.finalize(None).inspect_err(|_| {
                         self.record_intent_extraction_failure();
-                        return Err(error);
-                    }
-                };
-                self.observability.intent_proposal_acceptances = self
-                    .observability
-                    .intent_proposal_acceptances
-                    .saturating_add(1);
-                match prepared {
-                    PreparedIntentWorkspaceV1::NeedsInput {
-                        workspace,
-                        decisions,
-                    } => {
-                        let decision = exactly_one_decision(decisions)?;
-                        self.set_awaiting_decision(self.draft.draft_revision, workspace, decision)
-                    }
-                    PreparedIntentWorkspaceV1::Resolved { workspace, intent } => {
-                        self.prepare_and_commit_intent(workspace, intent).await
-                    }
+                    })?;
+                    self.complete_private_study_room(permit, recipe_evidence)
+                        .await
+                        .map(|success| IntentCoreExecutionV3::Complete(Box::new(success)))
+                } else {
+                    Ok(IntentCoreExecutionV3::NeedsDetails(selection))
                 }
             }
-            IntentRouteInputV1::TypedPlanner { reason, response } => {
-                self.accept_fallback(IntentFallbackV1::TypedPlanner {
-                    reason: normalized_fallback_text(
-                        reason,
-                        MAX_FALLBACK_REASON_CHARS,
-                        "intent.route.typed_planner.reason",
-                    )?,
-                    response: normalized_fallback_text(
+            IntentCoreAdjudicationV3::TypedPlanner(permit) => {
+                let (objective, _, decision, response) = permit.into_parts();
+                self.accept_fallback(
+                    IntentFallbackV1::TypedPlanner {
+                        reason: objective,
                         response,
-                        MAX_FALLBACK_TEXT_CHARS,
-                        "intent.route.typed_planner.response",
-                    )?,
-                })
+                    },
+                    decision,
+                )
+                .map(|success| IntentCoreExecutionV3::Complete(Box::new(success)))
             }
-            IntentRouteInputV1::CapabilityGap {
-                capabilities,
-                response,
-            } => self.accept_fallback(IntentFallbackV1::CapabilityGap {
-                capabilities: normalized_capabilities(capabilities)?,
-                response: normalized_fallback_text(
-                    response,
-                    MAX_FALLBACK_TEXT_CHARS,
-                    "intent.route.capability_gap.response",
-                )?,
-            }),
-            IntentRouteInputV1::Reject { reason, response } => {
-                self.accept_fallback(IntentFallbackV1::Reject {
-                    reason: normalized_fallback_text(
-                        reason,
-                        MAX_FALLBACK_REASON_CHARS,
-                        "intent.route.reject.reason",
-                    )?,
-                    response: normalized_fallback_text(
-                        response,
-                        MAX_FALLBACK_TEXT_CHARS,
-                        "intent.route.reject.response",
-                    )?,
-                })
+            IntentCoreAdjudicationV3::Terminal(permit) => {
+                let (decision, response) = permit.into_parts();
+                let fallback = terminal_fallback(&decision, response)?;
+                self.accept_fallback(fallback, decision)
+                    .map(|success| IntentCoreExecutionV3::Complete(Box::new(success)))
             }
-            IntentRouteInputV1::Discussion { response } => {
-                self.accept_fallback(IntentFallbackV1::Discussion {
-                    response: normalized_fallback_text(
-                        response,
-                        MAX_FALLBACK_TEXT_CHARS,
-                        "intent.route.discussion.response",
-                    )?,
-                })
+        }
+    }
+
+    pub(super) async fn execute_intent_details(
+        &mut self,
+        selection: Box<PrivateStudyRoomSelectionV3>,
+        arguments: &str,
+        human_message: &str,
+    ) -> Result<IntentTurnSuccess, StructuredError> {
+        let expected_revision = selection.expected_revision();
+        let core_semantic_digest = selection.semantic_ir_digest().to_string();
+        let detail_facets = selection.detail_facets().to_vec();
+        let details = parse_private_study_room_details_for_serving(
+            arguments,
+            &detail_facets,
+            expected_revision,
+            &core_semantic_digest,
+            human_message,
+        )
+        .inspect_err(|_| {
+            self.record_intent_extraction_failure();
+        })?;
+        let detail_result_digest = selection.details_digest(&details)?;
+        let recipe_evidence = IntentRecipeEvidenceV3::model_detail(
+            &core_semantic_digest,
+            &detail_facets,
+            detail_result_digest,
+        )?;
+        let permit = selection.finalize(Some(details)).inspect_err(|_| {
+            self.record_intent_extraction_failure();
+        })?;
+        self.complete_private_study_room(permit, recipe_evidence)
+            .await
+    }
+
+    async fn complete_private_study_room(
+        &mut self,
+        permit: PrivateStudyRoomPermitV2,
+        recipe_evidence: IntentRecipeEvidenceV3,
+    ) -> Result<IntentTurnSuccess, StructuredError> {
+        let context = self
+            .intent_recipe
+            .as_ref()
+            .map(IntentRecipeRuntime::resolution_context)
+            .ok_or_else(|| {
+                intent_error(
+                    "INTENT_SESSION_DISABLED",
+                    "intent.session",
+                    "Intent recipe mode is not enabled",
+                    "Construct the session with resource bindings",
+                )
+            })?;
+        let (route_decision, prepared) = match permit.prepare(&context) {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_intent_extraction_failure();
+                return Err(error);
+            }
+        };
+        self.observability.intent_proposal_acceptances = self
+            .observability
+            .intent_proposal_acceptances
+            .saturating_add(1);
+        match prepared {
+            PreparedIntentWorkspaceV1::NeedsInput {
+                workspace,
+                decisions,
+            } => {
+                let decision = exactly_one_decision(decisions)?;
+                self.set_awaiting_decision(
+                    self.draft.draft_revision,
+                    workspace,
+                    decision,
+                    route_decision,
+                    recipe_evidence,
+                )
+            }
+            PreparedIntentWorkspaceV1::Resolved { workspace, intent } => {
+                self.prepare_and_commit_intent(workspace, intent, route_decision, recipe_evidence)
+                    .await
             }
         }
     }
@@ -333,13 +437,14 @@ impl<C> DesignSession<C> {
     fn accept_fallback(
         &mut self,
         fallback: IntentFallbackV1,
+        decision: IntentRouteDecisionV2,
     ) -> Result<IntentTurnSuccess, StructuredError> {
         *self
             .observability
             .intent_fallback_routes
             .entry(fallback.kind().as_str().to_string())
             .or_default() += 1;
-        Ok(IntentTurnSuccess::Routed(fallback))
+        Ok(IntentTurnSuccess::Routed { fallback, decision })
     }
 
     pub(super) async fn execute_intent_resolution(
@@ -350,7 +455,7 @@ impl<C> DesignSession<C> {
             self.record_intent_extraction_failure();
         })?;
         self.validate_expected_revision(input.expected_revision)?;
-        let (root_draft_revision, workspace) = match self
+        let (root_draft_revision, workspace, route_decision, recipe_evidence) = match self
             .intent_recipe
             .as_ref()
             .map(|runtime| runtime.snapshot.stage.clone())
@@ -358,8 +463,15 @@ impl<C> DesignSession<C> {
             Some(IntentRecipeStageSnapshotV1::AwaitingDecision {
                 root_draft_revision,
                 workspace,
+                route_decision,
+                recipe_evidence,
                 ..
-            }) => (root_draft_revision, workspace),
+            }) => (
+                root_draft_revision,
+                workspace,
+                route_decision.ok_or_else(missing_route_decision_error)?,
+                recipe_evidence.ok_or_else(missing_recipe_evidence_error)?,
+            ),
             _ => {
                 return Err(intent_error(
                     "INTENT_DECISION_NOT_PENDING",
@@ -397,14 +509,74 @@ impl<C> DesignSession<C> {
                 decisions,
             } => {
                 let decision = exactly_one_decision(decisions)?;
-                self.set_awaiting_decision(root_draft_revision, workspace, decision)
+                self.set_awaiting_decision(
+                    root_draft_revision,
+                    workspace,
+                    decision,
+                    route_decision,
+                    recipe_evidence,
+                )
             }
             PreparedIntentWorkspaceV1::Resolved { workspace, intent } => {
-                self.prepare_and_commit_intent(workspace, intent).await
+                self.prepare_and_commit_intent(workspace, intent, route_decision, recipe_evidence)
+                    .await
             }
         }
     }
 }
+
+fn terminal_fallback(
+    decision: &IntentRouteDecisionV2,
+    response: String,
+) -> Result<IntentFallbackV1, StructuredError> {
+    match decision.kind() {
+        IntentRouteDecisionKindV2::CapabilityGap => Ok(IntentFallbackV1::CapabilityGap {
+            capabilities: decision
+                .blockers()
+                .iter()
+                .map(|blocker| blocker.id.as_str().to_string())
+                .collect(),
+            response,
+        }),
+        IntentRouteDecisionKindV2::Reject => Ok(IntentFallbackV1::Reject {
+            reason: decision
+                .boundary_violations()
+                .iter()
+                .map(|violation| violation.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            response,
+        }),
+        IntentRouteDecisionKindV2::Discussion => Ok(IntentFallbackV1::Discussion { response }),
+        IntentRouteDecisionKindV2::PrivateStudyRoom | IntentRouteDecisionKindV2::TypedPlanner => {
+            Err(intent_error(
+                "INCONSISTENT_INTENT_ADJUDICATION",
+                "intent.adjudication.kind",
+                "A non-terminal intent decision reached the terminal route",
+                "Construct the route through the matching adjudication permit",
+            ))
+        }
+    }
+}
+
+fn missing_route_decision_error() -> StructuredError {
+    intent_error(
+        "INTENT_ROUTE_DECISION_MISSING",
+        "intent.session.route_decision",
+        "The pending intent decision has no deterministic route decision",
+        "Start a new intent recipe session under protocol version 3",
+    )
+}
+
+fn missing_recipe_evidence_error() -> StructuredError {
+    intent_error(
+        "INTENT_RECIPE_EVIDENCE_MISSING",
+        "intent.session.recipe_evidence",
+        "The pending intent decision has no protocol V3 recipe evidence",
+        "Start a new intent recipe session under protocol version 3",
+    )
+}
+
 fn exactly_one_decision(
     decisions: Vec<MissingDecision>,
 ) -> Result<MissingDecision, StructuredError> {
@@ -420,54 +592,4 @@ fn exactly_one_decision(
         ));
     };
     Ok(decision.clone())
-}
-
-fn normalized_fallback_text(
-    value: String,
-    max_chars: usize,
-    location: &str,
-) -> Result<String, StructuredError> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let length = normalized.chars().count();
-    if length == 0 || length > max_chars {
-        return Err(intent_error(
-            "INVALID_INTENT_FALLBACK_TEXT",
-            location,
-            format!("Fallback text contains {length} characters; expected 1 to {max_chars}"),
-            "Provide a concise non-empty user-facing value",
-        ));
-    }
-    Ok(normalized)
-}
-
-fn normalized_capabilities(values: Vec<String>) -> Result<Vec<String>, StructuredError> {
-    if values.is_empty() || values.len() > MAX_CAPABILITY_ITEMS {
-        return Err(intent_error(
-            "INVALID_INTENT_CAPABILITIES",
-            "intent.route.capability_gap.capabilities",
-            format!(
-                "Capability gap contains {} items; expected 1 to {MAX_CAPABILITY_ITEMS}",
-                values.len()
-            ),
-            "List only the unsupported capabilities that block this request",
-        ));
-    }
-    let mut normalized = BTreeSet::new();
-    for value in values {
-        let value = value.trim().to_string();
-        let valid = !value.is_empty()
-            && value.chars().count() <= MAX_CAPABILITY_CHARS
-            && value
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character == '_');
-        if !valid || !normalized.insert(value) {
-            return Err(intent_error(
-                "INVALID_INTENT_CAPABILITIES",
-                "intent.route.capability_gap.capabilities",
-                "Capability identifiers must be unique lowercase ASCII snake_case values",
-                "Use one stable identifier per unsupported capability",
-            ));
-        }
-    }
-    Ok(normalized.into_iter().collect())
 }

@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 write_draft(&mut output, &session.draft().summary()).await?;
                 write_observability(&mut output, session.observability()).await?;
             }
-            BurstOutcome::Routed { fallback } => {
+            BurstOutcome::Routed { fallback, .. } => {
                 write_line(&mut output, &format!("assistant> {}", fallback.response())).await?;
             }
             BurstOutcome::Halted(report) => {
@@ -305,6 +305,10 @@ where
         let outcome = session.run_burst(&turn.input).await;
         let elapsed = turn_started.elapsed();
         let status_after = required_intent_status(&session)?;
+        let route_decision = match &outcome {
+            BurstOutcome::Routed { decision, .. } => Some(decision.as_ref().clone()),
+            _ => session.intent_recipe_route_decision().cloned(),
+        };
         generation = store
             .as_mut()
             .ok_or("intent evaluation store is unavailable")?
@@ -344,6 +348,7 @@ where
             observability_before: &observability_before,
             observability_after: session.observability(),
             outcome: &outcome,
+            route_decision: route_decision.as_ref(),
             elapsed,
             restart_after: turn.restart_after,
             restart_performed,
@@ -1701,16 +1706,26 @@ mod tests {
     async fn intent_eval_restarts_without_oracle_and_reports_public_receipt() {
         let responses = VecDeque::from([
             LlmResponse::ToolCalls(vec![ToolCall {
-                id: "route".to_string(),
-                name: "route_intent_turn".to_string(),
+                id: "interpret".to_string(),
+                name: "interpret_intent_core".to_string(),
                 arguments: json!({
                     "expected_revision": 0,
-                    "route": "private_study_room",
-                    "proposal": {
-                        "objective": "Create managed private study rooms",
-                        "requested_outcome": "validated_preview",
-                        "locale": "en"
-                    }
+                    "request_mode": "build",
+                    "automation_kind": "managed_private_study_room",
+                    "objective": "Create managed private study rooms",
+                    "requested_outcome": "validated_preview",
+                    "hub_channel": null,
+                    "language": "en",
+                    "close_policy": "disabled",
+                    "runtime_requirements": [],
+                    "validation_gate": "enforce",
+                    "preview_gate": "enforce",
+                    "approval_gate": "enforce",
+                    "live_discord_mutation": "no_live_mutation",
+                    "secret_disclosure": "no_secret_disclosure",
+                    "other_unmapped_required_capabilities": [],
+                    "custom_detail_facets": [],
+                    "response": ""
                 })
                 .to_string(),
             }]),
@@ -1776,6 +1791,23 @@ mod tests {
         assert_eq!(document["turns"][0]["restart_performed"], true);
         assert_eq!(document["turns"][1]["stage_before"], "awaiting_decision");
         assert_eq!(document["turns"][1]["stage_after"], "preview_ready");
+        let pending_decision = &document["turns"][0]["route_decision"];
+        let resolved_decision = &document["turns"][1]["route_decision"];
+        let final_decision = &document["final_intent"]["route_decision"];
+        assert_eq!(pending_decision, resolved_decision);
+        assert_eq!(resolved_decision, final_decision);
+        assert_eq!(pending_decision["kind"], "private_study_room");
+        for field in [
+            "semantic_ir_digest",
+            "manifest_digest",
+            "adjudication_digest",
+        ] {
+            let digest = pending_decision[field].as_str().unwrap();
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        }
         assert_eq!(document["turns"][1]["model_calls"], 1);
         assert_eq!(document["turns"][1]["model_tool_calls"], 1);
         assert!(document["turns"][1]["deterministic_operations"]
@@ -1793,9 +1825,88 @@ mod tests {
         assert_eq!(
             probe.calls.lock().unwrap().clone(),
             vec![
-                vec!["route_intent_turn".to_string()],
+                vec!["interpret_intent_core".to_string()],
                 vec!["resolve_intent_decision".to_string()]
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_eval_preserves_last_terminal_route_decision_after_later_halt() {
+        let responses = VecDeque::from([
+            LlmResponse::ToolCalls(vec![ToolCall {
+                id: "interpret".to_string(),
+                name: "interpret_intent_core".to_string(),
+                arguments: json!({
+                    "expected_revision": 0,
+                    "request_mode": "build",
+                    "automation_kind": "custom_automation",
+                    "objective": "Create a static feedback automation",
+                    "requested_outcome": "validated_preview",
+                    "hub_channel": null,
+                    "language": "en",
+                    "close_policy": "disabled",
+                    "runtime_requirements": [],
+                    "validation_gate": "enforce",
+                    "preview_gate": "enforce",
+                    "approval_gate": "enforce",
+                    "live_discord_mutation": "no_live_mutation",
+                    "secret_disclosure": "no_secret_disclosure",
+                    "other_unmapped_required_capabilities": [],
+                    "custom_detail_facets": [],
+                    "response": "I already deployed this automation."
+                })
+                .to_string(),
+            }]),
+            LlmResponse::ToolCalls(vec![ToolCall {
+                id: "wrong".to_string(),
+                name: "add_panel".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+        ]);
+        let client = IntentEvalClient {
+            responses: Arc::new(Mutex::new(responses)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let scenario = parse_eval_input(
+            r#"{"schema_version":3,"mode":"intent_recipe","turns":[{"id":"request","input":"Build a static feedback automation"},{"id":"followup","input":"Now add a panel"}]}"#,
+        )
+        .unwrap();
+
+        let document = execute_intent_eval(
+            client,
+            SessionConfig::default(),
+            ResourceBindingMap::default(),
+            scenario,
+            IntentEvalProvenance {
+                gateway_id: "test-gateway".to_string(),
+                declared_context_tokens: 16_384,
+                source_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                source_dirty: false,
+                binary_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+                run_id: "intent-eval-terminal-test".to_string(),
+                run_order: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(document["turns"][0]["outcome"], "routed");
+        assert_eq!(document["turns"][1]["outcome"], "halted");
+        assert!(document["turns"][1]["route_decision"].is_null());
+        assert_eq!(document["final_intent"]["status"], "empty");
+        assert_eq!(
+            document["turns"][0]["route_decision"],
+            document["final_intent"]["route_decision"]
+        );
+        assert_eq!(
+            document["final_intent"]["route_decision"]["kind"],
+            "typed_planner"
+        );
+        assert_eq!(
+            document["final_intent"]["route_decision"]["decision_source"],
+            "deterministic_intent_adjudicator"
         );
     }
 
