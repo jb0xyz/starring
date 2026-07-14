@@ -265,12 +265,18 @@ fn message_id_recorded_in_result() {
 #[test]
 fn missing_input_fails_post_panel() {
     let context = RuntimeContext::from_event(&submit("cozy"), &identity("test"));
-    let steps = vec![PlannedAction::PostPanel {
-        key: "panel".to_string(),
-        channel: PlannedChannel::Resolved(ChannelId(999)),
-        content: "${input.missing}".to_string(),
-        buttons: vec![],
-    }];
+    let steps = vec![
+        PlannedAction::CreateRole {
+            key: "member".to_string(),
+            name: "member".to_string(),
+        },
+        PlannedAction::PostPanel {
+            key: "panel".to_string(),
+            channel: PlannedChannel::Resolved(ChannelId(999)),
+            content: "${input.missing}".to_string(),
+            buttons: vec![],
+        },
+    ];
     let mutation = MockMutationAdapter::new();
     let responder = MockInteractionResponder::new();
     assert!(block_on(run(
@@ -285,6 +291,13 @@ fn missing_input_fails_post_panel() {
         },
     ))
     .is_err());
+    assert_eq!(
+        mutation.calls(),
+        vec![MutationCall::CreateRole {
+            guild: GuildId(7),
+            name: "member".to_string(),
+        }]
+    );
 }
 
 #[test]
