@@ -138,6 +138,8 @@ Unrequested objects may be omitted. Each requested facet must have at least one 
 
 The active detail router derives a per-request schema from the canonical selected facets. It removes every unselected object and `unmapped_facets`, then marks every remaining facet object as required. An extractor that cannot map a selected facet must return its required object empty, which the parser rejects without mutation. The broad public parser schema remains compatible with omitted objects and explicit `unmapped_facets`, but the serving frontier exposes only the closed active subset.
 
+The optional second model request uses a bounded isolated context containing only the detail system prompt, the current `INTENT_HUMAN` envelope, and the current `INTENT_DETAIL_STATE` anchor. The append-only durable transcript still records both accepted tool calls and results, but the extractor does not receive the Core tool arguments, Core tool result, or unrelated prior conversation.
+
 The detail result is rejected without mutation when:
 
 - a selected facet is missing, duplicated in the harness ticket, unknown, empty, or mapped to another facet;

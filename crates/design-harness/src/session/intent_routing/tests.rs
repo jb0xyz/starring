@@ -372,6 +372,15 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
         assert_eq!(calls[1].0[0].content, INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3);
+        assert_eq!(calls[1].0.len(), 3);
+        assert!(calls[1].0[1].content.starts_with(INTENT_HUMAN_PREFIX));
+        assert!(calls[1].0[2]
+            .content
+            .starts_with(INTENT_DETAIL_STATE_PREFIX));
+        assert!(calls[1]
+            .0
+            .iter()
+            .all(|message| message.tool_calls.is_empty()));
         assert_eq!(calls[0].1.len(), 1);
         assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert_eq!(calls[1].1.len(), 1);
@@ -403,8 +412,20 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
         )
         .unwrap();
         assert_eq!(detail_anchor, json!({"detail_facets": ["copy"]}));
-        let detail_request_result: serde_json::Value =
-            serde_json::from_str(&calls[1].0[calls[1].0.len() - 2].content).unwrap();
+        assert_eq!(session.observability.model_calls, 2);
+        assert_eq!(session.observability.tool_calls, 2);
+        assert_eq!(session.observability.intent_commits, 1);
+        let durable_snapshot = session.snapshot();
+        let snapshot = serde_json::to_value(&durable_snapshot).unwrap();
+        let detail_request_result = snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+            .find(|content| content["status"] == "details_required")
+            .unwrap();
         assert_eq!(
             detail_request_result,
             json!({
@@ -413,11 +434,6 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
                 "status": "details_required"
             })
         );
-        assert_eq!(session.observability.model_calls, 2);
-        assert_eq!(session.observability.tool_calls, 2);
-        assert_eq!(session.observability.intent_commits, 1);
-        let durable_snapshot = session.snapshot();
-        let snapshot = serde_json::to_value(&durable_snapshot).unwrap();
         assert_eq!(
             snapshot["intent_recipe"]["stage"]["recipe_evidence"]["extraction_mode"],
             "model_detail"

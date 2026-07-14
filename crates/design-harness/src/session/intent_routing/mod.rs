@@ -250,6 +250,38 @@ impl<C> DesignSession<C> {
             return None;
         }
         system.content = system_prompt.to_string();
+        self.fit_intent_messages(messages, tools)
+    }
+
+    fn fit_intent_detail_context(
+        &self,
+        tools: &[crate::tools::ToolDefinition],
+        system_prompt: &str,
+    ) -> Option<Vec<Message>> {
+        let human = self.messages.get(self.current_human_message_index?)?;
+        let detail_state = self.messages.last()?;
+        if human.role != crate::llm::MessageRole::User
+            || !human.content.starts_with(INTENT_HUMAN_PREFIX)
+            || detail_state.role != crate::llm::MessageRole::User
+            || !detail_state.content.starts_with(INTENT_DETAIL_STATE_PREFIX)
+        {
+            return None;
+        }
+        self.fit_intent_messages(
+            vec![
+                Message::system(system_prompt),
+                human.clone(),
+                detail_state.clone(),
+            ],
+            tools,
+        )
+    }
+
+    fn fit_intent_messages(
+        &self,
+        messages: Vec<Message>,
+        tools: &[crate::tools::ToolDefinition],
+    ) -> Option<Vec<Message>> {
         let message_chars = serde_json::to_string(&messages).ok()?.len();
         let tool_chars = serde_json::to_string(tools).ok()?.len();
         (message_chars.saturating_add(tool_chars) <= self.config.context_char_budget)
@@ -467,7 +499,12 @@ impl<C: LlmClient> DesignSession<C> {
             crate::turn::RESOLVE_INTENT_DECISION => INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
             _ => INTENT_RECIPE_SYSTEM_PROMPT_V3,
         };
-        let Some(messages) = self.fit_intent_context(tools, system_prompt) else {
+        let messages = if expected_tool == EXTRACT_PRIVATE_STUDY_ROOM_DETAILS {
+            self.fit_intent_detail_context(tools, system_prompt)
+        } else {
+            self.fit_intent_context(tools, system_prompt)
+        };
+        let Some(messages) = messages else {
             return Err(IntentToolRequestFailure::Limit(
                 intent_error(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
