@@ -22,6 +22,8 @@
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -35,6 +37,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -70,6 +74,8 @@
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -83,6 +89,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -119,6 +127,8 @@
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
     expectedRestartCount: 1
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -132,6 +142,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -162,6 +174,8 @@
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -175,6 +189,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -210,6 +226,8 @@
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -223,6 +241,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -252,6 +272,8 @@
     expectedRoutePath: typed_planner
     expectedFinalStatus: empty
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -265,6 +287,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -294,6 +318,8 @@
     expectedRoutePath: capability_gap
     expectedFinalStatus: empty
     expectedRestartCount: 0
+    expectedBlockers: instance_creator_teardown_authorization|unavailable|
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -307,6 +333,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -336,6 +364,8 @@
     expectedRoutePath: capability_gap
     expectedFinalStatus: empty
     expectedRestartCount: 0
+    expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|
+    expectedBoundaryViolations: ""
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -349,6 +379,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -378,6 +410,8 @@
     expectedRoutePath: reject
     expectedFinalStatus: empty
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: bypass_validation_preview_approval,direct_live_mutation
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -391,6 +425,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
@@ -420,6 +456,8 @@
     expectedRoutePath: reject
     expectedFinalStatus: empty
     expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: direct_live_mutation,secret_disclosure
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -433,6 +471,8 @@
       value: file://intent-assertions.js:intentOracleIsolation
     - type: javascript
       value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
     - type: javascript
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript

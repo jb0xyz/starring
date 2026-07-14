@@ -3,6 +3,67 @@ const assert = require('node:assert/strict');
 
 const { assess } = require('./acceptance');
 
+const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+
+function routeDecision(kind = 'private_study_room', overrides = {}) {
+  return {
+    kind,
+    decision_source: 'deterministic_intent_adjudicator',
+    adjudicator_version: 1,
+    semantic_ir_digest: 'a'.repeat(64),
+    manifest_version: 1,
+    manifest_digest: MANIFEST_DIGEST,
+    adjudication_digest: 'b'.repeat(64),
+    blockers: [],
+    boundary_violations: [],
+    unclassified_requirements: [],
+    route_target: kind === 'private_study_room'
+      ? { recipe_id: 'starring.private_study_room', recipe_version: 1 }
+      : null,
+    ...overrides,
+  };
+}
+
+function evidence(id) {
+  return [{ semantic_path: `intent.${id}`, description: `Requests ${id}` }];
+}
+
+function fallbackDecision(caseId, route) {
+  if (caseId === 'intent_creator_only_close_gap') {
+    return routeDecision(route, {
+      blockers: [{
+        id: 'instance_creator_teardown_authorization',
+        status: 'unavailable',
+        policy_id: null,
+        evidence: evidence('instance_creator_teardown_authorization'),
+      }],
+    });
+  }
+  if (caseId === 'intent_stateful_game_gap') {
+    return routeDecision(route, {
+      blockers: [
+        ['durable_timer', 'unavailable', null],
+        ['event_time_llm_decision', 'forbidden_policy', 'event_time_llm_execution_forbidden_v1'],
+        ['persistent_economy_ledger', 'unavailable', null],
+        ['restart_persistent_state', 'unavailable', null],
+      ].map(([id, status, policy_id]) => ({ id, status, policy_id, evidence: evidence(id) })),
+    });
+  }
+  if (caseId === 'intent_reject_live_mutation') {
+    return routeDecision(route, {
+      boundary_violations: ['bypass_validation_preview_approval', 'direct_live_mutation']
+        .map((id) => ({ id, evidence: evidence(id) })),
+    });
+  }
+  if (caseId === 'intent_reject_secret_disclosure') {
+    return routeDecision(route, {
+      boundary_violations: ['direct_live_mutation', 'secret_disclosure']
+        .map((id) => ({ id, evidence: evidence(id) })),
+    });
+  }
+  return routeDecision(route);
+}
+
 function intentCounters(overrides = {}) {
   return {
     route_calls: 1,
@@ -34,6 +95,7 @@ function buildTurn() {
     stage_after: 'preview_ready',
     intent_revision_before: 0,
     intent_revision_after: 1,
+    route_decision: routeDecision(),
     draft_changed: true,
     draft_revision_before: 0,
     draft_revision_after: 22,
@@ -109,6 +171,7 @@ function report(order, inputHash, turns = [buildTurn()]) {
           compiled_operations: 22,
         },
       },
+      route_decision: turns[turns.length - 1].route_decision,
       binding_fingerprint: '6'.repeat(64),
     },
     persistence: {
@@ -155,6 +218,7 @@ function passingDocument() {
       stage_after: 'awaiting_decision',
       intent_revision_before: 0,
       intent_revision_after: 1,
+      route_decision: routeDecision(),
       draft_changed: false,
       draft_revision_before: 0,
       draft_revision_after: 0,
@@ -186,6 +250,7 @@ function passingDocument() {
     return [pending, resolve];
   };
   const fallbackRow = (caseId, route, currentOrder) => {
+    const decision = fallbackDecision(caseId, route);
     const fallbackReport = report(currentOrder, '5'.repeat(64), [{
       id: 'fallback',
       input: 'Fallback request',
@@ -199,6 +264,7 @@ function passingDocument() {
       stage_after: 'empty',
       intent_revision_before: 0,
       intent_revision_after: 0,
+      route_decision: decision,
       draft_changed: false,
       draft_revision_before: 0,
       draft_revision_after: 0,
@@ -227,6 +293,7 @@ function passingDocument() {
       status: 'empty',
       receipt: null,
       public_status: { status: 'empty', expected_revision: 0 },
+      route_decision: decision,
       binding_fingerprint: '6'.repeat(64),
     };
     return {
