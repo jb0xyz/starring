@@ -498,6 +498,42 @@ pub(crate) fn action_matches(action: &ActionSpec, required: &ScopeAction) -> boo
     }
 }
 
+pub(crate) fn action_is_repeatable(action: &ScopeAction) -> bool {
+    matches!(
+        action,
+        ScopeAction::GrantRole { .. }
+            | ScopeAction::RespondEphemeral { .. }
+            | ScopeAction::OpenModal { .. }
+            | ScopeAction::UpsertOverwrite { .. }
+            | ScopeAction::TeardownInstance { .. }
+    )
+}
+
+pub(crate) fn scope_actions_equivalent(left: &ScopeAction, right: &ScopeAction) -> bool {
+    match (left, right) {
+        (
+            ScopeAction::UpsertOverwrite {
+                channel,
+                target,
+                allow,
+                deny,
+            },
+            ScopeAction::UpsertOverwrite {
+                channel: other_channel,
+                target: other_target,
+                allow: other_allow,
+                deny: other_deny,
+            },
+        ) => {
+            channel == other_channel
+                && target == other_target
+                && permission_bits(allow) == permission_bits(other_allow)
+                && permission_bits(deny) == permission_bits(other_deny)
+        }
+        _ => left == right,
+    }
+}
+
 fn action_target_matches(target: &ActionTarget, expected: ScopeActionTarget) -> bool {
     matches!(
         (target, expected),

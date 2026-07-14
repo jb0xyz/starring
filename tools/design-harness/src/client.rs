@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use design_harness::{
     LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall, ToolDefinition,
@@ -13,6 +16,7 @@ pub struct GemmaClient {
     endpoint: String,
     api_key: String,
     model: String,
+    adapted_call_sequence: AtomicU64,
 }
 
 impl GemmaClient {
@@ -26,6 +30,7 @@ impl GemmaClient {
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             api_key,
             model,
+            adapted_call_sequence: AtomicU64::new(0),
         })
     }
 }
@@ -67,7 +72,12 @@ impl LlmClient for GemmaClient {
                 .json::<Value>()
                 .await
                 .map_err(|error| LlmError::Client(error.to_string()))?;
-            return parse_response_value(value, &self.model);
+            let response = parse_response_value(value, &self.model)?;
+            return Ok(adapt_single_frontier_response(
+                response,
+                tools,
+                &self.adapted_call_sequence,
+            ));
         }
         unreachable!()
     }
@@ -88,6 +98,8 @@ struct ChatCompletionRequest<'a> {
     tools: Vec<OpenAiTool<'a>>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
+    temperature: f64,
+    seed: u32,
     stream: bool,
 }
 
@@ -136,7 +148,7 @@ fn build_request_body(
         .iter()
         .map(openai_message)
         .collect::<Result<Vec<_>, LlmError>>()?;
-    let tools = tools
+    let openai_tools = tools
         .iter()
         .map(|tool| OpenAiTool {
             r#type: "function",
@@ -147,15 +159,56 @@ fn build_request_body(
             },
         })
         .collect();
-    serde_json::to_value(ChatCompletionRequest {
+    let mut body = serde_json::to_value(ChatCompletionRequest {
         model,
         messages,
-        tools,
+        tools: openai_tools,
         tool_choice: "auto",
         parallel_tool_calls: false,
+        temperature: 0.1,
+        seed: 0,
         stream: false,
     })
-    .map_err(|error| LlmError::Client(error.to_string()))
+    .map_err(|error| LlmError::Client(error.to_string()))?;
+    if let [tool] = tools {
+        let body = body
+            .as_object_mut()
+            .ok_or_else(|| LlmError::Client("request body is not an object".to_string()))?;
+        body.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type":"json_schema",
+                "json_schema":{
+                    "name":format!("{}_arguments", tool.name),
+                    "strict":true,
+                    "schema":tool.parameters
+                }
+            }),
+        );
+    }
+    Ok(body)
+}
+
+fn adapt_single_frontier_response(
+    response: LlmResponse,
+    tools: &[ToolDefinition],
+    sequence: &AtomicU64,
+) -> LlmResponse {
+    let [tool] = tools else {
+        return response;
+    };
+    let LlmResponse::Text(arguments) = response else {
+        return response;
+    };
+    if !serde_json::from_str::<Value>(&arguments).is_ok_and(|value| value.is_object()) {
+        return LlmResponse::Text(arguments);
+    }
+    let id = sequence.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    LlmResponse::ToolCalls(vec![ToolCall {
+        id: format!("call-adapted-{id}"),
+        name: tool.name.clone(),
+        arguments,
+    }])
 }
 
 fn openai_message(message: &Message) -> Result<OpenAiMessage<'_>, LlmError> {
@@ -273,6 +326,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        sync::atomic::AtomicU64,
         thread,
         time::Duration,
     };
@@ -280,7 +334,10 @@ mod tests {
     use design_harness::{tool_definitions, LlmClient, LlmError, LlmResponse, Message, ToolCall};
     use serde_json::json;
 
-    use super::{build_request_body, is_retryable_status, parse_response_value, GemmaClient};
+    use super::{
+        adapt_single_frontier_response, build_request_body, is_retryable_status,
+        parse_response_value, GemmaClient,
+    };
 
     fn read_request(stream: &mut TcpStream) {
         stream
@@ -395,6 +452,8 @@ mod tests {
         assert_eq!(body["model"], "gemma4:12b-mlx");
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["seed"], 0);
         assert_eq!(body["stream"], false);
         assert_eq!(
             body["messages"][0],
@@ -441,10 +500,88 @@ mod tests {
             })
         );
         assert_eq!(body["tools"].as_array().unwrap().len(), 22);
+        assert!(body.get("response_format").is_none());
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "add_panel");
         assert!(body["tools"][0]["function"]["description"].is_string());
         assert!(body["tools"][0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn sole_frontier_request_constrains_arguments_with_the_tool_schema() {
+        let definitions = vec![tool_definitions().remove(0)];
+
+        let body = build_request_body(&[Message::user("build")], &definitions, "model").unwrap();
+
+        assert_eq!(
+            body["response_format"]["type"],
+            serde_json::json!("json_schema")
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            serde_json::json!("add_panel_arguments")
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            definitions[0].parameters
+        );
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["seed"], 0);
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn sole_frontier_json_content_is_promoted_to_the_routed_tool() {
+        let definitions = vec![tool_definitions().remove(0)];
+        let sequence = AtomicU64::new(0);
+
+        let response = adapt_single_frontier_response(
+            LlmResponse::Text(r#"{"key":"panel"}"#.to_string()),
+            &definitions,
+            &sequence,
+        );
+
+        assert_eq!(
+            response,
+            LlmResponse::ToolCalls(vec![ToolCall {
+                id: "call-adapted-1".to_string(),
+                name: "add_panel".to_string(),
+                arguments: r#"{"key":"panel"}"#.to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn sole_frontier_empty_or_non_json_content_remains_text() {
+        let definitions = vec![tool_definitions().remove(0)];
+        let sequence = AtomicU64::new(0);
+
+        for content in ["", "I cannot call the tool"] {
+            assert_eq!(
+                adapt_single_frontier_response(
+                    LlmResponse::Text(content.to_string()),
+                    &definitions,
+                    &sequence,
+                ),
+                LlmResponse::Text(content.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_frontier_json_content_is_not_promoted() {
+        let definitions = tool_definitions().into_iter().take(2).collect::<Vec<_>>();
+        let sequence = AtomicU64::new(0);
+        let response = LlmResponse::Text(r#"{"key":"panel"}"#.to_string());
+
+        assert_eq!(
+            adapt_single_frontier_response(response.clone(), &definitions, &sequence),
+            response
+        );
     }
 
     #[test]

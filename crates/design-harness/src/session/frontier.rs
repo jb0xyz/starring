@@ -107,13 +107,15 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
                         Some(LimitKind::ToolCalls),
                     ));
                 }
-                if self.planned_execution_attempts >= 2 {
+                if self.planned_correction_remaining == 0 {
                     return Some(self.halt(
                         "PLAN_REPAIR_FAILED",
                         "The single automatic turn-plan repair failed",
                         None,
                     ));
                 }
+                self.planned_correction_remaining -= 1;
+                self.reset_planned_frontier_corrections();
                 if let Some(brief) = self
                     .adaptive_turn
                     .as_mut()
@@ -121,6 +123,7 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
                 {
                     brief.requirements.clear();
                 }
+                self.add_planned_nudge("set_turn_plan");
                 None
             }
         }
@@ -154,13 +157,16 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
         if !self.rollback_planned_root(error) {
             return None;
         }
-        if self.planned_execution_attempts >= 2 {
+        if self.planned_correction_remaining == 0 {
             return Some(Err(self.halt(
                 "PLAN_REPAIR_FAILED",
                 "The single automatic turn-plan repair failed",
                 None,
             )));
         }
+        self.planned_correction_remaining -= 1;
+        self.reset_planned_frontier_corrections();
+        self.add_planned_nudge("set_turn_plan");
         Some(Ok(false))
     }
 
@@ -175,6 +181,7 @@ impl<C: crate::llm::LlmClient> DesignSession<C> {
             self.observability.plan_conflicts = self.observability.plan_conflicts.saturating_add(1);
         }
         self.draft = root;
+        self.plan_assembly = None;
         self.last_error = Some(error);
         if let Some(state) = self.adaptive_turn.as_mut() {
             if let Some(brief) = state.brief.as_mut() {

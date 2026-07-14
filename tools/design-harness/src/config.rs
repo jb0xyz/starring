@@ -19,6 +19,7 @@ pub struct EdgeConfig {
 pub struct PersistenceConfig {
     pub db_path: PathBuf,
     pub session_id: String,
+    pub planned: bool,
 }
 
 impl PersistenceConfig {
@@ -105,6 +106,12 @@ where
     if session_id.trim().is_empty() {
         return Err(ConfigError::EmptySessionId);
     }
+    let planned = match value("STARRING_HARNESS_PLANNED") {
+        None => false,
+        Some(value) if matches!(value.as_str(), "1" | "true") => true,
+        Some(value) if matches!(value.as_str(), "0" | "false") => false,
+        Some(_) => return Err(ConfigError::InvalidPlannedMode),
+    };
     let db_path = match value("STARRING_HARNESS_DB_PATH") {
         Some(path) if !path.trim().is_empty() => PathBuf::from(path),
         Some(_) => return Err(ConfigError::EmptyDatabasePath),
@@ -122,6 +129,7 @@ where
     Ok(PersistenceConfig {
         db_path,
         session_id,
+        planned,
     })
 }
 
@@ -132,6 +140,7 @@ pub enum ConfigError {
     EmptyModel,
     EmptySessionId,
     InvalidBound { name: &'static str },
+    InvalidPlannedMode,
     MissingApiKey,
     MissingHomeForDefaultDatabasePath,
 }
@@ -148,6 +157,9 @@ impl fmt::Display for ConfigError {
                 formatter.write_str("STARRING_HARNESS_SESSION_ID must not be empty")
             }
             Self::InvalidBound { name } => write!(formatter, "{name} must be a positive integer"),
+            Self::InvalidPlannedMode => {
+                formatter.write_str("STARRING_HARNESS_PLANNED must be 0, 1, false, or true")
+            }
             Self::MissingApiKey => formatter.write_str("STARRING_LLM_API_KEY is required"),
             Self::MissingHomeForDefaultDatabasePath => formatter.write_str(
                 "HOME or STARRING_HARNESS_DB_PATH is required for interactive persistence",
@@ -219,6 +231,7 @@ mod tests {
             persistence_config_from(|name| (name == "HOME").then(|| "/home/tester".to_string()))
                 .unwrap();
         assert_eq!(defaults.session_id, "default");
+        assert!(!defaults.planned);
         assert_eq!(
             defaults.db_path,
             std::path::Path::new("/home/tester/.local/share/starring/design-harness.sqlite3")
@@ -227,11 +240,13 @@ mod tests {
         let values = BTreeMap::from([
             ("STARRING_HARNESS_DB_PATH", "/tmp/harness.db"),
             ("STARRING_HARNESS_SESSION_ID", "study-room"),
+            ("STARRING_HARNESS_PLANNED", "true"),
         ]);
         let custom =
             persistence_config_from(|name| values.get(name).map(ToString::to_string)).unwrap();
         assert_eq!(custom.db_path, std::path::Path::new("/tmp/harness.db"));
         assert_eq!(custom.session_id, "study-room");
+        assert!(custom.planned);
     }
 
     #[test]
@@ -255,5 +270,36 @@ mod tests {
             }),
             Err(ConfigError::EmptyDatabasePath)
         ));
+        assert!(matches!(
+            persistence_config_from(|name| match name {
+                "HOME" => Some("/home/tester".to_string()),
+                "STARRING_HARNESS_PLANNED" => Some("yes".to_string()),
+                _ => None,
+            }),
+            Err(ConfigError::InvalidPlannedMode)
+        ));
+    }
+
+    #[test]
+    fn planned_mode_accepts_only_the_four_exact_boolean_forms() {
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let config = persistence_config_from(|name| match name {
+                "STARRING_HARNESS_DB_PATH" => Some("/tmp/harness.db".to_string()),
+                "STARRING_HARNESS_PLANNED" => Some(value.to_string()),
+                _ => None,
+            })
+            .unwrap();
+            assert_eq!(config.planned, expected);
+        }
+        for value in ["True", "FALSE", " true", "false "] {
+            assert!(matches!(
+                persistence_config_from(|name| match name {
+                    "STARRING_HARNESS_DB_PATH" => Some("/tmp/harness.db".to_string()),
+                    "STARRING_HARNESS_PLANNED" => Some(value.to_string()),
+                    _ => None,
+                }),
+                Err(ConfigError::InvalidPlannedMode)
+            ));
+        }
     }
 }

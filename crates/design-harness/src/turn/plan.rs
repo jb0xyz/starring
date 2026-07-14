@@ -8,9 +8,10 @@ use crate::errors::StructuredError;
 
 use super::protocol::{TurnBrief, TurnIntent};
 use super::scope::{
-    action_matches, overwrite_target_matches, requirement_satisfied, resource_ref_matches,
-    ScopeAction, ScopeButtonRoute, ScopeInstanceRef, ScopeOverwriteTarget,
-    ScopePostPanelButtonRoute, ScopeRequirement, ScopeResourceRef, ScopeRoleRef, ScopeTrigger,
+    action_is_repeatable, action_matches, overwrite_target_matches, requirement_satisfied,
+    resource_ref_matches, scope_actions_equivalent, ScopeAction, ScopeButtonRoute,
+    ScopeInstanceRef, ScopeOverwriteTarget, ScopePostPanelButtonRoute, ScopeRequirement,
+    ScopeResourceRef, ScopeRoleRef, ScopeTrigger,
 };
 
 const MAX_TURN_PLAN_REQUIREMENTS: usize = 32;
@@ -57,7 +58,7 @@ pub(crate) fn normalize_turn_plan(
             "Split the request into smaller human turns or reduce the plan",
         ));
     }
-    validate_ids_and_identities(&requirements)?;
+    validate_ids_and_identities(draft, &requirements)?;
     validate_created_action_keys(draft, &requirements)?;
     validate_dependencies(draft, &requirements)?;
     validate_conflicts(draft, &requirements)?;
@@ -145,9 +146,22 @@ fn normalize_guard(requirements: &mut Vec<ScopeRequirement>) -> Result<(), Struc
     Ok(())
 }
 
-fn validate_ids_and_identities(requirements: &[ScopeRequirement]) -> Result<(), StructuredError> {
+fn validate_ids_and_identities(
+    draft: &Draft,
+    requirements: &[ScopeRequirement],
+) -> Result<(), StructuredError> {
+    enum IdentityState {
+        Unique,
+        Repeat {
+            action: ScopeAction,
+            first_minimum: usize,
+            last_minimum: usize,
+            existing: usize,
+        },
+    }
+
     let mut ids = BTreeSet::new();
-    let mut identities = BTreeSet::new();
+    let mut identities = BTreeMap::<String, IdentityState>::new();
     for requirement in requirements {
         let id = requirement.id();
         if id.trim().is_empty() {
@@ -168,13 +182,74 @@ fn validate_ids_and_identities(requirements: &[ScopeRequirement]) -> Result<(), 
         }
         validate_requirement_shape(requirement)?;
         let identity = requirement_identity(requirement);
-        if !identities.insert(identity.clone()) {
-            return Err(plan_error(
-                "TURN_PLAN_DUPLICATE_IDENTITY",
-                format!("turn.plan.requirements.{id}"),
-                format!("The turn plan repeats operation identity {identity}"),
-                "Keep one requirement for each stable Draft identity",
-            ));
+        let repeat = match requirement {
+            ScopeRequirement::Action {
+                rule_key,
+                action,
+                minimum,
+                ..
+            } if action_is_repeatable(action) => {
+                let existing = draft
+                    .ruleset
+                    .rules
+                    .iter()
+                    .find(|rule| rule.key == *rule_key)
+                    .map_or(0, |rule| {
+                        rule.actions
+                            .iter()
+                            .filter(|candidate| action_matches(candidate, action))
+                            .count()
+                    });
+                Some((action, *minimum, existing))
+            }
+            _ => None,
+        };
+        let duplicate_allowed = identities.get_mut(&identity).is_some_and(|state| {
+            let (
+                IdentityState::Repeat {
+                    action,
+                    first_minimum,
+                    last_minimum,
+                    existing,
+                },
+                Some((candidate, minimum, candidate_existing)),
+            ) = (state, repeat)
+            else {
+                return false;
+            };
+            if !scope_actions_equivalent(action, candidate)
+                || *existing != candidate_existing
+                || *first_minimum != existing.saturating_add(1)
+                || minimum != last_minimum.saturating_add(1)
+            {
+                return false;
+            }
+            *last_minimum = minimum;
+            true
+        });
+        if duplicate_allowed {
+            continue;
+        }
+        let state = repeat.map_or(IdentityState::Unique, |(action, minimum, existing)| {
+            IdentityState::Repeat {
+                action: action.clone(),
+                first_minimum: minimum,
+                last_minimum: minimum,
+                existing,
+            }
+        });
+        match identities.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(plan_error(
+                    "TURN_PLAN_DUPLICATE_IDENTITY",
+                    format!("turn.plan.requirements.{id}"),
+                    format!("The turn plan repeats operation identity {}", entry.key()),
+                    "Use unique stable identities, or increasing occurrence targets for an exact repeatable action",
+                ));
+            }
         }
     }
     Ok(())
@@ -351,6 +426,17 @@ fn validate_dependencies(
             ButtonRoute::InstanceAction { .. } => None,
         })
         .collect::<BTreeSet<_>>();
+    for rule in &draft.ruleset.rules {
+        for action in &rule.actions {
+            if let ActionSpec::PostPanel { buttons, .. } = action {
+                for button in buttons {
+                    if let ButtonRoute::Static { key } = &button.route {
+                        button_components.insert(key.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut resources = draft_resources(draft);
     let registrations = planned_registrations(requirements)?;
 
@@ -407,6 +493,13 @@ fn validate_dependencies(
                     &resources,
                     &registrations,
                 )?;
+                if let ScopeAction::PostPanel { buttons, .. } = action {
+                    for button in buttons {
+                        if let ScopePostPanelButtonRoute::Static { key } = &button.route {
+                            button_components.insert(key.clone());
+                        }
+                    }
+                }
                 record_action_resource(&mut resources, rule_key, action);
             }
             ScopeRequirement::NoUnresolvedReferences { .. } => {}
@@ -504,8 +597,22 @@ fn validate_manifest(
         .chain(&manifest.messages)
         .map(|entry| entry.alias.as_str())
         .collect::<BTreeSet<_>>();
+    let unique_created = manifest
+        .roles
+        .iter()
+        .chain(&manifest.channels)
+        .chain(&manifest.messages)
+        .map(|entry| entry.created.as_str())
+        .collect::<BTreeSet<_>>();
     let total = manifest.roles.len() + manifest.channels.len() + manifest.messages.len();
+    if total == 0 {
+        return Err(dependency_error(
+            requirement,
+            "register_instance requires at least one created role, channel, or message",
+        ));
+    }
     if unique_aliases.len() != total
+        || unique_created.len() != total
         || roles != available.roles
         || channels != available.channels
         || messages != available.messages
@@ -599,6 +706,13 @@ impl ExpectedAction {
             Self::Planned(expected) => action_matches(actual, expected),
         }
     }
+
+    fn matches_scope(&self, expected: &ScopeAction) -> bool {
+        match self {
+            Self::Existing(actual) => action_matches(actual, expected),
+            Self::Planned(actual) => scope_actions_equivalent(actual, expected),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -683,17 +797,12 @@ fn expected_action_orders(
             last_exact_positions.insert(rule_key.clone(), *matching.last().unwrap());
         } else {
             rules_with_missing_actions.insert(rule_key.clone());
-            let exact_count = draft
-                .ruleset
-                .rules
-                .iter()
-                .find(|rule| rule.key == *rule_key)
-                .map_or(0, |rule| {
-                    rule.actions
-                        .iter()
-                        .filter(|candidate| action_matches(candidate, action))
-                        .count()
-                });
+            let exact_count = simulated.get(rule_key).map_or(0, |items| {
+                items
+                    .iter()
+                    .filter(|item| item.expected.matches_scope(action))
+                    .count()
+            });
             let deficit = minimum.saturating_sub(exact_count);
             for occurrence in 0..deficit {
                 let item = OrderedAction {
@@ -1121,10 +1230,11 @@ fn plan_error(
 
 #[cfg(test)]
 mod tests {
-    use automation_state::{InteractionRule, InteractionRuleSet, TriggerSpec};
+    use automation_state::{InstanceRef, InteractionRule, InteractionRuleSet, TriggerSpec};
     use serde_json::json;
 
     use super::*;
+    use crate::turn::scope::ScopePermission;
     use crate::turn::{RequestedOutcome, SimulationProfile, TurnVerification};
 
     fn brief() -> TurnBrief {
@@ -1238,6 +1348,75 @@ mod tests {
                 .code,
             "TURN_PLAN_GUARD_ORDER"
         );
+    }
+
+    #[test]
+    fn dependency_check_accepts_static_buttons_from_existing_post_panels() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[],
+            "modals":[],
+            "rules":[{
+                "key":"producer",
+                "trigger":{"type":"instance_action","action":"publish"},
+                "actions":[{
+                    "type":"post_panel",
+                    "key":"controls",
+                    "channel":"study_hub",
+                    "content":"Controls",
+                    "buttons":[{"label":"Help","route":{"static":{"key":"study_help"}}}]
+                }]
+            }]
+        }))
+        .unwrap();
+        let requirements = vec![requirement(json!({
+            "kind":"rule",
+            "id":"help_rule",
+            "key":"help",
+            "trigger":{"kind":"button_click","component":"study_help"}
+        }))];
+
+        validate_dependencies(&draft, &requirements).unwrap();
+    }
+
+    #[test]
+    fn dependency_check_accepts_static_buttons_from_prior_planned_post_panels() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[],
+            "modals":[],
+            "rules":[{
+                "key":"producer",
+                "trigger":{"type":"instance_action","action":"publish"},
+                "actions":[]
+            }]
+        }))
+        .unwrap();
+        let requirements = vec![
+            requirement(json!({
+                "kind":"action",
+                "id":"controls",
+                "rule_key":"producer",
+                "action":{
+                    "kind":"post_panel",
+                    "key":"controls",
+                    "channel":{"kind":"existing","name":"study_hub"},
+                    "content":"Controls",
+                    "buttons":[{"label":"Help","route":{"kind":"static","key":"study_help"}}]
+                },
+                "minimum":1
+            })),
+            requirement(json!({
+                "kind":"rule",
+                "id":"help_rule",
+                "key":"help",
+                "trigger":{"kind":"button_click","component":"study_help"}
+            })),
+        ];
+
+        validate_dependencies(&draft, &requirements).unwrap();
     }
 
     #[test]
@@ -1366,6 +1545,81 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn plan_rejects_an_empty_instance_manifest() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[],
+            "modals":[],
+            "rules":[{
+                "key":"room",
+                "trigger":{"type":"instance_action","action":"join"},
+                "actions":[]
+            }]
+        }))
+        .unwrap();
+        let requirements = vec![requirement(json!({
+            "kind":"action",
+            "id":"register",
+            "rule_key":"room",
+            "action":{
+                "kind":"register_instance",
+                "key":"room_instance",
+                "instance_kind":"room",
+                "resources":{"roles":[],"channels":[],"messages":[]}
+            },
+            "minimum":1
+        }))];
+
+        let error = normalize_turn_plan(&draft, &brief(), requirements).unwrap_err();
+
+        assert_eq!(error.code, "TURN_PLAN_DEPENDENCY_MISSING");
+        assert_eq!(error.location, "turn.plan.requirements.register");
+        assert!(error.message.contains("at least one created"));
+    }
+
+    #[test]
+    fn plan_rejects_a_created_key_repeated_under_distinct_aliases() {
+        let mut draft = Draft::new();
+        draft.ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[],
+            "modals":[],
+            "rules":[{
+                "key":"room",
+                "trigger":{"type":"instance_action","action":"join"},
+                "actions":[{"type":"create_role","key":"member_role","name":"Members"}]
+            }]
+        }))
+        .unwrap();
+        let requirements = vec![requirement(json!({
+            "kind":"action",
+            "id":"register",
+            "rule_key":"room",
+            "action":{
+                "kind":"register_instance",
+                "key":"room_instance",
+                "instance_kind":"room",
+                "resources":{
+                    "roles":[
+                        {"alias":"member","created":"member_role"},
+                        {"alias":"owner","created":"member_role"}
+                    ],
+                    "channels":[],
+                    "messages":[]
+                }
+            },
+            "minimum":1
+        }))];
+
+        let error = normalize_turn_plan(&draft, &brief(), requirements).unwrap_err();
+
+        assert_eq!(error.code, "TURN_PLAN_DEPENDENCY_MISSING");
+        assert_eq!(error.location, "turn.plan.requirements.register");
+        assert!(error.message.contains("exactly once"));
     }
 
     #[test]
@@ -1600,6 +1854,122 @@ mod tests {
         let plan = normalize_turn_plan(&draft, &brief(), requirements).unwrap();
 
         assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn reordered_overwrite_permissions_share_one_repeat_identity() {
+        let mut root = Draft::new();
+        root.ruleset = InteractionRuleSet {
+            version: 1,
+            panels: Vec::new(),
+            modals: Vec::new(),
+            rules: vec![InteractionRule {
+                key: "room".to_string(),
+                trigger: TriggerSpec::InstanceAction {
+                    action: "join".to_string(),
+                },
+                actions: Vec::new(),
+            }],
+        };
+        let action = |allow, deny| ScopeAction::UpsertOverwrite {
+            channel: ScopeResourceRef::Existing {
+                name: "room-channel".to_string(),
+            },
+            target: ScopeOverwriteTarget::Everyone,
+            allow,
+            deny,
+        };
+        let requirements = vec![
+            ScopeRequirement::Action {
+                id: "overwrite-first".to_string(),
+                rule_key: "room".to_string(),
+                action: action(
+                    vec![ScopePermission::ViewChannel, ScopePermission::SendMessages],
+                    vec![
+                        ScopePermission::ManageMessages,
+                        ScopePermission::AttachFiles,
+                    ],
+                ),
+                minimum: 1,
+            },
+            ScopeRequirement::Action {
+                id: "overwrite-second".to_string(),
+                rule_key: "room".to_string(),
+                action: action(
+                    vec![ScopePermission::SendMessages, ScopePermission::ViewChannel],
+                    vec![
+                        ScopePermission::AttachFiles,
+                        ScopePermission::ManageMessages,
+                    ],
+                ),
+                minimum: 2,
+            },
+        ];
+
+        let plan = normalize_turn_plan(&root, &brief(), requirements).unwrap();
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].id(), "overwrite-first");
+        assert_eq!(plan[1].id(), "overwrite-second");
+    }
+
+    #[test]
+    fn occurrence_targets_preserve_noncontiguous_repeat_order() {
+        let mut root = Draft::new();
+        root.ruleset = InteractionRuleSet {
+            version: 1,
+            panels: Vec::new(),
+            modals: Vec::new(),
+            rules: vec![InteractionRule {
+                key: "room".to_string(),
+                trigger: TriggerSpec::InstanceAction {
+                    action: "join".to_string(),
+                },
+                actions: Vec::new(),
+            }],
+        };
+        let first = ScopeAction::RespondEphemeral {
+            content: "A".to_string(),
+        };
+        let middle = ScopeAction::TeardownInstance {
+            instance: ScopeInstanceRef::Event,
+        };
+        let requirements = vec![
+            ScopeRequirement::Action {
+                id: "a-first".to_string(),
+                rule_key: "room".to_string(),
+                action: first.clone(),
+                minimum: 1,
+            },
+            ScopeRequirement::Action {
+                id: "middle".to_string(),
+                rule_key: "room".to_string(),
+                action: middle,
+                minimum: 1,
+            },
+            ScopeRequirement::Action {
+                id: "a-second".to_string(),
+                rule_key: "room".to_string(),
+                action: first,
+                minimum: 2,
+            },
+        ];
+        let plan = normalize_turn_plan(&root, &brief(), requirements).unwrap();
+        let mut candidate = root.clone();
+        candidate.ruleset.rules[0].actions = vec![
+            ActionSpec::RespondEphemeral {
+                content: "A".to_string(),
+            },
+            ActionSpec::TeardownInstance {
+                instance: InstanceRef::Event,
+            },
+            ActionSpec::RespondEphemeral {
+                content: "A".to_string(),
+            },
+        ];
+        validate_final_planned_action_order(&root, &candidate, &plan).unwrap();
+        candidate.ruleset.rules[0].actions.swap(1, 2);
+        assert!(validate_final_planned_action_order(&root, &candidate, &plan).is_err());
     }
 
     #[test]

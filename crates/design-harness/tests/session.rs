@@ -14,6 +14,7 @@ use futures::executor::block_on;
 use serde_json::{json, Value};
 
 type SeenToolParameters = Vec<Vec<(String, Value)>>;
+type SeenToolDescriptions = Vec<Vec<(String, String)>>;
 
 #[test]
 fn adaptive_system_prompt_assigns_automatic_gates_to_the_harness() {
@@ -25,11 +26,10 @@ fn adaptive_system_prompt_assigns_automatic_gates_to_the_harness() {
     assert!(DEFAULT_SYSTEM_PROMPT.contains(
         "For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true"
     ));
-    assert!(DEFAULT_SYSTEM_PROMPT.contains(
-        "A modify turn may offer Draft-legal update or remove tools beside set_turn_plan"
-    ));
     assert!(DEFAULT_SYSTEM_PROMPT
-        .contains("After attempting set_turn_plan, repair only through set_turn_plan"));
+        .contains("Classify adding new Draft structure as build and changing or removing existing structure as modify"));
+    assert!(!DEFAULT_SYSTEM_PROMPT.contains("additive_plan"));
+    assert!(!DEFAULT_SYSTEM_PROMPT.contains("fill_turn_plan_packet"));
     assert!(!DEFAULT_SYSTEM_PROMPT.contains("render_preview for a validated preview"));
 }
 
@@ -39,6 +39,7 @@ struct ScriptedClient {
     seen: Arc<Mutex<Vec<Vec<Message>>>>,
     seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
     seen_tool_parameters: Arc<Mutex<SeenToolParameters>>,
+    seen_tool_descriptions: Arc<Mutex<SeenToolDescriptions>>,
 }
 
 impl ScriptedClient {
@@ -48,6 +49,7 @@ impl ScriptedClient {
             seen: Arc::new(Mutex::new(Vec::new())),
             seen_tools: Arc::new(Mutex::new(Vec::new())),
             seen_tool_parameters: Arc::new(Mutex::new(Vec::new())),
+            seen_tool_descriptions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -61,6 +63,10 @@ impl ScriptedClient {
 
     fn seen_tool_parameters(&self) -> Vec<Vec<(String, Value)>> {
         self.seen_tool_parameters.lock().unwrap().clone()
+    }
+
+    fn seen_tool_descriptions(&self) -> Vec<Vec<(String, String)>> {
+        self.seen_tool_descriptions.lock().unwrap().clone()
     }
 }
 
@@ -79,6 +85,12 @@ impl LlmClient for ScriptedClient {
             tools
                 .iter()
                 .map(|tool| (tool.name.clone(), tool.parameters.clone()))
+                .collect(),
+        );
+        self.seen_tool_descriptions.lock().unwrap().push(
+            tools
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.description.clone()))
                 .collect(),
         );
         self.responses
@@ -3198,7 +3210,7 @@ fn planned_session_allows_one_invalid_plan_repair_then_halts() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -3220,6 +3232,130 @@ fn planned_session_allows_one_invalid_plan_repair_then_halts() {
             vec![
                 names(&["set_turn_brief"]),
                 names(&["set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_turn_brief_allows_only_one_classification_repair() {
+    block_on(async {
+        let invalid = || {
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "strategy":"additive",
+                    "objective":"Build a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )])
+        };
+        let client = ScriptedClient::new(vec![invalid(), invalid()]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected brief repair halt")
+        };
+        assert_eq!(report.code, "TURN_BRIEF_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.observability().model_calls, 2);
+        assert_eq!(session.observability().nudge_count, 1);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![names(&["set_turn_brief"]), names(&["set_turn_brief"])]
+        );
+    });
+}
+
+#[test]
+fn brief_repair_does_not_consume_the_plan_correction() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "invalid-brief",
+                "set_turn_brief",
+                json!({
+                    "strategy":"additive",
+                    "objective":"Add a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"modify",
+                    "objective":"Add a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![
+                call(
+                    "edit",
+                    "update_panel",
+                    json!({"key":"existing","content":"Changed"}),
+                ),
+                call(
+                    "plan",
+                    "set_turn_plan",
+                    json!({
+                        "requirements":[{
+                            "kind":"panel",
+                            "id":"new_panel",
+                            "key":"new_panel",
+                            "channel":"study_hub",
+                            "content":"New"
+                        }]
+                    }),
+                ),
+            ]),
+            LlmResponse::ToolCalls(vec![call(
+                "replan",
+                "set_turn_plan",
+                json!({"requirements":[]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "replan-two",
+                "set_turn_plan",
+                json!({"requirements":[]}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Add a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected exhausted plan correction")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.draft().ruleset.panels[0].content, "Old");
+        assert_eq!(session.observability().nudge_count, 2);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_brief"]),
+                names(&["update_panel", "remove_panel", "set_turn_plan"]),
                 names(&["set_turn_plan"])
             ]
         );
@@ -3257,7 +3393,7 @@ fn planned_normalization_conflicts_are_counted_without_execution() {
             )]),
             LlmResponse::ToolCalls(vec![call("plan-two", "set_turn_plan", conflicting_plan)]),
         ]);
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"panel","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3314,7 +3450,7 @@ fn planned_execution_failure_rolls_back_every_candidate_revision() {
             LlmResponse::ToolCalls(vec![call("plan-two", "set_turn_plan", invalid_plan)]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, long_flow_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, long_flow_config());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -3348,7 +3484,7 @@ fn planned_execution_failure_rolls_back_every_candidate_revision() {
 }
 
 #[test]
-fn planned_session_executes_an_exact_additive_plan_then_finishes_ready() {
+fn planned_session_executes_canonical_steps_then_finishes_ready() {
     block_on(async {
         let client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(vec![call(
@@ -3366,13 +3502,34 @@ fn planned_session_executes_an_exact_additive_plan_then_finishes_ready() {
                 "plan",
                 "set_turn_plan",
                 json!({
-                    "requirements":[{
-                        "kind":"panel",
-                        "id":"panel",
+                    "steps":[{
+                        "op":"panel",
+                        "owner":"draft",
+                        "goal":"Create key panel in study_hub with content Panel"
+                    }]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{
                         "key":"panel",
                         "channel":"study_hub",
                         "content":"Panel"
-                    }]
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "verdict":"complete",
+                    "request_clauses":[{
+                        "clause":"Create key panel in study_hub with content Panel",
+                        "id":"plan_01_panel"
+                    }],
+                    "issues":[]
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -3382,7 +3539,7 @@ fn planned_session_executes_an_exact_additive_plan_then_finishes_ready() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -3402,6 +3559,2211 @@ fn planned_session_executes_an_exact_additive_plan_then_finishes_ready() {
             vec![
                 names(&["set_turn_brief"]),
                 names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_packet_failure_discards_every_pre_execution_item_before_repair_halt() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build five panels",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"panel","owner":"draft","goal":"panel one"},
+                    {"op":"panel","owner":"draft","goal":"panel two"},
+                    {"op":"panel","owner":"draft","goal":"panel three"},
+                    {"op":"panel","owner":"draft","goal":"panel four"},
+                    {"op":"panel","owner":"draft","goal":"panel five"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-one",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{"key":"p1","channel":"hub","content":"1"},
+                    "plan_02_panel":{"key":"p2","channel":"hub","content":"2"},
+                    "plan_03_panel":{"key":"p3","channel":"hub","content":"3"},
+                    "plan_04_panel":{"key":"p4","channel":"hub","content":"4"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call("packet-two", "fill_turn_plan_packet", json!({}))]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-two-retry",
+                "fill_turn_plan_packet",
+                json!({}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build five panels").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected failed packet repair")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert!(session.draft().ruleset.panels.is_empty());
+        assert_eq!(session.observability().plan_acceptances, 0);
+        assert_eq!(session.observability().plan_commits, 0);
+        let seen = probe.seen();
+        assert!(seen[3].iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.starts_with("TURN_PLAN_PACKET_CONTINUE:")
+        }));
+        let anchor = seen[3]
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::System && message.content.starts_with("DRAFT_STATE:")
+            })
+            .unwrap();
+        let memory: Value =
+            serde_json::from_str(anchor.content.strip_prefix("DRAFT_STATE:").unwrap()).unwrap();
+        assert_eq!(memory["current_human_intent"], "Build five panels");
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_multi_item_schema_failure_refines_before_spending_the_single_item_correction() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build one panel and modal",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"panel","owner":"draft","goal":"panel p1 in study_hub with content one"},
+                    {"op":"modal","owner":"draft","goal":"modal m1 titled Room with room_name field"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "multi-invalid",
+                "fill_turn_plan_packet",
+                json!({}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "single-invalid",
+                "fill_turn_plan_packet",
+                json!({}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "panel-one",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{"key":"p1","channel":"study_hub","content":"1"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "modal",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_02_modal":{
+                        "key":"m1",
+                        "title":"Room",
+                        "fields":[{
+                            "key":"room_name",
+                            "label":"Room name",
+                            "style":"short",
+                            "required":true
+                        }]
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_panel","plan_02_modal"],
+                    "checked_references":["plan_01_panel:/channel"],
+                    "issue_kind":"none",
+                    "issue_id":"none",
+                    "issue_path":"none",
+                    "expected_json":"{}",
+                    "detail":"complete"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Panels ready."}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session
+            .run_burst("Build panel p1 in study_hub and modal m1 with a required room name field")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 2);
+        assert_eq!(session.draft().ruleset.panels.len(), 1);
+        assert_eq!(session.draft().ruleset.modals.len(), 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().nudge_count, 2);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+        let descriptions = probe.seen_tool_descriptions();
+        assert!(descriptions[2][0].1.contains("plan_01_panel"));
+        assert!(descriptions[2][0].1.contains("plan_02_modal"));
+        assert!(descriptions[3][0].1.contains("plan_01_panel"));
+        assert!(!descriptions[3][0].1.contains("plan_02_modal"));
+        assert!(descriptions[5][0].1.contains("plan_02_modal"));
+    });
+}
+
+#[test]
+fn planned_missing_stable_reference_replans_the_whole_candidate_atomically() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Add a welcome button and response rule",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-missing-button",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"welcome_rule triggered by welcome"},
+                    {"op":"respond_ephemeral","owner":"welcome_rule","goal":"respond Welcome"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-missing-button",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{
+                        "key":"welcome_rule",
+                        "trigger_kind":"button_click",
+                        "trigger_ref":"welcome"
+                    },
+                    "plan_02_respond_ephemeral":{"content":"Welcome"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-complete",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"button","owner":"welcome_panel","goal":"Welcome button routed to welcome"},
+                    {"op":"rule","owner":"draft","goal":"welcome_rule triggered by welcome"},
+                    {"op":"respond_ephemeral","owner":"welcome_rule","goal":"respond Welcome"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-button",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_button":{
+                        "label":"Welcome",
+                        "route_kind":"static",
+                        "route_value":"welcome"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-rule",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_02_rule":{
+                        "key":"welcome_rule",
+                        "trigger_kind":"button_click",
+                        "trigger_ref":"welcome"
+                    },
+                    "plan_03_respond_ephemeral":{"content":"Welcome"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"add welcome button","id":"plan_01_button"},
+                        {"clause":"add welcome rule","id":"plan_02_rule"},
+                        {"clause":"respond Welcome","id":"plan_03_respond_ephemeral"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Welcome automation ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"welcome_panel",
+                "channel":"study_hub",
+                "content":"Welcome",
+                "buttons":[]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session
+            .run_burst("Add a Welcome button that responds Welcome privately")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 3);
+        assert_eq!(session.draft().ruleset.panels[0].buttons.len(), 1);
+        assert_eq!(session.draft().ruleset.rules.len(), 1);
+        assert_eq!(session.draft().ruleset.rules[0].actions.len(), 1);
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert_eq!(session.observability().nudge_count, 1);
+        let missing_reference = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("packet-missing-button"))
+            .unwrap();
+        assert!(missing_reference
+            .content
+            .contains("TURN_PLAN_REFERENCE_MISSING"));
+        assert!(missing_reference
+            .content
+            .contains("tool.fill_turn_plan_packet.arguments.plan_01_rule.trigger_ref"));
+        assert!(missing_reference
+            .content
+            .contains("Replace the whole turn plan"));
+        let seen = probe.seen();
+        let retry_state = seen[3]
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::System && message.content.starts_with("DRAFT_STATE:")
+            })
+            .unwrap();
+        let retry_state: Value =
+            serde_json::from_str(retry_state.content.strip_prefix("DRAFT_STATE:").unwrap())
+                .unwrap();
+        assert_eq!(retry_state["revision"], 0);
+        assert_eq!(retry_state["panels"][0]["buttons"], json!([]));
+        assert_eq!(retry_state["rules"], json!([]));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_packet_field_typo_stays_on_the_packet_correction_frontier() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build one panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"panel",
+                    "owner":"draft",
+                    "goal":"panel p1 in study_hub with Welcome content"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-typo",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{
+                        "key":"p1",
+                        "channel":"study_hub",
+                        "conten":"Welcome"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-corrected",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{
+                        "key":"p1",
+                        "channel":"study_hub",
+                        "content":"Welcome"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[{"clause":"build panel","id":"plan_01_panel"}],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Panel ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session
+            .run_burst("Build a Welcome panel in study_hub")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.panels.len(), 1);
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().nudge_count, 1);
+        let typo = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("packet-typo"))
+            .unwrap();
+        assert!(!typo.content.contains("TURN_PLAN_REFERENCE_MISSING"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_prior_modal_template_typo_stays_on_the_isolated_packet_frontier() {
+    block_on(async {
+        let initial_steps = json!({"steps":[
+            {"op":"modal","owner":"draft","goal":"room_modal with room_name field"},
+            {"op":"rule","owner":"draft","goal":"submit_room handles room_modal"},
+            {"op":"create_channel","owner":"submit_room","goal":"create room_channel named from room_name"}
+        ]});
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Create a channel from a modal room name",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call("plan", "set_turn_plan", initial_steps)]),
+            LlmResponse::ToolCalls(vec![call(
+                "modal",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{
+                    "key":"room_modal",
+                    "title":"Room",
+                    "fields":[{
+                        "key":"room_name",
+                        "label":"Room name",
+                        "style":"short",
+                        "required":true
+                    }]
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "combined-typo",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_02_rule":{
+                        "key":"submit_room",
+                        "trigger_kind":"modal_submit",
+                        "trigger_ref":"room_modal"
+                    },
+                    "plan_03_create_channel":{
+                        "key":"room_channel",
+                        "name":"study-${input.room_nam}"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "rule",
+                "fill_turn_plan_packet",
+                json!({"plan_02_rule":{
+                    "key":"submit_room",
+                    "trigger_kind":"modal_submit",
+                    "trigger_ref":"room_modal"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "isolated-typo",
+                "fill_turn_plan_packet",
+                json!({"plan_03_create_channel":{
+                    "key":"room_channel",
+                    "name":"study-${input.room_nam}"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "isolated-corrected",
+                "fill_turn_plan_packet",
+                json!({"plan_03_create_channel":{
+                    "key":"room_channel",
+                    "name":"study-${input.room_name}"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"add room modal","id":"plan_01_modal"},
+                        {"clause":"add submit rule","id":"plan_02_rule"},
+                        {"clause":"create named channel","id":"plan_03_create_channel"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Room creation ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session
+            .run_burst("Create a channel from the submitted modal room name")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 3);
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().nudge_count, 2);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_repeated_prior_modal_template_dependency_replans_atomically() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Create a channel from a modal room name",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "incomplete-plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"modal","owner":"draft","goal":"room_modal without the required room_name field"},
+                    {"op":"rule","owner":"draft","goal":"submit_room handles room_modal"},
+                    {"op":"create_channel","owner":"submit_room","goal":"create room_channel named from room_name"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "incomplete-modal",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{
+                    "key":"room_modal",
+                    "title":"Room",
+                    "fields":[{
+                        "key":"room_title",
+                        "label":"Room title",
+                        "style":"short",
+                        "required":true
+                    }]
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "combined-missing",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_02_rule":{
+                        "key":"submit_room",
+                        "trigger_kind":"modal_submit",
+                        "trigger_ref":"room_modal"
+                    },
+                    "plan_03_create_channel":{
+                        "key":"room_channel",
+                        "name":"study-${input.room_name}"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "incomplete-rule",
+                "fill_turn_plan_packet",
+                json!({"plan_02_rule":{
+                    "key":"submit_room",
+                    "trigger_kind":"modal_submit",
+                    "trigger_ref":"room_modal"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "isolated-missing-first",
+                "fill_turn_plan_packet",
+                json!({"plan_03_create_channel":{
+                    "key":"room_channel",
+                    "name":"study-${input.room_name}"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "isolated-missing-repeated",
+                "fill_turn_plan_packet",
+                json!({"plan_03_create_channel":{
+                    "key":"room_channel",
+                    "name":"study-${input.room_name}"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "complete-plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"modal","owner":"draft","goal":"room_modal with room_name field"},
+                    {"op":"rule","owner":"draft","goal":"submit_room handles room_modal"},
+                    {"op":"create_channel","owner":"submit_room","goal":"create room_channel named from room_name"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "complete-modal",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{
+                    "key":"room_modal",
+                    "title":"Room",
+                    "fields":[{
+                        "key":"room_name",
+                        "label":"Room name",
+                        "style":"short",
+                        "required":true
+                    }]
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "complete-rule-action",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_02_rule":{
+                        "key":"submit_room",
+                        "trigger_kind":"modal_submit",
+                        "trigger_ref":"room_modal"
+                    },
+                    "plan_03_create_channel":{
+                        "key":"room_channel",
+                        "name":"study-${input.room_name}"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"add room modal","id":"plan_01_modal"},
+                        {"clause":"add submit rule","id":"plan_02_rule"},
+                        {"clause":"create named channel","id":"plan_03_create_channel"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Room creation ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session
+            .run_burst("Create a channel from the submitted modal room name")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 3);
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert_eq!(session.observability().nudge_count, 3);
+        let repeated = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("isolated-missing-repeated"))
+            .unwrap();
+        assert!(repeated.content.contains("UNKNOWN_TEMPLATE_INPUT"));
+        assert!(repeated.content.contains("replace the whole turn plan"));
+        let seen = probe.seen();
+        let replan_state = seen[7]
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::System && message.content.starts_with("DRAFT_STATE:")
+            })
+            .unwrap();
+        let replan_state: Value =
+            serde_json::from_str(replan_state.content.strip_prefix("DRAFT_STATE:").unwrap())
+                .unwrap();
+        assert_eq!(replan_state["revision"], 0);
+        assert_eq!(replan_state["modals"], json!([]));
+        assert_eq!(replan_state["rules"], json!([]));
+        assert_eq!(probe.seen_tools()[7], names(&["set_turn_plan"]));
+    });
+}
+
+#[test]
+fn planned_aggregate_failure_in_an_earlier_packet_replans_the_whole_outline() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build five panels",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"panel","goal":"panel one"},
+                    {"op":"panel","goal":"panel two"},
+                    {"op":"panel","goal":"panel three"},
+                    {"op":"panel","goal":"panel four"},
+                    {"op":"panel","goal":"panel five"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-one",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{"key":"duplicate","channel":"hub","content":"1"},
+                    "plan_02_panel":{"key":"duplicate","channel":"hub","content":"2"},
+                    "plan_03_panel":{"key":"p3","channel":"hub","content":"3"},
+                    "plan_04_panel":{"key":"p4","channel":"hub","content":"4"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-two",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_05_panel":{"key":"p5","channel":"hub","content":"5"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "replan",
+                "set_turn_plan",
+                json!({"requirements":[]}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build five panels").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected aggregate replan halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert!(session.draft().ruleset.panels.is_empty());
+        let packet_result = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("packet-two"))
+            .unwrap();
+        assert!(packet_result
+            .content
+            .contains("TURN_PLAN_DUPLICATE_IDENTITY"));
+        assert_eq!(session.observability().nudge_count, 2);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["set_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_incomplete_typed_review_extends_the_retained_candidate_once() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build five modals",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"modal","goal":"one"},
+                    {"op":"modal","goal":"two"},
+                    {"op":"modal","goal":"three"},
+                    {"op":"modal","goal":"four"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_modal":{"key":"m1","title":"1","fields":[]},
+                    "plan_02_modal":{"key":"m2","title":"2","fields":[]},
+                    "plan_03_modal":{"key":"m3","title":"3","fields":[]},
+                    "plan_04_modal":{"key":"m4","title":"4","fields":[]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-incomplete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"modal one","id":"plan_01_modal"},
+                        {"clause":"modal two","id":"plan_02_modal"},
+                        {"clause":"modal three","id":"plan_03_modal"},
+                        {"clause":"modal four","id":"plan_04_modal"}
+                    ],
+                    "issues":[{"kind":"missing","detail":"modal five is missing"}]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"modal five"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_05_modal":{"key":"m5","title":"5","fields":[]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"modal one","id":"plan_01_modal"},
+                        {"clause":"modal two","id":"plan_02_modal"},
+                        {"clause":"modal three","id":"plan_03_modal"},
+                        {"clause":"modal four","id":"plan_04_modal"},
+                        {"clause":"modal five","id":"plan_05_modal"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Five modals ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build five modals").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.modals.len(), 5);
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        let seen = probe.seen();
+        assert!(seen[4].iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.starts_with("TURN_PLAN_FRONTIER_RETRY:")
+        }));
+        assert!(seen[4].iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("accepted typed candidate is retained")
+                && message
+                    .content
+                    .contains("only the concrete missing operations")
+                && message
+                    .content
+                    .contains("Do not repeat accepted operations")
+        }));
+        assert!(seen[3][0]
+            .content
+            .starts_with("Act only as an independent typed-candidate reviewer"));
+        assert!(seen[3][0]
+            .content
+            .contains("enumerate each atomic new mutation"));
+        assert!(seen[3][0]
+            .content
+            .contains("covered_ids proves candidate-side inventory coverage only"));
+        assert!(!seen[3].iter().any(
+            |message| message.role == MessageRole::Assistant && !message.tool_calls.is_empty()
+        ));
+        assert!(seen[3].iter().any(|message| {
+            message.role == MessageRole::User && message.content == "Build five modals"
+        }));
+        let review_result = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("review-incomplete"))
+            .unwrap();
+        assert!(review_result
+            .content
+            .contains("TURN_PLAN_REVIEW_COVERAGE_INCOMPLETE"));
+        assert_eq!(session.observability().nudge_count, 1);
+        let extension_description = &probe.seen_tool_descriptions()[4][0].1;
+        assert!(extension_description.contains("plan_01_modal"));
+        assert!(extension_description.contains("plan_04_modal"));
+        assert!(extension_description.contains("modal five is missing"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_coverage_extension_merges_a_regular_action_before_register_and_edit() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build an instance rule with role and channel resources",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"instance create rule"},
+                    {"op":"defer_ephemeral","owner":"submit_room","goal":"defer interaction"},
+                    {"op":"create_role","owner":"submit_room","goal":"create member role"},
+                    {"op":"register_instance","owner":"submit_room","goal":"register room instance"},
+                    {"op":"edit_response","owner":"submit_room","goal":"finish response"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-rule",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"submit_room","trigger_kind":"button_click","trigger_ref":"create"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-defer",
+                "fill_turn_plan_packet",
+                json!({"plan_02_defer_ephemeral":{"confirm":true}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-role",
+                "fill_turn_plan_packet",
+                json!({"plan_03_create_role":{"key":"room_member","name":"Room Member"}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-register",
+                "fill_turn_plan_packet",
+                json!({"plan_04_register_instance":{"key":"room","instance_kind":"study_room"}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-edit",
+                "fill_turn_plan_packet",
+                json!({"plan_05_edit_response":{"content":"Room ready"}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-incomplete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"instance create rule","id":"plan_01_rule"},
+                        {"clause":"defer interaction","id":"plan_02_defer_ephemeral"},
+                        {"clause":"create member role","id":"plan_03_create_role"},
+                        {"clause":"register room instance","id":"plan_04_register_instance"},
+                        {"clause":"finish response","id":"plan_05_edit_response"}
+                    ],
+                    "issues":[{"kind":"missing","detail":"created room channel is missing"}]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"create_channel",
+                    "owner":"submit_room",
+                    "goal":"create room channel"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({"plan_06_create_channel":{"key":"room_channel","name":"study-room"}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"instance create rule","id":"plan_01_rule"},
+                        {"clause":"defer interaction","id":"plan_02_defer_ephemeral"},
+                        {"clause":"create member role","id":"plan_03_create_role"},
+                        {"clause":"create room channel","id":"plan_06_create_channel"},
+                        {"clause":"register room instance","id":"plan_04_register_instance"},
+                        {"clause":"finish response","id":"plan_05_edit_response"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Instance rule ready"}),
+            )]),
+        ]);
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"instance_surface",
+                "channel":"study_hub",
+                "content":"Create",
+                "buttons":[{"label":"Create","route":{"static":{"key":"create"}}}]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session
+            .run_burst("Build an instance rule with role and channel resources")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        let actions = &session.draft().ruleset.rules[0].actions;
+        assert!(matches!(actions[0], ActionSpec::DeferEphemeral));
+        assert!(matches!(actions[1], ActionSpec::CreateRole { .. }));
+        assert!(matches!(actions[2], ActionSpec::CreateChannel { .. }));
+        assert!(matches!(actions[3], ActionSpec::RegisterInstance { .. }));
+        assert!(matches!(actions[4], ActionSpec::EditResponse { .. }));
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+    });
+}
+
+#[test]
+fn planned_missing_instance_registration_uses_one_structural_coverage_extension() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build a room rule and instance panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"create submit_room from create button"},
+                    {"op":"create_channel","owner":"submit_room","goal":"create room_channel named study-room"},
+                    {"op":"post_panel","owner":"submit_room","goal":"post welcome in room_channel with Join instance action"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"submit_room","trigger_kind":"button_click","trigger_ref":"create"},
+                    "plan_02_create_channel":{"key":"room_channel","name":"study-room"},
+                    "plan_03_post_panel":{"key":"welcome_panel","channel_kind":"created","channel_name":"room_channel","content":"Welcome","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"register_instance",
+                    "owner":"submit_room",
+                    "goal":"register key room_instance kind study_room"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_04_register_instance":{"key":"room_instance","instance_kind":"study_room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"create submit rule","id":"plan_01_rule"},
+                        {"clause":"create room channel","id":"plan_02_create_channel"},
+                        {"clause":"post instance panel","id":"plan_03_post_panel"},
+                        {"clause":"register instance","id":"plan_04_register_instance"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Room instance ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"surface",
+                "channel":"study_hub",
+                "content":"Create",
+                "buttons":[{"label":"Create","route":{"static":{"key":"create"}}}]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session
+            .run_burst("Build a room rule and instance panel")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 4);
+        let actions = &session.draft().ruleset.rules[0].actions;
+        assert!(matches!(actions[0], ActionSpec::CreateChannel { .. }));
+        assert!(matches!(actions[1], ActionSpec::PostPanel { .. }));
+        assert!(matches!(actions[2], ActionSpec::RegisterInstance { .. }));
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert_eq!(session.observability().nudge_count, 1);
+        assert!(probe.seen()[3].iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("missing register_instance in each of these rules: submit_room")
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_review_extension_can_open_one_independent_structural_extension() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build a deferred room rule with an instance panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"create submit_room from create button"},
+                    {"op":"defer_ephemeral","owner":"submit_room","goal":"defer the interaction"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"submit_room","trigger_kind":"button_click","trigger_ref":"create"},
+                    "plan_02_defer_ephemeral":{"confirm":true}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-missing",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"create submit rule","id":"plan_01_rule"},
+                        {"clause":"defer interaction","id":"plan_02_defer_ephemeral"}
+                    ],
+                    "issues":[{"kind":"missing","detail":"the Join instance panel is missing"}]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-extension",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"post_panel",
+                    "owner":"submit_room",
+                    "goal":"post welcome with a Join instance action"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_03_post_panel":{"key":"welcome_panel","channel_kind":"existing","channel_name":"study_hub","content":"Welcome","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "structural-extension",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"register_instance",
+                    "owner":"submit_room",
+                    "goal":"register key room_instance kind study_room"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "structural-extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_04_register_instance":{"key":"room_instance","instance_kind":"study_room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-mismatch",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"create submit rule","id":"plan_01_rule"},
+                        {"clause":"defer interaction","id":"plan_02_defer_ephemeral"},
+                        {"clause":"post instance panel","id":"plan_03_post_panel"},
+                        {"clause":"register instance","id":"plan_04_register_instance"}
+                    ],
+                    "issues":[{"kind":"mismatch","detail":"panel content differs"}]
+                }),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"surface",
+                "channel":"study_hub",
+                "content":"Create",
+                "buttons":[{"label":"Create","route":{"static":{"key":"create"}}}]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session
+            .run_burst("Build a deferred room rule with a Join instance panel")
+            .await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected bounded semantic correction halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert!(session.draft().ruleset.rules.is_empty());
+        assert_eq!(session.observability().plan_submissions, 3);
+        assert_eq!(session.observability().plan_acceptances, 0);
+        assert_eq!(session.observability().plan_commits, 0);
+        assert_eq!(session.observability().nudge_count, 2);
+        assert!(probe.seen()[6].iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("missing register_instance in each of these rules: submit_room")
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_structural_extension_preserves_the_semantic_replan_budget() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build a room rule with the correct instance panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-wrong",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"create submit_room from create button"},
+                    {"op":"post_panel","owner":"submit_room","goal":"post the correct instance panel"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-wrong",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"submit_room","trigger_kind":"button_click","trigger_ref":"create"},
+                    "plan_02_post_panel":{"key":"welcome_panel","channel_kind":"existing","channel_name":"study_hub","content":"Wrong","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"register_instance",
+                    "owner":"submit_room",
+                    "goal":"register key room_instance kind study_room"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_03_register_instance":{"key":"room_instance","instance_kind":"study_room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-mismatch",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":[
+                        "plan_01_rule",
+                        "plan_02_post_panel",
+                        "plan_03_register_instance"
+                    ],
+                    "checked_references":[],
+                    "reference_verdict":"match",
+                    "issue_kind":"mismatch",
+                    "issue_id":"plan_02_post_panel",
+                    "issue_path":"/action/content",
+                    "expected_json":"\"Correct\"",
+                    "detail":"panel content must be Correct"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-correct",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"create submit_room from create button"},
+                    {"op":"post_panel","owner":"submit_room","goal":"post the Correct instance panel"},
+                    {"op":"register_instance","owner":"submit_room","goal":"register key room_instance kind study_room"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-correct",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"submit_room","trigger_kind":"button_click","trigger_ref":"create"},
+                    "plan_02_post_panel":{"key":"welcome_panel","channel_kind":"existing","channel_name":"study_hub","content":"Correct","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]},
+                    "plan_03_register_instance":{"key":"room_instance","instance_kind":"study_room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"create submit rule","id":"plan_01_rule"},
+                        {"clause":"post Correct instance panel","id":"plan_02_post_panel"},
+                        {"clause":"register instance","id":"plan_03_register_instance"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Correct instance panel ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"surface",
+                "channel":"study_hub",
+                "content":"Create",
+                "buttons":[{"label":"Create","route":{"static":{"key":"create"}}}]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session
+            .run_burst("Build a room rule with a Correct instance panel")
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        let actions = &session.draft().ruleset.rules[0].actions;
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            ActionSpec::PostPanel { content, .. } if content == "Correct"
+        ));
+        assert!(matches!(actions[1], ActionSpec::RegisterInstance { .. }));
+        assert_eq!(session.observability().plan_submissions, 3);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert!(probe.seen()[3].iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("missing register_instance in each of these rules: submit_room")
+        }));
+        assert!(probe.seen()[6].iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.starts_with("TURN_PLAN_FRONTIER_RETRY:")
+                && !message
+                    .content
+                    .contains("accepted typed candidate is retained")
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_structural_extension_covers_every_missing_instance_owner_once() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build two instance panel rules",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"rule","owner":"draft","goal":"create alpha_rule from create_alpha"},
+                    {"op":"post_panel","owner":"alpha_rule","goal":"post alpha panel with Join instance action"},
+                    {"op":"rule","owner":"draft","goal":"create beta_rule from create_beta"},
+                    {"op":"post_panel","owner":"beta_rule","goal":"post beta panel with Join instance action"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "alpha-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{"key":"alpha_rule","trigger_kind":"button_click","trigger_ref":"create_alpha"},
+                    "plan_02_post_panel":{"key":"alpha_panel","channel_kind":"existing","channel_name":"study_hub","content":"Alpha","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "beta-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_03_rule":{"key":"beta_rule","trigger_kind":"button_click","trigger_ref":"create_beta"},
+                    "plan_04_post_panel":{"key":"beta_panel","channel_kind":"existing","channel_name":"study_hub","content":"Beta","buttons":[{"label":"Join","route_kind":"instance_action","route_value":"join"}]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"register_instance","owner":"alpha_rule","goal":"register alpha_instance kind room"},
+                    {"op":"register_instance","owner":"beta_rule","goal":"register beta_instance kind room"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_05_register_instance":{"key":"alpha_instance","instance_kind":"room"},
+                    "plan_06_register_instance":{"key":"beta_instance","instance_kind":"room"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"create alpha rule","id":"plan_01_rule"},
+                        {"clause":"post alpha panel","id":"plan_02_post_panel"},
+                        {"clause":"create beta rule","id":"plan_03_rule"},
+                        {"clause":"post beta panel","id":"plan_04_post_panel"},
+                        {"clause":"register alpha instance","id":"plan_05_register_instance"},
+                        {"clause":"register beta instance","id":"plan_06_register_instance"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Both instance rules are ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+        session.draft_mut().ruleset = serde_json::from_value(json!({
+            "version":1,
+            "panels":[{
+                "key":"surface",
+                "channel":"study_hub",
+                "content":"Create",
+                "buttons":[
+                    {"label":"Create alpha","route":{"static":{"key":"create_alpha"}}},
+                    {"label":"Create beta","route":{"static":{"key":"create_beta"}}}
+                ]
+            }],
+            "modals":[],
+            "rules":[]
+        }))
+        .unwrap();
+
+        let outcome = session.run_burst("Build two instance panel rules").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 6);
+        assert_eq!(session.draft().ruleset.rules.len(), 2);
+        for rule in &session.draft().ruleset.rules {
+            assert_eq!(rule.actions.len(), 2);
+            assert!(matches!(rule.actions[0], ActionSpec::PostPanel { .. }));
+            assert!(matches!(
+                rule.actions[1],
+                ActionSpec::RegisterInstance { .. }
+            ));
+        }
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert_eq!(session.observability().nudge_count, 1);
+        assert!(probe.seen()[4].iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("required register_instance owners: [alpha_rule, beta_rule]")
+        }));
+    });
+}
+
+#[test]
+fn planned_second_incomplete_review_halts_without_mutating_the_canonical_draft() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build three modals",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"modal one"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{"key":"m1","title":"1","fields":[]}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-one",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[{"clause":"modal one","id":"plan_01_modal"}],
+                    "issues":[{"kind":"missing","detail":"modal two is missing"}]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"modal two"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "extension-packet",
+                "fill_turn_plan_packet",
+                json!({"plan_02_modal":{"key":"m2","title":"2","fields":[]}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-two",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[
+                        {"clause":"modal one","id":"plan_01_modal"},
+                        {"clause":"modal two","id":"plan_02_modal"}
+                    ],
+                    "issues":[{"kind":"missing","detail":"modal three is missing"}]
+                }),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build three modals").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected coverage extension halt")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(session.draft().draft_revision, 0);
+        assert!(session.draft().ruleset.modals.is_empty());
+        assert_eq!(session.observability().plan_acceptances, 0);
+        assert_eq!(session.observability().plan_commits, 0);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        assert_eq!(session.observability().nudge_count, 1);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_mismatch_review_replaces_the_candidate_instead_of_extending_it() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build the correct modal",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-wrong",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"correct modal"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-wrong",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{"key":"room","title":"Wrong","fields":[]}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-mismatch",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_modal"],
+                    "checked_references":[],
+                    "reference_verdict":"match",
+                    "issue_kind":"mismatch",
+                    "issue_id":"plan_01_modal",
+                    "issue_path":"/title",
+                    "expected_json":"\"Correct\"",
+                    "detail":"title must be Correct"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan-correct",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"modal title Correct"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-correct",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{"key":"room","title":"Correct","fields":[]}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "request_clauses":[{"clause":"correct modal","id":"plan_01_modal"}],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Correct modal ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build a modal titled Correct").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.modals.len(), 1);
+        assert_eq!(session.draft().ruleset.modals[0].title, "Correct");
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        let mismatch = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("review-mismatch"))
+            .unwrap();
+        assert!(mismatch
+            .content
+            .contains("TURN_PLAN_REVIEW_CANDIDATE_MISMATCH"));
+        assert!(probe.seen()[4].iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.starts_with("TURN_PLAN_FRONTIER_RETRY:")
+                && !message
+                    .content
+                    .contains("accepted typed candidate is retained")
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_contradicted_mismatch_retries_review_without_replanning() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build the correct modal",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[{"op":"modal","owner":"draft","goal":"modal title Correct"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({"plan_01_modal":{"key":"room","title":"Correct","fields":[]}}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-contradicted",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_modal"],
+                    "checked_references":[],
+                    "reference_verdict":"match",
+                    "issue_kind":"mismatch",
+                    "issue_id":"plan_01_modal",
+                    "issue_path":"/title",
+                    "expected_json":"\"Correct\"",
+                    "detail":"title must be Correct"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review-complete",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_modal"],
+                    "checked_references":[],
+                    "reference_verdict":"match",
+                    "issue_kind":"none",
+                    "issue_id":"none",
+                    "issue_path":"none",
+                    "expected_json":"{}",
+                    "detail":"complete"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Correct modal ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build a modal titled Correct").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().ruleset.modals.len(), 1);
+        assert_eq!(session.draft().ruleset.modals[0].title, "Correct");
+        assert_eq!(session.observability().plan_submissions, 1);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        let contradicted = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("review-contradicted"))
+            .unwrap();
+        assert!(contradicted
+            .content
+            .contains("TURN_PLAN_REVIEW_EVIDENCE_INVALID"));
+        let seen = probe.seen();
+        let retry_context = &seen[4];
+        let retry = retry_context
+            .iter()
+            .find(|message| {
+                message.role == MessageRole::User
+                    && message.content.starts_with("TURN_PLAN_REVIEW_RETRY:")
+            })
+            .unwrap();
+        assert!(retry.content.contains("Last review error capsule"));
+        assert!(retry
+            .content
+            .contains("\"code\":\"TURN_PLAN_REVIEW_EVIDENCE_INVALID\""));
+        assert!(retry.content.contains("\"location\":"));
+        assert!(retry.content.contains("\"message\":"));
+        assert!(retry.content.contains("\"hint\":"));
+        assert!(retry.content.contains("plan_01_modal"));
+        assert!(retry.content.contains("/title"));
+        assert!(retry.content.contains("submitted_expected_json"));
+        assert!(retry.content.contains("candidate_actual_json"));
+        assert!(retry.content.contains("Correct"));
+        assert!(!retry_context.iter().any(|message| {
+            message.role == MessageRole::Tool
+                || message.role == MessageRole::Assistant && !message.tool_calls.is_empty()
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_review_uses_prior_agreement_and_only_review_specific_retry() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brainstorm-brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"brainstorm",
+                    "objective":"Choose the panel content",
+                    "requested_outcome":"discussion",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "brainstorm-finish",
+                "finish_turn",
+                json!({
+                    "kind":"needs_input",
+                    "message":"Use a study panel in study_hub.",
+                    "question":"Should its content be Create a room?"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "build-brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build the agreed panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"panel",
+                    "goal":"Create key study_panel in study_hub with content Create a room"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{
+                        "key":"study_panel",
+                        "channel":"study_hub",
+                        "content":"Create a room"
+                    }
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "bad-review",
+                "review_turn_plan",
+                json!({
+                    "verdict":"complete",
+                    "request_clauses":[{"clause":"agreed study panel","id":"wrong"}],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "good-review",
+                "review_turn_plan",
+                json!({
+                    "verdict":"complete",
+                    "request_clauses":[{
+                        "clause":"agreed study panel in study_hub with Create a room content",
+                        "id":"plan_01_panel"
+                    }],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Agreed panel ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let first = session
+            .run_burst("study_hub에 방 생성 패널을 설계하고 싶어")
+            .await;
+        assert!(matches!(first, BurstOutcome::NeedsInput { .. }));
+        let second = session.run_burst("좋아, 그 설계대로 만들어줘").await;
+
+        assert!(matches!(second, BurstOutcome::Ready { .. }), "{second:?}");
+        assert_eq!(session.draft().draft_revision, 1);
+        let seen = probe.seen();
+        for review_call in [&seen[5], &seen[6]] {
+            assert!(review_call.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message.content == "study_hub에 방 생성 패널을 설계하고 싶어"
+            }));
+            assert!(review_call.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.contains("Use a study panel in study_hub")
+                    && message
+                        .content
+                        .contains("Should its content be Create a room?")
+            }));
+            assert!(review_call.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "좋아, 그 설계대로 만들어줘"
+            }));
+            assert!(!review_call.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message.content.starts_with("TURN_PLAN_FRONTIER_RETRY:")
+            }));
+        }
+        assert!(seen[6].iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.starts_with("TURN_PLAN_REVIEW_RETRY:")
+                && message.content.contains("covered_ids")
+                && message.content.contains("issue_kind")
+                && message.content.contains("expected_json")
+        }));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["finish_turn"]),
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn planned_packet_wrong_frontier_uses_one_correction_and_resumes_same_cursor() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build five modals",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {"op":"modal","goal":"modal one"},
+                    {"op":"modal","goal":"modal two"},
+                    {"op":"modal","goal":"modal three"},
+                    {"op":"modal","goal":"modal four"},
+                    {"op":"modal","goal":"modal five"}
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-one",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_modal":{"key":"m1","title":"1","fields":[]},
+                    "plan_02_modal":{"key":"m2","title":"2","fields":[]},
+                    "plan_03_modal":{"key":"m3","title":"3","fields":[]},
+                    "plan_04_modal":{"key":"m4","title":"4","fields":[]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "wrong-finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Done"}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet-two",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_05_modal":{"key":"m5","title":"5","fields":[]}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "verdict":"complete",
+                    "request_clauses":[
+                        {"clause":"modal one","requirement_id":"plan_01_modal"},
+                        {"clause":"modal two","requirement_id":"plan_02_modal"},
+                        {"clause":"modal three","requirement_id":"plan_03_modal"},
+                        {"clause":"modal four","requirement_id":"plan_04_modal"},
+                        {"clause":"modal five","requirement_id":"plan_05_modal"}
+                    ],
+                    "issues":[]
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Five modals ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build five modals").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 5);
+        assert_eq!(session.draft().ruleset.modals.len(), 5);
+        assert_eq!(session.observability().nudge_count, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        let seen = probe.seen();
+        let retry = seen[4]
+            .iter()
+            .find(|message| {
+                message.role == MessageRole::User
+                    && message.content.starts_with("TURN_PLAN_FRONTIER_RETRY:")
+            })
+            .unwrap();
+        assert!(!retry.content.contains("Last review error capsule"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
                 names(&["finish_turn"])
             ]
         );
@@ -3443,7 +5805,7 @@ fn planned_modify_misclassification_can_submit_an_additive_plan() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Add a temporary panel").await;
 
@@ -3491,7 +5853,7 @@ fn planned_true_modify_routes_only_legal_edits_then_scope() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"panel","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3543,7 +5905,7 @@ fn planned_modify_failed_plan_locks_the_repair_route_to_plan() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3560,7 +5922,7 @@ fn planned_modify_failed_plan_locks_the_repair_route_to_plan() {
         assert_eq!(report.code, "PLAN_REPAIR_FAILED");
         assert_eq!(
             report.last_error.unwrap().code,
-            "TOOL_NOT_AVAILABLE_FOR_DRAFT_STATE"
+            "TURN_PLAN_RESPONSE_REJECTED"
         );
         assert_eq!(session.draft().ruleset.panels[0].content, "Old");
         assert_eq!(session.draft().draft_revision, 0);
@@ -3617,7 +5979,7 @@ fn planned_modify_mixed_edit_and_plan_batch_dispatches_neither_path() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3702,7 +6064,7 @@ fn planned_modify_mixed_plan_and_edit_batch_dispatches_neither_path() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3781,7 +6143,7 @@ fn planned_modify_plan_selection_rejects_every_extra_call() {
                 LlmResponse::Text("I cannot repair the plan".to_string()),
             ]);
             let probe = client.clone();
-            let mut session = DesignSession::with_planned_config(client, large_config());
+            let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
             let outcome = session.run_burst("Add a panel").await;
 
@@ -3836,12 +6198,21 @@ fn planned_modify_requested_validation_failure_rolls_back_and_locks_to_plan() {
                 "plan",
                 "set_turn_plan",
                 json!({
-                    "requirements":[{
-                        "kind":"rule",
-                        "id":"empty_rule",
-                        "key":"empty_rule",
-                        "trigger":{"kind":"instance_action","action":"empty"}
-                    }]
+                    "requirements":[
+                        {
+                            "kind":"rule",
+                            "id":"invalid_rule",
+                            "key":"invalid_rule",
+                            "trigger":{"kind":"instance_action","action":"run"}
+                        },
+                        {
+                            "kind":"action",
+                            "id":"invalid_response",
+                            "rule_key":"invalid_rule",
+                            "action":{"kind":"respond_ephemeral","content":"Running"},
+                            "minimum":1
+                        }
+                    ]
                 }),
             )]),
             LlmResponse::ToolCalls(vec![call(
@@ -3851,7 +6222,7 @@ fn planned_modify_requested_validation_failure_rolls_back_and_locks_to_plan() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, long_flow_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, long_flow_config());
         session.draft_mut().ruleset = serde_json::from_value(json!({
             "version":1,
             "panels":[{"key":"existing","channel":"study_hub","content":"Old","buttons":[]}],
@@ -3880,6 +6251,7 @@ fn planned_modify_requested_validation_failure_rolls_back_and_locks_to_plan() {
             vec![
                 names(&["set_turn_brief"]),
                 names(&["update_panel", "remove_panel", "set_turn_plan"]),
+                names(&["set_turn_plan"]),
                 names(&["set_turn_plan"])
             ]
         );
@@ -3890,12 +6262,21 @@ fn planned_modify_requested_validation_failure_rolls_back_and_locks_to_plan() {
 fn planned_validation_failure_rolls_back_and_routes_one_exact_replan() {
     block_on(async {
         let invalid_plan = json!({
-            "requirements":[{
-                "kind":"rule",
-                "id":"empty_rule",
-                "key":"empty_rule",
-                "trigger":{"kind":"instance_action","action":"empty"}
-            }]
+            "requirements":[
+                {
+                    "kind":"rule",
+                    "id":"invalid_rule",
+                    "key":"invalid_rule",
+                    "trigger":{"kind":"instance_action","action":"run"}
+                },
+                {
+                    "kind":"action",
+                    "id":"invalid_response",
+                    "rule_key":"invalid_rule",
+                    "action":{"kind":"respond_ephemeral","content":"Running"},
+                    "minimum":1
+                }
+            ]
         });
         let client = ScriptedClient::new(vec![
             LlmResponse::ToolCalls(vec![call(
@@ -3919,7 +6300,7 @@ fn planned_validation_failure_rolls_back_and_routes_one_exact_replan() {
         let probe = client.clone();
         let mut config = long_flow_config();
         config.max_gate_failures = 1;
-        let mut session = DesignSession::with_planned_config(client, config);
+        let mut session = DesignSession::with_planned_oracle_config(client, config);
 
         let outcome = session.run_burst("Build and validate a rule").await;
 
@@ -3932,8 +6313,8 @@ fn planned_validation_failure_rolls_back_and_routes_one_exact_replan() {
         assert_eq!(session.observability().validation_failures, 2);
         assert_eq!(session.observability().plan_submissions, 2);
         assert_eq!(session.observability().plan_acceptances, 2);
-        assert_eq!(session.observability().planned_requirements, 4);
-        assert_eq!(session.observability().plan_compiled_tool_calls, 2);
+        assert_eq!(session.observability().planned_requirements, 6);
+        assert_eq!(session.observability().plan_compiled_tool_calls, 4);
         assert_eq!(session.observability().plan_execution_failures, 2);
         assert_eq!(session.observability().plan_rollbacks, 2);
         assert_eq!(session.observability().plan_commits, 0);
@@ -3982,16 +6363,25 @@ fn planned_gate_budget_halt_rolls_back_the_committed_candidate() {
                 "plan",
                 "set_turn_plan",
                 json!({
-                    "requirements":[{
-                        "kind":"rule",
-                        "id":"rule",
-                        "key":"rule",
-                        "trigger":{"kind":"instance_action","action":"run"}
-                    }]
+                    "requirements":[
+                        {
+                            "kind":"rule",
+                            "id":"rule",
+                            "key":"rule",
+                            "trigger":{"kind":"instance_action","action":"run"}
+                        },
+                        {
+                            "kind":"action",
+                            "id":"response",
+                            "rule_key":"rule",
+                            "action":{"kind":"respond_ephemeral","content":"Running"},
+                            "minimum":1
+                        }
+                    ]
                 }),
             )]),
         ]);
-        let mut session = DesignSession::with_planned_config(
+        let mut session = DesignSession::with_planned_oracle_config(
             client,
             SessionConfig {
                 max_model_calls: 8,
@@ -4033,6 +6423,454 @@ fn planned_mode_is_caller_selected_without_changing_snapshot_schema() {
     assert!(DesignSession::restore_planned((), config, snapshot)
         .unwrap()
         .planned_enabled());
+}
+
+#[test]
+fn production_plan_rejects_hidden_legacy_requirements() {
+    block_on(async {
+        let legacy = json!({
+            "requirements":[{
+                "kind":"panel",
+                "id":"panel",
+                "key":"panel",
+                "channel":"hub",
+                "content":"Panel"
+            }]
+        });
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build a panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call("legacy-one", "set_turn_plan", legacy.clone())]),
+            LlmResponse::ToolCalls(vec![call("legacy-two", "set_turn_plan", legacy)]),
+        ]);
+        let mut session = DesignSession::with_planned_config(client, large_config());
+
+        let outcome = session.run_burst("Build a panel").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected legacy plan rejection")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        assert_eq!(
+            report.last_error.unwrap().code,
+            "TURN_PLAN_LEGACY_FORBIDDEN"
+        );
+        assert_eq!(session.draft().draft_revision, 0);
+        assert_eq!(session.observability().plan_acceptances, 0);
+    });
+}
+
+#[test]
+fn oracle_complete_plan_rejects_an_actionless_new_rule_without_committing() {
+    block_on(async {
+        let actionless = json!({
+            "requirements":[{
+                "kind":"rule",
+                "id":"empty_rule",
+                "key":"empty_rule",
+                "trigger":{"kind":"instance_action","action":"empty"}
+            }]
+        });
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build an empty rule",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "actionless-one",
+                "set_turn_plan",
+                actionless.clone(),
+            )]),
+            LlmResponse::ToolCalls(vec![call("actionless-two", "set_turn_plan", actionless)]),
+        ]);
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
+
+        let outcome = session.run_burst("Build an empty rule").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected actionless oracle plan rejection")
+        };
+        assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+        let last_error = report.last_error.unwrap();
+        assert_eq!(last_error.code, "TURN_PLAN_NEW_RULE_ACTION_REQUIRED");
+        assert_eq!(
+            last_error.location,
+            "turn.plan.requirements.empty_rule.actions"
+        );
+        assert_eq!(session.draft().draft_revision, 0);
+        assert!(session.draft().ruleset.rules.is_empty());
+        assert_eq!(session.observability().plan_submissions, 2);
+        assert_eq!(session.observability().plan_acceptances, 0);
+        assert_eq!(session.observability().plan_compiled_tool_calls, 0);
+        assert_eq!(session.observability().plan_commits, 0);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+    });
+}
+
+#[test]
+fn production_review_rejects_hidden_legacy_shapes_without_committing() {
+    block_on(async {
+        let legacy_reviews = [
+            json!({
+                "verdict":"complete",
+                "request_clauses":[{"clause":"one panel","id":"plan_01_panel"}],
+                "issues":[]
+            }),
+            json!({
+                "covered_ids":["plan_01_panel"],
+                "checked_references":["plan_01_panel:/channel"],
+                "mismatches":[]
+            }),
+        ];
+        for legacy_review in legacy_reviews {
+            let client = ScriptedClient::new(vec![
+                LlmResponse::ToolCalls(vec![call(
+                    "brief",
+                    "set_turn_brief",
+                    json!({
+                        "intent":"build",
+                        "objective":"Build one panel",
+                        "requested_outcome":"draft_update",
+                        "assumptions":[],
+                        "validate":false
+                    }),
+                )]),
+                LlmResponse::ToolCalls(vec![call(
+                    "plan",
+                    "set_turn_plan",
+                    json!({"steps":[{"op":"panel","owner":"draft","goal":"one panel"}]}),
+                )]),
+                LlmResponse::ToolCalls(vec![call(
+                    "packet",
+                    "fill_turn_plan_packet",
+                    json!({
+                        "plan_01_panel":{
+                            "key":"panel",
+                            "channel":"study_hub",
+                            "content":"Panel"
+                        }
+                    }),
+                )]),
+                LlmResponse::ToolCalls(vec![call(
+                    "legacy-review-one",
+                    "review_turn_plan",
+                    legacy_review.clone(),
+                )]),
+                LlmResponse::ToolCalls(vec![call(
+                    "legacy-review-two",
+                    "review_turn_plan",
+                    legacy_review,
+                )]),
+            ]);
+            let mut session = DesignSession::with_planned_config(client, large_config());
+
+            let outcome = session.run_burst("Build one panel").await;
+
+            let BurstOutcome::Halted(report) = outcome else {
+                panic!("expected legacy review rejection")
+            };
+            assert_eq!(report.code, "PLAN_REPAIR_FAILED");
+            assert_eq!(
+                report.last_error.unwrap().code,
+                "TURN_PLAN_REVIEW_LEGACY_FORBIDDEN"
+            );
+            assert_eq!(session.draft().draft_revision, 0);
+            assert!(session.draft().ruleset.panels.is_empty());
+            assert_eq!(session.observability().plan_acceptances, 0);
+            assert_eq!(session.observability().plan_commits, 0);
+            assert_eq!(session.observability().plan_rollbacks, 0);
+        }
+    });
+}
+
+#[test]
+fn production_typed_plan_replans_a_reviewed_new_rule_without_actions() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Add the join room rule",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "open-rule-plan",
+                "set_turn_plan",
+                json!({"steps":[{
+                    "op":"rule",
+                    "owner":"draft",
+                    "goal":"Create join_room for the join instance action"
+                }]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "open-rule-packet",
+                "fill_turn_plan_packet",
+                json!({"plan_01_rule":{
+                    "key":"join_room",
+                    "trigger_kind":"instance_action",
+                    "trigger_ref":"join"
+                }}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "open-rule-review",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_rule"],
+                    "reference_verdict":"match",
+                    "issue_kind":"none",
+                    "issue_id":"none",
+                    "issue_path":"none",
+                    "expected_json":"{}",
+                    "detail":"Complete"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "replacement-plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {
+                        "op":"rule",
+                        "owner":"draft",
+                        "goal":"Create join_room for the join instance action"
+                    },
+                    {
+                        "op":"respond_ephemeral",
+                        "owner":"join_room",
+                        "goal":"Confirm that the actor joined"
+                    }
+                ]}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut config = large_config();
+        config.max_model_calls = 5;
+        let mut session = DesignSession::with_planned_config(client, config);
+        session.draft_mut().draft_revision = 4;
+
+        let outcome = session.run_burst("Add the join room rule").await;
+
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected the bounded replan run to halt")
+        };
+        assert_eq!(report.code, "MODEL_CALL_LIMIT_EXHAUSTED");
+        assert_eq!(session.draft().draft_revision, 4);
+        assert!(session.draft().ruleset.rules.is_empty());
+        assert_eq!(session.observability().plan_acceptances, 0);
+        assert_eq!(session.observability().plan_commits, 0);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+        let rejected = session
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("open-rule-review"))
+            .unwrap();
+        assert!(
+            rejected
+                .content
+                .contains("TURN_PLAN_NEW_RULE_ACTION_REQUIRED"),
+            "{}",
+            rejected.content
+        );
+        assert!(rejected
+            .content
+            .contains("turn.plan.requirements.plan_01_rule.actions"));
+        assert!(rejected.content.contains("owned by rule join_room"));
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["set_turn_plan"])
+            ]
+        );
+    });
+}
+
+#[test]
+fn production_typed_plan_commits_a_new_rule_with_an_action() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Add a complete join room rule",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "plan",
+                "set_turn_plan",
+                json!({"steps":[
+                    {
+                        "op":"rule",
+                        "owner":"draft",
+                        "goal":"Create join_room for the join instance action"
+                    },
+                    {
+                        "op":"respond_ephemeral",
+                        "owner":"join_room",
+                        "goal":"Confirm that the actor joined"
+                    }
+                ]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_rule":{
+                        "key":"join_room",
+                        "trigger_kind":"instance_action",
+                        "trigger_ref":"join"
+                    },
+                    "plan_02_respond_ephemeral":{"content":"Joined"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_rule","plan_02_respond_ephemeral"],
+                    "reference_verdict":"match",
+                    "issue_kind":"none",
+                    "issue_id":"none",
+                    "issue_path":"none",
+                    "expected_json":"{}",
+                    "detail":"Complete"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Join rule ready"}),
+            )]),
+        ]);
+        let mut session = DesignSession::with_planned_config(client, large_config());
+
+        let outcome = session.run_burst("Add a complete join room rule").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 2);
+        assert_eq!(session.draft().ruleset.rules.len(), 1);
+        assert_eq!(session.draft().ruleset.rules[0].key, "join_room");
+        assert!(matches!(
+            session.draft().ruleset.rules[0].actions.as_slice(),
+            [ActionSpec::RespondEphemeral { content }] if content == "Joined"
+        ));
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(session.observability().plan_rollbacks, 0);
+    });
+}
+
+#[test]
+fn outline_and_packet_each_receive_one_independent_format_correction() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![
+            LlmResponse::ToolCalls(vec![call(
+                "brief",
+                "set_turn_brief",
+                json!({
+                    "intent":"build",
+                    "objective":"Build one panel",
+                    "requested_outcome":"draft_update",
+                    "assumptions":[],
+                    "validate":false
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "bad-outline",
+                "set_turn_plan",
+                json!({"steps":[{"op":"panel","owner":"wrong","goal":"panel"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "outline",
+                "set_turn_plan",
+                json!({"steps":[{"op":"panel","owner":"draft","goal":"panel"}]}),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "bad-packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{"key":"panel","channel":"study_hub","content":"Panel"},
+                    "plan_02_panel":{"key":"extra","channel":"study_hub","content":"Extra"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "packet",
+                "fill_turn_plan_packet",
+                json!({
+                    "plan_01_panel":{"key":"panel","channel":"study_hub","content":"Panel"}
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "review",
+                "review_turn_plan",
+                json!({
+                    "covered_ids":["plan_01_panel"],
+                    "reference_verdict":"match",
+                    "issue_kind":"none",
+                    "issue_id":"none",
+                    "issue_path":"none",
+                    "expected_json":"{}",
+                    "detail":"Complete"
+                }),
+            )]),
+            LlmResponse::ToolCalls(vec![call(
+                "finish",
+                "finish_turn",
+                json!({"kind":"ready","message":"Panel ready"}),
+            )]),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_planned_config(client, large_config());
+
+        let outcome = session.run_burst("Build one panel").await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }), "{outcome:?}");
+        assert_eq!(session.draft().draft_revision, 1);
+        assert_eq!(session.draft().ruleset.panels[0].key, "panel");
+        assert_eq!(session.observability().nudge_count, 2);
+        assert_eq!(session.observability().plan_acceptances, 1);
+        assert_eq!(session.observability().plan_commits, 1);
+        assert_eq!(
+            probe.seen_tools(),
+            vec![
+                names(&["set_turn_brief"]),
+                names(&["set_turn_plan"]),
+                names(&["set_turn_plan"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["fill_turn_plan_packet"]),
+                names(&["review_turn_plan"]),
+                names(&["finish_turn"])
+            ]
+        );
+    });
 }
 
 #[test]
@@ -4090,7 +6928,7 @@ fn planned_prose_and_wrong_tool_share_the_single_response_repair_budget() {
             )]),
         ]);
         let probe = client.clone();
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -4100,7 +6938,7 @@ fn planned_prose_and_wrong_tool_share_the_single_response_repair_budget() {
         assert_eq!(report.code, "PLAN_REPAIR_FAILED");
         assert_eq!(
             report.last_error.unwrap().code,
-            "TOOL_NOT_AVAILABLE_FOR_DRAFT_STATE"
+            "TURN_PLAN_RESPONSE_REJECTED"
         );
         assert_eq!(session.draft().draft_revision, 0);
         assert_eq!(session.observability().plan_submissions, 0);
@@ -4134,7 +6972,7 @@ fn planned_empty_tool_batches_halt_on_the_second_response() {
             LlmResponse::ToolCalls(Vec::new()),
             LlmResponse::ToolCalls(Vec::new()),
         ]);
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -4183,7 +7021,7 @@ fn planned_invalid_tool_call_identifiers_use_the_plan_repair_budget() {
             malformed.clone(),
             malformed,
         ]);
-        let mut session = DesignSession::with_planned_config(client, large_config());
+        let mut session = DesignSession::with_planned_oracle_config(client, large_config());
 
         let outcome = session.run_burst("Build a panel").await;
 

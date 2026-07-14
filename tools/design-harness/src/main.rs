@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use design_harness::{
     parse_turn_brief, BurstOutcome, DesignSession, Draft, DraftSummary, HaltReport, LimitKind,
-    LlmClient, LlmError, LlmResponse, Message, Observability, StructuredError, ToolCall,
-    ToolDefinition, TurnIntent,
+    LlmClient, LlmError, LlmResponse, Message, Observability, SessionConfig, SessionSnapshot,
+    SessionSnapshotError, StructuredError, ToolCall, ToolDefinition, TurnIntent,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,6 +21,20 @@ use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::client::GemmaClient;
 use crate::config::{EdgeConfig, PersistenceConfig};
 use crate::store::SessionStore;
+
+fn create_interactive_session<C>(
+    client: C,
+    config: SessionConfig,
+    snapshot: Option<SessionSnapshot>,
+    planned: bool,
+) -> Result<DesignSession<C>, SessionSnapshotError> {
+    match (snapshot, planned) {
+        (Some(snapshot), true) => DesignSession::restore_planned(client, config, snapshot),
+        (Some(snapshot), false) => DesignSession::restore(client, config, snapshot),
+        (None, true) => Ok(DesignSession::with_planned_config(client, config)),
+        (None, false) => Ok(DesignSession::with_adaptive_config(client, config)),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -31,10 +45,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let persistence = PersistenceConfig::from_env()?;
     let mut store = SessionStore::open(&persistence.db_path)?;
-    let mut session = match store.load(&persistence.session_id)? {
-        Some(snapshot) => DesignSession::restore(client, config.session_config, snapshot)?,
-        None => DesignSession::with_adaptive_config(client, config.session_config),
-    };
+    let snapshot = store.load(&persistence.session_id)?;
+    let mut session =
+        create_interactive_session(client, config.session_config, snapshot, persistence.planned)?;
     let mut lines = BufReader::new(io::stdin()).lines();
     let mut output = io::stdout();
 
@@ -85,8 +98,12 @@ async fn run_eval(
         inner: client,
         oracle: Arc::clone(&oracle),
     };
+    let legacy_plan_enabled = scenario.turns.iter().any(|turn| turn.oracle_plan.is_some());
     let mut session = match scenario.mode {
         EvalMode::Adaptive => DesignSession::with_adaptive_config(client, config),
+        EvalMode::TypedPlan if legacy_plan_enabled => {
+            DesignSession::with_planned_oracle_config(client, config)
+        }
         EvalMode::TypedPlan => DesignSession::with_planned_config(client, config),
     };
     if let Some(draft) = scenario.initial_draft {
@@ -577,8 +594,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        clear_oracle_controls, delegated_model_calls, injected_control_calls, parse_eval_input,
-        prepare_oracle_controls, EvalClient, EvalMode, OracleState,
+        clear_oracle_controls, create_interactive_session, delegated_model_calls,
+        injected_control_calls, parse_eval_input, prepare_oracle_controls, EvalClient, EvalMode,
+        OracleState,
     };
 
     struct StubClient;
@@ -600,6 +618,26 @@ mod tests {
         ) -> Result<LlmResponse, LlmError> {
             Ok(LlmResponse::Text("delegated".to_string()))
         }
+    }
+
+    #[test]
+    fn interactive_session_selection_covers_fresh_and_restored_modes() {
+        let config = SessionConfig::default();
+        let adaptive_fresh =
+            create_interactive_session(StubClient, config.clone(), None, false).unwrap();
+        let planned_fresh =
+            create_interactive_session(StubClient, config.clone(), None, true).unwrap();
+        assert!(!adaptive_fresh.planned_enabled());
+        assert!(planned_fresh.planned_enabled());
+
+        let snapshot = adaptive_fresh.snapshot();
+        let adaptive_restored =
+            create_interactive_session(StubClient, config.clone(), Some(snapshot.clone()), false)
+                .unwrap();
+        let planned_restored =
+            create_interactive_session(StubClient, config, Some(snapshot), true).unwrap();
+        assert!(!adaptive_restored.planned_enabled());
+        assert!(planned_restored.planned_enabled());
     }
 
     impl LlmClient for QueueClient {
@@ -853,7 +891,8 @@ mod tests {
             },
             oracle: Arc::clone(&oracle),
         };
-        let mut session = DesignSession::with_planned_config(client, SessionConfig::default());
+        let mut session =
+            DesignSession::with_planned_oracle_config(client, SessionConfig::default());
         *session.draft_mut() = draft;
         let outcome = session.run_burst(input).await;
         assert!(matches!(outcome, BurstOutcome::Progressed { .. }));
@@ -1081,7 +1120,7 @@ mod tests {
             inner: StubClient,
             oracle: Arc::clone(&oracle),
         };
-        let mut session = DesignSession::with_planned_config(
+        let mut session = DesignSession::with_planned_oracle_config(
             client,
             SessionConfig {
                 max_model_calls: 0,
@@ -1114,7 +1153,8 @@ mod tests {
             },
             oracle: Arc::clone(&oracle),
         };
-        let mut session = DesignSession::with_planned_config(client, SessionConfig::default());
+        let mut session =
+            DesignSession::with_planned_oracle_config(client, SessionConfig::default());
 
         let outcome = session.run_burst("Build a panel").await;
 
@@ -1191,7 +1231,7 @@ mod tests {
             },
             oracle: Arc::clone(&oracle),
         };
-        let mut session = DesignSession::with_planned_config(
+        let mut session = DesignSession::with_planned_oracle_config(
             client,
             SessionConfig {
                 context_char_budget: 200_000,
@@ -1253,7 +1293,7 @@ mod tests {
             },
             oracle: Arc::clone(&oracle),
         };
-        let mut session = DesignSession::with_planned_config(
+        let mut session = DesignSession::with_planned_oracle_config(
             client,
             SessionConfig {
                 context_char_budget: 200_000,
