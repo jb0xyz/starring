@@ -200,6 +200,16 @@ fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
         parsed.runtime_requirements().persistence,
         PersistenceRequirementV2::RestartPersistent
     );
+
+    value = valid_core();
+    value["runtime_requirements"] = json!(["persistent_economy"]);
+    value["other_unmapped_hard_requirements"] =
+        json!(["persistent_economy", "external settlement lease"]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["external settlement lease"]
+    );
 }
 
 #[test]

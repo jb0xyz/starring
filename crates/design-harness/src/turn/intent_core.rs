@@ -263,12 +263,21 @@ fn normalize_core(
             "Use each closed runtime requirement at most once",
         ));
     }
+    input.runtime_requirements = input
+        .runtime_requirements
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     input.other_unmapped_hard_requirements = normalize_requirements(
         input.other_unmapped_hard_requirements,
         MAX_UNCLASSIFIED_REQUIREMENTS,
         MAX_UNCLASSIFIED_REQUIREMENT_CHARS,
         "intent.core.other_unmapped_hard_requirements",
     )?;
+    input
+        .other_unmapped_hard_requirements
+        .retain(|value| !runtime_requirement_is_redundant(value, &input.runtime_requirements));
     if input.explicit_boundary_requests.len() > 3 {
         return Err(core_error(
             "TOO_MANY_INTENT_BOUNDARY_REQUESTS",
@@ -410,6 +419,24 @@ fn normalize_runtime_requirements(values: Vec<RuntimeRequirementV3>) -> RuntimeR
             EconomyRequirementV2::None
         },
         event_time_llm: values.contains(&RuntimeRequirementV3::EventTimeLlm),
+    }
+}
+
+fn runtime_requirement_is_redundant(
+    value: &str,
+    runtime_requirements: &[RuntimeRequirementV3],
+) -> bool {
+    runtime_requirements
+        .iter()
+        .any(|requirement| runtime_requirement_name(*requirement) == value)
+}
+
+fn runtime_requirement_name(value: RuntimeRequirementV3) -> &'static str {
+    match value {
+        RuntimeRequirementV3::RestartPersistent => "restart_persistent",
+        RuntimeRequirementV3::DurableTimer => "durable_timer",
+        RuntimeRequirementV3::PersistentEconomy => "persistent_economy",
+        RuntimeRequirementV3::EventTimeLlm => "event_time_llm",
     }
 }
 
