@@ -294,6 +294,60 @@ test('detail-path assertions require two calls and preserve exact RuleSet string
   );
 });
 
+test('detail-path assertion pins custom copy and untouched naming and control defaults', () => {
+  const custom = JSON.parse(report());
+  custom.ruleset = {
+    version: 1,
+    panels: [{ buttons: [{ label: 'Begin deep work' }] }],
+    modals: [],
+    rules: [
+      {},
+      {
+        actions: [
+          {},
+          { name: '${input.room_name} members' },
+          { name: 'study-${input.room_name}' },
+          {},
+          {},
+          {},
+          { buttons: [{ label: 'Help' }] },
+          { buttons: [{ label: 'Join' }] },
+        ],
+      },
+      { actions: [{ content: 'This is a private study room' }] },
+      { actions: [{}, {}, { content: 'Joined the study room' }] },
+    ],
+  };
+  const expected = context({
+    expectedRulesetPathValues: JSON.stringify({
+      '/panels/0/buttons/0/label': 'Begin deep work',
+      '/rules/1/actions/1/name': '${input.room_name} members',
+      '/rules/1/actions/2/name': 'study-${input.room_name}',
+      '/rules/1/actions/6/buttons/0/label': 'Help',
+      '/rules/1/actions/7/buttons/0/label': 'Join',
+      '/rules/2/actions/0/content': 'This is a private study room',
+      '/rules/3/actions/2/content': 'Joined the study room',
+    }),
+    expectedRulesetAbsentPaths: JSON.stringify([
+      '/rules/1/actions/6/buttons/1',
+      '/rules/4',
+    ]),
+  });
+  assert.equal(checks.intentRulesetPathValues(JSON.stringify(custom), expected).pass, true);
+
+  custom.ruleset.rules[1].actions[2].name = 'focus-${input.room_name}';
+  assert.match(
+    checks.intentRulesetPathValues(JSON.stringify(custom), expected).reason,
+    /path=\/rules\/1\/actions\/2\/name/,
+  );
+  custom.ruleset.rules[1].actions[2].name = 'study-${input.room_name}';
+  custom.ruleset.rules[1].actions[6].buttons.push({ label: 'Close' });
+  assert.match(
+    checks.intentRulesetPathValues(JSON.stringify(custom), expected).reason,
+    /unexpected RuleSet path=\/rules\/1\/actions\/6\/buttons\/1/,
+  );
+});
+
 test('structural assertions ignore key order and reject contract drift', () => {
   const reordered = JSON.parse(report());
   reordered.session_config = {

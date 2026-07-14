@@ -719,3 +719,56 @@
       value: file://intent-assertions.js:intentRulesetStringValues
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe extracts only custom StudyRoom copy and preserves naming and controls
+  vars:
+    caseId: intent_private_study_room_custom_copy_only
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "custom-copy-only",
+            "input": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults for every name and room control, with exactly one copy override: set the launcher create-button label to 'Begin deep work'. Leave room closing disabled and do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedModelCallsPerTurn: "2"
+    expectedToolCallsPerTurn: "2"
+    expectedRulesetPathValues: '{"/panels/0/buttons/0/label":"Begin deep work","/rules/1/actions/1/name":"${input.room_name} members","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/buttons/0/label":"Help","/rules/1/actions/7/buttons/0/label":"Join","/rules/2/actions/0/content":"This is a private study room","/rules/3/actions/2/content":"Joined the study room"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency

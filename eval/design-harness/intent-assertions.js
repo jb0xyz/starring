@@ -664,6 +664,77 @@ function intentRulesetStringValues(output, context) {
   });
 }
 
+function parseExpectedJson(expected, field, kind) {
+  if (!Object.hasOwn(expected, field)) {
+    return null;
+  }
+  let value;
+  try {
+    value = typeof expected[field] === 'string'
+      ? JSON.parse(expected[field])
+      : expected[field];
+  } catch {
+    throw new Error(`${field} is not valid JSON`);
+  }
+  if (kind === 'object' && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(`${field} is not a JSON object`);
+  }
+  if (kind === 'string-array'
+    && (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string'))) {
+    throw new Error(`${field} is not a JSON string array`);
+  }
+  return value;
+}
+
+function resolveJsonPointer(root, pointer) {
+  if (pointer === '') {
+    return { found: true, value: root };
+  }
+  if (typeof pointer !== 'string' || !pointer.startsWith('/')) {
+    throw new Error(`invalid RuleSet JSON Pointer=${pointer}`);
+  }
+  let current = root;
+  for (const encoded of pointer.slice(1).split('/')) {
+    const token = encoded.replace(/~1/g, '/').replace(/~0/g, '~');
+    if (Array.isArray(current)) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(token) || Number(token) >= current.length) {
+        return { found: false, value: undefined };
+      }
+      current = current[Number(token)];
+    } else if (current !== null && typeof current === 'object' && Object.hasOwn(current, token)) {
+      current = current[token];
+    } else {
+      return { found: false, value: undefined };
+    }
+  }
+  return { found: true, value: current };
+}
+
+function intentRulesetPathValues(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const values = parseExpectedJson(expected, 'expectedRulesetPathValues', 'object') || {};
+    const absent = parseExpectedJson(expected, 'expectedRulesetAbsentPaths', 'string-array') || [];
+    const failures = [];
+    for (const [pointer, value] of Object.entries(values)) {
+      const actual = resolveJsonPointer(report.ruleset, pointer);
+      if (!actual.found) {
+        failures.push(`missing RuleSet path=${pointer}`);
+      } else if (!sameJson(actual.value, value)) {
+        failures.push(`RuleSet path=${pointer} value=${JSON.stringify(actual.value)} expected=${JSON.stringify(value)}`);
+      }
+    }
+    for (const pointer of absent) {
+      if (resolveJsonPointer(report.ruleset, pointer).found) {
+        failures.push(`unexpected RuleSet path=${pointer}`);
+      }
+    }
+    return result(failures.length === 0, failures.length === 0
+      ? 'custom copy and untouched recipe defaults match their exact RuleSet paths'
+      : failures.join(', '));
+  });
+}
+
 function intentOracleIsolation(output) {
   return checked(output, (report) => {
     const failures = [];
@@ -907,6 +978,7 @@ module.exports = {
   intentProvenance,
   intentReceipt,
   intentRestartContinuity,
+  intentRulesetPathValues,
   intentRulesetStringValues,
   intentRouteStage,
   parseReport,
