@@ -249,6 +249,21 @@ test('summary exposes Gemma intent cohort boundaries, isolation, operations, and
         vars: { caseId: 'intent', cohort: 'intent_recipe', requireSimulation: true },
         success: true,
         response: { metadata: report },
+      }, {
+        provider: { label: 'gemma-intent' },
+        vars: { caseId: 'intent', cohort: 'intent_recipe', requireSimulation: true },
+        success: true,
+        response: {
+          metadata: {
+            ...structuredClone(report),
+            session_config: {
+              context_char_budget: 44000,
+              max_gate_failures: 4,
+              max_model_calls: 12,
+              max_tool_calls: 24,
+            },
+          },
+        },
       }],
     },
   };

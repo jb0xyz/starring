@@ -1,5 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { createRequire } = require('node:module');
+const path = require('node:path');
+const vm = require('node:vm');
+const { pathToFileURL } = require('node:url');
 
 const checks = require('./intent-assertions');
 
@@ -140,6 +145,26 @@ function context(overrides = {}) {
   };
 }
 
+function promptfooRealmChecks() {
+  const filename = path.resolve(__dirname, 'intent-assertions.js');
+  const module = { exports: {} };
+  const sandbox = {
+    Array,
+    JSON,
+    Object,
+    console,
+    module,
+    exports: module.exports,
+    require: createRequire(pathToFileURL(filename).href),
+    __dirname: path.dirname(filename),
+    __filename: filename,
+  };
+  vm.createContext(sandbox);
+  const source = fs.readFileSync(filename, 'utf8');
+  vm.runInContext(`(function (exports, require, module, __filename, __dirname) {${source}\n})(exports, require, module, __filename, __dirname);`, sandbox);
+  return module.exports;
+}
+
 test('one-shot intent report satisfies provenance, route, receipt, call, and isolation contracts', () => {
   const document = report();
   const expected = context();
@@ -152,6 +177,63 @@ test('one-shot intent report satisfies provenance, route, receipt, call, and iso
   assert.equal(checks.intentDecisionFlow(document, expected).pass, true);
   assert.equal(checks.intentRestartContinuity(document, expected).pass, true);
   assert.equal(checks.intentHardLatency(document, expected).pass, true);
+});
+
+test('structural assertions ignore key order and reject contract drift', () => {
+  const reordered = JSON.parse(report());
+  reordered.session_config = {
+    context_char_budget: 44000,
+    max_gate_failures: 4,
+    max_model_calls: 12,
+    max_tool_calls: 24,
+  };
+  const value = reordered.final_intent.public_status.receipt;
+  reordered.final_intent.public_status.receipt = {
+    compiled_operations: value.compiled_operations,
+    compiled_plan_hash: value.compiled_plan_hash,
+    semantic_intent_hash: value.semantic_intent_hash,
+    input_intent_hash: value.input_intent_hash,
+    candidate_revision: value.candidate_revision,
+    intent_revision: value.intent_revision,
+  };
+
+  assert.equal(checks.intentProvenance(JSON.stringify(reordered), context()).pass, true);
+  assert.equal(checks.intentReceipt(JSON.stringify(reordered), context()).pass, true);
+
+  reordered.session_config.extra = true;
+  assert.equal(checks.intentProvenance(JSON.stringify(reordered), context()).pass, false);
+  delete reordered.session_config.extra;
+  reordered.final_intent.public_status.receipt.compiled_operations = 23;
+  assert.equal(checks.intentReceipt(JSON.stringify(reordered), context()).pass, false);
+});
+
+test('structural assertions remain exact in the Promptfoo VM realm', () => {
+  const vmChecks = promptfooRealmChecks();
+  const reordered = JSON.parse(report());
+  reordered.session_config = {
+    context_char_budget: 44000,
+    max_gate_failures: 4,
+    max_model_calls: 12,
+    max_tool_calls: 24,
+  };
+  const value = reordered.final_intent.public_status.receipt;
+  reordered.final_intent.public_status.receipt = {
+    compiled_operations: value.compiled_operations,
+    compiled_plan_hash: value.compiled_plan_hash,
+    semantic_intent_hash: value.semantic_intent_hash,
+    input_intent_hash: value.input_intent_hash,
+    candidate_revision: value.candidate_revision,
+    intent_revision: value.intent_revision,
+  };
+
+  assert.equal(vmChecks.intentProvenance(JSON.stringify(reordered), context()).pass, true);
+  assert.equal(vmChecks.intentReceipt(JSON.stringify(reordered), context()).pass, true);
+
+  reordered.session_config.extra = true;
+  assert.equal(vmChecks.intentProvenance(JSON.stringify(reordered), context()).pass, false);
+  delete reordered.session_config.extra;
+  reordered.final_intent.public_status.receipt.compiled_operations = 23;
+  assert.equal(vmChecks.intentReceipt(JSON.stringify(reordered), context()).pass, false);
 });
 
 test('decision and restart assertions require a mutation-free pending turn and durable continuity', () => {

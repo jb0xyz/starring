@@ -293,6 +293,20 @@ test('checkpoint acceptance enforces repeated Gemma recipe quality and equivalen
   assert.equal(assessment.equivalence_groups[0].one_shot_multi_input_hashes_differ, true);
 });
 
+test('checkpoint boundary canonicalizes session configuration key order', () => {
+  const document = passingDocument();
+  document.results.results[0].response.metadata.session_config = {
+    context_char_budget: 44000,
+    max_gate_failures: 4,
+    max_model_calls: 12,
+    max_tool_calls: 24,
+  };
+  const assessment = assess(document);
+
+  assert.equal(assessment.pass, true);
+  assert.equal(assessment.checks.find((entry) => entry.name === 'single_cohort_boundary').pass, true);
+});
+
 test('mixed semantics, models, failed assertions, or missing cases cannot pass the checkpoint', () => {
   const semantics = passingDocument();
   semantics.results.results[0].response.metadata.final_intent.receipt.semantic_intent_hash = '8'.repeat(64);

@@ -5,6 +5,20 @@ function object(value, location) {
   return value;
 }
 
+function stable(value) {
+  if (Array.isArray(value)) {
+    return value.map(stable);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
+
 function integer(value, location) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`invalid intent eval report: ${location} must be a non-negative integer`);
@@ -180,7 +194,7 @@ function intentProvenance(output) {
       || provenance.ended_at_unix_ms < provenance.started_at_unix_ms) {
       failures.push('provenance timestamps are invalid');
     }
-    if (JSON.stringify(report.session_config) !== JSON.stringify({
+    if (!sameJson(report.session_config, {
       max_model_calls: 12,
       max_tool_calls: 24,
       max_gate_failures: 4,
@@ -277,7 +291,7 @@ function intentReceipt(output, context) {
         if (receipt.candidate_revision !== report.draft_revision) {
           failures.push(`candidate_revision=${receipt.candidate_revision} draft_revision=${report.draft_revision}`);
         }
-        if (JSON.stringify(report.final_intent.public_status.receipt) !== JSON.stringify(receipt)) {
+        if (!sameJson(report.final_intent.public_status.receipt, receipt)) {
           failures.push('public status receipt differs from the top-level intent receipt');
         }
       }
