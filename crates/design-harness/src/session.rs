@@ -37,7 +37,8 @@ use intent_routing::IntentRecipeRuntime;
 pub use intent_routing::{
     IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1,
     IntentRecipeStatusV1, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
-    INTENT_ADJUDICATOR_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V2,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
 };
 use repair::is_argument_failure;
 use routing::{

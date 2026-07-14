@@ -6,9 +6,13 @@ use serde_json::json;
 
 use crate::intent::{IntentCapabilityIdV2, IntentSafetyBoundaryIdV2};
 use crate::llm::{LlmError, LlmResponse};
+use crate::turn::parse_interpret_intent_core;
 use crate::{dispatch_tool, BurstOutcome, LlmClient, Message, ToolCall, ToolDefinition, TurnPhase};
 
-use super::state::{INTENT_RECIPE_SYSTEM_PROMPT_V1, INTENT_RECIPE_SYSTEM_PROMPT_V2};
+use super::adjudicate::{adjudicate_intent_core_v3, IntentCoreAdjudicationV3};
+use super::state::{
+    INTENT_RECIPE_SYSTEM_PROMPT_V1, INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
+};
 use super::*;
 
 type SeenCalls = Vec<(Vec<Message>, Vec<ToolDefinition>)>;
@@ -89,13 +93,13 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         },
         "boundary_requests": [],
         "unclassified_requirements": [],
-        "response": "",
-        "response_locale": "en"
+        "detail_facets": [],
+        "response": ""
     })
 }
 
 fn interpretation_call(id: &str, value: serde_json::Value) -> LlmResponse {
-    tool_call(id, "interpret_intent_turn", value)
+    tool_call(id, "interpret_intent_core", value)
 }
 
 fn private_room(expected_revision: u64, hub: Option<&str>) -> LlmResponse {
@@ -113,6 +117,7 @@ fn custom_static(expected_revision: u64, response: &str) -> LlmResponse {
 fn creator_only(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["close_authorization"] = json!("creator_only");
+    value["detail_facets"] = json!(["controls"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -134,7 +139,6 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
 
 fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
-    value["automation_kind"] = json!("custom_automation");
     value["runtime_requirements"] = json!({
         "persistence": "restart_persistent",
         "timers": "none",
@@ -142,6 +146,7 @@ fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
         "event_time_llm": false
     });
     value["boundary_requests"] = json!(["secret_disclosure", "direct_live_mutation"]);
+    value["detail_facets"] = json!(["copy"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -167,6 +172,34 @@ fn build_without_automation(expected_revision: u64) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["automation_kind"] = json!("none");
     interpretation_call("interpret", value)
+}
+
+fn private_room_with_copy_details(
+    expected_revision: u64,
+    hub: Option<&str>,
+) -> (LlmResponse, LlmResponse) {
+    let mut value = private_room_value(expected_revision, hub);
+    value["detail_facets"] = json!(["copy"]);
+    let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) =
+        adjudicate_intent_core_v3(core).unwrap()
+    else {
+        panic!("expected private study-room selection")
+    };
+    let details = tool_call(
+        "details",
+        "extract_private_study_room_details",
+        json!({
+            "expected_revision": expected_revision,
+            "core_semantic_digest": selection.semantic_ir_digest(),
+            "copy": {"create_button_label": "Start exact focus"},
+            "naming": {},
+            "controls": {},
+            "covered_facets": ["copy"],
+            "unmapped_facets": []
+        }),
+    );
+    (interpretation_call("interpret", value), details)
 }
 
 fn resolve_channel(expected_revision: u64, channel: &str) -> LlmResponse {
@@ -204,7 +237,7 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         let calls = probe.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1.len(), 1);
-        assert_eq!(calls[0].1[0].name, "interpret_intent_turn");
+        assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert!(calls[0]
             .0
             .last()
@@ -243,6 +276,11 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         assert_eq!(session.observability.plan_submissions, 0);
         assert_eq!(session.observability.intent_commits, 1);
         assert!(session.observability.intent_compiled_operations > 20);
+        let snapshot = serde_json::to_value(session.snapshot()).unwrap();
+        assert_eq!(
+            snapshot["intent_recipe"]["stage"]["recipe_evidence"]["extraction_mode"],
+            "deterministic_default"
+        );
         let decision = session.intent_recipe_route_decision().unwrap();
         assert_eq!(decision.kind(), IntentRouteDecisionKindV2::PrivateStudyRoom);
         assert_eq!(
@@ -262,6 +300,68 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         assert_eq!(
             session.draft.simulated_revision,
             Some(session.draft.draft_revision)
+        );
+    });
+}
+
+#[test]
+fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
+    block_on(async {
+        let (core, details) = private_room_with_copy_details(0, Some("community_hub"));
+        let client = ScriptedClient::new(vec![Ok(core), Ok(details)]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session
+                .run_burst("Create private rooms with a Start exact focus button")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1.len(), 1);
+        assert_eq!(calls[0].1[0].name, "interpret_intent_core");
+        assert_eq!(calls[1].1.len(), 1);
+        assert_eq!(calls[1].1[0].name, "extract_private_study_room_details");
+        assert!(calls[1]
+            .0
+            .last()
+            .unwrap()
+            .content
+            .starts_with(INTENT_DETAIL_STATE_PREFIX));
+        let detail_anchor: serde_json::Value = serde_json::from_str(
+            calls[1]
+                .0
+                .last()
+                .unwrap()
+                .content
+                .strip_prefix(INTENT_DETAIL_STATE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail_anchor["expected_revision"], 0);
+        assert_eq!(detail_anchor["detail_facets"], json!(["copy"]));
+        assert_eq!(
+            detail_anchor["core_semantic_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(session.observability.model_calls, 2);
+        assert_eq!(session.observability.tool_calls, 2);
+        assert_eq!(session.observability.intent_commits, 1);
+        let snapshot = serde_json::to_value(session.snapshot()).unwrap();
+        assert_eq!(
+            snapshot["intent_recipe"]["stage"]["recipe_evidence"]["extraction_mode"],
+            "model_detail"
+        );
+        assert_eq!(
+            snapshot["intent_recipe"]["stage"]["recipe_evidence"]["detail_facets"],
+            json!(["copy"])
         );
     });
 }
@@ -306,7 +406,7 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
             BurstOutcome::Ready { .. }
         ));
         assert_eq!(probe.calls().len(), 2);
-        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_turn");
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
         assert_eq!(probe.calls()[1].1[0].name, "resolve_intent_decision");
         assert_eq!(
             session
@@ -518,6 +618,48 @@ fn stale_revision_wrong_tool_and_llm_failure_each_halt_without_mutation_or_retry
 }
 
 #[test]
+fn second_detail_call_failure_preserves_draft_and_durable_stage() {
+    block_on(async {
+        let (core, _) = private_room_with_copy_details(0, Some("community_hub"));
+        let client = ScriptedClient::new(vec![
+            Ok(core),
+            Err(LlmError::Client("detail gateway offline".to_string())),
+        ]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root_draft = session.draft.clone();
+        let root_stage = session.snapshot().intent_recipe.unwrap().stage;
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst("Create private rooms with a custom button")
+            .await
+        else {
+            panic!("expected detail failure")
+        };
+        assert_eq!(report.code, "LLM_CLIENT_ERROR");
+        assert_eq!(session.draft, root_draft);
+        assert_eq!(session.snapshot().intent_recipe.unwrap().stage, root_stage);
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1[0].name, "interpret_intent_core");
+        assert_eq!(calls[1].1[0].name, "extract_private_study_room_details");
+        assert_eq!(session.observability.model_calls, 2);
+        assert_eq!(session.observability.tool_calls, 1);
+        assert_eq!(session.observability.intent_commits, 0);
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            session.snapshot(),
+            bindings("community_hub", "700"),
+        )
+        .expect("detail failure snapshot should restore");
+        assert_eq!(restored.draft, root_draft);
+        assert_eq!(restored.snapshot().intent_recipe.unwrap().stage, root_stage);
+    });
+}
+
+#[test]
 fn candidate_conflict_rolls_back_every_compiled_operation() {
     block_on(async {
         let client = ScriptedClient::new(vec![Ok(private_room(1, Some("community_hub")))]);
@@ -556,10 +698,10 @@ fn typed_fallback_is_public_and_finishes_in_routed_phase() {
     block_on(async {
         let malicious = "I already deployed the bot and changed live Discord.";
         let response = custom_static(0, malicious);
-        let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(response)]),
-            bindings("community_hub", "700"),
-        );
+        let client = ScriptedClient::new(vec![Ok(response)]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
         let BurstOutcome::Routed { fallback, decision } = session
             .run_burst("Build a static feedback automation")
             .await
@@ -574,6 +716,10 @@ fn typed_fallback_is_public_and_finishes_in_routed_phase() {
         assert_eq!(session.intent_recipe_route_decision(), None);
         assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Routed);
         assert_eq!(session.draft.draft_revision, 0);
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
         assert_eq!(
             session
                 .observability
@@ -588,10 +734,10 @@ fn typed_fallback_is_public_and_finishes_in_routed_phase() {
 fn creator_only_requirement_routes_to_one_exact_gap_without_question_or_mutation() {
     block_on(async {
         let malicious = "I weakened creator-only close and built the room anyway.";
-        let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(creator_only(0, malicious))]),
-            bindings("community_hub", "700"),
-        );
+        let client = ScriptedClient::new(vec![Ok(creator_only(0, malicious))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
         let root = session.draft.clone();
 
         let BurstOutcome::Routed { fallback, decision } = session
@@ -616,6 +762,10 @@ fn creator_only_requirement_routes_to_one_exact_gap_without_question_or_mutation
         assert_eq!(session.observability.intent_compile_attempts, 0);
         assert_eq!(session.observability.intent_commits, 0);
         assert_eq!(session.observability.intent_compiled_operations, 0);
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
     });
 }
 
@@ -623,10 +773,10 @@ fn creator_only_requirement_routes_to_one_exact_gap_without_question_or_mutation
 fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
     block_on(async {
         let malicious = "The persistent timed economy game is live.";
-        let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(stateful_game(0, malicious))]),
-            bindings("community_hub", "700"),
-        );
+        let client = ScriptedClient::new(vec![Ok(stateful_game(0, malicious))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
         let root = session.draft.clone();
 
         let BurstOutcome::Routed { fallback, decision } = session
@@ -655,6 +805,10 @@ fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
         assert_eq!(session.observability.clarification_count, 0);
         assert_eq!(session.observability.intent_compile_attempts, 0);
         assert_eq!(session.observability.intent_commits, 0);
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
     });
 }
 
@@ -662,10 +816,10 @@ fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
 fn safety_boundary_precedes_capability_gap_and_never_mutates() {
     block_on(async {
         let malicious = "Secrets disclosed and the live server was changed.";
-        let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(boundary_request(0, malicious))]),
-            bindings("community_hub", "700"),
-        );
+        let client = ScriptedClient::new(vec![Ok(boundary_request(0, malicious))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
         let root = session.draft.clone();
 
         let BurstOutcome::Routed { fallback, decision } = session
@@ -701,6 +855,10 @@ fn safety_boundary_precedes_capability_gap_and_never_mutates() {
         assert_eq!(session.observability.clarification_count, 0);
         assert_eq!(session.observability.intent_compile_attempts, 0);
         assert_eq!(session.observability.intent_commits, 0);
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
     });
 }
 
@@ -775,7 +933,7 @@ fn legacy_route_tool_is_rejected_at_the_active_interpret_frontier() {
         };
         assert_eq!(report.code, "INTENT_FRONTIER_VIOLATION");
         assert_eq!(probe.calls()[0].1.len(), 1);
-        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_turn");
+        assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
         assert_eq!(session.draft, root);
         assert_eq!(session.observability.intent_commits, 0);
         let restored = DesignSession::restore_intent_recipe(
@@ -795,12 +953,12 @@ fn multiple_tool_call_rejection_snapshot_roundtrips() {
         let response = LlmResponse::ToolCalls(vec![
             ToolCall {
                 id: "first".to_string(),
-                name: "interpret_intent_turn".to_string(),
+                name: "interpret_intent_core".to_string(),
                 arguments: private_room_value(0, None).to_string(),
             },
             ToolCall {
                 id: "second".to_string(),
-                name: "interpret_intent_turn".to_string(),
+                name: "interpret_intent_core".to_string(),
                 arguments: private_room_value(0, None).to_string(),
             },
         ]);
@@ -852,8 +1010,8 @@ fn preview_ready_starts_the_next_turn_at_the_interpret_frontier() {
         assert_eq!(decision.kind(), IntentRouteDecisionKindV2::TypedPlanner);
         let calls = probe.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].1[0].name, "interpret_intent_turn");
-        assert_eq!(calls[1].1[0].name, "interpret_intent_turn");
+        assert_eq!(calls[0].1[0].name, "interpret_intent_core");
+        assert_eq!(calls[1].1[0].name, "interpret_intent_core");
         assert_eq!(session.draft, ready_draft);
     });
 }
@@ -866,11 +1024,27 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
         resource_bindings.clone(),
     );
     let current = session.snapshot();
-    assert_eq!(current.messages[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V2);
+    assert_eq!(current.messages[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
     assert_eq!(
         current.intent_recipe.as_ref().unwrap().protocol_version,
-        INTENT_RECIPE_PROTOCOL_VERSION_V2
+        INTENT_RECIPE_PROTOCOL_VERSION_V3
     );
+
+    let mut previous = current.clone();
+    previous.messages[0] = Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V2);
+    previous.intent_recipe.as_mut().unwrap().protocol_version = INTENT_RECIPE_PROTOCOL_VERSION_V2;
+    assert!(matches!(
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            previous,
+            resource_bindings.clone(),
+        ),
+        Err(SessionSnapshotError::UnsupportedIntentProtocolVersion {
+            expected: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+            found: INTENT_RECIPE_PROTOCOL_VERSION_V2
+        })
+    ));
 
     let mut legacy = current.clone();
     legacy.messages[0] = Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V1);
@@ -884,7 +1058,7 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
     assert!(matches!(
         result,
         Err(SessionSnapshotError::UnsupportedIntentProtocolVersion {
-            expected: INTENT_RECIPE_PROTOCOL_VERSION_V2,
+            expected: INTENT_RECIPE_PROTOCOL_VERSION_V3,
             found: 1
         })
     ));
@@ -950,6 +1124,27 @@ fn awaiting_and_preview_snapshots_require_a_valid_persisted_route_decision() {
             Err(SessionSnapshotError::InvalidInvariant { .. })
         ));
 
+        let mut missing_evidence = awaiting.snapshot();
+        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision {
+            recipe_evidence, ..
+        }) = missing_evidence
+            .intent_recipe
+            .as_mut()
+            .map(|intent| &mut intent.stage)
+        else {
+            panic!("expected awaiting snapshot")
+        };
+        *recipe_evidence = None;
+        assert!(matches!(
+            DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                missing_evidence,
+                resource_bindings.clone(),
+            ),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
         let mut tampered = awaiting.snapshot();
         let Some(IntentRecipeStageSnapshotV1::AwaitingDecision { route_decision, .. }) = tampered
             .intent_recipe
@@ -995,6 +1190,27 @@ fn awaiting_and_preview_snapshots_require_a_valid_persisted_route_decision() {
                 ScriptedClient::new(Vec::new()),
                 SessionConfig::default(),
                 missing,
+                resource_bindings.clone(),
+            ),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut missing_evidence = ready.snapshot();
+        let Some(IntentRecipeStageSnapshotV1::PreviewReady {
+            recipe_evidence, ..
+        }) = missing_evidence
+            .intent_recipe
+            .as_mut()
+            .map(|intent| &mut intent.stage)
+        else {
+            panic!("expected preview snapshot")
+        };
+        *recipe_evidence = None;
+        assert!(matches!(
+            DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                missing_evidence,
                 resource_bindings,
             ),
             Err(SessionSnapshotError::InvalidInvariant { .. })

@@ -8,17 +8,26 @@ use crate::errors::StructuredError;
 use crate::intent::{
     IntentCapabilityBlockerV2, IntentRequestedOutcome, IntentSafetyBoundaryViolationV2,
 };
+#[cfg(test)]
+use crate::turn::IntentInterpretationV2;
 use crate::turn::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
-    IntentInterpretationV2, IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2,
-    TimerRequirementV2,
+    IntentCoreInterpretationV3, IntentLocaleHintV2, IntentRecipeDetailFacetV3, IntentRequestModeV2,
+    PersistenceRequirementV2, PrivateStudyRoomDetailsV1, TimerRequirementV2,
 };
 
-use super::super::decision::{PinnedIntentRecipeV2, INTENT_RECIPE_PROTOCOL_VERSION_V2};
+#[cfg(test)]
+use super::super::decision::INTENT_RECIPE_PROTOCOL_VERSION_V2;
+use super::super::decision::{PinnedIntentRecipeV2, INTENT_RECIPE_PROTOCOL_VERSION_V3};
 use super::adjudication_error;
 
+#[cfg(test)]
 const SEMANTIC_IR_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.semantic_ir.v2\0";
+#[cfg(test)]
 const ADJUDICATION_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.adjudication.v2\0";
+const SEMANTIC_IR_DIGEST_DOMAIN_V3: &[u8] = b"starring.intent.semantic_ir.v3\0";
+const ADJUDICATION_DIGEST_DOMAIN_V3: &[u8] = b"starring.intent.adjudication.v3\0";
+const RECIPE_DETAILS_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.recipe_details.v1\0";
 
 pub(super) struct AdjudicationDigestInputV2<'a> {
     pub(super) decision_source: &'static str,
@@ -33,6 +42,7 @@ pub(super) struct AdjudicationDigestInputV2<'a> {
     pub(super) route_target: Option<&'a PinnedIntentRecipeV2>,
 }
 
+#[cfg(test)]
 pub(super) fn semantic_ir_digest_v2(
     interpretation: &IntentInterpretationV2,
 ) -> Result<String, StructuredError> {
@@ -74,6 +84,7 @@ pub(super) fn semantic_ir_digest_v2(
     )
 }
 
+#[cfg(test)]
 pub(super) fn adjudication_digest_v2(
     input: AdjudicationDigestInputV2<'_>,
 ) -> Result<String, StructuredError> {
@@ -101,6 +112,100 @@ pub(super) fn adjudication_digest_v2(
     )
 }
 
+pub(super) fn semantic_ir_digest_v3(
+    core: &IntentCoreInterpretationV3,
+) -> Result<String, StructuredError> {
+    let mut boundary_requests = core
+        .boundary_requests()
+        .iter()
+        .map(|value| boundary_request_wire(*value))
+        .collect::<Vec<_>>();
+    boundary_requests.sort_unstable();
+    boundary_requests.dedup();
+    let unclassified_requirements = core
+        .unclassified_requirements()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let detail_facets = canonical_detail_facets(core.recipe_detail_facets());
+    let projection = CanonicalSemanticIrV3 {
+        protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+        request_mode: request_mode_wire(core.request_mode()),
+        automation_kind: automation_kind_wire(core.automation_kind()),
+        objective: core.objective(),
+        requested_outcome: requested_outcome_wire(core.requested_outcome()),
+        hub_channel: core.selected_existing_channel().map(|value| value.as_str()),
+        locale: locale_wire(core.locale()),
+        close_authorization: close_authorization_wire(core.close_authorization()),
+        runtime_requirements: CanonicalRuntimeRequirementsV2 {
+            persistence: persistence_wire(core.runtime_requirements().persistence),
+            timers: timer_wire(core.runtime_requirements().timers),
+            economy: economy_wire(core.runtime_requirements().economy),
+            event_time_llm: core.runtime_requirements().event_time_llm,
+        },
+        boundary_requests,
+        unclassified_requirements,
+        detail_facets,
+    };
+    digest_serializable(
+        SEMANTIC_IR_DIGEST_DOMAIN_V3,
+        &projection,
+        "INTENT_SEMANTIC_IR_SERIALIZATION_FAILED",
+        "intent.semantic_ir",
+    )
+}
+
+pub(super) fn adjudication_digest_v3(
+    input: AdjudicationDigestInputV2<'_>,
+) -> Result<String, StructuredError> {
+    let projection = CanonicalAdjudicationV2 {
+        decision_source: input.decision_source,
+        adjudicator_version: input.adjudicator_version,
+        kind: input.kind,
+        semantic_ir_digest: input.semantic_ir_digest,
+        manifest_version: input.manifest_version,
+        manifest_digest: input.manifest_digest,
+        blockers: input.blockers,
+        boundary_violations: input.boundary_violations,
+        unclassified_requirements: input.unclassified_requirements,
+        route_target: input.route_target.map(|target| CanonicalRouteTargetV2 {
+            kind: "recipe",
+            recipe_id: target.recipe_id(),
+            recipe_version: target.recipe_version(),
+        }),
+    };
+    digest_serializable(
+        ADJUDICATION_DIGEST_DOMAIN_V3,
+        &projection,
+        "INTENT_ADJUDICATION_SERIALIZATION_FAILED",
+        "intent.adjudication",
+    )
+}
+
+pub(super) fn private_study_room_details_digest_v1(
+    core_semantic_digest: &str,
+    details: &PrivateStudyRoomDetailsV1,
+) -> Result<String, StructuredError> {
+    let projection = CanonicalRecipeDetailsV1 {
+        recipe_id: crate::intent::PRIVATE_STUDY_ROOM_RECIPE_ID,
+        recipe_version: crate::intent::PRIVATE_STUDY_ROOM_RECIPE_VERSION,
+        core_semantic_digest,
+        covered_facets: canonical_detail_facets(details.covered_facets()),
+        copy: details.copy(),
+        naming: details.naming(),
+        controls: details.controls(),
+    };
+    digest_serializable(
+        RECIPE_DETAILS_DIGEST_DOMAIN_V1,
+        &projection,
+        "INTENT_RECIPE_DETAILS_SERIALIZATION_FAILED",
+        "intent.recipe_details",
+    )
+}
+
+#[cfg(test)]
 pub(super) fn canonical_unclassified_requirements(
     interpretation: &IntentInterpretationV2,
 ) -> Vec<String> {
@@ -230,6 +335,24 @@ fn boundary_request_wire(value: IntentBoundaryRequestV2) -> &'static str {
     }
 }
 
+fn canonical_detail_facets(values: &[IntentRecipeDetailFacetV3]) -> Vec<&'static str> {
+    values
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(detail_facet_wire)
+        .collect()
+}
+
+fn detail_facet_wire(value: IntentRecipeDetailFacetV3) -> &'static str {
+    match value {
+        IntentRecipeDetailFacetV3::Copy => "copy",
+        IntentRecipeDetailFacetV3::Naming => "naming",
+        IntentRecipeDetailFacetV3::Controls => "controls",
+    }
+}
+
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -240,6 +363,7 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     output
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalSemanticIrV2<'a> {
     protocol_version: u16,
@@ -257,6 +381,22 @@ struct CanonicalSemanticIrV2<'a> {
     copy: &'a crate::intent::PrivateStudyRoomCopyProposalV1,
     naming: &'a crate::intent::PrivateStudyRoomNamingProposalV1,
     controls: &'a crate::turn::PrivateStudyRoomControlsInterpretationV2,
+}
+
+#[derive(Serialize)]
+struct CanonicalSemanticIrV3<'a> {
+    protocol_version: u16,
+    request_mode: &'static str,
+    automation_kind: &'static str,
+    objective: &'a str,
+    requested_outcome: &'static str,
+    hub_channel: Option<&'a str>,
+    locale: &'static str,
+    close_authorization: &'static str,
+    runtime_requirements: CanonicalRuntimeRequirementsV2,
+    boundary_requests: Vec<&'static str>,
+    unclassified_requirements: Vec<String>,
+    detail_facets: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -286,4 +426,15 @@ struct CanonicalRouteTargetV2<'a> {
     kind: &'static str,
     recipe_id: &'a str,
     recipe_version: u32,
+}
+
+#[derive(Serialize)]
+struct CanonicalRecipeDetailsV1<'a> {
+    recipe_id: &'static str,
+    recipe_version: u32,
+    core_semantic_digest: &'a str,
+    covered_facets: Vec<&'static str>,
+    copy: &'a crate::intent::PrivateStudyRoomCopyProposalV1,
+    naming: &'a crate::intent::PrivateStudyRoomNamingProposalV1,
+    controls: &'a crate::turn::PrivateStudyRoomControlsInterpretationV2,
 }

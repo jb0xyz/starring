@@ -20,8 +20,8 @@ pub use session::{
     IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1, IntentRouteDecisionKindV2,
     IntentRouteDecisionV2, LimitKind, Observability, PinnedIntentRecipeV2, RepairKind, RepairState,
     RepairTicket, SessionConfig, SessionSnapshot, SessionSnapshotError, TurnPhase, TurnState,
-    DEFAULT_SYSTEM_PROMPT, INTENT_ADJUDICATOR_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V2,
-    SESSION_SNAPSHOT_VERSION,
+    DEFAULT_SYSTEM_PROMPT, INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3, SESSION_SNAPSHOT_VERSION,
 };
 pub use tools::{dispatch_tool, tool_definitions, ToolDefinition};
 pub use turn::{

@@ -2,16 +2,27 @@ use std::collections::BTreeSet;
 
 use resource_resolution::ResourceBindingMap;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::errors::{StructuredError, ToolResult};
+use crate::intent::{PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION};
 use crate::llm::{LlmClient, LlmResponse, Message, ToolCall};
+use crate::turn::{
+    private_study_room_details_frontier, IntentRecipeDetailFacetV3,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+};
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
 
 mod adjudicate;
 #[cfg(test)]
 mod adjudicate_tests;
+#[cfg(test)]
+mod adjudicate_v3_tests;
 mod decision;
+mod evidence;
+#[cfg(test)]
+mod evidence_tests;
 mod execute;
 mod frontier;
 mod state;
@@ -19,18 +30,23 @@ mod state_binding;
 #[cfg(test)]
 mod tests;
 
+use adjudicate::PrivateStudyRoomSelectionV3;
 pub use decision::{
     IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
-    INTENT_ADJUDICATOR_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V2,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
 };
-use execute::IntentTurnSuccess;
-use frontier::IntentFrontierV2;
+use execute::{IntentCoreExecutionV3, IntentTurnSuccess};
+use frontier::IntentFrontierV3;
 pub(super) use state::IntentRecipeRuntime;
 pub(crate) use state::IntentRecipeSessionSnapshotV1;
-use state::{intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_STATE_PREFIX};
+use state::{
+    intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_DETAIL_STATE_PREFIX,
+    INTENT_STATE_PREFIX,
+};
 pub(super) use state::{
     validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT, INTENT_RECIPE_SYSTEM_PROMPT_V1,
-    INTENT_RECIPE_SYSTEM_PROMPT_V2,
+    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
 };
 pub use state::{
     IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
@@ -44,6 +60,21 @@ struct IntentStateAnchorV1 {
     available_channel_keys: Vec<String>,
     active_question: Option<String>,
     active_options: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntentDetailStateAnchorV3<'a> {
+    expected_revision: u64,
+    core_semantic_digest: &'a str,
+    recipe_id: &'static str,
+    recipe_version: u32,
+    detail_facets: &'a [IntentRecipeDetailFacetV3],
+}
+
+enum IntentToolRequestFailure {
+    Error(StructuredError),
+    Limit(StructuredError, LimitKind),
 }
 impl<C> DesignSession<C> {
     pub fn with_intent_recipe(client: C, bindings: ResourceBindingMap) -> Self {
@@ -148,7 +179,7 @@ impl<C> DesignSession<C> {
         })
     }
 
-    fn intent_frontier(&self) -> Result<IntentFrontierV2, StructuredError> {
+    fn intent_frontier(&self) -> Result<IntentFrontierV3, StructuredError> {
         self.intent_recipe
             .as_ref()
             .map(IntentRecipeRuntime::frontier)
@@ -246,6 +277,60 @@ impl<C> DesignSession<C> {
         self.record_failure(None, &result);
         self.halt(&code, &message, Some(limit))
     }
+
+    fn intent_detail_state<'a>(
+        &self,
+        selection: &'a PrivateStudyRoomSelectionV3,
+    ) -> Result<(IntentDetailStateAnchorV3<'a>, String), StructuredError> {
+        let state = IntentDetailStateAnchorV3 {
+            expected_revision: selection.expected_revision(),
+            core_semantic_digest: selection.semantic_ir_digest(),
+            recipe_id: PRIVATE_STUDY_ROOM_RECIPE_ID,
+            recipe_version: PRIVATE_STUDY_ROOM_RECIPE_VERSION,
+            detail_facets: selection.detail_facets(),
+        };
+        let content = serde_json::to_string(&state).map_err(|error| {
+            intent_error(
+                "INTENT_DETAIL_STATE_SERIALIZATION_FAILED",
+                "intent.session.detail_state",
+                error.to_string(),
+                "Start a new intent recipe session",
+            )
+        })?;
+        Ok((state, format!("{INTENT_DETAIL_STATE_PREFIX}{content}")))
+    }
+
+    fn finish_intent_request_failure(
+        &mut self,
+        failure: IntentToolRequestFailure,
+    ) -> super::BurstOutcome {
+        match failure {
+            IntentToolRequestFailure::Error(error) => self.fail_intent(error),
+            IntentToolRequestFailure::Limit(error, limit) => {
+                self.fail_intent_with_limit(error, limit)
+            }
+        }
+    }
+
+    fn finish_intent_tool_execution(
+        &mut self,
+        call: ToolCall,
+        result: Result<IntentTurnSuccess, StructuredError>,
+    ) -> super::BurstOutcome {
+        match result {
+            Ok(success) => {
+                self.last_error = None;
+                self.messages
+                    .push(Message::tool(call.id, success.tool_result()));
+                self.finish_intent_success(success)
+            }
+            Err(error) => {
+                let result = ToolResult::failure_from(&self.draft, error.clone());
+                self.messages.push(Message::tool(call.id, result.as_json()));
+                self.fail_intent(error)
+            }
+        }
+    }
 }
 
 impl<C: LlmClient> DesignSession<C> {
@@ -273,17 +358,6 @@ impl<C: LlmClient> DesignSession<C> {
         if let Err(error) = revision_check {
             return self.fail_intent(error);
         }
-        if self.turn_model_calls() >= self.config.max_model_calls {
-            return self.fail_intent_with_limit(
-                intent_error(
-                    "MODEL_CALL_LIMIT_EXHAUSTED",
-                    "intent.session.model_calls",
-                    "The intent session cannot make its required model call",
-                    "Increase the per-turn model-call limit",
-                ),
-                LimitKind::ModelCalls,
-            );
-        }
         if let Err(error) = self.append_intent_state_anchor() {
             return self.fail_intent(error);
         }
@@ -292,8 +366,92 @@ impl<C: LlmClient> DesignSession<C> {
             Err(error) => return self.fail_intent(error),
         };
         let tools = frontier.tools();
-        let Some(messages) = self.fit_intent_context(&tools) else {
-            return self.fail_intent_with_limit(
+        let expected_tool = frontier.name();
+        let call = match self.request_intent_tool_once(expected_tool, &tools).await {
+            Ok(call) => call,
+            Err(failure) => return self.finish_intent_request_failure(failure),
+        };
+        match frontier {
+            IntentFrontierV3::Resolve => {
+                let result = self.execute_intent_resolution(&call.arguments).await;
+                self.finish_intent_tool_execution(call, result)
+            }
+            IntentFrontierV3::InterpretCore => {
+                let result = self.execute_intent_core(&call.arguments).await;
+                match result {
+                    Ok(IntentCoreExecutionV3::Complete(success)) => {
+                        self.finish_intent_tool_execution(call, Ok(*success))
+                    }
+                    Ok(IntentCoreExecutionV3::NeedsDetails(selection)) => {
+                        let (detail_state, detail_anchor) =
+                            match self.intent_detail_state(&selection) {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    return self.finish_intent_tool_execution(call, Err(error));
+                                }
+                            };
+                        self.messages.push(Message::tool(
+                            call.id,
+                            json!({
+                                "ok": true,
+                                "status": "details_required",
+                                "expected_revision": detail_state.expected_revision,
+                                "core_semantic_digest": detail_state.core_semantic_digest,
+                                "recipe_id": detail_state.recipe_id,
+                                "recipe_version": detail_state.recipe_version,
+                                "detail_facets": detail_state.detail_facets,
+                            })
+                            .to_string(),
+                        ));
+                        self.messages.push(Message::user(detail_anchor));
+                        let tools: Vec<_> = private_study_room_details_frontier().into();
+                        let detail_call = match self
+                            .request_intent_tool_once(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &tools)
+                            .await
+                        {
+                            Ok(call) => call,
+                            Err(failure) => return self.finish_intent_request_failure(failure),
+                        };
+                        let result = self
+                            .execute_intent_details(selection, &detail_call.arguments)
+                            .await;
+                        self.finish_intent_tool_execution(detail_call, result)
+                    }
+                    Err(error) => self.finish_intent_tool_execution(call, Err(error)),
+                }
+            }
+        }
+    }
+
+    async fn request_intent_tool_once(
+        &mut self,
+        expected_tool: &str,
+        tools: &[crate::tools::ToolDefinition],
+    ) -> Result<ToolCall, IntentToolRequestFailure> {
+        if self.turn_model_calls() >= self.config.max_model_calls {
+            return Err(IntentToolRequestFailure::Limit(
+                intent_error(
+                    "MODEL_CALL_LIMIT_EXHAUSTED",
+                    "intent.session.model_calls",
+                    "The intent session cannot make its required model call",
+                    "Increase the per-turn model-call limit",
+                ),
+                LimitKind::ModelCalls,
+            ));
+        }
+        if self.turn_tool_calls() >= self.config.max_tool_calls {
+            return Err(IntentToolRequestFailure::Limit(
+                intent_error(
+                    "TOOL_CALL_LIMIT_EXHAUSTED",
+                    "intent.session.tool_calls",
+                    "The intent session cannot execute its required model tool call",
+                    "Increase the per-turn tool-call limit",
+                ),
+                LimitKind::ToolCalls,
+            ));
+        }
+        let Some(messages) = self.fit_intent_context(tools) else {
+            return Err(IntentToolRequestFailure::Limit(
                 intent_error(
                     "CONTEXT_CHAR_LIMIT_EXHAUSTED",
                     "intent.session.context",
@@ -301,31 +459,27 @@ impl<C: LlmClient> DesignSession<C> {
                     "Start a compacted session snapshot or increase the context budget",
                 ),
                 LimitKind::ContextChars,
-            );
+            ));
         };
-        let expected_tool = frontier.name();
         self.record_model_call();
-        let response = match self.client.complete(&messages, &tools).await {
-            Ok(response) => response,
-            Err(_) => {
-                return self.fail_intent(intent_error(
-                    "LLM_CLIENT_ERROR",
-                    "llm",
-                    "The intent router model request failed",
-                    "Retry the same user turn after the model gateway is available",
-                ));
-            }
-        };
+        let response = self.client.complete(&messages, tools).await.map_err(|_| {
+            IntentToolRequestFailure::Error(intent_error(
+                "LLM_CLIENT_ERROR",
+                "llm",
+                "The intent router model request failed",
+                "Retry the same user turn after the model gateway is available",
+            ))
+        })?;
         let calls = match response {
             LlmResponse::Text(text) => {
                 self.messages.push(Message::assistant(text));
                 self.record_intent_extraction_failure();
-                return self.fail_intent(intent_error(
+                return Err(IntentToolRequestFailure::Error(intent_error(
                     "INTENT_TOOL_CALL_REQUIRED",
                     "intent.response",
                     format!("The model returned prose instead of {expected_tool}"),
                     format!("Call exactly one {expected_tool} tool"),
-                ));
+                )));
             }
             LlmResponse::ToolCalls(calls) => calls,
         };
@@ -334,7 +488,7 @@ impl<C: LlmClient> DesignSession<C> {
                 "INTENT_RESPONSE_REJECTED: expected exactly one {expected_tool} call with a non-empty unique identifier"
             )));
             self.record_intent_extraction_failure();
-            return self.fail_intent(intent_error(
+            return Err(IntentToolRequestFailure::Error(intent_error(
                 "INTENT_FRONTIER_VIOLATION",
                 "intent.response",
                 format!(
@@ -342,9 +496,16 @@ impl<C: LlmClient> DesignSession<C> {
                     calls.len()
                 ),
                 format!("Call exactly one {expected_tool} tool with a non-empty identifier"),
-            ));
+            )));
         }
-        let call = calls.into_iter().next().expect("single call was checked");
+        let Some(call) = calls.into_iter().next() else {
+            return Err(IntentToolRequestFailure::Error(intent_error(
+                "INTENT_FRONTIER_VIOLATION",
+                "intent.response",
+                "The model returned no intent tool call",
+                format!("Call exactly one {expected_tool} tool"),
+            )));
+        };
         if call.name != expected_tool {
             let error = intent_error(
                 "INTENT_FRONTIER_VIOLATION",
@@ -360,41 +521,12 @@ impl<C: LlmClient> DesignSession<C> {
                 call.name
             )));
             self.record_intent_extraction_failure();
-            return self.fail_intent(error);
+            return Err(IntentToolRequestFailure::Error(error));
         }
         self.messages
             .push(Message::assistant_tool_calls(vec![call.clone()]));
-        if self.turn_tool_calls() >= self.config.max_tool_calls {
-            let error = intent_error(
-                "TOOL_CALL_LIMIT_EXHAUSTED",
-                "intent.session.tool_calls",
-                "The intent session cannot execute its required model tool call",
-                "Increase the per-turn tool-call limit",
-            );
-            let result = ToolResult::failure_from(&self.draft, error.clone());
-            self.messages.push(Message::tool(call.id, result.as_json()));
-            return self.fail_intent_with_limit(error, LimitKind::ToolCalls);
-        }
         self.record_tool_call();
-        let result = match frontier {
-            IntentFrontierV2::Interpret => {
-                self.execute_intent_interpretation(&call.arguments).await
-            }
-            IntentFrontierV2::Resolve => self.execute_intent_resolution(&call.arguments).await,
-        };
-        match result {
-            Ok(success) => {
-                self.last_error = None;
-                self.messages
-                    .push(Message::tool(call.id, success.tool_result()));
-                self.finish_intent_success(success)
-            }
-            Err(error) => {
-                let result = ToolResult::failure_from(&self.draft, error.clone());
-                self.messages.push(Message::tool(call.id, result.as_json()));
-                self.fail_intent(error)
-            }
-        }
+        Ok(call)
     }
 }
 fn valid_tool_call_ids(calls: &[ToolCall]) -> bool {

@@ -6,20 +6,26 @@ use crate::errors::StructuredError;
 use crate::intent::{IntentWorkspaceV1, MissingDecision};
 
 use super::decision::IntentRouteDecisionV2;
+use super::evidence::IntentRecipeEvidenceV3;
 use super::state::intent_error;
 
-const AWAITING_DECISION_BINDING_DOMAIN_V2: &[u8] =
-    b"starring.intent.stage_binding.awaiting_decision.v2\0";
-const PREVIEW_READY_BINDING_DOMAIN_V2: &[u8] = b"starring.intent.stage_binding.preview_ready.v2\0";
+const AWAITING_DECISION_BINDING_DOMAIN_V3: &[u8] =
+    b"starring.intent.stage_binding.awaiting_decision.v3\0";
+const PREVIEW_READY_BINDING_DOMAIN_V3: &[u8] = b"starring.intent.stage_binding.preview_ready.v3\0";
 
-pub(super) struct AwaitingDecisionBindingInputV2<'a> {
+pub(super) struct AwaitingDecisionBindingInputV3<'a> {
+    pub(super) protocol_version: u16,
+    pub(super) context_fingerprint: &'a str,
     pub(super) root_draft_revision: u64,
     pub(super) workspace: &'a IntentWorkspaceV1,
     pub(super) active_decision: &'a MissingDecision,
     pub(super) route_decision: &'a IntentRouteDecisionV2,
+    pub(super) recipe_evidence: &'a IntentRecipeEvidenceV3,
 }
 
-pub(super) struct PreviewReadyBindingInputV2<'a> {
+pub(super) struct PreviewReadyBindingInputV3<'a> {
+    pub(super) protocol_version: u16,
+    pub(super) context_fingerprint: &'a str,
     pub(super) root_draft_revision: u64,
     pub(super) workspace: &'a IntentWorkspaceV1,
     pub(super) intent_revision: u64,
@@ -30,25 +36,32 @@ pub(super) struct PreviewReadyBindingInputV2<'a> {
     pub(super) external_channel_bindings: &'a [String],
     pub(super) compiled_operations: usize,
     pub(super) route_decision: &'a IntentRouteDecisionV2,
+    pub(super) recipe_evidence: &'a IntentRecipeEvidenceV3,
 }
 
-pub(super) fn awaiting_decision_binding_digest_v2(
-    input: AwaitingDecisionBindingInputV2<'_>,
+pub(super) fn awaiting_decision_binding_digest_v3(
+    input: AwaitingDecisionBindingInputV3<'_>,
 ) -> Result<String, StructuredError> {
-    let projection = AwaitingDecisionBindingProjectionV2 {
+    let projection = AwaitingDecisionBindingProjectionV3 {
+        protocol_version: input.protocol_version,
+        context_fingerprint: input.context_fingerprint,
         route_decision_adjudication_digest: input.route_decision.adjudication_digest(),
+        recipe_evidence: input.recipe_evidence,
         root_draft_revision: input.root_draft_revision,
         workspace: input.workspace,
         active_decision: input.active_decision,
     };
-    digest_binding(AWAITING_DECISION_BINDING_DOMAIN_V2, &projection)
+    digest_binding(AWAITING_DECISION_BINDING_DOMAIN_V3, &projection)
 }
 
-pub(super) fn preview_ready_binding_digest_v2(
-    input: PreviewReadyBindingInputV2<'_>,
+pub(super) fn preview_ready_binding_digest_v3(
+    input: PreviewReadyBindingInputV3<'_>,
 ) -> Result<String, StructuredError> {
-    let projection = PreviewReadyBindingProjectionV2 {
+    let projection = PreviewReadyBindingProjectionV3 {
+        protocol_version: input.protocol_version,
+        context_fingerprint: input.context_fingerprint,
         route_decision_adjudication_digest: input.route_decision.adjudication_digest(),
+        recipe_evidence: input.recipe_evidence,
         root_draft_revision: input.root_draft_revision,
         workspace: input.workspace,
         intent_revision: input.intent_revision,
@@ -59,20 +72,26 @@ pub(super) fn preview_ready_binding_digest_v2(
         external_channel_bindings: input.external_channel_bindings,
         compiled_operations: input.compiled_operations,
     };
-    digest_binding(PREVIEW_READY_BINDING_DOMAIN_V2, &projection)
+    digest_binding(PREVIEW_READY_BINDING_DOMAIN_V3, &projection)
 }
 
 #[derive(Serialize)]
-struct AwaitingDecisionBindingProjectionV2<'a> {
+struct AwaitingDecisionBindingProjectionV3<'a> {
+    protocol_version: u16,
+    context_fingerprint: &'a str,
     route_decision_adjudication_digest: &'a str,
+    recipe_evidence: &'a IntentRecipeEvidenceV3,
     root_draft_revision: u64,
     workspace: &'a IntentWorkspaceV1,
     active_decision: &'a MissingDecision,
 }
 
 #[derive(Serialize)]
-struct PreviewReadyBindingProjectionV2<'a> {
+struct PreviewReadyBindingProjectionV3<'a> {
+    protocol_version: u16,
+    context_fingerprint: &'a str,
     route_decision_adjudication_digest: &'a str,
+    recipe_evidence: &'a IntentRecipeEvidenceV3,
     root_draft_revision: u64,
     workspace: &'a IntentWorkspaceV1,
     intent_revision: u64,
