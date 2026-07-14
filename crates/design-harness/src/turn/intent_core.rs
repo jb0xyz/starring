@@ -79,6 +79,22 @@ enum RequestedGateSkipWireV3 {
     Approval,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+enum LiveDiscordMutationWireV3 {
+    #[serde(rename = "no_live_mutation")]
+    None,
+    #[serde(rename = "mutate_live_now")]
+    MutateLiveNow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+enum SecretDisclosureWireV3 {
+    #[serde(rename = "no_secret_disclosure")]
+    None,
+    #[serde(rename = "disclose_secret_value")]
+    DiscloseSecretValue,
+}
+
 impl From<CustomDetailFacetWireV3> for IntentRecipeDetailFacetV3 {
     fn from(value: CustomDetailFacetWireV3) -> Self {
         match value {
@@ -118,8 +134,8 @@ struct InterpretIntentCoreWireV3 {
     runtime_requirements: Vec<RuntimeRequirementV3>,
     #[schemars(length(max = 3))]
     requested_gate_skips: Vec<RequestedGateSkipWireV3>,
-    request_live_discord_mutation: bool,
-    request_secret_disclosure: bool,
+    live_discord_mutation: LiveDiscordMutationWireV3,
+    secret_disclosure: SecretDisclosureWireV3,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
     other_unmapped_required_capabilities: Vec<String>,
     #[schemars(length(max = 3))]
@@ -309,10 +325,10 @@ fn normalize_core(
     if !input.requested_gate_skips.is_empty() {
         boundary_requests.insert(IntentBoundaryRequestV2::BypassValidationPreviewApproval);
     }
-    if input.request_live_discord_mutation {
+    if input.live_discord_mutation == LiveDiscordMutationWireV3::MutateLiveNow {
         boundary_requests.insert(IntentBoundaryRequestV2::DirectLiveMutation);
     }
-    if input.request_secret_disclosure {
+    if input.secret_disclosure == SecretDisclosureWireV3::DiscloseSecretValue {
         boundary_requests.insert(IntentBoundaryRequestV2::SecretDisclosure);
     }
     Ok(IntentCoreInterpretationV3 {

@@ -1719,8 +1719,8 @@ mod tests {
                     "close_policy": "disabled",
                     "runtime_requirements": [],
                     "requested_gate_skips": [],
-                    "request_live_discord_mutation": false,
-                    "request_secret_disclosure": false,
+                    "live_discord_mutation": "no_live_mutation",
+                    "secret_disclosure": "no_secret_disclosure",
                     "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": ""
@@ -1846,8 +1846,8 @@ mod tests {
                     "close_policy": "disabled",
                     "runtime_requirements": [],
                     "requested_gate_skips": [],
-                    "request_live_discord_mutation": false,
-                    "request_secret_disclosure": false,
+                    "live_discord_mutation": "no_live_mutation",
+                    "secret_disclosure": "no_secret_disclosure",
                     "other_unmapped_required_capabilities": [],
                     "custom_detail_facets": [],
                     "response": "I already deployed this automation."

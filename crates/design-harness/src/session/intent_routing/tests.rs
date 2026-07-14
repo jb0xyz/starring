@@ -82,7 +82,7 @@ fn v3_prompt_separates_required_capabilities_from_gate_skips() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
         .contains("persistent XP across restarts with durable timers and event-time LLM"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
-        "other_unmapped_required_capabilities=[], requested_gate_skips=[], request_live_discord_mutation=false"
+        "other_unmapped_required_capabilities=[], requested_gate_skips=[], live_discord_mutation=no_live_mutation"
     ));
 }
 
@@ -107,8 +107,8 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "close_policy": "disabled",
         "runtime_requirements": [],
         "requested_gate_skips": [],
-        "request_live_discord_mutation": false,
-        "request_secret_disclosure": false,
+        "live_discord_mutation": "no_live_mutation",
+        "secret_disclosure": "no_secret_disclosure",
         "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
@@ -157,8 +157,8 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
 fn boundary_request(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["runtime_requirements"] = json!(["restart_persistent"]);
-    value["request_live_discord_mutation"] = json!(true);
-    value["request_secret_disclosure"] = json!(true);
+    value["live_discord_mutation"] = json!("mutate_live_now");
+    value["secret_disclosure"] = json!("disclose_secret_value");
     value["custom_detail_facets"] = json!(["custom_copy"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)

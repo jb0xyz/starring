@@ -22,8 +22,8 @@ fn valid_core() -> Value {
         "close_policy": "disabled",
         "runtime_requirements": [],
         "requested_gate_skips": [],
-        "request_live_discord_mutation": false,
-        "request_secret_disclosure": false,
+        "live_discord_mutation": "no_live_mutation",
+        "secret_disclosure": "no_secret_disclosure",
         "other_unmapped_required_capabilities": [],
         "custom_detail_facets": [],
         "response": ""
@@ -43,8 +43,8 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         strings([
             "automation_kind",
             "requested_gate_skips",
-            "request_live_discord_mutation",
-            "request_secret_disclosure",
+            "live_discord_mutation",
+            "secret_disclosure",
             "close_policy",
             "expected_revision",
             "language",
@@ -86,6 +86,14 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         tool.parameters["properties"]["requested_gate_skips"]["items"]["enum"],
         json!(["validation", "preview", "approval"])
     );
+    assert_eq!(
+        tool.parameters["properties"]["live_discord_mutation"]["enum"],
+        json!(["no_live_mutation", "mutate_live_now"])
+    );
+    assert_eq!(
+        tool.parameters["properties"]["secret_disclosure"]["enum"],
+        json!(["no_secret_disclosure", "disclose_secret_value"])
+    );
     let schema_text = tool.parameters.to_string();
     assert!(!schema_text.contains("$defs"));
     assert!(!schema_text.contains("$ref"));
@@ -122,8 +130,8 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
     let mut value = valid_core();
     value["hub_channel"] = Value::Null;
     value["requested_gate_skips"] = json!(["approval", "validation", "approval"]);
-    value["request_live_discord_mutation"] = json!(true);
-    value["request_secret_disclosure"] = json!(true);
+    value["live_discord_mutation"] = json!("mutate_live_now");
+    value["secret_disclosure"] = json!("disclose_secret_value");
     value["other_unmapped_required_capabilities"] = json!([
         "  external   scheduler lease ",
         "cross-service quorum",
