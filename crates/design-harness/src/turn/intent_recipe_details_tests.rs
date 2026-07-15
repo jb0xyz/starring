@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use super::{
     analyze_private_study_room_details, parse_private_study_room_details,
     parse_private_study_room_details_for_active_serving,
+    parse_private_study_room_details_for_active_serving_with_parameters,
     parse_private_study_room_details_for_serving, private_study_room_details_frontier,
     private_study_room_details_frontier_for, private_study_room_details_frontier_for_fields,
     IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
@@ -223,6 +224,62 @@ fn active_field_parser_requires_exact_leaf_shape_and_restores_empty_affix_counte
         .unwrap_err();
         assert_eq!(error.code, "RECIPE_DETAIL_FRONTIER_MISMATCH");
     }
+}
+
+#[test]
+fn active_field_parser_reuses_the_exact_served_schema_without_contract_drift() {
+    let human = "Set the Help button label to 'Guide' and its response to 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let facets = [IntentRecipeDetailFacetV3::Controls];
+    let [tool] =
+        private_study_room_details_frontier_for_fields(&facets, analysis.fields()).unwrap();
+    let arguments = json!({
+        "controls": {"help_label": "Guide", "help_response": "Read this first"}
+    })
+    .to_string();
+    let rebuilt = parse_private_study_room_details_for_active_serving(
+        &arguments,
+        &facets,
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    let reused = parse_private_study_room_details_for_active_serving_with_parameters(
+        &arguments,
+        &facets,
+        analysis.expectations(),
+        &tool.parameters,
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    assert_eq!(reused, rebuilt);
+
+    let invalid = r#"{"controls":{"help_label":"Guide"}}"#;
+    let rebuilt = parse_private_study_room_details_for_active_serving(
+        invalid,
+        &facets,
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap_err();
+    let reused = parse_private_study_room_details_for_active_serving_with_parameters(
+        invalid,
+        &facets,
+        analysis.expectations(),
+        &tool.parameters,
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap_err();
+    assert_eq!(reused.code, rebuilt.code);
+    assert_eq!(reused.location, rebuilt.location);
 }
 
 #[test]

@@ -579,8 +579,8 @@ fn human_grounding_reclassifies_exact_supported_recipe_details() {
     ]);
     let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
 
-    parsed
-        .apply_human_grounding(
+    let detail_ticket = parsed
+        .apply_human_grounding_with_detail_ticket(
             human,
             Some(&ExistingChannelKey("community_hub".to_string())),
         )
@@ -594,6 +594,24 @@ fn human_grounding_reclassifies_exact_supported_recipe_details() {
             IntentRecipeDetailFacetV3::Naming,
             IntentRecipeDetailFacetV3::Controls
         ]
+    );
+    assert_eq!(detail_ticket.facets(), parsed.recipe_detail_facets());
+    assert_eq!(
+        detail_ticket.fields(),
+        &[
+            super::IntentRecipeDetailFieldV4::CreateButtonLabel,
+            super::IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            super::IntentRecipeDetailFieldV4::HelpLabel,
+            super::IntentRecipeDetailFieldV4::HelpResponse,
+        ]
+    );
+    assert_eq!(
+        detail_ticket.fields(),
+        detail_ticket
+            .expectations()
+            .iter()
+            .map(super::IntentRecipeDetailExpectationV4::field)
+            .collect::<Vec<_>>()
     );
 }
 

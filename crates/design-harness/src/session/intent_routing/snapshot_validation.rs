@@ -7,8 +7,8 @@ use crate::intent::{
 };
 use crate::llm::Message;
 use crate::turn::{
-    analyze_private_study_room_details, parse_private_study_room_details_for_active_serving,
-    INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
+    parse_private_study_room_details_for_active_serving_with_parameters, INTERPRET_INTENT_CORE,
+    RESOLVE_INTENT_DECISION,
 };
 use resource_resolution::ResourceBindingMap;
 
@@ -598,6 +598,7 @@ fn validate_initial_semantics_replay(
         if turn.detail_arguments.is_some()
             || !turn.detail_facets.is_empty()
             || !turn.detail_fields.is_empty()
+            || replayed.detail_parameters.is_some()
         {
             return Err(snapshot_error(
                 "default recipe extraction contains an unexpected detail frontier",
@@ -624,8 +625,7 @@ fn validate_initial_semantics_replay(
                 "detail state facets do not reproduce from the initial Core",
             ));
         }
-        let detail_analysis = analyze_private_study_room_details(human);
-        if turn.detail_fields.as_slice() != detail_analysis.fields() {
+        if turn.detail_fields.as_slice() != replayed.detail_ticket.fields() {
             return Err(snapshot_error(
                 "detail state fields do not reproduce from the source human turn",
             ));
@@ -634,10 +634,14 @@ fn validate_initial_semantics_replay(
             .detail_arguments
             .as_deref()
             .ok_or_else(|| snapshot_error("persisted detail arguments are missing"))?;
-        let details = parse_private_study_room_details_for_active_serving(
+        let detail_parameters = replayed.detail_parameters.as_ref().ok_or_else(|| {
+            snapshot_error("replayed detail frontier is missing its serving parameters")
+        })?;
+        let details = parse_private_study_room_details_for_active_serving_with_parameters(
             detail_arguments,
             selection.detail_facets(),
-            detail_analysis.expectations(),
+            replayed.detail_ticket.expectations(),
+            detail_parameters,
             selection.expected_revision(),
             selection.semantic_ir_digest(),
             human,

@@ -14,11 +14,15 @@ use super::intent_detail_syntax::{
 use super::intent_detail_text::{closes_quote, normalized_whitespace, opening_quote};
 
 pub(crate) struct PrivateStudyRoomDetailAnalysis {
+    ticket: PrivateStudyRoomDetailTicketV4,
+    normalized_human: String,
+    evidence_entries: Vec<IndexedDetailEvidence>,
+}
+
+pub(crate) struct PrivateStudyRoomDetailTicketV4 {
     facets: Vec<IntentRecipeDetailFacetV3>,
     expectations: Vec<IntentRecipeDetailExpectationV4>,
     fields: Vec<IntentRecipeDetailFieldV4>,
-    normalized_human: String,
-    evidence_entries: Vec<IndexedDetailEvidence>,
 }
 
 struct DetailEvidenceEntry {
@@ -89,16 +93,23 @@ impl IndexedDetailEvidence {
 }
 
 impl PrivateStudyRoomDetailAnalysis {
+    #[cfg(test)]
     pub(super) fn facets(&self) -> &[IntentRecipeDetailFacetV3] {
-        &self.facets
+        self.ticket.facets()
     }
 
+    #[cfg(test)]
     pub(crate) fn fields(&self) -> &[IntentRecipeDetailFieldV4] {
-        &self.fields
+        self.ticket.fields()
     }
 
+    #[cfg(test)]
     pub(crate) fn expectations(&self) -> &[IntentRecipeDetailExpectationV4] {
-        &self.expectations
+        self.ticket.expectations()
+    }
+
+    pub(crate) fn into_ticket(self) -> PrivateStudyRoomDetailTicketV4 {
+        self.ticket
     }
 
     pub(super) fn explains_requirement(&self, requirement: &str) -> bool {
@@ -119,6 +130,28 @@ impl PrivateStudyRoomDetailAnalysis {
             .map(|entry| entry.supported_occurrences(&requirement))
             .sum::<usize>();
         supported_occurrences == total_occurrences
+    }
+}
+
+impl PrivateStudyRoomDetailTicketV4 {
+    pub(crate) fn empty() -> Self {
+        Self {
+            facets: Vec::new(),
+            expectations: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    pub(crate) fn facets(&self) -> &[IntentRecipeDetailFacetV3] {
+        &self.facets
+    }
+
+    pub(crate) fn fields(&self) -> &[IntentRecipeDetailFieldV4] {
+        &self.fields
+    }
+
+    pub(crate) fn expectations(&self) -> &[IntentRecipeDetailExpectationV4] {
+        &self.expectations
     }
 }
 
@@ -175,9 +208,11 @@ pub(crate) fn analyze_private_study_room_details(
         .iter()
         .all(|expectation| !expectation.literal().is_empty()));
     PrivateStudyRoomDetailAnalysis {
-        facets: facets.into_iter().collect(),
-        expectations,
-        fields,
+        ticket: PrivateStudyRoomDetailTicketV4 {
+            facets: facets.into_iter().collect(),
+            expectations,
+            fields,
+        },
         normalized_human: normalized_whitespace(human_message),
         evidence_entries,
     }
@@ -212,9 +247,7 @@ fn all_slots_have_material_values(assignments: &[DetailAssignmentClaim]) -> bool
 
 fn empty_detail_analysis(human_message: &str) -> PrivateStudyRoomDetailAnalysis {
     PrivateStudyRoomDetailAnalysis {
-        facets: Vec::new(),
-        expectations: Vec::new(),
-        fields: Vec::new(),
+        ticket: PrivateStudyRoomDetailTicketV4::empty(),
         normalized_human: normalized_whitespace(human_message),
         evidence_entries: Vec::new(),
     }

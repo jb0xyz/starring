@@ -13,7 +13,9 @@ use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
     reconcile_unmapped_capabilities, CapabilityReconciliationError,
 };
-use super::intent_detail_requirement::analyze_private_study_room_details;
+use super::intent_detail_requirement::{
+    analyze_private_study_room_details, PrivateStudyRoomDetailTicketV4,
+};
 use super::intent_interpretation::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
@@ -216,6 +218,15 @@ impl IntentCoreInterpretationV4 {
         human_message: &str,
         grounded_channel: Option<&ExistingChannelKey>,
     ) -> Result<(), StructuredError> {
+        self.apply_human_grounding_with_detail_ticket(human_message, grounded_channel)
+            .map(|_| ())
+    }
+
+    pub(crate) fn apply_human_grounding_with_detail_ticket(
+        &mut self,
+        human_message: &str,
+        grounded_channel: Option<&ExistingChannelKey>,
+    ) -> Result<PrivateStudyRoomDetailTicketV4, StructuredError> {
         let canonical_human = canonical_human_message(human_message);
         let mut unclassified_requirements = if self.request_mode == IntentRequestModeV2::Discussion
         {
@@ -230,13 +241,13 @@ impl IntentCoreInterpretationV4 {
         };
         let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
             && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
-        let detail_facets = if managed_private_study_room {
+        let detail_ticket = if managed_private_study_room {
             let analysis = analyze_private_study_room_details(human_message);
             unclassified_requirements
                 .retain(|requirement| !analysis.explains_requirement(requirement));
-            analysis.facets().to_vec()
+            analysis.into_ticket()
         } else {
-            Vec::new()
+            PrivateStudyRoomDetailTicketV4::empty()
         };
         let boundary_analysis = analyze_safety_boundaries(human_message);
         unclassified_requirements
@@ -250,8 +261,8 @@ impl IntentCoreInterpretationV4 {
         self.apply_human_grounded_channel(grounded_channel);
         self.boundary_requests = boundary_requests;
         self.unclassified_requirements = unclassified_requirements;
-        self.detail_facets = detail_facets;
-        Ok(())
+        self.detail_facets = detail_ticket.facets().to_vec();
+        Ok(detail_ticket)
     }
 
     pub fn locale(&self) -> IntentLocaleHintV2 {

@@ -7,9 +7,8 @@ use serde_json::json;
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
-    analyze_private_study_room_details, private_study_room_details_frontier_for_fields,
-    validate_intent_human_grounding_size, IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4,
-    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    private_study_room_details_frontier_for_fields, validate_intent_human_grounding_size,
+    IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
@@ -761,21 +760,20 @@ impl<C: LlmClient> DesignSession<C> {
                     Ok(IntentCoreExecutionV4::NeedsDetails {
                         selection,
                         request_evidence,
+                        detail_ticket,
                     }) => {
-                        let detail_analysis = analyze_private_study_room_details(human_message);
-                        let detail_fields = detail_analysis.fields().to_vec();
                         let (detail_state, detail_anchor) =
-                            match self.intent_detail_state(&selection, &detail_fields) {
+                            match self.intent_detail_state(&selection, detail_ticket.fields()) {
                                 Ok(state) => state,
                                 Err(error) => {
                                     return self.finish_intent_tool_execution(call, Err(error));
                                 }
                             };
-                        let tools: Vec<_> = match private_study_room_details_frontier_for_fields(
+                        let tools = match private_study_room_details_frontier_for_fields(
                             selection.detail_facets(),
-                            &detail_fields,
+                            detail_ticket.fields(),
                         ) {
-                            Ok(frontier) => frontier.into(),
+                            Ok(frontier) => frontier,
                             Err(error) => {
                                 return self.finish_intent_tool_execution(call, Err(error));
                             }
@@ -803,7 +801,8 @@ impl<C: LlmClient> DesignSession<C> {
                                 request_evidence,
                                 &detail_call.arguments,
                                 human_message,
-                                detail_analysis.expectations(),
+                                detail_ticket.expectations(),
+                                &tools[0].parameters,
                             )
                             .await;
                         self.finish_intent_tool_execution(detail_call, result)

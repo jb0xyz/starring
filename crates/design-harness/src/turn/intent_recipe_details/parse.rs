@@ -7,11 +7,10 @@ use crate::strict_json::{parse_json_with_unique_object_keys, StrictJsonError};
 use super::super::schema::inline_schema_value;
 use super::super::IntentRecipeDetailExpectationV4;
 #[cfg(test)]
-use super::schema::private_study_room_details_serving_schema;
 use super::schema::{
-    private_study_room_details_serving_schema_for_fields, validate_serving_leaf_keys,
-    validate_serving_root_keys,
+    private_study_room_details_serving_schema, private_study_room_details_serving_schema_for_fields,
 };
+use super::schema::{validate_serving_leaf_keys, validate_serving_root_keys};
 use super::validation::{
     detail_error, finalize_private_study_room_details, validate_expected_detail_literals,
 };
@@ -80,6 +79,7 @@ pub(crate) fn parse_private_study_room_details_for_serving(
     Ok(details)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_private_study_room_details_for_active_serving(
     arguments: &str,
     required_facets: &[IntentRecipeDetailFacetV3],
@@ -94,12 +94,36 @@ pub(crate) fn parse_private_study_room_details_for_active_serving(
         .collect::<Vec<_>>();
     let parameters =
         private_study_room_details_serving_schema_for_fields(required_facets, &required_fields)?;
-    let value = parse_serving_json(arguments, &parameters)?;
+    parse_private_study_room_details_for_active_serving_with_parameters(
+        arguments,
+        required_facets,
+        expectations,
+        &parameters,
+        expected_revision,
+        expected_core_semantic_digest,
+        human_message,
+    )
+}
+
+pub(crate) fn parse_private_study_room_details_for_active_serving_with_parameters(
+    arguments: &str,
+    required_facets: &[IntentRecipeDetailFacetV3],
+    expectations: &[IntentRecipeDetailExpectationV4],
+    parameters: &serde_json::Value,
+    expected_revision: u64,
+    expected_core_semantic_digest: &str,
+    human_message: &str,
+) -> Result<PrivateStudyRoomDetailsV1, StructuredError> {
+    let required_fields = expectations
+        .iter()
+        .map(IntentRecipeDetailExpectationV4::field)
+        .collect::<Vec<_>>();
+    let value = parse_serving_json(arguments, parameters)?;
     validate_serving_root_keys(&value, required_facets)?;
     validate_serving_leaf_keys(&value, required_facets, &required_fields)?;
     let input = serde_json::from_value::<ExtractPrivateStudyRoomDetailsServingWireV2>(value)
         .map_err(|error| {
-            translate_tool_arguments_error(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &error, &parameters)
+            translate_tool_arguments_error(EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, &error, parameters)
         })?;
     let details = finalize_private_study_room_details(
         PrivateStudyRoomDetailsCandidateV1 {

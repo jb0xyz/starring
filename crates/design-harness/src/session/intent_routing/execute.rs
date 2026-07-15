@@ -7,8 +7,9 @@ use crate::intent::{
     ValidatedIntentV2, INTENT_IDENTITY_REVISION,
 };
 use crate::turn::{
-    parse_interpret_intent_core_for_serving, parse_private_study_room_details_for_active_serving,
-    parse_resolve_intent_decision, IntentRecipeDetailExpectationV4,
+    parse_interpret_intent_core_for_serving,
+    parse_private_study_room_details_for_active_serving_with_parameters,
+    parse_resolve_intent_decision, IntentRecipeDetailExpectationV4, PrivateStudyRoomDetailTicketV4,
 };
 
 use super::super::DesignSession;
@@ -37,6 +38,7 @@ pub(super) enum IntentCoreExecutionV4 {
     NeedsDetails {
         selection: Box<PrivateStudyRoomSelectionV4>,
         request_evidence: IntentRequestEvidenceChainV1,
+        detail_ticket: PrivateStudyRoomDetailTicketV4,
     },
 }
 
@@ -392,7 +394,8 @@ impl<C> DesignSession<C> {
             .collect::<Vec<_>>();
         let grounded_channel = deterministically_selected_option(human_message, &channel_options)
             .map(crate::intent::ExistingChannelKey);
-        core.apply_human_grounding(human_message, grounded_channel.as_ref())
+        let detail_ticket = core
+            .apply_human_grounding_with_detail_ticket(human_message, grounded_channel.as_ref())
             .inspect_err(|_| {
                 self.record_intent_extraction_failure();
             })?;
@@ -408,6 +411,14 @@ impl<C> DesignSession<C> {
         })?;
         match adjudication {
             IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => {
+                if selection.detail_facets() != detail_ticket.facets() {
+                    return Err(intent_error(
+                        "INCONSISTENT_INTENT_DETAIL_TICKET",
+                        "intent.details",
+                        "The grounded detail ticket does not match the adjudicated Core",
+                        "Derive the detail ticket and Core facets from the same human analysis",
+                    ));
+                }
                 if selection.detail_facets().is_empty() {
                     let recipe_evidence = IntentRecipeEvidenceV4::deterministic_default(
                         selection.semantic_ir_digest(),
@@ -423,6 +434,7 @@ impl<C> DesignSession<C> {
                     Ok(IntentCoreExecutionV4::NeedsDetails {
                         selection,
                         request_evidence,
+                        detail_ticket,
                     })
                 }
             }
@@ -450,15 +462,17 @@ impl<C> DesignSession<C> {
         arguments: &str,
         human_message: &str,
         detail_expectations: &[IntentRecipeDetailExpectationV4],
+        detail_parameters: &serde_json::Value,
     ) -> Result<IntentTurnSuccess, StructuredError> {
         let expected_revision = selection.expected_revision();
         let core_semantic_digest = selection.semantic_ir_digest().to_string();
         let source_human_turn_digest = request_evidence.initial_human_turn_digest()?.to_string();
         let detail_facets = selection.detail_facets().to_vec();
-        let details = parse_private_study_room_details_for_active_serving(
+        let details = parse_private_study_room_details_for_active_serving_with_parameters(
             arguments,
             &detail_facets,
             detail_expectations,
+            detail_parameters,
             expected_revision,
             &core_semantic_digest,
             human_message,

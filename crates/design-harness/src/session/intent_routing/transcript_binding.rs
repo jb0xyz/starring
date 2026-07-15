@@ -9,8 +9,8 @@ use crate::intent::{
 };
 use crate::llm::Message;
 use crate::turn::{
-    analyze_private_study_room_details, parse_private_study_room_details_for_active_serving,
-    IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
+    parse_private_study_room_details_for_active_serving_with_parameters, IntentRecipeDetailFacetV3,
+    INTERPRET_INTENT_CORE,
 };
 use resource_resolution::ResourceBindingMap;
 
@@ -493,6 +493,7 @@ fn validate_private_core_result(
             || turn.detail_result.is_some()
             || !turn.detail_facets.is_empty()
             || !turn.detail_fields.is_empty()
+            || replayed.detail_parameters.is_some()
         {
             return Err(snapshot_error(
                 "default private Core contains an unexpected detail frontier",
@@ -522,8 +523,7 @@ fn validate_private_core_result(
             "private Core detail state does not match its replayed facets",
         ));
     }
-    let detail_analysis = analyze_private_study_room_details(human);
-    if turn.detail_fields.as_slice() != detail_analysis.fields() {
+    if turn.detail_fields.as_slice() != replayed.detail_ticket.fields() {
         return Err(snapshot_error(
             "private detail state fields do not match the source human turn",
         ));
@@ -535,10 +535,14 @@ fn validate_private_core_result(
         .detail_result
         .as_ref()
         .ok_or_else(|| snapshot_error("private detail transcript result is missing"))?;
-    let details = match parse_private_study_room_details_for_active_serving(
+    let detail_parameters = replayed.detail_parameters.as_ref().ok_or_else(|| {
+        snapshot_error("replayed private detail frontier is missing its serving parameters")
+    })?;
+    let details = match parse_private_study_room_details_for_active_serving_with_parameters(
         detail_arguments,
         &facets,
-        detail_analysis.expectations(),
+        replayed.detail_ticket.expectations(),
+        detail_parameters,
         selection.expected_revision(),
         selection.semantic_ir_digest(),
         human,

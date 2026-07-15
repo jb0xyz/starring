@@ -51,7 +51,9 @@ pub use intent_core::{
     interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV4,
     IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
 };
+#[cfg(test)]
 pub(crate) use intent_detail_requirement::analyze_private_study_room_details;
+pub(crate) use intent_detail_requirement::PrivateStudyRoomDetailTicketV4;
 pub(crate) use intent_detail_syntax::{IntentRecipeDetailExpectationV4, IntentRecipeDetailFieldV4};
 pub use intent_interpretation::{
     interpret_intent_turn_frontier, parse_interpret_intent_turn, CloseAuthorizationV2,
@@ -70,13 +72,14 @@ pub use intent_recipe_details::{
     parse_private_study_room_details, private_study_room_details_frontier,
     PrivateStudyRoomDetailsV1, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
-pub(crate) use intent_recipe_details::{
-    parse_private_study_room_details_for_active_serving,
-    private_study_room_details_frontier_for_fields,
-};
 #[cfg(test)]
 pub(crate) use intent_recipe_details::{
+    parse_private_study_room_details_for_active_serving,
     parse_private_study_room_details_for_serving, private_study_room_details_frontier_for,
+};
+pub(crate) use intent_recipe_details::{
+    parse_private_study_room_details_for_active_serving_with_parameters,
+    private_study_room_details_frontier_for_fields,
 };
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{

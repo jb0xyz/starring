@@ -347,6 +347,13 @@ model arguments. Persisted tool-result JSON also rejects duplicate object keys
 before any value projection or typed binding. Any mismatch fails closed without
 retry, repair, compilation, or Draft mutation.
 
+The immutable detail ticket carries facets, canonical fields, and slot-literal
+expectations from the one grounding pass through live execution and replay.
+Consumers do not reanalyze the same human turn, and the exact schema instance
+served to the model is reused for response parsing and structured error shape.
+The ticket and schema cache are ephemeral derivations; snapshots persist only
+the path ticket and independently reproduce it from the preserved human turn.
+
 The decoder may accept the pre-release hidden boundary and detail fields for
 fixture and transcript compatibility, but serving schemas omit them and their
 values have no authority after human grounding. Missing hidden values always

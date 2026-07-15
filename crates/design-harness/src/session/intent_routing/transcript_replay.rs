@@ -1,7 +1,10 @@
 use crate::errors::StructuredError;
 use crate::intent::ExistingChannelKey;
 use crate::llm::Message;
-use crate::turn::parse_interpret_intent_core_for_serving;
+use crate::turn::{
+    parse_interpret_intent_core_for_serving, private_study_room_details_frontier_for_fields,
+    PrivateStudyRoomDetailTicketV4,
+};
 
 use super::super::SessionSnapshotError;
 use super::adjudicate::{
@@ -45,6 +48,8 @@ pub(super) struct ReplayedRoutedSemanticsV4 {
 
 pub(super) struct ReplayedPrivateSemanticsV4 {
     pub(super) selection: Box<PrivateStudyRoomSelectionV4>,
+    pub(super) detail_ticket: PrivateStudyRoomDetailTicketV4,
+    pub(super) detail_parameters: Option<serde_json::Value>,
     pub(super) human: String,
     pub(super) available_channel_keys: Vec<String>,
     pub(super) expected_revision: u64,
@@ -94,7 +99,8 @@ pub(super) fn replay_core_semantics(
             })?;
     let grounded_channel = deterministically_selected_option(&human, &state.available_channel_keys)
         .map(ExistingChannelKey);
-    core.apply_human_grounding(&human, grounded_channel.as_ref())
+    let detail_ticket = core
+        .apply_human_grounding_with_detail_ticket(&human, grounded_channel.as_ref())
         .map_err(|error| CoreReplayErrorV4::Semantic {
             error,
             revision: failure_revision,
@@ -123,9 +129,24 @@ pub(super) fn replay_core_semantics(
         }
     })? {
         IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => {
+            let detail_parameters = if selection.detail_facets().is_empty() {
+                None
+            } else {
+                let [tool] = private_study_room_details_frontier_for_fields(
+                    selection.detail_facets(),
+                    detail_ticket.fields(),
+                )
+                .map_err(|error| CoreReplayErrorV4::Semantic {
+                    error,
+                    revision: failure_revision,
+                })?;
+                Some(tool.parameters)
+            };
             return Ok(ReplayedCoreSemanticsV4::Private(
                 ReplayedPrivateSemanticsV4 {
                     selection,
+                    detail_ticket,
+                    detail_parameters,
                     human,
                     available_channel_keys: state.available_channel_keys,
                     expected_revision: state.expected_revision,
