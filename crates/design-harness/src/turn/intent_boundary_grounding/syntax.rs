@@ -47,6 +47,7 @@ pub(super) enum UnitLink {
     Start,
     Additive,
     Alternative,
+    ConditionalAlternative,
     Barrier,
 }
 
@@ -163,6 +164,8 @@ fn connector_at(visible: &[char], start: usize, end: usize) -> Option<(usize, Un
 fn connector_link(connector: &str) -> UnitLink {
     if connector == " or " {
         UnitLink::Alternative
+    } else if connector == " unless " {
+        UnitLink::ConditionalAlternative
     } else if matches!(
         connector,
         " and then "

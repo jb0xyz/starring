@@ -185,19 +185,9 @@ fn creator_only(expected_revision: u64, response: &str) -> LlmResponse {
 fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["automation_kind"] = json!("custom_automation");
-    value["runtime_requirements"] = json!([
-        "restart_persistent",
-        "durable_timer",
-        "persistent_economy",
-        "event_time_llm"
-    ]);
-    value["other_unmapped_required_capabilities"] = json!([
-        "LLM decides rewards at event time",
-        "do not reduce the request to static responses",
-        "every message earns XP",
-        "levels unlock an economy",
-        "timers advance quests"
-    ]);
+    value["runtime_requirements"] = json!([]);
+    value["other_unmapped_required_capabilities"] =
+        json!(["do not reduce the request to static responses"]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -1150,6 +1140,57 @@ fn model_core_revision_is_bound_by_the_harness_before_compilation() {
         )
         .unwrap();
 
+        assert_eq!(restored.draft, expected_draft);
+        assert_eq!(receipt(&restored), expected_receipt);
+    });
+}
+
+#[test]
+fn discussion_runtime_language_cannot_contaminate_the_next_build() {
+    block_on(async {
+        let mut contaminated = private_room_value(99, Some("community_hub"));
+        contaminated["runtime_requirements"] = json!([
+            "restart_persistent",
+            "durable_timer",
+            "persistent_economy",
+            "event_time_llm"
+        ]);
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![
+            Ok(discussion(
+                99,
+                "Private rooms can use timers, but they can also feel rigid.",
+            )),
+            Ok(interpretation_call("build", contaminated)),
+        ]);
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+
+        assert!(matches!(
+            session
+                .run_burst("Let's brainstorm private study-room tradeoffs only.")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Now build the managed private study-room automation and prepare its validated preview. Use community_hub and leave closing disabled.",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert_eq!(session.observability.intent_commits, 1);
+        assert_eq!(session.observability.intent_stale_revision_rejections, 0);
+
+        let expected_draft = session.draft.clone();
+        let expected_receipt = receipt(&session);
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            session.snapshot(),
+            resource_bindings,
+        )
+        .unwrap();
         assert_eq!(restored.draft, expected_draft);
         assert_eq!(receipt(&restored), expected_receipt);
     });
@@ -2870,28 +2911,36 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
         let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
         session.append_intent_state_anchor().unwrap();
         let state_anchor = session.messages.pop().unwrap();
+        let current_human = "Continue the current discussion without changing the Draft";
+        let current_envelope = Message::user(intent_human_envelope(current_human));
+        let prior_human = Message::user(intent_human_envelope(
+            "Discussion only for now; compare room UX without changing the Draft",
+        ));
         let fixed_size = session
             .messages
             .iter()
             .map(|message| message.estimated_chars().saturating_add(96))
-            .sum::<usize>();
-        let empty_envelope = Message::user(intent_human_envelope(""));
-        let human_overhead = empty_envelope.estimated_chars().saturating_add(96);
+            .sum::<usize>()
+            .saturating_add(prior_human.estimated_chars().saturating_add(96))
+            .saturating_add(96)
+            .saturating_add(current_envelope.estimated_chars().saturating_add(96));
         let filler_size = MAX_INTENT_RESTORED_TRANSCRIPT_CHARS
             .checked_sub(fixed_size)
-            .and_then(|remaining| remaining.checked_sub(human_overhead))
             .unwrap();
-        let near_limit_human = "x".repeat(filler_size);
-        let human_envelope = Message::user(intent_human_envelope(&near_limit_human));
+        session.messages.push(prior_human);
+        session
+            .messages
+            .push(Message::assistant("x".repeat(filler_size)));
         assert!(intent_transcript_fits_added_message(
             &session.messages,
-            &human_envelope
+            &current_envelope
         ));
         let mut projected = session.messages.clone();
-        projected.push(human_envelope);
+        projected.push(current_envelope);
         projected.push(state_anchor);
         assert!(!intent_transcript_fits_durable_bound(&projected));
-        let BurstOutcome::Halted(report) = session.run_burst(&near_limit_human).await else {
+        let checkpoint = session.snapshot();
+        let BurstOutcome::Halted(report) = session.run_burst(current_human).await else {
             panic!("state-anchor overflow was admitted")
         };
         assert_eq!(report.code, "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED");
@@ -2900,7 +2949,7 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
             Some(LimitKind::DurableTranscriptChars)
         );
         assert!(probe.calls().is_empty());
-        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.snapshot(), checkpoint);
         assert_eq!(session.observability.model_calls, 0);
 
         let client = ScriptedClient::new(Vec::new());
@@ -2910,11 +2959,8 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
         let BurstOutcome::Halted(report) = session.run_burst(&oversized_human).await else {
             panic!("oversized human message was admitted")
         };
-        assert_eq!(report.code, "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED");
-        assert_eq!(
-            report.exhausted_limit,
-            Some(LimitKind::DurableTranscriptChars)
-        );
+        assert_eq!(report.code, "INTENT_HUMAN_MESSAGE_TOO_LARGE");
+        assert_eq!(report.exhausted_limit, None);
         assert!(probe.calls().is_empty());
         assert_eq!(session.messages.len(), 1);
         let snapshot = session.snapshot();
@@ -2926,6 +2972,25 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
             resource_bindings,
         )
         .expect("rejected oversized human message should remain restorable");
+    });
+}
+
+#[test]
+fn oversized_current_human_halts_before_model_or_draft_mutation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        let BurstOutcome::Halted(report) = session.run_burst(&"x".repeat(64 * 1024 + 1)).await
+        else {
+            panic!("oversized current human message was admitted")
+        };
+        assert_eq!(report.code, "INTENT_HUMAN_MESSAGE_TOO_LARGE");
+        assert!(probe.calls().is_empty());
+        assert_eq!(session.draft.draft_revision, 0);
+        assert_eq!(session.observability.model_calls, 0);
     });
 }
 

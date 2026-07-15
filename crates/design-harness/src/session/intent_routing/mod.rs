@@ -7,8 +7,8 @@ use serde_json::json;
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
-    private_study_room_details_frontier_for, IntentRecipeDetailFacetV3,
-    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    private_study_room_details_frontier_for, validate_intent_human_grounding_size,
+    IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
@@ -660,6 +660,9 @@ impl<C: LlmClient> DesignSession<C> {
         &mut self,
         human_message: &str,
     ) -> super::BurstOutcome {
+        if let Err(error) = validate_intent_human_grounding_size(human_message) {
+            return self.fail_intent(error);
+        }
         let human_envelope = Message::user(intent_human_envelope(human_message));
         if let Some(limit) =
             durable_transcript_violation_with_added(&self.messages, &human_envelope)

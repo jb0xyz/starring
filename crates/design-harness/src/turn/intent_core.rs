@@ -19,9 +19,16 @@ use super::intent_interpretation::{
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
     TimerRequirementV2,
 };
-use super::intent_request_mode_grounding::grounded_request_controls;
+use super::intent_request_mode_grounding::{grounded_request_controls, GroundedSemanticUnit};
+use super::intent_runtime_grounding::{
+    ground_runtime_requirements, RuntimeGroundingAmbiguity, RuntimeGroundingError,
+    RuntimeRequirementAxis,
+};
 use super::intent_text::{normalized_required_text, validate_text_shape};
 use super::schema::inline_schema_value;
+
+pub(crate) const MAX_INTENT_GROUNDED_HUMAN_BYTES: usize = 64 * 1024;
+const MAX_INTENT_GROUNDED_SEMANTIC_UNITS: usize = 2_048;
 
 pub const INTERPRET_INTENT_CORE: &str = "interpret_intent_core";
 
@@ -390,7 +397,22 @@ fn parse_grounded_intent_core(
     human_message: &str,
     expected_revision: Option<u64>,
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    validate_intent_human_grounding_size(human_message)?;
     let grounded = grounded_request_controls(human_message);
+    if grounded
+        .active_semantic_units
+        .as_ref()
+        .is_some_and(|units| units.len() > MAX_INTENT_GROUNDED_SEMANTIC_UNITS)
+    {
+        return Err(core_error(
+            "INTENT_HUMAN_MESSAGE_TOO_FRAGMENTED",
+            "intent.human_message",
+            format!(
+                "The current human message exceeds {MAX_INTENT_GROUNDED_SEMANTIC_UNITS} semantic units"
+            ),
+            "Split the request into smaller conversational turns",
+        ));
+    }
     let mut input = match parse_core_wire(arguments) {
         Ok(input) => input,
         Err(error)
@@ -405,7 +427,22 @@ fn parse_grounded_intent_core(
         input.expected_revision = expected_revision;
     }
     apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
+    apply_grounded_runtime_requirements(&mut input, grounded.active_semantic_units.as_deref())?;
     normalize_core(input)
+}
+
+pub(crate) fn validate_intent_human_grounding_size(
+    human_message: &str,
+) -> Result<(), StructuredError> {
+    if human_message.len() > MAX_INTENT_GROUNDED_HUMAN_BYTES {
+        return Err(core_error(
+            "INTENT_HUMAN_MESSAGE_TOO_LARGE",
+            "intent.human_message",
+            format!("The current human message exceeds {MAX_INTENT_GROUNDED_HUMAN_BYTES} bytes"),
+            "Split the request into smaller conversational turns",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_core_wire(arguments: &str) -> Result<InterpretIntentCoreWireV4, StructuredError> {
@@ -489,6 +526,68 @@ fn apply_grounded_request_mode(
         }
         None => {}
     }
+}
+
+fn apply_grounded_runtime_requirements(
+    input: &mut InterpretIntentCoreWireV4,
+    active_semantic_units: Option<&[GroundedSemanticUnit]>,
+) -> Result<(), StructuredError> {
+    if input.request_mode == IntentRequestModeV2::Discussion {
+        input.runtime_requirements.clear();
+        return Ok(());
+    }
+    let active_semantic_units = active_semantic_units.ok_or_else(|| {
+        core_error(
+            "AMBIGUOUS_INTENT_RUNTIME_GROUNDING",
+            "intent.core.runtime_requirements",
+            "Runtime requirements cannot be grounded across an unbalanced quoted span",
+            "Close the quoted span so active runtime requirements are unambiguous",
+        )
+    })?;
+    let grounded = ground_runtime_requirements(active_semantic_units)
+        .map_err(ambiguous_runtime_grounding_error)?;
+    let mut values = Vec::new();
+    if grounded.persistence == PersistenceRequirementV2::RestartPersistent {
+        values.push(RuntimeRequirementV3::RestartPersistent);
+    }
+    if grounded.timers == TimerRequirementV2::Durable {
+        values.push(RuntimeRequirementV3::DurableTimer);
+    }
+    if grounded.economy == EconomyRequirementV2::PersistentLedger {
+        values.push(RuntimeRequirementV3::PersistentEconomy);
+    }
+    if grounded.event_time_llm {
+        values.push(RuntimeRequirementV3::EventTimeLlm);
+    }
+    input.runtime_requirements = values;
+    Ok(())
+}
+
+fn ambiguous_runtime_grounding_error(error: RuntimeGroundingError) -> StructuredError {
+    let axis = match error.axis {
+        RuntimeRequirementAxis::Persistence => "persistence",
+        RuntimeRequirementAxis::Timers => "timers",
+        RuntimeRequirementAxis::Economy => "economy",
+        RuntimeRequirementAxis::EventTimeLlm => "event_time_llm",
+    };
+    let (message, hint) = match error.ambiguity {
+        RuntimeGroundingAmbiguity::Conflict => (
+            format!("The human request both requires and rejects the {axis} runtime property"),
+            "Resolve the conflicting runtime requirements in one active instruction",
+        ),
+        RuntimeGroundingAmbiguity::Alternative => (
+            format!(
+                "The human request leaves the {axis} runtime property as an unresolved alternative"
+            ),
+            "Choose one runtime alternative before building the automation",
+        ),
+    };
+    core_error(
+        "AMBIGUOUS_INTENT_RUNTIME_GROUNDING",
+        format!("intent.core.runtime_requirements.{axis}"),
+        message,
+        hint,
+    )
 }
 
 fn deserialize_required_nullable_channel<'de, D>(

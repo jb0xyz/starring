@@ -199,11 +199,19 @@ fn validated_preview_requires_explicit_unquoted_language() {
         None
     );
     assert_eq!(
+        grounded_preview_preference("Build an automation. Set response text to no preview."),
+        None
+    );
+    assert_eq!(
         grounded_preview_preference("버튼 라벨은 검증된 미리보기로 해줘."),
         None
     );
     assert_eq!(
         grounded_preview_preference("패널 제목은 미리보기 없이로 해줘."),
+        None
+    );
+    assert_eq!(
+        grounded_preview_preference("게임 자동화를 만들고 상태 라벨은 미리보기 없이로 해줘."),
         None
     );
     assert_eq!(

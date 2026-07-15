@@ -449,6 +449,24 @@ paraphrases, unbalanced quotes, overlong evidence, and count overflow fail close
 The result remains sorted, bounded, exact-source evidence and neither compiles nor
 executes an unsupported capability.
 
+Normalizer V7 makes the four closed runtime properties harness-authoritative.
+The same quote-aware request scanner supplies only active current-human units;
+questions without a direct build, hypothetical language, copied prompt blocks,
+and UI-copy suffixes have no runtime authority. The runtime grounder recovers
+explicit restart persistence, durable timers, persistent economy storage, and
+event-time LLM execution even when the model omits them, and removes every model
+value without matching current-human evidence. Plain timer or economy behavior
+does not imply infrastructure. Detached, additive, and alternative links remain
+explicit through grounding. Non-authoritative scope continues only over connected
+units, event-time scope continues only over authoritative additive units, and an
+unresolved positive runtime alternative fails closed. A copied block can regain
+authority only after a closed terminator. Unbalanced quotes and conflicting
+positive and negative requirements fail closed before normalization. Bounded
+term indexes keep proximity classification linear in current-turn length. This
+replacement runs before runtime-versus-behavior deduplication and is replayed
+identically during snapshot verification, so presentation history cannot
+contaminate a later build.
+
 ## Workspace and recipe boundary
 
 The authoritative root types move to schema V2:
@@ -528,12 +546,12 @@ extractor revision moves from 4 to 10, including the closed detail grammar,
 supported-base classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay.
-The normalizer revision moves from 1 to 6, including exact capability-evidence
+The normalizer revision moves from 1 to 7, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
-external-precondition recovery, and the recipe descriptor and registry digests
-rotate. Recipe version,
+external-precondition recovery, and current-human runtime grounding, and the
+recipe descriptor and registry digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
 The root `IntentRecipeSessionSnapshotV2` requires a
@@ -725,7 +743,7 @@ Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
 Recipe extractor revision         10
-Recipe normalizer revision         6
+Recipe normalizer revision         7
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -773,7 +791,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 9, normalizer revisions through 5, or
+branch-local extractor revisions through 9, normalizer revisions through 6, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -787,9 +805,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 10, and normalizer 6 is current;
+- the exact V4 prompt with protocol 4, extractor 10, and normalizer 7 is current;
 - a pre-release V4 prompt, extractor revision through 9, or normalizer revision
-  through 5 is rejected;
+  through 6 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;

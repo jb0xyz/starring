@@ -1,4 +1,4 @@
-use super::intent_boundary_grounding::unquoted_grounding_text;
+use super::intent_boundary_grounding::{unquoted_grounding_text, UnquotedGroundingLink};
 use super::intent_interpretation::IntentRequestModeV2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,6 +294,13 @@ const KOREAN_DRAFT_HOLD_DIRECTIVES: &[&str] = &["초안을 변경하지 마", "�
 pub(super) struct GroundedRequestControls {
     pub(super) mode: Option<IntentRequestModeV2>,
     pub(super) preview: Option<bool>,
+    pub(super) active_semantic_units: Option<Vec<GroundedSemanticUnit>>,
+}
+
+pub(super) struct GroundedSemanticUnit {
+    pub(super) text: String,
+    pub(super) authoritative: bool,
+    pub(super) link: UnquotedGroundingLink,
 }
 
 pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls {
@@ -301,15 +308,26 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         return GroundedRequestControls {
             mode: None,
             preview: None,
+            active_semantic_units: None,
         };
     };
     let mut mode = None;
     let mut active_build_targets = Vec::new();
     let mut preview = None;
     let mut copied_block = false;
+    let mut active_semantic_units = Vec::new();
     for sentence in &grounding.sentences {
+        let mut question_build_scope = false;
+        let mut non_authoritative_scope = false;
+        let mut conditional_scope = false;
+        let mut runtime_negation_scope = false;
+        let mut ui_copy_scope = false;
         for (index, unit) in sentence.iter().enumerate() {
             if copied_block {
+                non_authoritative_scope = false;
+                conditional_scope = false;
+                runtime_negation_scope = false;
+                question_build_scope = false;
                 if analyzes_metalinguistic_copy(&unit.text) {
                     mode = Some(IntentRequestModeV2::Discussion);
                     active_build_targets.clear();
@@ -322,12 +340,33 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             }
             if metalinguistic_carrier(&unit.text) {
                 copied_block = true;
+                non_authoritative_scope = false;
+                conditional_scope = false;
+                runtime_negation_scope = false;
+                question_build_scope = false;
+                continue;
+            }
+            if ui_copy_scope {
+                active_semantic_units.push(GroundedSemanticUnit {
+                    text: unit.text.clone(),
+                    authoritative: false,
+                    link: unit.link,
+                });
                 continue;
             }
             let continuation = sentence
                 .get(index.saturating_add(1))
                 .map(|unit| unit.text.as_str());
-            if let Some(directive) = request_directive(&unit.text, continuation) {
+            if unit.link == UnquotedGroundingLink::Detached {
+                non_authoritative_scope = false;
+                conditional_scope = false;
+            }
+            let directive = request_directive(&unit.text, continuation);
+            let directive_is_build = matches!(&directive, Some(RequestDirective::Build(_)));
+            let scope_break = breaks_non_authoritative_scope(&unit.text, directive_is_build)
+                || (!conditional_scope && starts_positive_runtime_scope(&unit.text));
+            let directive_authoritative = !non_authoritative_scope || scope_break;
+            if let Some(directive) = directive.filter(|_| directive_authoritative) {
                 match directive {
                     RequestDirective::Build(build) => {
                         mode = Some(IntentRequestModeV2::Build);
@@ -353,12 +392,64 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                     }
                 }
             }
-            if let Some(preference) = preview_directive(&unit.text) {
-                preview = Some(preference);
+            if directive_authoritative {
+                if let Some(preference) = preview_directive(&unit.text) {
+                    preview = Some(preference);
+                }
+            }
+            let unit_non_authoritative = non_authoritative_semantic_unit(&unit.text);
+            if scope_break {
+                non_authoritative_scope = false;
+                conditional_scope = false;
+            }
+            if unit_non_authoritative {
+                non_authoritative_scope = true;
+                conditional_scope = conditional_non_authoritative_semantic_unit(&unit.text);
+            }
+            if unit.question && directive_is_build && directive_authoritative {
+                question_build_scope = true;
+            }
+            let authoritative = !unit.question
+                || (directive_is_build && directive_authoritative)
+                || question_build_scope;
+            let active = active_semantic_unit(&unit.text);
+            let authoritative = authoritative && !non_authoritative_scope && active.is_some();
+            let mut text = active.unwrap_or_else(|| unit.text.clone());
+            if authoritative {
+                if unit.link == UnquotedGroundingLink::Detached
+                    || starts_positive_runtime_scope(&text)
+                {
+                    runtime_negation_scope = false;
+                }
+                let distributes_negation = distributes_runtime_negation(&text);
+                if distributes_negation {
+                    runtime_negation_scope = true;
+                }
+                if runtime_negation_scope
+                    && unit.link != UnquotedGroundingLink::Detached
+                    && !distributes_negation
+                {
+                    text = format!("do not use {text}");
+                }
+            } else {
+                runtime_negation_scope = false;
+                question_build_scope = false;
+            }
+            active_semantic_units.push(GroundedSemanticUnit {
+                text,
+                authoritative,
+                link: unit.link,
+            });
+            if opens_ui_copy_scope(&unit.text) {
+                ui_copy_scope = true;
             }
         }
     }
-    GroundedRequestControls { mode, preview }
+    GroundedRequestControls {
+        mode,
+        preview,
+        active_semantic_units: Some(active_semantic_units),
+    }
 }
 
 #[cfg(test)]
@@ -588,13 +679,13 @@ fn non_direct_preview_tail(tail: &str) -> bool {
         "as ",
         "capabilities",
         "capability",
-        "called ",
+        "called",
         "failure",
         "failures",
         "label",
         "mode",
         "modes",
-        "named ",
+        "named",
         "state",
         "states",
         "support",
@@ -619,28 +710,535 @@ fn non_direct_preview_tail(tail: &str) -> bool {
 }
 
 fn first_copy_carrier_index(unit: &str) -> Option<usize> {
-    [
+    let structural_english = [
         "button says",
         "button label",
         "button text",
         "displays the words",
         "display the words",
         "fallback panel title",
-        "label",
-        "literal",
         "panel title",
-        "phrase",
+    ]
+    .iter()
+    .filter_map(|marker| first_ascii_word_index(unit, marker));
+    let owned_english = [
+        "about",
+        "ask if",
+        "ask whether",
+        "asking if",
+        "asking whether",
+        "asking users if",
+        "asking users whether",
+        "asks if",
+        "asks whether",
+        "called",
+        "caption is",
+        "describing",
+        "explaining",
+        "explaining how",
+        "explaining when",
+        "explaining that",
+        "explaining whether",
+        "explaining why",
+        "explains how",
+        "explains that",
+        "explains whether",
+        "explains why",
+        "label is",
+        "label to",
+        "literal is",
+        "named",
+        "phrase is",
+        "prompting users if",
+        "prompting users whether",
+        "prompts the user if",
+        "prompts the user whether",
+        "posing if",
+        "posing whether",
+        "says",
         "text is",
+        "text says",
         "text to",
-        "라벨",
-        "문구",
+        "under the label",
+        "whose caption is",
+        "with the label",
+    ]
+    .iter()
+    .filter_map(|marker| first_ascii_word_index(unit, marker))
+    .filter(|position| english_ui_owner_before(unit, *position));
+    let korean = [
+        "라벨은",
+        "버튼 라벨",
         "버튼 글자",
-        "제목",
+        "패널 제목",
+        "문구는",
         "텍스트는",
     ]
     .iter()
     .filter_map(|marker| unit.find(marker))
+    .min();
+    structural_english
+        .chain(owned_english)
+        .chain(korean)
+        .chain(korean_ui_content_start(unit).map(|_| 0))
+        .min()
+}
+
+fn active_semantic_unit(unit: &str) -> Option<String> {
+    if non_authoritative_semantic_unit(unit) {
+        return None;
+    }
+    if let Some(start) = korean_ui_content_start(unit) {
+        let active = unit.get(start..)?.trim();
+        return (!active.is_empty()).then(|| active.to_string());
+    }
+    let end = first_copy_carrier_index(unit).unwrap_or(unit.len());
+    let end = first_non_executable_content_index(unit).map_or(end, |content| content.min(end));
+    let active = unit.get(..end)?.trim();
+    (!active.is_empty()).then(|| active.to_string())
+}
+
+fn first_non_executable_content_index(unit: &str) -> Option<usize> {
+    [
+        " to describe how to ",
+        " to document how to ",
+        " to explain how to ",
+    ]
+    .iter()
+    .filter_map(|marker| unit.find(marker))
     .min()
+}
+
+fn english_ui_owner_before(unit: &str, boundary: usize) -> bool {
+    let ui = [
+        "button",
+        "caption",
+        "copy",
+        "help panel",
+        "label",
+        "message",
+        "modal",
+        "panel",
+        "response",
+        "text",
+        "title",
+    ]
+    .iter()
+    .filter_map(|owner| last_ascii_word_index_before(unit, owner, boundary))
+    .map(|position| (position, true));
+    let non_ui = [
+        "automation",
+        "channel",
+        "game",
+        "llm",
+        "role",
+        "room",
+        "user",
+        "workflow",
+    ]
+    .iter()
+    .filter_map(|owner| last_ascii_word_index_before(unit, owner, boundary))
+    .map(|position| (position, false));
+    ui.chain(non_ui)
+        .max_by_key(|(position, _)| *position)
+        .is_some_and(|(_, is_ui)| is_ui)
+}
+
+fn opens_ui_copy_scope(unit: &str) -> bool {
+    english_ui_owner_before(unit, unit.len())
+        && ["ask", "asks", "explaining", "says"]
+            .iter()
+            .any(|suffix| unit.ends_with(suffix))
+}
+
+fn korean_ui_content_start(unit: &str) -> Option<usize> {
+    let carrier = ["묻는", "질문하는", "안내하는", "확인하는"]
+        .iter()
+        .filter_map(|marker| unit.find(marker))
+        .min()?;
+    ["패널", "모달", "버튼", "메시지", "문구"]
+        .iter()
+        .filter_map(|owner| {
+            unit[carrier..]
+                .find(owner)
+                .map(|position| carrier + position)
+        })
+        .min()
+}
+
+fn breaks_non_authoritative_scope(unit: &str, directive_is_build: bool) -> bool {
+    let authoritative_wrapper = has_authoritative_scope_wrapper(unit);
+    let unit = strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS);
+    authoritative_wrapper
+        || (directive_is_build
+            && ENGLISH_POLITE_BUILD_PREFIXES
+                .iter()
+                .any(|prefix| unit.starts_with(prefix)))
+}
+
+fn has_authoritative_scope_wrapper(unit: &str) -> bool {
+    let mut value = unit;
+    let mut authoritative = false;
+    loop {
+        if let Some(tail) = [
+            "actually, ",
+            "actually ",
+            "definitely ",
+            "instead ",
+            "now, ",
+            "now ",
+            "반드시 ",
+            "이제 ",
+        ]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        {
+            authoritative = true;
+            value = tail;
+            continue;
+        }
+        if let Some(tail) = ["please, ", "please "]
+            .iter()
+            .find_map(|prefix| value.strip_prefix(prefix))
+        {
+            value = tail;
+            continue;
+        }
+        return authoritative;
+    }
+}
+
+fn non_authoritative_semantic_unit(unit: &str) -> bool {
+    let semantic_unit = strip_repeated_prefixes(
+        unit,
+        &[
+            "actually ",
+            "actually, ",
+            "definitely ",
+            "instead ",
+            "now ",
+            "now, ",
+            "please ",
+            "please, ",
+            "반드시 ",
+            "이제 ",
+        ],
+    );
+    ENGLISH_METALINGUISTIC_PREDICATES
+        .iter()
+        .any(|predicate| semantic_unit.contains(predicate))
+        || [
+            "if ",
+            "if we built",
+            "if we build",
+            "if we were to",
+            "imagine ",
+            "suppose ",
+            "hypothetically ",
+            "maybe ",
+            "perhaps ",
+            "potentially ",
+            "optionally ",
+            "you may ",
+            "when available",
+            "what if ",
+            "for example ",
+            "are ",
+            "is ",
+            "does ",
+            "can we ",
+            "could we ",
+            "we could ",
+            "we may ",
+            "we might ",
+            "do we need ",
+            "should we ",
+            "would we ",
+            "만약 ",
+            "가정하면 ",
+            "예를 들어 ",
+            "선택적으로 ",
+            "가능하면 ",
+        ]
+        .iter()
+        .any(|prefix| semantic_unit.starts_with(prefix))
+        || [
+            "사용할까",
+            "쓸까",
+            "필요할까",
+            "어떨까",
+            "사용해도 돼",
+            "사용해도 됩니다",
+            "써도 돼",
+            "써도 됩니다",
+        ]
+        .iter()
+        .any(|suffix| semantic_unit.ends_with(suffix))
+        || [
+            " could be useful",
+            " could be used",
+            " may need ",
+            " may use ",
+            " may be useful",
+            " may be used",
+            " might need ",
+            " might use ",
+            " might be useful",
+            " might be required",
+            " can be used",
+            "쓸 수도",
+            "쓸 수도 있지만",
+            "사용할 수도",
+            "사용할 수도 있지만",
+            " may be required",
+            "필요할 수도",
+            "필요할 수도 있지만",
+        ]
+        .iter()
+        .any(|marker| semantic_unit.contains(marker))
+        || metalinguistic_runtime_comparison(semantic_unit)
+}
+
+fn conditional_non_authoritative_semantic_unit(unit: &str) -> bool {
+    let unit = strip_repeated_prefixes(
+        unit,
+        &[
+            "actually ",
+            "actually, ",
+            "definitely ",
+            "instead ",
+            "now ",
+            "now, ",
+            "please ",
+            "please, ",
+            "반드시 ",
+            "이제 ",
+        ],
+    );
+    [
+        "if ",
+        "if we built",
+        "if we build",
+        "if we were to",
+        "when available",
+        "만약 ",
+        "가능하면 ",
+        "가정하면 ",
+    ]
+    .iter()
+    .any(|prefix| unit.starts_with(prefix))
+}
+
+fn metalinguistic_runtime_comparison(unit: &str) -> bool {
+    let english = [
+        "compare ",
+        "consider ",
+        "discuss ",
+        "brainstorm ",
+        "explain ",
+    ]
+    .iter()
+    .any(|prefix| unit.starts_with(prefix));
+    let korean = [
+        "고려",
+        "고려해줘",
+        "고려해 줘",
+        "고려하자",
+        "논의",
+        "논의해줘",
+        "논의해 줘",
+        "논의하자",
+        "비교",
+        "비교해줘",
+        "비교해 줘",
+        "비교하자",
+        "설명",
+        "설명해줘",
+        "설명해 줘",
+        "설명하자",
+    ]
+    .iter()
+    .any(|suffix| unit.ends_with(suffix));
+    let runtime_subject = [
+        "durable timer",
+        "persistent timer",
+        "persistent state",
+        "restart persistence",
+        "persistent economy",
+        "event-time llm",
+        "event time llm",
+        "영속 타이머",
+        "내구성 타이머",
+        "영속 상태",
+        "재시작 영속성",
+        "영속 경제",
+        "이벤트 시점 llm",
+    ]
+    .iter()
+    .any(|subject| unit.contains(subject));
+    (english || korean) && runtime_subject
+}
+
+fn distributes_runtime_negation(unit: &str) -> bool {
+    let direct_unit = strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS);
+    let direct = [
+        "do not add ",
+        "do not enable ",
+        "do not include ",
+        "do not require ",
+        "do not use ",
+        "don't add ",
+        "don't enable ",
+        "don't include ",
+        "don't require ",
+        "don't use ",
+        "don’t add ",
+        "don’t enable ",
+        "don’t include ",
+        "don’t require ",
+        "don’t use ",
+        "avoid ",
+        "avoid using ",
+        "disable ",
+        "exclude ",
+        "omit ",
+        "remove ",
+        "must not add ",
+        "must not enable ",
+        "must not include ",
+        "must not require ",
+        "must not use ",
+        "cannot use ",
+        "can't use ",
+        "not use ",
+        "without using ",
+        "never add ",
+        "never enable ",
+        "never include ",
+        "never require ",
+        "never use ",
+    ]
+    .iter()
+    .any(|marker| direct_unit.starts_with(marker));
+    let targeted = [
+        "no persistent state",
+        "no restart persistence",
+        "no durable timer",
+        "no persistent timer",
+        "no persistent economy",
+        "no event-time llm",
+        "without persistent state",
+        "without restart persistence",
+        "without durable timer",
+        "without persistent timer",
+        "without a persistent economy",
+        "without persistent economy",
+        "without an llm at event time",
+        "without llm at event time",
+        "영속 상태 없이",
+        "재시작 영속성 없이",
+        "영속 타이머 없이",
+        "내구성 타이머 없이",
+        "영속 경제 없이",
+        "이벤트 시점 llm 없이",
+        "이벤트 시점 언어 모델 없이",
+        "이벤트 시점 인공지능 없이",
+    ]
+    .iter()
+    .any(|marker| unit.contains(marker));
+    let korean_targeted = [
+        "영속 상태",
+        "재시작 영속성",
+        "영속 타이머",
+        "내구성 타이머",
+        "영속 경제",
+        "이벤트 시점 llm",
+        "이벤트 시점 언어 모델",
+        "이벤트 시점 인공지능",
+    ]
+    .iter()
+    .any(|target| unit.contains(target))
+        && [
+            "사용하지 마",
+            "사용하지마",
+            "쓰지 마",
+            "쓰지마",
+            "추가하지 마",
+            "추가하지마",
+            "포함하지 마",
+            "포함하지마",
+            "필요 없",
+        ]
+        .iter()
+        .any(|marker| unit.contains(marker));
+    direct || targeted || korean_targeted
+}
+
+fn starts_positive_runtime_scope(unit: &str) -> bool {
+    let unit = strip_repeated_prefixes(
+        unit,
+        &[
+            "actually ",
+            "actually, ",
+            "definitely ",
+            "instead ",
+            "now ",
+            "now, ",
+            "please ",
+            "please, ",
+            "반드시 ",
+            "이제 ",
+        ],
+    );
+    let action_first = [
+        "add ",
+        "enable ",
+        "include ",
+        "keep ",
+        "make ",
+        "persist ",
+        "preserve ",
+        "require ",
+        "restore ",
+        "retain ",
+        "run ",
+        "call ",
+        "store ",
+        "use ",
+        "추가",
+        "포함",
+        "사용",
+        "유지",
+        "보존",
+        "복구",
+        "실행",
+        "호출",
+    ]
+    .iter()
+    .any(|prefix| unit.starts_with(prefix));
+    let subject_first = [
+        "timer must be durable",
+        "timers must be durable",
+        "timer must be persistent",
+        "timers must be persistent",
+        "timer must survive",
+        "timers must survive",
+        "state must persist",
+        "state must survive",
+        "economy must persist",
+        "xp must persist",
+        "durable timer is required",
+        "durable timers are required",
+        "persistent economy is required",
+        "영속 타이머를 사용",
+        "영속 타이머를 추가",
+        "영속 경제를 사용",
+        "영속 경제를 추가",
+        "영속 상태를 사용",
+    ]
+    .iter()
+    .any(|pattern| unit.starts_with(pattern));
+    (action_first || subject_first) && !distributes_runtime_negation(unit)
 }
 
 fn metalinguistic_carrier(unit: &str) -> bool {
@@ -831,4 +1429,23 @@ fn first_ascii_word_index(value: &str, expected: &str) -> Option<usize> {
                 .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_'))
         .then_some(start)
     })
+}
+
+fn last_ascii_word_index_before(value: &str, expected: &str, boundary: usize) -> Option<usize> {
+    value
+        .match_indices(expected)
+        .filter_map(|(start, _)| {
+            let end = start.saturating_add(expected.len());
+            (start < boundary
+                && value
+                    .get(..start)
+                    .and_then(|prefix| prefix.chars().next_back())
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+                && value
+                    .get(end..)
+                    .and_then(|suffix| suffix.chars().next())
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_'))
+            .then_some(start)
+        })
+        .max()
 }

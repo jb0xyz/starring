@@ -30,6 +30,9 @@ mod intent_recipe_details_tests;
 mod intent_request_mode_grounding;
 #[cfg(test)]
 mod intent_request_mode_grounding_tests;
+mod intent_runtime_grounding;
+#[cfg(test)]
+mod intent_runtime_grounding_tests;
 mod intent_text;
 mod plan;
 mod plan_input;
@@ -43,6 +46,7 @@ pub(crate) use execution::{
 #[cfg(test)]
 pub(crate) use intent_core::parse_interpret_intent_core_for_human;
 pub(crate) use intent_core::parse_interpret_intent_core_for_serving;
+pub(crate) use intent_core::validate_intent_human_grounding_size;
 pub use intent_core::{
     interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV4,
     IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,

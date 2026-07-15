@@ -279,6 +279,101 @@ fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
 }
 
 #[test]
+fn serving_runtime_grounding_overwrites_model_inference_and_omission() {
+    let mut inferred = valid_core();
+    inferred["runtime_requirements"] = json!([
+        "restart_persistent",
+        "durable_timer",
+        "persistent_economy",
+        "event_time_llm"
+    ]);
+    let parsed = parse_interpret_intent_core_for_human(
+        &inferred.to_string(),
+        "Build a managed private study-room automation and prepare its validated preview.",
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::None
+    );
+    assert!(!parsed.runtime_requirements().event_time_llm);
+
+    let omitted = valid_core();
+    let parsed = parse_interpret_intent_core_for_human(
+        &omitted.to_string(),
+        "Build a game where an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts.",
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::RestartPersistent
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::Durable
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::PersistentLedger
+    );
+    assert!(parsed.runtime_requirements().event_time_llm);
+}
+
+#[test]
+fn serving_runtime_grounding_fails_closed_on_ambiguous_source() {
+    let value = valid_core();
+    for human in [
+        "Build a game with 'durable timers.",
+        "Build a game with durable timers, but timers do not need to be durable.",
+        "Build a game using persistent state or durable timers.",
+    ] {
+        assert_eq!(
+            parse_interpret_intent_core_for_human(&value.to_string(), human)
+                .unwrap_err()
+                .code,
+            "AMBIGUOUS_INTENT_RUNTIME_GROUNDING"
+        );
+    }
+
+    let error = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "Build a game using persistent state or durable timers.",
+    )
+    .unwrap_err();
+    assert!(error.message.contains("unresolved alternative"));
+    assert!(error.hint.contains("Choose one runtime alternative"));
+}
+
+#[test]
+fn serving_grounding_bounds_current_human_size_and_fragmentation() {
+    let value = valid_core().to_string();
+    let oversized = "x".repeat(64 * 1024 + 1);
+    assert_eq!(
+        parse_interpret_intent_core_for_human(&value, &oversized)
+            .unwrap_err()
+            .code,
+        "INTENT_HUMAN_MESSAGE_TOO_LARGE"
+    );
+
+    let fragmented = "use durable timers,".repeat(2_049);
+    assert!(fragmented.len() < 64 * 1024);
+    assert_eq!(
+        parse_interpret_intent_core_for_human(&value, &fragmented)
+            .unwrap_err()
+            .code,
+        "INTENT_HUMAN_MESSAGE_TOO_FRAGMENTED"
+    );
+}
+
+#[test]
 fn core_parser_keeps_behaviors_separate_from_runtime_infrastructure() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");

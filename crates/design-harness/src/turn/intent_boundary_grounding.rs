@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use self::classification::classify_sentence_units;
 use self::evidence::{evidence_groups, unique_visible_bounded_span, BoundaryEvidenceGroup};
-use self::syntax::{mask_quoted_text, sentence_spans, sentence_units};
+use self::syntax::{mask_quoted_text, sentence_spans, sentence_units, UnitLink};
 use super::intent_interpretation::IntentBoundaryRequestV2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,8 +69,17 @@ pub(super) struct UnquotedGroundingText {
     pub(super) sentences: Vec<Vec<UnquotedGroundingUnit>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnquotedGroundingLink {
+    Detached,
+    Additive,
+    Alternative,
+}
+
 pub(super) struct UnquotedGroundingUnit {
     pub(super) text: String,
+    pub(super) question: bool,
+    pub(super) link: UnquotedGroundingLink,
 }
 
 pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGroundingText> {
@@ -80,10 +89,20 @@ pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGro
     }
     let sentences = sentence_spans(&mask.visible)
         .into_iter()
-        .map(|(span, _)| {
+        .map(|(span, question)| {
             sentence_units(&mask.visible, span)
                 .into_iter()
-                .map(|unit| UnquotedGroundingUnit { text: unit.text })
+                .map(|unit| UnquotedGroundingUnit {
+                    text: unit.text,
+                    question,
+                    link: match unit.link {
+                        UnitLink::Additive => UnquotedGroundingLink::Additive,
+                        UnitLink::Alternative | UnitLink::ConditionalAlternative => {
+                            UnquotedGroundingLink::Alternative
+                        }
+                        UnitLink::Start | UnitLink::Barrier => UnquotedGroundingLink::Detached,
+                    },
+                })
                 .collect()
         })
         .collect();
