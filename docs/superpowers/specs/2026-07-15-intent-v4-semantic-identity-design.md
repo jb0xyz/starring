@@ -467,6 +467,14 @@ replacement runs before runtime-versus-behavior deduplication and is replayed
 identically during snapshot verification, so presentation history cannot
 contaminate a later build.
 
+Current-human grounding accepts at most 64 KiB and 2,048 semantic units per
+turn. Durable replay accepts at most 512 KiB of serialized `INTENT_HUMAN`
+envelopes across a session in addition to the existing turn, failure, and total
+transcript limits. Crossing the per-turn boundary fails before a model call;
+crossing the aggregate boundary exhausts the durable replay-work budget. The
+boundary and runtime classifiers use fixed-pass indexes so adversarial repeated
+markers remain linear in admitted input size.
+
 ## Workspace and recipe boundary
 
 The authoritative root types move to schema V2:

@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use super::super::intent_interpretation::IntentBoundaryRequestV2;
 use super::classification::{
     contains_any, live_weak_context, BoundaryKind, UnitFacts, GATE_ACTIONS, GATE_TARGETS,
@@ -10,6 +13,11 @@ use super::syntax::{
     ascii_case_insensitive_chars_equal, normalized_text, word_continuation, BoundaryUnit, TextSpan,
     UnitLink,
 };
+
+#[cfg(test)]
+thread_local! {
+    static COMPONENT_ONLY_EVALUATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BoundaryEvidenceGroup {
@@ -45,10 +53,34 @@ pub(super) fn evidence_groups(
         .collect::<Vec<_>>();
     let mut groups = Vec::new();
     for kind in [BoundaryKind::Gate, BoundaryKind::Live, BoundaryKind::Secret] {
+        let component_only = units
+            .iter()
+            .map(|unit| !unit.hypothetical && unit_is_boundary_component_only(&unit.text, kind))
+            .collect::<Vec<_>>();
+        let mut expanded_starts = (0..units.len()).collect::<Vec<_>>();
+        for index in 1..units.len() {
+            let previous = index - 1;
+            if units[index].link == UnitLink::Additive
+                && component_only[previous]
+                && facts[previous].has_evidence(kind)
+            {
+                expanded_starts[index] = expanded_starts[previous];
+            }
+        }
+        let mut expanded_ends = (0..units.len()).collect::<Vec<_>>();
+        for index in (0..units.len().saturating_sub(1)).rev() {
+            let next = index + 1;
+            if units[next].link == UnitLink::Additive
+                && component_only[next]
+                && facts[next].has_evidence(kind)
+            {
+                expanded_ends[index] = expanded_ends[next];
+            }
+        }
         let mut intervals = BTreeSet::new();
         for (index, unit_facts) in facts.iter().enumerate() {
             if unit_facts.is_seed(kind) {
-                intervals.insert(expanded_group_interval(units, &facts, kind, index, index));
+                intervals.insert((expanded_starts[index], expanded_ends[index]));
             }
         }
         if kind == BoundaryKind::Live {
@@ -56,20 +88,14 @@ pub(super) fn evidence_groups(
                 if units[index].hypothetical
                     || units[index + 1].hypothetical
                     || units[index + 1].link == UnitLink::Alternative
-                    || !unit_is_boundary_component_only(&units[index].text, kind)
-                    || !unit_is_boundary_component_only(&units[index + 1].text, kind)
+                    || !component_only[index]
+                    || !component_only[index + 1]
                 {
                     continue;
                 }
                 let combined = combine_facts(&facts[index], &facts[index + 1]);
                 if combined.is_seed(kind) {
-                    intervals.insert(expanded_group_interval(
-                        units,
-                        &facts,
-                        kind,
-                        index,
-                        index + 1,
-                    ));
+                    intervals.insert((expanded_starts[index], expanded_ends[index + 1]));
                 }
             }
         }
@@ -138,32 +164,6 @@ fn group_covers_candidate(
             .any(|span| candidate.start < span.end && candidate.end > span.start)
 }
 
-fn expanded_group_interval(
-    units: &[BoundaryUnit],
-    facts: &[UnitFacts],
-    kind: BoundaryKind,
-    mut start: usize,
-    mut end: usize,
-) -> (usize, usize) {
-    while start > 0
-        && units[start].link == UnitLink::Additive
-        && !units[start - 1].hypothetical
-        && facts[start - 1].has_evidence(kind)
-        && unit_is_boundary_component_only(&units[start - 1].text, kind)
-    {
-        start -= 1;
-    }
-    while end + 1 < units.len()
-        && units[end + 1].link == UnitLink::Additive
-        && !units[end + 1].hypothetical
-        && facts[end + 1].has_evidence(kind)
-        && unit_is_boundary_component_only(&units[end + 1].text, kind)
-    {
-        end += 1;
-    }
-    (start, end)
-}
-
 fn combine_facts(left: &UnitFacts, right: &UnitFacts) -> UnitFacts {
     UnitFacts {
         gate_action: left.gate_action || right.gate_action,
@@ -230,6 +230,10 @@ fn known_korean_suffix_boundary(value: &str) -> bool {
 }
 
 fn unit_is_boundary_component_only(value: &str, kind: BoundaryKind) -> bool {
+    #[cfg(test)]
+    COMPONENT_ONLY_EVALUATIONS.with(|evaluations| {
+        evaluations.set(evaluations.get().saturating_add(1));
+    });
     let value = normalized_text(&value.to_lowercase());
     !value.is_empty()
         && UnitFacts::for_text(&value).has_evidence(kind)
@@ -478,4 +482,36 @@ fn korean_neutral_fragments() -> &'static [&'static str] {
         "고",
         "해",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::classification::classify_sentence_units;
+    use super::super::syntax::sentence_spans;
+    use super::*;
+
+    fn component_evaluations(unit_count: usize) -> usize {
+        let human = vec!["skip validation"; unit_count].join(" and ");
+        let visible = human.chars().collect::<Vec<_>>();
+        let (span, question) = sentence_spans(&visible).into_iter().next().unwrap();
+        let units = classify_sentence_units(&visible, span, question);
+        assert_eq!(units.len(), unit_count);
+        COMPONENT_ONLY_EVALUATIONS.with(|evaluations| evaluations.set(0));
+        let groups = evidence_groups(&units, &visible);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].request(),
+            IntentBoundaryRequestV2::BypassValidationPreviewApproval
+        );
+        COMPONENT_ONLY_EVALUATIONS.with(Cell::get)
+    }
+
+    #[test]
+    fn component_classification_work_scales_linearly() {
+        let small = component_evaluations(128);
+        let large = component_evaluations(256);
+        assert_eq!(small, 3 * 128);
+        assert_eq!(large, 3 * 256);
+        assert_eq!(large, small * 2);
+    }
 }
