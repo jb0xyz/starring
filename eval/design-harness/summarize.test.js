@@ -198,7 +198,7 @@ test('summary separates oracle injections from delegated model calls and semanti
 
 test('summary exposes Gemma intent cohort boundaries, isolation, operations, and latency', () => {
   const report = {
-    schema_version: 3,
+    schema_version: 5,
     outcome: 'ready',
     completed: true,
     elapsed_ms: 7000,
@@ -233,9 +233,26 @@ test('summary exposes Gemma intent cohort boundaries, isolation, operations, and
       receipt: { compiled_operations: 22 },
     },
     observability: { model_calls: 1, tool_calls: 1, distinct_mutation_tools: [] },
+    model_call_metrics: [{
+      call_sequence: 1,
+      attempt: 1,
+      frontier_name: 'interpret_intent_core',
+      outcome: 'succeeded',
+      http_status: 200,
+      served_model: 'gemma4:12b-mlx',
+      request_body_bytes: 6400,
+      message_bytes: 1200,
+      tool_bytes: 2500,
+      duplicated_schema_bytes: 2000,
+      prompt_tokens: 800,
+      completion_tokens: 120,
+      request_duration_ms: 5900,
+      gateway_model_duration_ms: null,
+    }],
     turns: [{
       outcome: 'ready',
       draft_changed: true,
+      burst_elapsed_ms: 6000,
       elapsed_ms: 7000,
       model_calls: 1,
       model_tool_calls: 1,
@@ -285,8 +302,104 @@ test('summary exposes Gemma intent cohort boundaries, isolation, operations, and
   assert.equal(row.last_run_order, 4);
   assert.equal(row.p50_elapsed_ms, 7000);
   assert.equal(row.p50_turn_elapsed_ms, 7000);
+  assert.equal(row.p50_turn_burst_elapsed_ms, 6000);
   assert.equal(row.mean_turn_model_calls, 1);
   assert.equal(row.mean_turn_tool_calls, 1);
   assert.equal(row.mean_turn_deterministic_operations, 22);
+  assert.equal(row.model_attempt_metric_samples, 2);
+  assert.deepEqual(row.model_attempt_outcomes, { succeeded: 2 });
+  assert.equal(row.model_attempt_success_rate, 1);
+  assert.equal(row.prompt_token_metric_coverage, 1);
+  assert.equal(row.completion_token_metric_coverage, 1);
+  assert.equal(row.mean_request_body_bytes, 6400);
+  assert.equal(row.mean_prompt_tokens, 800);
+  assert.equal(row.mean_completion_tokens, 120);
+  assert.equal(row.mean_request_duration_ms, 5900);
+  assert.equal(row.gateway_model_duration_metric_coverage, 0);
+  assert.equal(row.mean_gateway_model_duration_ms, null);
   assert.equal(row.mean_compiled_operations, 22);
+  assert.equal(row.unique_route_semantic_identities, null);
+  assert.equal(row.unique_adjudication_identities, null);
+  assert.equal(row.unique_compiler_input_identities, null);
+  assert.equal(row.unique_semantic_intent_identities, null);
+  assert.equal(row.unique_compiled_plan_identities, null);
+  assert.equal(row.unique_ruleset_identities, null);
+  assert.deepEqual(row.canonical_ruleset_digests, []);
+  assert.equal(row.semantic_ruleset_identity_consistent, false);
+  assert.equal(row.semantic_ruleset_identity_eligible_reports, 2);
+  assert.equal(row.semantic_ruleset_identity_covered_reports, 0);
+  assert.equal(row.semantic_ruleset_identity_missing_reports, 2);
+});
+
+test('summary canonicalizes RuleSets and exposes constant semantic identity collisions', () => {
+  const identity = (value) => value.repeat(64);
+  const intent = (overrides = {}) => ({
+    schema_version: 4,
+    outcome: 'ready',
+    completed: true,
+    elapsed_ms: 1,
+    final_intent: {
+      status: 'preview_ready',
+      route_decision: {
+        semantic_ir_digest: overrides.routeSemantic || identity('1'),
+        adjudication_digest: overrides.adjudication || identity('2'),
+      },
+      receipt: {
+        compiler_input_hash: overrides.compilerInput || identity('3'),
+        semantic_intent_hash: identity('4'),
+        compiled_plan_hash: overrides.plan || identity('5'),
+        candidate_ruleset_hash: overrides.candidateRuleset || identity('a'),
+        compiled_operations: 22,
+      },
+    },
+    ruleset: overrides.ruleset,
+    observability: { model_calls: 1, tool_calls: 1, distinct_mutation_tools: [] },
+    turns: [],
+  });
+  const canonical = {
+    version: 1,
+    panels: [{ key: 'study', buttons: [{ label: 'Create' }] }],
+    modals: [],
+    rules: [],
+  };
+  const reordered = {
+    rules: [],
+    modals: [],
+    panels: [{ buttons: [{ label: 'Create' }], key: 'study' }],
+    version: 1,
+  };
+  const changed = structuredClone(canonical);
+  changed.panels[0].buttons[0].label = 'Start';
+  const document = {
+    results: {
+      results: [
+        intent({ ruleset: canonical }),
+        intent({ ruleset: reordered }),
+        intent({
+          routeSemantic: identity('6'),
+          adjudication: identity('7'),
+          compilerInput: identity('8'),
+          plan: identity('9'),
+          candidateRuleset: identity('b'),
+          ruleset: changed,
+        }),
+      ].map((report) => ({
+        provider: { label: 'gemma-intent' },
+        vars: { caseId: 'constant-semantic', cohort: 'intent_recipe' },
+        success: true,
+        response: { metadata: report },
+      })),
+    },
+  };
+
+  const [row] = summarize(document);
+
+  assert.equal(row.unique_route_semantic_identities, 2);
+  assert.equal(row.unique_adjudication_identities, 2);
+  assert.equal(row.unique_compiler_input_identities, 2);
+  assert.equal(row.unique_semantic_intent_identities, 1);
+  assert.equal(row.unique_compiled_plan_identities, 2);
+  assert.equal(row.unique_ruleset_identities, 2);
+  assert.equal(row.canonical_ruleset_digests.length, 2);
+  assert.equal(row.semantic_ruleset_identity_consistent, false);
 });

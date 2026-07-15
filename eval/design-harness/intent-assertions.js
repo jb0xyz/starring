@@ -1,4 +1,10 @@
+const { createHash } = require('node:crypto');
+
 const INTENT_MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+const INTENT_PROTOCOL_VERSION = 4;
+const INTENT_ADJUDICATOR_VERSION = 3;
+const INTENT_IDENTITY_REVISION = 2;
+const INTENT_SNAPSHOT_VERSION = 7;
 const SHA256 = /^[0-9a-f]{64}$/;
 const DECISION_KINDS = new Set([
   'private_study_room',
@@ -102,6 +108,7 @@ function routeDecision(value, location) {
     'decision_source',
     'adjudicator_version',
     'semantic_ir_digest',
+    'request_evidence_hash',
     'manifest_version',
     'manifest_digest',
     'adjudication_digest',
@@ -114,10 +121,12 @@ function routeDecision(value, location) {
     throw new Error(`invalid intent eval report: ${location}.kind is invalid`);
   }
   if (value.decision_source !== 'deterministic_intent_adjudicator'
-    || value.adjudicator_version !== 2) {
+    || value.adjudicator_version !== INTENT_ADJUDICATOR_VERSION) {
     throw new Error(`invalid intent eval report: ${location} has invalid adjudicator identity`);
   }
-  if (!SHA256.test(value.semantic_ir_digest) || !SHA256.test(value.adjudication_digest)) {
+  if (!SHA256.test(value.semantic_ir_digest)
+    || !SHA256.test(value.request_evidence_hash)
+    || !SHA256.test(value.adjudication_digest)) {
     throw new Error(`invalid intent eval report: ${location} has invalid decision hashes`);
   }
   if (value.manifest_version !== 1 || value.manifest_digest !== INTENT_MANIFEST_DIGEST) {
@@ -181,7 +190,9 @@ function routeDecision(value, location) {
     throw new Error(`invalid intent eval report: ${location} has an invalid reject shape`);
   }
   if (['private_study_room', 'typed_planner', 'discussion'].includes(value.kind)
-    && (value.blockers.length !== 0 || value.boundary_violations.length !== 0)) {
+    && (value.blockers.length !== 0
+      || value.boundary_violations.length !== 0
+      || value.unclassified_requirements.length !== 0)) {
     throw new Error(`invalid intent eval report: ${location} has blockers on a non-blocking route`);
   }
   return value;
@@ -201,9 +212,361 @@ function sameJson(left, right) {
   return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
 }
 
+function domainSeparatedCanonicalDigest(domain, value) {
+  return createHash('sha256')
+    .update(domain)
+    .update(JSON.stringify(stable(value)))
+    .digest('hex');
+}
+
+function candidateIdentityHashes(report) {
+  const draft = {
+    ruleset: report.ruleset,
+    draft_revision: report.draft_revision,
+    validated_revision: report.actual_gates.validated_revision,
+    simulated_revision: report.actual_gates.simulated_revision,
+  };
+  return {
+    candidate_ruleset_hash: domainSeparatedCanonicalDigest(
+      'starring.intent.candidate_ruleset.v1\0',
+      report.ruleset,
+    ),
+    candidate_draft_hash: domainSeparatedCanonicalDigest(
+      'starring.intent.draft_state.v1\0',
+      draft,
+    ),
+  };
+}
+
 function integer(value, location) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`invalid intent eval report: ${location} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function receiptValue(value, location) {
+  object(value, location);
+  exactKeys(value, [
+    'identity_revision',
+    'intent_revision',
+    'candidate_revision',
+    'request_evidence_hash',
+    'request_evidence_entries',
+    'compiler_input_hash',
+    'semantic_intent_hash',
+    'compiled_plan_hash',
+    'candidate_ruleset_hash',
+    'candidate_draft_hash',
+    'compiled_operations',
+  ], location);
+  if (value.identity_revision !== INTENT_IDENTITY_REVISION) {
+    throw new Error(`invalid intent eval report: ${location}.identity_revision is invalid`);
+  }
+  for (const field of [
+    'request_evidence_hash',
+    'compiler_input_hash',
+    'semantic_intent_hash',
+    'compiled_plan_hash',
+    'candidate_ruleset_hash',
+    'candidate_draft_hash',
+  ]) {
+    if (!SHA256.test(value[field])) {
+      throw new Error(`invalid intent eval report: ${location}.${field} must be a SHA-256 hash`);
+    }
+  }
+  for (const field of [
+    'intent_revision',
+    'candidate_revision',
+    'request_evidence_entries',
+    'compiled_operations',
+  ]) {
+    integer(value[field], `${location}.${field}`);
+  }
+  if (value.request_evidence_entries < 1) {
+    throw new Error(`invalid intent eval report: ${location}.request_evidence_entries must be positive`);
+  }
+  return value;
+}
+
+function publicStatus(value, location) {
+  object(value, location);
+  if (value.status === 'empty') {
+    exactKeys(value, ['status', 'expected_revision'], location);
+    integer(value.expected_revision, `${location}.expected_revision`);
+    return value;
+  }
+  if (value.status === 'awaiting_decision') {
+    exactKeys(value, [
+      'status',
+      'root_draft_revision',
+      'workspace_revision',
+      'question',
+      'available_channel_keys',
+    ], location);
+    integer(value.root_draft_revision, `${location}.root_draft_revision`);
+    integer(value.workspace_revision, `${location}.workspace_revision`);
+    nonEmptyString(value.question, `${location}.question`);
+    if (!Array.isArray(value.available_channel_keys)
+      || value.available_channel_keys.some((entry) => typeof entry !== 'string')) {
+      throw new Error(`invalid intent eval report: ${location}.available_channel_keys must be strings`);
+    }
+    sortedUnique(value.available_channel_keys, `${location}.available_channel_keys`);
+    return value;
+  }
+  if (value.status === 'preview_ready') {
+    exactKeys(value, [
+      'status',
+      'root_draft_revision',
+      'workspace_revision',
+      'receipt',
+    ], location);
+    integer(value.root_draft_revision, `${location}.root_draft_revision`);
+    integer(value.workspace_revision, `${location}.workspace_revision`);
+    receiptValue(value.receipt, `${location}.receipt`);
+    return value;
+  }
+  throw new Error(`invalid intent eval report: ${location}.status is invalid`);
+}
+
+function actualGates(value, location, draftRevision) {
+  object(value, location);
+  exactKeys(value, [
+    'validated_revision',
+    'simulated_revision',
+    'validation_current',
+    'simulation_current',
+  ], location);
+  for (const field of ['validated_revision', 'simulated_revision']) {
+    if (value[field] !== null) {
+      integer(value[field], `${location}.${field}`);
+    }
+  }
+  if (typeof value.validation_current !== 'boolean'
+    || typeof value.simulation_current !== 'boolean') {
+    throw new Error(`invalid intent eval report: ${location} current flags must be booleans`);
+  }
+  if (value.validation_current !== (value.validated_revision === draftRevision)
+    || value.simulation_current !== (value.simulated_revision === draftRevision)) {
+    throw new Error(`invalid intent eval report: ${location} revision stamps are inconsistent`);
+  }
+  return value;
+}
+
+function modelCallMetric(value, location) {
+  object(value, location);
+  exactKeys(value, [
+    'call_sequence',
+    'attempt',
+    'frontier_name',
+    'outcome',
+    'http_status',
+    'served_model',
+    'request_body_bytes',
+    'message_bytes',
+    'tool_bytes',
+    'duplicated_schema_bytes',
+    'prompt_tokens',
+    'completion_tokens',
+    'request_duration_ms',
+    'gateway_model_duration_ms',
+  ], location);
+  nonEmptyString(value.frontier_name, `${location}.frontier_name`);
+  for (const field of [
+    'call_sequence',
+    'attempt',
+    'request_body_bytes',
+    'message_bytes',
+    'tool_bytes',
+    'duplicated_schema_bytes',
+    'request_duration_ms',
+  ]) {
+    integer(value[field], `${location}.${field}`);
+  }
+  if (value.call_sequence === 0 || value.attempt === 0) {
+    throw new Error(`invalid intent eval report: ${location} call and attempt indexes must be positive`);
+  }
+  for (const field of ['prompt_tokens', 'completion_tokens']) {
+    if (value[field] !== null) {
+      integer(value[field], `${location}.${field}`);
+    }
+  }
+  if (value.gateway_model_duration_ms !== null) {
+    integer(value.gateway_model_duration_ms, `${location}.gateway_model_duration_ms`);
+  }
+  const outcomes = [
+    'succeeded',
+    'transport_error',
+    'http_error',
+    'response_body_error',
+    'malformed_json',
+    'invalid_response',
+  ];
+  if (!outcomes.includes(value.outcome)) {
+    throw new Error(`invalid intent eval report: ${location}.outcome is invalid`);
+  }
+  if (value.http_status !== null) {
+    integer(value.http_status, `${location}.http_status`);
+    if (value.http_status < 100 || value.http_status > 599) {
+      throw new Error(`invalid intent eval report: ${location}.http_status is invalid`);
+    }
+  }
+  if (value.served_model !== null && typeof value.served_model !== 'string') {
+    throw new Error(`invalid intent eval report: ${location}.served_model must be a string or null`);
+  }
+  const successfulHttp = value.http_status !== null
+    && value.http_status >= 200
+    && value.http_status < 300;
+  if (value.outcome === 'transport_error' && value.http_status !== null) {
+    throw new Error(`invalid intent eval report: ${location} transport errors cannot have HTTP status`);
+  }
+  if (value.outcome === 'http_error' && (value.http_status === null || successfulHttp)) {
+    throw new Error(`invalid intent eval report: ${location} HTTP error status is inconsistent`);
+  }
+  if (['succeeded', 'response_body_error', 'malformed_json', 'invalid_response']
+    .includes(value.outcome) && !successfulHttp) {
+    throw new Error(`invalid intent eval report: ${location} response outcome lacks successful HTTP status`);
+  }
+  if (value.outcome === 'succeeded'
+    && (typeof value.served_model !== 'string' || value.served_model.length === 0)) {
+    throw new Error(`invalid intent eval report: ${location} successful response lacks model provenance`);
+  }
+  if (!successfulHttp && value.served_model !== null) {
+    throw new Error(`invalid intent eval report: ${location} non-successful HTTP attempt has model provenance`);
+  }
+  if (['transport_error', 'http_error', 'response_body_error', 'malformed_json']
+    .includes(value.outcome)
+    && (value.prompt_tokens !== null || value.completion_tokens !== null)) {
+    throw new Error(`invalid intent eval report: ${location} failed response has fabricated token usage`);
+  }
+  if (value.request_body_bytes === 0
+    || value.message_bytes === 0
+    || value.tool_bytes === 0
+    || value.duplicated_schema_bytes === 0
+    || value.request_body_bytes
+      <= value.message_bytes + value.tool_bytes + value.duplicated_schema_bytes) {
+    throw new Error(`invalid intent eval report: ${location} byte accounting is invalid`);
+  }
+  if (value.frontier_name === 'interpret_intent_core'
+    && (value.duplicated_schema_bytes > 2400
+      || value.tool_bytes + value.duplicated_schema_bytes > 5600)) {
+    throw new Error(`invalid intent eval report: ${location} exceeds the Core schema budget`);
+  }
+  if (value.frontier_name === 'extract_private_study_room_details'
+    && value.duplicated_schema_bytes >= 1800) {
+    throw new Error(`invalid intent eval report: ${location} exceeds the detail schema budget`);
+  }
+  return value;
+}
+
+function modelCallSequences(metrics, expectedCalls, location) {
+  const calls = new Map();
+  metrics.forEach((metric) => {
+    const attempts = calls.get(metric.call_sequence) || [];
+    attempts.push(metric);
+    calls.set(metric.call_sequence, attempts);
+  });
+  if (calls.size !== expectedCalls) {
+    throw new Error(`invalid intent eval report: ${location} model metric call count differs from model_calls`);
+  }
+  calls.forEach((attempts, callSequence) => {
+    attempts.forEach((metric, index) => {
+      if (metric.attempt !== index + 1) {
+        throw new Error(`invalid intent eval report: ${location} call ${callSequence} attempts are not contiguous`);
+      }
+      if (index + 1 < attempts.length && metric.outcome === 'succeeded') {
+        throw new Error(`invalid intent eval report: ${location} call ${callSequence} retried after success`);
+      }
+    });
+  });
+  return calls;
+}
+
+function observability(value, location) {
+  object(value, location);
+  exactKeys(value, [
+    'model_calls',
+    'tool_calls',
+    'distinct_mutation_tools',
+    'mutation_tool_calls',
+    'clarification_count',
+    'validation_failures',
+    'simulation_failures',
+    'failure_signatures',
+    'repeated_errors',
+    'repair_attempts',
+    'repair_successes',
+    'repair_failures',
+    'repair_escalations',
+    'nudge_count',
+    'plan_submissions',
+    'plan_acceptances',
+    'planned_requirements',
+    'plan_compiled_tool_calls',
+    'plan_execution_failures',
+    'plan_rollbacks',
+    'plan_commits',
+    'plan_conflicts',
+    'intent_route_calls',
+    'intent_proposal_acceptances',
+    'intent_resolution_acceptances',
+    'intent_compile_attempts',
+    'intent_compile_successes',
+    'intent_commits',
+    'intent_rollbacks',
+    'intent_conflicts',
+    'intent_stale_revision_rejections',
+    'intent_extraction_failures',
+    'intent_fallback_routes',
+    'intent_compiled_operations',
+  ], location);
+  for (const field of [
+    'model_calls',
+    'tool_calls',
+    'clarification_count',
+    'validation_failures',
+    'simulation_failures',
+    'repeated_errors',
+    'repair_attempts',
+    'repair_successes',
+    'repair_failures',
+    'repair_escalations',
+    'nudge_count',
+    'plan_submissions',
+    'plan_acceptances',
+    'planned_requirements',
+    'plan_compiled_tool_calls',
+    'plan_execution_failures',
+    'plan_rollbacks',
+    'plan_commits',
+    'plan_conflicts',
+    'intent_route_calls',
+    'intent_proposal_acceptances',
+    'intent_resolution_acceptances',
+    'intent_compile_attempts',
+    'intent_compile_successes',
+    'intent_commits',
+    'intent_rollbacks',
+    'intent_conflicts',
+    'intent_stale_revision_rejections',
+    'intent_extraction_failures',
+    'intent_compiled_operations',
+  ]) {
+    integer(value[field], `${location}.${field}`);
+  }
+  if (!Array.isArray(value.distinct_mutation_tools)) {
+    throw new Error(`invalid intent eval report: ${location}.distinct_mutation_tools must be an array`);
+  }
+  value.distinct_mutation_tools.forEach((entry, index) => {
+    nonEmptyString(entry, `${location}.distinct_mutation_tools[${index}]`);
+  });
+  sortedUnique(value.distinct_mutation_tools, `${location}.distinct_mutation_tools`);
+  for (const field of ['mutation_tool_calls', 'failure_signatures', 'intent_fallback_routes']) {
+    object(value[field], `${location}.${field}`);
+    for (const [key, count] of Object.entries(value[field])) {
+      nonEmptyString(key, `${location}.${field} key`);
+      integer(count, `${location}.${field}.${key}`);
+    }
   }
   return value;
 }
@@ -216,8 +579,40 @@ function parseReport(output) {
     throw new Error(`invalid intent eval report: ${error.message}`);
   }
   object(report, 'report');
-  if (report.schema_version !== 3 || report.input_schema_version !== 3) {
-    throw new Error('invalid intent eval report: schema_version and input_schema_version must be 3');
+  exactKeys(report, [
+    'schema_version',
+    'input_schema_version',
+    'mode',
+    'intent_protocol_version',
+    'intent_adjudicator_version',
+    'intent_identity_revision',
+    'requested_model',
+    'served_model',
+    'gateway_id',
+    'declared_context_tokens',
+    'context_declaration_source',
+    'gateway_context_observed_tokens',
+    'catalog_identity',
+    'provenance',
+    'oracle',
+    'session_config',
+    'outcome',
+    'completed',
+    'message',
+    'question',
+    'halt_code',
+    'turns',
+    'model_call_metrics',
+    'draft_revision',
+    'ruleset',
+    'actual_gates',
+    'observability',
+    'final_intent',
+    'persistence',
+    'elapsed_ms',
+  ], 'report');
+  if (report.schema_version !== 5 || report.input_schema_version !== 3) {
+    throw new Error('invalid intent eval report: schema_version must be 5 and input_schema_version must be 3');
   }
   if (report.mode !== 'intent_recipe') {
     throw new Error('invalid intent eval report: mode must be intent_recipe');
@@ -230,13 +625,66 @@ function parseReport(output) {
   }
   object(report.ruleset, 'ruleset');
   object(report.actual_gates, 'actual_gates');
-  object(report.observability, 'observability');
+  observability(report.observability, 'observability');
   object(report.provenance, 'provenance');
+  exactKeys(report.provenance, [
+    'source_commit',
+    'source_dirty',
+    'build_source_commit',
+    'build_source_dirty',
+    'binary_sha256',
+    'attestation_kind',
+    'run_id',
+    'run_order',
+    'started_at_unix_ms',
+    'ended_at_unix_ms',
+  ], 'provenance');
   object(report.oracle, 'oracle');
+  exactKeys(report.oracle, ['enabled', 'injected_control_calls'], 'oracle');
   object(report.session_config, 'session_config');
+  exactKeys(report.session_config, [
+    'max_model_calls',
+    'max_tool_calls',
+    'max_gate_failures',
+    'context_char_budget',
+  ], 'session_config');
+  object(report.catalog_identity, 'catalog_identity');
+  exactKeys(report.catalog_identity, [
+    'recipe_id',
+    'recipe_version',
+    'extractor_revision',
+    'normalizer_revision',
+    'compiler_revision',
+    'simulator_revision',
+    'registry_digest',
+  ], 'catalog_identity');
+  if (report.catalog_identity.recipe_id !== 'starring.private_study_room'
+    || report.catalog_identity.recipe_version !== 1
+    || report.catalog_identity.extractor_revision !== 5
+    || report.catalog_identity.normalizer_revision !== 2
+    || report.catalog_identity.compiler_revision !== 1
+    || report.catalog_identity.simulator_revision !== 1
+    || !SHA256.test(report.catalog_identity.registry_digest)) {
+    throw new Error('invalid intent eval report: catalog identity is invalid');
+  }
   object(report.final_intent, 'final_intent');
-  object(report.final_intent.public_status, 'final_intent.public_status');
+  exactKeys(report.final_intent, [
+    'status',
+    'public_status',
+    'receipt',
+    'route_decision',
+    'binding_fingerprint',
+  ], 'final_intent');
+  publicStatus(report.final_intent.public_status, 'final_intent.public_status');
   object(report.persistence, 'persistence');
+  exactKeys(report.persistence, [
+    'backend',
+    'store_writes',
+    'connection_reopen_count',
+    'final_generation',
+    'snapshot_schema_version',
+    'roundtrip_verified',
+  ], 'persistence');
   if (typeof report.final_intent.status !== 'string'
     || typeof report.final_intent.public_status.status !== 'string') {
     throw new Error('invalid intent eval report: final intent status is required');
@@ -248,21 +696,92 @@ function parseReport(output) {
     throw new Error('invalid intent eval report: final_intent.route_decision is required');
   }
   routeDecision(report.final_intent.route_decision, 'final_intent.route_decision');
+  if (report.intent_protocol_version !== INTENT_PROTOCOL_VERSION
+    || report.intent_adjudicator_version !== INTENT_ADJUDICATOR_VERSION
+    || report.intent_identity_revision !== INTENT_IDENTITY_REVISION) {
+    throw new Error('invalid intent eval report: V4 intent contract identity is invalid');
+  }
+  if (report.final_intent.status === 'preview_ready') {
+    receiptValue(report.final_intent.receipt, 'final_intent.receipt');
+    if (!sameJson(report.final_intent.receipt, report.final_intent.public_status.receipt)) {
+      throw new Error('invalid intent eval report: public receipt differs from final receipt');
+    }
+    const expectedCandidate = candidateIdentityHashes(report);
+    if (report.final_intent.receipt.candidate_ruleset_hash
+      !== expectedCandidate.candidate_ruleset_hash) {
+      throw new Error('invalid intent eval report: candidate_ruleset_hash does not match ruleset');
+    }
+    if (report.final_intent.receipt.candidate_draft_hash
+      !== expectedCandidate.candidate_draft_hash) {
+      throw new Error('invalid intent eval report: candidate_draft_hash does not match Draft state');
+    }
+  } else if (report.final_intent.receipt !== null) {
+    throw new Error('invalid intent eval report: non-preview status must not contain a receipt');
+  }
   integer(report.draft_revision, 'draft_revision');
   integer(report.elapsed_ms, 'elapsed_ms');
+  actualGates(report.actual_gates, 'actual_gates', report.draft_revision);
+  if (!Array.isArray(report.model_call_metrics)) {
+    throw new Error('invalid intent eval report: model_call_metrics must be an array');
+  }
+  report.model_call_metrics.forEach((metric, index) => (
+    modelCallMetric(metric, `model_call_metrics[${index}]`)
+  ));
   integer(report.persistence.store_writes, 'persistence.store_writes');
   integer(report.persistence.connection_reopen_count, 'persistence.connection_reopen_count');
   integer(report.persistence.final_generation, 'persistence.final_generation');
   integer(report.persistence.snapshot_schema_version, 'persistence.snapshot_schema_version');
   if (report.persistence.backend !== 'sqlite_file'
+    || report.persistence.snapshot_schema_version !== INTENT_SNAPSHOT_VERSION
     || typeof report.persistence.roundtrip_verified !== 'boolean') {
     throw new Error('invalid intent eval report: SQLite persistence evidence is required');
   }
   for (const [index, turn] of report.turns.entries()) {
     object(turn, `turns[${index}]`);
+    exactKeys(turn, [
+      'id',
+      'input',
+      'outcome',
+      'completed',
+      'message',
+      'question',
+      'halt_code',
+      'last_error',
+      'burst_elapsed_ms',
+      'elapsed_ms',
+      'model_call_metrics',
+      'model_calls',
+      'model_tool_calls',
+      'deterministic_operations',
+      'intent_counters',
+      'stage_before',
+      'stage_after',
+      'intent_revision_before',
+      'intent_revision_after',
+      'route_decision',
+      'draft_revision_before',
+      'draft_revision_after',
+      'draft_changed',
+      'actual_gates',
+      'restart_after',
+      'restart_performed',
+    ], `turns[${index}]`);
     object(turn.intent_counters, `turns[${index}].intent_counters`);
+    exactKeys(turn.intent_counters, [
+      'route_calls',
+      'proposal_acceptances',
+      'resolution_acceptances',
+      'compile_attempts',
+      'compile_successes',
+      'commits',
+      'rollbacks',
+      'conflicts',
+      'stale_revision_rejections',
+      'extraction_failures',
+      'fallback_routes',
+    ], `turns[${index}].intent_counters`);
     object(turn.intent_counters.fallback_routes, `turns[${index}].intent_counters.fallback_routes`);
-    object(turn.actual_gates, `turns[${index}].actual_gates`);
+    actualGates(turn.actual_gates, `turns[${index}].actual_gates`, turn.draft_revision_after);
     if (!Object.hasOwn(turn, 'route_decision')) {
       throw new Error(`invalid intent eval report: turns[${index}].route_decision is required`);
     }
@@ -276,8 +795,29 @@ function parseReport(output) {
       || typeof turn.restart_performed !== 'boolean') {
       throw new Error(`invalid intent eval report: turns[${index}] has invalid lifecycle fields`);
     }
-    for (const field of ['model_calls', 'model_tool_calls', 'deterministic_operations', 'elapsed_ms']) {
+    for (const field of [
+      'model_calls',
+      'model_tool_calls',
+      'deterministic_operations',
+      'burst_elapsed_ms',
+      'elapsed_ms',
+    ]) {
       integer(turn[field], `turns[${index}].${field}`);
+    }
+    if (turn.elapsed_ms < turn.burst_elapsed_ms) {
+      throw new Error(`invalid intent eval report: turns[${index}] total duration is below burst duration`);
+    }
+    if (!Array.isArray(turn.model_call_metrics)) {
+      throw new Error(`invalid intent eval report: turns[${index}] model metrics must be an array`);
+    }
+    turn.model_call_metrics.forEach((metric, metricIndex) => {
+      modelCallMetric(metric, `turns[${index}].model_call_metrics[${metricIndex}]`);
+    });
+    modelCallSequences(turn.model_call_metrics, turn.model_calls, `turns[${index}]`);
+    const requestDuration = turn.model_call_metrics
+      .reduce((sum, metric) => sum + metric.request_duration_ms, 0);
+    if (requestDuration > turn.burst_elapsed_ms + 1) {
+      throw new Error(`invalid intent eval report: turns[${index}] request duration exceeds burst duration`);
     }
     for (const field of [
       'intent_revision_before',
@@ -304,6 +844,35 @@ function parseReport(output) {
     for (const [kind, count] of Object.entries(turn.intent_counters.fallback_routes)) {
       integer(count, `turns[${index}].intent_counters.fallback_routes.${kind}`);
     }
+  }
+  const flattenedMetrics = report.turns.flatMap((turn) => turn.model_call_metrics);
+  if (!sameJson(flattenedMetrics, report.model_call_metrics)) {
+    throw new Error('invalid intent eval report: top-level model metrics do not match turn metrics');
+  }
+  const calls = modelCallSequences(
+    report.model_call_metrics,
+    report.observability.model_calls,
+    'model_call_metrics',
+  );
+  const sequences = [...calls.keys()];
+  if (sequences.some((sequence, index) => sequence !== index + 1)) {
+    throw new Error('invalid intent eval report: model call sequences are not contiguous');
+  }
+  const servedModels = [...new Set(report.model_call_metrics
+    .filter((metric) => metric.http_status >= 200
+      && metric.http_status < 300
+      && metric.served_model !== null)
+    .map((metric) => metric.served_model))];
+  if (servedModels.length > 1) {
+    throw new Error('invalid intent eval report: successful HTTP responses have conflicting model provenance');
+  }
+  const observedServedModel = servedModels.length === 1 ? servedModels[0] : null;
+  if (report.served_model !== observedServedModel) {
+    throw new Error('invalid intent eval report: served_model differs from successful HTTP response provenance');
+  }
+  const turnElapsed = report.turns.reduce((sum, turn) => sum + turn.elapsed_ms, 0);
+  if (report.elapsed_ms < turnElapsed) {
+    throw new Error('invalid intent eval report: total elapsed time is below summed turn time');
   }
   return report;
 }
@@ -419,7 +988,14 @@ function checked(output, assertion) {
 }
 
 function hashesAreValid(receipt) {
-  return ['input_intent_hash', 'semantic_intent_hash', 'compiled_plan_hash']
+  return [
+    'request_evidence_hash',
+    'compiler_input_hash',
+    'semantic_intent_hash',
+    'compiled_plan_hash',
+    'candidate_ruleset_hash',
+    'candidate_draft_hash',
+  ]
     .every((field) => /^[0-9a-f]{64}$/.test(receipt[field]));
 }
 
@@ -475,6 +1051,12 @@ function intentProvenance(output) {
       context_char_budget: 44000,
     })) {
       failures.push('session_config differs from the pinned benchmark policy');
+    }
+    if (report.model_call_metrics.some((metric) => (
+      !Number.isSafeInteger(metric.prompt_tokens)
+        || !Number.isSafeInteger(metric.completion_tokens)
+    ))) {
+      failures.push('gateway token usage is missing from model call metrics');
     }
     return result(failures.length === 0, failures.length === 0
       ? 'Gemma4 cohort source, binary, and declared context policy are exact and clean'
@@ -622,45 +1204,6 @@ function intentOneCallTurns(output, context) {
     return result(failures.length === 0, failures.length === 0
       ? 'every turn used its exact bounded model and frontier call path'
       : failures.join(', '));
-  });
-}
-
-function intentRulesetStringValues(output, context) {
-  return checked(output, (report) => {
-    const expected = vars(context);
-    if (!Object.hasOwn(expected, 'expectedRulesetStringValues')) {
-      return result(true, 'no exact RuleSet string values requested');
-    }
-    let values;
-    try {
-      values = Array.isArray(expected.expectedRulesetStringValues)
-        ? expected.expectedRulesetStringValues
-        : JSON.parse(expected.expectedRulesetStringValues);
-    } catch {
-      return result(false, 'expectedRulesetStringValues is not a JSON string array');
-    }
-    if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
-      return result(false, 'expectedRulesetStringValues is not a JSON string array');
-    }
-    const actual = [];
-    const visit = (value) => {
-      if (typeof value === 'string') {
-        actual.push(value);
-        return;
-      }
-      if (Array.isArray(value)) {
-        value.forEach(visit);
-        return;
-      }
-      if (value !== null && typeof value === 'object') {
-        Object.values(value).forEach(visit);
-      }
-    };
-    visit(report.ruleset);
-    const missing = values.filter((value) => !actual.includes(value));
-    return result(missing.length === 0, missing.length === 0
-      ? 'every exact custom literal reached the canonical RuleSet'
-      : `missing RuleSet string values=${JSON.stringify(missing)}`);
   });
 }
 
@@ -969,6 +1512,7 @@ function intentHardLatency(output) {
 }
 
 module.exports = {
+  candidateIdentityHashes,
   intentAdjudicationDecision,
   intentDecisionFlow,
   intentHardLatency,
@@ -979,7 +1523,6 @@ module.exports = {
   intentReceipt,
   intentRestartContinuity,
   intentRulesetPathValues,
-  intentRulesetStringValues,
   intentRouteStage,
   parseReport,
 };

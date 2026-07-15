@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const { createHash } = require('node:crypto');
 
 function parseReport(row) {
   const metadata = row.response?.metadata;
@@ -54,12 +55,50 @@ function stable(value) {
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
 }
 
+function canonicalDigest(value) {
+  return createHash('sha256').update(JSON.stringify(stable(value))).digest('hex');
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter((value) => typeof value === 'string' && value.length > 0))].sort();
+}
+
+function identityCount(values) {
+  const identities = uniqueStrings(values);
+  return identities.length === 0 ? null : identities.length;
+}
+
+function semanticRulesetConsistency(reports) {
+  const previews = reports.filter((report) => report.final_intent?.status === 'preview_ready');
+  const pairs = previews.map((report) => {
+    const semantic = report.final_intent?.receipt?.semantic_intent_hash;
+    const ruleset = report.final_intent?.receipt?.candidate_ruleset_hash;
+    return { semantic, ruleset };
+  }).filter((pair) => typeof pair.semantic === 'string' && typeof pair.ruleset === 'string');
+  if (previews.length === 0) {
+    return { consistent: null, eligible: 0, covered: 0, missing: 0 };
+  }
+  const semanticToRulesets = new Map();
+  for (const pair of pairs) {
+    const rulesets = semanticToRulesets.get(pair.semantic) || new Set();
+    rulesets.add(pair.ruleset);
+    semanticToRulesets.set(pair.semantic, rulesets);
+  }
+  return {
+    consistent: pairs.length === previews.length
+      && [...semanticToRulesets.values()].every((identities) => identities.size === 1),
+    eligible: previews.length,
+    covered: pairs.length,
+    missing: previews.length - pairs.length,
+  };
+}
+
 function vars(row) {
   return row.vars || row.testCase?.vars || {};
 }
 
 function postcheck(report, gate) {
-  if (report?.schema_version === 3) {
+  if ([3, 4, 5].includes(report?.schema_version)) {
     return report.actual_gates?.[`${gate === 'validate' ? 'validation' : 'simulation'}_current`] === true;
   }
   if (report?.schema_version === 2) {
@@ -69,7 +108,7 @@ function postcheck(report, gate) {
 }
 
 function actualGate(report, gate) {
-  if (report?.schema_version === 3) {
+  if ([3, 4, 5].includes(report?.schema_version)) {
     return report.actual_gates?.[`${gate}_current`] === true;
   }
   if (report?.schema_version === 2) {
@@ -122,10 +161,37 @@ function summarize(document) {
     const planConflicts = reports.map((report) => Number(report.observability?.plan_conflicts ?? 0));
     const turns = reports.flatMap((report) => Array.isArray(report.turns) ? report.turns : []);
     const turnElapsed = turns.map((turn) => Number(turn.elapsed_ms));
+    const turnBurstElapsed = turns.map((turn) => Number(turn.burst_elapsed_ms));
     const turnModelCalls = turns.map((turn) => Number(turn.model_calls ?? turn.observability_delta?.model_calls));
     const turnToolCalls = turns.map((turn) => Number(turn.model_tool_calls ?? turn.observability_delta?.tool_calls));
     const turnDeterministicOperations = turns.map((turn) => Number(turn.deterministic_operations));
-    const intentReports = reports.filter((report) => report.schema_version === 3);
+    const modelMetrics = reports.flatMap((report) => (
+      Array.isArray(report.model_call_metrics) ? report.model_call_metrics : []
+    ));
+    const requestBytes = modelMetrics.map((metric) => Number(metric.request_body_bytes));
+    const messageBytes = modelMetrics.map((metric) => Number(metric.message_bytes));
+    const toolBytes = modelMetrics.map((metric) => Number(metric.tool_bytes));
+    const duplicatedSchemaBytes = modelMetrics.map((metric) => Number(metric.duplicated_schema_bytes));
+    const promptTokens = modelMetrics.map((metric) => (
+      Number.isFinite(metric.prompt_tokens) ? Number(metric.prompt_tokens) : Number.NaN
+    ));
+    const completionTokens = modelMetrics.map((metric) => (
+      Number.isFinite(metric.completion_tokens) ? Number(metric.completion_tokens) : Number.NaN
+    ));
+    const requestDuration = modelMetrics.map((metric) => Number(metric.request_duration_ms));
+    const gatewayModelDuration = modelMetrics.map((metric) => (
+      Number.isFinite(metric.gateway_model_duration_ms)
+        ? Number(metric.gateway_model_duration_ms)
+        : Number.NaN
+    ));
+    const observedAttemptMetrics = modelMetrics.filter(
+      (metric) => typeof metric.outcome === 'string',
+    );
+    const attemptOutcomes = observedAttemptMetrics.reduce((counts, metric) => ({
+      ...counts,
+      [metric.outcome]: (counts[metric.outcome] || 0) + 1,
+    }), {});
+    const intentReports = reports.filter((report) => [3, 4, 5].includes(report.schema_version));
     const metadataBoundaries = new Set(intentReports.map((report) => [
       report.requested_model,
       report.served_model,
@@ -149,7 +215,27 @@ function summarize(document) {
     const started = intentReports.map((report) => Number(report.provenance?.started_at_unix_ms));
     const ended = intentReports.map((report) => Number(report.provenance?.ended_at_unix_ms));
     const receiptOperations = intentReports.map((report) => Number(report.final_intent?.receipt?.compiled_operations));
+    const routeSemanticIdentities = intentReports.map(
+      (report) => report.final_intent?.route_decision?.semantic_ir_digest,
+    );
+    const adjudicationIdentities = intentReports.map(
+      (report) => report.final_intent?.route_decision?.adjudication_digest,
+    );
+    const compilerInputIdentities = intentReports.map((report) => (
+      report.final_intent?.receipt?.compiler_input_hash
+        ?? report.final_intent?.receipt?.input_intent_hash
+    ));
+    const semanticIntentIdentities = intentReports.map(
+      (report) => report.final_intent?.receipt?.semantic_intent_hash,
+    );
+    const compiledPlanIdentities = intentReports.map(
+      (report) => report.final_intent?.receipt?.compiled_plan_hash,
+    );
+    const rulesetDigests = uniqueStrings(intentReports
+      .filter((report) => report.ruleset && typeof report.ruleset === 'object')
+      .map((report) => canonicalDigest(report.ruleset)));
     const semanticRows = group.rows.filter((entry) => assertionPassed(entry.row, 'taskSemantics') !== null);
+    const identityCoverage = semanticRulesetConsistency(intentReports);
     return {
       provider: group.provider,
       case_id: group.caseId,
@@ -200,10 +286,52 @@ function summarize(document) {
       mean_turn_elapsed_ms: mean(turnElapsed) === null ? null : Math.round(mean(turnElapsed)),
       p50_turn_elapsed_ms: percentile(turnElapsed, 0.5),
       p95_turn_elapsed_ms: percentile(turnElapsed, 0.95),
+      mean_turn_burst_elapsed_ms: mean(turnBurstElapsed) === null
+        ? null
+        : Math.round(mean(turnBurstElapsed)),
+      p50_turn_burst_elapsed_ms: percentile(turnBurstElapsed, 0.5),
+      p95_turn_burst_elapsed_ms: percentile(turnBurstElapsed, 0.95),
       mean_turn_model_calls: mean(turnModelCalls),
       mean_turn_tool_calls: mean(turnToolCalls),
       mean_turn_deterministic_operations: mean(turnDeterministicOperations),
+      model_attempt_metric_samples: observedAttemptMetrics.length,
+      model_attempt_outcomes: attemptOutcomes,
+      model_attempt_success_rate: observedAttemptMetrics.length === 0
+        ? null
+        : observedAttemptMetrics.filter((metric) => metric.outcome === 'succeeded').length
+          / observedAttemptMetrics.length,
+      prompt_token_metric_coverage: modelMetrics.length === 0
+        ? null
+        : finiteValues(promptTokens).length / modelMetrics.length,
+      completion_token_metric_coverage: modelMetrics.length === 0
+        ? null
+        : finiteValues(completionTokens).length / modelMetrics.length,
+      mean_request_body_bytes: mean(requestBytes),
+      p95_request_body_bytes: percentile(requestBytes, 0.95),
+      mean_message_bytes: mean(messageBytes),
+      mean_tool_bytes: mean(toolBytes),
+      mean_duplicated_schema_bytes: mean(duplicatedSchemaBytes),
+      mean_prompt_tokens: mean(promptTokens),
+      mean_completion_tokens: mean(completionTokens),
+      mean_request_duration_ms: mean(requestDuration),
+      p95_request_duration_ms: percentile(requestDuration, 0.95),
+      gateway_model_duration_metric_coverage: modelMetrics.length === 0
+        ? null
+        : finiteValues(gatewayModelDuration).length / modelMetrics.length,
+      mean_gateway_model_duration_ms: mean(gatewayModelDuration),
+      p95_gateway_model_duration_ms: percentile(gatewayModelDuration, 0.95),
       mean_compiled_operations: mean(receiptOperations),
+      unique_route_semantic_identities: identityCount(routeSemanticIdentities),
+      unique_adjudication_identities: identityCount(adjudicationIdentities),
+      unique_compiler_input_identities: identityCount(compilerInputIdentities),
+      unique_semantic_intent_identities: identityCount(semanticIntentIdentities),
+      unique_compiled_plan_identities: identityCount(compiledPlanIdentities),
+      unique_ruleset_identities: rulesetDigests.length === 0 ? null : rulesetDigests.length,
+      canonical_ruleset_digests: rulesetDigests,
+      semantic_ruleset_identity_consistent: identityCoverage.consistent,
+      semantic_ruleset_identity_eligible_reports: identityCoverage.eligible,
+      semantic_ruleset_identity_covered_reports: identityCoverage.covered,
+      semantic_ruleset_identity_missing_reports: identityCoverage.missing,
       recipe_selection_rate: intentReports.length === 0
         ? null
         : intentReports.filter((report) => report.final_intent?.status === 'preview_ready').length / group.rows.length,

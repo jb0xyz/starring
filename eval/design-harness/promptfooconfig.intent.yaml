@@ -1,4 +1,4 @@
-description: Starring Gemma4 oracle-free close-disabled intent checkpoint
+description: Starring Gemma4 oracle-free Intent V4 private-room checkpoint
 prompts:
   - label: intent-request
     raw: "{{request}}"
