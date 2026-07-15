@@ -387,7 +387,7 @@ impl<C> DesignSession<C> {
             .collect::<Vec<_>>();
         let grounded_channel = deterministically_selected_option(human_message, &channel_options)
             .map(crate::intent::ExistingChannelKey);
-        core.apply_human_grounded_channel(grounded_channel.as_ref());
+        core.apply_human_grounding(human_message, grounded_channel.as_ref());
         let request_evidence = IntentRequestEvidenceChainV1::from_initial_human(
             &self.messages,
             transcript_message_index,

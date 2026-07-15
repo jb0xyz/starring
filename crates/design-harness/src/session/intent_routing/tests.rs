@@ -28,9 +28,6 @@ use super::*;
 
 type SeenCalls = Vec<(Vec<Message>, Vec<ToolDefinition>)>;
 
-const REQUEST_EVIDENCE_HASH: &str =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-
 #[derive(Clone)]
 struct ScriptedClient {
     responses: Arc<Mutex<VecDeque<Result<LlmResponse, LlmError>>>>,
@@ -81,24 +78,24 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 }
 
 #[test]
-fn v4_prompt_separates_required_capabilities_from_gate_skips_and_display_prose() {
+fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("other_unmapped_required_capabilities"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("shortest exact phrase from the human text"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("scope-preservation or anti-weakening instructions"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "expose a secret without redaction and deploy immediately means validation_gate=enforce"
+        "Safety-boundary requests and recipe-detail frontiers are grounded directly from INTENT_HUMAN"
     ));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("custom_detail_facets"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("persistent XP across restarts with durable timers and event-time LLM"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "external settlement lease means other_unmapped_required_capabilities=[external settlement lease]"
     ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("Custom Help, Join, or Close labels and their responses map to custom_controls"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Never encode safety-boundary requests or supported copy, naming, and control literals"
+    ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("No positive requirement may exist only in response text"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("belong only in objective"));
@@ -130,13 +127,7 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "language": "en",
         "close_policy": "disabled",
         "runtime_requirements": [],
-        "validation_gate": "enforce",
-        "preview_gate": "enforce",
-        "approval_gate": "enforce",
-        "live_discord_mutation": "no_live_mutation",
-        "secret_disclosure": "no_secret_disclosure",
         "other_unmapped_required_capabilities": [],
-        "custom_detail_facets": [],
         "response": ""
     })
 }
@@ -213,14 +204,7 @@ fn private_room_with_copy_details(
     expected_revision: u64,
     hub: Option<&str>,
 ) -> (LlmResponse, LlmResponse) {
-    let mut value = private_room_value(expected_revision, hub);
-    value["custom_detail_facets"] = json!(["custom_copy"]);
-    let core = parse_interpret_intent_core(&value.to_string()).unwrap();
-    let IntentCoreAdjudicationV4::PrivateStudyRoom(_selection) =
-        adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap()
-    else {
-        panic!("expected private study-room selection")
-    };
+    let value = private_room_value(expected_revision, hub);
     let details = tool_call(
         "details",
         "extract_private_study_room_details",
@@ -637,6 +621,87 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
         .unwrap();
         assert_eq!(restored.draft, session.draft);
         assert_eq!(receipt(&restored), receipt(&session));
+    });
+}
+
+#[test]
+fn human_grounding_adds_an_omitted_naming_frontier_and_restores_it() {
+    block_on(async {
+        let core = private_room(0, Some("community_hub"));
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({
+                "naming": {
+                    "channel_name_prefix": "focus-",
+                    "channel_name_suffix": "-room",
+                    "member_role_name_prefix": "team-",
+                    "member_role_name_suffix": "-members"
+                }
+            }),
+        );
+        let client = ScriptedClient::new(vec![Ok(core), Ok(details)]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let request = "Build a managed private study-room automation in community_hub. Keep default copy and controls, but set the channel name prefix to 'focus-' and suffix to '-room' and the member-role name prefix to 'team-' and suffix to '-members'.";
+
+        assert!(matches!(
+            session.run_burst(request).await,
+            BurstOutcome::Ready { .. }
+        ));
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1[0].parameters["required"], json!(["naming"]));
+        let ruleset = serde_json::to_value(&session.draft.ruleset).unwrap();
+        assert_eq!(
+            ruleset.pointer("/rules/1/actions/1/name"),
+            Some(&json!("team-${input.room_name}-members"))
+        );
+        assert_eq!(
+            ruleset.pointer("/rules/1/actions/2/name"),
+            Some(&json!("focus-${input.room_name}-room"))
+        );
+        let durable_snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            durable_snapshot,
+            bindings("community_hub", "700"),
+        )
+        .unwrap();
+        assert_eq!(restored.draft, session.draft);
+        assert_eq!(receipt(&restored), receipt(&session));
+    });
+}
+
+#[test]
+fn human_grounding_removes_model_detail_facets_from_korean_defaults() {
+    block_on(async {
+        let mut value = private_room_value(0, Some("community_hub"));
+        value["language"] = json!("ko");
+        value["custom_detail_facets"] = json!(["custom_copy", "custom_naming", "custom_controls"]);
+        let client = ScriptedClient::new(vec![Ok(interpretation_call("interpret", value))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session
+                .run_burst("관리형 비공개 스터디룸을 community_hub에 만들고 한국어 기본 문구와 이름, 기본 컨트롤을 그대로 사용해줘.")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert_eq!(probe.calls().len(), 1);
+        let ruleset = serde_json::to_value(&session.draft.ruleset).unwrap();
+        assert_eq!(
+            ruleset.pointer("/panels/0/buttons/0/label"),
+            Some(&json!("스터디룸 만들기"))
+        );
+        assert_eq!(
+            ruleset.pointer("/rules/1/actions/1/name"),
+            Some(&json!("${input.room_name} 멤버"))
+        );
     });
 }
 
@@ -1241,6 +1306,74 @@ fn safety_boundary_precedes_capability_gap_and_never_mutates() {
         assert_eq!(probe.calls()[0].1[0].name, "interpret_intent_core");
         assert_eq!(session.observability.model_calls, 1);
         assert_eq!(session.observability.tool_calls, 1);
+    });
+}
+
+#[test]
+fn human_boundary_grounding_rejects_even_when_model_fields_are_omitted() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, None))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root = session.draft.clone();
+
+        let BurstOutcome::Routed { fallback, decision } = session
+            .run_burst(
+                "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
+            )
+            .await
+        else {
+            panic!("expected human-grounded rejection")
+        };
+        assert_eq!(fallback.kind(), IntentFallbackKind::Reject);
+        assert_eq!(decision.kind(), IntentRouteDecisionKindV2::Reject);
+        assert_eq!(
+            decision
+                .boundary_violations()
+                .iter()
+                .map(|violation| violation.id)
+                .collect::<Vec<_>>(),
+            vec![
+                IntentSafetyBoundaryIdV2::BypassValidationPreviewApproval,
+                IntentSafetyBoundaryIdV2::DirectLiveMutation,
+            ]
+        );
+        assert_eq!(session.draft, root);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_commits, 0);
+    });
+}
+
+#[test]
+fn human_boundary_grounding_discards_legacy_model_false_positives() {
+    block_on(async {
+        let mut value = private_room_value(0, None);
+        value["automation_kind"] = json!("custom_automation");
+        value["requested_outcome"] = json!("working_draft");
+        value["validation_gate"] = json!("skip");
+        value["preview_gate"] = json!("skip");
+        value["approval_gate"] = json!("skip");
+        value["live_discord_mutation"] = json!("mutate_live_now");
+        value["secret_disclosure"] = json!("disclose_secret_value");
+        let client = ScriptedClient::new(vec![Ok(interpretation_call("interpret", value))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root = session.draft.clone();
+
+        let BurstOutcome::Routed { fallback, decision } = session
+            .run_burst(
+                "Build a moderation panel whose message says secrets are redacted. Do not deploy it or expose any actual secret.",
+            )
+            .await
+        else {
+            panic!("expected safe typed-planner route")
+        };
+        assert_eq!(fallback.kind(), IntentFallbackKind::TypedPlanner);
+        assert_eq!(decision.kind(), IntentRouteDecisionKindV2::TypedPlanner);
+        assert!(decision.boundary_violations().is_empty());
+        assert_eq!(session.draft, root);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_commits, 0);
     });
 }
 
@@ -2111,7 +2244,7 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
         assert!(matches!(
             session
                 .run_burst(
-                    "Create private rooms in community_hub with launcher label Start exact focus; keep Alternate exact label as another literal",
+                    "Create private rooms in community_hub with launcher create-button label 'Start exact focus'; keep 'Alternate exact label' as another literal",
                 )
                 .await,
             BurstOutcome::Ready { .. }

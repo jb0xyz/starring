@@ -43,15 +43,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         required_names(&tool.parameters),
         strings([
             "automation_kind",
-            "validation_gate",
-            "preview_gate",
-            "approval_gate",
-            "live_discord_mutation",
-            "secret_disclosure",
             "close_policy",
             "expected_revision",
             "language",
-            "custom_detail_facets",
             "request_mode",
             "requested_outcome",
             "response",
@@ -73,30 +67,18 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         "actions",
         "permissions",
         "ruleset",
+        "validation_gate",
+        "preview_gate",
+        "approval_gate",
+        "live_discord_mutation",
+        "secret_disclosure",
+        "custom_detail_facets",
     ] {
         assert!(!properties.contains(forbidden));
     }
     assert_eq!(
         tool.parameters.get("additionalProperties"),
         Some(&Value::Bool(false))
-    );
-    assert_eq!(
-        tool.parameters["properties"]["custom_detail_facets"]["items"]["enum"],
-        json!(["custom_copy", "custom_naming", "custom_controls"])
-    );
-    for field in ["validation_gate", "preview_gate", "approval_gate"] {
-        assert_eq!(
-            tool.parameters["properties"][field]["enum"],
-            json!(["enforce", "skip"])
-        );
-    }
-    assert_eq!(
-        tool.parameters["properties"]["live_discord_mutation"]["enum"],
-        json!(["no_live_mutation", "mutate_live_now"])
-    );
-    assert_eq!(
-        tool.parameters["properties"]["secret_disclosure"]["enum"],
-        json!(["no_secret_disclosure", "disclose_secret_value"])
     );
     let schema_text = tool.parameters.to_string();
     assert!(!schema_text.contains("$defs"));
@@ -127,6 +109,24 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         structured_bytes <= 5_600,
         "core structured metadata is {structured_bytes} bytes"
     );
+}
+
+#[test]
+fn core_parser_defaults_hidden_model_fields_to_safe_empty_semantics() {
+    let mut value = valid_core();
+    for field in [
+        "validation_gate",
+        "preview_gate",
+        "approval_gate",
+        "live_discord_mutation",
+        "secret_disclosure",
+        "custom_detail_facets",
+    ] {
+        value.as_object_mut().unwrap().remove(field);
+    }
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert!(parsed.boundary_requests().is_empty());
+    assert!(parsed.recipe_detail_facets().is_empty());
 }
 
 #[test]

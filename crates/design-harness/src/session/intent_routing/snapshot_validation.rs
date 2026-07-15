@@ -536,7 +536,7 @@ fn validate_initial_semantics_replay(
     }
     let grounded_channel = deterministically_selected_option(&human, &state.available_channel_keys)
         .map(ExistingChannelKey);
-    core.apply_human_grounded_channel(grounded_channel.as_ref());
+    core.apply_human_grounding(&human, grounded_channel.as_ref());
     let adjudication =
         adjudicate_intent_core_v4(core, initial_head).map_err(restored_semantics_error)?;
     let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudication else {

@@ -8,6 +8,8 @@ use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
+use super::intent_boundary_grounding::ground_safety_boundary_requests;
+use super::intent_detail_grounding::ground_private_study_room_detail_facets;
 use super::intent_interpretation::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
@@ -68,24 +70,27 @@ enum CustomDetailFacetWireV3 {
     Controls,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum GateDispositionWireV3 {
+    #[default]
     Enforce,
     Skip,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 enum LiveDiscordMutationWireV3 {
     #[serde(rename = "no_live_mutation")]
+    #[default]
     None,
     #[serde(rename = "mutate_live_now")]
     MutateLiveNow,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 enum SecretDisclosureWireV3 {
     #[serde(rename = "no_secret_disclosure")]
+    #[default]
     None,
     #[serde(rename = "disclose_secret_value")]
     DiscloseSecretValue,
@@ -126,14 +131,25 @@ struct InterpretIntentCoreWireV4 {
     close_policy: CloseAuthorizationV2,
     #[schemars(length(max = 4))]
     runtime_requirements: Vec<RuntimeRequirementV3>,
+    #[serde(default)]
+    #[schemars(skip)]
     validation_gate: GateDispositionWireV3,
+    #[serde(default)]
+    #[schemars(skip)]
     preview_gate: GateDispositionWireV3,
+    #[serde(default)]
+    #[schemars(skip)]
     approval_gate: GateDispositionWireV3,
+    #[serde(default)]
+    #[schemars(skip)]
     live_discord_mutation: LiveDiscordMutationWireV3,
+    #[serde(default)]
+    #[schemars(skip)]
     secret_disclosure: SecretDisclosureWireV3,
     #[schemars(length(max = 8), inner(length(min = 1, max = 160)))]
     other_unmapped_required_capabilities: Vec<String>,
-    #[schemars(length(max = 3))]
+    #[serde(default)]
+    #[schemars(skip)]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
     #[schemars(length(max = 2000))]
     response: String,
@@ -181,6 +197,22 @@ impl IntentCoreInterpretationV4 {
         grounded_channel: Option<&ExistingChannelKey>,
     ) {
         self.hub_channel.0 = grounded_channel.cloned();
+    }
+
+    pub(crate) fn apply_human_grounding(
+        &mut self,
+        human_message: &str,
+        grounded_channel: Option<&ExistingChannelKey>,
+    ) {
+        self.apply_human_grounded_channel(grounded_channel);
+        self.boundary_requests = ground_safety_boundary_requests(human_message);
+        self.detail_facets = if self.request_mode == IntentRequestModeV2::Build
+            && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom
+        {
+            ground_private_study_room_detail_facets(human_message)
+        } else {
+            Vec::new()
+        };
     }
 
     pub fn locale(&self) -> IntentLocaleHintV2 {

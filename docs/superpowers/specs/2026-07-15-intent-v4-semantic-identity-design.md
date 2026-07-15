@@ -233,31 +233,39 @@ hub_channel
 language
 close_policy
 runtime_requirements
-validation_gate
-preview_gate
-approval_gate
-live_discord_mutation
-secret_disclosure
 other_unmapped_required_capabilities
-custom_detail_facets
 response
 ```
 
 An `objective` field is unknown in V4 and fails strict parsing. Build responses
 remain empty. Discussion responses remain presentation-only.
 
+Safety-boundary requests and selected recipe-detail facets remain part of the
+closed Core semantic projection, but they are not model wire fields. A pure,
+linear-time grounder derives them from the exact current human turn before
+adjudication. The same grounder runs during snapshot verification, so live and
+restore semantics cannot diverge. Explicit literals override defaults; a
+default-only request has no detail frontier. Quoted UI copy is excluded from
+safety-boundary grounding, and negated or hypothetical boundary language does
+not become an execution request.
+
+The decoder may accept the pre-release hidden boundary and detail fields for
+fixture and transcript compatibility, but serving schemas omit them and their
+values have no authority after human grounding. Missing hidden values always
+decode to safe defaults.
+
 The prompt must make these rules explicit:
 
 - the managed recipe's built-in room creation flow is represented by the closed
   automation kind and must not be restated as an unmapped capability;
-- concrete supported copy, naming, and control literals select their matching
-  detail facets;
+- deterministic human grounding selects concrete supported copy, naming, and
+  control detail facets;
 - every additional positive behavior, authorization, lifecycle, runtime, or
   external-effect requirement not represented by a closed field must be copied
   as one contiguous whitespace-canonical phrase into
   `other_unmapped_required_capabilities`;
 - no positive requirement may exist only in response or presentation prose;
-- safety-boundary requests belong only in the closed boundary fields;
+- safety-boundary requests and detail-facet selection are harness-owned;
 - recipe identity, objective identity, compiler identity, and hashes are
   harness-owned and never model outputs.
 
@@ -341,7 +349,7 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 5, the normalizer revision from 1 to 2, and
+extractor revision moves from 4 to 6, the normalizer revision from 1 to 2, and
 the recipe descriptor and registry digests rotate. Recipe version, capability
 manifest version, and simulator revision remain unchanged.
 
@@ -380,7 +388,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   7
-Recipe extractor revision          5
+Recipe extractor revision          6
 Recipe normalizer revision         2
 Recipe compiler revision           1
 Recipe simulator revision          1

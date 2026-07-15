@@ -1,7 +1,9 @@
 mod execution;
+mod intent_boundary_grounding;
 mod intent_core;
 #[cfg(test)]
 mod intent_core_tests;
+mod intent_detail_grounding;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
