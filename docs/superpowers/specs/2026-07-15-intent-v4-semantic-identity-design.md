@@ -240,6 +240,87 @@ response
 An `objective` field is unknown in V4 and fails strict parsing. Build responses
 remain empty. Discussion responses remain presentation-only.
 
+The normalizer grounds request controls only from high-confidence, unquoted
+current-human language. It reuses the bounded sentence and clause scanner used
+by safety grounding. A direct construction imperative whose command object is
+an automation, bot, button, channel, feature, flow, game, modal, panel, role,
+room, rule, system, or workflow selects build mode and records that target.
+English polite wrappers are recognized only when the same direct-command shape
+remains intact. Korean build grammar accepts both a supported unit-final
+construction suffix and a closed compound form: a recognized build-and marker
+such as `만들고` or `설계하고` must be followed by one of the bounded
+continuation prefixes for validation, preview, preparation, testing,
+confirmation, posting, display, setup, or connection. Generic design
+vocabulary, questions about how something could be designed, hypotheticals,
+unmatched quote state, and grammatical descriptions of an imperative select no
+mode.
+
+Build and hold grammar is target-aware and symmetric. English positive verbs
+and their `do not` or `don't` forms, and Korean construction verbs and their
+negative unit-final forms, resolve against the same closed target set. Each
+direct build records the alias set of every recognized target in its direct
+object rather than only one head noun. `Build a private room workflow` therefore
+records both room and workflow, while `Build a game automation` records both
+game and automation. A hold is classified as global, as a recognized target
+hold, or as an unrecognized scoped constraint. With no active build, a direct
+hold selects discussion. With an active build, a global hold or a hold whose
+target is in the active alias set retracts the build. Thus `do not build the
+room` withdraws the private-room workflow and `do not build the game` withdraws
+the game automation. A hold for an absent subtarget and an unrecognized scoped
+hold constrain the design without downgrading the whole request, so `Build a
+game; do not build channels` remains a game build. A later effective direct
+build, discussion, or retracting hold replaces the earlier mode.
+
+Quoted examples and metalinguistic copies have explicit scope. A unit beginning
+with a carrier such as `The payload says:` or `Example prompt:` starts a copied
+block at that unit. Build, hold, discussion, and preview phrases in that unit
+and following units have no authority. A copied block can leave copied state
+only on a closed standalone terminal unit. The boundary-only terminators are
+`end of example`, `end of payload`, `end of prompt`, `붙여넣기 끝`, `예시 끝`,
+and `프롬프트 끝`; they merely permit a later unit to regain authority. A word
+such as `Now`, `actually`, or `instead` inside copied payload remains copied data
+and cannot resume request authority.
+
+Closed standalone payload-analysis commands are the other terminal class.
+`analyze the payload`, `analyze this payload`, `explain what the payload does`,
+`explain what this payload does`, `이 페이로드를 분석해`,
+`이 페이로드가 무엇을 하는지 설명해`, and `페이로드를 분석해` ground
+Discussion without releasing the copied block. Only an explicit end marker
+releases later directive authority. They never execute a build or preview
+directive contained in the payload they ask the harness to analyze.
+
+Validated-preview selection has its own direct action grammar over the same
+unquoted units. A bare `validated preview` noun phrase has no authority.
+Positive forms require an action such as preparing, showing, or producing a
+validated preview, `validate and preview`, preparing a preview, previewing the
+Draft or design, or one of the closed Korean action equivalents. Explicit
+negative preview actions, `without preview`, terminal `no preview`, and the
+closed Korean negative forms select working draft. Noun contexts such as a
+preview capability, failure, mode, state, label, or named value are excluded.
+The last direct positive or negative action wins. Markers at or after a UI-copy
+carrier such as `label`, `button text`, `panel title`, `문구`, or `라벨` are
+presentation literals and do not control the outcome. Quoted, hypothetical, and
+metalinguistically copied preview phrases are likewise ignored. A direct
+preview preference is applied only with a grounded build. Without one, the
+model's valid build outcome is preserved, except that a grounded build can
+never retain model-authored discussion and falls back to working draft.
+
+A grounded discussion removes build, channel, runtime, unmapped, and
+recipe-detail semantics before adjudication, so model field contradictions
+cannot mutate a Draft. A grounded build clears model response prose and cannot
+remain a model-authored discussion.
+
+Both Core arrays remain required on the model schema. The decoder may supply a
+missing array as empty only when the same current-human analysis positively
+grounds discussion mode. A build or ungrounded request with either array missing
+still fails closed. Discussion presentation is control-validated and bounded to
+2,000 UTF-16 code units. Truncation reserves one unit for an ellipsis, prefers
+the last whitespace cut within the final quarter of the budget, and otherwise
+uses the last complete Unicode scalar that fits. The bounded value is the only
+presentation admitted to serving history. Raw tool arguments remain in the
+append-only audit transcript but their overlong response has no semantic or
+presentation authority.
+
 Safety-boundary requests and selected recipe-detail facets remain part of the
 closed Core semantic projection, but they are not model wire fields. A pure,
 linear-time grounder derives them from the exact current human turn before
@@ -305,12 +386,30 @@ and response-format metadata remains capped at 3.8 KB. Detail schemas retain
 their current subset-specific ceilings.
 
 The durable transcript remains append-only. Core serving projects at most four
-recent human envelopes plus prior discussion presentation into conversational
-history, while removing prior tool calls, tool results, and their stale revision
-numbers. The exact current human envelope and authoritative state anchor remain
-last. This preserves useful dialogue context without inviting the model to copy
-an earlier tool schema or infer a revision increment. Snapshot verification still
-uses the complete unprojected transcript.
+recent human envelopes plus accepted discussion presentation into
+conversational history, while removing prior tool calls, tool results, and
+their stale revision numbers. The exact current human envelope and
+authoritative state anchor remain last. Snapshot verification always uses the
+complete unprojected transcript.
+
+Projection has a one-replay-per-history-turn contract. Before attempting any
+context-size fit, the harness materializes each eligible historical turn once.
+For that turn it replays the exact Core arguments through the human-aware
+parser, current-human grounding, request evidence construction, and
+adjudicator, then checks the persisted fallback kind, adjudication digest, and
+presentation digest. Only a successful replayed discussion contributes one
+assistant presentation; failed, rejected, private, or non-discussion turns
+contribute only their human envelope. Context fitting then drops the oldest
+already-materialized projections without replaying a turn again. This makes
+projection work bounded by the history-turn cap rather than by the number of
+fit attempts.
+
+Every successful routed Core result stores the deterministic route decision's
+adjudication digest and a separately domain-separated, length-framed digest of
+the normalized presentation. These values bind the append-only transcript only
+and do not enter semantic identity. A malformed or forged historical result is
+never surfaced as assistant presentation, and a snapshot containing it fails
+the full restore replay before another serving turn can begin.
 
 For the stateful-game evaluation, `Preserve state across restarts` is represented
 only by `restart_persistent`. The anti-weakening sentence is not a capability.
@@ -415,14 +514,49 @@ The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
 extractor revision moves from 4 to 9, including the closed detail grammar,
 supported-base classification, and runtime-versus-behavior evidence contract.
-The normalizer revision moves from 1 to 4, including exact capability-evidence
-canonicalization and typed safety-boundary evidence ownership, and the recipe
-descriptor and registry digests rotate. Recipe version,
+The normalizer revision moves from 1 to 5, including exact capability-evidence
+canonicalization, typed safety-boundary evidence ownership, explicit request-mode
+grounding, discussion-only array recovery, and bounded presentation, and the
+recipe descriptor and registry digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
+
+The root `IntentRecipeSessionSnapshotV2` requires a
+`transcript_integrity_digest` even when its stage is `Empty`. This digest is
+append-only transcript integrity, not request evidence, compiler input, semantic
+intent, a preview receipt, or stage semantics. Its projection under
+`starring.intent.transcript_integrity.v1\0` is:
+
+```text
+message count as u64 big-endian
+for each message in order:
+  "message"
+  message index as u64 big-endian
+  role wire value: system, user, assistant, or tool
+  exact UTF-8 content bytes
+  tool_call_id presence: some or none
+  exact UTF-8 tool_call_id bytes, or empty bytes when absent
+  tool-call count as u64 big-endian
+  for each tool call in order:
+    "tool_call"
+    exact UTF-8 call ID bytes
+    exact UTF-8 tool name bytes
+    exact UTF-8 raw arguments bytes
+```
+
+The domain and every projection field are separately length-framed with a
+fixed-width big-endian `u64` length. Message and tool-call counts are themselves
+encoded as big-endian `u64` values before framing. Content and raw arguments are
+never parsed and JSON-canonicalized for this digest. Semantically equivalent
+whitespace, object-key ordering, or escaping therefore rotates it, as does any
+message insertion, deletion, reordering, role change, call rebinding, or raw
+argument edit. The zero-message projection has a pinned golden digest, while an
+`Empty` stage still hashes its actual complete transcript, including the system
+prompt. The root field is never optional or null.
 
 Durable awaiting-decision and preview-ready stages move to a V2 shape. They bind:
 
-- protocol and resource context fingerprint;
+- protocol, required extractor and normalizer revisions, and resource context
+  fingerprint;
 - complete ordered request-evidence entries and chain head;
 - root or candidate Draft digest;
 - route semantic and audited adjudication identities;
@@ -432,7 +566,18 @@ Durable awaiting-decision and preview-ready stages move to a V2 shape. They bind
 
 Restore performs pure deterministic verification:
 
+- compare the root extractor and normalizer revisions with the current recipe
+  descriptor before any Empty-stage return;
 - recompute context fingerprint with architecture-independent framing;
+- validate the well-formed transcript digest and compare the exact streamed
+  transcript digest before parsing or semantic replay;
+- structurally validate the complete unprojected transcript and its strict typed
+  tool outcomes;
+- replay every persisted Core turn from its exact human and state envelopes and
+  persisted raw arguments, then apply the result contract appropriate to the
+  reproduced semantic branch;
+- validate the terminal private outcome, historical candidate-failure ordering,
+  and Empty-stage terminal invariant;
 - validate the request evidence against transcript envelopes;
 - validate route decision and recipe evidence;
 - re-normalize an awaiting workspace and compare the derived missing decision;
@@ -441,9 +586,117 @@ Restore performs pure deterministic verification:
 - recompute candidate RuleSet and complete Draft digests;
 - recompute the stage binding.
 
-Restore does not call the model, rerun simulation, mutate the Draft, or touch an
-external service. Normalizing and compiling at most 31 requirements is negligible
-relative to one model request.
+Restore does not call the model, mutate the canonical Draft, or touch an external
+service. A current-root candidate failure does rerun the pure in-memory simulator
+as part of the exact preparation boundary described below. Identical candidate
+replays within one restore are memoized, and durable replay-work bounds keep the
+remaining local CPU work finite.
+
+### Transcript result replay
+
+Every persisted `interpret_intent_core` turn is semantically replayed according
+to its persisted raw arguments, not only the turn referenced by the current
+private recipe stage. Replay starts from the exact preceding `INTENT_HUMAN`
+envelope and `INTENT_STATE` anchor, applies the human-aware parser and grounding,
+reconstructs initial request evidence, and runs deterministic adjudication. This
+reproduces the Core branch; it is not a blanket claim that every historical
+downstream result can be regenerated without its former Draft.
+
+An `ok=false` tool result has one strict `deny_unknown_fields` envelope:
+
+```text
+ok
+code
+location
+message
+hint
+revision
+```
+
+The four text fields must be nonempty. When Core parse, revision, grounding,
+evidence construction, or adjudication deterministically fails, restore
+requires the persisted code, location, message, hint, and revision to equal the
+replayed error exactly. If replay instead reaches a routed success, replacing
+its typed result with a failure cannot restore.
+
+A routed success has an exact typed result containing `status=routed`, fallback
+kind, adjudication digest, and presentation digest. A private Core branch is
+replayed through its selected recipe path. Default private extraction forbids a
+detail frontier. Detail extraction requires the exact selected-facet
+`details_required` result, matching detail-state facets, current-human detail
+parsing and grounding, and recipe finalization. A deterministic detail-parse,
+recipe-finalization, or recipe-preparation failure must reproduce exactly,
+including `code`, `location`, `message`, `hint`, and `revision`.
+
+After recipe preparation produces a resolved candidate, failure verification
+depends on Draft availability. A failure whose expected revision equals the
+current canonical Draft revision is a current-root candidate failure. Restore
+reruns the complete deterministic preparation boundary against that Draft:
+compile, plan normalization, atomic execution on a clone, validation,
+in-memory simulation, and preview. Replay uses the exact original
+`ResourceBindingMap` after its channel and role keys and IDs reproduce the
+persisted context fingerprint. This prevents a valid external role reference in
+the root Draft from becoming unresolved only during restore. Restore requires the
+exact structured error; successful preparation or a different error rejects the
+snapshot. Equivalent replay inputs share one memoized success or structured
+failure during that restore. The replay future must complete synchronously and
+fails closed if preparation ever crosses an asynchronous boundary. A failure whose expected revision is less
+than the current Draft revision is historical because the old root Draft is
+unavailable. Restore does not semantically re-execute that candidate. It
+requires the strict failure shape, the state anchor's exact revision, and a
+position before a later successful private terminal outcome; its exact bytes
+and surrounding transcript placement are protected by
+`transcript_integrity_digest`. A future revision, a historical candidate
+failure without a later terminal success, or one at or after that terminal is
+rejected.
+
+A successful private result that is historical and nonterminal is likewise
+protected as exact transcript bytes rather than represented as current
+authoritative stage identity. The most recent terminal success receives the
+stronger stage and request-evidence checks below. This distinction prevents
+full-transcript integrity from being described as semantic re-execution of an
+artifact whose old Draft is no longer retained.
+
+A failed `resolve_intent_decision` is required to have the strict typed failure
+shape and is protected by the complete transcript digest. It is not blanket
+exact semantic replay because it does not enter authoritative request evidence.
+When a successful resolution is represented by the final accepted evidence,
+restore instead rederives the pending workspace decision, grounds the exact
+human selection, reapplies the typed value, and compares the final terminal
+result with the authoritative stage.
+
+### Terminal stage and evidence binding
+
+Restore locates the most recent successful private outcome whose typed status
+is `awaiting_decision` or `preview_ready`. A nonempty durable private stage must
+have that outcome, its status must equal the stage variant, and its human
+message index must equal the final request-evidence entry's transcript index.
+This prevents a successful private result from being erased into another stage
+or rebound to unrelated evidence.
+
+For `AwaitingDecision`, the final evidence turn's result must exactly reproduce
+the workspace revision and active channel options. For `PreviewReady`, it must
+exactly reproduce the intent revision, Draft revision, semantic-intent hash,
+compiled-plan hash, candidate-RuleSet hash, and operation count stored by the
+stage. The normal workspace, recipe-evidence, Draft, receipt, and stage-binding
+checks still run afterward; the transcript result is an additional binding, not
+a replacement for them.
+
+`Empty` means that no successful private recipe outcome owns a durable Intent
+workspace or receipt. It does not mean that the canonical Draft is the default
+Draft. Restore permits an existing nondefault root Draft, including a root
+preserved after an atomic candidate rollback, and requires only that the
+transcript contain no successful private terminal outcome. Routed discussion,
+typed-planner, capability-gap, rejection, exactly replayed Core or private
+failures, current-root full-preparation failures, and typed failed
+resolutions may therefore leave the stage Empty without erasing pre-existing
+design state. A historical candidate failure cannot appear under `Empty`
+because it requires a later successful private terminal outcome. A snapshot
+still cannot erase an awaiting or preview-ready stage to Empty because its
+successful private terminal result remains in the transcript. Component
+identities and the required root transcript digest are checked before accepting
+the Empty stage, so an obsolete or partially edited pre-release snapshot cannot
+bypass root validation.
 
 ## Version and digest rotation
 
@@ -454,9 +707,9 @@ Intent protocol                    4
 Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
-Session snapshot                   7
+Session snapshot                   8
 Recipe extractor revision          9
-Recipe normalizer revision         4
+Recipe normalizer revision         5
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -475,6 +728,8 @@ starring.intent.request_evidence.resolution.v1\0
 starring.intent.request_evidence.options.v1\0
 starring.intent.semantic_ir.v4\0
 starring.intent.adjudication.v4\0
+starring.intent.routed_presentation.v1\0
+starring.intent.transcript_integrity.v1\0
 starring.intent.recipe_details.v2\0
 starring.intent.detail_request.v2\0
 starring.intent.detail_coverage.v2\0
@@ -488,9 +743,11 @@ starring.intent.stage_binding.preview_ready.v4\0
 starring.intent.resource_context.v2\0
 ```
 
-All identity hashing uses one shared pure module for canonical JSON,
+Identity hashing uses one shared pure module for canonical JSON,
 domain-prefixing, lowercase hexadecimal formatting, and hash-shape validation.
-Length framing, where used, is fixed-width `u64` big-endian rather than
+Transcript integrity reuses its domain-separated length-framing and hexadecimal
+helpers but deliberately hashes exact transcript bytes instead of canonical
+JSON. Length framing is fixed-width `u64` big-endian rather than
 architecture-dependent `usize` bytes.
 
 ## Snapshot compatibility
@@ -500,28 +757,51 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 8, normalizer revisions through 3, or
+branch-local extractor revisions through 8, normalizer revisions through 4, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
-durable format. They are rejected by the exact fixed-prompt or recipe-registry
-identity checks and must be discarded rather than migrated. After V4 ships, a
-semantic prompt, extractor, or normalizer change must either rotate the protocol
+durable format. The root Intent snapshot requires the extractor and normalizer
+revisions and the `transcript_integrity_digest`, including for an Empty stage.
+Earlier or missing component identities, a missing or malformed transcript
+digest, and an exact digest mismatch are rejected, while an earlier prompt is
+rejected by the exact fixed-prompt check. These artifacts must be discarded
+rather than migrated. After V4 ships, a semantic prompt, extractor, normalizer,
+or transcript-integrity projection change must either rotate the protocol
 or snapshot contract or retain an explicit verified restore-only compatibility
 path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 9, and normalizer 4 is current;
+- the exact V4 prompt with protocol 4, extractor 9, and normalizer 5 is current;
 - a pre-release V4 prompt, extractor revision through 8, or normalizer revision
-  through 3 is rejected;
+  through 4 is rejected;
+- every V4 root, including `Empty`, requires a well-formed
+  `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
 - any crossed prompt/protocol pair is an invalid invariant;
-- a V6 non-Intent adaptive or typed snapshot may be promoted in memory to V7;
-- a V6 snapshot with non-null `intent_recipe`, including an Empty V3 stage, is
-  rejected before V4 deserialization;
+- a V6 or V7 non-Intent adaptive or typed snapshot may be promoted in memory to
+  V8;
+- a V6 or V7 snapshot with non-null `intent_recipe`, including an Empty V3
+  stage, is rejected before V4 deserialization;
 - SQLite rows and generations remain unchanged after a rejected migration;
 - store schema stays at 2 because no relational column changes;
 - a future explicit operator reset may preserve the Draft while discarding old
   Intent identity, but runtime migration never re-signs a V3 preview as V4.
+
+Every Intent turn is durably admitted against three restored-transcript bounds:
+4 MiB of estimated serialized message content, 1,024 human turns, and 16 persisted
+failure results. The latter two cap deterministic replay work as well as storage.
+Human input that cannot fit is rejected without a model call. The complete
+current transcript, including the state anchor and any detail frontier, is checked
+again immediately before each model call. A response or deterministic tool result
+that would cross a bound causes the Draft, messages, recipe stage, observability,
+last error, prose state, turn lifecycle, and current-human index to roll back to
+the exact pre-turn checkpoint. Character overflow returns
+`INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED`; replay-work overflow returns
+`INTENT_DURABLE_REPLAY_WORK_LIMIT_EXHAUSTED`. No successful outcome from that turn
+is returned. SQLite compare-and-swap validates the same bounds before serialization
+and transaction start as a second defense. `snapshot()` output from an admitted
+session is therefore self-restorable, while a caller-created oversized or
+unbounded-work snapshot is rejected before persistence.
 
 The resource context fingerprint rotates to V2. Its canonical representation is
 architecture-independent and continues to bind exact channel and role keys and
@@ -529,11 +809,19 @@ IDs.
 
 ## Integrity boundary
 
-Stage digests detect accidental corruption and inconsistent partial edits. They
-are not authentication against an attacker who can rewrite both SQLite JSON and
-all digests. A production threat model that includes local database write access
-requires a separate Keychain-backed HMAC or signature envelope. That is not
-silently implied by V4 SHA-256 receipts and is not added in this change.
+Stage and transcript-integrity digests detect accidental corruption and
+inconsistent partial edits to persisted local SQLite state. They are not
+authentication against an attacker who can rewrite both the snapshot JSON and
+its digests. Defending that threat requires a separate Keychain-backed HMAC or
+signature envelope over the persisted snapshot. That authenticated envelope is
+outside this change and is not silently implied by V4 SHA-256 receipts or
+integrity digests.
+
+Transcript integrity is streamed directly into the length-framed SHA-256
+state, so snapshot generation does not duplicate up to 4 MiB of message and
+tool-argument bytes in temporary vectors. Restore validates the well-formed
+digest and exact transcript digest before transcript parsing and semantic Core
+replay, then runs every deeper defense-in-depth check only for matching bytes.
 
 ## Deterministic verification matrix
 
@@ -557,6 +845,18 @@ The Rust suite must prove each relationship independently of Gemma.
 Additional required tests cover:
 
 - V4 Core rejects objective and unknown fields;
+- direct English and Korean build and hold grammar shares one target ontology;
+- a build records its closed target alias set: a room hold retracts a private-room
+  workflow, a game hold retracts a game automation, and an absent-subtarget or
+  scoped negative constraint preserves Build;
+- copied commands, quoted commands, hypotheticals, and unmatched quotes do not
+  select build, discussion, hold, or preview; only a closed standalone
+  terminator ends a copied block, `Now` inside the block has no authority, and a
+  closed payload-analysis command selects Discussion;
+- direct positive and negative preview grammar overrides the model only for a
+  grounded build, and preview-looking UI copy remains presentation data;
+- discussion-only missing-array recovery is unavailable to build or ungrounded
+  turns, and a bounded discussion response is the only presentation persisted;
 - every positive unmapped requirement must be exact-grounded;
 - closed runtime properties cannot consume executable behavior evidence;
 - the stateful-game behavior set is exact, sorted, and identical in the Core
@@ -565,21 +865,50 @@ Additional required tests cover:
 - every model-authored display field is absent from compiler inputs;
 - request evidence entry order, message index, revision, decision ID, path,
   option digest, and accepted value tampering is rejected;
+- every persisted Core turn is semantically replayed from its persisted raw
+  arguments; exact Core and pre-candidate private failures, routed result
+  digests, detail-required facets, and current-root resolved-candidate full
+  preparation failures reject semantic tampering;
+- historical candidate failures require strict shape, exact revision, ordering
+  before a later terminal success, and full-transcript byte binding without a
+  claim of semantic re-execution;
+- failed `resolve_intent_decision` results are strict typed and full-transcript
+  bound unless represented by authoritative final evidence, where workspace,
+  human selection, accepted value, and terminal result are rederived exactly;
+- historical nonterminal successes are full-transcript bound, while the final
+  awaiting or preview success matches the authoritative stage and final request
+  evidence exactly;
+- the root transcript digest is required even for Empty, pins the zero-message
+  projection, hashes the actual complete Empty-stage transcript, and rotates for
+  message insertion, deletion, reorder, role, content, call-ID presence or bytes,
+  call count, call ID, tool name, or exact raw argument changes, including
+  JSON-equivalent byte rewrites;
+- an Empty stage permits the preserved pre-existing or root Draft but contains
+  no successful private terminal result; awaiting and preview stages match the
+  terminal result and final request-evidence message index;
+- each admitted history turn is replayed once before context-fit trimming, and
+  only an exactly replayed discussion contributes assistant presentation;
 - failed clarification does not advance evidence or stage;
 - awaiting missing-decision re-derivation is exact;
 - preview recompile matches every persisted identity;
-- Draft, workspace, decision, evidence, receipt, and transcript tampering is
-  independently rejected;
+- Draft, workspace, decision, evidence, receipt, and transcript partial
+  tampering is independently rejected under the documented non-authenticated
+  local-SQLite integrity boundary;
 - V3 prompt, protocol, workspace, evidence, and snapshot shapes cannot be
   relabeled as V4;
-- V6 non-Intent migration succeeds while every V6 Intent stage rejects;
+- V6 and V7 non-Intent migration succeeds while every V6 or V7 Intent stage
+  rejects;
+- oversized human or model content never creates a persisted or returned
+  self-unrestorable Intent turn, and the SQLite store rejects an oversized
+  caller-created Intent snapshot before writing a row;
 - V3 and V4 equivalent inputs emit byte-identical requirements and RuleSet;
 - all parse, adjudication, evidence, normalization, compile, validation, and
   simulation failures leave the canonical Draft unchanged.
 
-Reviewed golden digests pin projection fixtures and domain versions. Tests must
-also assert the canonical projection content so a constant hash implementation
-or an accidentally omitted semantic field cannot satisfy the suite.
+Reviewed golden digests pin canonical identity projections, exact transcript
+projection fixtures, and domain versions. Tests must also assert the projected
+content so a constant hash implementation or an accidentally omitted field
+cannot satisfy the suite.
 
 ## Evaluation contract
 
@@ -600,11 +929,28 @@ The evaluator must add:
 - canonical RuleSet digest;
 - per-case unique counts for route semantic, adjudication, compiler input,
   semantic intent, compiled plan, and RuleSet identities;
+- an own serialized string output and own metadata object on every provider
+  response, with structural equality after both copies parse as reports;
+- visible projection collision rejection across every turn and final route
+  decision;
+- a pinned all-case axis-specific class matrix that requires route identity to
+  be stable and equal within Core-equivalent default, English discussion,
+  custom-static, and clarification/restart projections while keeping distinct
+  route classes pairwise separate;
+- narrower request and adjudication classes that allow equality only for exact
+  shared human sequences and require every other evidence provenance to remain
+  distinct even when route semantics are equal;
+- one-shot request, route, and adjudication identities distinct from the
+  clarification path, with clarification and restart identities continuous;
 - equivalence groups for paraphrase, one-shot, clarification, restart, and
   discussion-then-build;
-- mutation groups for hub, locale, close, copy, naming, and controls;
-- regression tests proving constant semantic hashes, swapped custom fields,
-  and English output substituted for Korean output all fail acceptance.
+- pairwise identity groups for hub, locale, close, copy, naming, controls, and
+  the full-custom combination;
+- regression tests proving split or non-string response output, top-level
+  output fallback, constant fallback identities, peer mutation aliases,
+  hidden same-kind Core aliases, nonterminal aliases, automatic retries,
+  swapped custom fields, and English output substituted for Korean output all
+  fail acceptance.
 
 Custom full and copy-only cases become first-class repeated acceptance cases.
 The required-case manifest must match the actual case set rather than silently
@@ -634,9 +980,10 @@ The CLI evaluator should capture, without changing the pure `LlmClient` trait:
 - total turn duration.
 
 This closes the current observability gap where the gateway returns usage but
-Promptfoo reports zero tokens. Context admission must be compared with the real
-HTTP request, because the gateway duplicates schema into both tools and response
-format while the harness currently counts it once.
+Promptfoo reports zero tokens. Context admission now serializes the same sole
+tool schema under both `tools` and strict `response_format`, matching the actual
+request shape; a regression test requires the admitted byte count to include
+that second schema copy.
 
 V4 live evaluation runs in this order:
 
@@ -649,11 +996,15 @@ V4 live evaluation runs in this order:
    equivalence checks;
 7. final clean-source acceptance summary.
 
-Latency is reported separately for one-call and two-call paths. Default retains
+Latency is reported separately for one-call and two-call paths across every
+valid preview, including independent mutation cases. Default retains
 P50 below 8 seconds and P95 below 20 seconds. Detail reports P50 at or below 22
 seconds and P95 at or below 30 seconds. Every turn remains below 60 seconds.
-V4 mean and P95 are compared honestly against the matching V3 path, with a
-10–15 percent non-inferiority band and no mixing of different commits or models.
+A V3 comparison requires a separately supplied clean-source artifact from the
+same model, hardware, case slice, and concurrency policy. The current checkpoint
+has no such baseline input and therefore makes no automated V3 non-inferiority
+claim. When that artifact exists, mean and P95 must be reported separately with a
+10–15 percent non-inferiority band and no mixing of commits or models.
 
 Passing these gates proves bounded harness identity stability and measured local
 serving behavior. It does not certify production authentication, concurrency,
