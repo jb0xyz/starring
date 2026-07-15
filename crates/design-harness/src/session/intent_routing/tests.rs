@@ -80,19 +80,29 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 #[test]
 fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("other_unmapped_required_capabilities"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("shortest exact phrase from the human text"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Runtime closed fields are infrastructure properties only; they never replace automation behaviors"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "set the closed infrastructure field and also preserve the complete behavior separately"
+    ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("scope-preservation or anti-weakening instructions"));
+        .contains("shortest complete contiguous subject-and-predicate phrase"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("Never paraphrase it or reduce it to a noun fragment"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Do not copy meta-instructions about preserving or not weakening the request as capabilities"
+    ));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("anti-weakening"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "Safety-boundary requests and recipe-detail frontiers are grounded directly from INTENT_HUMAN"
     ));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("custom_detail_facets"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("persistent XP across restarts with durable timers and event-time LLM"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "external settlement lease means other_unmapped_required_capabilities=[external settlement lease]"
+        "durable scheduling infrastructure for a workflow where each approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[each approved invoice posts a signed audit record]"
     ));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("every message earns XP"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "Never encode safety-boundary requests or supported copy, naming, and control literals"
     ));
@@ -163,6 +173,12 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
         "durable_timer",
         "persistent_economy",
         "event_time_llm"
+    ]);
+    value["other_unmapped_required_capabilities"] = json!([
+        "timers advance quests",
+        "every message earns XP",
+        "an LLM decides rewards at event time",
+        "levels unlock an economy"
     ]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
@@ -1271,7 +1287,7 @@ fn creator_only_requirement_routes_to_one_exact_gap_without_question_or_mutation
 }
 
 #[test]
-fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
+fn stateful_game_preserves_exact_sorted_behaviors_beside_runtime_infrastructure() {
     block_on(async {
         let malicious = "The persistent timed economy game is live.";
         let client = ScriptedClient::new(vec![Ok(stateful_game(0, malicious))]);
@@ -1281,7 +1297,7 @@ fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
         let root = session.draft.clone();
 
         let BurstOutcome::Routed { fallback, decision } = session
-            .run_burst("Build a persistent timed economy game with an event-time LLM")
+            .run_burst("Build a stateful game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts. Do not reduce or weaken any of these requirements")
             .await
         else {
             panic!("expected capability gap")
@@ -1292,15 +1308,75 @@ fn stateful_game_routes_to_the_exact_sorted_four_blockers() {
             decision
                 .blockers()
                 .iter()
-                .map(|blocker| blocker.id)
+                .map(|blocker| {
+                    (
+                        blocker.id,
+                        blocker
+                            .evidence
+                            .iter()
+                            .map(|evidence| {
+                                (
+                                    evidence.semantic_path.as_str(),
+                                    evidence.description.as_str(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
-                IntentCapabilityIdV2::DurableTimer,
-                IntentCapabilityIdV2::EventTimeLlmDecision,
-                IntentCapabilityIdV2::PersistentEconomyLedger,
-                IntentCapabilityIdV2::RestartPersistentState,
+                (
+                    IntentCapabilityIdV2::DurableTimer,
+                    vec![("intent.core.runtime_requirements.timers", "durable")],
+                ),
+                (
+                    IntentCapabilityIdV2::EventTimeLlmDecision,
+                    vec![("intent.core.runtime_requirements.event_time_llm", "true")],
+                ),
+                (
+                    IntentCapabilityIdV2::PersistentEconomyLedger,
+                    vec![(
+                        "intent.core.runtime_requirements.economy",
+                        "persistent_ledger",
+                    )],
+                ),
+                (
+                    IntentCapabilityIdV2::RestartPersistentState,
+                    vec![(
+                        "intent.core.runtime_requirements.persistence",
+                        "restart_persistent",
+                    )],
+                ),
+                (
+                    IntentCapabilityIdV2::UnclassifiedIntentRequirement,
+                    vec![
+                        (
+                            "intent.core.unclassified_requirements.0",
+                            "an LLM decides rewards at event time",
+                        ),
+                        (
+                            "intent.core.unclassified_requirements.1",
+                            "every message earns XP",
+                        ),
+                        (
+                            "intent.core.unclassified_requirements.2",
+                            "levels unlock an economy",
+                        ),
+                        (
+                            "intent.core.unclassified_requirements.3",
+                            "timers advance quests",
+                        ),
+                    ],
+                ),
             ]
         );
+        let exact_behaviors = vec![
+            "an LLM decides rewards at event time".to_string(),
+            "every message earns XP".to_string(),
+            "levels unlock an economy".to_string(),
+            "timers advance quests".to_string(),
+        ];
+        assert_eq!(decision.unclassified_requirements(), exact_behaviors);
         assert!(!fallback.response().contains("game is live"));
         assert_eq!(session.draft, root);
         assert_eq!(session.observability.clarification_count, 0);

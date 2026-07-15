@@ -581,7 +581,7 @@
         "turns": [
           {
             "id": "stateful-game",
-            "input": "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Preserve state across restarts and do not reduce the request to static responses."
+            "input": "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses."
           }
         ]
       }
@@ -590,8 +590,13 @@
     expectedRoutePath: capability_gap
     expectedFinalStatus: empty
     expectedRestartCount: 0
-    expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|
+    expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|
     expectedBoundaryViolations: ""
+    expectedUnclassifiedRequirements:
+      - an LLM decides rewards at event time
+      - every message earns XP
+      - levels unlock an economy
+      - timers advance quests
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance

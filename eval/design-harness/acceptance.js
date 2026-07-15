@@ -3,6 +3,9 @@ const { createHash } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 const { parseReport } = require('./intent-assertions');
 
+const INTENT_EXTRACTOR_REVISION = 7;
+const INTENT_REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
+
 const REQUIRED_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
   'intent_private_study_room_mutation_hub',
@@ -278,11 +281,11 @@ function metadataIsExact(entry) {
     && provenance?.attestation_kind === 'local_unsigned'
     && report?.catalog_identity?.recipe_id === 'starring.private_study_room'
     && report?.catalog_identity?.recipe_version === 1
-    && report?.catalog_identity?.extractor_revision === 6
+    && report?.catalog_identity?.extractor_revision === INTENT_EXTRACTOR_REVISION
     && report?.catalog_identity?.normalizer_revision === 2
     && report?.catalog_identity?.compiler_revision === 1
     && report?.catalog_identity?.simulator_revision === 1
-    && /^[0-9a-f]{64}$/.test(report?.catalog_identity?.registry_digest)
+    && report?.catalog_identity?.registry_digest === INTENT_REGISTRY_DIGEST
     && report?.model_call_metrics?.every((metric) => (
       Number.isSafeInteger(metric.prompt_tokens)
         && Number.isSafeInteger(metric.completion_tokens)

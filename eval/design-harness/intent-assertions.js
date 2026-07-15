@@ -5,6 +5,8 @@ const INTENT_PROTOCOL_VERSION = 4;
 const INTENT_ADJUDICATOR_VERSION = 3;
 const INTENT_IDENTITY_REVISION = 2;
 const INTENT_SNAPSHOT_VERSION = 7;
+const INTENT_EXTRACTOR_REVISION = 7;
+const INTENT_REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
 const SHA256 = /^[0-9a-f]{64}$/;
 const DECISION_KINDS = new Set([
   'private_study_room',
@@ -20,6 +22,24 @@ const CAPABILITY_CONTRACTS = {
   persistent_economy_ledger: ['unavailable', null],
   restart_persistent_state: ['unavailable', null],
   unclassified_intent_requirement: ['unclassified', null],
+};
+const CAPABILITY_EVIDENCE_CONTRACTS = {
+  durable_timer: [{
+    semantic_path: 'intent.core.runtime_requirements.timers',
+    description: 'durable',
+  }],
+  event_time_llm_decision: [{
+    semantic_path: 'intent.core.runtime_requirements.event_time_llm',
+    description: 'true',
+  }],
+  persistent_economy_ledger: [{
+    semantic_path: 'intent.core.runtime_requirements.economy',
+    description: 'persistent_ledger',
+  }],
+  restart_persistent_state: [{
+    semantic_path: 'intent.core.runtime_requirements.persistence',
+    description: 'restart_persistent',
+  }],
 };
 const BOUNDARY_IDS = new Set([
   'bypass_validation_preview_approval',
@@ -144,6 +164,10 @@ function routeDecision(value, location) {
       throw new Error(`invalid intent eval report: ${blockerLocation} contradicts the capability manifest`);
     }
     evidenceList(blocker.evidence, `${blockerLocation}.evidence`);
+    const evidenceContract = CAPABILITY_EVIDENCE_CONTRACTS[blocker.id];
+    if (evidenceContract && !sameJson(blocker.evidence, evidenceContract)) {
+      throw new Error(`invalid intent eval report: ${blockerLocation}.evidence contradicts the capability evidence contract`);
+    }
   }
   sortedUnique(value.blockers.map((blocker) => blocker.id), `${location}.blockers`);
   if (!Array.isArray(value.boundary_violations)) {
@@ -169,6 +193,19 @@ function routeDecision(value, location) {
     nonEmptyString(entry, `${location}.unclassified_requirements[${index}]`);
   });
   sortedUnique(value.unclassified_requirements, `${location}.unclassified_requirements`);
+  const unclassifiedBlocker = value.blockers.find(
+    (blocker) => blocker.id === 'unclassified_intent_requirement',
+  );
+  const expectedUnclassifiedEvidence = value.unclassified_requirements.map(
+    (description, index) => ({
+      semantic_path: `intent.core.unclassified_requirements.${index}`,
+      description,
+    }),
+  );
+  const actualUnclassifiedEvidence = unclassifiedBlocker?.evidence ?? [];
+  if (!sameJson(actualUnclassifiedEvidence, expectedUnclassifiedEvidence)) {
+    throw new Error(`invalid intent eval report: ${location} unclassified evidence does not match indexed unclassified_requirements`);
+  }
   if (value.route_target === null) {
     if (value.kind === 'private_study_room') {
       throw new Error(`invalid intent eval report: ${location} is missing its pinned recipe`);
@@ -660,11 +697,11 @@ function parseReport(output) {
   ], 'catalog_identity');
   if (report.catalog_identity.recipe_id !== 'starring.private_study_room'
     || report.catalog_identity.recipe_version !== 1
-    || report.catalog_identity.extractor_revision !== 6
+    || report.catalog_identity.extractor_revision !== INTENT_EXTRACTOR_REVISION
     || report.catalog_identity.normalizer_revision !== 2
     || report.catalog_identity.compiler_revision !== 1
     || report.catalog_identity.simulator_revision !== 1
-    || !SHA256.test(report.catalog_identity.registry_digest)) {
+    || report.catalog_identity.registry_digest !== INTENT_REGISTRY_DIGEST) {
     throw new Error('invalid intent eval report: catalog identity is invalid');
   }
   object(report.final_intent, 'final_intent');
@@ -1429,17 +1466,20 @@ function intentAdjudicationDecision(output, context) {
         failures.push(`${turn.id} boundaries=${JSON.stringify(actualBoundaries)} expected=${JSON.stringify(expectedBoundarySet)}`);
       }
       const actualUnclassified = [...decision.unclassified_requirements].sort();
+      const canonicalInput = turn.input.split(/\s+/u).filter(Boolean).join(' ');
+      const grounded = actualUnclassified.every((value) => canonicalInput.includes(value));
+      if (!grounded) {
+        failures.push(`${turn.id} contains unclassified evidence not grounded in its human input`);
+      }
       if (expectedUnclassified.exact !== null
         && !sameJson(actualUnclassified, expectedUnclassified.exact)) {
         failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected=${JSON.stringify(expectedUnclassified.exact)}`);
       }
       if (expectedUnclassified.exact === null) {
-        const grounded = actualUnclassified.every((value) => turn.input.includes(value));
         const containsEvery = expectedUnclassified.contains.every((expectedValue) => (
           actualUnclassified.some((actualValue) => actualValue.includes(expectedValue))
         ));
         if (actualUnclassified.length !== expectedUnclassified.contains.length
-          || !grounded
           || !containsEvery) {
           failures.push(`${turn.id} unclassified=${JSON.stringify(actualUnclassified)} expected grounded evidence containing=${JSON.stringify(expectedUnclassified.contains)}`);
         }

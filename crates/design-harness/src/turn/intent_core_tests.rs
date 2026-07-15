@@ -263,6 +263,38 @@ fn core_parser_maps_every_runtime_requirement_and_deduplicates_values() {
 }
 
 #[test]
+fn core_parser_keeps_behaviors_separate_from_runtime_infrastructure() {
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["runtime_requirements"] = json!([
+        "persistent_economy",
+        "event_time_llm",
+        "restart_persistent",
+        "durable_timer"
+    ]);
+    value["other_unmapped_required_capabilities"] = json!([
+        "timers advance quests",
+        "every message earns XP",
+        "an LLM decides rewards at event time",
+        "levels unlock an economy",
+        "persistent_economy",
+        "event_time_llm",
+        "restart_persistent",
+        "durable_timer"
+    ]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &[
+            "an LLM decides rewards at event time",
+            "every message earns XP",
+            "levels unlock an economy",
+            "timers advance quests"
+        ]
+    );
+}
+
+#[test]
 fn core_capability_evidence_must_be_grounded_in_the_human_request() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");

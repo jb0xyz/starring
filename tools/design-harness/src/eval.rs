@@ -576,7 +576,7 @@ mod tests {
             "starring.private_study_room"
         );
         assert_eq!(document["catalog_identity"]["recipe_version"], 1);
-        assert_eq!(document["catalog_identity"]["extractor_revision"], 5);
+        assert_eq!(document["catalog_identity"]["extractor_revision"], 7);
         assert_eq!(document["catalog_identity"]["normalizer_revision"], 2);
         assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
         assert_eq!(document["catalog_identity"]["simulator_revision"], 1);

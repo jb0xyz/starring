@@ -7,6 +7,19 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+const REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
+const RUNTIME_EVIDENCE = {
+  durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
+  event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
+  persistent_economy_ledger: [
+    'intent.core.runtime_requirements.economy',
+    'persistent_ledger',
+  ],
+  restart_persistent_state: [
+    'intent.core.runtime_requirements.persistence',
+    'restart_persistent',
+  ],
+};
 
 function routeDecision(kind = 'private_study_room', overrides = {}) {
   return {
@@ -32,6 +45,11 @@ function evidence(id) {
   return [{ semantic_path: `intent.${id}`, description: `Requests ${id}` }];
 }
 
+function runtimeEvidence(id) {
+  const [semanticPath, description] = RUNTIME_EVIDENCE[id];
+  return [{ semantic_path: semanticPath, description }];
+}
+
 function fallbackDecision(caseId, route) {
   if (caseId === 'intent_creator_only_close_gap') {
     return routeDecision(route, {
@@ -44,13 +62,33 @@ function fallbackDecision(caseId, route) {
     });
   }
   if (caseId === 'intent_stateful_game_gap') {
+    const requirements = [
+      'an LLM decides rewards at event time',
+      'every message earns XP',
+      'levels unlock an economy',
+      'timers advance quests',
+    ];
     return routeDecision(route, {
       blockers: [
         ['durable_timer', 'unavailable', null],
         ['event_time_llm_decision', 'forbidden_policy', 'event_time_llm_execution_forbidden_v1'],
         ['persistent_economy_ledger', 'unavailable', null],
         ['restart_persistent_state', 'unavailable', null],
-      ].map(([id, status, policy_id]) => ({ id, status, policy_id, evidence: evidence(id) })),
+      ].map(([id, status, policy_id]) => ({
+        id,
+        status,
+        policy_id,
+        evidence: runtimeEvidence(id),
+      })).concat({
+        id: 'unclassified_intent_requirement',
+        status: 'unclassified',
+        policy_id: null,
+        evidence: requirements.map((description, index) => ({
+          semantic_path: `intent.core.unclassified_requirements.${index}`,
+          description,
+        })),
+      }),
+      unclassified_requirements: requirements,
     });
   }
   if (caseId === 'intent_reject_live_mutation') {
@@ -86,7 +124,7 @@ function fallbackDecision(caseId, route) {
         status: 'unclassified',
         policy_id: null,
         evidence: [{
-          semantic_path: 'intent.other_unmapped_required_capabilities',
+          semantic_path: 'intent.core.unclassified_requirements.0',
           description: 'external consensus lease',
         }],
       }],
@@ -306,11 +344,11 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 6,
+      extractor_revision: 7,
       normalizer_revision: 2,
       compiler_revision: 1,
       simulator_revision: 1,
-      registry_digest: '8'.repeat(64),
+      registry_digest: REGISTRY_DIGEST,
     },
     provenance: {
       source_commit: 'c'.repeat(40),
@@ -797,6 +835,27 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
 
   assert.equal(assessment.pass, true);
   assert.equal(assessment.checks.find((entry) => entry.name === 'single_cohort_boundary').pass, true);
+});
+
+test('checkpoint rejects stale extractor and forged registry identities', () => {
+  const oldExtractor = passingDocument();
+  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 6;
+  const oldExtractorAssessment = assess(oldExtractor);
+  assert.equal(oldExtractorAssessment.pass, false);
+  assert.equal(
+    oldExtractorAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+
+  const forgedRegistry = passingDocument();
+  forgedRegistry.results.results[0].response.metadata.catalog_identity.registry_digest =
+    '8'.repeat(64);
+  const forgedRegistryAssessment = assess(forgedRegistry);
+  assert.equal(forgedRegistryAssessment.pass, false);
+  assert.equal(
+    forgedRegistryAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
 });
 
 test('mixed semantics, models, failed assertions, or missing cases cannot pass the checkpoint', () => {

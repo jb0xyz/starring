@@ -264,15 +264,33 @@ The prompt must make these rules explicit:
   external-effect requirement not represented by a closed field must be copied
   as one contiguous whitespace-canonical phrase into
   `other_unmapped_required_capabilities`;
+- runtime fields describe infrastructure properties, not the business behavior
+  that uses them: restart persistence does not represent the state transition,
+  durable timers do not represent the timed action, persistent economy does not
+  represent earning or unlocking rules, and event-time LLM does not represent
+  the decision the model makes;
+- a behavior that depends on a closed runtime property therefore remains exact
+  unmapped evidence unless another closed semantic field represents that
+  behavior;
+- unmapped evidence must retain the shortest complete contiguous subject and
+  predicate, never a paraphrase or a noun fragment;
 - no positive requirement may exist only in response or presentation prose;
 - safety-boundary requests and detail-facet selection are harness-owned;
 - recipe identity, objective identity, compiler identity, and hashes are
   harness-owned and never model outputs.
 
-This keeps the Core schema at or below the existing 2.4 KB ceiling and should
+This keeps the Core duplicated schema at or below a 1.6 KB ceiling and should
 reduce both output tokens and structured metadata. The combined duplicated tool
-and response-format metadata remains capped at 5.6 KB. Detail schemas retain
+and response-format metadata remains capped at 3.8 KB. Detail schemas retain
 their current subset-specific ceilings.
+
+For the stateful-game evaluation, `Preserve state across restarts` is represented
+only by `restart_persistent`. The anti-weakening sentence is not a capability.
+The four executable behaviors remain four sorted exact evidence phrases and
+produce one unclassified blocker containing those four evidence records in
+addition to the four runtime-property blockers. The evaluator requires the
+decision's unmapped requirement set and the unclassified blocker's evidence set
+to be identical.
 
 ## Workspace and recipe boundary
 
@@ -349,9 +367,10 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 6, the normalizer revision from 1 to 2, and
-the recipe descriptor and registry digests rotate. Recipe version, capability
-manifest version, and simulator revision remain unchanged.
+extractor revision moves from 4 to 7, including the closed detail grammar and
+runtime-versus-behavior evidence contract, the normalizer revision from 1 to 2,
+and the recipe descriptor and registry digests rotate. Recipe version,
+capability manifest version, and simulator revision remain unchanged.
 
 Durable awaiting-decision and preview-ready stages move to a V2 shape. They bind:
 
@@ -388,7 +407,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   7
-Recipe extractor revision          6
+Recipe extractor revision          7
 Recipe normalizer revision         2
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -480,6 +499,9 @@ Additional required tests cover:
 
 - V4 Core rejects objective and unknown fields;
 - every positive unmapped requirement must be exact-grounded;
+- closed runtime properties cannot consume executable behavior evidence;
+- the stateful-game behavior set is exact, sorted, and identical in the Core
+  decision and unclassified blocker evidence;
 - detail literals cannot be sourced from another turn;
 - every model-authored display field is absent from compiler inputs;
 - request evidence entry order, message index, revision, decision ID, path,
@@ -536,8 +558,8 @@ V4 performance invariants are:
 - default path exactly one model call and one tool call;
 - detail path exactly two model calls and two tool calls;
 - zero automatic model repairs or retries;
-- Core schema at most 2.4 KB;
-- combined Core structured metadata at most 5.6 KB;
+- duplicated Core schema at most 1.6 KB;
+- combined Core structured metadata at most 3.8 KB;
 - largest detail schema below its current measured ceiling;
 - all extra identity and restore work remains deterministic local CPU work.
 

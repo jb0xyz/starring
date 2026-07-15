@@ -9,17 +9,33 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+const REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
+const RUNTIME_EVIDENCE = {
+  durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
+  event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
+  persistent_economy_ledger: [
+    'intent.core.runtime_requirements.economy',
+    'persistent_ledger',
+  ],
+  restart_persistent_state: [
+    'intent.core.runtime_requirements.persistence',
+    'restart_persistent',
+  ],
+};
 
 function evidence(semanticPath = 'intent.automation_kind', description = 'Requested automation') {
   return { semantic_path: semanticPath, description };
 }
 
 function blocker(id, status, policyId = null) {
+  const runtimeEvidence = RUNTIME_EVIDENCE[id];
   return {
     id,
     status,
     policy_id: policyId,
-    evidence: [evidence(`intent.runtime_requirements.${id}`, `Requires ${id}`)],
+    evidence: [runtimeEvidence
+      ? evidence(runtimeEvidence[0], runtimeEvidence[1])
+      : evidence(`intent.runtime_requirements.${id}`, `Requires ${id}`)],
   };
 }
 
@@ -212,11 +228,11 @@ function report(overrides = {}) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 6,
+      extractor_revision: 7,
       normalizer_revision: 2,
       compiler_revision: 1,
       simulator_revision: 1,
-      registry_digest: '8'.repeat(64),
+      registry_digest: REGISTRY_DIGEST,
     },
     provenance: {
       source_commit: 'a'.repeat(40),
@@ -310,10 +326,10 @@ function context(overrides = {}) {
   };
 }
 
-function routedDocument(routeDecision, message, id = 'routed') {
+function routedDocument(routeDecision, message, id = 'routed', input = 'Route this request') {
   const routed = turn({
     id,
-    input: 'Route this request',
+    input,
     outcome: 'routed',
     completed: false,
     message,
@@ -826,8 +842,23 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
     blocker('persistent_economy_ledger', 'unavailable'),
     blocker('restart_persistent_state', 'unavailable'),
   ];
-  const statefulDecision = decision('capability_gap', { blockers: statefulBlockers });
-  const statefulMessage = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Durable timers (unavailable), Event-time LLM decisions (forbidden by policy), Persistent economy ledger (unavailable), State preserved across restarts (unavailable). I did not build a partial or weakened version.';
+  const statefulRequirements = [
+    'an LLM decides rewards at event time',
+    'every message earns XP',
+    'levels unlock an economy',
+    'timers advance quests',
+  ];
+  const statefulUnclassified = blocker('unclassified_intent_requirement', 'unclassified');
+  statefulUnclassified.evidence = statefulRequirements.map((description, index) => evidence(
+    `intent.core.unclassified_requirements.${index}`,
+    description,
+  ));
+  statefulBlockers.push(statefulUnclassified);
+  const statefulDecision = decision('capability_gap', {
+    blockers: statefulBlockers,
+    unclassified_requirements: statefulRequirements,
+  });
+  const statefulMessage = `I preserved the request, but did not compile it because these required capabilities are not currently supported: Durable timers (unavailable), Event-time LLM decisions (forbidden by policy), Persistent economy ledger (unavailable), State preserved across restarts (unavailable), Unclassified hard requirement (unclassified): ${statefulRequirements.join(', ')}. I did not build a partial or weakened version.`;
   const statefulExpected = context({
     caseId: 'intent_stateful_game_gap',
     expectedOutcomes: 'routed',
@@ -836,13 +867,57 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
     expectedFinalStatus: 'empty',
     expectedCompiledOperations: undefined,
     completeRequest: false,
-    expectedBlockers: 'durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|',
+    expectedBlockers: 'durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|',
+    expectedUnclassifiedRequirements: statefulRequirements,
   });
-  const stateful = routedDocument(statefulDecision, statefulMessage, 'stateful-game');
+  const statefulInput = `Build a stateful game where ${statefulRequirements.join(', ')}. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts.`;
+  const stateful = routedDocument(
+    statefulDecision,
+    statefulMessage,
+    'stateful-game',
+    statefulInput,
+  );
   assert.equal(checks.intentAdjudicationDecision(stateful, statefulExpected).pass, true);
 
+  const ungrounded = JSON.parse(stateful);
+  ungrounded.turns[0].input = 'Build a generic stateful game';
+  assert.match(
+    checks.intentAdjudicationDecision(JSON.stringify(ungrounded), statefulExpected).reason,
+    /unclassified evidence not grounded/,
+  );
+
+  const swappedUnclassifiedPaths = JSON.parse(stateful);
+  const unclassifiedEvidence =
+    swappedUnclassifiedPaths.turns[0].route_decision.blockers[4].evidence;
+  [unclassifiedEvidence[0].semantic_path, unclassifiedEvidence[1].semantic_path] =
+    [unclassifiedEvidence[1].semantic_path, unclassifiedEvidence[0].semantic_path];
+  unclassifiedEvidence.sort((left, right) => left.semantic_path.localeCompare(right.semantic_path));
+  swappedUnclassifiedPaths.final_intent.route_decision =
+    swappedUnclassifiedPaths.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(
+      JSON.stringify(swappedUnclassifiedPaths),
+      statefulExpected,
+    ).reason,
+    /unclassified evidence does not match indexed unclassified_requirements/,
+  );
+
+  const swappedRuntimeEvidence = JSON.parse(stateful);
+  const runtimeBlockers = swappedRuntimeEvidence.turns[0].route_decision.blockers;
+  [runtimeBlockers[0].evidence, runtimeBlockers[1].evidence] =
+    [runtimeBlockers[1].evidence, runtimeBlockers[0].evidence];
+  swappedRuntimeEvidence.final_intent.route_decision =
+    swappedRuntimeEvidence.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(
+      JSON.stringify(swappedRuntimeEvidence),
+      statefulExpected,
+    ).reason,
+    /capability evidence contract/,
+  );
+
   const missing = JSON.parse(stateful);
-  missing.turns[0].route_decision.blockers.pop();
+  missing.turns[0].route_decision.blockers.shift();
   missing.final_intent.route_decision = missing.turns[0].route_decision;
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(missing), statefulExpected).reason,
@@ -871,7 +946,12 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
     expectedBlockers: 'unclassified_intent_requirement|unclassified|',
     expectedUnclassifiedRequirements: 'external consensus lease',
   });
-  const document = routedDocument(routeDecision, message, 'external-capability');
+  const document = routedDocument(
+    routeDecision,
+    message,
+    'external-capability',
+    'Build a flow that requires an external consensus lease',
+  );
   assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
 
   const changed = JSON.parse(document);
@@ -879,7 +959,7 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
   changed.final_intent.route_decision = changed.turns[0].route_decision;
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(changed), expected).reason,
-    /unclassified=/,
+    /unclassified evidence does not match indexed unclassified_requirements/,
   );
 
   const grounded = JSON.parse(document);
@@ -887,6 +967,10 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
   grounded.turns[0].route_decision.unclassified_requirements = [
     'acquire an external consensus lease',
   ];
+  grounded.turns[0].route_decision.blockers[0].evidence[0].description =
+    'acquire an external consensus lease';
+  grounded.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): acquire an external consensus lease. I did not build a partial or weakened version.';
+  grounded.message = grounded.turns[0].message;
   grounded.final_intent.route_decision = grounded.turns[0].route_decision;
   const containsExpected = context({
     ...expected.vars,
@@ -900,6 +984,10 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
   );
 
   grounded.turns[0].route_decision.unclassified_requirements = ['external_consensus_lease'];
+  grounded.turns[0].route_decision.blockers[0].evidence[0].description =
+    'external_consensus_lease';
+  grounded.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external_consensus_lease. I did not build a partial or weakened version.';
+  grounded.message = grounded.turns[0].message;
   grounded.final_intent.route_decision = grounded.turns[0].route_decision;
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).reason,
@@ -973,6 +1061,14 @@ test('V4 report contract rejects version, evidence, and candidate identity drift
   const adjudicator = JSON.parse(report());
   adjudicator.intent_adjudicator_version = 2;
   assert.match(checks.intentReceipt(JSON.stringify(adjudicator), context()).reason, /contract identity/);
+
+  const oldExtractor = JSON.parse(report());
+  oldExtractor.catalog_identity.extractor_revision = 6;
+  assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
+
+  const forgedRegistry = JSON.parse(report());
+  forgedRegistry.catalog_identity.registry_digest = '8'.repeat(64);
+  assert.match(checks.intentReceipt(JSON.stringify(forgedRegistry), context()).reason, /catalog identity/);
 
   const identity = JSON.parse(report());
   identity.final_intent.receipt.identity_revision = 1;
