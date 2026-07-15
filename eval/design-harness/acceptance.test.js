@@ -180,6 +180,7 @@ function metric(frontierName = 'interpret_intent_core') {
     duplicated_schema_bytes: detail ? 1200 : 1100,
     prompt_tokens: 800,
     completion_tokens: 120,
+    finish_reason: 'tool_calls',
     request_duration_ms: detail ? 350 : 450,
     gateway_model_duration_ms: null,
   };
@@ -1466,6 +1467,7 @@ test('checkpoint rejects any automatic HTTP retry attempt', () => {
     ...succeeded,
     attempt: 1,
     outcome: 'invalid_response',
+    finish_reason: null,
   };
   reportDocument.turns[0].model_call_metrics = [rejected, succeeded];
   reportDocument.model_call_metrics = reportDocument.turns

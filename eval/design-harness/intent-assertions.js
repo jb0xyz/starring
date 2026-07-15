@@ -412,6 +412,7 @@ function modelCallMetric(value, location) {
     'duplicated_schema_bytes',
     'prompt_tokens',
     'completion_tokens',
+    'finish_reason',
     'request_duration_ms',
     'gateway_model_duration_ms',
   ], location);
@@ -434,6 +435,9 @@ function modelCallMetric(value, location) {
     if (value[field] !== null) {
       integer(value[field], `${location}.${field}`);
     }
+  }
+  if (value.finish_reason !== null) {
+    nonEmptyString(value.finish_reason, `${location}.finish_reason`);
   }
   if (value.gateway_model_duration_ms !== null) {
     integer(value.gateway_model_duration_ms, `${location}.gateway_model_duration_ms`);
@@ -482,6 +486,9 @@ function modelCallMetric(value, location) {
     .includes(value.outcome)
     && (value.prompt_tokens !== null || value.completion_tokens !== null)) {
     throw new Error(`invalid intent eval report: ${location} failed response has fabricated token usage`);
+  }
+  if (value.outcome !== 'succeeded' && value.finish_reason !== null) {
+    throw new Error(`invalid intent eval report: ${location} failed response has a finish reason`);
   }
   if (value.request_body_bytes === 0
     || value.message_bytes === 0
@@ -1125,6 +1132,15 @@ function discussionResponseFailures(turn, context) {
   }
   const completedMetrics = turn.model_call_metrics.filter((metric) => metric.outcome === 'succeeded');
   const finalMetric = completedMetrics[completedMetrics.length - 1];
+  const metricFinishReason = typeof finalMetric?.finish_reason === 'string'
+    ? finalMetric.finish_reason.trim().toLowerCase().replace(/[\s-]+/gu, '_')
+    : null;
+  const acceptableFinishReasons = new Set(['stop', 'tool_calls']);
+  if (cappedReasons.has(metricFinishReason)) {
+    failures.push(`${turn.id} discussion response has a completion-limit finish reason`);
+  } else if (!acceptableFinishReasons.has(metricFinishReason)) {
+    failures.push(`${turn.id} discussion response lacks an acceptable final finish reason`);
+  }
   if (finalMetric?.completion_tokens >= DISCUSSION_COMPLETION_TOKEN_CAP) {
     failures.push(`${turn.id} discussion response reached the completion-token cap`);
   }

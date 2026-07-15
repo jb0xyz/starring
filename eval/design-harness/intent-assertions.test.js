@@ -107,6 +107,7 @@ function metric(frontierName = 'interpret_intent_core', callSequence = 1) {
     duplicated_schema_bytes: detail ? 1200 : 1100,
     prompt_tokens: 800,
     completion_tokens: 120,
+    finish_reason: 'tool_calls',
     request_duration_ms: detail ? 350 : 450,
     gateway_model_duration_ms: null,
   };
@@ -413,6 +414,7 @@ test('served model provenance is independent of tool calls and retry attempts st
   failed.served_model = null;
   failed.prompt_tokens = null;
   failed.completion_tokens = null;
+  failed.finish_reason = null;
   failed.request_duration_ms = 100;
   const succeeded = metric();
   succeeded.attempt = 2;
@@ -1265,6 +1267,17 @@ test('discussion response quality accepts concise complete English and Korean pr
     const document = routedDocument(routeDecision, message, 'discussion-quality');
     assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
   }
+  const promotedJson = JSON.parse(routedDocument(
+    routeDecision,
+    'We can compare the tradeoffs without changing the Draft.',
+    'discussion-quality',
+  ));
+  promotedJson.turns[0].model_call_metrics[0].finish_reason = 'stop';
+  promotedJson.model_call_metrics[0].finish_reason = 'stop';
+  assert.equal(
+    checks.intentAdjudicationDecision(JSON.stringify(promotedJson), expected).pass,
+    true,
+  );
 });
 
 test('discussion response quality rejects completion limits and structurally poor endings', () => {
@@ -1296,8 +1309,10 @@ test('discussion response quality rejects completion limits and structurally poo
   qualityFailure(
     'This concise comparison is complete.',
     /completion-limit finish reason/,
-    () => {},
-    { ...expected, providerResponse: { finishReason: 'length' } },
+    (document) => {
+      document.turns[0].model_call_metrics[0].finish_reason = 'length';
+      document.model_call_metrics[0].finish_reason = 'length';
+    },
   );
   qualityFailure(`${'A focused comparison remains useful. '.repeat(30)}`, /overly long/);
   qualityFailure(`${'😀'.repeat(300)}.`, /overly long/);
@@ -1359,6 +1374,26 @@ test('schema, model, oracle, calls, and hard latency regressions fail closed', (
   assert.match(
     checks.intentReceipt(JSON.stringify(invalidByteAccounting), context()).reason,
     /byte accounting is invalid/,
+  );
+
+  const missingFinishReason = JSON.parse(report());
+  delete missingFinishReason.turns[0].model_call_metrics[0].finish_reason;
+  delete missingFinishReason.model_call_metrics[0].finish_reason;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(missingFinishReason), context()).reason,
+    /model_call_metrics\[0\] has invalid fields/,
+  );
+
+  const failedFinishReason = JSON.parse(report());
+  for (const value of [
+    failedFinishReason.turns[0].model_call_metrics[0],
+    failedFinishReason.model_call_metrics[0],
+  ]) {
+    value.outcome = 'invalid_response';
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(failedFinishReason), context()).reason,
+    /failed response has a finish reason/,
   );
 
   const wrongModel = JSON.parse(report());

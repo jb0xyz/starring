@@ -246,6 +246,7 @@ test('summary exposes Gemma intent cohort boundaries, isolation, operations, and
       duplicated_schema_bytes: 2000,
       prompt_tokens: 800,
       completion_tokens: 120,
+      finish_reason: 'tool_calls',
       request_duration_ms: 5900,
       gateway_model_duration_ms: null,
     }],

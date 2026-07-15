@@ -1224,6 +1224,10 @@ mod tests {
                 .ok_or_else(|| {
                     LlmError::Client("intent eval response queue is empty".to_string())
                 })?;
+            let finish_reason = match &response {
+                LlmResponse::ToolCalls(_) => Some("tool_calls".to_string()),
+                LlmResponse::Text(_) => Some("stop".to_string()),
+            };
             let mut metrics = self
                 .metrics
                 .lock()
@@ -1263,6 +1267,7 @@ mod tests {
                     .map_or(0, |tool| tool.parameters.to_string().len()),
                 prompt_tokens: Some(100),
                 completion_tokens: Some(10),
+                finish_reason,
                 request_duration_ms: 1,
                 gateway_model_duration_ms: None,
             });
@@ -1938,6 +1943,14 @@ mod tests {
         assert_eq!(
             document["turns"][1]["model_call_metrics"][0]["frontier_name"],
             "resolve_intent_decision"
+        );
+        assert_eq!(
+            document["turns"][0]["model_call_metrics"][0]["finish_reason"],
+            "tool_calls"
+        );
+        assert_eq!(
+            document["turns"][1]["model_call_metrics"][0]["finish_reason"],
+            "tool_calls"
         );
         assert_eq!(document["model_call_metrics"].as_array().unwrap().len(), 2);
         assert_eq!(

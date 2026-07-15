@@ -80,6 +80,7 @@ pub struct ModelCallMetric {
     pub duplicated_schema_bytes: usize,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    pub finish_reason: Option<String>,
     pub request_duration_ms: u64,
     pub gateway_model_duration_ms: Option<u64>,
 }
@@ -193,6 +194,7 @@ impl GemmaClient {
             duplicated_schema_bytes: input.duplicated_schema_bytes,
             prompt_tokens: observation.prompt_tokens,
             completion_tokens: observation.completion_tokens,
+            finish_reason: observation.finish_reason,
             request_duration_ms: u64::try_from(request_duration.as_millis()).unwrap_or(u64::MAX),
             gateway_model_duration_ms: None,
         };
@@ -214,6 +216,7 @@ struct AttemptObservation {
     served_model: Option<String>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    finish_reason: Option<String>,
 }
 
 impl AttemptObservation {
@@ -224,6 +227,7 @@ impl AttemptObservation {
             served_model: None,
             prompt_tokens: None,
             completion_tokens: None,
+            finish_reason: None,
         }
     }
 }
@@ -331,6 +335,7 @@ impl LlmClient for GemmaClient {
             };
             let (prompt_tokens, completion_tokens) = completion_usage(&value);
             let served_model = response_model(&value);
+            let finish_reason = response_finish_reason(&value);
             let response = match parse_response_value(value, &self.model) {
                 Ok(response) => response,
                 Err(error) => {
@@ -344,6 +349,7 @@ impl LlmClient for GemmaClient {
                             served_model,
                             prompt_tokens,
                             completion_tokens,
+                            finish_reason: None,
                         },
                         started.elapsed(),
                     )?;
@@ -362,6 +368,7 @@ impl LlmClient for GemmaClient {
                     served_model,
                     prompt_tokens,
                     completion_tokens,
+                    finish_reason,
                 },
                 started.elapsed(),
             )?;
@@ -422,6 +429,16 @@ fn completion_usage(value: &Value) -> (Option<u64>, Option<u64>) {
 fn response_model(value: &Value) -> Option<String> {
     value
         .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn response_finish_reason(value: &Value) -> Option<String> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
         .map(str::to_string)
 }
@@ -775,7 +792,7 @@ mod tests {
     }
 
     fn success_response() -> &'static str {
-        r#"{"model":"test-model","choices":[{"message":{"content":"done"}}]}"#
+        r#"{"model":"test-model","choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#
     }
 
     fn spawn_capture_server(
@@ -1235,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_call_records_usage_and_payload_metrics_across_clones() {
-        let response = r#"{"model":"test-model","usage":{"prompt_tokens":321,"completion_tokens":17},"choices":[{"message":{"content":"done"}}]}"#;
+        let response = r#"{"model":"test-model","usage":{"prompt_tokens":321,"completion_tokens":17},"choices":[{"message":{"content":"done"},"finish_reason":"length"}]}"#;
         let (address, server) = spawn_server(vec![(200, response)]);
         let client = test_client(address);
         let probe = client.clone();
@@ -1264,7 +1281,26 @@ mod tests {
         );
         assert_eq!(metrics[0].prompt_tokens, Some(321));
         assert_eq!(metrics[0].completion_tokens, Some(17));
+        assert_eq!(metrics[0].finish_reason.as_deref(), Some("length"));
         assert_eq!(metrics[0].gateway_model_duration_ms, None);
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_tool_call_records_the_gateway_tool_calls_finish_reason() {
+        let response = r#"{"model":"test-model","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"add_panel","arguments":"{\"key\":\"panel\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let (address, server) = spawn_server(vec![(200, response)]);
+        let client = test_client(address);
+        let definitions = vec![tool_definitions().remove(0)];
+
+        let result = client
+            .complete(&[Message::user("build")], &definitions)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, LlmResponse::ToolCalls(_)));
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics[0].finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(server.join().unwrap(), 1);
     }
 
@@ -1303,6 +1339,11 @@ mod tests {
         assert_eq!(metrics[0].outcome, ModelCallOutcome::HttpError);
         assert_eq!(metrics[0].http_status, Some(400));
         assert_eq!(metrics[0].served_model, None);
+        assert_eq!(metrics[0].finish_reason, None);
+        assert_eq!(
+            serde_json::to_value(&metrics[0]).unwrap()["finish_reason"],
+            serde_json::Value::Null
+        );
         assert_eq!(server.join().unwrap(), 1);
     }
 
