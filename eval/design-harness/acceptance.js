@@ -278,7 +278,7 @@ function metadataIsExact(entry) {
     && provenance?.attestation_kind === 'local_unsigned'
     && report?.catalog_identity?.recipe_id === 'starring.private_study_room'
     && report?.catalog_identity?.recipe_version === 1
-    && report?.catalog_identity?.extractor_revision === 5
+    && report?.catalog_identity?.extractor_revision === 6
     && report?.catalog_identity?.normalizer_revision === 2
     && report?.catalog_identity?.compiler_revision === 1
     && report?.catalog_identity?.simulator_revision === 1

@@ -306,7 +306,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 5,
+      extractor_revision: 6,
       normalizer_revision: 2,
       compiler_revision: 1,
       simulator_revision: 1,
