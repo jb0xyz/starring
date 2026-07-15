@@ -9,6 +9,7 @@ use std::{
 
 use design_harness::{
     LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall, ToolDefinition,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -525,7 +526,7 @@ fn build_request_body(
         tools: openai_tools,
         tool_choice: "auto",
         parallel_tool_calls: false,
-        temperature: 0.1,
+        temperature: request_temperature(tools),
         seed: 0,
         stream: false,
     })
@@ -547,6 +548,13 @@ fn build_request_body(
         );
     }
     Ok(body)
+}
+
+fn request_temperature(tools: &[ToolDefinition]) -> f64 {
+    match tools {
+        [tool] if tool.name == EXTRACT_PRIVATE_STUDY_ROOM_DETAILS => 0.0,
+        _ => 0.1,
+    }
 }
 
 fn adapt_single_frontier_response(
@@ -701,7 +709,10 @@ mod tests {
         time::Duration,
     };
 
-    use design_harness::{tool_definitions, LlmClient, LlmError, LlmResponse, Message, ToolCall};
+    use design_harness::{
+        tool_definitions, LlmClient, LlmError, LlmResponse, Message, ToolCall, ToolDefinition,
+        EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    };
     use serde_json::json;
 
     use super::{
@@ -963,6 +974,24 @@ mod tests {
         assert_eq!(body["temperature"], 0.1);
         assert_eq!(body["seed"], 0);
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn recipe_detail_frontier_uses_deterministic_sampling() {
+        let definitions = vec![ToolDefinition {
+            name: EXTRACT_PRIVATE_STUDY_ROOM_DETAILS.to_string(),
+            description: "extract details".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }];
+
+        let body = build_request_body(&[Message::user("build")], &definitions, "model").unwrap();
+
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["seed"], 0);
     }
 
     #[test]
