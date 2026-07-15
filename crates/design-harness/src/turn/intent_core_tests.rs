@@ -315,13 +315,14 @@ fn human_grounding_canonicalizes_live_stateful_evidence() {
     let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
-    value["other_unmapped_required_capabilities"] = json!([
-        "LLM decides rewards at event time",
-        "do not reduce the request to static responses",
-        "every message earns XP",
-        "levels unlock an economy",
-        "timers advance quests"
+    value["runtime_requirements"] = json!([
+        "restart_persistent",
+        "durable_timer",
+        "persistent_economy",
+        "event_time_llm"
     ]);
+    value["other_unmapped_required_capabilities"] =
+        json!(["do not reduce the request to static responses"]);
     let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
     parsed.apply_human_grounding(human, None).unwrap();
     assert_eq!(
@@ -333,6 +334,22 @@ fn human_grounding_canonicalizes_live_stateful_evidence() {
             "timers advance quests"
         ]
     );
+}
+
+#[test]
+fn human_grounding_removes_static_custom_behavior_owned_by_the_base() {
+    let human = "Design a feedback automation where a button opens a paragraph modal and submitting it sends a private thank-you response.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!([
+        "a button opens a paragraph modal",
+        "submitting it sends a private thank-you response"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert!(parsed.unclassified_requirements().is_empty());
 }
 
 #[test]
@@ -348,15 +365,16 @@ fn core_capability_evidence_must_be_grounded_in_the_human_request() {
         .unwrap();
 
     value["other_unmapped_required_capabilities"] = json!(["external_consensus_lease"]);
-    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    parsed
+        .apply_human_grounding(
+            "Build a flow that must acquire an external consensus lease before responding.",
+            None,
+        )
+        .unwrap();
     assert_eq!(
-        parsed
-            .validate_human_evidence(
-                "Build a flow that must acquire an external consensus lease before responding.",
-            )
-            .unwrap_err()
-            .code,
-        "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE"
+        parsed.unclassified_requirements(),
+        &["a flow that must acquire an external consensus lease before responding"]
     );
 
     value["other_unmapped_required_capabilities"] = json!(["LLM decides rewards at event time"]);
@@ -560,7 +578,7 @@ fn human_grounding_preserves_external_capability_next_to_recipe_details() {
 
     assert_eq!(
         parsed.unclassified_requirements(),
-        &["external consensus lease"]
+        &["Acquire an external consensus lease before responding"]
     );
     assert_eq!(
         parsed.recipe_detail_facets(),

@@ -437,6 +437,18 @@ At most eight candidates are scanned, so this work remains linear in the
 human-turn length under the fixed Core bound and reproduces identically during
 snapshot restore.
 
+Normalizer V6 adds a deterministic capability reconciler after exact candidate
+grounding. Static modal-open and private modal-submit response behavior owned by
+the custom automation base is removed from the unsupported set. When a closed
+runtime axis is active, the reconciler recovers its dependent executable
+business clauses as exact source spans instead of allowing infrastructure fields
+to consume behavior. A unique external or cross-service precondition is expanded
+to its complete actor-action-temporal clause even when the model copied a noun
+fragment or a prompt example. Multiple plausible external clauses, non-external
+paraphrases, unbalanced quotes, overlong evidence, and count overflow fail closed.
+The result remains sorted, bounded, exact-source evidence and neither compiles nor
+executes an unsupported capability.
+
 ## Workspace and recipe boundary
 
 The authoritative root types move to schema V2:
@@ -516,10 +528,12 @@ extractor revision moves from 4 to 10, including the closed detail grammar,
 supported-base classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay.
-The normalizer revision moves from 1 to 5, including exact capability-evidence
+The normalizer revision moves from 1 to 6, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
-grounding, discussion-only array recovery, and bounded presentation, and the
-recipe descriptor and registry digests rotate. Recipe version,
+grounding, discussion-only array recovery, bounded presentation, static-base
+ownership reconciliation, dependent runtime-behavior recovery, and complete
+external-precondition recovery, and the recipe descriptor and registry digests
+rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
 The root `IntentRecipeSessionSnapshotV2` requires a
@@ -711,7 +725,7 @@ Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
 Recipe extractor revision         10
-Recipe normalizer revision         5
+Recipe normalizer revision         6
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -759,7 +773,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 9, normalizer revisions through 4, or
+branch-local extractor revisions through 9, normalizer revisions through 5, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -773,9 +787,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 10, and normalizer 5 is current;
+- the exact V4 prompt with protocol 4, extractor 10, and normalizer 6 is current;
 - a pre-release V4 prompt, extractor revision through 9, or normalizer revision
-  through 4 is rejected;
+  through 5 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;

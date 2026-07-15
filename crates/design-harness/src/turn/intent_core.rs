@@ -9,8 +9,9 @@ use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
 use super::intent_boundary_grounding::analyze_safety_boundaries;
-use super::intent_capability_grounding::{
-    ground_unmapped_capability_evidence, CapabilityEvidenceGroundingError,
+use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
+use super::intent_capability_reconciliation::{
+    reconcile_unmapped_capabilities, CapabilityReconciliationError,
 };
 use super::intent_detail_requirement::analyze_private_study_room_details;
 use super::intent_interpretation::{
@@ -209,8 +210,17 @@ impl IntentCoreInterpretationV4 {
         grounded_channel: Option<&ExistingChannelKey>,
     ) -> Result<(), StructuredError> {
         let canonical_human = canonical_human_message(human_message);
-        let mut unclassified_requirements =
-            grounded_capability_evidence(&canonical_human, self.unclassified_requirements.clone())?;
+        let mut unclassified_requirements = if self.request_mode == IntentRequestModeV2::Discussion
+        {
+            Vec::new()
+        } else {
+            reconciled_capability_evidence(
+                &canonical_human,
+                self.automation_kind,
+                &self.runtime_requirements,
+                self.unclassified_requirements.clone(),
+            )?
+        };
         let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
             && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
         let detail_facets = if managed_private_study_room {
@@ -278,35 +288,70 @@ fn canonical_human_message(human_message: &str) -> String {
         .join(" ")
 }
 
-fn grounded_capability_evidence(
+fn reconciled_capability_evidence(
     human_message: &str,
+    automation_kind: IntentAutomationKindV2,
+    runtime: &RuntimeRequirementsV2,
     candidates: Vec<String>,
 ) -> Result<Vec<String>, StructuredError> {
-    ground_unmapped_capability_evidence(
-        human_message,
-        candidates,
-        MAX_UNCLASSIFIED_REQUIREMENT_CHARS,
-    )
-    .map_err(|error| match error {
-        CapabilityEvidenceGroundingError::Ambiguous => core_error(
+    reconcile_unmapped_capabilities(human_message, automation_kind, runtime, candidates).map_err(
+        |error| {
+            match error {
+        CapabilityReconciliationError::Grounding {
+            reason: CapabilityEvidenceGroundingError::Ambiguous,
+            ..
+        } => core_error(
             "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
             "intent.core.other_unmapped_required_capabilities",
             "An unmapped capability has multiple exact occurrences and cannot be repaired uniquely",
             "Return one complete exact source phrase including its leading article",
         ),
-        CapabilityEvidenceGroundingError::ExpandedTooLong => core_error(
+        CapabilityReconciliationError::Grounding {
+            reason: CapabilityEvidenceGroundingError::ExpandedTooLong,
+            ..
+        }
+        | CapabilityReconciliationError::EvidenceTooLong { .. } => core_error(
             "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
             "intent.core.other_unmapped_required_capabilities",
             "An exact grounded capability exceeds the supported UTF-16 length after repair",
             "Return a shorter complete exact source phrase within 160 UTF-16 code units",
         ),
-        CapabilityEvidenceGroundingError::Ungrounded => core_error(
+        CapabilityReconciliationError::Grounding {
+            reason: CapabilityEvidenceGroundingError::Ungrounded,
+            ..
+        } => core_error(
             "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
             "intent.core.other_unmapped_required_capabilities",
             "An unmapped capability is not an exact phrase from the human request",
             "Copy a contiguous human phrase without synthesizing an identifier",
         ),
-    })
+        CapabilityReconciliationError::IncompleteExternalEvidence { .. } => core_error(
+            "INCOMPLETE_EXTERNAL_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "An external capability omits its complete actor, action, or temporal constraint",
+            "Copy one complete exact external precondition clause from the human request",
+        ),
+        CapabilityReconciliationError::AmbiguousExternalEvidence { .. } => core_error(
+            "AMBIGUOUS_EXTERNAL_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "Multiple external preconditions cannot be reconciled to one model candidate",
+            "Return each complete exact external precondition as a separate capability",
+        ),
+        CapabilityReconciliationError::TooManyCapabilities { .. } => core_error(
+            "TOO_MANY_INTENT_REQUIREMENTS",
+            "intent.core.other_unmapped_required_capabilities",
+            "The reconciled interpretation contains more than eight requirements",
+            "Keep only distinct requirements not represented by closed fields",
+        ),
+        CapabilityReconciliationError::UnbalancedQuote => core_error(
+            "AMBIGUOUS_INTENT_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "Capability evidence cannot be reconciled across an unbalanced quoted span",
+            "Close the quoted span so active requirements are unambiguous",
+        ),
+    }
+        },
+    )
 }
 
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {

@@ -5,6 +5,9 @@ mod intent_boundary_grounding_tests;
 mod intent_capability_grounding;
 #[cfg(test)]
 mod intent_capability_grounding_tests;
+mod intent_capability_reconciliation;
+#[cfg(test)]
+mod intent_capability_reconciliation_tests;
 mod intent_core;
 #[cfg(test)]
 mod intent_core_tests;
