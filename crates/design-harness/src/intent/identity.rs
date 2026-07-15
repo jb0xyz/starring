@@ -49,12 +49,31 @@ pub(crate) fn compatibility_json_digest<T: Serialize + ?Sized>(
 }
 
 pub(crate) fn domain_separated_length_framed_digest(domain: &[u8], fields: &[&[u8]]) -> String {
-    let mut hasher = Sha256::new();
-    update_length_framed(&mut hasher, domain);
+    let mut digest = LengthFramedDigest::new(domain);
     for field in fields {
-        update_length_framed(&mut hasher, field);
+        digest.update(field);
     }
-    lowercase_hex(hasher.finalize())
+    digest.finalize()
+}
+
+pub(crate) struct LengthFramedDigest {
+    hasher: Sha256,
+}
+
+impl LengthFramedDigest {
+    pub(crate) fn new(domain: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        update_length_framed(&mut hasher, domain);
+        Self { hasher }
+    }
+
+    pub(crate) fn update(&mut self, field: &[u8]) {
+        update_length_framed(&mut self.hasher, field);
+    }
+
+    pub(crate) fn finalize(self) -> String {
+        lowercase_hex(self.hasher.finalize())
+    }
 }
 
 pub(crate) fn is_lowercase_sha256_hex(value: &str) -> bool {

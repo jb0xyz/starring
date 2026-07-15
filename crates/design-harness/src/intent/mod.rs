@@ -22,7 +22,9 @@ mod tests;
 #[cfg(test)]
 mod workspace_tests;
 
-pub(crate) use candidate::{candidate_ruleset_hash, draft_state_hash};
+pub(crate) use candidate::{
+    candidate_ruleset_hash, draft_state_hash, replay_intent_candidate_preparation,
+};
 pub use candidate::{
     prepare_intent_candidate, CommittedIntentCandidateV1, IntentExecutionReportV1,
     PreparedIntentCandidateV1,

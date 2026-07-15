@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
+
 use resource_resolution::ResourceBindingMap;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -96,10 +99,12 @@ pub async fn prepare_intent_candidate(
     intent: &ValidatedIntentV2,
     bindings: &ResourceBindingMap,
 ) -> Result<PreparedIntentCandidateV1, StructuredError> {
-    let compiled = compile_intent(intent)?;
-    verify_external_bindings(&compiled, bindings)?;
-    let mut brief = recipe_turn_brief(intent)?;
-    brief.requirements = normalize_turn_plan(root, &brief, compiled.requirements.clone())?;
+    let available_channel_keys = bindings
+        .channel_bindings
+        .keys()
+        .map(|key| key.0.clone())
+        .collect::<Vec<_>>();
+    let (compiled, brief) = intent_candidate_preflight(root, intent, &available_channel_keys)?;
     let execution =
         execute_plan_atomically_with_bindings(root, &brief, bindings, MAX_COMPILED_REQUIREMENTS)
             .await
@@ -127,20 +132,52 @@ pub async fn prepare_intent_candidate(
     })
 }
 
-fn verify_external_bindings(
-    compiled: &CompiledIntentV2,
+pub(crate) fn replay_intent_candidate_preparation(
+    root: &Draft,
+    intent: &ValidatedIntentV2,
     bindings: &ResourceBindingMap,
+) -> Result<(), StructuredError> {
+    block_on_candidate_replay(prepare_intent_candidate(root, intent, bindings)).map(|_| ())
+}
+
+fn block_on_candidate_replay<F, T>(future: F) -> Result<T, StructuredError>
+where
+    F: Future<Output = Result<T, StructuredError>>,
+{
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => Err(candidate_error(
+            "INTENT_CANDIDATE_REPLAY_NOT_SYNCHRONOUS",
+            "intent.candidate.replay",
+            "Candidate preparation crossed an asynchronous boundary during snapshot replay",
+            "Keep candidate preparation side-effect-free and immediately ready during restore",
+        )),
+    }
+}
+
+fn intent_candidate_preflight(
+    root: &Draft,
+    intent: &ValidatedIntentV2,
+    available_channel_keys: &[String],
+) -> Result<(CompiledIntentV2, TurnBrief), StructuredError> {
+    let compiled = compile_intent(intent)?;
+    verify_external_channel_keys(&compiled, available_channel_keys)?;
+    let mut brief = recipe_turn_brief(intent)?;
+    brief.requirements = normalize_turn_plan(root, &brief, compiled.requirements.clone())?;
+    Ok((compiled, brief))
+}
+
+fn verify_external_channel_keys(
+    compiled: &CompiledIntentV2,
+    available_channel_keys: &[String],
 ) -> Result<(), StructuredError> {
     let missing = compiled
         .manifest
         .external_channel_bindings
         .iter()
-        .filter(|required| {
-            !bindings
-                .channel_bindings
-                .keys()
-                .any(|available| available.0.as_str() == required.as_str())
-        })
+        .filter(|required| !available_channel_keys.contains(required))
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -347,6 +384,31 @@ mod tests {
             assert_eq!(root.simulated_revision, Some(root.draft_revision));
             assert_eq!(committed.execution.candidate_revision, root.draft_revision);
         });
+    }
+
+    #[test]
+    fn candidate_replay_runs_the_complete_preparation_boundary() {
+        let intent = resolved_intent("community_hub", None);
+
+        replay_intent_candidate_preparation(&Draft::new(), &intent, &bindings("community_hub"))
+            .unwrap();
+
+        let close_intent = resolved_intent("community_hub", Some(ClosePolicyV1::AnyMember));
+        replay_intent_candidate_preparation(
+            &Draft::new(),
+            &close_intent,
+            &bindings("community_hub"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn candidate_replay_fails_closed_at_an_async_boundary() {
+        let error =
+            block_on_candidate_replay(std::future::pending::<Result<(), StructuredError>>())
+                .unwrap_err();
+
+        assert_eq!(error.code, "INTENT_CANDIDATE_REPLAY_NOT_SYNCHRONOUS");
     }
 
     #[test]

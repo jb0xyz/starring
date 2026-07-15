@@ -577,7 +577,7 @@ mod tests {
         );
         assert_eq!(document["catalog_identity"]["recipe_version"], 1);
         assert_eq!(document["catalog_identity"]["extractor_revision"], 9);
-        assert_eq!(document["catalog_identity"]["normalizer_revision"], 4);
+        assert_eq!(document["catalog_identity"]["normalizer_revision"], 5);
         assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
         assert_eq!(document["catalog_identity"]["simulator_revision"], 1);
         assert_eq!(
@@ -602,7 +602,7 @@ mod tests {
         );
         assert!(document["final_intent"]["binding_fingerprint"].is_string());
         assert_eq!(document["persistence"]["connection_reopen_count"], 0);
-        assert_eq!(document["persistence"]["snapshot_schema_version"], 7);
+        assert_eq!(document["persistence"]["snapshot_schema_version"], 8);
         assert_eq!(document["persistence"]["roundtrip_verified"], false);
     }
 

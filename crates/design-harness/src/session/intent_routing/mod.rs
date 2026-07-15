@@ -19,6 +19,7 @@ mod adjudicate_tests;
 #[cfg(test)]
 mod adjudicate_v3_tests;
 mod decision;
+mod durability;
 mod evidence;
 #[cfg(test)]
 mod evidence_tests;
@@ -31,6 +32,9 @@ mod state;
 mod state_binding;
 #[cfg(test)]
 mod tests;
+mod transcript_binding;
+mod transcript_integrity;
+mod transcript_replay;
 mod transcript_restore;
 
 use adjudicate::PrivateStudyRoomSelectionV4;
@@ -40,6 +44,9 @@ pub use decision::{
     INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
     INTENT_RECIPE_PROTOCOL_VERSION_V4,
 };
+use durability::{durable_transcript_violation, durable_transcript_violation_with_added};
+#[cfg(test)]
+use durability::{MAX_INTENT_RESTORED_FAILURE_RESULTS, MAX_INTENT_RESTORED_TRANSCRIPT_CHARS};
 use execute::{IntentCoreExecutionV4, IntentTurnSuccess};
 use frontier::IntentFrontierV4;
 pub(super) use state::IntentRecipeRuntime;
@@ -83,7 +90,6 @@ enum IntentToolRequestFailure {
 }
 
 const MAX_INTENT_SERVING_HISTORY_TURNS: usize = 4;
-const MAX_INTENT_RESTORED_TRANSCRIPT_CHARS: usize = 4 * 1024 * 1024;
 
 impl<C> DesignSession<C> {
     pub fn with_intent_recipe(client: C, bindings: ResourceBindingMap) -> Self {
@@ -108,8 +114,8 @@ impl<C> DesignSession<C> {
         snapshot: SessionSnapshot,
         bindings: ResourceBindingMap,
     ) -> Result<Self, SessionSnapshotError> {
-        validate_intent_restore_transcript_bound(&snapshot)?;
-        super::validate_snapshot(&snapshot)?;
+        validate_intent_durable_transcript_bound(&snapshot)?;
+        super::validate_snapshot_with_intent_bindings(&snapshot, &bindings)?;
         let intent_snapshot = snapshot
             .intent_recipe
             .clone()
@@ -289,23 +295,31 @@ impl<C> DesignSession<C> {
             return None;
         }
         let maximum = turn_starts.len().min(MAX_INTENT_SERVING_HISTORY_TURNS);
-        for retained in (1..=maximum).rev() {
-            let start = turn_starts[turn_starts.len().saturating_sub(retained)];
-            let mut messages = Vec::with_capacity(self.messages.len().saturating_sub(start) + 1);
+        let history_start = turn_starts.len().saturating_sub(maximum);
+        let projected_history = turn_starts[history_start..turn_starts.len().saturating_sub(1)]
+            .iter()
+            .enumerate()
+            .map(|(offset, start)| {
+                let end = turn_starts
+                    .get(history_start.saturating_add(offset).saturating_add(1))
+                    .copied()
+                    .unwrap_or(current_human_message_index);
+                project_intent_history_turn(&self.messages, *start, end)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        for retained_history in (0..=projected_history.len()).rev() {
+            let mut messages = Vec::with_capacity(
+                self.messages
+                    .len()
+                    .saturating_sub(current_human_message_index)
+                    .saturating_add(retained_history.saturating_mul(2))
+                    .saturating_add(1),
+            );
             messages.push(Message::system(system_prompt));
-            let history = &self.messages[start..current_human_message_index];
-            for (index, message) in history.iter().enumerate() {
-                if message.role == MessageRole::User
-                    && message.tool_call_id.is_none()
-                    && message.tool_calls.is_empty()
-                    && message.content.starts_with(INTENT_HUMAN_PREFIX)
-                {
-                    messages.push(message.clone());
-                } else if let Some(presentation) =
-                    intent_history_presentation(message, history.get(index + 1))
-                {
-                    messages.push(presentation);
-                }
+            for projected in
+                &projected_history[projected_history.len().saturating_sub(retained_history)..]
+            {
+                messages.extend_from_slice(projected);
             }
             messages.extend_from_slice(&self.messages[current_human_message_index..]);
             if let Some(messages) = self.fit_intent_messages(messages, tools) {
@@ -431,33 +445,57 @@ impl<C> DesignSession<C> {
     }
 }
 
-fn intent_history_presentation(message: &Message, result: Option<&Message>) -> Option<Message> {
+fn project_intent_history_turn(
+    messages: &[Message],
+    human_message_index: usize,
+    turn_end: usize,
+) -> Option<Vec<Message>> {
+    let human = messages.get(human_message_index)?;
+    if human.role != MessageRole::User
+        || human.tool_call_id.is_some()
+        || !human.tool_calls.is_empty()
+        || !human.content.starts_with(INTENT_HUMAN_PREFIX)
+    {
+        return None;
+    }
+    let mut projected = vec![human.clone()];
+    if let Some(presentation) = (human_message_index.saturating_add(1)..turn_end)
+        .find_map(|index| intent_history_presentation(messages, human_message_index, index))
+    {
+        projected.push(presentation);
+    }
+    Some(projected)
+}
+
+fn intent_history_presentation(
+    messages: &[Message],
+    human_message_index: usize,
+    call_message_index: usize,
+) -> Option<Message> {
+    let message = messages.get(call_message_index)?;
     let [call] = message.tool_calls.as_slice() else {
         return None;
     };
     if message.role != MessageRole::Assistant || call.name != crate::turn::INTERPRET_INTENT_CORE {
         return None;
     }
-    let result = result?;
+    let result = messages.get(call_message_index.saturating_add(1))?;
     if result.role != MessageRole::Tool || result.tool_call_id.as_deref() != Some(call.id.as_str())
     {
         return None;
     }
     let result_value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
-    if !result_value.get("ok")?.as_bool()?
-        || result_value.get("status")?.as_str()? != "routed"
-        || result_value.get("fallback_kind")?.as_str()? != "discussion"
-    {
-        return None;
-    }
-    let value = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-    if value.get("request_mode")?.as_str()? != "discussion"
-        || value.get("requested_outcome")?.as_str()? != "discussion"
-    {
-        return None;
-    }
-    let response = value.get("response")?.as_str()?.trim();
-    (!response.is_empty()).then(|| Message::assistant(response))
+    let human_message_index = u64::try_from(human_message_index).ok()?;
+    let replayed = transcript_binding::replay_successful_routed_core_turn(
+        messages,
+        human_message_index,
+        &call.arguments,
+        &result_value,
+    )
+    .ok()??;
+    replayed
+        .is_discussion()
+        .then(|| Message::assistant(replayed.response()))
 }
 
 fn intent_openai_context_chars(
@@ -554,24 +592,67 @@ fn intent_openai_message(message: &Message) -> Option<serde_json::Value> {
     Some(value)
 }
 
-fn validate_intent_restore_transcript_bound(
+pub(super) fn validate_intent_durable_transcript_bound(
     snapshot: &SessionSnapshot,
 ) -> Result<(), SessionSnapshotError> {
     if snapshot.intent_recipe.is_none() {
         return Ok(());
     }
-    let estimated = snapshot.messages.iter().try_fold(0usize, |total, message| {
-        total
-            .checked_add(message.estimated_chars())
-            .and_then(|value| value.checked_add(96))
-    });
-    if estimated.is_some_and(|value| value <= MAX_INTENT_RESTORED_TRANSCRIPT_CHARS) {
-        Ok(())
-    } else {
-        Err(snapshot_error(
+    match durable_transcript_violation(&snapshot.messages) {
+        None => Ok(()),
+        Some(LimitKind::DurableTranscriptChars) => Err(snapshot_error(
             "intent recipe transcript exceeds the durable restore size limit",
-        ))
+        )),
+        Some(LimitKind::DurableTranscriptReplayWork) => Err(snapshot_error(
+            "intent recipe transcript exceeds the durable replay work limit",
+        )),
+        Some(_) => Err(snapshot_error(
+            "intent recipe transcript violates an unexpected durable limit",
+        )),
     }
+}
+
+#[cfg(test)]
+fn intent_transcript_fits_durable_bound(messages: &[Message]) -> bool {
+    durable_transcript_violation(messages).is_none()
+}
+
+#[cfg(test)]
+fn intent_transcript_fits_added_message(messages: &[Message], message: &Message) -> bool {
+    durable_transcript_violation_with_added(messages, message).is_none()
+}
+
+fn durable_transcript_limit_error(limit: LimitKind) -> StructuredError {
+    match limit {
+        LimitKind::DurableTranscriptReplayWork => intent_error(
+            "INTENT_DURABLE_REPLAY_WORK_LIMIT_EXHAUSTED",
+            "intent.session.durable_transcript.replay_work",
+            "The intent turn would make deterministic session restore exceed its work budget",
+            "Start a new intent recipe session and preserve the current preview receipt externally",
+        ),
+        _ => intent_error(
+            "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED",
+            "intent.session.durable_transcript",
+            "The intent turn would make its durable transcript impossible to restore",
+            "Start a new intent recipe session and preserve the current preview receipt externally",
+        ),
+    }
+}
+
+fn durable_transcript_limit_outcome<C>(
+    session: &DesignSession<C>,
+    observability: super::Observability,
+    limit: LimitKind,
+) -> super::BurstOutcome {
+    let error = durable_transcript_limit_error(limit);
+    super::BurstOutcome::Halted(Box::new(super::HaltReport {
+        code: error.code.clone(),
+        message: error.message.clone(),
+        exhausted_limit: Some(limit),
+        draft: session.draft.summary(),
+        last_error: Some(error),
+        observability,
+    }))
 }
 
 impl<C: LlmClient> DesignSession<C> {
@@ -579,10 +660,52 @@ impl<C: LlmClient> DesignSession<C> {
         &mut self,
         human_message: &str,
     ) -> super::BurstOutcome {
+        let human_envelope = Message::user(intent_human_envelope(human_message));
+        if let Some(limit) =
+            durable_transcript_violation_with_added(&self.messages, &human_envelope)
+        {
+            return durable_transcript_limit_outcome(self, self.observability.clone(), limit);
+        }
+        let root_draft = self.draft.clone();
+        let root_message_len = self.messages.len();
+        let root_observability = self.observability.clone();
+        let root_last_error = self.last_error.clone();
+        let root_prose_nudged = self.prose_nudged;
+        let root_turn_state = self.turn_state.clone();
+        let root_human_message_index = self.current_human_message_index;
+        let root_intent_snapshot = self
+            .intent_recipe
+            .as_ref()
+            .map(|runtime| runtime.snapshot.clone());
+        let outcome = self
+            .run_intent_recipe_burst_unbounded(human_message, human_envelope)
+            .await;
+        let Some(limit) = durable_transcript_violation(&self.messages) else {
+            return outcome;
+        };
+        let attempt_observability = self.observability.clone();
+        self.draft = root_draft;
+        self.messages.truncate(root_message_len);
+        self.observability = root_observability;
+        self.last_error = root_last_error;
+        self.prose_nudged = root_prose_nudged;
+        self.turn_state = root_turn_state;
+        self.current_human_message_index = root_human_message_index;
+        if let (Some(runtime), Some(snapshot)) = (self.intent_recipe.as_mut(), root_intent_snapshot)
+        {
+            runtime.snapshot = snapshot;
+        }
+        durable_transcript_limit_outcome(self, attempt_observability, limit)
+    }
+
+    async fn run_intent_recipe_burst_unbounded(
+        &mut self,
+        human_message: &str,
+        human_envelope: Message,
+    ) -> super::BurstOutcome {
         self.begin_turn(human_message);
         self.current_human_message_index = Some(self.messages.len());
-        self.messages
-            .push(Message::user(intent_human_envelope(human_message)));
+        self.messages.push(human_envelope);
         self.prose_nudged = false;
 
         let revision_check = self
@@ -685,6 +808,12 @@ impl<C: LlmClient> DesignSession<C> {
         expected_tool: &str,
         tools: &[crate::tools::ToolDefinition],
     ) -> Result<ToolCall, IntentToolRequestFailure> {
+        if let Some(limit) = durable_transcript_violation(&self.messages) {
+            return Err(IntentToolRequestFailure::Limit(
+                durable_transcript_limit_error(limit),
+                limit,
+            ));
+        }
         if self.turn_model_calls() >= self.config.max_model_calls {
             return Err(IntentToolRequestFailure::Limit(
                 intent_error(

@@ -5,8 +5,8 @@ use futures::executor::block_on;
 use serde_json::json;
 
 use crate::intent::{
-    draft_state_hash, ExistingChannelKey, IntentCapabilityIdV2, IntentResolutionContext,
-    IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV2,
+    draft_state_hash, recipe_descriptor_v1, ExistingChannelKey, IntentCapabilityIdV2,
+    IntentResolutionContext, IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV2, RecipeKindV1,
 };
 use crate::llm::{LlmError, LlmResponse};
 use crate::turn::parse_interpret_intent_core;
@@ -495,6 +495,7 @@ fn restore_rejects_fully_rehashed_initial_channel_erased_to_awaiting() {
             recipe_evidence,
             decision_binding_digest,
         };
+        refresh_transcript_integrity(&mut snapshot);
 
         let error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
@@ -507,7 +508,7 @@ fn restore_rejects_fully_rehashed_initial_channel_erased_to_awaiting() {
         };
         assert!(error
             .to_string()
-            .contains("does not reproduce from the initial Core arguments"));
+            .contains("replayed preview result has an invalid shape"));
     });
 }
 
@@ -1229,6 +1230,419 @@ fn candidate_conflict_rolls_back_every_compiled_operation() {
         assert_eq!(session.observability.intent_conflicts, 1);
         assert_eq!(session.observability.intent_commits, 0);
         assert_eq!(session.observability.plan_compiled_tool_calls, 0);
+        let snapshot = session.snapshot();
+        assert!(matches!(
+            snapshot.intent_recipe.as_ref().unwrap().stage,
+            IntentRecipeStageSnapshotV2::Empty
+        ));
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            bindings("community_hub", "700"),
+        )
+        .expect("rolled-back root Draft snapshot should restore");
+        assert_eq!(restored.draft, root);
+
+        let mut tampered = snapshot;
+        let result = tampered
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("ok").cloned())
+                        == Some(json!(false))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["message"] = json!("rewritten current-root conflict");
+        result.content = value.to_string();
+        tampered
+            .intent_recipe
+            .as_mut()
+            .unwrap()
+            .transcript_integrity_digest =
+            super::transcript_integrity::intent_transcript_integrity_digest(&tampered.messages);
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            tampered,
+            bindings("community_hub", "700"),
+        )
+        .err()
+        .expect("rehashed current-root conflict forgery restored");
+        assert!(error
+            .to_string()
+            .contains("private failure result does not match deterministic transcript replay"));
+    });
+}
+
+#[test]
+fn candidate_scope_failure_restores_from_full_preparation_replay() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(private_room(1, Some("community_hub")))]);
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let result = dispatch_tool(
+            &mut session.draft,
+            "add_panel",
+            &json!({
+                "key": "unrelated_panel",
+                "channel": "unbound_channel",
+                "content": "Unrelated unresolved panel"
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(result.is_ok(), "{}", result.as_json());
+        let root = session.draft.clone();
+
+        let BurstOutcome::Halted(report) = session.run_burst("Build rooms in community_hub").await
+        else {
+            panic!("expected scope halt")
+        };
+        assert_eq!(report.code, "PLAN_SCOPE_INCOMPLETE");
+        assert_eq!(session.draft, root);
+        assert_eq!(session.observability.intent_compile_attempts, 1);
+        assert_eq!(session.observability.intent_compile_successes, 0);
+        assert_eq!(session.observability.intent_rollbacks, 1);
+        assert_eq!(session.observability.intent_commits, 0);
+
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("full candidate preparation failure should replay during restore");
+        assert_eq!(restored.draft, root);
+
+        let mut forged = snapshot;
+        let result = forged
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("ok").cloned())
+                        == Some(json!(false))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["message"] = json!("forged scope failure");
+        result.content = value.to_string();
+        refresh_transcript_integrity(&mut forged);
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            forged,
+            resource_bindings,
+        )
+        .err()
+        .expect("forged candidate scope failure restored");
+        assert!(error
+            .to_string()
+            .contains("private failure result does not match deterministic transcript replay"));
+    });
+}
+
+#[test]
+fn candidate_failure_replay_uses_the_exact_original_role_bindings() {
+    block_on(async {
+        let mut resource_bindings = bindings("community_hub", "700");
+        resource_bindings.role_bindings.insert(
+            serde_json::from_value(json!("existing_member")).unwrap(),
+            "900".parse().unwrap(),
+        );
+        let client = ScriptedClient::new(vec![Ok(private_room(1, Some("community_hub")))]);
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        session
+            .draft
+            .ruleset
+            .panels
+            .push(automation_state::PanelSpec {
+                key: "existing_panel".to_string(),
+                channel: serde_json::from_value(json!("community_hub")).unwrap(),
+                content: "Existing controls".to_string(),
+                buttons: vec![automation_state::ButtonSpec {
+                    label: "Join".to_string(),
+                    route: automation_state::ButtonRoute::Static {
+                        key: "existing_join".to_string(),
+                    },
+                }],
+            });
+        session
+            .draft
+            .ruleset
+            .rules
+            .push(automation_state::InteractionRule {
+                key: "existing_join_rule".to_string(),
+                trigger: automation_state::TriggerSpec::ButtonClick {
+                    component: "existing_join".to_string(),
+                },
+                actions: vec![
+                    automation_state::ActionSpec::GrantRole {
+                        role: automation_state::RoleRef::Existing(
+                            serde_json::from_value(json!("existing_member")).unwrap(),
+                        ),
+                        target: automation_state::ActionTarget::Actor,
+                    },
+                    automation_state::ActionSpec::RespondEphemeral {
+                        content: String::new(),
+                    },
+                ],
+            });
+        session.draft.draft_revision = 1;
+
+        let BurstOutcome::Halted(report) = session.run_burst("Build rooms in community_hub").await
+        else {
+            panic!("expected candidate validation halt")
+        };
+        assert_ne!(report.code, "UNRESOLVED_REFERENCE");
+        let snapshot = session.snapshot();
+
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("candidate failure should replay with the original role binding");
+
+        resource_bindings.role_bindings.insert(
+            serde_json::from_value(json!("existing_member")).unwrap(),
+            "901".parse().unwrap(),
+        );
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("role binding drift restored");
+        assert!(error
+            .to_string()
+            .contains("resource bindings changed after the snapshot was created"));
+    });
+}
+
+#[test]
+fn historical_candidate_failure_restores_only_with_bound_exact_bytes() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![
+            Ok(private_room(1, Some("community_hub"))),
+            Ok(private_room(2, Some("community_hub"))),
+        ]);
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let added = dispatch_tool(
+            &mut session.draft,
+            "add_panel",
+            &json!({
+                "key": "private_study_room__study_panel",
+                "channel": "community_hub",
+                "content": "Conflicting panel"
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(added.is_ok(), "{}", added.as_json());
+        assert!(matches!(
+            session.run_burst("Build rooms in community_hub").await,
+            BurstOutcome::Halted { .. }
+        ));
+        let removed = dispatch_tool(
+            &mut session.draft,
+            "remove_panel",
+            &json!({"key": "private_study_room__study_panel"}).to_string(),
+        )
+        .await;
+        assert!(removed.is_ok(), "{}", removed.as_json());
+        assert_eq!(session.draft.draft_revision, 2);
+        let orphaned_failure = session.snapshot();
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            orphaned_failure,
+            resource_bindings.clone(),
+        )
+        .err()
+        .expect("empty stage with a historical candidate failure restored");
+        assert!(error.to_string().contains(
+            "empty intent recipe stage contains an unreproducible historical candidate failure"
+        ));
+        assert!(matches!(
+            session.run_burst("Build rooms in community_hub").await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("bound historical candidate failure should restore");
+        assert_eq!(restored.draft, session.draft);
+
+        for field in ["code", "location", "message", "hint", "revision"] {
+            let mut tampered = snapshot.clone();
+            let result = tampered
+                .messages
+                .iter_mut()
+                .find(|message| {
+                    message.role == MessageRole::Tool
+                        && serde_json::from_str::<serde_json::Value>(&message.content)
+                            .ok()
+                            .and_then(|value| value.get("ok").cloned())
+                            == Some(json!(false))
+                })
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+            value[field] = if field == "revision" {
+                json!(0)
+            } else {
+                json!(format!("rewritten-{field}"))
+            };
+            result.content = value.to_string();
+            let _error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                tampered,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("historical candidate failure rewrite restored");
+
+            let mut invalid = snapshot.clone();
+            let result = invalid
+                .messages
+                .iter_mut()
+                .find(|message| {
+                    message.role == MessageRole::Tool
+                        && serde_json::from_str::<serde_json::Value>(&message.content)
+                            .ok()
+                            .and_then(|value| value.get("ok").cloned())
+                            == Some(json!(false))
+                })
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+            value[field] = if field == "revision" {
+                json!(0)
+            } else {
+                json!("")
+            };
+            result.content = value.to_string();
+            refresh_transcript_integrity(&mut invalid);
+            let error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                invalid,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("rehashed invalid historical candidate failure restored");
+            let message = error.to_string();
+            assert!(
+                message.contains("intent transcript tool failure has invalid fields")
+                    || message.contains("private failure result has an invalid transcript binding"),
+                "{error}"
+            );
+        }
+    });
+}
+
+#[test]
+fn failed_resolution_history_is_typed_and_transcript_bound() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![
+                Ok(private_room(0, None)),
+                Ok(resolve_channel(1, "community_hub")),
+            ]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session.run_burst("Build private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        let BurstOutcome::Halted(report) = session.run_burst("Use another channel").await else {
+            panic!("expected ungrounded resolution halt")
+        };
+        assert_eq!(report.code, "UNGROUNDED_INTENT_DECISION_EVIDENCE");
+
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("typed failed resolution history should restore");
+        assert!(matches!(
+            restored.intent_recipe_status(),
+            Some(IntentRecipeStatusV2::AwaitingDecision { .. })
+        ));
+
+        let mut tampered = snapshot.clone();
+        let result = tampered
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("ok").cloned())
+                        == Some(json!(false))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["hint"] = json!("rewritten resolution hint");
+        result.content = value.to_string();
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            tampered,
+            resource_bindings.clone(),
+        )
+        .err()
+        .expect("rewritten resolution failure restored");
+        assert!(error.to_string().contains("persisted integrity digest"));
+
+        let mut invalid = snapshot;
+        let result = invalid
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("ok").cloned())
+                        == Some(json!(false))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["hint"] = json!("");
+        result.content = value.to_string();
+        refresh_transcript_integrity(&mut invalid);
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            invalid,
+            resource_bindings,
+        )
+        .err()
+        .expect("rehashed invalid resolution failure restored");
+        assert!(error.to_string().contains("invalid fields"), "{error}");
     });
 }
 
@@ -1780,6 +2194,178 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
 }
 
 #[test]
+fn empty_snapshot_requires_current_extractor_and_normalizer_identity() {
+    let resource_bindings = bindings("community_hub", "700");
+    let session = DesignSession::with_intent_recipe(
+        ScriptedClient::new(Vec::new()),
+        resource_bindings.clone(),
+    );
+    let current = session.snapshot();
+    let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
+    let intent = current.intent_recipe.as_ref().unwrap();
+    assert_eq!(intent.extractor_revision, descriptor.extractor_revision);
+    assert_eq!(intent.normalizer_revision, descriptor.normalizer_revision);
+    assert_eq!(intent.transcript_integrity_digest.len(), 64);
+    assert!(matches!(intent.stage, IntentRecipeStageSnapshotV2::Empty));
+
+    for (field, value) in [
+        ("extractor_revision", descriptor.extractor_revision - 1),
+        ("normalizer_revision", descriptor.normalizer_revision - 1),
+    ] {
+        let mut tampered = current.clone();
+        let intent = tampered.intent_recipe.as_mut().unwrap();
+        match field {
+            "extractor_revision" => intent.extractor_revision = value,
+            "normalizer_revision" => intent.normalizer_revision = value,
+            _ => unreachable!(),
+        }
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            tampered,
+            resource_bindings.clone(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot with stale {field} restored"),
+        };
+        assert!(error.to_string().contains(field.replace('_', " ").as_str()));
+    }
+
+    for field in [
+        "extractor_revision",
+        "normalizer_revision",
+        "transcript_integrity_digest",
+    ] {
+        let mut missing = serde_json::to_value(&current).unwrap();
+        missing["intent_recipe"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(serde_json::from_value::<SessionSnapshot>(missing).is_err());
+    }
+
+    let mut malformed = current.clone();
+    malformed
+        .intent_recipe
+        .as_mut()
+        .unwrap()
+        .transcript_integrity_digest = "A".repeat(64);
+    let error = DesignSession::restore_intent_recipe(
+        ScriptedClient::new(Vec::new()),
+        SessionConfig::default(),
+        malformed,
+        resource_bindings,
+    )
+    .err()
+    .expect("malformed transcript digest restored");
+    assert!(error
+        .to_string()
+        .contains("transcript integrity digest is malformed"));
+}
+
+#[test]
+fn restore_binds_every_historical_transcript_surface() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![
+                Ok(discussion(0, "Original comparison")),
+                Ok(private_room(0, Some("community_hub"))),
+            ]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let base = session.snapshot();
+        let mut semantic_equivalents = Vec::new();
+
+        let mut changed = base.clone();
+        let human = changed.messages[1]
+            .content
+            .strip_prefix(INTENT_HUMAN_PREFIX)
+            .unwrap();
+        let human: serde_json::Value = serde_json::from_str(human).unwrap();
+        changed.messages[1].content = format!(
+            "{INTENT_HUMAN_PREFIX}{}",
+            serde_json::to_string_pretty(&human).unwrap()
+        );
+        semantic_equivalents.push(changed);
+
+        let mut changed = base.clone();
+        let state = changed.messages[2]
+            .content
+            .strip_prefix(INTENT_STATE_PREFIX)
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(state).unwrap();
+        changed.messages[2].content = format!(
+            "{INTENT_STATE_PREFIX}{}",
+            serde_json::to_string_pretty(&state).unwrap()
+        );
+        semantic_equivalents.push(changed);
+
+        let mut changed = base.clone();
+        let arguments: serde_json::Value =
+            serde_json::from_str(&changed.messages[3].tool_calls[0].arguments).unwrap();
+        changed.messages[3].tool_calls[0].arguments =
+            serde_json::to_string_pretty(&arguments).unwrap();
+        semantic_equivalents.push(changed);
+
+        let mut changed = base.clone();
+        let result: serde_json::Value = serde_json::from_str(&changed.messages[4].content).unwrap();
+        changed.messages[4].content = serde_json::to_string_pretty(&result).unwrap();
+        semantic_equivalents.push(changed);
+
+        let mut changed = base.clone();
+        changed.messages[3].tool_calls[0].id = "rebound".to_string();
+        changed.messages[4].tool_call_id = Some("rebound".to_string());
+        semantic_equivalents.push(changed);
+
+        for changed in semantic_equivalents {
+            let error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                changed,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("historical transcript rewrite restored");
+            assert!(error.to_string().contains("persisted integrity digest"));
+        }
+
+        let mut structural_changes = Vec::new();
+        let mut changed = base.clone();
+        changed.messages.remove(4);
+        structural_changes.push(changed);
+        let mut changed = base.clone();
+        changed.messages.insert(4, changed.messages[4].clone());
+        structural_changes.push(changed);
+        let mut changed = base;
+        changed.messages.swap(3, 4);
+        structural_changes.push(changed);
+
+        for changed in structural_changes {
+            assert!(DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                changed,
+                resource_bindings.clone(),
+            )
+            .is_err());
+        }
+    });
+}
+
+#[test]
 fn awaiting_and_preview_snapshots_require_a_valid_persisted_route_decision() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
@@ -2205,6 +2791,171 @@ fn restore_rejects_unreferenced_messages_system_anchors_and_oversized_transcript
 }
 
 #[test]
+fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let oversized_text = "x".repeat(MAX_INTENT_RESTORED_TRANSCRIPT_CHARS);
+        let client = ScriptedClient::new(vec![
+            Ok(discussion(0, "Initial durable discussion")),
+            Ok(LlmResponse::Text(oversized_text)),
+        ]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+
+        assert!(matches!(
+            session
+                .run_burst("Discussion only for now; compare room UX without changing the Draft")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        let durable_checkpoint = session.snapshot();
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst("Discussion only for now; continue without changing the Draft")
+            .await
+        else {
+            panic!("oversized model response was admitted")
+        };
+        assert_eq!(report.code, "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED");
+        assert_eq!(
+            report.exhausted_limit,
+            Some(LimitKind::DurableTranscriptChars)
+        );
+        assert_eq!(report.observability.model_calls, 2);
+        assert_eq!(probe.calls().len(), 2);
+        assert_eq!(session.draft.draft_revision, 0);
+        assert_eq!(session.observability.model_calls, 1);
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot, durable_checkpoint);
+        snapshot.validate_durable_size().unwrap();
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings.clone(),
+        )
+        .expect("rolled-back oversized model response should remain restorable");
+
+        let client = ScriptedClient::new(Vec::new());
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        session.append_intent_state_anchor().unwrap();
+        let state_anchor = session.messages.pop().unwrap();
+        let fixed_size = session
+            .messages
+            .iter()
+            .map(|message| message.estimated_chars().saturating_add(96))
+            .sum::<usize>();
+        let empty_envelope = Message::user(intent_human_envelope(""));
+        let human_overhead = empty_envelope.estimated_chars().saturating_add(96);
+        let filler_size = MAX_INTENT_RESTORED_TRANSCRIPT_CHARS
+            .checked_sub(fixed_size)
+            .and_then(|remaining| remaining.checked_sub(human_overhead))
+            .unwrap();
+        let near_limit_human = "x".repeat(filler_size);
+        let human_envelope = Message::user(intent_human_envelope(&near_limit_human));
+        assert!(intent_transcript_fits_added_message(
+            &session.messages,
+            &human_envelope
+        ));
+        let mut projected = session.messages.clone();
+        projected.push(human_envelope);
+        projected.push(state_anchor);
+        assert!(!intent_transcript_fits_durable_bound(&projected));
+        let BurstOutcome::Halted(report) = session.run_burst(&near_limit_human).await else {
+            panic!("state-anchor overflow was admitted")
+        };
+        assert_eq!(report.code, "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED");
+        assert_eq!(
+            report.exhausted_limit,
+            Some(LimitKind::DurableTranscriptChars)
+        );
+        assert!(probe.calls().is_empty());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.observability.model_calls, 0);
+
+        let client = ScriptedClient::new(Vec::new());
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let oversized_human = "x".repeat(MAX_INTENT_RESTORED_TRANSCRIPT_CHARS);
+        let BurstOutcome::Halted(report) = session.run_burst(&oversized_human).await else {
+            panic!("oversized human message was admitted")
+        };
+        assert_eq!(report.code, "INTENT_DURABLE_TRANSCRIPT_LIMIT_EXHAUSTED");
+        assert_eq!(
+            report.exhausted_limit,
+            Some(LimitKind::DurableTranscriptChars)
+        );
+        assert!(probe.calls().is_empty());
+        assert_eq!(session.messages.len(), 1);
+        let snapshot = session.snapshot();
+        snapshot.validate_durable_size().unwrap();
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .expect("rejected oversized human message should remain restorable");
+    });
+}
+
+#[test]
+fn durable_replay_work_is_bounded_and_the_admitted_boundary_restores() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let responses = (0..=MAX_INTENT_RESTORED_FAILURE_RESULTS)
+            .map(|_| Ok(private_room(1, Some("community_hub"))))
+            .collect::<Vec<_>>();
+        let client = ScriptedClient::new(responses);
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let added = dispatch_tool(
+            &mut session.draft,
+            "add_panel",
+            &json!({
+                "key": "private_study_room__study_panel",
+                "channel": "community_hub",
+                "content": "Conflicting panel"
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(added.is_ok(), "{}", added.as_json());
+
+        for _ in 0..MAX_INTENT_RESTORED_FAILURE_RESULTS {
+            let BurstOutcome::Halted(report) =
+                session.run_burst("Build rooms in community_hub").await
+            else {
+                panic!("candidate conflict did not halt")
+            };
+            assert_ne!(report.code, "INTENT_DURABLE_REPLAY_WORK_LIMIT_EXHAUSTED");
+        }
+        let durable_checkpoint = session.snapshot();
+        durable_checkpoint.validate_durable_size().unwrap();
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            durable_checkpoint.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("the exact replay-work boundary should restore");
+
+        let BurstOutcome::Halted(report) = session.run_burst("Build rooms in community_hub").await
+        else {
+            panic!("excess replay work was admitted")
+        };
+        assert_eq!(report.code, "INTENT_DURABLE_REPLAY_WORK_LIMIT_EXHAUSTED");
+        assert_eq!(
+            report.exhausted_limit,
+            Some(LimitKind::DurableTranscriptReplayWork)
+        );
+        assert_eq!(probe.calls().len(), MAX_INTENT_RESTORED_FAILURE_RESULTS + 1);
+        assert_eq!(session.snapshot(), durable_checkpoint);
+    });
+}
+
+#[test]
 fn restore_rejects_rebound_compiled_operation_count_after_full_receipt_rehash() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
@@ -2273,6 +3024,13 @@ fn restore_rejects_rebound_compiled_operation_count_after_full_receipt_rehash() 
             recipe_evidence,
         })
         .unwrap();
+        let rewritten_candidate_revision = *candidate_revision;
+        let rewritten_compiled_operations = *compiled_operations;
+        rewrite_tool_result(&mut snapshot, "preview_ready", |value| {
+            value["draft_revision"] = json!(rewritten_candidate_revision);
+            value["compiled_operations"] = json!(rewritten_compiled_operations);
+        });
+        refresh_transcript_integrity(&mut snapshot);
         let error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
             SessionConfig::default(),
@@ -2456,6 +3214,7 @@ fn restore_rejects_semantically_tampered_core_arguments() {
         let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
         arguments["language"] = json!("ko");
         call.arguments = arguments.to_string();
+        refresh_transcript_integrity(&mut snapshot);
 
         let error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
@@ -2500,6 +3259,7 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
             "copy": {"create_button_label": "Alternate exact label"}
         })
         .to_string();
+        refresh_transcript_integrity(&mut snapshot);
 
         let error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
@@ -2513,6 +3273,552 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
         assert!(error
             .to_string()
             .contains("detail recipe evidence does not reproduce"));
+    });
+}
+
+#[test]
+fn restore_rejects_tampered_private_success_tool_results() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+
+        let mut preview = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            preview
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut preview_snapshot = preview.snapshot();
+        rewrite_tool_result(&mut preview_snapshot, "preview_ready", |value| {
+            value["semantic_intent_hash"] = json!("0".repeat(64));
+        });
+        refresh_transcript_integrity(&mut preview_snapshot);
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            preview_snapshot,
+            resource_bindings.clone(),
+        )
+        .err()
+        .expect("tampered preview result restored")
+        .to_string()
+        .contains("does not match its persisted stage"));
+
+        let mut awaiting = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            awaiting.run_burst("Create private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        let mut awaiting_snapshot = awaiting.snapshot();
+        rewrite_tool_result(&mut awaiting_snapshot, "awaiting_decision", |value| {
+            value["revision"] = json!(999);
+        });
+        refresh_transcript_integrity(&mut awaiting_snapshot);
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            awaiting_snapshot,
+            resource_bindings.clone(),
+        )
+        .err()
+        .expect("tampered awaiting result restored")
+        .to_string()
+        .contains("awaiting result does not reproduce from its private Core"));
+
+        let (core, details) = private_room_with_copy_details(0, Some("community_hub"));
+        let mut detailed = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(core), Ok(details)]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            detailed
+                .run_burst(
+                    "Create private rooms in community_hub. Set the launcher create-button label to 'Start exact focus'.",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut detailed_snapshot = detailed.snapshot();
+        rewrite_tool_result(&mut detailed_snapshot, "details_required", |value| {
+            value["detail_facets"] = json!([]);
+        });
+        refresh_transcript_integrity(&mut detailed_snapshot);
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            detailed_snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("tampered detail-required result restored")
+        .to_string()
+        .contains("does not match its selected facets"));
+    });
+}
+
+#[test]
+fn restore_rejects_erased_private_terminal_stages() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut preview = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            preview
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut preview_snapshot = preview.snapshot();
+        preview_snapshot.intent_recipe.as_mut().unwrap().stage = IntentRecipeStageSnapshotV2::Empty;
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            preview_snapshot,
+            resource_bindings.clone(),
+        )
+        .err()
+        .expect("erased preview stage restored")
+        .to_string()
+        .contains("empty intent recipe stage"));
+
+        let mut awaiting = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            awaiting.run_burst("Create private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        let mut awaiting_snapshot = awaiting.snapshot();
+        awaiting_snapshot.intent_recipe.as_mut().unwrap().stage =
+            IntentRecipeStageSnapshotV2::Empty;
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            awaiting_snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("erased awaiting stage restored")
+        .to_string()
+        .contains("empty intent recipe stage"));
+    });
+}
+
+fn rewrite_tool_result(
+    snapshot: &mut SessionSnapshot,
+    status: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let result = snapshot
+        .messages
+        .iter_mut()
+        .find(|message| {
+            message.role == MessageRole::Tool
+                && serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|value| value.get("status").cloned())
+                    == Some(json!(status))
+        })
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    mutate(&mut value);
+    result.content = value.to_string();
+}
+
+fn refresh_transcript_integrity(snapshot: &mut SessionSnapshot) {
+    snapshot
+        .intent_recipe
+        .as_mut()
+        .unwrap()
+        .transcript_integrity_digest =
+        super::transcript_integrity::intent_transcript_integrity_digest(&snapshot.messages);
+}
+
+#[test]
+fn restore_rejects_forged_terminal_response_in_preview_ready_history() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![
+                Ok(discussion(0, "Original comparison")),
+                Ok(private_room(0, Some("community_hub"))),
+            ]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let call = snapshot
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.tool_calls)
+            .find(|call| call.id == "interpret")
+            .unwrap();
+        let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        arguments["response"] = json!("Forged comparison");
+        call.arguments = arguments.to_string();
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot with forged terminal response restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("does not match deterministic transcript replay"));
+    });
+}
+
+#[test]
+fn restore_rejects_forged_terminal_fallback_kind() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let result = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("status").cloned())
+                        == Some(json!("routed"))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(value["presentation_digest"].as_str().unwrap().len(), 64);
+        assert_eq!(value["adjudication_digest"].as_str().unwrap().len(), 64);
+        value["fallback_kind"] = json!("typed_planner");
+        result.content = value.to_string();
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot with forged terminal fallback kind restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("does not match deterministic transcript replay"));
+    });
+}
+
+#[test]
+fn restore_rejects_a_routed_result_downgraded_to_failure() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let result = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("status").cloned())
+                        == Some(json!("routed"))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["ok"] = json!(false);
+        result.content = value.to_string();
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("routed transcript downgraded to failure restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("tool failure has an invalid shape"));
+    });
+}
+
+#[test]
+fn restore_rejects_a_routed_result_replaced_with_failure_shape() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let result = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("status").cloned())
+                        == Some(json!("routed"))
+            })
+            .unwrap();
+        result.content = json!({"ok": false}).to_string();
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("routed transcript replaced by failure restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("tool failure has an invalid shape"));
+    });
+}
+
+#[test]
+fn restore_accepts_an_exactly_replayed_core_failure() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(tool_call(
+                "interpret",
+                "interpret_intent_core",
+                json!({}),
+            ))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session.run_burst("Build a private room.").await,
+            BurstOutcome::Halted { .. }
+        ));
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings,
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot().messages, snapshot.messages);
+    });
+}
+
+#[test]
+fn restore_accepts_exact_private_detail_failure_and_rejects_forgery() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let (core, _) = private_room_with_copy_details(0, Some("community_hub"));
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({"copy": {"create_button_label": "Invented button"}}),
+        );
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(core), Ok(details)]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private rooms in community_hub. Set the launcher create-button label to 'Requested button'."
+                )
+                .await,
+            BurstOutcome::Halted { .. }
+        ));
+        let snapshot = session.snapshot();
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .expect("exact private detail failure should restore");
+
+        let mut forged = snapshot;
+        let result = forged
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("ok").cloned())
+                        == Some(json!(false))
+            })
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        value["message"] = json!("forged private failure");
+        result.content = value.to_string();
+        refresh_transcript_integrity(&mut forged);
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            forged,
+            resource_bindings,
+        )
+        .err()
+        .expect("forged private detail failure restored");
+        assert!(error
+            .to_string()
+            .contains("private failure result does not match deterministic transcript replay"));
+    });
+}
+
+#[test]
+fn restore_rejects_private_success_downgraded_to_a_failure_shape() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let result = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| {
+                message.role == MessageRole::Tool
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .ok()
+                        .and_then(|value| value.get("status").cloned())
+                        == Some(json!("preview_ready"))
+            })
+            .unwrap();
+        result.content = json!({
+            "ok": false,
+            "code": "FORGED",
+            "location": "intent.forged",
+            "message": "forged private failure",
+            "hint": "forged hint",
+            "revision": 0
+        })
+        .to_string();
+        refresh_transcript_integrity(&mut snapshot);
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("private success downgraded to a failure restored");
+        assert!(error
+            .to_string()
+            .contains("has no successful private transcript outcome"));
+    });
+}
+
+#[test]
+fn restore_rejects_routed_arguments_and_result_downgraded_together() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Compare options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let call = snapshot
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.tool_calls)
+            .find(|call| call.name == "interpret_intent_core")
+            .unwrap();
+        call.arguments = "{}".to_string();
+        let result = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap();
+        result.content = json!({
+            "ok": false,
+            "code": "FORGED",
+            "location": "intent.forged",
+            "message": "forged failure",
+            "hint": "forged hint",
+            "revision": 0
+        })
+        .to_string();
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("jointly downgraded routed transcript restored");
+        assert!(error
+            .to_string()
+            .contains("does not match deterministic transcript replay"));
     });
 }
 
@@ -2554,6 +3860,57 @@ fn serving_projection_excludes_rejected_discussion_presentation() {
             .0
             .iter()
             .all(|message| message.role != MessageRole::Assistant));
+    });
+}
+
+#[test]
+fn serving_projection_replays_grounded_and_bounded_discussion() {
+    block_on(async {
+        let response = format!("{}final", "word ".repeat(500));
+        let mut recovered = private_room_value(0, Some("community_hub"));
+        recovered["automation_kind"] = json!("custom_automation");
+        recovered["requested_outcome"] = json!("working_draft");
+        recovered["response"] = json!(response);
+        recovered
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_requirements");
+        recovered
+            .as_object_mut()
+            .unwrap()
+            .remove("other_unmapped_required_capabilities");
+        let client = ScriptedClient::new(vec![
+            Ok(interpretation_call("recovered", recovered)),
+            Ok(discussion(0, "Next comparison")),
+        ]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session
+                .run_burst("This is brainstorming only; do not change the Draft yet.")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            session
+                .run_burst("Discussion only for now; do not change the Draft yet.")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        let presentations = calls[1]
+            .0
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(presentations.len(), 1);
+        assert!(presentations[0].content.encode_utf16().count() <= 2_000);
+        assert!(presentations[0].content.ends_with('…'));
+        assert!(presentations[0].tool_calls.is_empty());
     });
 }
 

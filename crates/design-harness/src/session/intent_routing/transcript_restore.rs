@@ -33,13 +33,26 @@ struct RestoredIntentHumanEnvelopeV1 {
     text: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoredIntentToolFailureV4 {
+    ok: bool,
+    code: String,
+    location: String,
+    message: String,
+    hint: String,
+    revision: u64,
+}
+
 pub(super) struct IntentTranscriptTurnV4 {
     pub(super) human_message_index: u64,
     pub(super) primary_tool: Option<String>,
     pub(super) primary_arguments: Option<String>,
     pub(super) detail_arguments: Option<String>,
+    pub(super) detail_result: Option<serde_json::Value>,
     pub(super) detail_facets: Vec<crate::turn::IntentRecipeDetailFacetV3>,
     pub(super) succeeded: bool,
+    pub(super) primary_result: Option<serde_json::Value>,
     model_responses: usize,
     open_model_request: bool,
     tool_calls: usize,
@@ -80,8 +93,10 @@ pub(super) fn validate_v4_transcript(
             primary_tool: None,
             primary_arguments: None,
             detail_arguments: None,
+            detail_result: None,
             detail_facets: Vec::new(),
             succeeded: false,
+            primary_result: None,
             model_responses: 0,
             open_model_request: false,
             tool_calls: 0,
@@ -117,6 +132,7 @@ pub(super) fn validate_v4_transcript(
             snapshot_error("intent transcript tool call is missing its tool result")
         })?;
         let result_value = parse_intent_tool_result(result, &call.id)?;
+        turn.primary_result = Some(result_value.clone());
         index = index.saturating_add(1);
         if call.name == INTERPRET_INTENT_CORE
             && result_value
@@ -164,6 +180,7 @@ pub(super) fn validate_v4_transcript(
                 snapshot_error("intent detail tool call is missing its tool result")
             })?;
             let detail_value = parse_intent_tool_result(detail_result, &detail_call.id)?;
+            turn.detail_result = Some(detail_value.clone());
             turn.succeeded =
                 detail_value.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
             index = index.saturating_add(1);
@@ -317,6 +334,21 @@ fn parse_intent_tool_result(
         return Err(snapshot_error(
             "intent transcript tool result does not contain a typed outcome",
         ));
+    }
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        let failure: RestoredIntentToolFailureV4 = serde_json::from_value(value.clone())
+            .map_err(|_| snapshot_error("intent transcript tool failure has an invalid shape"))?;
+        if failure.ok
+            || failure.code.trim().is_empty()
+            || failure.location.trim().is_empty()
+            || failure.message.trim().is_empty()
+            || failure.hint.trim().is_empty()
+        {
+            return Err(snapshot_error(
+                "intent transcript tool failure has invalid fields",
+            ));
+        }
+        let _ = failure.revision;
     }
     Ok(value)
 }

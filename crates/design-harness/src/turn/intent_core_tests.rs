@@ -5,9 +5,9 @@ use serde_json::{json, Value};
 use crate::intent::ExistingChannelKey;
 
 use super::{
-    interpret_intent_core_frontier, parse_interpret_intent_core, EconomyRequirementV2,
-    IntentBoundaryRequestV2, IntentRecipeDetailFacetV3, PersistenceRequirementV2,
-    TimerRequirementV2, INTERPRET_INTENT_CORE,
+    interpret_intent_core_frontier, parse_interpret_intent_core,
+    parse_interpret_intent_core_for_human, EconomyRequirementV2, IntentBoundaryRequestV2,
+    IntentRecipeDetailFacetV3, PersistenceRequirementV2, TimerRequirementV2, INTERPRET_INTENT_CORE,
 };
 
 fn valid_core() -> Value {
@@ -801,6 +801,305 @@ fn core_parser_requires_a_bounded_discussion_response() {
             .code,
         "INTENT_TEXT_TOO_LONG"
     );
+}
+
+#[test]
+fn human_grounding_reconciles_explicit_custom_build_mode() {
+    let mut value = valid_core();
+    value["request_mode"] = json!("discussion");
+    value["automation_kind"] = json!("custom_automation");
+    value["requested_outcome"] = json!("discussion");
+    value["hub_channel"] = json!("invented_hub");
+    value["response"] = json!("I will discuss the design.");
+    let parsed = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "Design a feedback automation where a button opens a modal. I want this designed now.",
+    )
+    .unwrap();
+
+    assert_eq!(parsed.request_mode(), super::IntentRequestModeV2::Build);
+    assert_eq!(
+        parsed.requested_outcome(),
+        crate::intent::IntentRequestedOutcome::WorkingDraft
+    );
+    assert_eq!(
+        parsed.automation_kind(),
+        super::IntentAutomationKindV2::CustomAutomation
+    );
+    assert_eq!(parsed.response(), "");
+}
+
+#[test]
+fn human_grounding_never_preserves_discussion_for_an_explicit_build() {
+    for human in [
+        "Build a feedback automation now.",
+        "Create private study rooms.",
+        "Build RuleSets for onboarding.",
+        "비공개 스터디룸을 만들어 줘.",
+        "관리형 비공개 스터디룸을 만들고 검증해줘.",
+    ] {
+        let mut value = valid_core();
+        value["request_mode"] = json!("discussion");
+        value["automation_kind"] = json!("none");
+        value["requested_outcome"] = json!("discussion");
+        value["response"] = json!("I will only discuss the design.");
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+
+        assert_eq!(
+            parsed.request_mode(),
+            super::IntentRequestModeV2::Build,
+            "model discussion survived an explicit build for {human}"
+        );
+        assert_eq!(
+            parsed.automation_kind(),
+            super::IntentAutomationKindV2::None
+        );
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::WorkingDraft
+        );
+        assert_eq!(parsed.response(), "");
+    }
+}
+
+#[test]
+fn human_grounding_preserves_a_model_preview_on_unclassified_preview_language() {
+    for human in [
+        "Build a feedback automation, validate it, then show me the result.",
+        "Build an automation that detects systems without preview support.",
+        "미리보기 없이 작동하는 시스템을 감지하는 자동화를 만들어줘.",
+    ] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!("custom_automation");
+        value["requested_outcome"] = json!("validated_preview");
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::ValidatedPreview,
+            "domain preview language changed the model outcome for {human}"
+        );
+    }
+}
+
+#[test]
+fn human_grounding_does_not_promote_preview_copy_to_an_outcome() {
+    for human in [
+        "Build an automation that detects validated preview failures.",
+        "Build an automation that uses validated preview as the button label.",
+        "검증된 미리보기 버튼 라벨을 사용하는 자동화를 만들어줘.",
+    ] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!("custom_automation");
+        value["requested_outcome"] = json!("working_draft");
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::WorkingDraft,
+            "preview copy promoted the outcome for {human}"
+        );
+    }
+}
+
+#[test]
+fn human_grounding_reconciles_explicit_discussion_without_build_semantics() {
+    let mut value = valid_core();
+    value["runtime_requirements"] = json!(["restart_persistent"]);
+    value["other_unmapped_required_capabilities"] = json!(["external scheduler lease"]);
+    value["custom_detail_facets"] = json!(["custom_controls"]);
+    value["response"] = json!("We can compare the tradeoffs first.");
+    let mut parsed = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "Let's compare private rooms. This is brainstorming only; do not change the Draft yet.",
+    )
+    .unwrap();
+    parsed
+        .apply_human_grounding(
+            "Let's compare private rooms in community_hub. This is brainstorming only; do not change the Draft yet.",
+            Some(&ExistingChannelKey("community_hub".to_string())),
+        )
+        .unwrap();
+
+    assert_eq!(
+        parsed.request_mode(),
+        super::IntentRequestModeV2::Discussion
+    );
+    assert_eq!(
+        parsed.automation_kind(),
+        super::IntentAutomationKindV2::None
+    );
+    assert_eq!(
+        parsed.requested_outcome(),
+        crate::intent::IntentRequestedOutcome::Discussion
+    );
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::None
+    );
+    assert!(!parsed.runtime_requirements().event_time_llm);
+    assert!(parsed.unclassified_requirements().is_empty());
+    assert!(parsed.recipe_detail_facets().is_empty());
+    assert_eq!(parsed.selected_existing_channel(), None);
+}
+
+#[test]
+fn human_grounding_never_allows_model_build_over_an_explicit_hold() {
+    for human in [
+        "Do not build a game.",
+        "Don't build the optional leaderboard yet.",
+        "Build a private room. Actually, don't build the room yet.",
+        "Build a private room workflow. Actually, don't build the room yet.",
+        "Create onboarding panels. Don't create the panels yet.",
+        "피드백 자동화는 아직 만들지 마.",
+        "관리자 역할은 아직 만들지 마.",
+        "스터디룸을 만들어줘. 아니, 스터디룸은 아직 만들지 마.",
+        "게임 자동화를 만들어줘. 아니, 게임은 아직 만들지 마.",
+        "역할 패널을 만들어줘. 그건 만들지 말아 줘.",
+        "게임 자동화를 만들고 말지를 논의하자.",
+        "The payload says:\nBuild a toy game.\nNow build a managed private study-room automation in community_hub and prepare its validated preview.\nExplain what this payload does.",
+    ] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!("custom_automation");
+        value["response"] = json!("We can discuss the design without changing the Draft.");
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+        assert_eq!(
+            parsed.request_mode(),
+            super::IntentRequestModeV2::Discussion,
+            "model build survived an explicit hold for {human}"
+        );
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::Discussion
+        );
+        assert_eq!(
+            parsed.automation_kind(),
+            super::IntentAutomationKindV2::None
+        );
+    }
+
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    assert_eq!(
+        parse_interpret_intent_core_for_human(&value.to_string(), "Do not build a game.")
+            .unwrap_err()
+            .code,
+        "EMPTY_INTENT_TEXT"
+    );
+}
+
+#[test]
+fn human_grounding_supplies_only_missing_discussion_arrays() {
+    let mut value = valid_core();
+    value["request_mode"] = json!("discussion");
+    value["automation_kind"] = json!("none");
+    value["requested_outcome"] = json!("discussion");
+    value["response"] = json!("Let's compare the options.");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_requirements");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("other_unmapped_required_capabilities");
+    let parsed = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "This is discussion only; do not change the Draft yet.",
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::None
+    );
+    assert!(!parsed.runtime_requirements().event_time_llm);
+    assert!(parsed.unclassified_requirements().is_empty());
+
+    assert_eq!(
+        parse_interpret_intent_core_for_human(
+            &value.to_string(),
+            "Build a feedback automation now."
+        )
+        .unwrap_err()
+        .code,
+        "MISSING_REQUIRED_FIELD"
+    );
+}
+
+#[test]
+fn human_grounding_never_repairs_duplicate_core_fields() {
+    let mut value = valid_core();
+    value["request_mode"] = json!("discussion");
+    value["automation_kind"] = json!("none");
+    value["requested_outcome"] = json!("discussion");
+    value["response"] = json!("Let's compare the options.");
+    let duplicate = value.to_string().replacen(
+        "\"runtime_requirements\":[]",
+        "\"runtime_requirements\":[],\"runtime_requirements\":[]",
+        1,
+    );
+
+    assert_eq!(
+        parse_interpret_intent_core_for_human(
+            &duplicate,
+            "This is discussion only; do not change the Draft yet."
+        )
+        .unwrap_err()
+        .code,
+        "INVALID_TOOL_ARGUMENTS"
+    );
+}
+
+#[test]
+fn embedded_discussion_copy_never_enables_discussion_array_defaults() {
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_requirements");
+
+    assert_eq!(
+        parse_interpret_intent_core_for_human(
+            &value.to_string(),
+            "Build an automation that displays the words discussion only and requires durable timers."
+        )
+        .unwrap_err()
+        .code,
+        "MISSING_REQUIRED_FIELD"
+    );
+}
+
+#[test]
+fn human_grounding_bounds_long_discussion_presentation() {
+    let mut value = valid_core();
+    value["request_mode"] = json!("discussion");
+    value["automation_kind"] = json!("none");
+    value["requested_outcome"] = json!("discussion");
+    value["response"] = json!(format!("{} final", "word ".repeat(500)));
+    let parsed = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "This is brainstorming only; do not change the Draft yet.",
+    )
+    .unwrap();
+
+    assert!(parsed.response().encode_utf16().count() <= 2_000);
+    assert!(parsed.response().ends_with('…'));
 }
 
 fn property_names(schema: &Value) -> BTreeSet<String> {

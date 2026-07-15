@@ -46,7 +46,7 @@ use routing::{
     all_tool_definitions, is_control_tool, is_mutation_tool, legacy_tool_definitions,
     tool_is_available,
 };
-use snapshot::validate_snapshot;
+use snapshot::{validate_snapshot, validate_snapshot_with_intent_bindings};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a concise intent, objective, requested outcome, assumptions, and whether validation is required. Classify adding new Draft structure as build and changing or removing existing structure as modify. Build turns use set_turn_plan for exact ordered semantic requirements. A modify turn may offer Draft-legal update or remove tools beside set_turn_plan; use set_turn_plan when the requested work is actually additive, and use update or remove only for a true edit or removal. After attempting set_turn_plan, repair only through set_turn_plan. The harness executes accepted plans deterministically. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For build or modify, continue in the same turn with the staged design tools and call check_turn_scope after the requested Draft change is complete. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness then automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Actual edits and removals must use update or remove tools instead of creating duplicates. Reference created resources by alias. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
 pub(super) const PLANNED_SYSTEM_PROMPT: &str = "Design Discord automations only with the provided tools. Never touch live Discord, publish, deploy, or activate. At the start of every human turn call set_turn_brief with only a strategy, concise objective, requested outcome, assumptions, and whether validation is required. Use additive_plan whenever the request adds any new panel, button, modal, rule, or action, even when it preserves and extends an existing Draft. Use edit_existing only when every requested mutation updates or removes a target that already exists. For additive work call set_turn_plan with a complete ordered outline containing exactly the missing mutations needed for the current request; omit every existing object or action mentioned only to preserve it. Include one op and a goal with the literal keys, values, references, and semantics needed for every new requested object and action. Preserve duplicate ops and the requested action order. Put every new top-level button immediately after its persistent panel and every action immediately after its rule. Every outline step must include owner. Use draft for panel, modal, and rule; use the parent panel key for a button; use the parent rule key for every action, never a role, channel, panel, modal, action target, or resource key. Panel, button, and modal ops declare one persistent object. The button op is only for a persistent panel declared by panel. A post_panel action contains its complete embedded button list inside its packet, so never add separate button ops for buttons embedded in post_panel. A rule op declares only a trigger and never includes an action. Every rule action is a separate op: open_modal opens a modal, respond_ephemeral sends one response, defer_ephemeral defers, create_role creates a role, create_channel creates a channel, upsert_overwrite sets one permission target, grant_role grants a role, post_panel posts one panel, register_instance declares only its instance key and kind, edit_response edits the response, and teardown_instance removes the current instance. The harness derives the complete canonical register_instance manifest from created resources; do not add another op or enumerate manifest resources. The harness assigns stable ids and then exposes fill_turn_plan_packet with a small exact schema for the current packet. For each currently exposed packet, call fill_turn_plan_packet exactly once and fill every required property. While that tool remains exposed, the overall plan is incomplete, so continue with the newly exposed packet until the harness reports completion. The harness injects explicit or backward-compatible inferred owners, assembles, validates, and executes the completed plan atomically. An edit_existing turn may offer Draft-legal update or remove tools; never use those tools to add a missing key and never mix them with a plan. After a plan-path failure use only the replanning frontier exposed by the harness. The harness deterministically enables StudyRoom simulation from the exact human message; set validate to true whenever the human explicitly says StudyRoom. Use discussion or brainstorm for design conversation or a missing structural decision, then finish_turn with one focused question or response without changing the Draft. For an unchanged existing Draft verification turn, use inspect with validated_preview and validate true; the harness scopes the current revision and automatically validates, runs the selected simulation, and renders the preview without a mutation. The harness automatically runs requested validation, harness-selected simulation, and preview steps. When finish_turn is the only available tool, call it with kind ready and summarize the result. Use safe defaults only for non-blocking details. Actual edits and removals must use update or remove tools instead of creating duplicates. Reference created resources by stable key alias, never the rendered role or channel name. Never ask whether to continue, stop, validate, or review. Legacy QUESTION, PROGRESSED, and READY text are accepted only for compatibility; prefer finish_turn.";
@@ -63,7 +63,7 @@ const MAX_INTENT_MEMORY_CHARS: usize = 240;
 const MAX_ERROR_MEMORY_CHARS: usize = 360;
 const MAX_REVIEW_RETRY_ERROR_FIELD_CHARS: usize = 448;
 
-pub const SESSION_SNAPSHOT_VERSION: u32 = 7;
+pub const SESSION_SNAPSHOT_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -91,6 +91,8 @@ pub enum LimitKind {
     ToolCalls,
     GateFailures,
     ContextChars,
+    DurableTranscriptChars,
+    DurableTranscriptReplayWork,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +267,12 @@ pub struct SessionSnapshot {
     pub brief_history: Vec<TurnBrief>,
     #[serde(default)]
     pub(crate) intent_recipe: Option<intent_routing::IntentRecipeSessionSnapshotV2>,
+}
+
+impl SessionSnapshot {
+    pub fn validate_durable_size(&self) -> Result<(), SessionSnapshotError> {
+        intent_routing::validate_intent_durable_transcript_bound(self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -766,7 +774,7 @@ impl<C> DesignSession<C> {
             intent_recipe: self
                 .intent_recipe
                 .as_ref()
-                .map(IntentRecipeRuntime::snapshot),
+                .map(|runtime| runtime.snapshot(&self.messages)),
         }
     }
 

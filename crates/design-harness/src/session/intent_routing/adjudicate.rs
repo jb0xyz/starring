@@ -50,6 +50,7 @@ pub(super) enum IntentCoreAdjudicationV4 {
     Terminal(TerminalIntentPermitV2),
 }
 
+#[derive(Clone)]
 pub(super) struct PrivateStudyRoomSelectionV4 {
     core: IntentCoreInterpretationV4,
     decision: IntentRouteDecisionV2,

@@ -2,7 +2,8 @@ use crate::draft::Draft;
 use crate::errors::StructuredError;
 use crate::intent::identity::domain_separated_length_framed_digest;
 use crate::intent::{
-    ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV2, MissingDecision,
+    recipe_descriptor_v1, ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV2,
+    MissingDecision, RecipeKindV1,
 };
 use crate::llm::Message;
 use resource_resolution::ResourceBindingMap;
@@ -13,6 +14,7 @@ use super::decision::IntentRouteDecisionV2;
 use super::evidence::IntentRecipeEvidenceV4;
 use super::frontier::IntentFrontierV4;
 use super::request_evidence::IntentRequestEvidenceChainV1;
+use super::transcript_integrity::intent_transcript_integrity_digest;
 use super::INTENT_RECIPE_PROTOCOL_VERSION_V4;
 
 pub(in crate::session) use super::snapshot_validation::validate_intent_recipe_snapshot;
@@ -187,7 +189,10 @@ pub enum IntentRecipeStatusV2 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct IntentRecipeSessionSnapshotV2 {
     pub(crate) protocol_version: u16,
+    pub(crate) extractor_revision: u32,
+    pub(crate) normalizer_revision: u32,
     pub(crate) context_fingerprint: String,
+    pub(crate) transcript_integrity_digest: String,
     pub(crate) stage: IntentRecipeStageSnapshotV2,
 }
 
@@ -232,10 +237,14 @@ pub(in crate::session) struct IntentRecipeRuntime {
 
 impl IntentRecipeRuntime {
     pub(super) fn new(bindings: ResourceBindingMap) -> Self {
+        let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
         Self {
             snapshot: IntentRecipeSessionSnapshotV2 {
                 protocol_version: INTENT_RECIPE_PROTOCOL_VERSION,
+                extractor_revision: descriptor.extractor_revision,
+                normalizer_revision: descriptor.normalizer_revision,
                 context_fingerprint: context_fingerprint(&bindings),
+                transcript_integrity_digest: intent_transcript_integrity_digest(&[]),
                 stage: IntentRecipeStageSnapshotV2::Empty,
             },
             bindings,
@@ -248,6 +257,7 @@ impl IntentRecipeRuntime {
         draft: &Draft,
         messages: &[Message],
     ) -> Result<Self, SessionSnapshotError> {
+        validate_intent_recipe_component_identity(&snapshot)?;
         let actual = context_fingerprint(&bindings);
         if actual != snapshot.context_fingerprint {
             return Err(snapshot_error(
@@ -259,8 +269,13 @@ impl IntentRecipeRuntime {
         Ok(runtime)
     }
 
-    pub(in crate::session) fn snapshot(&self) -> IntentRecipeSessionSnapshotV2 {
-        self.snapshot.clone()
+    pub(in crate::session) fn snapshot(
+        &self,
+        messages: &[Message],
+    ) -> IntentRecipeSessionSnapshotV2 {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.transcript_integrity_digest = intent_transcript_integrity_digest(messages);
+        snapshot
     }
 
     pub(super) fn resolution_context(&self) -> IntentResolutionContext {
@@ -319,7 +334,26 @@ impl IntentRecipeRuntime {
     }
 }
 
-fn context_fingerprint(bindings: &ResourceBindingMap) -> String {
+pub(super) fn validate_intent_recipe_component_identity(
+    snapshot: &IntentRecipeSessionSnapshotV2,
+) -> Result<(), SessionSnapshotError> {
+    let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
+    if snapshot.extractor_revision != descriptor.extractor_revision {
+        return Err(snapshot_error(format!(
+            "intent recipe extractor revision changed: expected {}, found {}",
+            descriptor.extractor_revision, snapshot.extractor_revision
+        )));
+    }
+    if snapshot.normalizer_revision != descriptor.normalizer_revision {
+        return Err(snapshot_error(format!(
+            "intent recipe normalizer revision changed: expected {}, found {}",
+            descriptor.normalizer_revision, snapshot.normalizer_revision
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn context_fingerprint(bindings: &ResourceBindingMap) -> String {
     let mut fields = Vec::<Vec<u8>>::new();
     for (key, id) in &bindings.channel_bindings {
         fields.push(b"channel".to_vec());

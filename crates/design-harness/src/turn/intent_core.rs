@@ -18,6 +18,7 @@ use super::intent_interpretation::{
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
     TimerRequirementV2,
 };
+use super::intent_request_mode_grounding::grounded_request_controls;
 use super::intent_text::{normalized_required_text, validate_text_shape};
 use super::schema::inline_schema_value;
 
@@ -224,6 +225,11 @@ impl IntentCoreInterpretationV4 {
         unclassified_requirements
             .retain(|requirement| !boundary_analysis.owns_capability_evidence(requirement));
         let boundary_requests = boundary_analysis.requests().to_vec();
+        let grounded_channel = if self.request_mode == IntentRequestModeV2::Build {
+            grounded_channel
+        } else {
+            None
+        };
         self.apply_human_grounded_channel(grounded_channel);
         self.boundary_requests = boundary_requests;
         self.unclassified_requirements = unclassified_requirements;
@@ -315,14 +321,143 @@ pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
 pub fn parse_interpret_intent_core(
     arguments: &str,
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
-    let input = serde_json::from_str::<InterpretIntentCoreWireV4>(arguments).map_err(|error| {
+    normalize_core(parse_core_wire(arguments)?)
+}
+
+pub(crate) fn parse_interpret_intent_core_for_human(
+    arguments: &str,
+    human_message: &str,
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    let grounded = grounded_request_controls(human_message);
+    let mut input = match parse_core_wire(arguments) {
+        Ok(input) => input,
+        Err(error)
+            if grounded.mode == Some(IntentRequestModeV2::Discussion)
+                && missing_discussion_array(&error) =>
+        {
+            parse_core_wire(&supply_empty_discussion_arrays(arguments)?)?
+        }
+        Err(error) => return Err(error),
+    };
+    apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
+    bound_discussion_response(&mut input)?;
+    normalize_core(input)
+}
+
+fn parse_core_wire(arguments: &str) -> Result<InterpretIntentCoreWireV4, StructuredError> {
+    serde_json::from_str::<InterpretIntentCoreWireV4>(arguments).map_err(|error| {
+        translate_tool_arguments_error(
+            INTERPRET_INTENT_CORE,
+            &error,
+            &inline_schema_value::<InterpretIntentCoreWireV4>(),
+        )
+    })
+}
+
+fn missing_discussion_array(error: &StructuredError) -> bool {
+    error.code == "MISSING_REQUIRED_FIELD"
+        && [
+            "tool.interpret_intent_core.arguments.runtime_requirements",
+            "tool.interpret_intent_core.arguments.other_unmapped_required_capabilities",
+        ]
+        .contains(&error.location.as_str())
+}
+
+fn supply_empty_discussion_arrays(arguments: &str) -> Result<String, StructuredError> {
+    let mut value = serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
         translate_tool_arguments_error(
             INTERPRET_INTENT_CORE,
             &error,
             &inline_schema_value::<InterpretIntentCoreWireV4>(),
         )
     })?;
-    normalize_core(input)
+    let object = value.as_object_mut().ok_or_else(|| {
+        core_error(
+            "INVALID_TOOL_ARGUMENTS",
+            "tool.interpret_intent_core.arguments",
+            "tool arguments must be a JSON object",
+            "Return one complete interpret_intent_core object",
+        )
+    })?;
+    object
+        .entry("runtime_requirements")
+        .or_insert_with(|| serde_json::json!([]));
+    object
+        .entry("other_unmapped_required_capabilities")
+        .or_insert_with(|| serde_json::json!([]));
+    serde_json::to_string(&value).map_err(|error| {
+        core_error(
+            "INVALID_TOOL_ARGUMENTS",
+            "tool.interpret_intent_core.arguments",
+            error.to_string(),
+            "Return one complete interpret_intent_core object",
+        )
+    })
+}
+
+fn apply_grounded_request_mode(
+    input: &mut InterpretIntentCoreWireV4,
+    grounded_mode: Option<IntentRequestModeV2>,
+    grounded_preview: Option<bool>,
+) {
+    match grounded_mode {
+        Some(IntentRequestModeV2::Discussion) => {
+            input.request_mode = IntentRequestModeV2::Discussion;
+            input.automation_kind = IntentAutomationKindV2::None;
+            input.requested_outcome = IntentRequestedOutcome::Discussion;
+            input.hub_channel = RequiredNullableChannelV3(None);
+            input.close_policy = CloseAuthorizationV2::NotRequested;
+            input.runtime_requirements.clear();
+            input.other_unmapped_required_capabilities.clear();
+            input.custom_detail_facets.clear();
+        }
+        Some(IntentRequestModeV2::Build) => {
+            input.request_mode = IntentRequestModeV2::Build;
+            input.requested_outcome = match grounded_preview {
+                Some(true) => IntentRequestedOutcome::ValidatedPreview,
+                Some(false) => IntentRequestedOutcome::WorkingDraft,
+                None if input.requested_outcome == IntentRequestedOutcome::Discussion => {
+                    IntentRequestedOutcome::WorkingDraft
+                }
+                None => input.requested_outcome,
+            };
+            input.response.clear();
+        }
+        None => {}
+    }
+}
+
+fn bound_discussion_response(input: &mut InterpretIntentCoreWireV4) -> Result<(), StructuredError> {
+    if input.request_mode != IntentRequestModeV2::Discussion {
+        return Ok(());
+    }
+    let normalized = input.response.trim();
+    validate_text_shape(normalized, usize::MAX, true, false, "intent.core.response")?;
+    if normalized.encode_utf16().count() <= MAX_RESPONSE_CHARS {
+        input.response = normalized.to_string();
+        return Ok(());
+    }
+    let budget = MAX_RESPONSE_CHARS.saturating_sub(1);
+    let mut units = 0usize;
+    let mut end = 0usize;
+    let mut last_whitespace = None;
+    for (index, character) in normalized.char_indices() {
+        let next = units.saturating_add(character.len_utf16());
+        if next > budget {
+            break;
+        }
+        units = next;
+        end = index.saturating_add(character.len_utf8());
+        if character.is_whitespace() {
+            last_whitespace = Some(index);
+        }
+    }
+    let minimum_word_cut = budget.saturating_mul(3) / 4;
+    let cut = last_whitespace
+        .filter(|index| normalized[..*index].encode_utf16().count() >= minimum_word_cut)
+        .unwrap_or(end);
+    input.response = format!("{}…", normalized[..cut].trim_end());
+    Ok(())
 }
 
 fn deserialize_required_nullable_channel<'de, D>(

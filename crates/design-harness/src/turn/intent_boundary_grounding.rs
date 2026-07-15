@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use self::classification::classify_sentence_units;
 use self::evidence::{evidence_groups, unique_visible_bounded_span, BoundaryEvidenceGroup};
-use self::syntax::{mask_quoted_text, sentence_spans};
+use self::syntax::{mask_quoted_text, sentence_spans, sentence_units};
 use super::intent_interpretation::IntentBoundaryRequestV2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +63,31 @@ impl<'a> SafetyBoundaryAnalysis<'a> {
 
 pub(crate) fn analyze_safety_boundaries(human_message: &str) -> SafetyBoundaryAnalysis<'_> {
     SafetyBoundaryAnalysis::analyze(human_message)
+}
+
+pub(super) struct UnquotedGroundingText {
+    pub(super) sentences: Vec<Vec<UnquotedGroundingUnit>>,
+}
+
+pub(super) struct UnquotedGroundingUnit {
+    pub(super) text: String,
+}
+
+pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGroundingText> {
+    let mask = mask_quoted_text(human_message);
+    if mask.unmatched {
+        return None;
+    }
+    let sentences = sentence_spans(&mask.visible)
+        .into_iter()
+        .map(|(span, _)| {
+            sentence_units(&mask.visible, span)
+                .into_iter()
+                .map(|unit| UnquotedGroundingUnit { text: unit.text })
+                .collect()
+        })
+        .collect();
+    Some(UnquotedGroundingText { sentences })
 }
 
 #[cfg(test)]

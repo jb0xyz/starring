@@ -7,7 +7,7 @@ use crate::intent::{
     ValidatedIntentV2, INTENT_IDENTITY_REVISION,
 };
 use crate::turn::{
-    parse_interpret_intent_core, parse_private_study_room_details_for_serving,
+    parse_interpret_intent_core_for_human, parse_private_study_room_details_for_serving,
     parse_resolve_intent_decision,
 };
 
@@ -29,6 +29,7 @@ use super::state_binding::{
     awaiting_decision_binding_digest_v4, preview_ready_binding_digest_v4,
     AwaitingDecisionBindingInputV4, PreviewReadyBindingInputV4,
 };
+use super::transcript_binding::routed_presentation_digest;
 use super::INTENT_RECIPE_PROTOCOL_VERSION_V4;
 
 pub(super) enum IntentCoreExecutionV4 {
@@ -89,10 +90,12 @@ impl IntentTurnSuccess {
                 "candidate_ruleset_hash": candidate_ruleset_hash,
                 "compiled_operations": compiled_operations,
             }),
-            Self::Routed { fallback, .. } => json!({
+            Self::Routed { fallback, decision } => json!({
                 "ok": true,
                 "status": "routed",
                 "fallback_kind": fallback.kind().as_str(),
+                "adjudication_digest": decision.adjudication_digest(),
+                "presentation_digest": routed_presentation_digest(fallback.response()),
             }),
         };
         value.to_string()
@@ -344,9 +347,10 @@ impl<C> DesignSession<C> {
     ) -> Result<IntentCoreExecutionV4, StructuredError> {
         self.observability.intent_route_calls =
             self.observability.intent_route_calls.saturating_add(1);
-        let mut core = parse_interpret_intent_core(arguments).inspect_err(|_| {
-            self.record_intent_extraction_failure();
-        })?;
+        let mut core = parse_interpret_intent_core_for_human(arguments, human_message)
+            .inspect_err(|_| {
+                self.record_intent_extraction_failure();
+            })?;
         self.validate_expected_revision(core.expected_revision())?;
         let transcript_message_index =
             u64::try_from(self.current_human_message_index.ok_or_else(|| {

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::llm::{Message, MessageRole};
 use crate::tools::tool_definitions;
 use crate::turn::AdaptivePhase;
+use resource_resolution::ResourceBindingMap;
 
 use super::context::{is_anchor, DraftStateMemory};
 use super::intent_routing::{
@@ -17,6 +18,20 @@ use super::{
 };
 
 pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), SessionSnapshotError> {
+    validate_snapshot_with_bindings(snapshot, None)
+}
+
+pub(super) fn validate_snapshot_with_intent_bindings(
+    snapshot: &SessionSnapshot,
+    bindings: &ResourceBindingMap,
+) -> Result<(), SessionSnapshotError> {
+    validate_snapshot_with_bindings(snapshot, Some(bindings))
+}
+
+fn validate_snapshot_with_bindings(
+    snapshot: &SessionSnapshot,
+    bindings: Option<&ResourceBindingMap>,
+) -> Result<(), SessionSnapshotError> {
     if snapshot.schema_version != SESSION_SNAPSHOT_VERSION {
         return Err(SessionSnapshotError::UnsupportedVersion {
             expected: SESSION_SNAPSHOT_VERSION,
@@ -75,7 +90,7 @@ pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), Sessio
     validate_turn_snapshot(snapshot)?;
     validate_adaptive_turn_snapshot(snapshot)?;
     validate_repair_snapshot(snapshot)?;
-    validate_intent_recipe_snapshot(snapshot)?;
+    validate_intent_recipe_snapshot(snapshot, bindings)?;
     validate_message_pairing(&snapshot.messages, snapshot.draft.draft_revision)
 }
 

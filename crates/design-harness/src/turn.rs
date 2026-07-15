@@ -24,6 +24,9 @@ mod intent_protocol;
 mod intent_recipe_details;
 #[cfg(test)]
 mod intent_recipe_details_tests;
+mod intent_request_mode_grounding;
+#[cfg(test)]
+mod intent_request_mode_grounding_tests;
 mod intent_text;
 mod plan;
 mod plan_input;
@@ -34,6 +37,7 @@ mod scope;
 pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
 };
+pub(crate) use intent_core::parse_interpret_intent_core_for_human;
 pub use intent_core::{
     interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV4,
     IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,

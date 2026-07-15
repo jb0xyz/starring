@@ -1144,6 +1144,8 @@ fn limit_name(limit: LimitKind) -> &'static str {
         LimitKind::ToolCalls => "tool_calls",
         LimitKind::GateFailures => "gate_failures",
         LimitKind::ContextChars => "context_chars",
+        LimitKind::DurableTranscriptChars => "durable_transcript_chars",
+        LimitKind::DurableTranscriptReplayWork => "durable_transcript_replay_work",
     }
 }
 
@@ -1874,7 +1876,7 @@ mod tests {
         );
         assert_eq!(document["catalog_identity"]["recipe_version"], 1);
         assert_eq!(document["catalog_identity"]["extractor_revision"], 9);
-        assert_eq!(document["catalog_identity"]["normalizer_revision"], 4);
+        assert_eq!(document["catalog_identity"]["normalizer_revision"], 5);
         assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
         assert_eq!(document["catalog_identity"]["simulator_revision"], 1);
         assert_eq!(

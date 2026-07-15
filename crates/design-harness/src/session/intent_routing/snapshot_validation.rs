@@ -1,6 +1,5 @@
 use crate::draft::Draft;
 use crate::errors::StructuredError;
-use crate::intent::identity::is_lowercase_sha256_hex;
 use crate::intent::{
     candidate_ruleset_hash, compile_intent, draft_state_hash, prepare_intent_workspace,
     ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV2, PreparedIntentWorkspaceV2,
@@ -8,32 +7,34 @@ use crate::intent::{
 };
 use crate::llm::Message;
 use crate::turn::{
-    parse_interpret_intent_core, parse_private_study_room_details_for_serving,
-    INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
+    parse_private_study_room_details_for_serving, INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
 };
+use resource_resolution::ResourceBindingMap;
 
 use super::super::{SessionSnapshot, SessionSnapshotError};
-use super::adjudicate::{
-    adjudicate_intent_core_v4, validate_persisted_private_study_room_decision_v4,
-    IntentCoreAdjudicationV4,
-};
+use super::adjudicate::validate_persisted_private_study_room_decision_v4;
 use super::decision::IntentRouteDecisionV2;
 use super::evidence::IntentRecipeEvidenceV4;
-use super::grounding::deterministically_selected_option;
 use super::request_evidence::{IntentRequestEvidenceChainV1, IntentRequestEvidenceEntryV1};
 use super::state::{
-    snapshot_error, IntentRecipeRuntime, IntentRecipeStageSnapshotV2,
-    INTENT_RECIPE_PROTOCOL_VERSION, INTENT_RECIPE_SYSTEM_PROMPT_V1, INTENT_RECIPE_SYSTEM_PROMPT_V2,
-    INTENT_RECIPE_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V4,
+    context_fingerprint, snapshot_error, validate_intent_recipe_component_identity,
+    IntentRecipeRuntime, IntentRecipeStageSnapshotV2, INTENT_RECIPE_PROTOCOL_VERSION,
+    INTENT_RECIPE_SYSTEM_PROMPT_V1, INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_SYSTEM_PROMPT_V4,
 };
 use super::state_binding::{
     awaiting_decision_binding_digest_v4, preview_ready_binding_digest_v4,
     AwaitingDecisionBindingInputV4, PreviewReadyBindingInputV4,
 };
-use super::transcript_restore::{
-    parse_intent_state_anchor, restored_human_text, validate_intent_state_anchor,
-    validate_v4_transcript, IntentTranscriptV4,
+use super::transcript_binding::{
+    valid_hash, validate_core_transcript_results, validate_details_required_tool_result,
+    validate_final_awaiting_tool_result, validate_final_preview_tool_result,
+    validate_initial_awaiting_tool_result, validate_persisted_binding,
+    validate_terminal_private_stage, PreviewToolResultExpectationV4, ValidatedCoreTranscriptV4,
 };
+use super::transcript_integrity::intent_transcript_integrity_digest;
+use super::transcript_replay::restored_semantics_error;
+use super::transcript_restore::{validate_v4_transcript, IntentTranscriptV4};
 use super::{INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3};
 
 impl IntentRecipeRuntime {
@@ -149,6 +150,7 @@ impl IntentRecipeRuntime {
 
 pub(in crate::session) fn validate_intent_recipe_snapshot(
     snapshot: &SessionSnapshot,
+    bindings: Option<&ResourceBindingMap>,
 ) -> Result<(), SessionSnapshotError> {
     let prompt = snapshot
         .messages
@@ -199,9 +201,23 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
             ));
         }
     }
+    validate_intent_recipe_component_identity(intent)?;
     if !valid_hash(&intent.context_fingerprint) {
         return Err(snapshot_error(
             "intent recipe context fingerprint is malformed",
+        ));
+    }
+    let bindings = bindings.ok_or_else(|| {
+        snapshot_error("intent recipe snapshots require their original resource bindings")
+    })?;
+    if intent.context_fingerprint != context_fingerprint(bindings) {
+        return Err(snapshot_error(
+            "intent recipe resource bindings changed after the snapshot was created",
+        ));
+    }
+    if !valid_hash(&intent.transcript_integrity_digest) {
+        return Err(snapshot_error(
+            "intent recipe transcript integrity digest is malformed",
         ));
     }
     if snapshot.adaptive_enabled
@@ -214,7 +230,20 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
             "intent recipe snapshot contains incompatible adaptive or repair state",
         ));
     }
+    if intent.transcript_integrity_digest != intent_transcript_integrity_digest(&snapshot.messages)
+    {
+        return Err(snapshot_error(
+            "intent recipe transcript does not match its persisted integrity digest",
+        ));
+    }
     let transcript = validate_v4_transcript(snapshot)?;
+    let core_transcript = validate_core_transcript_results(
+        &snapshot.messages,
+        &transcript,
+        &snapshot.draft,
+        bindings,
+    )?;
+    validate_terminal_private_stage(&intent.stage, &transcript, &core_transcript)?;
     match &intent.stage {
         IntentRecipeStageSnapshotV2::Empty => Ok(()),
         IntentRecipeStageSnapshotV2::AwaitingDecision {
@@ -247,6 +276,13 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                 workspace,
                 route_decision,
                 recipe_evidence,
+                &core_transcript,
+            )?;
+            validate_final_awaiting_tool_result(
+                request_evidence,
+                &transcript,
+                workspace.revision,
+                &active_decision.options,
             )?;
             let actual_draft_hash = draft_state_hash(&snapshot.draft).map_err(|error| {
                 snapshot_error(format!(
@@ -329,6 +365,19 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                 workspace,
                 route_decision,
                 recipe_evidence,
+                &core_transcript,
+            )?;
+            validate_final_preview_tool_result(
+                request_evidence,
+                &transcript,
+                PreviewToolResultExpectationV4 {
+                    intent_revision: *intent_revision,
+                    draft_revision: *candidate_revision,
+                    semantic_intent_hash,
+                    compiled_plan_hash,
+                    candidate_ruleset_hash: persisted_ruleset_hash,
+                    compiled_operations: *compiled_operations,
+                },
             )?;
             let actual_ruleset_hash = candidate_ruleset_hash(&snapshot.draft).map_err(|error| {
                 snapshot_error(format!(
@@ -417,6 +466,7 @@ fn validate_persisted_evidence_chain(
     workspace: &IntentWorkspaceV2,
     decision: &IntentRouteDecisionV2,
     evidence: &IntentRecipeEvidenceV4,
+    core_transcript: &ValidatedCoreTranscriptV4,
 ) -> Result<(), SessionSnapshotError> {
     request_evidence
         .validate_against_transcript(messages)
@@ -468,24 +518,24 @@ fn validate_persisted_evidence_chain(
     }
     validate_initial_semantics_replay(
         request_evidence,
-        messages,
         transcript,
         workspace,
         decision,
         evidence,
         &initial_head,
+        core_transcript,
     )?;
     Ok(())
 }
 
 fn validate_initial_semantics_replay(
     request_evidence: &IntentRequestEvidenceChainV1,
-    messages: &[Message],
     transcript: &IntentTranscriptV4,
     workspace: &IntentWorkspaceV2,
     decision: &IntentRouteDecisionV2,
     evidence: &IntentRecipeEvidenceV4,
     initial_head: &str,
+    core_transcript: &ValidatedCoreTranscriptV4,
 ) -> Result<(), SessionSnapshotError> {
     let Some(IntentRequestEvidenceEntryV1::InitialHuman {
         transcript_message_index,
@@ -497,19 +547,6 @@ fn validate_initial_semantics_replay(
             "persisted request evidence has no initial human entry",
         ));
     };
-    let initial_index = usize::try_from(*transcript_message_index)
-        .map_err(|_| snapshot_error("initial human transcript index overflowed"))?;
-    let human = restored_human_text(
-        messages
-            .get(initial_index)
-            .ok_or_else(|| snapshot_error("initial human transcript message is missing"))?,
-    )?;
-    let state = parse_intent_state_anchor(
-        messages
-            .get(initial_index.saturating_add(1))
-            .ok_or_else(|| snapshot_error("initial intent state anchor is missing"))?,
-    )?;
-    validate_intent_state_anchor(&state)?;
     let turn = transcript
         .turns
         .iter()
@@ -520,29 +557,34 @@ fn validate_initial_semantics_replay(
             "initial semantic transcript frontier did not succeed",
         ));
     }
-    let arguments = turn
+    let _arguments = turn
         .primary_arguments
         .as_deref()
         .ok_or_else(|| snapshot_error("initial Core arguments are missing"))?;
-    let mut core = parse_interpret_intent_core(arguments).map_err(restored_semantics_error)?;
-    if core.expected_revision() != *expected_revision
-        || state.expected_revision != *expected_revision
-    {
+    let primary_result = turn
+        .primary_result
+        .as_ref()
+        .ok_or_else(|| snapshot_error("initial Core result is missing"))?;
+    let replayed = core_transcript
+        .private_turn(*transcript_message_index)
+        .ok_or_else(|| {
+            snapshot_error(
+                "initial Core no longer adjudicates to the persisted private study-room route",
+            )
+        })?;
+    if replayed.expected_revision != *expected_revision {
         return Err(snapshot_error(
             "initial Core revision does not match its human evidence",
         ));
     }
-    let grounded_channel = deterministically_selected_option(&human, &state.available_channel_keys)
-        .map(ExistingChannelKey);
-    core.apply_human_grounding(&human, grounded_channel.as_ref())
-        .map_err(restored_semantics_error)?;
-    let adjudication =
-        adjudicate_intent_core_v4(core, initial_head).map_err(restored_semantics_error)?;
-    let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudication else {
+    let selection = &replayed.selection;
+    let human = &replayed.human;
+    let available_channel_keys = &replayed.available_channel_keys;
+    if replayed.initial_head != initial_head {
         return Err(snapshot_error(
-            "initial Core no longer adjudicates to the persisted private study-room route",
+            "persisted route decision does not reproduce from the initial Core arguments",
         ));
-    };
+    }
     if selection.decision() != decision {
         return Err(snapshot_error(
             "persisted route decision does not reproduce from the initial Core arguments",
@@ -567,8 +609,12 @@ fn validate_initial_semantics_replay(
                 "default recipe evidence does not reproduce from the initial Core",
             ));
         }
-        selection.finalize(None).map_err(restored_semantics_error)?
+        selection
+            .clone()
+            .finalize(None)
+            .map_err(restored_semantics_error)?
     } else {
+        validate_details_required_tool_result(primary_result, selection.detail_facets())?;
         if turn.detail_facets.as_slice() != selection.detail_facets() {
             return Err(snapshot_error(
                 "detail state facets do not reproduce from the initial Core",
@@ -583,7 +629,7 @@ fn validate_initial_semantics_replay(
             selection.detail_facets(),
             selection.expected_revision(),
             selection.semantic_ir_digest(),
-            &human,
+            human,
         )
         .map_err(restored_semantics_error)?;
         let detail_result_digest = selection
@@ -602,12 +648,12 @@ fn validate_initial_semantics_replay(
             ));
         }
         selection
+            .clone()
             .finalize(Some(details))
             .map_err(restored_semantics_error)?
     };
     let context = IntentResolutionContext::from_channel_bindings(
-        state
-            .available_channel_keys
+        available_channel_keys
             .iter()
             .cloned()
             .map(ExistingChannelKey),
@@ -620,8 +666,24 @@ fn validate_initial_semantics_replay(
         ));
     }
     let replayed_workspace = match prepared {
-        PreparedIntentWorkspaceV2::NeedsInput { workspace, .. }
-        | PreparedIntentWorkspaceV2::Resolved { workspace, .. } => workspace,
+        PreparedIntentWorkspaceV2::NeedsInput {
+            workspace,
+            decisions,
+        } => {
+            let [active_decision] = decisions.as_slice() else {
+                return Err(snapshot_error(
+                    "initial private study-room replay did not produce one active decision",
+                ));
+            };
+            let outcome_result = turn.detail_result.as_ref().unwrap_or(primary_result);
+            validate_initial_awaiting_tool_result(
+                outcome_result,
+                workspace.revision,
+                &active_decision.options,
+            )?;
+            workspace
+        }
+        PreparedIntentWorkspaceV2::Resolved { workspace, .. } => workspace,
     };
     let initial_workspace = request_evidence
         .initial_workspace(workspace)
@@ -632,27 +694,6 @@ fn validate_initial_semantics_replay(
         ));
     }
     Ok(())
-}
-
-fn restored_semantics_error(error: StructuredError) -> SessionSnapshotError {
-    snapshot_error(format!(
-        "persisted model semantics failed deterministic replay {}: {}",
-        error.code, error.message
-    ))
-}
-
-fn validate_persisted_binding(binding: &str, expected: &str) -> Result<(), SessionSnapshotError> {
-    if valid_hash(binding) && binding == expected {
-        Ok(())
-    } else {
-        Err(snapshot_error(
-            "persisted intent stage does not match its route decision binding",
-        ))
-    }
-}
-
-fn valid_hash(value: &str) -> bool {
-    is_lowercase_sha256_hex(value)
 }
 
 fn restored_state_error(error: StructuredError) -> SessionSnapshotError {
