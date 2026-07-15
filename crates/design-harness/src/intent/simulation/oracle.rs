@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::draft::Draft;
 use crate::errors::StructuredError;
 
-use super::super::compile::CompiledIntentV1;
+use super::super::compile::CompiledIntentV2;
 use super::super::model::{ResolvedCloseControlV1, ResolvedManagedPrivateRoomV1};
 use super::support::{
     bound_hub_channel, identity_error, instance_manifest_error, render_pattern, trace_error,
@@ -288,7 +288,7 @@ pub(super) async fn load_and_verify_instance(
 
 pub(super) fn prove_close_disabled(
     candidate: &Draft,
-    compiled: &CompiledIntentV1,
+    compiled: &CompiledIntentV2,
 ) -> Result<(), StructuredError> {
     let close_action = format!("{}__close", compiled.manifest.feature_id);
     let close_rule = format!("{}__close_room", compiled.manifest.feature_id);

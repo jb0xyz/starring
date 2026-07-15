@@ -15,7 +15,6 @@ fn valid_core() -> Value {
         "expected_revision": 0,
         "request_mode": "build",
         "automation_kind": "managed_private_study_room",
-        "objective": "Create private study rooms",
         "requested_outcome": "validated_preview",
         "hub_channel": "community_hub",
         "language": "en",
@@ -52,7 +51,6 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
             "close_policy",
             "expected_revision",
             "language",
-            "objective",
             "custom_detail_facets",
             "request_mode",
             "requested_outcome",
@@ -164,6 +162,44 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
         parse_interpret_intent_core(&value.to_string())
             .unwrap()
             .selected_existing_channel(),
+        Some(&ExistingChannelKey("community_hub".to_string()))
+    );
+
+    value["hub_channel"] = json!("---");
+    assert_eq!(
+        parse_interpret_intent_core(&value.to_string())
+            .unwrap()
+            .selected_existing_channel(),
+        Some(&ExistingChannelKey("---".to_string()))
+    );
+}
+
+#[test]
+fn core_channel_is_derived_only_from_unambiguous_human_grounding() {
+    let mut retained = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+    retained.apply_human_grounded_channel(Some(&ExistingChannelKey("community_hub".to_string())));
+    assert_eq!(
+        retained.selected_existing_channel(),
+        Some(&ExistingChannelKey("community_hub".to_string()))
+    );
+
+    let mut ungrounded = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+    ungrounded.apply_human_grounded_channel(None);
+    assert_eq!(ungrounded.selected_existing_channel(), None);
+
+    let mut mismatched = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+    mismatched.apply_human_grounded_channel(Some(&ExistingChannelKey("general_chat".to_string())));
+    assert_eq!(
+        mismatched.selected_existing_channel(),
+        Some(&ExistingChannelKey("general_chat".to_string()))
+    );
+
+    let mut missing_value = valid_core();
+    missing_value["hub_channel"] = Value::Null;
+    let mut missing = parse_interpret_intent_core(&missing_value.to_string()).unwrap();
+    missing.apply_human_grounded_channel(Some(&ExistingChannelKey("community_hub".to_string())));
+    assert_eq!(
+        missing.selected_existing_channel(),
         Some(&ExistingChannelKey("community_hub".to_string()))
     );
 }
@@ -454,12 +490,12 @@ fn core_parser_enforces_detail_and_text_bounds() {
     );
 
     value = valid_core();
-    value["objective"] = json!("x".repeat(2_049));
+    value["objective"] = json!("Create private study rooms");
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
             .code,
-        "INTENT_TEXT_TOO_LONG"
+        "UNKNOWN_FIELD"
     );
 }
 

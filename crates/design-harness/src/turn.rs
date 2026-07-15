@@ -20,7 +20,7 @@ pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
 };
 pub use intent_core::{
-    interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV3,
+    interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV4,
     IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
 };
 pub use intent_interpretation::{

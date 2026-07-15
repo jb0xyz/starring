@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use crate::intent::{
     compile_intent, CapabilityPolicyIdV2, CapabilityStatusV2, ExistingChannelKey,
     IntentCapabilityIdV2, IntentRequestedOutcome, IntentResolutionContext,
-    IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV1,
+    IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV2,
 };
 use crate::turn::parse_interpret_intent_turn;
 
@@ -86,7 +86,7 @@ fn supported_recipe_gets_one_pinned_consuming_permit() {
     let original_digest = permit.decision().adjudication_digest().to_string();
     let (decision, prepared) = permit.prepare(&context()).unwrap();
     assert_eq!(decision.adjudication_digest(), original_digest);
-    let PreparedIntentWorkspaceV1::Resolved { intent, .. } = prepared else {
+    let PreparedIntentWorkspaceV2::Resolved { intent, .. } = prepared else {
         panic!("expected a resolved recipe");
     };
     let compiled = compile_intent(&intent).unwrap();
@@ -101,7 +101,7 @@ fn any_member_close_lowers_but_creator_only_never_gets_a_recipe_permit() {
     let IntentAdjudicationV2::PrivateStudyRoom(permit) = adjudicate(&any_member) else {
         panic!("expected a private study-room permit");
     };
-    let (_, PreparedIntentWorkspaceV1::Resolved { intent, .. }) =
+    let (_, PreparedIntentWorkspaceV2::Resolved { intent, .. }) =
         permit.prepare(&context()).unwrap()
     else {
         panic!("expected a resolved recipe");
@@ -237,7 +237,7 @@ fn custom_static_build_gets_typed_permit_and_ignores_recipe_overrides() {
         IntentRouteDecisionKindV2::TypedPlanner
     );
     assert!(permit.decision().blockers().is_empty());
-    assert_eq!(permit.objective(), "Create a static feedback flow");
+    assert_eq!(permit.reason(), "Create a static feedback flow");
     assert_eq!(
         permit.requested_outcome(),
         IntentRequestedOutcome::ValidatedPreview
@@ -491,7 +491,7 @@ fn missing_hub_preserves_the_decision_across_deterministic_question_creation() {
     let digest = permit.decision().adjudication_digest().to_string();
     let (decision, prepared) = permit.prepare(&context()).unwrap();
     assert_eq!(decision.adjudication_digest(), digest);
-    let PreparedIntentWorkspaceV1::NeedsInput { decisions, .. } = prepared else {
+    let PreparedIntentWorkspaceV2::NeedsInput { decisions, .. } = prepared else {
         panic!("expected one deterministic hub question");
     };
     assert_eq!(decisions.len(), 1);

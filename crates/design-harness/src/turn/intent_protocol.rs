@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{
     ExistingChannelKey, IntentLocaleV1, IntentRequestedOutcome, PrivateStudyRoomControlsProposalV1,
-    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1,
+    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,
 };
 use crate::tools::ToolDefinition;
 
@@ -23,7 +23,7 @@ pub struct RouteIntentTurnInputV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IntentRouteInputV1 {
     PrivateStudyRoom {
-        proposal: Box<PrivateStudyRoomProposalV1>,
+        proposal: Box<PrivateStudyRoomProposalV2>,
     },
     TypedPlanner {
         reason: String,
@@ -62,8 +62,6 @@ enum PrivateStudyRoomRequestedOutcomeV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PrivateStudyRoomProposalWireV1 {
-    #[schemars(description = "Concise summary of the complete requested automation")]
-    objective: String,
     #[schemars(description = "Exact build result: working_draft or validated_preview")]
     requested_outcome: PrivateStudyRoomRequestedOutcomeV1,
     #[serde(default)]
@@ -124,7 +122,7 @@ pub struct ResolveIntentDecisionInputV1 {
 pub fn route_intent_turn_frontier() -> [ToolDefinition; 1] {
     [definition::<RouteIntentTurnWireV1>(
         ROUTE_INTENT_TURN,
-        "Route this user turn exactly once. Set route to private_study_room and proposal to the user-facing study-room fields for the managed recipe. Summarize the full automation in proposal.objective. Set proposal.requested_outcome to exactly working_draft or validated_preview. Use the top-level discussion route when no build is requested. Otherwise set route to typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields that do not belong to the selected route",
+        "Route this user turn exactly once. Set route to private_study_room and proposal to the exact user-facing study-room fields for the managed recipe. Set proposal.requested_outcome to exactly working_draft or validated_preview. Use the top-level discussion route when no build is requested. Otherwise set route to typed_planner with reason and response, capability_gap with capabilities and response, reject with reason and response, or discussion with response. Omit payload fields that do not belong to the selected route",
     )]
 }
 
@@ -270,10 +268,9 @@ impl RouteIntentTurnWireV1 {
     }
 }
 
-impl From<PrivateStudyRoomProposalWireV1> for PrivateStudyRoomProposalV1 {
+impl From<PrivateStudyRoomProposalWireV1> for PrivateStudyRoomProposalV2 {
     fn from(value: PrivateStudyRoomProposalWireV1) -> Self {
         Self {
-            objective: value.objective,
             requested_outcome: match value.requested_outcome {
                 PrivateStudyRoomRequestedOutcomeV1::WorkingDraft => {
                     IntentRequestedOutcome::WorkingDraft
@@ -389,7 +386,7 @@ mod tests {
     #[test]
     fn route_parser_accepts_every_typed_variant() {
         let private_room = parse_route_intent_turn(
-            r#"{"expected_revision":7,"route":"private_study_room","proposal":{"objective":"Create private study rooms","requested_outcome":"validated_preview"}}"#,
+            r#"{"expected_revision":7,"route":"private_study_room","proposal":{"requested_outcome":"validated_preview"}}"#,
         )
         .unwrap();
         assert_eq!(private_room.expected_revision, 7);
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn route_parser_keeps_the_nested_v1_input_compatible() {
         let parsed = parse_route_intent_turn(
-            r#"{"expected_revision":7,"route":{"kind":"private_study_room","proposal":{"objective":"Create private study rooms","requested_outcome":"validated_preview"}}}"#,
+            r#"{"expected_revision":7,"route":{"kind":"private_study_room","proposal":{"requested_outcome":"validated_preview"}}}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -449,7 +446,7 @@ mod tests {
         for arguments in [
             r#"{"expected_revision":0,"expected_revision":1,"route":"discussion","response":"ok"}"#,
             r#"{"expected_revision":0,"route":"discussion","route":"reject","response":"ok"}"#,
-            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"objective":"room","objective":"other","requested_outcome":"working_draft"}}"#,
+            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"requested_outcome":"working_draft","requested_outcome":"validated_preview"}}"#,
             r#"{"expected_revision":0,"route":{"kind":"discussion","kind":"reject","response":"ok"}}"#,
         ] {
             assert_eq!(
@@ -462,13 +459,13 @@ mod tests {
     #[test]
     fn private_room_discussion_outcome_is_not_a_build_route() {
         let flat = parse_route_intent_turn(
-            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"objective":"compare options","requested_outcome":"discussion"}}"#,
+            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"requested_outcome":"discussion"}}"#,
         )
         .unwrap_err();
         assert_eq!(flat.code, "INVALID_TOOL_ARGUMENTS");
 
         let nested = parse_route_intent_turn(
-            r#"{"expected_revision":0,"route":{"kind":"private_study_room","proposal":{"objective":"compare options","requested_outcome":"discussion"}}}"#,
+            r#"{"expected_revision":0,"route":{"kind":"private_study_room","proposal":{"requested_outcome":"discussion"}}}"#,
         )
         .unwrap_err();
         assert_eq!(nested.code, "INVALID_ROUTE_PAYLOAD");
@@ -490,7 +487,7 @@ mod tests {
         assert_eq!(route.code, "UNKNOWN_FIELD");
 
         let proposal = parse_route_intent_turn(
-            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"objective":"room","requested_outcome":"working_draft","source":"model"}}"#,
+            r#"{"expected_revision":0,"route":"private_study_room","proposal":{"requested_outcome":"working_draft","objective":"model summary"}}"#,
         )
         .unwrap_err();
         assert_eq!(proposal.code, "UNKNOWN_FIELD");

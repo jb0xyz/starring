@@ -35,10 +35,11 @@ use adaptive::simulation_profile_for_current_human_turn;
 use context::compact_text;
 use intent_routing::IntentRecipeRuntime;
 pub use intent_routing::{
-    IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1,
-    IntentRecipeStatusV1, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
-    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV2,
+    IntentRecipeStatusV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3, INTENT_ADJUDICATOR_VERSION_V4,
     INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V4,
 };
 use repair::is_argument_failure;
 use routing::{
@@ -62,7 +63,7 @@ const MAX_INTENT_MEMORY_CHARS: usize = 240;
 const MAX_ERROR_MEMORY_CHARS: usize = 360;
 const MAX_REVIEW_RETRY_ERROR_FIELD_CHARS: usize = 448;
 
-pub const SESSION_SNAPSHOT_VERSION: u32 = 6;
+pub const SESSION_SNAPSHOT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -263,7 +264,7 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub brief_history: Vec<TurnBrief>,
     #[serde(default)]
-    pub(crate) intent_recipe: Option<intent_routing::IntentRecipeSessionSnapshotV1>,
+    pub(crate) intent_recipe: Option<intent_routing::IntentRecipeSessionSnapshotV2>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

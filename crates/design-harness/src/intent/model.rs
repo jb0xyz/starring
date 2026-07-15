@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const INTENT_SCHEMA_VERSION: u16 = 1;
+pub(crate) const INTENT_SCHEMA_VERSION: u16 = 2;
 pub(crate) const PRIVATE_STUDY_ROOM_RECIPE_ID: &str = "starring.private_study_room";
 pub(crate) const PRIVATE_STUDY_ROOM_RECIPE_VERSION: u32 = 1;
 
@@ -22,10 +22,9 @@ impl IntentResolutionContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IntentWorkspaceV1 {
+pub(crate) struct IntentWorkspaceV2 {
     pub schema_version: u16,
     pub revision: u64,
-    pub objective: String,
     pub requested_outcome: IntentRequestedOutcome,
     pub features: Vec<FeatureIntentV1>,
 }
@@ -196,10 +195,9 @@ pub struct RoomNamePatternV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ResolvedIntentV1 {
+pub(crate) struct ResolvedIntentV2 {
     pub schema_version: u16,
     pub revision: u64,
-    pub objective: String,
     pub requested_outcome: IntentRequestedOutcome,
     pub features: Vec<ResolvedFeatureIntentV1>,
 }

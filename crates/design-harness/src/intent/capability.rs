@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
+
+use super::identity::{compatibility_json_digest, IdentityErrorSpec};
 
 pub const INTENT_CAPABILITY_MANIFEST_VERSION_V2: u16 = 1;
 
@@ -250,18 +251,15 @@ pub fn intent_capability_manifest_digest_v2(
     manifest: &CapabilityManifestV2,
 ) -> Result<String, StructuredError> {
     let canonical = canonical_manifest(manifest)?;
-    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
-        capability_error(
+    compatibility_json_digest(
+        CAPABILITY_MANIFEST_DIGEST_DOMAIN_V2,
+        &canonical,
+        IdentityErrorSpec::new(
             "INTENT_CAPABILITY_MANIFEST_SERIALIZATION_FAILED",
             "intent.capability_manifest",
             "The capability manifest could not be serialized deterministically",
-            error.to_string(),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(CAPABILITY_MANIFEST_DIGEST_DOMAIN_V2);
-    hasher.update(bytes);
-    Ok(hex_digest(hasher.finalize()))
+        ),
+    )
 }
 
 pub fn assess_intent_capabilities_v2(
@@ -525,15 +523,6 @@ fn validate_safety_boundaries(
         ));
     }
     Ok(())
-}
-
-fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    let bytes = digest.as_ref();
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 fn capability_error(

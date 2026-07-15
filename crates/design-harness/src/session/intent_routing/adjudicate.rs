@@ -1,19 +1,20 @@
 use std::collections::BTreeSet;
 
 use crate::errors::StructuredError;
+use crate::intent::identity::is_lowercase_sha256_hex;
 use crate::intent::{
     assess_intent_capabilities_v2, intent_capability_manifest_digest_v2,
     intent_capability_manifest_v2, ClosePolicyV1, IntentCapabilityAssessmentV2,
     IntentCapabilityIdV2, IntentCapabilityRequirementV2, IntentLocaleV1, IntentRequestedOutcome,
     IntentRequirementEvidenceV2, IntentResolutionContext, IntentSafetyBoundaryIdV2,
-    IntentSafetyBoundaryRequestV2, PreparedIntentWorkspaceV1, PrivateStudyRoomControlsProposalV1,
-    PrivateStudyRoomProposalV1, PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
+    IntentSafetyBoundaryRequestV2, PreparedIntentWorkspaceV2, PrivateStudyRoomControlsProposalV1,
+    PrivateStudyRoomProposalV2, PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
 };
 #[cfg(test)]
 use crate::turn::IntentInterpretationV2;
 use crate::turn::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
-    IntentCoreInterpretationV3, IntentLocaleHintV2, IntentRecipeDetailFacetV3, IntentRequestModeV2,
+    IntentCoreInterpretationV4, IntentLocaleHintV2, IntentRecipeDetailFacetV3, IntentRequestModeV2,
     PersistenceRequirementV2, PrivateStudyRoomControlsInterpretationV2, PrivateStudyRoomDetailsV1,
     RuntimeRequirementsV2, TimerRequirementV2,
 };
@@ -22,7 +23,7 @@ use crate::turn::{
 use super::decision::INTENT_ADJUDICATOR_VERSION_V2;
 use super::decision::{
     IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionPartsV2,
-    IntentRouteDecisionV2, PinnedIntentRecipeV2, INTENT_ADJUDICATOR_VERSION_V3,
+    IntentRouteDecisionV2, PinnedIntentRecipeV2, INTENT_ADJUDICATOR_VERSION_V4,
 };
 
 mod digest;
@@ -31,7 +32,7 @@ mod response;
 #[cfg(test)]
 use digest::{adjudication_digest_v2, semantic_ir_digest_v2};
 use digest::{
-    adjudication_digest_v3, private_study_room_details_digest_v1, semantic_ir_digest_v3,
+    adjudication_digest_v4, private_study_room_details_digest_v2, semantic_ir_digest_v4,
     AdjudicationDigestInputV2,
 };
 use response::{capability_gap_response, reject_response, typed_planner_response};
@@ -43,18 +44,18 @@ pub(super) enum IntentAdjudicationV2 {
     Terminal(TerminalIntentPermitV2),
 }
 
-pub(super) enum IntentCoreAdjudicationV3 {
-    PrivateStudyRoom(Box<PrivateStudyRoomSelectionV3>),
+pub(super) enum IntentCoreAdjudicationV4 {
+    PrivateStudyRoom(Box<PrivateStudyRoomSelectionV4>),
     TypedPlanner(TypedPlannerPermitV2),
     Terminal(TerminalIntentPermitV2),
 }
 
-pub(super) struct PrivateStudyRoomSelectionV3 {
-    core: IntentCoreInterpretationV3,
+pub(super) struct PrivateStudyRoomSelectionV4 {
+    core: IntentCoreInterpretationV4,
     decision: IntentRouteDecisionV2,
 }
 
-impl PrivateStudyRoomSelectionV3 {
+impl PrivateStudyRoomSelectionV4 {
     pub(super) fn expected_revision(&self) -> u64 {
         self.core.expected_revision()
     }
@@ -67,16 +68,20 @@ impl PrivateStudyRoomSelectionV3 {
         self.core.recipe_detail_facets()
     }
 
-    #[cfg(test)]
     pub(super) fn decision(&self) -> &IntentRouteDecisionV2 {
         &self.decision
     }
 
     pub(super) fn details_digest(
         &self,
+        source_human_turn_digest: &str,
         details: &PrivateStudyRoomDetailsV1,
     ) -> Result<String, StructuredError> {
-        private_study_room_details_digest_v1(self.semantic_ir_digest(), details)
+        private_study_room_details_digest_v2(
+            self.semantic_ir_digest(),
+            source_human_turn_digest,
+            details,
+        )
     }
 
     pub(super) fn finalize(
@@ -84,7 +89,7 @@ impl PrivateStudyRoomSelectionV3 {
         details: Option<PrivateStudyRoomDetailsV1>,
     ) -> Result<PrivateStudyRoomPermitV2, StructuredError> {
         let proposal =
-            private_study_room_proposal_v3(&self.core, details.as_ref(), &self.decision)?;
+            private_study_room_proposal_v4(&self.core, details.as_ref(), &self.decision)?;
         Ok(PrivateStudyRoomPermitV2 {
             proposal,
             decision: self.decision,
@@ -93,7 +98,7 @@ impl PrivateStudyRoomSelectionV3 {
 }
 
 pub(super) struct PrivateStudyRoomPermitV2 {
-    proposal: PrivateStudyRoomProposalV1,
+    proposal: PrivateStudyRoomProposalV2,
     decision: IntentRouteDecisionV2,
 }
 
@@ -106,14 +111,14 @@ impl PrivateStudyRoomPermitV2 {
     pub(super) fn prepare(
         self,
         context: &IntentResolutionContext,
-    ) -> Result<(IntentRouteDecisionV2, PreparedIntentWorkspaceV1), StructuredError> {
+    ) -> Result<(IntentRouteDecisionV2, PreparedIntentWorkspaceV2), StructuredError> {
         let prepared = crate::intent::prepare_private_study_room(self.proposal, context)?;
         Ok((self.decision, prepared))
     }
 }
 
 pub(super) struct TypedPlannerPermitV2 {
-    objective: String,
+    reason: String,
     requested_outcome: IntentRequestedOutcome,
     decision: IntentRouteDecisionV2,
     response: String,
@@ -121,8 +126,8 @@ pub(super) struct TypedPlannerPermitV2 {
 
 impl TypedPlannerPermitV2 {
     #[cfg(test)]
-    pub(super) fn objective(&self) -> &str {
-        &self.objective
+    pub(super) fn reason(&self) -> &str {
+        &self.reason
     }
 
     #[cfg(test)]
@@ -149,7 +154,7 @@ impl TypedPlannerPermitV2 {
         String,
     ) {
         (
-            self.objective,
+            self.reason,
             self.requested_outcome,
             self.decision,
             self.response,
@@ -197,25 +202,26 @@ pub(super) fn adjudicate_intent_v2(
     }
 }
 
-pub(super) fn adjudicate_intent_core_v3(
-    core: IntentCoreInterpretationV3,
-) -> Result<IntentCoreAdjudicationV3, StructuredError> {
-    let semantic_ir_digest = semantic_ir_digest_v3(&core)?;
+pub(super) fn adjudicate_intent_core_v4(
+    core: IntentCoreInterpretationV4,
+    request_evidence_hash: &str,
+) -> Result<IntentCoreAdjudicationV4, StructuredError> {
+    let semantic_ir_digest = semantic_ir_digest_v4(&core)?;
     let adjudication = adjudicate_semantics(
-        SemanticIntentView::from_core(&core),
+        SemanticIntentView::from_core(&core, request_evidence_hash),
         semantic_ir_digest,
-        AdjudicationProtocol::V3,
+        AdjudicationProtocol::V4,
     )?;
     match adjudication {
         SemanticAdjudication::PrivateStudyRoom(decision) => {
-            Ok(IntentCoreAdjudicationV3::PrivateStudyRoom(Box::new(
-                PrivateStudyRoomSelectionV3 { core, decision },
+            Ok(IntentCoreAdjudicationV4::PrivateStudyRoom(Box::new(
+                PrivateStudyRoomSelectionV4 { core, decision },
             )))
         }
         SemanticAdjudication::TypedPlanner(permit) => {
-            Ok(IntentCoreAdjudicationV3::TypedPlanner(permit))
+            Ok(IntentCoreAdjudicationV4::TypedPlanner(permit))
         }
-        SemanticAdjudication::Terminal(permit) => Ok(IntentCoreAdjudicationV3::Terminal(permit)),
+        SemanticAdjudication::Terminal(permit) => Ok(IntentCoreAdjudicationV4::Terminal(permit)),
     }
 }
 
@@ -224,7 +230,8 @@ struct SemanticIntentView<'a> {
     root: &'static str,
     request_mode: IntentRequestModeV2,
     automation_kind: IntentAutomationKindV2,
-    objective: &'a str,
+    typed_planner_reason: Option<&'a str>,
+    request_evidence_hash: Option<&'a str>,
     requested_outcome: IntentRequestedOutcome,
     close_authorization: CloseAuthorizationV2,
     runtime_requirements: &'a RuntimeRequirementsV2,
@@ -241,7 +248,8 @@ impl<'a> SemanticIntentView<'a> {
             root: "intent.interpretation",
             request_mode: interpretation.request_mode(),
             automation_kind: interpretation.automation_kind(),
-            objective: interpretation.objective(),
+            typed_planner_reason: Some(interpretation.objective()),
+            request_evidence_hash: None,
             requested_outcome: interpretation.requested_outcome(),
             close_authorization: interpretation.close_authorization(),
             runtime_requirements: interpretation.runtime_requirements(),
@@ -252,12 +260,13 @@ impl<'a> SemanticIntentView<'a> {
         }
     }
 
-    fn from_core(core: &'a IntentCoreInterpretationV3) -> Self {
+    fn from_core(core: &'a IntentCoreInterpretationV4, request_evidence_hash: &'a str) -> Self {
         Self {
             root: "intent.core",
             request_mode: core.request_mode(),
             automation_kind: core.automation_kind(),
-            objective: core.objective(),
+            typed_planner_reason: None,
+            request_evidence_hash: Some(request_evidence_hash),
             requested_outcome: core.requested_outcome(),
             close_authorization: core.close_authorization(),
             runtime_requirements: core.runtime_requirements(),
@@ -273,7 +282,7 @@ impl<'a> SemanticIntentView<'a> {
 enum AdjudicationProtocol {
     #[cfg(test)]
     V2,
-    V3,
+    V4,
 }
 
 enum SemanticAdjudication {
@@ -307,6 +316,7 @@ fn adjudicate_semantics(
             unclassified_requirements,
             None,
             protocol,
+            input.request_evidence_hash,
         )?;
         return Ok(SemanticAdjudication::Terminal(TerminalIntentPermitV2 {
             decision,
@@ -322,6 +332,7 @@ fn adjudicate_semantics(
             unclassified_requirements,
             None,
             protocol,
+            input.request_evidence_hash,
         )?;
         return Ok(SemanticAdjudication::Terminal(TerminalIntentPermitV2 {
             decision,
@@ -338,6 +349,7 @@ fn adjudicate_semantics(
             unclassified_requirements,
             None,
             protocol,
+            input.request_evidence_hash,
         )?;
         return Ok(SemanticAdjudication::Terminal(TerminalIntentPermitV2 {
             decision,
@@ -358,6 +370,7 @@ fn adjudicate_semantics(
                 unclassified_requirements,
                 Some(route_target),
                 protocol,
+                input.request_evidence_hash,
             )?;
             Ok(SemanticAdjudication::PrivateStudyRoom(decision))
         }
@@ -370,9 +383,13 @@ fn adjudicate_semantics(
                 unclassified_requirements,
                 None,
                 protocol,
+                input.request_evidence_hash,
             )?;
             Ok(SemanticAdjudication::TypedPlanner(TypedPlannerPermitV2 {
-                objective: input.objective.to_string(),
+                reason: input
+                    .typed_planner_reason
+                    .unwrap_or("Supported custom static automation")
+                    .to_string(),
                 requested_outcome: input.requested_outcome,
                 decision,
                 response,
@@ -492,6 +509,7 @@ fn decision_for(
     unclassified_requirements: Vec<String>,
     route_target: Option<PinnedIntentRecipeV2>,
     protocol: AdjudicationProtocol,
+    request_evidence_hash: Option<&str>,
 ) -> Result<IntentRouteDecisionV2, StructuredError> {
     let mut blockers = assessment.blockers;
     blockers.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
@@ -516,13 +534,14 @@ fn decision_for(
     let adjudicator_version = match protocol {
         #[cfg(test)]
         AdjudicationProtocol::V2 => INTENT_ADJUDICATOR_VERSION_V2,
-        AdjudicationProtocol::V3 => INTENT_ADJUDICATOR_VERSION_V3,
+        AdjudicationProtocol::V4 => INTENT_ADJUDICATOR_VERSION_V4,
     };
-    let input = AdjudicationDigestInputV2 {
+    let digest_input = AdjudicationDigestInputV2 {
         decision_source: decision_source.as_str(),
         adjudicator_version,
         kind: kind.as_str(),
         semantic_ir_digest: &semantic_ir_digest,
+        request_evidence_hash,
         manifest_version: assessment.manifest_version,
         manifest_digest: &assessment.manifest_digest,
         blockers: &blockers,
@@ -532,8 +551,8 @@ fn decision_for(
     };
     let adjudication_digest = match protocol {
         #[cfg(test)]
-        AdjudicationProtocol::V2 => adjudication_digest_v2(input),
-        AdjudicationProtocol::V3 => adjudication_digest_v3(input),
+        AdjudicationProtocol::V2 => adjudication_digest_v2(digest_input),
+        AdjudicationProtocol::V4 => adjudication_digest_v4(digest_input),
     }?;
     Ok(IntentRouteDecisionV2::from_parts(
         IntentRouteDecisionPartsV2 {
@@ -541,6 +560,7 @@ fn decision_for(
             decision_source,
             adjudicator_version,
             semantic_ir_digest,
+            request_evidence_hash: request_evidence_hash.map(str::to_string),
             manifest_version: assessment.manifest_version,
             manifest_digest: assessment.manifest_digest,
             adjudication_digest,
@@ -603,10 +623,10 @@ pub(super) fn validate_persisted_private_study_room_decision_v2(
     validate_persisted_private_study_room_decision(decision, AdjudicationProtocol::V2)
 }
 
-pub(super) fn validate_persisted_private_study_room_decision_v3(
+pub(super) fn validate_persisted_private_study_room_decision_v4(
     decision: &IntentRouteDecisionV2,
 ) -> Result<(), StructuredError> {
-    validate_persisted_private_study_room_decision(decision, AdjudicationProtocol::V3)
+    validate_persisted_private_study_room_decision(decision, AdjudicationProtocol::V4)
 }
 
 fn validate_persisted_private_study_room_decision(
@@ -628,16 +648,18 @@ fn validate_persisted_private_study_room_decision(
         decision.adjudication_digest(),
     ]
     .into_iter()
-    .all(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
-    });
+    .all(is_lowercase_sha256_hex);
     let adjudicator_version = match protocol {
         #[cfg(test)]
         AdjudicationProtocol::V2 => INTENT_ADJUDICATOR_VERSION_V2,
-        AdjudicationProtocol::V3 => INTENT_ADJUDICATOR_VERSION_V3,
+        AdjudicationProtocol::V4 => INTENT_ADJUDICATOR_VERSION_V4,
+    };
+    let request_evidence_valid = match protocol {
+        AdjudicationProtocol::V4 => decision
+            .request_evidence_hash()
+            .is_some_and(valid_digest_shape),
+        #[cfg(test)]
+        AdjudicationProtocol::V2 => decision.request_evidence_hash().is_none(),
     };
     if decision.kind() != IntentRouteDecisionKindV2::PrivateStudyRoom
         || decision.decision_source() != IntentDecisionSourceV2::DeterministicIntentAdjudicator
@@ -645,6 +667,7 @@ fn validate_persisted_private_study_room_decision(
         || decision.manifest_version() != manifest.version
         || decision.manifest_digest() != manifest_digest
         || !digests_are_hex
+        || !request_evidence_valid
     {
         return Err(adjudication_error(
             "INVALID_PERSISTED_INTENT_DECISION",
@@ -658,6 +681,7 @@ fn validate_persisted_private_study_room_decision(
         adjudicator_version: decision.adjudicator_version(),
         kind: decision.kind().as_str(),
         semantic_ir_digest: decision.semantic_ir_digest(),
+        request_evidence_hash: decision.request_evidence_hash(),
         manifest_version: decision.manifest_version(),
         manifest_digest: decision.manifest_digest(),
         blockers: decision.blockers(),
@@ -668,7 +692,7 @@ fn validate_persisted_private_study_room_decision(
     let expected_digest = match protocol {
         #[cfg(test)]
         AdjudicationProtocol::V2 => adjudication_digest_v2(input),
-        AdjudicationProtocol::V3 => adjudication_digest_v3(input),
+        AdjudicationProtocol::V4 => adjudication_digest_v4(input),
     }?;
     if decision.adjudication_digest() != expected_digest {
         return Err(adjudication_error(
@@ -684,7 +708,7 @@ fn validate_persisted_private_study_room_decision(
 #[cfg(test)]
 fn private_study_room_proposal(
     interpretation: &IntentInterpretationV2,
-) -> Result<PrivateStudyRoomProposalV1, StructuredError> {
+) -> Result<PrivateStudyRoomProposalV2, StructuredError> {
     let close_policy = match interpretation.close_authorization() {
         CloseAuthorizationV2::NotRequested => None,
         CloseAuthorizationV2::Disabled => Some(ClosePolicyV1::Disabled),
@@ -704,8 +728,7 @@ fn private_study_room_proposal(
         IntentLocaleHintV2::Unspecified => None,
     };
     let controls = interpretation.controls();
-    Ok(PrivateStudyRoomProposalV1 {
-        objective: interpretation.objective().to_string(),
+    Ok(PrivateStudyRoomProposalV2 {
         requested_outcome: interpretation.requested_outcome(),
         hub_channel: interpretation.hub_channel().cloned(),
         locale,
@@ -723,11 +746,11 @@ fn private_study_room_proposal(
     })
 }
 
-fn private_study_room_proposal_v3(
-    core: &IntentCoreInterpretationV3,
+fn private_study_room_proposal_v4(
+    core: &IntentCoreInterpretationV4,
     details: Option<&PrivateStudyRoomDetailsV1>,
     decision: &IntentRouteDecisionV2,
-) -> Result<PrivateStudyRoomProposalV1, StructuredError> {
+) -> Result<PrivateStudyRoomProposalV2, StructuredError> {
     validate_detail_selection(core, details, decision)?;
     let close_policy = close_policy(
         core.close_authorization(),
@@ -744,8 +767,7 @@ fn private_study_room_proposal_v3(
         .map(|value| value.controls().clone())
         .unwrap_or_default();
     validate_close_control_consistency(core.close_authorization(), &controls)?;
-    Ok(PrivateStudyRoomProposalV1 {
-        objective: core.objective().to_string(),
+    Ok(PrivateStudyRoomProposalV2 {
         requested_outcome: core.requested_outcome(),
         hub_channel: core.selected_existing_channel().cloned(),
         locale,
@@ -764,7 +786,7 @@ fn private_study_room_proposal_v3(
 }
 
 fn validate_detail_selection(
-    core: &IntentCoreInterpretationV3,
+    core: &IntentCoreInterpretationV4,
     details: Option<&PrivateStudyRoomDetailsV1>,
     decision: &IntentRouteDecisionV2,
 ) -> Result<(), StructuredError> {
@@ -872,6 +894,10 @@ fn locale(value: IntentLocaleHintV2) -> Option<IntentLocaleV1> {
         IntentLocaleHintV2::Ko => Some(IntentLocaleV1::Ko),
         IntentLocaleHintV2::Unspecified => None,
     }
+}
+
+fn valid_digest_shape(value: &str) -> bool {
+    is_lowercase_sha256_hex(value)
 }
 
 fn adjudication_error(

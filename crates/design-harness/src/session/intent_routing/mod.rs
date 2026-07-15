@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::errors::{StructuredError, ToolResult};
-use crate::llm::{LlmClient, LlmResponse, Message, ToolCall};
+use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
     private_study_room_details_frontier_for, IntentRecipeDetailFacetV3,
     EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
@@ -24,32 +24,37 @@ mod evidence;
 mod evidence_tests;
 mod execute;
 mod frontier;
+mod grounding;
+mod request_evidence;
+mod snapshot_validation;
 mod state;
 mod state_binding;
 #[cfg(test)]
 mod tests;
+mod transcript_restore;
 
-use adjudicate::PrivateStudyRoomSelectionV3;
+use adjudicate::PrivateStudyRoomSelectionV4;
 pub use decision::{
     IntentDecisionSourceV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
-    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3, INTENT_ADJUDICATOR_VERSION_V4,
     INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
+    INTENT_RECIPE_PROTOCOL_VERSION_V4,
 };
-use execute::{IntentCoreExecutionV3, IntentTurnSuccess};
-use frontier::IntentFrontierV3;
+use execute::{IntentCoreExecutionV4, IntentTurnSuccess};
+use frontier::IntentFrontierV4;
 pub(super) use state::IntentRecipeRuntime;
-pub(crate) use state::IntentRecipeSessionSnapshotV1;
+pub(crate) use state::IntentRecipeSessionSnapshotV2;
 use state::{
-    intent_error, snapshot_error, IntentRecipeStageSnapshotV1, INTENT_DETAIL_STATE_PREFIX,
+    intent_error, snapshot_error, IntentRecipeStageSnapshotV2, INTENT_DETAIL_STATE_PREFIX,
     INTENT_HUMAN_PREFIX, INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
     INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3, INTENT_STATE_PREFIX,
 };
 pub(super) use state::{
     validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT, INTENT_RECIPE_SYSTEM_PROMPT_V1,
-    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V4,
 };
 pub use state::{
-    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV1, IntentRecipeStatusV1,
+    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV2, IntentRecipeStatusV2,
 };
 
 #[derive(Serialize)]
@@ -76,6 +81,10 @@ enum IntentToolRequestFailure {
     Error(StructuredError),
     Limit(StructuredError, LimitKind),
 }
+
+const MAX_INTENT_SERVING_HISTORY_TURNS: usize = 4;
+const MAX_INTENT_RESTORED_TRANSCRIPT_CHARS: usize = 4 * 1024 * 1024;
+
 impl<C> DesignSession<C> {
     pub fn with_intent_recipe(client: C, bindings: ResourceBindingMap) -> Self {
         Self::with_intent_recipe_config(client, SessionConfig::default(), bindings)
@@ -99,12 +108,18 @@ impl<C> DesignSession<C> {
         snapshot: SessionSnapshot,
         bindings: ResourceBindingMap,
     ) -> Result<Self, SessionSnapshotError> {
+        validate_intent_restore_transcript_bound(&snapshot)?;
         super::validate_snapshot(&snapshot)?;
         let intent_snapshot = snapshot
             .intent_recipe
             .clone()
             .ok_or_else(|| snapshot_error("snapshot is not an intent recipe session"))?;
-        let runtime = IntentRecipeRuntime::restore(bindings, intent_snapshot)?;
+        let runtime = IntentRecipeRuntime::restore(
+            bindings,
+            intent_snapshot,
+            &snapshot.draft,
+            &snapshot.messages,
+        )?;
         let mut session = Self::build(client, config, false, false, false);
         session.draft = snapshot.draft;
         session.messages = snapshot.messages;
@@ -137,49 +152,58 @@ impl<C> DesignSession<C> {
             .and_then(IntentRecipeRuntime::route_decision)
     }
 
-    pub fn intent_recipe_status(&self) -> Option<IntentRecipeStatusV1> {
+    pub fn intent_recipe_status(&self) -> Option<IntentRecipeStatusV2> {
         let runtime = self.intent_recipe.as_ref()?;
         Some(match &runtime.snapshot.stage {
-            IntentRecipeStageSnapshotV1::Empty => IntentRecipeStatusV1::Empty {
+            IntentRecipeStageSnapshotV2::Empty => IntentRecipeStatusV2::Empty {
                 expected_revision: runtime.expected_revision(self.draft.draft_revision),
             },
-            IntentRecipeStageSnapshotV1::AwaitingDecision {
+            IntentRecipeStageSnapshotV2::AwaitingDecision {
                 root_draft_revision,
                 workspace,
                 active_decision,
                 ..
-            } => IntentRecipeStatusV1::AwaitingDecision {
+            } => IntentRecipeStatusV2::AwaitingDecision {
                 root_draft_revision: *root_draft_revision,
                 workspace_revision: workspace.revision,
                 question: active_decision.question.clone(),
                 available_channel_keys: active_decision.options.clone(),
             },
-            IntentRecipeStageSnapshotV1::PreviewReady {
+            IntentRecipeStageSnapshotV2::PreviewReady {
                 root_draft_revision,
                 workspace,
+                identity_revision,
                 intent_revision,
                 candidate_revision,
-                input_intent_hash,
+                compiler_input_hash,
                 semantic_intent_hash,
                 compiled_plan_hash,
+                candidate_ruleset_hash,
+                candidate_draft_hash,
                 compiled_operations,
+                request_evidence,
                 ..
-            } => IntentRecipeStatusV1::PreviewReady {
+            } => IntentRecipeStatusV2::PreviewReady {
                 root_draft_revision: *root_draft_revision,
                 workspace_revision: workspace.revision,
-                receipt: IntentRecipeReceiptV1 {
+                receipt: IntentRecipeReceiptV2 {
+                    identity_revision: *identity_revision,
                     intent_revision: *intent_revision,
                     candidate_revision: *candidate_revision,
-                    input_intent_hash: input_intent_hash.clone(),
+                    request_evidence_hash: request_evidence.head().to_string(),
+                    request_evidence_entries: request_evidence.entries().len(),
+                    compiler_input_hash: compiler_input_hash.clone(),
                     semantic_intent_hash: semantic_intent_hash.clone(),
                     compiled_plan_hash: compiled_plan_hash.clone(),
+                    candidate_ruleset_hash: candidate_ruleset_hash.clone(),
+                    candidate_draft_hash: candidate_draft_hash.clone(),
                     compiled_operations: *compiled_operations,
                 },
             },
         })
     }
 
-    fn intent_frontier(&self) -> Result<IntentFrontierV3, StructuredError> {
+    fn intent_frontier(&self) -> Result<IntentFrontierV4, StructuredError> {
         self.intent_recipe
             .as_ref()
             .map(IntentRecipeRuntime::frontier)
@@ -203,15 +227,15 @@ impl<C> DesignSession<C> {
             )
         })?;
         let (stage, active_question, active_options) = match &runtime.snapshot.stage {
-            IntentRecipeStageSnapshotV1::Empty => ("empty", None, Vec::new()),
-            IntentRecipeStageSnapshotV1::AwaitingDecision {
+            IntentRecipeStageSnapshotV2::Empty => ("empty", None, Vec::new()),
+            IntentRecipeStageSnapshotV2::AwaitingDecision {
                 active_decision, ..
             } => (
                 "awaiting_decision",
                 Some(active_decision.question.clone()),
                 active_decision.options.clone(),
             ),
-            IntentRecipeStageSnapshotV1::PreviewReady { .. } => ("preview_ready", None, Vec::new()),
+            IntentRecipeStageSnapshotV2::PreviewReady { .. } => ("preview_ready", None, Vec::new()),
         };
         let available_channel_keys = runtime
             .bindings
@@ -244,13 +268,37 @@ impl<C> DesignSession<C> {
         tools: &[crate::tools::ToolDefinition],
         system_prompt: &str,
     ) -> Option<Vec<Message>> {
-        let mut messages = self.messages.clone();
-        let system = messages.first_mut()?;
+        let current_human_message_index = self.current_human_message_index?;
+        let turn_starts = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (message.role == crate::llm::MessageRole::User
+                    && message.tool_call_id.is_none()
+                    && message.tool_calls.is_empty()
+                    && message.content.starts_with(INTENT_HUMAN_PREFIX))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if turn_starts.last().copied() != Some(current_human_message_index) {
+            return None;
+        }
+        let system = self.messages.first()?;
         if system.role != crate::llm::MessageRole::System {
             return None;
         }
-        system.content = system_prompt.to_string();
-        self.fit_intent_messages(messages, tools)
+        let maximum = turn_starts.len().min(MAX_INTENT_SERVING_HISTORY_TURNS);
+        for retained in (1..=maximum).rev() {
+            let start = turn_starts[turn_starts.len().saturating_sub(retained)];
+            let mut messages = Vec::with_capacity(self.messages.len().saturating_sub(start) + 1);
+            messages.push(Message::system(system_prompt));
+            messages.extend_from_slice(&self.messages[start..]);
+            if let Some(messages) = self.fit_intent_messages(messages, tools) {
+                return Some(messages);
+            }
+        }
+        None
     }
 
     fn fit_intent_detail_context(
@@ -282,9 +330,7 @@ impl<C> DesignSession<C> {
         messages: Vec<Message>,
         tools: &[crate::tools::ToolDefinition],
     ) -> Option<Vec<Message>> {
-        let message_chars = serde_json::to_string(&messages).ok()?.len();
-        let tool_chars = serde_json::to_string(tools).ok()?.len();
-        (message_chars.saturating_add(tool_chars) <= self.config.context_char_budget)
+        (intent_openai_context_chars(&messages, tools)? <= self.config.context_char_budget)
             .then_some(messages)
     }
 
@@ -322,7 +368,7 @@ impl<C> DesignSession<C> {
 
     fn intent_detail_state<'a>(
         &self,
-        selection: &'a PrivateStudyRoomSelectionV3,
+        selection: &'a PrivateStudyRoomSelectionV4,
     ) -> Result<(IntentDetailStateAnchorV3<'a>, String), StructuredError> {
         let state = IntentDetailStateAnchorV3 {
             detail_facets: selection.detail_facets(),
@@ -371,6 +417,120 @@ impl<C> DesignSession<C> {
     }
 }
 
+fn intent_openai_context_chars(
+    messages: &[Message],
+    tools: &[crate::tools::ToolDefinition],
+) -> Option<usize> {
+    let messages = messages
+        .iter()
+        .map(intent_openai_message)
+        .collect::<Option<Vec<_>>>()?;
+    let tools_value = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut context = json!({
+        "messages": messages,
+        "tools": tools_value
+    });
+    if let [tool] = tools {
+        context.as_object_mut()?.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": format!("{}_arguments", tool.name),
+                    "strict": true,
+                    "schema": tool.parameters
+                }
+            }),
+        );
+    }
+    serde_json::to_vec(&context).ok().map(|bytes| bytes.len())
+}
+
+fn intent_openai_message(message: &Message) -> Option<serde_json::Value> {
+    let role = match message.role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    };
+    if message.role == MessageRole::Tool && message.tool_call_id.is_none() {
+        return None;
+    }
+    let content = if message.role == MessageRole::Assistant
+        && message.content.is_empty()
+        && !message.tool_calls.is_empty()
+    {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(message.content.clone())
+    };
+    let mut value = json!({
+        "role": role,
+        "content": content
+    });
+    let object = value.as_object_mut()?;
+    if !message.tool_calls.is_empty() {
+        object.insert(
+            "tool_calls".to_string(),
+            serde_json::Value::Array(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        object.insert(
+            "tool_call_id".to_string(),
+            serde_json::Value::String(tool_call_id.clone()),
+        );
+    }
+    Some(value)
+}
+
+fn validate_intent_restore_transcript_bound(
+    snapshot: &SessionSnapshot,
+) -> Result<(), SessionSnapshotError> {
+    if snapshot.intent_recipe.is_none() {
+        return Ok(());
+    }
+    let estimated = snapshot.messages.iter().try_fold(0usize, |total, message| {
+        total
+            .checked_add(message.estimated_chars())
+            .and_then(|value| value.checked_add(96))
+    });
+    if estimated.is_some_and(|value| value <= MAX_INTENT_RESTORED_TRANSCRIPT_CHARS) {
+        Ok(())
+    } else {
+        Err(snapshot_error(
+            "intent recipe transcript exceeds the durable restore size limit",
+        ))
+    }
+}
+
 impl<C: LlmClient> DesignSession<C> {
     pub(super) async fn run_intent_recipe_burst(
         &mut self,
@@ -411,19 +571,24 @@ impl<C: LlmClient> DesignSession<C> {
             Err(failure) => return self.finish_intent_request_failure(failure),
         };
         match frontier {
-            IntentFrontierV3::Resolve => {
-                let result = self.execute_intent_resolution(&call.arguments).await;
+            IntentFrontierV4::Resolve => {
+                let result = self
+                    .execute_intent_resolution(&call.arguments, human_message)
+                    .await;
                 self.finish_intent_tool_execution(call, result)
             }
-            IntentFrontierV3::InterpretCore => {
+            IntentFrontierV4::InterpretCore => {
                 let result = self
                     .execute_intent_core(&call.arguments, human_message)
                     .await;
                 match result {
-                    Ok(IntentCoreExecutionV3::Complete(success)) => {
+                    Ok(IntentCoreExecutionV4::Complete(success)) => {
                         self.finish_intent_tool_execution(call, Ok(*success))
                     }
-                    Ok(IntentCoreExecutionV3::NeedsDetails(selection)) => {
+                    Ok(IntentCoreExecutionV4::NeedsDetails {
+                        selection,
+                        request_evidence,
+                    }) => {
                         let (detail_state, detail_anchor) =
                             match self.intent_detail_state(&selection) {
                                 Ok(state) => state,
@@ -459,6 +624,7 @@ impl<C: LlmClient> DesignSession<C> {
                         let result = self
                             .execute_intent_details(
                                 selection,
+                                request_evidence,
                                 &detail_call.arguments,
                                 human_message,
                             )
@@ -501,7 +667,7 @@ impl<C: LlmClient> DesignSession<C> {
         let system_prompt = match expected_tool {
             EXTRACT_PRIVATE_STUDY_ROOM_DETAILS => INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3,
             crate::turn::RESOLVE_INTENT_DECISION => INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
-            _ => INTENT_RECIPE_SYSTEM_PROMPT_V3,
+            _ => INTENT_RECIPE_SYSTEM_PROMPT,
         };
         let messages = if expected_tool == EXTRACT_PRIVATE_STUDY_ROOM_DETAILS {
             self.fit_intent_detail_context(tools, system_prompt)

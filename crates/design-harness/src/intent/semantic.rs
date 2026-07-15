@@ -1,22 +1,23 @@
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
 
+use super::identity::{canonical_json_digest, IdentityErrorSpec};
 use super::model::{
     ExistingChannelKey, FeatureId, IntentLocaleV1, IntentRequestedOutcome, IntentValue, RecipeRef,
     ResolvedCloseControlV1, ResolvedFeatureConfigurationV1, ResolvedFeatureIntentV1,
-    ResolvedHelpControlV1, ResolvedIntentV1, ResolvedJoinControlV1,
+    ResolvedHelpControlV1, ResolvedIntentV2, ResolvedJoinControlV1,
     ResolvedManagedPrivateRoomControlsV1, ResolvedManagedPrivateRoomCopyV1,
     ResolvedManagedPrivateRoomNamingV1, ResolvedManagedPrivateRoomV1, RoomNamePatternV1,
 };
-use super::normalize::ValidatedIntentV1;
+use super::normalize::ValidatedIntentV2;
+
+const SEMANTIC_INTENT_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.semantic_intent.v2\0";
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct SemanticIntentProjectionV1 {
+struct SemanticIntentProjectionV2 {
     schema_version: u16,
-    objective: String,
     requested_outcome: IntentRequestedOutcome,
     features: Vec<SemanticFeatureProjectionV1>,
 }
@@ -105,35 +106,32 @@ enum SemanticCloseControlProjectionV1 {
     AnyMember { label: String, response: String },
 }
 
-pub(super) fn semantic_intent_hash(intent: &ValidatedIntentV1) -> Result<String, StructuredError> {
-    let projection = project_intent(intent.resolved());
-    let bytes = serde_json::to_vec(&projection).map_err(|error| {
-        StructuredError::new(
+pub(super) fn semantic_intent_hash(intent: &ValidatedIntentV2) -> Result<String, StructuredError> {
+    semantic_resolved_intent_hash(intent.resolved())
+}
+
+fn semantic_resolved_intent_hash(intent: &ResolvedIntentV2) -> Result<String, StructuredError> {
+    let projection = project_intent(intent);
+    canonical_json_digest(
+        SEMANTIC_INTENT_DIGEST_DOMAIN_V2,
+        &projection,
+        IdentityErrorSpec::new(
             "INTENT_COMPILER_SERIALIZATION_FAILED",
             "intent.compiler.semantic_input",
             "The semantic intent projection could not be serialized deterministically",
-            error.to_string(),
-        )
-    })?;
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    Ok(output)
+        ),
+    )
 }
 
-fn project_intent(intent: &ResolvedIntentV1) -> SemanticIntentProjectionV1 {
-    let ResolvedIntentV1 {
+fn project_intent(intent: &ResolvedIntentV2) -> SemanticIntentProjectionV2 {
+    let ResolvedIntentV2 {
         schema_version,
         revision: _,
-        objective,
         requested_outcome,
         features,
     } = intent;
-    SemanticIntentProjectionV1 {
+    SemanticIntentProjectionV2 {
         schema_version: *schema_version,
-        objective: objective.clone(),
         requested_outcome: *requested_outcome,
         features: features.iter().map(project_feature).collect(),
     }
@@ -330,6 +328,68 @@ fn project_close(close: &ResolvedCloseControlV1) -> SemanticCloseControlProjecti
                 label: label_value.clone(),
                 response: response_value.clone(),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intent::{
+        propose_private_study_room, ExistingChannelKey, IntentProposalOutcomeV2,
+        IntentResolutionContext, PrivateStudyRoomControlsProposalV1,
+        PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1,
+        PrivateStudyRoomProposalV2,
+    };
+
+    fn resolved() -> ResolvedIntentV2 {
+        let proposal = PrivateStudyRoomProposalV2 {
+            requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+            hub_channel: Some(ExistingChannelKey("community_hub".to_string())),
+            locale: Some(IntentLocaleV1::En),
+            copy: PrivateStudyRoomCopyProposalV1::default(),
+            naming: PrivateStudyRoomNamingProposalV1::default(),
+            controls: PrivateStudyRoomControlsProposalV1::default(),
+        };
+        let context = IntentResolutionContext::from_channel_bindings([ExistingChannelKey(
+            "community_hub".to_string(),
+        )]);
+        let IntentProposalOutcomeV2::Resolved { intent, .. } =
+            propose_private_study_room(proposal, &context).expect("proposal should resolve")
+        else {
+            panic!("expected resolved intent");
+        };
+        intent.resolved().clone()
+    }
+
+    #[test]
+    fn semantic_projection_binds_outcome_feature_and_recipe_identity_independently() {
+        let baseline = resolved();
+        let baseline_hash = semantic_resolved_intent_hash(&baseline).expect("baseline should hash");
+
+        let mut outcome = baseline.clone();
+        outcome.requested_outcome = IntentRequestedOutcome::WorkingDraft;
+
+        let mut feature = baseline.clone();
+        feature.features[0].feature_id = FeatureId("alternate_feature".to_string());
+
+        let mut recipe_id = baseline.clone();
+        recipe_id.features[0].recipe.id = "starring.alternate".to_string();
+
+        let mut recipe_version = baseline;
+        recipe_version.features[0].recipe.version += 1;
+
+        for (name, variant) in [
+            ("requested_outcome", outcome),
+            ("feature_id", feature),
+            ("recipe_id", recipe_id),
+            ("recipe_version", recipe_version),
+        ] {
+            assert_ne!(
+                baseline_hash,
+                semantic_resolved_intent_hash(&variant).expect("variant should hash"),
+                "{name} was omitted from semantic identity"
+            );
         }
     }
 }

@@ -4,9 +4,9 @@ use serde_json::json;
 use crate::gates::validate_candidate_with_bindings;
 use crate::intent::{
     propose_private_study_room, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
-    IntentProposalOutcomeV1, IntentRequestedOutcome, IntentResolutionContext,
+    IntentProposalOutcomeV2, IntentRequestedOutcome, IntentResolutionContext,
     PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
-    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1,
+    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,
 };
 use crate::turn::{
     execute_plan_atomically_with_bindings, RequestedOutcome, SimulationProfile, TurnBrief,
@@ -15,11 +15,10 @@ use crate::turn::{
 
 use super::*;
 
-fn resolved_intent(hub: &str, close_policy: ClosePolicyV1) -> ValidatedIntentV1 {
+fn resolved_intent(hub: &str, close_policy: ClosePolicyV1) -> ValidatedIntentV2 {
     let context =
         IntentResolutionContext::from_channel_bindings([ExistingChannelKey(hub.to_string())]);
-    let proposal = PrivateStudyRoomProposalV1 {
-        objective: "Create a private study room".to_string(),
+    let proposal = PrivateStudyRoomProposalV2 {
         requested_outcome: IntentRequestedOutcome::ValidatedPreview,
         hub_channel: Some(ExistingChannelKey(hub.to_string())),
         locale: Some(IntentLocaleV1::En),
@@ -33,8 +32,8 @@ fn resolved_intent(hub: &str, close_policy: ClosePolicyV1) -> ValidatedIntentV1 
     let outcome = propose_private_study_room(proposal, &context)
         .expect("private room proposal should normalize");
     match outcome {
-        IntentProposalOutcomeV1::Resolved { intent, .. } => intent,
-        IntentProposalOutcomeV1::NeedsInput { decisions, .. } => {
+        IntentProposalOutcomeV2::Resolved { intent, .. } => intent,
+        IntentProposalOutcomeV2::NeedsInput { decisions, .. } => {
             panic!("unexpected missing decisions: {decisions:?}")
         }
     }
@@ -48,14 +47,10 @@ fn bindings(hub: &str, channel: &str) -> ResourceBindingMap {
     bindings
 }
 
-fn candidate(
-    intent: &ValidatedIntentV1,
-    compiled: &CompiledIntentV1,
-    bindings: &ResourceBindingMap,
-) -> Draft {
+fn candidate(compiled: &CompiledIntentV2, bindings: &ResourceBindingMap) -> Draft {
     let brief = TurnBrief {
         intent: TurnIntent::Build,
-        objective: intent.objective().to_string(),
+        objective: "Build managed private study rooms".to_string(),
         requested_outcome: RequestedOutcome::ValidatedPreview,
         requirements: compiled.requirements.clone(),
         assumptions: vec![],
@@ -83,7 +78,7 @@ fn disabled_close_runs_four_traces_with_an_arbitrary_hub_binding() {
     let intent = resolved_intent("community_rooms", ClosePolicyV1::Disabled);
     let compiled = compile_intent(&intent).expect("intent should compile");
     let bindings = bindings("community_rooms", "902");
-    let mut candidate = candidate(&intent, &compiled, &bindings);
+    let mut candidate = candidate(&compiled, &bindings);
 
     let report = block_on(simulate_compiled_intent(
         &mut candidate,
@@ -108,7 +103,7 @@ fn any_member_close_runs_five_traces_and_exactly_one_teardown() {
     let intent = resolved_intent("study_hub", ClosePolicyV1::AnyMember);
     let compiled = compile_intent(&intent).expect("intent should compile");
     let bindings = bindings("study_hub", "700");
-    let mut candidate = candidate(&intent, &compiled, &bindings);
+    let mut candidate = candidate(&compiled, &bindings);
 
     let report = block_on(simulate_compiled_intent(
         &mut candidate,
@@ -133,7 +128,7 @@ fn simulation_failure_clears_a_previous_simulation_revision() {
     let intent = resolved_intent("study_hub", ClosePolicyV1::Disabled);
     let compiled = compile_intent(&intent).expect("intent should compile");
     let bindings = bindings("study_hub", "700");
-    let mut candidate = candidate(&intent, &compiled, &bindings);
+    let mut candidate = candidate(&compiled, &bindings);
     candidate.simulated_revision = Some(candidate.draft_revision);
     candidate
         .ruleset

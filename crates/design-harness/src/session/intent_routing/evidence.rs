@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
+use crate::intent::identity::{canonical_json_digest, is_lowercase_sha256_hex, IdentityErrorSpec};
 use crate::intent::{
     recipe_descriptor_digest_v1, recipe_registry_digest_v1, RecipeKindV1,
     PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
@@ -10,38 +10,41 @@ use crate::turn::IntentRecipeDetailFacetV3;
 
 use super::state::intent_error;
 
-const DETAIL_REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.detail_request.v1\0";
-const DETAIL_COVERAGE_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.detail_coverage.v1\0";
+const DETAIL_REQUEST_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.detail_request.v2\0";
+const DETAIL_COVERAGE_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.detail_coverage.v2\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum IntentRecipeExtractionModeV3 {
+pub(crate) enum IntentRecipeExtractionModeV4 {
     DeterministicDefault,
     ModelDetail,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct IntentRecipeEvidenceV3 {
+pub(crate) struct IntentRecipeEvidenceV4 {
     core_semantic_digest: String,
+    source_human_turn_digest: String,
     recipe_id: String,
     recipe_version: u32,
     registry_digest: String,
     selected_descriptor_digest: String,
-    extraction_mode: IntentRecipeExtractionModeV3,
+    extraction_mode: IntentRecipeExtractionModeV4,
     detail_facets: Vec<IntentRecipeDetailFacetV3>,
     detail_request_digest: String,
     detail_result_digest: Option<String>,
     detail_coverage_digest: String,
 }
 
-impl IntentRecipeEvidenceV3 {
+impl IntentRecipeEvidenceV4 {
     pub(super) fn deterministic_default(
         core_semantic_digest: &str,
+        source_human_turn_digest: &str,
     ) -> Result<Self, StructuredError> {
         Self::build(
             core_semantic_digest,
-            IntentRecipeExtractionModeV3::DeterministicDefault,
+            source_human_turn_digest,
+            IntentRecipeExtractionModeV4::DeterministicDefault,
             &[],
             None,
         )
@@ -49,12 +52,14 @@ impl IntentRecipeEvidenceV3 {
 
     pub(super) fn model_detail(
         core_semantic_digest: &str,
+        source_human_turn_digest: &str,
         detail_facets: &[IntentRecipeDetailFacetV3],
         detail_result_digest: String,
     ) -> Result<Self, StructuredError> {
         Self::build(
             core_semantic_digest,
-            IntentRecipeExtractionModeV3::ModelDetail,
+            source_human_turn_digest,
+            IntentRecipeExtractionModeV4::ModelDetail,
             detail_facets,
             Some(detail_result_digest),
         )
@@ -64,6 +69,10 @@ impl IntentRecipeEvidenceV3 {
         &self.core_semantic_digest
     }
 
+    pub(super) fn source_human_turn_digest(&self) -> &str {
+        &self.source_human_turn_digest
+    }
+
     pub(super) fn validate(&self) -> Result<(), StructuredError> {
         let canonical_facets = canonical_facets(&self.detail_facets)?;
         let registry_digest = recipe_registry_digest_v1()?;
@@ -71,6 +80,7 @@ impl IntentRecipeEvidenceV3 {
             recipe_descriptor_digest_v1(RecipeKindV1::PrivateStudyRoomV1)?;
         let expected_request_digest = detail_request_digest(
             &self.core_semantic_digest,
+            &self.source_human_turn_digest,
             &self.recipe_id,
             self.recipe_version,
             &canonical_facets,
@@ -81,10 +91,10 @@ impl IntentRecipeEvidenceV3 {
             &canonical_facets,
         )?;
         let valid_mode = match self.extraction_mode {
-            IntentRecipeExtractionModeV3::DeterministicDefault => {
+            IntentRecipeExtractionModeV4::DeterministicDefault => {
                 canonical_facets.is_empty() && self.detail_result_digest.is_none()
             }
-            IntentRecipeExtractionModeV3::ModelDetail => {
+            IntentRecipeExtractionModeV4::ModelDetail => {
                 !canonical_facets.is_empty()
                     && self.detail_result_digest.as_deref().is_some_and(valid_hash)
             }
@@ -97,6 +107,7 @@ impl IntentRecipeEvidenceV3 {
             || self.detail_request_digest != expected_request_digest
             || self.detail_coverage_digest != expected_coverage_digest
             || !valid_hash(&self.core_semantic_digest)
+            || !valid_hash(&self.source_human_turn_digest)
             || !valid_mode
         {
             return Err(intent_error(
@@ -111,7 +122,8 @@ impl IntentRecipeEvidenceV3 {
 
     fn build(
         core_semantic_digest: &str,
-        extraction_mode: IntentRecipeExtractionModeV3,
+        source_human_turn_digest: &str,
+        extraction_mode: IntentRecipeExtractionModeV4,
         detail_facets: &[IntentRecipeDetailFacetV3],
         detail_result_digest: Option<String>,
     ) -> Result<Self, StructuredError> {
@@ -123,6 +135,7 @@ impl IntentRecipeEvidenceV3 {
             recipe_descriptor_digest_v1(RecipeKindV1::PrivateStudyRoomV1)?;
         let detail_request_digest = detail_request_digest(
             core_semantic_digest,
+            source_human_turn_digest,
             &recipe_id,
             recipe_version,
             &detail_facets,
@@ -134,6 +147,7 @@ impl IntentRecipeEvidenceV3 {
         )?;
         let evidence = Self {
             core_semantic_digest: core_semantic_digest.to_string(),
+            source_human_turn_digest: source_human_turn_digest.to_string(),
             recipe_id,
             recipe_version,
             registry_digest,
@@ -175,15 +189,16 @@ fn canonical_facets(
 }
 
 #[derive(Serialize)]
-struct DetailRequestProjectionV1<'a> {
+struct DetailRequestProjectionV2<'a> {
     core_semantic_digest: &'a str,
+    source_human_turn_digest: &'a str,
     recipe_id: &'a str,
     recipe_version: u32,
     detail_facets: &'a [IntentRecipeDetailFacetV3],
 }
 
 #[derive(Serialize)]
-struct DetailCoverageProjectionV1<'a> {
+struct DetailCoverageProjectionV2<'a> {
     detail_request_digest: &'a str,
     detail_result_digest: Option<&'a str>,
     covered_facets: &'a [IntentRecipeDetailFacetV3],
@@ -191,14 +206,16 @@ struct DetailCoverageProjectionV1<'a> {
 
 fn detail_request_digest(
     core_semantic_digest: &str,
+    source_human_turn_digest: &str,
     recipe_id: &str,
     recipe_version: u32,
     detail_facets: &[IntentRecipeDetailFacetV3],
 ) -> Result<String, StructuredError> {
     stable_hash(
-        DETAIL_REQUEST_DIGEST_DOMAIN_V1,
-        &DetailRequestProjectionV1 {
+        DETAIL_REQUEST_DIGEST_DOMAIN_V2,
+        &DetailRequestProjectionV2 {
             core_semantic_digest,
+            source_human_turn_digest,
             recipe_id,
             recipe_version,
             detail_facets,
@@ -213,8 +230,8 @@ fn detail_coverage_digest(
     covered_facets: &[IntentRecipeDetailFacetV3],
 ) -> Result<String, StructuredError> {
     stable_hash(
-        DETAIL_COVERAGE_DIGEST_DOMAIN_V1,
-        &DetailCoverageProjectionV1 {
+        DETAIL_COVERAGE_DIGEST_DOMAIN_V2,
+        &DetailCoverageProjectionV2 {
             detail_request_digest,
             detail_result_digest,
             covered_facets,
@@ -228,23 +245,17 @@ fn stable_hash(
     value: &impl Serialize,
     location: &str,
 ) -> Result<String, StructuredError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        intent_error(
+    canonical_json_digest(
+        domain,
+        value,
+        IdentityErrorSpec::new(
             "INTENT_RECIPE_EVIDENCE_SERIALIZATION_FAILED",
             location,
             "Recipe evidence could not be serialized deterministically",
-            error.to_string(),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+        ),
+    )
 }
 
 fn valid_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    is_lowercase_sha256_hex(value)
 }

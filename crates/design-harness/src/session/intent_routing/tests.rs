@@ -4,20 +4,32 @@ use std::sync::{Arc, Mutex};
 use futures::executor::block_on;
 use serde_json::json;
 
-use crate::intent::{IntentCapabilityIdV2, IntentSafetyBoundaryIdV2};
+use crate::intent::{
+    draft_state_hash, ExistingChannelKey, IntentCapabilityIdV2, IntentResolutionContext,
+    IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV2,
+};
 use crate::llm::{LlmError, LlmResponse};
 use crate::turn::parse_interpret_intent_core;
 use crate::{dispatch_tool, BurstOutcome, LlmClient, Message, ToolCall, ToolDefinition, TurnPhase};
 
-use super::adjudicate::{adjudicate_intent_core_v3, IntentCoreAdjudicationV3};
+use super::adjudicate::{adjudicate_intent_core_v4, IntentCoreAdjudicationV4};
+use super::evidence::IntentRecipeEvidenceV4;
+use super::request_evidence::IntentRequestEvidenceChainV1;
 use super::state::{
     INTENT_HUMAN_PREFIX, INTENT_RECIPE_DECISION_SYSTEM_PROMPT_V3,
     INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V1,
-    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V4,
+};
+use super::state_binding::{
+    awaiting_decision_binding_digest_v4, preview_ready_binding_digest_v4,
+    AwaitingDecisionBindingInputV4, PreviewReadyBindingInputV4,
 };
 use super::*;
 
 type SeenCalls = Vec<(Vec<Message>, Vec<ToolDefinition>)>;
+
+const REQUEST_EVIDENCE_HASH: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 #[derive(Clone)]
 struct ScriptedClient {
@@ -69,27 +81,27 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 }
 
 #[test]
-fn v3_prompt_separates_required_capabilities_from_gate_skips() {
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("other_unmapped_required_capabilities"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("shortest exact phrase from the human text"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+fn v4_prompt_separates_required_capabilities_from_gate_skips_and_display_prose() {
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("other_unmapped_required_capabilities"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("shortest exact phrase from the human text"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("scope-preservation or anti-weakening instructions"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains("validation_gate"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("Redacting, substituting, or exposing content alone is not a gate-skip request"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "expose a secret without redaction and deploy immediately means validation_gate=enforce"
     ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("persistent XP across restarts with durable timers and event-time LLM"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
-        "other_unmapped_required_capabilities=[], validation_gate=enforce, preview_gate=enforce, approval_gate=enforce"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3.contains(
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "external settlement lease means other_unmapped_required_capabilities=[external settlement lease]"
     ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V3
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("Custom Help, Join, or Close labels and their responses map to custom_controls"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("No positive requirement may exist only in response text"));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("belong only in objective"));
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
         .contains("launcher create-button label to copy.create_button_label"));
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
@@ -113,7 +125,6 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "expected_revision": expected_revision,
         "request_mode": "build",
         "automation_kind": "managed_private_study_room",
-        "objective": "Create managed private study rooms",
         "requested_outcome": "validated_preview",
         "hub_channel": hub,
         "language": "en",
@@ -141,7 +152,6 @@ fn private_room(expected_revision: u64, hub: Option<&str>) -> LlmResponse {
 fn custom_static(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, Some("community_hub"));
     value["automation_kind"] = json!("custom_automation");
-    value["objective"] = json!("Create a static feedback automation");
     value["response"] = json!(response);
     interpretation_call("interpret", value)
 }
@@ -157,8 +167,6 @@ fn creator_only(expected_revision: u64, response: &str) -> LlmResponse {
 fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["automation_kind"] = json!("custom_automation");
-    value["objective"] =
-        json!("Create a restart-persistent timed economy game using event-time LLM decisions");
     value["runtime_requirements"] = json!([
         "restart_persistent",
         "durable_timer",
@@ -183,7 +191,6 @@ fn discussion(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["request_mode"] = json!("discussion");
     value["automation_kind"] = json!("none");
-    value["objective"] = json!("Compare durable game designs");
     value["requested_outcome"] = json!("discussion");
     value["runtime_requirements"] = json!([
         "restart_persistent",
@@ -209,8 +216,8 @@ fn private_room_with_copy_details(
     let mut value = private_room_value(expected_revision, hub);
     value["custom_detail_facets"] = json!(["custom_copy"]);
     let core = parse_interpret_intent_core(&value.to_string()).unwrap();
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(_selection) =
-        adjudicate_intent_core_v3(core).unwrap()
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(_selection) =
+        adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap()
     else {
         panic!("expected private study-room selection")
     };
@@ -235,8 +242,8 @@ fn resolve_channel(expected_revision: u64, channel: &str) -> LlmResponse {
     )
 }
 
-fn receipt<C>(session: &DesignSession<C>) -> IntentRecipeReceiptV1 {
-    let Some(IntentRecipeStatusV1::PreviewReady { receipt, .. }) = session.intent_recipe_status()
+fn receipt<C>(session: &DesignSession<C>) -> IntentRecipeReceiptV2 {
+    let Some(IntentRecipeStatusV2::PreviewReady { receipt, .. }) = session.intent_recipe_status()
     else {
         panic!("expected preview receipt")
     };
@@ -252,13 +259,15 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
             DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
 
         assert!(matches!(
-            session.run_burst("Create private study rooms").await,
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
             BurstOutcome::Ready { .. }
         ));
 
         let calls = probe.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
+        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V4);
         assert_eq!(calls[0].1.len(), 1);
         assert_eq!(calls[0].1[0].name, "interpret_intent_core");
         assert!(calls[0]
@@ -299,13 +308,25 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         assert_eq!(session.observability.plan_submissions, 0);
         assert_eq!(session.observability.intent_commits, 1);
         assert!(session.observability.intent_compiled_operations > 20);
-        let snapshot = serde_json::to_value(session.snapshot()).unwrap();
+        let durable_snapshot = session.snapshot();
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            request_evidence, ..
+        } = &durable_snapshot.intent_recipe.as_ref().unwrap().stage
+        else {
+            panic!("expected preview snapshot")
+        };
+        let initial_evidence_head = request_evidence.initial_head().unwrap();
+        let snapshot = serde_json::to_value(durable_snapshot).unwrap();
         assert_eq!(
             snapshot["intent_recipe"]["stage"]["recipe_evidence"]["extraction_mode"],
             "deterministic_default"
         );
         let decision = session.intent_recipe_route_decision().unwrap();
         assert_eq!(decision.kind(), IntentRouteDecisionKindV2::PrivateStudyRoom);
+        assert_eq!(
+            decision.request_evidence_hash(),
+            Some(initial_evidence_head.as_str())
+        );
         assert_eq!(
             decision.decision_source(),
             IntentDecisionSourceV2::DeterministicIntentAdjudicator
@@ -315,6 +336,11 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         let target = decision.route_target().unwrap();
         assert_eq!(target.recipe_id(), "starring.private_study_room");
         assert_eq!(target.recipe_version(), 1);
+        let receipt = receipt(&session);
+        assert_eq!(receipt.identity_revision, 2);
+        assert_eq!(receipt.request_evidence_hash, initial_evidence_head);
+        assert_eq!(receipt.request_evidence_entries, 1);
+        assert_eq!(receipt.candidate_ruleset_hash.len(), 64);
         assert_eq!(session.turn_state().unwrap().phase, TurnPhase::Ready);
         assert_eq!(
             session.draft.validated_revision,
@@ -324,6 +350,161 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
             session.draft.simulated_revision,
             Some(session.draft.draft_revision)
         );
+    });
+}
+
+#[test]
+fn initial_model_channel_guess_becomes_a_missing_decision() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root = session.draft.clone();
+
+        assert!(matches!(
+            session.run_burst("Create private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(session.draft, root);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_commits, 0);
+        let snapshot = session.snapshot();
+        let IntentRecipeStageSnapshotV2::AwaitingDecision {
+            workspace,
+            active_decision,
+            ..
+        } = &snapshot.intent_recipe.as_ref().unwrap().stage
+        else {
+            panic!("expected awaiting decision")
+        };
+        let workspace = serde_json::to_value(workspace).unwrap();
+        assert_eq!(
+            workspace["features"][0]["configuration"]["parameters"]["hub_channel"],
+            serde_json::Value::Null
+        );
+        assert_eq!(active_decision.options, vec!["community_hub"]);
+    });
+}
+
+#[test]
+fn restore_rejects_fully_rehashed_initial_channel_erased_to_awaiting() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session.run_burst("Create private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let human_message_index = snapshot
+            .messages
+            .iter()
+            .position(|message| message.content.starts_with(INTENT_HUMAN_PREFIX))
+            .unwrap();
+        snapshot.messages[human_message_index].content = format!(
+            "{INTENT_HUMAN_PREFIX}{}",
+            json!({"text": "Create private study rooms in community_hub"})
+        );
+        let transcript_message_index = u64::try_from(human_message_index).unwrap();
+        let request_evidence = IntentRequestEvidenceChainV1::from_initial_human(
+            &snapshot.messages,
+            transcript_message_index,
+            0,
+        )
+        .unwrap();
+        let request_evidence_head = request_evidence.initial_head().unwrap();
+        let source_human_turn_digest = request_evidence
+            .initial_human_turn_digest()
+            .unwrap()
+            .to_string();
+        let core = parse_interpret_intent_core(&private_room_value(0, None).to_string()).unwrap();
+        let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) =
+            adjudicate_intent_core_v4(core, &request_evidence_head).unwrap()
+        else {
+            panic!("expected private study-room selection")
+        };
+        let recipe_evidence = IntentRecipeEvidenceV4::deterministic_default(
+            selection.semantic_ir_digest(),
+            &source_human_turn_digest,
+        )
+        .unwrap();
+        let permit = selection.finalize(None).unwrap();
+        let context = IntentResolutionContext::from_channel_bindings([ExistingChannelKey(
+            "community_hub".to_string(),
+        )]);
+        let (route_decision, prepared) = permit.prepare(&context).unwrap();
+        let PreparedIntentWorkspaceV2::NeedsInput {
+            workspace,
+            decisions,
+        } = prepared
+        else {
+            panic!("expected erased channel to require a decision")
+        };
+        let [active_decision] = decisions.as_slice() else {
+            panic!("expected one active decision")
+        };
+        let active_decision = active_decision.clone();
+        let root_draft_revision = snapshot.draft.draft_revision;
+        let root_draft_hash = draft_state_hash(&snapshot.draft).unwrap();
+        let intent = snapshot.intent_recipe.as_mut().unwrap();
+        let decision_binding_digest =
+            awaiting_decision_binding_digest_v4(AwaitingDecisionBindingInputV4 {
+                protocol_version: intent.protocol_version,
+                context_fingerprint: &intent.context_fingerprint,
+                root_draft_revision,
+                root_draft_hash: &root_draft_hash,
+                workspace: &workspace,
+                active_decision: &active_decision,
+                request_evidence: &request_evidence,
+                route_decision: &route_decision,
+                recipe_evidence: &recipe_evidence,
+            })
+            .unwrap();
+        intent.stage = IntentRecipeStageSnapshotV2::AwaitingDecision {
+            root_draft_revision,
+            workspace,
+            active_decision,
+            request_evidence,
+            root_draft_hash,
+            route_decision,
+            recipe_evidence,
+            decision_binding_digest,
+        };
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("fully rehashed erased initial channel restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("does not reproduce from the initial Core arguments"));
+    });
+}
+
+#[test]
+fn explicit_human_channel_fills_a_model_omission_without_clarification() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, None))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert_eq!(session.observability.intent_compile_attempts, 1);
+        assert_eq!(session.observability.intent_commits, 1);
+        assert_eq!(receipt(&session).request_evidence_entries, 1);
     });
 }
 
@@ -338,9 +519,10 @@ fn human_state_prefixes_are_json_enveloped_as_untrusted_text() {
             let probe = client.clone();
             let mut session =
                 DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+            let request = format!("{raw} community_hub");
 
             assert!(matches!(
-                session.run_burst(raw).await,
+                session.run_burst(&request).await,
                 BurstOutcome::Ready { .. }
             ));
 
@@ -351,7 +533,7 @@ fn human_state_prefixes_are_json_enveloped_as_untrusted_text() {
             assert!(!human.starts_with(INTENT_DETAIL_STATE_PREFIX));
             let envelope: serde_json::Value =
                 serde_json::from_str(human.strip_prefix(INTENT_HUMAN_PREFIX).unwrap()).unwrap();
-            assert_eq!(envelope, json!({"text": raw}));
+            assert_eq!(envelope, json!({"text": request}));
         }
     });
 }
@@ -367,14 +549,14 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
 
         assert!(matches!(
             session
-                .run_burst("Create private rooms with a Start exact focus button")
+                .run_burst("Create private rooms in community_hub with a Start exact focus button",)
                 .await,
             BurstOutcome::Ready { .. }
         ));
 
         let calls = probe.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
+        assert_eq!(calls[0].0[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V4);
         assert_eq!(calls[1].0[0].content, INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3);
         assert_eq!(calls[1].0.len(), 3);
         assert!(calls[1].0[1].content.starts_with(INTENT_HUMAN_PREFIX));
@@ -474,7 +656,7 @@ fn ungrounded_recipe_detail_halts_before_digest_compile_or_commit() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Create private rooms with a custom button")
+            .run_burst("Create private rooms in community_hub with a custom button")
             .await
         else {
             panic!("expected ungrounded detail halt")
@@ -518,7 +700,7 @@ fn recipe_detail_cannot_reuse_a_literal_from_an_earlier_human_turn() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Keep the same design but customize its button")
+            .run_burst("Keep the same community_hub design but customize its button")
             .await
         else {
             panic!("expected current-turn grounding halt")
@@ -553,7 +735,7 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
             original_decision.kind(),
             IntentRouteDecisionKindV2::PrivateStudyRoom
         );
-        let Some(IntentRecipeStatusV1::AwaitingDecision {
+        let Some(IntentRecipeStatusV2::AwaitingDecision {
             workspace_revision,
             available_channel_keys,
             ..
@@ -564,10 +746,11 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
         assert_eq!(workspace_revision, 1);
         assert_eq!(available_channel_keys, vec!["community_hub"]);
 
-        assert!(matches!(
-            session.run_burst("Use the community hub").await,
-            BurstOutcome::Ready { .. }
-        ));
+        match session.run_burst("Use community_hub").await {
+            BurstOutcome::Ready { .. } => {}
+            BurstOutcome::Halted(report) => panic!("unexpected halt: {}", report.code),
+            _ => panic!("expected ready resolution"),
+        }
         assert_eq!(probe.calls().len(), 2);
         assert_eq!(
             probe.calls()[1].0[0].content,
@@ -586,6 +769,25 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
         assert_eq!(session.observability.tool_calls, 2);
         assert_eq!(session.observability.clarification_count, 1);
         assert_eq!(session.observability.intent_resolution_acceptances, 1);
+        let snapshot = session.snapshot();
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            request_evidence,
+            route_decision,
+            ..
+        } = &snapshot.intent_recipe.as_ref().unwrap().stage
+        else {
+            panic!("expected preview snapshot")
+        };
+        let initial_head = request_evidence.initial_head().unwrap();
+        assert_eq!(
+            route_decision.request_evidence_hash(),
+            Some(initial_head.as_str())
+        );
+        assert_eq!(request_evidence.accepted_resolution_count(), 1);
+        assert_ne!(request_evidence.head(), initial_head);
+        let receipt = receipt(&session);
+        assert_eq!(receipt.request_evidence_hash, request_evidence.head());
+        assert_eq!(receipt.request_evidence_entries, 2);
     });
 }
 
@@ -597,7 +799,9 @@ fn one_shot_and_resumed_routes_compile_to_the_same_semantics_plan_and_draft() {
             bindings("community_hub", "700"),
         );
         assert!(matches!(
-            one_shot.run_burst("Build it in one turn").await,
+            one_shot
+                .run_burst("Build it in one turn in community_hub")
+                .await,
             BurstOutcome::Ready { .. }
         ));
 
@@ -627,9 +831,19 @@ fn one_shot_and_resumed_routes_compile_to_the_same_semantics_plan_and_draft() {
             one_shot_receipt.compiled_plan_hash,
             resumed_receipt.compiled_plan_hash
         );
+        assert_eq!(
+            one_shot_receipt.candidate_ruleset_hash,
+            resumed_receipt.candidate_ruleset_hash
+        );
         assert_ne!(
-            one_shot_receipt.input_intent_hash,
-            resumed_receipt.input_intent_hash
+            one_shot_receipt.request_evidence_hash,
+            resumed_receipt.request_evidence_hash
+        );
+        assert_eq!(one_shot_receipt.request_evidence_entries, 1);
+        assert_eq!(resumed_receipt.request_evidence_entries, 2);
+        assert_ne!(
+            one_shot_receipt.compiler_input_hash,
+            resumed_receipt.compiler_input_hash
         );
         assert_eq!(one_shot.draft, resumed.draft);
     });
@@ -716,7 +930,7 @@ fn empty_and_preview_ready_snapshots_restore_with_typed_status_and_receipt() {
         .unwrap();
         assert!(matches!(
             empty_restored.intent_recipe_status(),
-            Some(IntentRecipeStatusV1::Empty {
+            Some(IntentRecipeStatusV2::Empty {
                 expected_revision: 0
             })
         ));
@@ -726,7 +940,7 @@ fn empty_and_preview_ready_snapshots_restore_with_typed_status_and_receipt() {
             resource_bindings.clone(),
         );
         assert!(matches!(
-            ready.run_burst("Create rooms").await,
+            ready.run_burst("Create rooms in community_hub").await,
             BurstOutcome::Ready { .. }
         ));
         let expected_draft = ready.draft.clone();
@@ -799,7 +1013,7 @@ fn second_detail_call_failure_preserves_draft_and_durable_stage() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Create private rooms with a custom button")
+            .run_burst("Create private rooms in community_hub with a custom button")
             .await
         else {
             panic!("expected detail failure")
@@ -846,7 +1060,8 @@ fn candidate_conflict_rolls_back_every_compiled_operation() {
         assert!(result.is_ok(), "{}", result.as_json());
         let root = session.draft.clone();
 
-        let BurstOutcome::Halted(report) = session.run_burst("Build rooms").await else {
+        let BurstOutcome::Halted(report) = session.run_burst("Build rooms in community_hub").await
+        else {
             panic!("expected conflict halt")
         };
         assert!(report.code.contains("CONFLICT"), "{}", report.code);
@@ -1159,7 +1374,9 @@ fn preview_ready_starts_the_next_turn_at_the_interpret_frontier() {
         let mut session =
             DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
         assert!(matches!(
-            session.run_burst("Create private rooms").await,
+            session
+                .run_burst("Create private rooms in community_hub")
+                .await,
             BurstOutcome::Ready { .. }
         ));
         let ready_draft = session.draft.clone();
@@ -1192,15 +1409,15 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
         resource_bindings.clone(),
     );
     let current = session.snapshot();
-    assert_eq!(current.messages[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V3);
+    assert_eq!(current.messages[0].content, INTENT_RECIPE_SYSTEM_PROMPT_V4);
     assert_eq!(
         current.intent_recipe.as_ref().unwrap().protocol_version,
-        INTENT_RECIPE_PROTOCOL_VERSION_V3
+        INTENT_RECIPE_PROTOCOL_VERSION_V4
     );
 
     let mut previous = current.clone();
-    previous.messages[0] = Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V2);
-    previous.intent_recipe.as_mut().unwrap().protocol_version = INTENT_RECIPE_PROTOCOL_VERSION_V2;
+    previous.messages[0] = Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V3);
+    previous.intent_recipe.as_mut().unwrap().protocol_version = INTENT_RECIPE_PROTOCOL_VERSION_V3;
     assert!(matches!(
         DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
@@ -1209,8 +1426,8 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
             resource_bindings.clone(),
         ),
         Err(SessionSnapshotError::UnsupportedIntentProtocolVersion {
-            expected: INTENT_RECIPE_PROTOCOL_VERSION_V3,
-            found: INTENT_RECIPE_PROTOCOL_VERSION_V2
+            expected: INTENT_RECIPE_PROTOCOL_VERSION_V4,
+            found: INTENT_RECIPE_PROTOCOL_VERSION_V3
         })
     ));
 
@@ -1226,7 +1443,7 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
     assert!(matches!(
         result,
         Err(SessionSnapshotError::UnsupportedIntentProtocolVersion {
-            expected: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+            expected: INTENT_RECIPE_PROTOCOL_VERSION_V4,
             found: 1
         })
     ));
@@ -1273,57 +1490,27 @@ fn awaiting_and_preview_snapshots_require_a_valid_persisted_route_decision() {
             BurstOutcome::NeedsInput { .. }
         ));
 
-        let mut missing = awaiting.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision { route_decision, .. }) = missing
-            .intent_recipe
-            .as_mut()
-            .map(|intent| &mut intent.stage)
-        else {
-            panic!("expected awaiting snapshot")
-        };
-        *route_decision = None;
-        assert!(matches!(
-            DesignSession::restore_intent_recipe(
-                ScriptedClient::new(Vec::new()),
-                SessionConfig::default(),
-                missing,
-                resource_bindings.clone(),
-            ),
-            Err(SessionSnapshotError::InvalidInvariant { .. })
-        ));
-
-        let mut missing_evidence = awaiting.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision {
-            recipe_evidence, ..
-        }) = missing_evidence
-            .intent_recipe
-            .as_mut()
-            .map(|intent| &mut intent.stage)
-        else {
-            panic!("expected awaiting snapshot")
-        };
-        *recipe_evidence = None;
-        assert!(matches!(
-            DesignSession::restore_intent_recipe(
-                ScriptedClient::new(Vec::new()),
-                SessionConfig::default(),
-                missing_evidence,
-                resource_bindings.clone(),
-            ),
-            Err(SessionSnapshotError::InvalidInvariant { .. })
-        ));
+        let awaiting_value = serde_json::to_value(awaiting.snapshot()).unwrap();
+        for field in ["route_decision", "recipe_evidence", "request_evidence"] {
+            let mut missing = awaiting_value.clone();
+            missing["intent_recipe"]["stage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<SessionSnapshot>(missing).is_err());
+        }
 
         let mut tampered = awaiting.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision { route_decision, .. }) = tampered
+        let Some(IntentRecipeStageSnapshotV2::AwaitingDecision { route_decision, .. }) = tampered
             .intent_recipe
             .as_mut()
             .map(|intent| &mut intent.stage)
         else {
             panic!("expected awaiting snapshot")
         };
-        let mut decision_value = serde_json::to_value(route_decision.as_ref().unwrap()).unwrap();
+        let mut decision_value = serde_json::to_value(&*route_decision).unwrap();
         decision_value["manifest_digest"] = json!("0".repeat(64));
-        *route_decision = Some(serde_json::from_value(decision_value).unwrap());
+        *route_decision = serde_json::from_value(decision_value).unwrap();
         assert!(matches!(
             DesignSession::restore_intent_recipe(
                 ScriptedClient::new(Vec::new()),
@@ -1344,45 +1531,15 @@ fn awaiting_and_preview_snapshots_require_a_valid_persisted_route_decision() {
                 .await,
             BurstOutcome::Ready { .. }
         ));
-        let mut missing = ready.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::PreviewReady { route_decision, .. }) = missing
-            .intent_recipe
-            .as_mut()
-            .map(|intent| &mut intent.stage)
-        else {
-            panic!("expected preview snapshot")
-        };
-        *route_decision = None;
-        assert!(matches!(
-            DesignSession::restore_intent_recipe(
-                ScriptedClient::new(Vec::new()),
-                SessionConfig::default(),
-                missing,
-                resource_bindings.clone(),
-            ),
-            Err(SessionSnapshotError::InvalidInvariant { .. })
-        ));
-
-        let mut missing_evidence = ready.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::PreviewReady {
-            recipe_evidence, ..
-        }) = missing_evidence
-            .intent_recipe
-            .as_mut()
-            .map(|intent| &mut intent.stage)
-        else {
-            panic!("expected preview snapshot")
-        };
-        *recipe_evidence = None;
-        assert!(matches!(
-            DesignSession::restore_intent_recipe(
-                ScriptedClient::new(Vec::new()),
-                SessionConfig::default(),
-                missing_evidence,
-                resource_bindings,
-            ),
-            Err(SessionSnapshotError::InvalidInvariant { .. })
-        ));
+        let ready_value = serde_json::to_value(ready.snapshot()).unwrap();
+        for field in ["route_decision", "recipe_evidence", "request_evidence"] {
+            let mut missing = ready_value.clone();
+            missing["intent_recipe"]["stage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<SessionSnapshot>(missing).is_err());
+        }
     });
 }
 
@@ -1400,7 +1557,7 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         ));
 
         let mut workspace_tampered = awaiting.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision {
+        let Some(IntentRecipeStageSnapshotV2::AwaitingDecision {
             workspace,
             decision_binding_digest,
             ..
@@ -1411,8 +1568,8 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         else {
             panic!("expected awaiting snapshot")
         };
-        assert!(decision_binding_digest.is_some());
-        workspace.objective.push_str(" after tampering");
+        assert_eq!(decision_binding_digest.len(), 64);
+        workspace.revision = workspace.revision.saturating_add(1);
         assert!(matches!(
             DesignSession::restore_intent_recipe(
                 ScriptedClient::new(Vec::new()),
@@ -1423,8 +1580,53 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
             Err(SessionSnapshotError::InvalidInvariant { .. })
         ));
 
+        let mut route_evidence_tampered = awaiting.snapshot();
+        let Some(IntentRecipeStageSnapshotV2::AwaitingDecision { route_decision, .. }) =
+            route_evidence_tampered
+                .intent_recipe
+                .as_mut()
+                .map(|intent| &mut intent.stage)
+        else {
+            panic!("expected awaiting snapshot")
+        };
+        let mut route_value = serde_json::to_value(&*route_decision).unwrap();
+        route_value["request_evidence_hash"] = json!("f".repeat(64));
+        *route_decision = serde_json::from_value(route_value).unwrap();
+        assert!(matches!(
+            DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                route_evidence_tampered,
+                resource_bindings.clone(),
+            ),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut evidence_chain_tampered = awaiting.snapshot();
+        let Some(IntentRecipeStageSnapshotV2::AwaitingDecision {
+            request_evidence, ..
+        }) = evidence_chain_tampered
+            .intent_recipe
+            .as_mut()
+            .map(|intent| &mut intent.stage)
+        else {
+            panic!("expected awaiting snapshot")
+        };
+        let mut evidence_value = serde_json::to_value(&*request_evidence).unwrap();
+        evidence_value["head"] = json!("f".repeat(64));
+        *request_evidence = serde_json::from_value(evidence_value).unwrap();
+        assert!(matches!(
+            DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                evidence_chain_tampered,
+                resource_bindings.clone(),
+            ),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
         let mut active_decision_tampered = awaiting.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::AwaitingDecision {
+        let Some(IntentRecipeStageSnapshotV2::AwaitingDecision {
             active_decision,
             decision_binding_digest,
             ..
@@ -1435,7 +1637,7 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         else {
             panic!("expected awaiting snapshot")
         };
-        assert!(decision_binding_digest.is_some());
+        assert_eq!(decision_binding_digest.len(), 64);
         active_decision.reason.push_str(" after tampering");
         assert!(matches!(
             DesignSession::restore_intent_recipe(
@@ -1459,7 +1661,7 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         ));
 
         let mut receipt_tampered = ready.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::PreviewReady {
+        let Some(IntentRecipeStageSnapshotV2::PreviewReady {
             compiled_operations,
             decision_binding_digest,
             ..
@@ -1470,7 +1672,7 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         else {
             panic!("expected preview snapshot")
         };
-        assert!(decision_binding_digest.is_some());
+        assert_eq!(decision_binding_digest.len(), 64);
         *compiled_operations = compiled_operations.saturating_add(1);
         assert!(matches!(
             DesignSession::restore_intent_recipe(
@@ -1483,7 +1685,7 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         ));
 
         let mut preview_workspace_tampered = ready.snapshot();
-        let Some(IntentRecipeStageSnapshotV1::PreviewReady {
+        let Some(IntentRecipeStageSnapshotV2::PreviewReady {
             workspace,
             decision_binding_digest,
             ..
@@ -1494,8 +1696,8 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
         else {
             panic!("expected preview snapshot")
         };
-        assert!(decision_binding_digest.is_some());
-        workspace.objective.push_str(" after tampering");
+        assert_eq!(decision_binding_digest.len(), 64);
+        workspace.revision = workspace.revision.saturating_add(1);
         assert!(matches!(
             DesignSession::restore_intent_recipe(
                 ScriptedClient::new(Vec::new()),
@@ -1506,4 +1708,492 @@ fn persisted_route_decision_is_bound_to_every_authoritative_stage_field() {
             Err(SessionSnapshotError::InvalidInvariant { .. })
         ));
     });
+}
+
+#[test]
+fn restore_reproduces_awaiting_decisions_and_preview_identities_from_typed_state() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut awaiting = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            awaiting.run_burst("Create private rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        let mut awaiting_snapshot = awaiting.snapshot();
+        let intent = awaiting_snapshot.intent_recipe.as_mut().unwrap();
+        let protocol_version = intent.protocol_version;
+        let context_fingerprint = intent.context_fingerprint.clone();
+        let IntentRecipeStageSnapshotV2::AwaitingDecision {
+            root_draft_revision,
+            workspace,
+            active_decision,
+            request_evidence,
+            root_draft_hash,
+            route_decision,
+            recipe_evidence,
+            decision_binding_digest,
+        } = &mut intent.stage
+        else {
+            panic!("expected awaiting snapshot")
+        };
+        active_decision.question.push_str(" tampered");
+        *decision_binding_digest =
+            awaiting_decision_binding_digest_v4(AwaitingDecisionBindingInputV4 {
+                protocol_version,
+                context_fingerprint: &context_fingerprint,
+                root_draft_revision: *root_draft_revision,
+                root_draft_hash,
+                workspace,
+                active_decision,
+                request_evidence,
+                route_decision,
+                recipe_evidence,
+            })
+            .unwrap();
+        let awaiting_error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            awaiting_snapshot,
+            resource_bindings.clone(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("tampered awaiting state restored"),
+        };
+        assert!(awaiting_error
+            .to_string()
+            .contains("does not reproduce its active decision"));
+
+        let mut ready = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            ready
+                .run_burst("Create private rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut ready_snapshot = ready.snapshot();
+        let intent = ready_snapshot.intent_recipe.as_mut().unwrap();
+        let protocol_version = intent.protocol_version;
+        let context_fingerprint = intent.context_fingerprint.clone();
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            root_draft_revision,
+            workspace,
+            identity_revision,
+            intent_revision,
+            candidate_revision,
+            compiler_input_hash,
+            semantic_intent_hash,
+            compiled_plan_hash,
+            candidate_ruleset_hash,
+            candidate_draft_hash,
+            external_channel_bindings,
+            compiled_operations,
+            request_evidence,
+            route_decision,
+            recipe_evidence,
+            decision_binding_digest,
+        } = &mut intent.stage
+        else {
+            panic!("expected preview snapshot")
+        };
+        *compiler_input_hash = "f".repeat(64);
+        *decision_binding_digest = preview_ready_binding_digest_v4(PreviewReadyBindingInputV4 {
+            protocol_version,
+            context_fingerprint: &context_fingerprint,
+            root_draft_revision: *root_draft_revision,
+            workspace,
+            identity_revision: *identity_revision,
+            intent_revision: *intent_revision,
+            candidate_revision: *candidate_revision,
+            compiler_input_hash,
+            semantic_intent_hash,
+            compiled_plan_hash,
+            candidate_ruleset_hash,
+            candidate_draft_hash,
+            external_channel_bindings,
+            compiled_operations: *compiled_operations,
+            request_evidence,
+            route_decision,
+            recipe_evidence,
+        })
+        .unwrap();
+        let ready_error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            ready_snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("tampered preview state restored"),
+        };
+        assert!(ready_error
+            .to_string()
+            .contains("identities do not reproduce from its typed workspace"));
+    });
+}
+
+#[test]
+fn restore_rejects_unreferenced_messages_system_anchors_and_oversized_transcripts() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let snapshot = session.snapshot();
+        for extra in [
+            Message::user("unreferenced user"),
+            Message::assistant("unreferenced assistant"),
+            Message::tool("unreferenced", json!({"ok": false}).to_string()),
+            Message::system("DRAFT_STATE:{}"),
+        ] {
+            let mut tampered = snapshot.clone();
+            tampered.messages.push(extra);
+            assert!(matches!(
+                DesignSession::restore_intent_recipe(
+                    ScriptedClient::new(Vec::new()),
+                    SessionConfig::default(),
+                    tampered,
+                    resource_bindings.clone(),
+                ),
+                Err(SessionSnapshotError::InvalidInvariant { .. })
+            ));
+        }
+
+        let mut nonfirst_system = snapshot.clone();
+        nonfirst_system
+            .messages
+            .insert(1, Message::system("DRAFT_STATE:{}"));
+        assert!(matches!(
+            DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                nonfirst_system,
+                resource_bindings.clone(),
+            ),
+            Err(SessionSnapshotError::InvalidInvariant { .. })
+        ));
+
+        let mut inflated = snapshot;
+        inflated.messages.push(Message::user(
+            "x".repeat(MAX_INTENT_RESTORED_TRANSCRIPT_CHARS.saturating_add(1)),
+        ));
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            inflated,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("inflated transcript restored"),
+        };
+        assert!(error.to_string().contains("durable restore size limit"));
+    });
+}
+
+#[test]
+fn restore_rejects_rebound_compiled_operation_count_after_full_receipt_rehash() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        snapshot.draft.draft_revision = snapshot.draft.draft_revision.saturating_add(1);
+        snapshot.draft.validated_revision = Some(snapshot.draft.draft_revision);
+        snapshot.draft.simulated_revision = Some(snapshot.draft.draft_revision);
+        if let Some(turn) = snapshot.turn_state.as_mut() {
+            turn.current_revision = snapshot.draft.draft_revision;
+        }
+        let rewritten_draft_hash = draft_state_hash(&snapshot.draft).unwrap();
+        let intent = snapshot.intent_recipe.as_mut().unwrap();
+        let protocol_version = intent.protocol_version;
+        let context_fingerprint = intent.context_fingerprint.clone();
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            root_draft_revision,
+            workspace,
+            identity_revision,
+            intent_revision,
+            candidate_revision,
+            compiler_input_hash,
+            semantic_intent_hash,
+            compiled_plan_hash,
+            candidate_ruleset_hash,
+            candidate_draft_hash,
+            external_channel_bindings,
+            compiled_operations,
+            request_evidence,
+            route_decision,
+            recipe_evidence,
+            decision_binding_digest,
+        } = &mut intent.stage
+        else {
+            panic!("expected preview snapshot")
+        };
+        *candidate_revision = candidate_revision.saturating_add(1);
+        *compiled_operations = compiled_operations.saturating_add(1);
+        *candidate_draft_hash = rewritten_draft_hash;
+        *decision_binding_digest = preview_ready_binding_digest_v4(PreviewReadyBindingInputV4 {
+            protocol_version,
+            context_fingerprint: &context_fingerprint,
+            root_draft_revision: *root_draft_revision,
+            workspace,
+            identity_revision: *identity_revision,
+            intent_revision: *intent_revision,
+            candidate_revision: *candidate_revision,
+            compiler_input_hash,
+            semantic_intent_hash,
+            compiled_plan_hash,
+            candidate_ruleset_hash,
+            candidate_draft_hash,
+            external_channel_bindings,
+            compiled_operations: *compiled_operations,
+            request_evidence,
+            route_decision,
+            recipe_evidence,
+        })
+        .unwrap();
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("rebound operation count restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("identities do not reproduce from its typed workspace"));
+    });
+}
+
+#[test]
+fn restore_preserves_history_and_serves_the_same_bounded_projection() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![
+            Ok(discussion(0, "Let us compare options.")),
+            Ok(private_room(0, Some("community_hub"))),
+        ]);
+        let mut session =
+            DesignSession::with_intent_recipe(client.clone(), resource_bindings.clone());
+        assert!(matches!(
+            session
+                .run_burst("Help me compare game designs that require an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            session
+                .run_burst("Create private rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let expected_receipt = receipt(&session);
+        let original_snapshot = session.snapshot();
+        let restored_client = ScriptedClient::new(vec![Ok(discussion(
+            session.draft.draft_revision,
+            "Let us compare the completed design.",
+        ))]);
+        let mut restored = DesignSession::restore_intent_recipe(
+            restored_client.clone(),
+            SessionConfig::default(),
+            original_snapshot.clone(),
+            resource_bindings.clone(),
+        )
+        .unwrap();
+        assert_eq!(receipt(&restored), expected_receipt);
+        assert_eq!(restored.snapshot().messages, original_snapshot.messages);
+        assert!(restored
+            .snapshot()
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .all(|call| call.arguments != "{}"));
+
+        let followup = "Compare room designs that require an external consensus lease";
+        client.push(Ok(discussion(
+            session.draft.draft_revision,
+            "Let us compare the completed design.",
+        )));
+        assert!(matches!(
+            session.run_burst(followup).await,
+            BurstOutcome::Routed { .. }
+        ));
+        assert!(matches!(
+            restored.run_burst(followup).await,
+            BurstOutcome::Routed { .. }
+        ));
+        let uninterrupted_calls = client.calls();
+        let restored_calls = restored_client.calls();
+        let uninterrupted_messages = &uninterrupted_calls.last().unwrap().0;
+        let restored_messages = &restored_calls.last().unwrap().0;
+        assert_eq!(uninterrupted_messages, restored_messages);
+
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            original_snapshot,
+            resource_bindings,
+        )
+        .expect("the unchanged append-only history should restore again");
+    });
+}
+
+#[test]
+fn restore_rejects_semantically_tampered_core_arguments() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let call = snapshot
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.tool_calls)
+            .find(|call| call.name == "interpret_intent_core")
+            .unwrap();
+        let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        arguments["language"] = json!("ko");
+        call.arguments = arguments.to_string();
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("tampered Core arguments restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("does not reproduce from the initial Core arguments"));
+    });
+}
+
+#[test]
+fn restore_rejects_grounded_but_tampered_detail_arguments() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let (core, details) = private_room_with_copy_details(0, Some("community_hub"));
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(core), Ok(details)]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private rooms in community_hub with launcher label Start exact focus; keep Alternate exact label as another literal",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let call = snapshot
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.tool_calls)
+            .find(|call| call.name == "extract_private_study_room_details")
+            .unwrap();
+        call.arguments = json!({
+            "copy": {"create_button_label": "Alternate exact label"}
+        })
+        .to_string();
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("tampered detail arguments restored"),
+        };
+        assert!(error
+            .to_string()
+            .contains("detail recipe evidence does not reproduce"));
+    });
+}
+
+#[test]
+fn serving_projection_keeps_recent_conversation_without_growing_with_the_snapshot() {
+    block_on(async {
+        let responses = (0..6)
+            .map(|index| Ok(discussion(0, &format!("Comparison {index}"))))
+            .collect();
+        let client = ScriptedClient::new(responses);
+        let mut session =
+            DesignSession::with_intent_recipe(client.clone(), bindings("community_hub", "700"));
+
+        for index in 0..6 {
+            assert!(matches!(
+                session
+                    .run_burst(&format!(
+                        "Comparison turn {index} requires an external consensus lease"
+                    ))
+                    .await,
+                BurstOutcome::Routed { .. }
+            ));
+        }
+
+        let snapshot_humans = session
+            .snapshot()
+            .messages
+            .into_iter()
+            .filter(|message| message.content.starts_with(INTENT_HUMAN_PREFIX))
+            .count();
+        let served_humans = client
+            .calls()
+            .last()
+            .unwrap()
+            .0
+            .iter()
+            .filter(|message| message.content.starts_with(INTENT_HUMAN_PREFIX))
+            .count();
+        assert_eq!(snapshot_humans, 6);
+        assert_eq!(served_humans, MAX_INTENT_SERVING_HISTORY_TURNS);
+    });
+}
+
+#[test]
+fn intent_context_admission_counts_the_response_format_schema_copy() {
+    let tools = crate::interpret_intent_core_frontier();
+    let messages = vec![
+        Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V4),
+        Message::user(r#"INTENT_HUMAN:{"text":"Create private rooms"}"#),
+    ];
+    let legacy_count =
+        serde_json::to_vec(&messages).unwrap().len() + serde_json::to_vec(&tools).unwrap().len();
+    let schema_count = serde_json::to_vec(&tools[0].parameters).unwrap().len();
+    let admitted_count = intent_openai_context_chars(&messages, &tools).unwrap();
+
+    assert!(admitted_count >= legacy_count.saturating_add(schema_count));
 }

@@ -109,10 +109,25 @@ accepted_typed_value
 ```
 
 Human turn digests preserve Unicode, case, and whitespace after only CRLF-to-LF
-normalization, matching the existing literal-grounding boundary. Every entry
+normalization. Capability grounding separately canonicalizes each nonempty
+whitespace run to one ASCII space while preserving Unicode, case, punctuation,
+and token order. Every entry
 references the append-only `INTENT_HUMAN` transcript message that supplied it.
 Restore reparses that envelope, recomputes the turn digest and chain, and rejects
 a missing, reordered, duplicated, or mismatched entry.
+
+An existing-channel answer is grounded deterministically. The exact key and its
+display form with `_` or `-` separators rendered as spaces are equivalent after
+Unicode-aware lowercase tokenization. The answer is accepted only when exactly
+one active option matches; zero matches, multiple named options, and colliding
+display forms fail closed.
+
+The same grounder owns the initial hub selection. Before route hashing, the
+harness replaces the model's hub field with the one uniquely selected available
+key, including when the model omitted or miscopied it. When the human selected
+none or more than one, the field becomes null and the normal missing-decision
+flow applies. Model output can therefore neither invent a binding nor force an
+unnecessary clarification when the human already made an unambiguous choice.
 
 Only accepted decisions advance the chain. A malformed, stale, ungrounded, or
 rejected answer remains in the transcript but does not become authoritative
@@ -127,7 +142,8 @@ same semantic intent, compiled plan, and RuleSet.
 
 ### Route semantic identity
 
-The V4 Core semantic projection contains only closed or exact-grounded fields:
+The V4 Core semantic projection contains only closed or whitespace-canonical
+exact-grounded fields:
 
 ```text
 protocol version
@@ -139,7 +155,7 @@ locale
 close authorization
 runtime requirements
 safety-boundary requests
-exact-grounded unmapped required capabilities
+whitespace-canonical exact-grounded unmapped required capabilities
 selected recipe-detail facets
 ```
 
@@ -238,7 +254,8 @@ The prompt must make these rules explicit:
   detail facets;
 - every additional positive behavior, authorization, lifecycle, runtime, or
   external-effect requirement not represented by a closed field must be copied
-  exactly into `other_unmapped_required_capabilities`;
+  as one contiguous whitespace-canonical phrase into
+  `other_unmapped_required_capabilities`;
 - no positive requirement may exist only in response or presentation prose;
 - safety-boundary requests belong only in the closed boundary fields;
 - recipe identity, objective identity, compiler identity, and hashes are
@@ -318,6 +335,7 @@ compiler_input_hash
 semantic_intent_hash
 compiled_plan_hash
 candidate_ruleset_hash
+candidate_draft_hash
 compiled_operations
 ```
 
@@ -367,10 +385,10 @@ Recipe normalizer revision         2
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
-Capability manifest version        2
+Capability manifest version        1
 SQLite store schema                2
 Intent evaluation input schema     3
-Intent evaluation report schema    4
+Intent evaluation report schema    5
 ```
 
 New domains are:
@@ -477,7 +495,7 @@ or an accidentally omitted semantic field cannot satisfy the suite.
 ## Evaluation contract
 
 The Intent scenario input remains schema 3 because its document shape does not
-change. The Intent report moves to schema 4 and explicitly reports protocol,
+change. The Intent report moves to schema 5 and explicitly reports protocol,
 adjudicator, identity, snapshot, descriptor, and registry versions.
 
 Five exact-objective instructions are removed from the known-recipe prompts.
@@ -521,7 +539,10 @@ The CLI evaluator should capture, without changing the pure `LlmClient` trait:
 - serialized HTTP request bytes;
 - message, tool, and duplicated schema bytes;
 - gateway prompt and completion token usage;
-- model duration and total turn duration.
+- per-attempt outcome, HTTP status, served-model provenance, and client-observed
+  request duration;
+- gateway model duration only when the gateway actually reports it;
+- total turn duration.
 
 This closes the current observability gap where the gateway returns usage but
 Promptfoo reports zero tokens. Context admission must be compared with the real

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
 use crate::turn::{
@@ -13,28 +12,30 @@ use super::catalog::{
     recipe_registry_digest_v1, registered_recipe_kind_v1, RecipeDescriptorV1, RecipeKindV1,
     MAX_COMPILED_REQUIREMENTS,
 };
+use super::identity::{canonical_json_digest, IdentityErrorSpec};
 use super::model::{IntentRequestedOutcome, ResolvedFeatureConfigurationV1};
-use super::normalize::ValidatedIntentV1;
+use super::normalize::ValidatedIntentV2;
 use super::private_study_room::compile_private_study_room;
 use super::provenance::{IntentCoverageV1, ProvenanceBuilder, RequirementProvenanceV1};
 use super::semantic::semantic_intent_hash;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CompiledIntentV1 {
+pub struct CompiledIntentV2 {
     pub requirements: Vec<ScopeRequirement>,
     pub coverage: Vec<IntentCoverageV1>,
     pub requirement_provenance: Vec<RequirementProvenanceV1>,
-    pub manifest: CompilationManifestV1,
+    pub manifest: CompilationManifestV2,
     pub verification: CompilationVerificationV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CompilationManifestV1 {
+pub struct CompilationManifestV2 {
+    pub identity_revision: u16,
     pub compiler_revision: u32,
     pub registry_digest: String,
-    pub input_intent_hash: String,
+    pub compiler_input_hash: String,
     pub semantic_intent_hash: String,
     pub compiled_plan_hash: String,
     pub feature_id: String,
@@ -53,6 +54,11 @@ pub struct CompilationVerificationV1 {
     pub matched_button_handlers: usize,
 }
 
+pub const INTENT_IDENTITY_REVISION: u16 = 2;
+
+const COMPILER_INPUT_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.compiler_input.v2\0";
+const COMPILED_PLAN_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.compiled_plan.v2\0";
+
 pub(super) struct RecipeExpansion {
     pub(super) descriptor: RecipeDescriptorV1,
     pub(super) feature_id: String,
@@ -62,7 +68,7 @@ pub(super) struct RecipeExpansion {
     pub(super) external_channel_bindings: Vec<String>,
 }
 
-pub fn compile_intent(intent: &ValidatedIntentV1) -> Result<CompiledIntentV1, StructuredError> {
+pub fn compile_intent(intent: &ValidatedIntentV2) -> Result<CompiledIntentV2, StructuredError> {
     let resolved = intent.resolved();
     if resolved.requested_outcome == IntentRequestedOutcome::Discussion {
         return Err(compile_error(
@@ -76,8 +82,8 @@ pub fn compile_intent(intent: &ValidatedIntentV1) -> Result<CompiledIntentV1, St
         return Err(compile_error(
             "INTENT_FEATURE_CARDINALITY_INVALID",
             "intent.features",
-            "Intent V1 compilation requires exactly one normalized feature",
-            "Resolve a single-feature Intent V1 before compilation",
+            "Intent V2 compilation requires exactly one normalized feature",
+            "Resolve a single-feature Intent V2 before compilation",
         ));
     };
     let recipe_kind = registered_recipe_kind_v1(&feature.recipe.id, feature.recipe.version)?;
@@ -91,9 +97,9 @@ pub fn compile_intent(intent: &ValidatedIntentV1) -> Result<CompiledIntentV1, St
 }
 
 fn finalize_compilation(
-    intent: &ValidatedIntentV1,
+    intent: &ValidatedIntentV2,
     expansion: RecipeExpansion,
-) -> Result<CompiledIntentV1, StructuredError> {
+) -> Result<CompiledIntentV2, StructuredError> {
     let RecipeExpansion {
         descriptor,
         feature_id,
@@ -149,19 +155,28 @@ fn finalize_compilation(
             "Map every generated requirement to exactly one high-level intent clause",
         ));
     }
-    let manifest = CompilationManifestV1 {
+    let manifest = CompilationManifestV2 {
+        identity_revision: INTENT_IDENTITY_REVISION,
         compiler_revision: descriptor.compiler_revision,
         registry_digest: recipe_registry_digest_v1()?,
-        input_intent_hash: stable_hash(intent, "intent.compiler.input")?,
+        compiler_input_hash: canonical_json_digest(
+            COMPILER_INPUT_DIGEST_DOMAIN_V2,
+            intent,
+            compiler_identity_error("intent.compiler.input"),
+        )?,
         semantic_intent_hash: semantic_intent_hash(intent)?,
-        compiled_plan_hash: stable_hash(&requirements, "intent.compiler.requirements")?,
+        compiled_plan_hash: canonical_json_digest(
+            COMPILED_PLAN_DIGEST_DOMAIN_V2,
+            &requirements,
+            compiler_identity_error("intent.compiler.requirements"),
+        )?,
         feature_id,
         recipe_id: descriptor.id.to_string(),
         recipe_version: descriptor.version,
         generated_objects,
         external_channel_bindings,
     };
-    Ok(CompiledIntentV1 {
+    Ok(CompiledIntentV2 {
         requirements,
         coverage,
         requirement_provenance,
@@ -234,21 +249,12 @@ fn verify_compilation(
     })
 }
 
-fn stable_hash(value: &impl Serialize, location: &str) -> Result<String, StructuredError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        compile_error(
-            "INTENT_COMPILER_SERIALIZATION_FAILED",
-            location,
-            "A deterministic compiler artifact could not be serialized",
-            error.to_string(),
-        )
-    })?;
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    Ok(output)
+fn compiler_identity_error(location: &'static str) -> IdentityErrorSpec<'static> {
+    IdentityErrorSpec::new(
+        "INTENT_COMPILER_SERIALIZATION_FAILED",
+        location,
+        "A deterministic compiler artifact could not be serialized",
+    )
 }
 
 fn compile_error(

@@ -6,6 +6,8 @@ pub const INTENT_ADJUDICATOR_VERSION_V2: u16 = 1;
 pub const INTENT_RECIPE_PROTOCOL_VERSION_V2: u16 = 2;
 pub const INTENT_ADJUDICATOR_VERSION_V3: u16 = 2;
 pub const INTENT_RECIPE_PROTOCOL_VERSION_V3: u16 = 3;
+pub const INTENT_ADJUDICATOR_VERSION_V4: u16 = 3;
+pub const INTENT_RECIPE_PROTOCOL_VERSION_V4: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +76,8 @@ pub struct IntentRouteDecisionV2 {
     decision_source: IntentDecisionSourceV2,
     adjudicator_version: u16,
     semantic_ir_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_evidence_hash: Option<String>,
     manifest_version: u16,
     manifest_digest: String,
     adjudication_digest: String,
@@ -98,6 +102,10 @@ impl IntentRouteDecisionV2 {
 
     pub fn semantic_ir_digest(&self) -> &str {
         &self.semantic_ir_digest
+    }
+
+    pub fn request_evidence_hash(&self) -> Option<&str> {
+        self.request_evidence_hash.as_deref()
     }
 
     pub fn manifest_version(&self) -> u16 {
@@ -134,6 +142,7 @@ impl IntentRouteDecisionV2 {
             decision_source: parts.decision_source,
             adjudicator_version: parts.adjudicator_version,
             semantic_ir_digest: parts.semantic_ir_digest,
+            request_evidence_hash: parts.request_evidence_hash,
             manifest_version: parts.manifest_version,
             manifest_digest: parts.manifest_digest,
             adjudication_digest: parts.adjudication_digest,
@@ -150,6 +159,7 @@ pub(super) struct IntentRouteDecisionPartsV2 {
     pub decision_source: IntentDecisionSourceV2,
     pub adjudicator_version: u16,
     pub semantic_ir_digest: String,
+    pub request_evidence_hash: Option<String>,
     pub manifest_version: u16,
     pub manifest_digest: String,
     pub adjudication_digest: String,

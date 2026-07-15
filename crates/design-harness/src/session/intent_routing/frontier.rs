@@ -4,20 +4,20 @@ use crate::turn::{
     RESOLVE_INTENT_DECISION,
 };
 
-use super::state::IntentRecipeStageSnapshotV1;
+use super::state::IntentRecipeStageSnapshotV2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum IntentFrontierV3 {
+pub(super) enum IntentFrontierV4 {
     InterpretCore,
     Resolve,
 }
 
-impl IntentFrontierV3 {
-    pub(super) fn from_stage(stage: &IntentRecipeStageSnapshotV1) -> Self {
+impl IntentFrontierV4 {
+    pub(super) fn from_stage(stage: &IntentRecipeStageSnapshotV2) -> Self {
         match stage {
-            IntentRecipeStageSnapshotV1::Empty
-            | IntentRecipeStageSnapshotV1::PreviewReady { .. } => Self::InterpretCore,
-            IntentRecipeStageSnapshotV1::AwaitingDecision { .. } => Self::Resolve,
+            IntentRecipeStageSnapshotV2::Empty
+            | IntentRecipeStageSnapshotV2::PreviewReady { .. } => Self::InterpretCore,
+            IntentRecipeStageSnapshotV2::AwaitingDecision { .. } => Self::Resolve,
         }
     }
 

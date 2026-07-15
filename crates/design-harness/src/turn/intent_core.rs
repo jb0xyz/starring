@@ -18,7 +18,6 @@ use super::schema::inline_schema_value;
 
 pub const INTERPRET_INTENT_CORE: &str = "interpret_intent_core";
 
-const MAX_OBJECTIVE_CHARS: usize = 2_048;
 const MAX_RESPONSE_CHARS: usize = 2_000;
 const MAX_UNCLASSIFIED_REQUIREMENTS: usize = 8;
 const MAX_UNCLASSIFIED_REQUIREMENT_CHARS: usize = 160;
@@ -115,12 +114,10 @@ enum RuntimeRequirementV3 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct InterpretIntentCoreWireV3 {
+struct InterpretIntentCoreWireV4 {
     expected_revision: u64,
     request_mode: IntentRequestModeV2,
     automation_kind: IntentAutomationKindV2,
-    #[schemars(length(min = 1, max = 2048))]
-    objective: String,
     requested_outcome: IntentRequestedOutcome,
     #[serde(deserialize_with = "deserialize_required_nullable_channel")]
     #[schemars(required)]
@@ -143,11 +140,10 @@ struct InterpretIntentCoreWireV3 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IntentCoreInterpretationV3 {
+pub struct IntentCoreInterpretationV4 {
     expected_revision: u64,
     request_mode: IntentRequestModeV2,
     automation_kind: IntentAutomationKindV2,
-    objective: String,
     requested_outcome: IntentRequestedOutcome,
     hub_channel: RequiredNullableChannelV3,
     locale: IntentLocaleHintV2,
@@ -159,7 +155,7 @@ pub struct IntentCoreInterpretationV3 {
     response: String,
 }
 
-impl IntentCoreInterpretationV3 {
+impl IntentCoreInterpretationV4 {
     pub fn expected_revision(&self) -> u64 {
         self.expected_revision
     }
@@ -172,16 +168,19 @@ impl IntentCoreInterpretationV3 {
         self.automation_kind
     }
 
-    pub fn objective(&self) -> &str {
-        &self.objective
-    }
-
     pub fn requested_outcome(&self) -> IntentRequestedOutcome {
         self.requested_outcome
     }
 
     pub fn selected_existing_channel(&self) -> Option<&ExistingChannelKey> {
         self.hub_channel.0.as_ref()
+    }
+
+    pub(crate) fn apply_human_grounded_channel(
+        &mut self,
+        grounded_channel: Option<&ExistingChannelKey>,
+    ) {
+        self.hub_channel.0 = grounded_channel.cloned();
     }
 
     pub fn locale(&self) -> IntentLocaleHintV2 {
@@ -238,18 +237,18 @@ pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
         name: INTERPRET_INTENT_CORE.to_string(),
         description: "Classify bounded routing semantics without executing the human request"
             .to_string(),
-        parameters: inline_schema_value::<InterpretIntentCoreWireV3>(),
+        parameters: inline_schema_value::<InterpretIntentCoreWireV4>(),
     }]
 }
 
 pub fn parse_interpret_intent_core(
     arguments: &str,
-) -> Result<IntentCoreInterpretationV3, StructuredError> {
-    let input = serde_json::from_str::<InterpretIntentCoreWireV3>(arguments).map_err(|error| {
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    let input = serde_json::from_str::<InterpretIntentCoreWireV4>(arguments).map_err(|error| {
         translate_tool_arguments_error(
             INTERPRET_INTENT_CORE,
             &error,
-            &inline_schema_value::<InterpretIntentCoreWireV3>(),
+            &inline_schema_value::<InterpretIntentCoreWireV4>(),
         )
     })?;
     normalize_core(input)
@@ -265,16 +264,9 @@ where
 }
 
 fn normalize_core(
-    mut input: InterpretIntentCoreWireV3,
-) -> Result<IntentCoreInterpretationV3, StructuredError> {
+    mut input: InterpretIntentCoreWireV4,
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
     validate_mode_outcome(&input)?;
-    input.objective = normalized_required_text(
-        &input.objective,
-        MAX_OBJECTIVE_CHARS,
-        true,
-        false,
-        "intent.core.objective",
-    )?;
     input.response = normalized_response(&input.response, input.request_mode)?;
     normalize_channel(&mut input.hub_channel)?;
     if input.runtime_requirements.len() > MAX_RUNTIME_REQUIREMENTS {
@@ -341,11 +333,10 @@ fn normalize_core(
     if input.secret_disclosure == SecretDisclosureWireV3::DiscloseSecretValue {
         boundary_requests.insert(IntentBoundaryRequestV2::SecretDisclosure);
     }
-    Ok(IntentCoreInterpretationV3 {
+    Ok(IntentCoreInterpretationV4 {
         expected_revision: input.expected_revision,
         request_mode: input.request_mode,
         automation_kind: input.automation_kind,
-        objective: input.objective,
         requested_outcome: input.requested_outcome,
         hub_channel: input.hub_channel,
         locale: input.language,
@@ -362,7 +353,7 @@ fn normalize_core(
     })
 }
 
-fn validate_mode_outcome(input: &InterpretIntentCoreWireV3) -> Result<(), StructuredError> {
+fn validate_mode_outcome(input: &InterpretIntentCoreWireV4) -> Result<(), StructuredError> {
     if input.request_mode == IntentRequestModeV2::Discussion
         && input.automation_kind != IntentAutomationKindV2::None
     {

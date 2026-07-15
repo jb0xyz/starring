@@ -7,7 +7,7 @@ use crate::turn::AdaptivePhase;
 use super::context::{is_anchor, DraftStateMemory};
 use super::intent_routing::{
     validate_intent_recipe_snapshot, INTENT_RECIPE_SYSTEM_PROMPT_V1,
-    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3,
+    INTENT_RECIPE_SYSTEM_PROMPT_V2, INTENT_RECIPE_SYSTEM_PROMPT_V3, INTENT_RECIPE_SYSTEM_PROMPT_V4,
 };
 use super::repair::{has_matching_repair_directive, is_argument_failure};
 use super::routing::{is_mutation_tool, routed_tool_definitions};
@@ -34,6 +34,7 @@ pub(super) fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), Sessio
                 | INTENT_RECIPE_SYSTEM_PROMPT_V1
                 | INTENT_RECIPE_SYSTEM_PROMPT_V2
                 | INTENT_RECIPE_SYSTEM_PROMPT_V3
+                | INTENT_RECIPE_SYSTEM_PROMPT_V4
         )
     {
         return Err(snapshot_invariant(

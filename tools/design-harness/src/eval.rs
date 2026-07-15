@@ -1,12 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use design_harness::intent::{
+    recipe_descriptor_v1, recipe_registry_digest_v1, RecipeKindV1, INTENT_IDENTITY_REVISION,
+};
 use design_harness::{
-    simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, IntentRecipeStatusV1,
+    simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, IntentRecipeStatusV2,
     IntentRouteDecisionV2, Observability, SessionConfig, ToolFailure, ToolResult,
-    SESSION_SNAPSHOT_VERSION,
+    INTENT_ADJUDICATOR_VERSION_V4, INTENT_RECIPE_PROTOCOL_VERSION_V4, SESSION_SNAPSHOT_VERSION,
 };
 use serde_json::{json, Value};
+
+use crate::client::ModelCallMetric;
 
 pub struct TurnReportInput<'a> {
     pub id: &'a str,
@@ -52,13 +57,15 @@ pub struct IntentTurnReportInput<'a> {
     pub input: &'a str,
     pub before: &'a Draft,
     pub after: &'a Draft,
-    pub status_before: &'a IntentRecipeStatusV1,
-    pub status_after: &'a IntentRecipeStatusV1,
+    pub status_before: &'a IntentRecipeStatusV2,
+    pub status_after: &'a IntentRecipeStatusV2,
     pub observability_before: &'a Observability,
     pub observability_after: &'a Observability,
     pub outcome: &'a BurstOutcome,
     pub route_decision: Option<&'a IntentRouteDecisionV2>,
+    pub burst_elapsed: Duration,
     pub elapsed: Duration,
+    pub model_call_metrics: &'a [ModelCallMetric],
     pub restart_after: bool,
     pub restart_performed: bool,
 }
@@ -86,7 +93,9 @@ pub fn intent_turn_report(input: IntentTurnReportInput<'_>) -> Value {
         "question": outcome.question,
         "halt_code": outcome.halt_code,
         "last_error": outcome.last_error,
+        "burst_elapsed_ms": input.burst_elapsed.as_millis(),
         "elapsed_ms": input.elapsed.as_millis(),
+        "model_call_metrics": input.model_call_metrics,
         "model_calls": model_calls,
         "model_tool_calls": model_tool_calls,
         "deterministic_operations": deterministic_operations,
@@ -136,12 +145,12 @@ pub fn intent_report<C>(
     elapsed: Duration,
     persistence: IntentPersistenceEvidence,
     metadata: IntentReportMetadata<'_>,
-) -> Value {
+) -> Result<Value, design_harness::StructuredError> {
     let draft = session.draft();
     let status = session.intent_recipe_status();
     let receipt = status.as_ref().and_then(|status| match status {
-        IntentRecipeStatusV1::PreviewReady { receipt, .. } => Some(receipt),
-        IntentRecipeStatusV1::Empty { .. } | IntentRecipeStatusV1::AwaitingDecision { .. } => None,
+        IntentRecipeStatusV2::PreviewReady { receipt, .. } => Some(receipt),
+        IntentRecipeStatusV2::Empty { .. } | IntentRecipeStatusV2::AwaitingDecision { .. } => None,
     });
     let final_stage = status.as_ref().map(intent_stage);
     let terminal = turns.last();
@@ -154,17 +163,37 @@ pub fn intent_report<C>(
                 .cloned()
         })
         .unwrap_or_else(|| json!(session.intent_recipe_route_decision()));
-    let served_model = (session.observability().tool_calls > 0).then_some(metadata.requested_model);
-    json!({
-        "schema_version": 3,
+    let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
+    let registry_digest = recipe_registry_digest_v1()?;
+    let model_call_metrics = turns
+        .iter()
+        .filter_map(|turn| turn.get("model_call_metrics").and_then(Value::as_array))
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let served_model = served_model_from_metrics(&model_call_metrics);
+    Ok(json!({
+        "schema_version": 5,
         "input_schema_version": 3,
         "mode": "intent_recipe",
+        "intent_protocol_version": INTENT_RECIPE_PROTOCOL_VERSION_V4,
+        "intent_adjudicator_version": INTENT_ADJUDICATOR_VERSION_V4,
+        "intent_identity_revision": INTENT_IDENTITY_REVISION,
         "requested_model": metadata.requested_model,
         "served_model": served_model,
         "gateway_id": metadata.gateway_id,
         "declared_context_tokens": metadata.declared_context_tokens,
         "context_declaration_source": "evaluation_provider",
         "gateway_context_observed_tokens": Value::Null,
+        "catalog_identity": {
+            "recipe_id": descriptor.id,
+            "recipe_version": descriptor.version,
+            "extractor_revision": descriptor.extractor_revision,
+            "normalizer_revision": descriptor.normalizer_revision,
+            "compiler_revision": descriptor.compiler_revision,
+            "simulator_revision": descriptor.simulator_revision,
+            "registry_digest": registry_digest
+        },
         "provenance": {
             "source_commit": metadata.source_commit,
             "source_dirty": metadata.source_dirty,
@@ -193,6 +222,7 @@ pub fn intent_report<C>(
         "question": terminal.and_then(|turn| turn.get("question")).cloned().unwrap_or(Value::Null),
         "halt_code": terminal.and_then(|turn| turn.get("halt_code")).cloned().unwrap_or(Value::Null),
         "turns": turns,
+        "model_call_metrics": model_call_metrics,
         "draft_revision": draft.draft_revision,
         "ruleset": &draft.ruleset,
         "actual_gates": actual_gates(draft),
@@ -213,7 +243,24 @@ pub fn intent_report<C>(
             "roundtrip_verified": persistence.connection_reopens > 0
         },
         "elapsed_ms": elapsed.as_millis()
-    })
+    }))
+}
+
+fn served_model_from_metrics(metrics: &[Value]) -> Option<String> {
+    let models = metrics
+        .iter()
+        .filter(|metric| {
+            metric
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .is_some_and(|status| (200..300).contains(&status))
+        })
+        .filter_map(|metric| metric.get("served_model").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    (models.len() == 1)
+        .then(|| models.into_iter().next())
+        .flatten()
 }
 
 pub async fn report<C>(
@@ -419,21 +466,21 @@ fn intent_observability_delta(before: &Observability, after: &Observability) -> 
     })
 }
 
-fn intent_stage(status: &IntentRecipeStatusV1) -> &'static str {
+fn intent_stage(status: &IntentRecipeStatusV2) -> &'static str {
     match status {
-        IntentRecipeStatusV1::Empty { .. } => "empty",
-        IntentRecipeStatusV1::AwaitingDecision { .. } => "awaiting_decision",
-        IntentRecipeStatusV1::PreviewReady { .. } => "preview_ready",
+        IntentRecipeStatusV2::Empty { .. } => "empty",
+        IntentRecipeStatusV2::AwaitingDecision { .. } => "awaiting_decision",
+        IntentRecipeStatusV2::PreviewReady { .. } => "preview_ready",
     }
 }
 
-fn intent_revision(status: &IntentRecipeStatusV1) -> u64 {
+fn intent_revision(status: &IntentRecipeStatusV2) -> u64 {
     match status {
-        IntentRecipeStatusV1::Empty { expected_revision } => *expected_revision,
-        IntentRecipeStatusV1::AwaitingDecision {
+        IntentRecipeStatusV2::Empty { expected_revision } => *expected_revision,
+        IntentRecipeStatusV2::AwaitingDecision {
             workspace_revision, ..
         } => *workspace_revision,
-        IntentRecipeStatusV1::PreviewReady { receipt, .. } => receipt.intent_revision,
+        IntentRecipeStatusV2::PreviewReady { receipt, .. } => receipt.intent_revision,
     }
 }
 
@@ -445,15 +492,49 @@ fn failure(result: &ToolResult) -> Option<&ToolFailure> {
 mod tests {
     use std::time::Duration;
 
-    use design_harness::{BurstOutcome, DesignSession, ResourceBindingMap, SessionConfig};
+    use design_harness::{
+        BurstOutcome, DesignSession, IntentRecipeReceiptV2, IntentRecipeStatusV2,
+        ResourceBindingMap, SessionConfig,
+    };
 
     use super::{
-        intent_report, report, turn_report, IntentPersistenceEvidence, IntentReportMetadata,
-        TurnReportInput,
+        intent_report, report, served_model_from_metrics, turn_report, IntentPersistenceEvidence,
+        IntentReportMetadata, TurnReportInput,
     };
 
     #[test]
-    fn intent_report_uses_v3_oracle_free_contract_and_null_model_without_calls() {
+    fn served_model_is_derived_from_successful_http_response_metrics() {
+        let metrics = vec![
+            serde_json::json!({
+                "http_status": null,
+                "served_model": null
+            }),
+            serde_json::json!({
+                "http_status": 200,
+                "served_model": "gemma4:12b-mlx"
+            }),
+        ];
+
+        assert_eq!(
+            served_model_from_metrics(&metrics).as_deref(),
+            Some("gemma4:12b-mlx")
+        );
+
+        let conflicting = vec![
+            serde_json::json!({
+                "http_status": 200,
+                "served_model": "gemma4:12b-mlx"
+            }),
+            serde_json::json!({
+                "http_status": 200,
+                "served_model": "other-model"
+            }),
+        ];
+        assert_eq!(served_model_from_metrics(&conflicting), None);
+    }
+
+    #[test]
+    fn intent_report_uses_v4_oracle_free_contract_and_null_model_without_calls() {
         let session = DesignSession::with_intent_recipe((), ResourceBindingMap::default());
         let session_config = SessionConfig::default();
         let document = intent_report(
@@ -480,11 +561,36 @@ mod tests {
                 requested_model: "gemma4:12b-mlx",
                 session_config: &session_config,
             },
-        );
+        )
+        .unwrap();
 
-        assert_eq!(document["schema_version"], 3);
+        assert_eq!(document["schema_version"], 5);
+        assert_eq!(document["input_schema_version"], 3);
+        assert_eq!(document["intent_protocol_version"], 4);
+        assert_eq!(document["intent_adjudicator_version"], 3);
+        assert_eq!(document["intent_identity_revision"], 2);
         assert_eq!(document["mode"], "intent_recipe");
         assert_eq!(document["served_model"], serde_json::Value::Null);
+        assert_eq!(
+            document["catalog_identity"]["recipe_id"],
+            "starring.private_study_room"
+        );
+        assert_eq!(document["catalog_identity"]["recipe_version"], 1);
+        assert_eq!(document["catalog_identity"]["extractor_revision"], 5);
+        assert_eq!(document["catalog_identity"]["normalizer_revision"], 2);
+        assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
+        assert_eq!(document["catalog_identity"]["simulator_revision"], 1);
+        assert_eq!(
+            document["catalog_identity"]["registry_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(document["model_call_metrics"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(document["oracle"]["enabled"], false);
         assert_eq!(document["oracle"]["injected_control_calls"], 0);
         assert_eq!(document["final_intent"]["status"], "empty");
@@ -496,7 +602,43 @@ mod tests {
         );
         assert!(document["final_intent"]["binding_fingerprint"].is_string());
         assert_eq!(document["persistence"]["connection_reopen_count"], 0);
+        assert_eq!(document["persistence"]["snapshot_schema_version"], 7);
         assert_eq!(document["persistence"]["roundtrip_verified"], false);
+    }
+
+    #[test]
+    fn v4_public_status_serializes_complete_identity_receipt() {
+        let status = IntentRecipeStatusV2::PreviewReady {
+            root_draft_revision: 0,
+            workspace_revision: 1,
+            receipt: IntentRecipeReceiptV2 {
+                identity_revision: 2,
+                intent_revision: 1,
+                candidate_revision: 22,
+                request_evidence_hash: "a".repeat(64),
+                request_evidence_entries: 1,
+                compiler_input_hash: "b".repeat(64),
+                semantic_intent_hash: "c".repeat(64),
+                compiled_plan_hash: "d".repeat(64),
+                candidate_ruleset_hash: "e".repeat(64),
+                candidate_draft_hash: "f".repeat(64),
+                compiled_operations: 22,
+            },
+        };
+        let value = serde_json::to_value(status).unwrap();
+
+        assert_eq!(value["status"], "preview_ready");
+        assert_eq!(value["root_draft_revision"], 0);
+        assert_eq!(value["workspace_revision"], 1);
+        assert_eq!(value["receipt"]["identity_revision"], 2);
+        assert_eq!(value["receipt"]["request_evidence_entries"], 1);
+        assert!(value["receipt"]["request_evidence_hash"].is_string());
+        assert!(value["receipt"]["compiler_input_hash"].is_string());
+        assert!(value["receipt"]["semantic_intent_hash"].is_string());
+        assert!(value["receipt"]["compiled_plan_hash"].is_string());
+        assert!(value["receipt"]["candidate_ruleset_hash"].is_string());
+        assert!(value["receipt"]["candidate_draft_hash"].is_string());
+        assert!(value["receipt"].get("input_intent_hash").is_none());
     }
 
     #[tokio::test]

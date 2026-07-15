@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use design_harness::{
     parse_turn_brief, BurstOutcome, DesignSession, Draft, DraftSummary, HaltReport,
-    IntentRecipeStatusV1, LimitKind, LlmClient, LlmError, LlmResponse, Message, Observability,
+    IntentRecipeStatusV2, LimitKind, LlmClient, LlmError, LlmResponse, Message, Observability,
     ResourceBindingMap, SessionConfig, SessionSnapshot, SessionSnapshotError, StructuredError,
     ToolCall, ToolDefinition, TurnIntent,
 };
@@ -22,7 +22,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::client::GemmaClient;
+use crate::client::{GemmaClient, ModelCallMetric};
 use crate::config::{
     intent_bindings_from_env, EdgeConfig, HarnessMode, PersistenceConfig, SERVING_MODEL,
 };
@@ -30,6 +30,16 @@ use crate::store::{SessionStore, StoreError};
 
 const BUILD_SOURCE_COMMIT: &str = env!("STARRING_BUILD_SOURCE_COMMIT");
 const BUILD_SOURCE_DIRTY: &str = env!("STARRING_BUILD_SOURCE_DIRTY");
+
+trait IntentMetricsSource {
+    fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError>;
+}
+
+impl IntentMetricsSource for GemmaClient {
+    fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
+        GemmaClient::model_call_metrics(self)
+    }
+}
 
 fn create_interactive_session<C>(
     client: C,
@@ -269,7 +279,7 @@ async fn execute_intent_eval<C>(
     provenance: IntentEvalProvenance,
 ) -> Result<Value, Box<dyn Error>>
 where
-    C: LlmClient + Clone,
+    C: LlmClient + Clone + IntentMetricsSource,
 {
     if scenario.schema_version != 3 || scenario.mode != EvalMode::IntentRecipe {
         return Err(
@@ -301,9 +311,11 @@ where
         let draft_before = session.draft().clone();
         let observability_before = session.observability().clone();
         let status_before = required_intent_status(&session)?;
+        let model_call_metrics_before = client.model_call_metrics()?.len();
         let turn_started = Instant::now();
+        let burst_started = Instant::now();
         let outcome = session.run_burst(&turn.input).await;
-        let elapsed = turn_started.elapsed();
+        let burst_elapsed = burst_started.elapsed();
         let status_after = required_intent_status(&session)?;
         let route_decision = match &outcome {
             BurstOutcome::Routed { decision, .. } => Some(decision.as_ref().clone()),
@@ -338,6 +350,11 @@ where
         } else {
             false
         };
+        let model_call_metrics = client.model_call_metrics()?;
+        let model_call_metrics = model_call_metrics
+            .get(model_call_metrics_before..)
+            .ok_or("intent evaluation model call metrics regressed")?;
+        let elapsed = turn_started.elapsed();
         reports.push(eval::intent_turn_report(eval::IntentTurnReportInput {
             id: &turn.id,
             input: &turn.input,
@@ -349,7 +366,9 @@ where
             observability_after: session.observability(),
             outcome: &outcome,
             route_decision: route_decision.as_ref(),
+            burst_elapsed,
             elapsed,
+            model_call_metrics,
             restart_after: turn.restart_after,
             restart_performed,
         }));
@@ -358,7 +377,7 @@ where
         }
     }
     let ended_at_unix_ms = unix_timestamp_millis()?;
-    Ok(eval::intent_report(
+    eval::intent_report(
         &session,
         reports,
         started.elapsed(),
@@ -382,7 +401,14 @@ where
             requested_model: SERVING_MODEL,
             session_config: &config,
         },
-    ))
+    )
+    .map_err(|error| {
+        format!(
+            "intent evaluation catalog identity failed: {} at {}",
+            error.code, error.location
+        )
+        .into()
+    })
 }
 
 struct EvalStoreCleanup {
@@ -423,7 +449,7 @@ fn intent_eval_store_path(
 
 fn required_intent_status<C>(
     session: &DesignSession<C>,
-) -> Result<IntentRecipeStatusV1, Box<dyn Error>> {
+) -> Result<IntentRecipeStatusV2, Box<dyn Error>> {
     session
         .intent_recipe_status()
         .ok_or_else(|| "intent recipe evaluation session lost its public status".into())
@@ -1132,11 +1158,14 @@ mod tests {
     };
     use serde_json::json;
 
+    use crate::client::ModelCallOutcome;
+    use crate::config::SERVING_MODEL;
+
     use super::{
         clear_oracle_controls, create_interactive_session, delegated_model_calls,
         execute_intent_eval, injected_control_calls, intent_eval_provenance_from, parse_eval_input,
         prepare_oracle_controls, verify_intent_eval_artifact, EvalClient, EvalMode, HarnessMode,
-        IntentEvalProvenance, OracleState,
+        IntentEvalProvenance, IntentMetricsSource, ModelCallMetric, OracleState,
     };
 
     struct StubClient;
@@ -1156,6 +1185,7 @@ mod tests {
     struct IntentEvalClient {
         responses: Arc<Mutex<VecDeque<LlmResponse>>>,
         calls: Arc<Mutex<IntentEvalCalls>>,
+        metrics: Arc<Mutex<Vec<ModelCallMetric>>>,
     }
 
     impl LlmClient for StubClient {
@@ -1171,20 +1201,79 @@ mod tests {
     impl LlmClient for IntentEvalClient {
         async fn complete(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             tools: &[ToolDefinition],
         ) -> Result<LlmResponse, LlmError> {
+            let tool_names = tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
             self.calls
                 .lock()
                 .map_err(|_| LlmError::Client("intent eval call log is unavailable".to_string()))?
-                .push(tools.iter().map(|tool| tool.name.clone()).collect());
-            self.responses
+                .push(tool_names.clone());
+            let response = self
+                .responses
                 .lock()
                 .map_err(|_| {
                     LlmError::Client("intent eval response queue is unavailable".to_string())
                 })?
                 .pop_front()
-                .ok_or_else(|| LlmError::Client("intent eval response queue is empty".to_string()))
+                .ok_or_else(|| {
+                    LlmError::Client("intent eval response queue is empty".to_string())
+                })?;
+            let mut metrics = self
+                .metrics
+                .lock()
+                .map_err(|_| LlmError::Client("intent eval metrics are unavailable".to_string()))?;
+            let call_sequence = u64::try_from(metrics.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            metrics.push(ModelCallMetric {
+                call_sequence,
+                attempt: 1,
+                frontier_name: match tool_names.as_slice() {
+                    [name] => name.clone(),
+                    [] => "no_tool_frontier".to_string(),
+                    _ => "multi_tool_frontier".to_string(),
+                },
+                outcome: ModelCallOutcome::Succeeded,
+                http_status: Some(200),
+                served_model: Some(SERVING_MODEL.to_string()),
+                request_body_bytes: messages
+                    .iter()
+                    .map(Message::estimated_chars)
+                    .sum::<usize>()
+                    .saturating_add(
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.len() + tool.description.len())
+                            .sum::<usize>(),
+                    ),
+                message_bytes: messages.iter().map(Message::estimated_chars).sum(),
+                tool_bytes: tools
+                    .iter()
+                    .map(|tool| tool.name.len() + tool.description.len())
+                    .sum(),
+                duplicated_schema_bytes: tools
+                    .first()
+                    .filter(|_| tools.len() == 1)
+                    .map_or(0, |tool| tool.parameters.to_string().len()),
+                prompt_tokens: Some(100),
+                completion_tokens: Some(10),
+                request_duration_ms: 1,
+                gateway_model_duration_ms: None,
+            });
+            Ok(response)
+        }
+    }
+
+    impl IntentMetricsSource for IntentEvalClient {
+        fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
+            self.metrics
+                .lock()
+                .map(|metrics| metrics.clone())
+                .map_err(|_| LlmError::Client("intent eval metrics are unavailable".to_string()))
         }
     }
 
@@ -1712,7 +1801,6 @@ mod tests {
                     "expected_revision": 0,
                     "request_mode": "build",
                     "automation_kind": "managed_private_study_room",
-                    "objective": "Create managed private study rooms",
                     "requested_outcome": "validated_preview",
                     "hub_channel": null,
                     "language": "en",
@@ -1742,6 +1830,7 @@ mod tests {
         let client = IntentEvalClient {
             responses: Arc::new(Mutex::new(responses)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(Mutex::new(Vec::new())),
         };
         let probe = client.clone();
         let scenario = parse_eval_input(
@@ -1773,12 +1862,28 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(document["schema_version"], 3);
+        assert_eq!(document["schema_version"], 5);
         assert_eq!(document["mode"], "intent_recipe");
         assert_eq!(document["requested_model"], "gemma4:12b-mlx");
         assert_eq!(document["served_model"], "gemma4:12b-mlx");
         assert_eq!(document["declared_context_tokens"], 16_384);
         assert!(document["gateway_context_observed_tokens"].is_null());
+        assert_eq!(
+            document["catalog_identity"]["recipe_id"],
+            "starring.private_study_room"
+        );
+        assert_eq!(document["catalog_identity"]["recipe_version"], 1);
+        assert_eq!(document["catalog_identity"]["extractor_revision"], 5);
+        assert_eq!(document["catalog_identity"]["normalizer_revision"], 2);
+        assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
+        assert_eq!(document["catalog_identity"]["simulator_revision"], 1);
+        assert_eq!(
+            document["catalog_identity"]["registry_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         assert_eq!(document["oracle"]["enabled"], false);
         assert_eq!(document["oracle"]["injected_control_calls"], 0);
         assert_eq!(document["persistence"]["backend"], "sqlite_file");
@@ -1810,6 +1915,45 @@ mod tests {
         }
         assert_eq!(document["turns"][1]["model_calls"], 1);
         assert_eq!(document["turns"][1]["model_tool_calls"], 1);
+        assert_eq!(
+            document["turns"][0]["model_call_metrics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            document["turns"][1]["model_call_metrics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            document["turns"][0]["model_call_metrics"][0]["frontier_name"],
+            "interpret_intent_core"
+        );
+        assert_eq!(
+            document["turns"][1]["model_call_metrics"][0]["frontier_name"],
+            "resolve_intent_decision"
+        );
+        assert_eq!(document["model_call_metrics"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            document["model_call_metrics"][0],
+            document["turns"][0]["model_call_metrics"][0]
+        );
+        assert_eq!(
+            document["model_call_metrics"][1],
+            document["turns"][1]["model_call_metrics"][0]
+        );
+        assert!(
+            document["turns"][0]["elapsed_ms"].as_u64().unwrap()
+                >= document["turns"][0]["burst_elapsed_ms"].as_u64().unwrap()
+        );
+        assert!(
+            document["turns"][1]["elapsed_ms"].as_u64().unwrap()
+                >= document["turns"][1]["burst_elapsed_ms"].as_u64().unwrap()
+        );
         assert!(document["turns"][1]["deterministic_operations"]
             .as_u64()
             .is_some_and(|operations| operations > 20));
@@ -1841,7 +1985,6 @@ mod tests {
                     "expected_revision": 0,
                     "request_mode": "build",
                     "automation_kind": "custom_automation",
-                    "objective": "Create a static feedback automation",
                     "requested_outcome": "validated_preview",
                     "hub_channel": null,
                     "language": "en",
@@ -1867,6 +2010,7 @@ mod tests {
         let client = IntentEvalClient {
             responses: Arc::new(Mutex::new(responses)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(Mutex::new(Vec::new())),
         };
         let scenario = parse_eval_input(
             r#"{"schema_version":3,"mode":"intent_recipe","turns":[{"id":"request","input":"Build a static feedback automation"},{"id":"followup","input":"Now add a panel"}]}"#,
