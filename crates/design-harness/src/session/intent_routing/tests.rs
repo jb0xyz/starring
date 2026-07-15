@@ -86,7 +86,8 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "Always include runtime_requirements and other_unmapped_required_capabilities, using [] if empty",
         "request_mode=build when automation is requested and request_mode=discussion only when no build is requested",
         "requested_outcome=validated_preview only if requested, otherwise working_draft",
-        "Discussion: requested_outcome=discussion and a nonempty natural response",
+        "Discussion: requested_outcome=discussion and a complete natural response of 2-4 sentences within 480 UTF-16 units",
+        "use no headings, tables, or lists",
         "Blockers do not change the supported base",
         "custom_automation owns static buttons, modals, role/channel creation, permissions, role grants, posts, and ephemeral responses",
         "a control opening a modal whose submission returns an ephemeral response",
@@ -102,22 +103,15 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "source article, quantifier, or relative word like that",
         "Never alter words or order, or reduce an action to a noun fragment",
         "No build requirement may exist only in response",
+        "external or cross-service precondition is unmapped",
+        "Brainstorming and discussion are still classifications",
+        "place the concise conversational answer only in response",
     ] {
         assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(expected));
     }
-    assert_eq!(
-        INTENT_RECIPE_SYSTEM_PROMPT_V4
-            .matches("each order posts a signed record")
-            .count(),
-        2
-    );
-    assert_eq!(
-        INTENT_RECIPE_SYSTEM_PROMPT_V4
-            .matches("a worker that must obtain a cross-service lease before replying")
-            .count(),
-        2
-    );
-    assert_eq!(INTENT_RECIPE_SYSTEM_PROMPT_V4.len(), 3_493);
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("each order posts a signed record"));
+    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("a worker that must obtain a cross-service lease before replying"));
     for forbidden in [
         "validation_gate",
         "custom_detail_facets",
@@ -3864,9 +3858,9 @@ fn serving_projection_excludes_rejected_discussion_presentation() {
 }
 
 #[test]
-fn serving_projection_replays_grounded_and_bounded_discussion() {
+fn serving_projection_replays_grounded_concise_discussion() {
     block_on(async {
-        let response = format!("{}final", "word ".repeat(500));
+        let response = format!("{}final.", "word ".repeat(60));
         let mut recovered = private_room_value(0, Some("community_hub"));
         recovered["automation_kind"] = json!("custom_automation");
         recovered["requested_outcome"] = json!("working_draft");
@@ -3908,8 +3902,8 @@ fn serving_projection_replays_grounded_and_bounded_discussion() {
             .filter(|message| message.role == MessageRole::Assistant)
             .collect::<Vec<_>>();
         assert_eq!(presentations.len(), 1);
-        assert!(presentations[0].content.encode_utf16().count() <= 2_000);
-        assert!(presentations[0].content.ends_with('…'));
+        assert_eq!(presentations[0].content, response);
+        assert!(presentations[0].content.encode_utf16().count() <= 480);
         assert!(presentations[0].tool_calls.is_empty());
     });
 }

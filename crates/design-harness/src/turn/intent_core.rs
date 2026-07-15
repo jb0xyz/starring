@@ -24,7 +24,7 @@ use super::schema::inline_schema_value;
 
 pub const INTERPRET_INTENT_CORE: &str = "interpret_intent_core";
 
-const MAX_RESPONSE_CHARS: usize = 2_000;
+const MAX_DISCUSSION_RESPONSE_CHARS: usize = 480;
 const MAX_UNCLASSIFIED_REQUIREMENTS: usize = 8;
 const MAX_UNCLASSIFIED_REQUIREMENT_CHARS: usize = 160;
 const MAX_BINDING_KEY_CHARS: usize = 64;
@@ -155,7 +155,7 @@ struct InterpretIntentCoreWireV4 {
     #[serde(default)]
     #[schemars(skip)]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
-    #[schemars(length(max = 2000))]
+    #[schemars(length(max = 480))]
     response: String,
 }
 
@@ -312,7 +312,7 @@ fn grounded_capability_evidence(
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: INTERPRET_INTENT_CORE.to_string(),
-        description: "Call once without prose; fill every field and copy exact source phrases without paraphrasing"
+        description: "Call once for every request, including discussion; put a concise complete conversational answer only in response and copy capability evidence exactly"
             .to_string(),
         parameters: inline_schema_value::<InterpretIntentCoreWireV4>(),
     }]
@@ -340,7 +340,6 @@ pub(crate) fn parse_interpret_intent_core_for_human(
         Err(error) => return Err(error),
     };
     apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
-    bound_discussion_response(&mut input)?;
     normalize_core(input)
 }
 
@@ -425,39 +424,6 @@ fn apply_grounded_request_mode(
         }
         None => {}
     }
-}
-
-fn bound_discussion_response(input: &mut InterpretIntentCoreWireV4) -> Result<(), StructuredError> {
-    if input.request_mode != IntentRequestModeV2::Discussion {
-        return Ok(());
-    }
-    let normalized = input.response.trim();
-    validate_text_shape(normalized, usize::MAX, true, false, "intent.core.response")?;
-    if normalized.encode_utf16().count() <= MAX_RESPONSE_CHARS {
-        input.response = normalized.to_string();
-        return Ok(());
-    }
-    let budget = MAX_RESPONSE_CHARS.saturating_sub(1);
-    let mut units = 0usize;
-    let mut end = 0usize;
-    let mut last_whitespace = None;
-    for (index, character) in normalized.char_indices() {
-        let next = units.saturating_add(character.len_utf16());
-        if next > budget {
-            break;
-        }
-        units = next;
-        end = index.saturating_add(character.len_utf8());
-        if character.is_whitespace() {
-            last_whitespace = Some(index);
-        }
-    }
-    let minimum_word_cut = budget.saturating_mul(3) / 4;
-    let cut = last_whitespace
-        .filter(|index| normalized[..*index].encode_utf16().count() >= minimum_word_cut)
-        .unwrap_or(end);
-    input.response = format!("{}…", normalized[..cut].trim_end());
-    Ok(())
 }
 
 fn deserialize_required_nullable_channel<'de, D>(
@@ -609,7 +575,7 @@ fn normalized_response(
     }
     validate_text_shape(
         &normalized,
-        MAX_RESPONSE_CHARS,
+        MAX_DISCUSSION_RESPONSE_CHARS,
         true,
         false,
         "intent.core.response",

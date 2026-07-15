@@ -37,7 +37,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     assert_eq!(tool.name, INTERPRET_INTENT_CORE);
     assert_eq!(
         tool.description,
-        "Call once without prose; fill every field and copy exact source phrases without paraphrasing"
+        "Call once for every request, including discussion; put a concise complete conversational answer only in response and copy capability evidence exactly"
     );
     assert_eq!(
         required_names(&tool.parameters),
@@ -1086,20 +1086,20 @@ fn embedded_discussion_copy_never_enables_discussion_array_defaults() {
 }
 
 #[test]
-fn human_grounding_bounds_long_discussion_presentation() {
+fn human_grounding_rejects_long_discussion_presentation() {
     let mut value = valid_core();
     value["request_mode"] = json!("discussion");
     value["automation_kind"] = json!("none");
     value["requested_outcome"] = json!("discussion");
     value["response"] = json!(format!("{} final", "word ".repeat(500)));
-    let parsed = parse_interpret_intent_core_for_human(
+    let error = parse_interpret_intent_core_for_human(
         &value.to_string(),
         "This is brainstorming only; do not change the Draft yet.",
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert!(parsed.response().encode_utf16().count() <= 2_000);
-    assert!(parsed.response().ends_with('…'));
+    assert_eq!(error.code, "INTENT_TEXT_TOO_LONG");
+    assert_eq!(error.location, "intent.core.response");
 }
 
 fn property_names(schema: &Value) -> BTreeSet<String> {

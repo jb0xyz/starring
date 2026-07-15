@@ -1247,6 +1247,77 @@ test('terminal responses and final decisions cannot diverge from deterministic e
   );
 });
 
+test('discussion response quality accepts concise complete English and Korean prose', () => {
+  const routeDecision = decision('discussion');
+  const expected = context({
+    expectedOutcomes: 'routed',
+    expectedStagePath: 'empty>empty',
+    expectedRoutePath: 'discussion',
+    expectedFinalStatus: 'empty',
+    expectedCompiledOperations: undefined,
+    completeRequest: false,
+  });
+  for (const message of [
+    'Private rooms improve focus and privacy. They add discovery friction and moderation overhead. We can compare those tradeoffs before changing the Draft.',
+    '비공개 방은 몰입감과 안전성을 높입니다. 대신 방 탐색과 관리 비용이 늘어날 수 있습니다. Draft를 바꾸지 않고 이 균형을 먼저 비교해보겠습니다.',
+    'We can compare the tradeoffs without changing the Draft.',
+  ]) {
+    const document = routedDocument(routeDecision, message, 'discussion-quality');
+    assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
+  }
+});
+
+test('discussion response quality rejects completion limits and structurally poor endings', () => {
+  const routeDecision = decision('discussion');
+  const expected = context({
+    expectedOutcomes: 'routed',
+    expectedStagePath: 'empty>empty',
+    expectedRoutePath: 'discussion',
+    expectedFinalStatus: 'empty',
+    expectedCompiledOperations: undefined,
+    completeRequest: false,
+  });
+  const qualityFailure = (message, reason, mutate = () => {}, contextOverride = expected) => {
+    const document = JSON.parse(routedDocument(routeDecision, message, 'discussion-quality'));
+    mutate(document);
+    const actual = checks.intentAdjudicationDecision(JSON.stringify(document), contextOverride);
+    assert.equal(actual.pass, false);
+    assert.match(actual.reason, reason);
+  };
+
+  qualityFailure(
+    'This concise comparison is complete.',
+    /completion-token cap/,
+    (document) => {
+      document.turns[0].model_call_metrics[0].completion_tokens = 512;
+      document.model_call_metrics[0].completion_tokens = 512;
+    },
+  );
+  qualityFailure(
+    'This concise comparison is complete.',
+    /completion-limit finish reason/,
+    () => {},
+    { ...expected, providerResponse: { finishReason: 'length' } },
+  );
+  qualityFailure(`${'A focused comparison remains useful. '.repeat(30)}`, /overly long/);
+  qualityFailure(`${'😀'.repeat(300)}.`, /overly long/);
+  qualityFailure('### Tradeoffs\nPrivacy improves, while discovery becomes harder.', /Markdown heading/);
+  qualityFailure(
+    'Choice | Benefit | Cost\n--- | --- | ---\nPrivate | Focus | Discovery friction',
+    /Markdown table/,
+  );
+  qualityFailure(
+    '- Focus\n- Privacy\n- Safety\n- Moderation\n- Discovery',
+    /long list/,
+  );
+  qualityFailure('Privacy improves, but the next tradeoff is…', /unfinished ending/);
+  qualityFailure('Privacy improves (with stricter access.', /unbalanced delimiters/);
+  qualityFailure(
+    'Focus improves. Privacy improves. Discovery becomes harder. Moderation costs rise. The balance depends on the community.',
+    /more than four sentences/,
+  );
+});
+
 test('schema, model, oracle, calls, and hard latency regressions fail closed', () => {
   const malformed = JSON.parse(report());
   malformed.schema_version = 2;
