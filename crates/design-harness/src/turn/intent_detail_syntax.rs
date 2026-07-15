@@ -81,10 +81,13 @@ pub(super) fn supported_detail_fragment(requirement: &str) -> bool {
         return false;
     };
     let tokens = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let tokens = strip_detail_command_prefix(&tokens);
+    let tokens = tokens.strip_prefix(&["its"]).unwrap_or(tokens);
     matches!(
-        strip_detail_command_prefix(&tokens),
+        tokens,
         ["ephemeral", "response", LITERAL_SENTINEL]
             | ["ephemeral", "response", "is", LITERAL_SENTINEL]
+            | ["ephemeral", "response", "is", "exactly", LITERAL_SENTINEL]
             | ["ephemeral", "response", "to", LITERAL_SENTINEL]
             | ["ephemeral", "message", LITERAL_SENTINEL]
             | ["ephemeral", "message", "is", LITERAL_SENTINEL]

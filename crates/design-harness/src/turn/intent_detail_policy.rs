@@ -25,6 +25,16 @@ const NEGATIVE_SCOPE_START_WORDS: &[&str] = &[
 
 const HYPOTHETICAL_SCOPE_START_WORDS: &[&str] = &["hypothetically", "imagine", "suppose"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DefaultDetailHeaderPolicy {
+    Facets {
+        copy: bool,
+        naming: bool,
+        controls: bool,
+    },
+    ExactlyOneCopy,
+}
+
 pub(super) fn is_unsafe_scope(value: &str) -> bool {
     let recognized_header = split_first_unquoted_colon(value).is_some_and(|(header, _)| {
         declares_exact_override_list(header) || declares_default_detail_header(header)
@@ -34,6 +44,9 @@ pub(super) fn is_unsafe_scope(value: &str) -> bool {
     }
     let masked = masked_lowercase(value);
     let scope = strip_scope_modifiers(&masked);
+    if is_non_detail_interaction_directive(scope) {
+        return false;
+    }
     let words = detail_words(scope);
     let dynamic = has_dynamic_detail_context(scope);
     let negative = has_negative_detail_context(scope);
@@ -67,6 +80,20 @@ pub(super) fn is_unsafe_scope(value: &str) -> bool {
         || negative_scope
         || hypothetical_scope
         || korean_scope
+}
+
+fn is_non_detail_interaction_directive(value: &str) -> bool {
+    matches!(
+        value,
+        "do not ask a follow-up question"
+            | "do not ask follow-up questions"
+            | "don't ask a follow-up question"
+            | "don't ask follow-up questions"
+            | "don’t ask a follow-up question"
+            | "don’t ask follow-up questions"
+            | "dont ask a follow-up question"
+            | "dont ask follow-up questions"
+    )
 }
 
 fn strip_scope_modifiers(mut value: &str) -> &str {
@@ -136,23 +163,74 @@ fn exact_override_marker(words: &[&str]) -> bool {
 }
 
 pub(super) fn declares_default_detail_header(value: &str) -> bool {
-    if contains_quote_delimiter(value) || has_forbidden_detail_context(value) {
-        return false;
+    default_detail_header_policy(value).is_some()
+}
+
+pub(super) fn default_detail_header_policy(value: &str) -> Option<DefaultDetailHeaderPolicy> {
+    if contains_quote_delimiter(value) {
+        return None;
     }
     let value = masked_lowercase(value);
     let words = detail_words(&value);
+    if let Some(policy) = closed_default_detail_header(&words) {
+        return Some(policy);
+    }
+    if has_forbidden_detail_context(&value) {
+        return None;
+    }
     const ALLOWED: &[&str] = &[
         "and", "controls", "copy", "default", "defaults", "except", "for", "naming", "the", "use",
         "with",
     ];
-    words.iter().all(|word| ALLOWED.contains(word))
-        && words
+    if !words.iter().all(|word| ALLOWED.contains(word))
+        || !words
             .iter()
             .any(|word| matches!(*word, "default" | "defaults"))
-        && words.contains(&"except")
-        && words
-            .iter()
-            .any(|word| matches!(*word, "controls" | "copy" | "naming"))
+        || words.iter().filter(|word| **word == "except").count() != 1
+    {
+        return None;
+    }
+    let exception = words.iter().position(|word| *word == "except")?;
+    let exception_words = &words[exception.saturating_add(1)..];
+    if !exception_words.iter().all(|word| {
+        matches!(
+            *word,
+            "and" | "controls" | "copy" | "for" | "naming" | "the" | "with"
+        )
+    }) {
+        return None;
+    }
+    let copy = exception_words.contains(&"copy");
+    let naming = exception_words.contains(&"naming");
+    let controls = exception_words.contains(&"controls");
+    (copy || naming || controls).then_some(DefaultDetailHeaderPolicy::Facets {
+        copy,
+        naming,
+        controls,
+    })
+}
+
+fn closed_default_detail_header(words: &[&str]) -> Option<DefaultDetailHeaderPolicy> {
+    let words = words.strip_prefix(&["use"])?;
+    let words = words
+        .strip_prefix(&["english"])
+        .or_else(|| words.strip_prefix(&["korean"]))
+        .unwrap_or(words);
+    if matches!(words, ["defaults", "except", "for", "generated", "names"]) {
+        return Some(DefaultDetailHeaderPolicy::Facets {
+            copy: false,
+            naming: true,
+            controls: false,
+        });
+    }
+    matches!(
+        words,
+        [
+            "defaults", "for", "every", "name", "and", "room", "control", "with", "exactly", "one",
+            "copy", "override"
+        ]
+    )
+    .then_some(DefaultDetailHeaderPolicy::ExactlyOneCopy)
 }
 
 fn has_forbidden_detail_context(value: &str) -> bool {

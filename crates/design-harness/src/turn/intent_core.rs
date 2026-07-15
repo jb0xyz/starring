@@ -8,7 +8,9 @@ use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
-use super::intent_boundary_grounding::ground_safety_boundary_requests;
+use super::intent_boundary_grounding::{
+    ground_safety_boundary_requests, safety_boundary_owns_capability_evidence,
+};
 use super::intent_capability_grounding::{
     ground_unmapped_capability_evidence, CapabilityEvidenceGroundingError,
 };
@@ -220,8 +222,12 @@ impl IntentCoreInterpretationV4 {
         } else {
             Vec::new()
         };
+        let boundary_requests = ground_safety_boundary_requests(human_message);
+        unclassified_requirements.retain(|requirement| {
+            !safety_boundary_owns_capability_evidence(human_message, requirement)
+        });
         self.apply_human_grounded_channel(grounded_channel);
-        self.boundary_requests = ground_safety_boundary_requests(human_message);
+        self.boundary_requests = boundary_requests;
         self.unclassified_requirements = unclassified_requirements;
         self.detail_facets = detail_facets;
         Ok(())

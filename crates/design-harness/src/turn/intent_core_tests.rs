@@ -375,6 +375,70 @@ fn failed_human_grounding_leaves_the_parsed_core_unchanged() {
 }
 
 #[test]
+fn human_grounding_removes_only_boundary_owned_capability_evidence() {
+    let human = "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately. Each approved invoice posts an audit record.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!([
+        "Skip only user approval",
+        "connect to Discord",
+        "deploy the live changes immediately",
+        "Each approved invoice posts an audit record"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["Each approved invoice posts an audit record"]
+    );
+    assert_eq!(
+        parsed.boundary_requests(),
+        &[
+            IntentBoundaryRequestV2::DirectLiveMutation,
+            IntentBoundaryRequestV2::BypassValidationPreviewApproval
+        ]
+    );
+}
+
+#[test]
+fn human_grounding_preserves_unrelated_capability_in_boundary_clause() {
+    let human = "Post an audit record and deploy the live changes immediately.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!([
+        "Post an audit record",
+        "deploy the live changes immediately"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["Post an audit record"]
+    );
+    assert_eq!(
+        parsed.boundary_requests(),
+        &[IntentBoundaryRequestV2::DirectLiveMutation]
+    );
+}
+
+#[test]
+fn human_grounding_preserves_newline_boundary_semantics() {
+    let human = "What happens if someone posts an audit record\nDeploy to live Discord now";
+    let mut parsed = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert_eq!(
+        parsed.boundary_requests(),
+        &[IntentBoundaryRequestV2::DirectLiveMutation]
+    );
+}
+
+#[test]
 fn human_grounding_reclassifies_exact_supported_recipe_details() {
     let human = "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.";
     let mut value = valid_core();
@@ -402,6 +466,62 @@ fn human_grounding_reclassifies_exact_supported_recipe_details() {
             IntentRecipeDetailFacetV3::Controls
         ]
     );
+}
+
+#[test]
+fn human_grounding_reclassifies_evaluation_detail_wrappers() {
+    let cases: &[(&str, &[&str], &[IntentRecipeDetailFacetV3])] = &[
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room', and the member-role name has prefix 'team-' and suffix '-members'. Leave all copy and controls at their defaults, keep closing disabled, and do not ask a follow-up question.",
+            &[],
+            &[IntentRecipeDetailFacetV3::Naming],
+        ),
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
+            &[
+                "its ephemeral response is exactly 'Read the guide'",
+                "the room Help button label is exactly 'Guide'",
+            ],
+            &[IntentRecipeDetailFacetV3::Controls],
+        ),
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.",
+            &["its ephemeral response is 'Read this first'"],
+            &[
+                IntentRecipeDetailFacetV3::Copy,
+                IntentRecipeDetailFacetV3::Naming,
+                IntentRecipeDetailFacetV3::Controls,
+            ],
+        ),
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults for every name and room control, with exactly one copy override: set the launcher create-button label to 'Begin deep work'. Leave room closing disabled and do not ask a follow-up question.",
+            &["launcher create-button label to 'Begin deep work'"],
+            &[IntentRecipeDetailFacetV3::Copy],
+        ),
+    ];
+
+    for (human, requirements, expected_facets) in cases {
+        let mut value = valid_core();
+        value["other_unmapped_required_capabilities"] = json!(requirements);
+        let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+        parsed
+            .apply_human_grounding(
+                human,
+                Some(&ExistingChannelKey("community_hub".to_string())),
+            )
+            .unwrap();
+
+        assert!(
+            parsed.unclassified_requirements().is_empty(),
+            "unclassified detail remained for {human}"
+        );
+        assert_eq!(
+            parsed.recipe_detail_facets(),
+            *expected_facets,
+            "unexpected facets for {human}"
+        );
+    }
 }
 
 #[test]

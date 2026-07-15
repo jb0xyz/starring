@@ -9,6 +9,20 @@ fn is_private_study_room_detail_requirement(human: &str, requirement: &str) -> b
     analyze_private_study_room_details(human).explains_requirement(requirement)
 }
 
+fn assert_grounded_details(
+    human: &str,
+    expected: &[IntentRecipeDetailFacetV3],
+    requirements: &[&str],
+) {
+    assert_eq!(facets(human), expected, "unexpected facets for {human}");
+    for requirement in requirements {
+        assert!(
+            is_private_study_room_detail_requirement(human, requirement),
+            "unsupported requirement {requirement} for {human}"
+        );
+    }
+}
+
 #[test]
 fn gemma_override_phrases_are_supported_by_closed_entries() {
     let human = "Build a managed private study-room automation. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'.";
@@ -28,6 +42,103 @@ fn gemma_override_phrases_are_supported_by_closed_entries() {
             IntentRecipeDetailFacetV3::Controls,
         ]
     );
+}
+
+#[test]
+fn evaluation_default_wrappers_preserve_exact_detail_evidence() {
+    assert_grounded_details(
+        "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room', and the member-role name has prefix 'team-' and suffix '-members'. Leave all copy and controls at their defaults, keep closing disabled, and do not ask a follow-up question.",
+        &[IntentRecipeDetailFacetV3::Naming],
+        &[
+            "the channel name has prefix 'focus-' and suffix '-room'",
+            "the member-role name has prefix 'team-' and suffix '-members'",
+        ],
+    );
+    assert_grounded_details(
+        "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
+        &[IntentRecipeDetailFacetV3::Controls],
+        &[
+            "the room Help button label is exactly 'Guide'",
+            "its ephemeral response is exactly 'Read the guide'",
+        ],
+    );
+    assert_grounded_details(
+        "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.",
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Controls,
+        ],
+        &["its ephemeral response is 'Read this first'"],
+    );
+    assert_grounded_details(
+        "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults for every name and room control, with exactly one copy override: set the launcher create-button label to 'Begin deep work'. Leave room closing disabled and do not ask a follow-up question.",
+        &[IntentRecipeDetailFacetV3::Copy],
+        &["launcher create-button label to 'Begin deep work'"],
+    );
+}
+
+#[test]
+fn closed_default_wrappers_enforce_facets_and_cardinality() {
+    let valid_naming = "Use English defaults except for generated names:\n- the channel name has prefix 'focus-' and suffix '-room'\n- the member-role name has prefix 'team-' and suffix '-members'";
+    assert_grounded_details(
+        valid_naming,
+        &[IntentRecipeDetailFacetV3::Naming],
+        &[
+            "the channel name has prefix 'focus-' and suffix '-room'",
+            "the member-role name has prefix 'team-' and suffix '-members'",
+        ],
+    );
+
+    let valid_copy = "Use English defaults for every name and room control, with exactly one copy override: set the launcher create-button label to 'Begin deep work'.";
+    assert_grounded_details(
+        valid_copy,
+        &[IntentRecipeDetailFacetV3::Copy],
+        &["launcher create-button label to 'Begin deep work'"],
+    );
+
+    let valid_scoped_facets = "Use default controls, except for copy and naming: set the modal title to 'Focus'; set the channel name prefix to 'focus-'.";
+    assert_grounded_details(
+        valid_scoped_facets,
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+        ],
+        &["modal title to 'Focus'", "channel name prefix to 'focus-'"],
+    );
+
+    for invalid in [
+        "Use English defaults except for generated names: the Help button label is 'Guide'.",
+        "Use default copy and controls, except for naming: set the Help button label to 'Guide'.",
+        "Use default copy and controls, except for naming:\n- set the Help button label to 'Guide'",
+        "Use English defaults for every name and room control, with exactly one copy override:\n- the launcher create-button label is 'Begin'\n- the modal title is 'Focus room'",
+        "Use English defaults except for generated names: when a room opens, set the channel name prefix to 'focus-'.",
+        "Use English defaults for every name and room control, with exactly one copy override: do not set the launcher create-button label to 'Begin'.",
+    ] {
+        assert!(facets(invalid).is_empty(), "unexpected facets for {invalid}");
+    }
+}
+
+#[test]
+fn no_followup_meta_directives_do_not_weaken_scope_guards() {
+    let safe =
+        "Exact overrides: the Help button label is 'Guide'. Do not ask a follow-up question.";
+    assert_grounded_details(
+        safe,
+        &[IntentRecipeDetailFacetV3::Controls],
+        &["the Help button label is 'Guide'"],
+    );
+
+    for unsafe_request in [
+        "Do not apply these overrides. Set the Help button label to 'Guide'.",
+        "Exact overrides: the Help button label is 'Guide'. Do not ask a follow-up question and do not apply these overrides.",
+        "Use English defaults except for generated names: the channel name prefix is 'focus-'; send the channel name suffix '-room' to a webhook.",
+    ] {
+        assert!(
+            facets(unsafe_request).is_empty(),
+            "unexpected facets for {unsafe_request}"
+        );
+    }
 }
 
 #[test]

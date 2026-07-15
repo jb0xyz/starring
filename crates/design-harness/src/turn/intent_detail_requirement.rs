@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_detail_policy::{
-    declares_default_detail_header, declares_exact_override_list, is_unsafe_scope,
+    declares_exact_override_list, default_detail_header_policy, is_unsafe_scope,
+    DefaultDetailHeaderPolicy,
 };
 use super::intent_detail_syntax::{
     detail_requirement_connector_len, supported_detail_fragment, supported_detail_syntax,
@@ -210,8 +211,8 @@ fn multiline_detail_evidence(value: &str) -> MultilineDetailEvidence {
             index += 1;
             continue;
         }
-        let recognized =
-            declares_exact_override_list(header) || declares_default_detail_header(header);
+        let default_policy = default_detail_header_policy(header);
+        let recognized = declares_exact_override_list(header) || default_policy.is_some();
         if !recognized {
             let next_is_list = next_nonempty_line(&lines, index.saturating_add(1))
                 .and_then(|index| lines.get(index))
@@ -250,6 +251,11 @@ fn multiline_detail_evidence(value: &str) -> MultilineDetailEvidence {
             index += 1;
         }
         if entries.len() == group_start {
+            return MultilineDetailEvidence::Invalid;
+        }
+        if default_policy
+            .is_some_and(|policy| !default_header_accepts_entries(policy, &entries[group_start..]))
+        {
             return MultilineDetailEvidence::Invalid;
         }
     }
@@ -368,11 +374,45 @@ fn detail_evidence_entries(sentence: &str) -> Option<Vec<DetailEvidenceEntry>> {
                 })
                 .collect();
         }
-        if declares_default_detail_header(header) {
-            return general_detail_entries(body);
+        if let Some(policy) = default_detail_header_policy(header) {
+            let entries = general_detail_entries(body)?;
+            return default_header_accepts_entries(policy, &entries).then_some(entries);
         }
     }
     general_detail_entries(sentence)
+}
+
+fn default_header_accepts_entries(
+    policy: DefaultDetailHeaderPolicy,
+    entries: &[DetailEvidenceEntry],
+) -> bool {
+    match policy {
+        DefaultDetailHeaderPolicy::Facets {
+            copy,
+            naming,
+            controls,
+        } => entries.iter().all(|entry| {
+            !entry.facets.is_empty()
+                && entry.facets.iter().all(|facet| match facet {
+                    IntentRecipeDetailFacetV3::Copy => copy,
+                    IntentRecipeDetailFacetV3::Naming => naming,
+                    IntentRecipeDetailFacetV3::Controls => controls,
+                })
+        }),
+        DefaultDetailHeaderPolicy::ExactlyOneCopy => {
+            entries.iter().all(|entry| {
+                !entry.facets.is_empty()
+                    && entry
+                        .facets
+                        .iter()
+                        .all(|facet| *facet == IntentRecipeDetailFacetV3::Copy)
+            }) && entries
+                .iter()
+                .map(|entry| entry.assignments.len())
+                .sum::<usize>()
+                == 1
+        }
+    }
 }
 
 fn general_detail_entries(value: &str) -> Option<Vec<DetailEvidenceEntry>> {
@@ -396,6 +436,17 @@ fn general_detail_entries(value: &str) -> Option<Vec<DetailEvidenceEntry>> {
 
 fn static_override_tail(value: &str) -> Option<&str> {
     let lowercase = value.to_ascii_lowercase();
+    for prefix in [
+        "use defaults except that ",
+        "use english defaults except that ",
+        "use korean defaults except that ",
+    ] {
+        if lowercase.starts_with(prefix) {
+            return value
+                .get(prefix.len()..)
+                .filter(|tail| !tail.trim().is_empty());
+        }
+    }
     let split = lowercase.find(" but ")?;
     let prefix = normalized_whitespace(&value[..split]).to_ascii_lowercase();
     let suffix = &value[split + " but ".len()..];

@@ -258,8 +258,16 @@ The prompt must make these rules explicit:
 
 - the managed recipe's built-in room creation flow is represented by the closed
   automation kind and must not be restated as an unmapped capability;
+- `custom_automation` represents supported static buttons, modals, role and
+  channel creation, permission-setting behavior, role grants, posts, and
+  ephemeral responses; represented primitives must not be restated as unmapped
+  capabilities;
 - deterministic human grounding selects concrete supported copy, naming, and
   control detail facets;
+- closed default wrappers retain their declared scope in inline and multiline
+  forms: generic wrappers accept only facets named after `except`, `generated
+  names` accepts only naming assignments, and `exactly one copy override`
+  accepts exactly one copy assignment;
 - every additional positive behavior, authorization, lifecycle, runtime, or
   external-effect requirement not represented by a closed field must be copied
   as one contiguous whitespace-canonical phrase into
@@ -389,9 +397,10 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 7, including the closed detail grammar and
-runtime-versus-behavior evidence contract. The normalizer revision moves from 1
-to 3, including exact capability-evidence canonicalization, and the recipe
+extractor revision moves from 4 to 8, including the closed detail grammar,
+supported-base classification, and runtime-versus-behavior evidence contract.
+The normalizer revision moves from 1 to 4, including exact capability-evidence
+canonicalization and typed safety-boundary evidence ownership, and the recipe
 descriptor and registry digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
@@ -430,8 +439,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   7
-Recipe extractor revision          7
-Recipe normalizer revision         3
+Recipe extractor revision          8
+Recipe normalizer revision         4
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -475,17 +484,19 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-the branch-local normalizer revision 2 or its earlier V4 prompt are pre-release
-evaluation artifacts, not a supported durable format. They are rejected by the
-exact fixed-prompt or recipe-registry identity checks and must be discarded
-rather than migrated. After V4 ships, a semantic prompt or normalizer change must
-either rotate the protocol or snapshot contract or retain an explicit verified
-restore-only compatibility path.
+branch-local extractor revisions through 7, normalizer revisions through 3, or
+an earlier V4 prompt are pre-release evaluation artifacts, not a supported
+durable format. They are rejected by the exact fixed-prompt or recipe-registry
+identity checks and must be discarded rather than migrated. After V4 ships, a
+semantic prompt, extractor, or normalizer change must either rotate the protocol
+or snapshot contract or retain an explicit verified restore-only compatibility
+path.
 
 Compatibility rules are:
 
-- V4 prompt with protocol 4 is current;
-- a pre-release V4 prompt or normalizer-2 recipe identity is rejected;
+- the exact V4 prompt with protocol 4, extractor 8, and normalizer 4 is current;
+- a pre-release V4 prompt, extractor revision through 7, or normalizer revision
+  through 3 is rejected;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
 - any crossed prompt/protocol pair is an invalid invariant;
 - a V6 non-Intent adaptive or typed snapshot may be promoted in memory to V7;

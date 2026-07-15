@@ -372,6 +372,7 @@ fn valid_detail_assignment(slot: DetailSlot, tail: &[&str]) -> bool {
     const DIRECT: &[&[&str]] = &[
         &[LITERAL_SENTINEL],
         &["is", LITERAL_SENTINEL],
+        &["is", "exactly", LITERAL_SENTINEL],
         &["are", LITERAL_SENTINEL],
         &["to", LITERAL_SENTINEL],
         &["set", "to", LITERAL_SENTINEL],
@@ -465,12 +466,22 @@ fn match_detail_continuation(tokens: &[&str], active_slot: DetailSlot) -> Option
         tokens,
         ["its", "response", LITERAL_SENTINEL]
             | ["its", "response", "is", LITERAL_SENTINEL]
+            | ["its", "response", "is", "exactly", LITERAL_SENTINEL]
             | ["its", "response", "to", LITERAL_SENTINEL]
             | ["its", "help", "response", LITERAL_SENTINEL]
             | ["its", "help", "response", "is", LITERAL_SENTINEL]
+            | ["its", "help", "response", "is", "exactly", LITERAL_SENTINEL]
             | ["its", "help", "response", "to", LITERAL_SENTINEL]
             | ["its", "ephemeral", "response", LITERAL_SENTINEL]
             | ["its", "ephemeral", "response", "is", LITERAL_SENTINEL]
+            | [
+                "its",
+                "ephemeral",
+                "response",
+                "is",
+                "exactly",
+                LITERAL_SENTINEL
+            ]
             | ["its", "ephemeral", "response", "to", LITERAL_SENTINEL]
     ) {
         return active_slot.response_slot();

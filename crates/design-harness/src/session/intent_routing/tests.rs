@@ -81,39 +81,69 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("other_unmapped_required_capabilities"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Runtime closed fields are infrastructure properties only; they never replace automation behaviors"
+        "Except expected_revision and response, only explicit INTENT_HUMAN text may set semantic fields"
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "set the closed infrastructure field and also preserve the complete behavior separately"
+        "request_mode=build when automation is requested and request_mode=discussion only when no build is requested"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Build uses requested_outcome=working_draft or validated_preview with response=\"\""
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("shortest complete contiguous subject-and-predicate phrase"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("Never paraphrase it or reduce it to a noun fragment"));
+        .contains("discussion uses requested_outcome=discussion with a nonempty natural response"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Exclude meta-instructions whose object is the request, requirements, or instructions, such as do not weaken the instructions"
+        "Supported base is independent of blockers; extra unmapped requirements never change it"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "automation_kind=managed_private_study_room for the supported private-room base"
     ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("Keep the subject's leading a, an, the, each, or every"));
-    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("anti-weakening"));
+        .contains("automation_kind=custom_automation for another supported static base"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Safety-boundary requests and recipe-detail frontiers are grounded directly from INTENT_HUMAN"
+        "automation_kind=none only for discussion, boundary-only requests, or builds with no supported base"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "custom_automation owns supported static buttons, modals, role/channel creation, permission-setting behavior"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Never repeat behavior owned by either kind in other_unmapped_required_capabilities"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "runtime_requirements=[] unless INTENT_HUMAN explicitly states a listed infrastructure property"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("restart_persistent=state or data survives process restarts"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("durable_timer=durable timer or scheduler infrastructure"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("event_time_llm=LLM executes or decides while handling an event"));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Leases, locks, approvals, timeouts, deadlines, waits, ordering, or preserving requirements select no runtime value"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Closed runtime fields represent infrastructure only; dependent business behavior belongs separately in other_unmapped_required_capabilities"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "For each distinct capability, emit its shortest exact contiguous subject-predicate phrase, including a leading article or quantifier"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Exclude summaries or preservation, anti-weakening, and anti-substitution restatements of captured requirements"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Harness-grounded boundaries and supported recipe copy, naming, or controls never belong in unmapped or response"
+    ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
+        "Raw action and permission structures, recipe identity and hashes, and generated keys are harness-owned"
     ));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("custom_detail_facets"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "durable scheduling infrastructure for a workflow where an approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[an approved invoice posts a signed audit record]"
-    ));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("every message earns XP"));
     assert!(
         !INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("do not reduce the request to static responses")
     );
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Never encode safety-boundary requests or supported copy, naming, and control literals"
-    ));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.len() <= 3_500);
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("No positive requirement may exist only in response text"));
+        .contains("In a build, no positive requirement may exist only in response"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("belong only in objective"));
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
         .contains("launcher create-button label to copy.create_button_label"));
@@ -1685,16 +1715,10 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
         INTENT_RECIPE_PROTOCOL_VERSION_V4
     );
 
-    let prerelease_prompt = INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .replace(
-            " Exclude meta-instructions whose object is the request, requirements, or instructions, such as do not weaken the instructions.",
-            " Do not copy meta-instructions about preserving or not weakening the request as capabilities.",
-        )
-        .replace(" Keep the subject's leading a, an, the, each, or every.", "")
-        .replace(
-            " durable scheduling infrastructure for a workflow where an approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[an approved invoice posts a signed audit record].",
-            " durable scheduling infrastructure for a workflow where each approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[each approved invoice posts a signed audit record].",
-        );
+    let prerelease_prompt = INTENT_RECIPE_SYSTEM_PROMPT_V4.replace(
+        " Exclude summaries or preservation, anti-weakening, and anti-substitution restatements of captured requirements. Never paraphrase or use noun fragments.",
+        " Exclude summaries.",
+    );
     assert_ne!(prerelease_prompt, INTENT_RECIPE_SYSTEM_PROMPT_V4);
     let mut prerelease = current.clone();
     prerelease.messages[0] = Message::system(prerelease_prompt);

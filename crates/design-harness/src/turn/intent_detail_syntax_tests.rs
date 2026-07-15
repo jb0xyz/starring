@@ -199,6 +199,23 @@ fn generic_ephemeral_text_is_only_a_requirement_fragment() {
 }
 
 #[test]
+fn exact_adverbs_and_possessive_response_fragments_remain_closed() {
+    assert_eq!(
+        supported_detail_facets(
+            "room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'"
+        ),
+        Some(vec![IntentRecipeDetailFacetV3::Controls])
+    );
+    for requirement in [
+        "its ephemeral response is 'Read this first'",
+        "its ephemeral response is exactly 'Read the guide'",
+    ] {
+        assert_eq!(supported_detail_facets(requirement), None);
+        assert!(supported_detail_fragment(requirement));
+    }
+}
+
+#[test]
 fn unquoted_values_require_a_closed_assignment_tail() {
     for requirement in [
         "channel name prefix to focus-",
