@@ -592,11 +592,7 @@
     expectedRestartCount: 0
     expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|
     expectedBoundaryViolations: ""
-    expectedUnclassifiedRequirements:
-      - an LLM decides rewards at event time
-      - every message earns XP
-      - levels unlock an economy
-      - timers advance quests
+    expectedUnclassifiedRequirements: '["an LLM decides rewards at event time","every message earns XP","levels unlock an economy","timers advance quests"]'
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance

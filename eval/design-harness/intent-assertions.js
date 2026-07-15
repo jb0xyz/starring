@@ -951,7 +951,21 @@ function expectedBoundaries(expected) {
 
 function expectedUnclassifiedRequirements(expected) {
   if (Object.hasOwn(expected, 'expectedUnclassifiedRequirements')) {
-    return { exact: list(expected.expectedUnclassifiedRequirements).sort(), contains: [] };
+    const value = expected.expectedUnclassifiedRequirements;
+    if (typeof value === 'string' && value.trim().startsWith('[')) {
+      let decoded;
+      try {
+        decoded = JSON.parse(value);
+      } catch {
+        throw new Error('expectedUnclassifiedRequirements JSON is invalid');
+      }
+      if (!Array.isArray(decoded)
+        || decoded.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)) {
+        throw new Error('expectedUnclassifiedRequirements JSON must be an array of non-empty strings');
+      }
+      return { exact: decoded.map((entry) => entry.trim()).sort(), contains: [] };
+    }
+    return { exact: list(value).sort(), contains: [] };
   }
   if (Object.hasOwn(expected, 'expectedUnclassifiedEvidenceContains')) {
     return { exact: null, contains: list(expected.expectedUnclassifiedEvidenceContains).sort() };

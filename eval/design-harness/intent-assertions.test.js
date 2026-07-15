@@ -868,7 +868,7 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
     expectedCompiledOperations: undefined,
     completeRequest: false,
     expectedBlockers: 'durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|',
-    expectedUnclassifiedRequirements: statefulRequirements,
+    expectedUnclassifiedRequirements: JSON.stringify(statefulRequirements),
   });
   const statefulInput = `Build a stateful game where ${statefulRequirements.join(', ')}. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts.`;
   const stateful = routedDocument(
