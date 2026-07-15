@@ -7,8 +7,8 @@ use crate::intent::{
     ValidatedIntentV2, INTENT_IDENTITY_REVISION,
 };
 use crate::turn::{
-    parse_interpret_intent_core_for_serving, parse_private_study_room_details_for_serving,
-    parse_resolve_intent_decision,
+    parse_interpret_intent_core_for_serving, parse_private_study_room_details_for_active_serving,
+    parse_resolve_intent_decision, IntentRecipeDetailExpectationV4,
 };
 
 use super::super::DesignSession;
@@ -449,14 +449,16 @@ impl<C> DesignSession<C> {
         request_evidence: IntentRequestEvidenceChainV1,
         arguments: &str,
         human_message: &str,
+        detail_expectations: &[IntentRecipeDetailExpectationV4],
     ) -> Result<IntentTurnSuccess, StructuredError> {
         let expected_revision = selection.expected_revision();
         let core_semantic_digest = selection.semantic_ir_digest().to_string();
         let source_human_turn_digest = request_evidence.initial_human_turn_digest()?.to_string();
         let detail_facets = selection.detail_facets().to_vec();
-        let details = parse_private_study_room_details_for_serving(
+        let details = parse_private_study_room_details_for_active_serving(
             arguments,
             &detail_facets,
+            detail_expectations,
             expected_revision,
             &core_semantic_digest,
             human_message,

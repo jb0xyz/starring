@@ -9,7 +9,7 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '625d1cf7521753c4b113ca7fd73860d5184fdabe1674a45501a733a62eb380be';
+const REGISTRY_DIGEST = '2f657bb1b83bd3daa16a2b7fab30674fc749cce4f4094460b9a031bb166aee10';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -229,7 +229,7 @@ function report(overrides = {}) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 10,
+      extractor_revision: 11,
       normalizer_revision: 7,
       compiler_revision: 1,
       simulator_revision: 1,
@@ -422,6 +422,27 @@ test('served model provenance is independent of tool calls and retry attempts st
   retry.model_call_metrics = structuredClone(retry.turns[0].model_call_metrics);
 
   assert.equal(checks.intentReceipt(JSON.stringify(retry), context()).pass, true);
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(retry), context()).reason,
+    /successful tool-call completion/,
+  );
+});
+
+test('bounded call assertion rejects non-tool completion and repair counters', () => {
+  const stopped = JSON.parse(report());
+  stopped.turns[0].model_call_metrics[0].finish_reason = 'stop';
+  stopped.model_call_metrics[0].finish_reason = 'stop';
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(stopped), context()).reason,
+    /successful tool-call completion/,
+  );
+
+  const repaired = JSON.parse(report());
+  repaired.observability.repair_attempts = 1;
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(repaired), context()).reason,
+    /repair_attempts=1 expected=0/,
+  );
 });
 
 test('detail-path assertions require two calls and pin every custom value to its RuleSet path', () => {
@@ -1162,7 +1183,7 @@ test('V4 report contract rejects version, evidence, and candidate identity drift
   assert.match(checks.intentReceipt(JSON.stringify(adjudicator), context()).reason, /contract identity/);
 
   const oldExtractor = JSON.parse(report());
-  oldExtractor.catalog_identity.extractor_revision = 9;
+  oldExtractor.catalog_identity.extractor_revision = 10;
   assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
 
   const oldNormalizer = JSON.parse(report());
@@ -1360,6 +1381,20 @@ test('schema, model, oracle, calls, and hard latency regressions fail closed', (
   assert.match(
     checks.intentReceipt(JSON.stringify(combinedSchemaBudget), context()).reason,
     /exceeds the Core schema budget/,
+  );
+
+  const detailSchemaBudget = JSON.parse(report());
+  for (const value of [
+    detailSchemaBudget.turns[0].model_call_metrics[0],
+    detailSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.frontier_name = 'extract_private_study_room_details';
+    value.duplicated_schema_bytes = 2100;
+    value.request_body_bytes = 7000;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(detailSchemaBudget), context()).reason,
+    /exceeds the detail schema budget/,
   );
 
   const invalidByteAccounting = JSON.parse(report());

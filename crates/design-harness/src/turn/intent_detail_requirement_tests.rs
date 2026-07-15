@@ -1,8 +1,169 @@
 use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_detail_requirement::analyze_private_study_room_details;
+use super::intent_detail_syntax::IntentRecipeDetailFieldV4;
 
 fn facets(human: &str) -> Vec<IntentRecipeDetailFacetV3> {
     analyze_private_study_room_details(human).facets().to_vec()
+}
+
+fn fields(human: &str) -> Vec<IntentRecipeDetailFieldV4> {
+    analyze_private_study_room_details(human).fields().to_vec()
+}
+
+fn expectations(human: &str) -> Vec<(IntentRecipeDetailFieldV4, String)> {
+    analyze_private_study_room_details(human)
+        .expectations()
+        .iter()
+        .map(|expectation| (expectation.field(), expectation.literal().to_owned()))
+        .collect()
+}
+
+#[test]
+fn analysis_exposes_canonical_field_literal_expectations_as_its_field_source() {
+    let human = "Exact overrides: closed response is 'Closed'; channel name prefix to Focus-; modal title is 'Deep   Focus'; channel name uses an empty suffix.";
+    let analysis = analyze_private_study_room_details(human);
+    let expected = vec![
+        (
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "Deep   Focus".to_owned(),
+        ),
+        (
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            "Focus-".to_owned(),
+        ),
+        (
+            IntentRecipeDetailFieldV4::ClosedResponse,
+            "Closed".to_owned(),
+        ),
+    ];
+    assert_eq!(
+        analysis
+            .expectations()
+            .iter()
+            .map(|expectation| (expectation.field(), expectation.literal().to_owned()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        analysis.fields(),
+        expected.iter().map(|(field, _)| *field).collect::<Vec<_>>()
+    );
+    for (_, literal) in expected {
+        assert!(human.contains(&literal), "missing {literal}");
+    }
+}
+
+#[test]
+fn analysis_preserves_korean_quoted_and_unquoted_exact_literals() {
+    for (human, expected) in [
+        (
+            "모달 제목을 '집중 방'으로 변경해줘.",
+            vec![(IntentRecipeDetailFieldV4::ModalTitle, "집중 방".to_owned())],
+        ),
+        (
+            "모달 제목을 집중 방으로 변경해줘.",
+            vec![(IntentRecipeDetailFieldV4::ModalTitle, "집중 방".to_owned())],
+        ),
+        (
+            "채널 이름 접두사를 'focus-'로 설정.",
+            vec![(
+                IntentRecipeDetailFieldV4::ChannelNamePrefix,
+                "focus-".to_owned(),
+            )],
+        ),
+        (
+            "채널 이름 접두사를 focus-로 설정하고 모달 제목을 집중 방으로 변경해줘.",
+            vec![
+                (IntentRecipeDetailFieldV4::ModalTitle, "집중 방".to_owned()),
+                (
+                    IntentRecipeDetailFieldV4::ChannelNamePrefix,
+                    "focus-".to_owned(),
+                ),
+            ],
+        ),
+    ] {
+        assert_eq!(expectations(human), expected, "{human}");
+    }
+}
+
+#[test]
+fn analysis_preserves_particle_bound_punctuation_and_rejects_final_questions() {
+    for (human, field, literal) in [
+        (
+            "도움말 버튼 라벨을 안내!로 변경해줘.",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내!",
+        ),
+        (
+            "도움말 버튼 라벨을 안내?로 변경해줘.",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내?",
+        ),
+        (
+            "도움말 버튼 라벨을 안내!?🧭로 변경해줘.",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내!?🧭",
+        ),
+        (
+            "모달 제목을 v1.0로 설정해줘.",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "v1.0",
+        ),
+    ] {
+        assert_eq!(
+            expectations(human),
+            vec![(field, literal.to_owned())],
+            "{human}"
+        );
+    }
+    assert!(expectations("도움말 버튼 라벨을 안내로 변경해줘?").is_empty());
+}
+
+#[test]
+fn full_custom_study_room_prompt_retains_only_material_serving_fields() {
+    let human = "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.";
+    assert_eq!(
+        fields(human),
+        vec![
+            IntentRecipeDetailFieldV4::CreateButtonLabel,
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            IntentRecipeDetailFieldV4::HelpLabel,
+            IntentRecipeDetailFieldV4::HelpResponse,
+        ]
+    );
+}
+
+#[test]
+fn analysis_fields_are_canonical_across_entries_and_omit_empty_counterparts() {
+    let human = "Exact overrides: closed response is 'Closed'; channel name suffix is '-room'; launcher content is 'Create'; channel name uses an empty prefix; Help button label is 'Guide'.";
+    assert_eq!(
+        fields(human),
+        vec![
+            IntentRecipeDetailFieldV4::LauncherContent,
+            IntentRecipeDetailFieldV4::ChannelNameSuffix,
+            IntentRecipeDetailFieldV4::HelpLabel,
+            IntentRecipeDetailFieldV4::ClosedResponse,
+        ]
+    );
+}
+
+#[test]
+fn conflicting_or_absent_detail_analysis_has_no_material_fields() {
+    for human in [
+        "Set the Help button label to 'Guide'. Set the Help button label to 'Assist'.",
+        "Build a managed private study-room automation with default copy and controls.",
+        "channel name uses an empty suffix",
+    ] {
+        let analysis = analyze_private_study_room_details(human);
+        assert!(
+            analysis.facets().is_empty(),
+            "unexpected facets for {human}"
+        );
+        assert!(
+            analysis.fields().is_empty(),
+            "unexpected fields for {human}"
+        );
+    }
 }
 
 fn is_private_study_room_detail_requirement(human: &str, requirement: &str) -> bool {

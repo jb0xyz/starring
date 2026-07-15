@@ -7,7 +7,8 @@ use crate::intent::{
 };
 use crate::llm::Message;
 use crate::turn::{
-    parse_private_study_room_details_for_serving, INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
+    analyze_private_study_room_details, parse_private_study_room_details_for_active_serving,
+    INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
 };
 use resource_resolution::ResourceBindingMap;
 
@@ -594,7 +595,10 @@ fn validate_initial_semantics_replay(
         .initial_human_turn_digest()
         .map_err(restored_semantics_error)?;
     let permit = if selection.detail_facets().is_empty() {
-        if turn.detail_arguments.is_some() || !turn.detail_facets.is_empty() {
+        if turn.detail_arguments.is_some()
+            || !turn.detail_facets.is_empty()
+            || !turn.detail_fields.is_empty()
+        {
             return Err(snapshot_error(
                 "default recipe extraction contains an unexpected detail frontier",
             ));
@@ -620,13 +624,20 @@ fn validate_initial_semantics_replay(
                 "detail state facets do not reproduce from the initial Core",
             ));
         }
+        let detail_analysis = analyze_private_study_room_details(human);
+        if turn.detail_fields.as_slice() != detail_analysis.fields() {
+            return Err(snapshot_error(
+                "detail state fields do not reproduce from the source human turn",
+            ));
+        }
         let detail_arguments = turn
             .detail_arguments
             .as_deref()
             .ok_or_else(|| snapshot_error("persisted detail arguments are missing"))?;
-        let details = parse_private_study_room_details_for_serving(
+        let details = parse_private_study_room_details_for_active_serving(
             detail_arguments,
             selection.detail_facets(),
+            detail_analysis.expectations(),
             selection.expected_revision(),
             selection.semantic_ir_digest(),
             human,

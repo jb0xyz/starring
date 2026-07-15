@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::llm::{Message, MessageRole};
+use crate::strict_json::{parse_json_with_unique_object_keys, StrictJsonError};
 use crate::turn::{
     EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
 };
@@ -25,6 +26,7 @@ pub(super) struct RestoredIntentStateAnchorV1 {
 #[serde(deny_unknown_fields)]
 struct RestoredIntentDetailStateAnchorV3 {
     detail_facets: Vec<crate::turn::IntentRecipeDetailFacetV3>,
+    detail_fields: Vec<crate::turn::IntentRecipeDetailFieldV4>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +53,7 @@ pub(super) struct IntentTranscriptTurnV4 {
     pub(super) detail_arguments: Option<String>,
     pub(super) detail_result: Option<serde_json::Value>,
     pub(super) detail_facets: Vec<crate::turn::IntentRecipeDetailFacetV3>,
+    pub(super) detail_fields: Vec<crate::turn::IntentRecipeDetailFieldV4>,
     pub(super) succeeded: bool,
     pub(super) primary_result: Option<serde_json::Value>,
     model_responses: usize,
@@ -95,6 +98,7 @@ pub(super) fn validate_v4_transcript(
             detail_arguments: None,
             detail_result: None,
             detail_facets: Vec::new(),
+            detail_fields: Vec::new(),
             succeeded: false,
             primary_result: None,
             model_responses: 0,
@@ -148,7 +152,9 @@ pub(super) fn validate_v4_transcript(
             let detail_state = messages.get(index).ok_or_else(|| {
                 snapshot_error("intent detail request is missing its detail state anchor")
             })?;
-            turn.detail_facets = validate_intent_detail_state(detail_state)?;
+            let detail_state = validate_intent_detail_state(detail_state)?;
+            turn.detail_facets = detail_state.detail_facets;
+            turn.detail_fields = detail_state.detail_fields;
             index = index.saturating_add(1);
             let Some(detail_response) = messages.get(index) else {
                 turn.open_model_request = true;
@@ -323,8 +329,19 @@ fn parse_intent_tool_result(
             "intent transcript tool result does not match its assistant call",
         ));
     }
-    let value: serde_json::Value = serde_json::from_str(&message.content)
-        .map_err(|_| snapshot_error("intent transcript tool result is not valid JSON"))?;
+    let value = match parse_json_with_unique_object_keys(&message.content) {
+        Ok(value) => value,
+        Err(StrictJsonError::Malformed(_)) => {
+            return Err(snapshot_error(
+                "intent transcript tool result is not valid JSON",
+            ));
+        }
+        Err(StrictJsonError::DuplicateObjectKey { .. }) => {
+            return Err(snapshot_error(
+                "intent transcript tool result contains a duplicate object key",
+            ));
+        }
+    };
     if !value.is_object()
         || value
             .get("ok")
@@ -355,7 +372,7 @@ fn parse_intent_tool_result(
 
 fn validate_intent_detail_state(
     message: &Message,
-) -> Result<Vec<crate::turn::IntentRecipeDetailFacetV3>, SessionSnapshotError> {
+) -> Result<RestoredIntentDetailStateAnchorV3, SessionSnapshotError> {
     if message.role != MessageRole::User
         || message.tool_call_id.is_some()
         || !message.tool_calls.is_empty()
@@ -371,12 +388,29 @@ fn validate_intent_detail_state(
     let state: RestoredIntentDetailStateAnchorV3 = serde_json::from_str(value)
         .map_err(|_| snapshot_error("intent transcript contains malformed detail state"))?;
     let unique = state.detail_facets.iter().copied().collect::<BTreeSet<_>>();
-    if state.detail_facets.is_empty() || unique.len() != state.detail_facets.len() {
+    if state.detail_facets.is_empty()
+        || unique.len() != state.detail_facets.len()
+        || state.detail_facets != unique.iter().copied().collect::<Vec<_>>()
+    {
         return Err(snapshot_error(
-            "intent detail state contains empty or duplicate facets",
+            "intent detail state contains empty, duplicate, or noncanonical facets",
         ));
     }
-    Ok(state.detail_facets)
+    let fields = state.detail_fields.iter().copied().collect::<BTreeSet<_>>();
+    let field_facets = fields
+        .iter()
+        .map(|field| field.facet())
+        .collect::<BTreeSet<_>>();
+    if state.detail_fields.is_empty()
+        || fields.len() != state.detail_fields.len()
+        || state.detail_fields != fields.iter().copied().collect::<Vec<_>>()
+        || field_facets != unique
+    {
+        return Err(snapshot_error(
+            "intent detail state contains invalid material fields",
+        ));
+    }
+    Ok(state)
 }
 
 fn validate_transcript_counters(

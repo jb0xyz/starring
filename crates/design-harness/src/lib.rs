@@ -4,6 +4,7 @@ pub mod gates;
 pub mod intent;
 pub mod llm;
 pub mod session;
+mod strict_json;
 pub mod tools;
 pub mod turn;
 

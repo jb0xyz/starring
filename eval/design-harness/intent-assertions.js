@@ -504,7 +504,7 @@ function modelCallMetric(value, location) {
     throw new Error(`invalid intent eval report: ${location} exceeds the Core schema budget`);
   }
   if (value.frontier_name === 'extract_private_study_room_details'
-    && value.duplicated_schema_bytes >= 1800) {
+    && value.duplicated_schema_bytes >= 2100) {
     throw new Error(`invalid intent eval report: ${location} exceeds the detail schema budget`);
   }
   return value;
@@ -1391,6 +1391,17 @@ function intentOneCallTurns(output, context) {
         || turn.model_tool_calls !== expectedToolCalls[index]) {
         failures.push(`${turn.id} calls=${turn.model_calls}/${turn.model_tool_calls} expected=${expectedModelCalls[index]}/${expectedToolCalls[index]}`);
       }
+      if (turn.model_call_metrics.length !== turn.model_calls
+        || turn.model_call_metrics.some((metric) => (
+          metric.attempt !== 1
+          || metric.outcome !== 'succeeded'
+          || metric.http_status < 200
+          || metric.http_status >= 300
+          || metric.served_model !== report.served_model
+          || metric.finish_reason !== 'tool_calls'
+        ))) {
+        failures.push(`${turn.id} did not use one successful tool-call completion per logical model call`);
+      }
     }
     const modelCalls = report.turns.reduce((sum, turn) => sum + turn.model_calls, 0);
     const modelToolCalls = report.turns.reduce((sum, turn) => sum + turn.model_tool_calls, 0);
@@ -1400,8 +1411,18 @@ function intentOneCallTurns(output, context) {
     if (report.observability.tool_calls !== modelToolCalls) {
       failures.push(`cumulative tool_calls=${report.observability.tool_calls} expected=${modelToolCalls}`);
     }
+    for (const field of [
+      'repair_attempts',
+      'repair_successes',
+      'repair_failures',
+      'repair_escalations',
+    ]) {
+      if (report.observability[field] !== 0) {
+        failures.push(`${field}=${report.observability[field]} expected=0`);
+      }
+    }
     return result(failures.length === 0, failures.length === 0
-      ? 'every turn used its exact bounded model and frontier call path'
+      ? 'every turn used its exact bounded first-attempt tool-call path without repair'
       : failures.join(', '));
   });
 }

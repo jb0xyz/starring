@@ -1,6 +1,19 @@
 use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_detail_syntax::{closed_detail_syntax_tokens, LITERAL_SENTINEL};
 
+const KOREAN_DIRECT_TERMINALS: &[&str] = &[
+    "바꿔",
+    "바꿔줘",
+    "바꿔주세요",
+    "바꾸고",
+    "변경",
+    "변경해",
+    "변경해줘",
+    "설정",
+    "설정해",
+    "설정해줘",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DetailSlot {
     LauncherContent,
@@ -24,6 +37,13 @@ pub(super) enum DetailSlot {
 pub(super) enum DetailValueShape {
     Direct,
     Affix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnquotedDetailLiteralShape {
+    FinalToken,
+    KoreanDirect,
+    KoreanAffix,
 }
 
 impl DetailSlot {
@@ -172,31 +192,26 @@ fn valid_unquoted_value_token(value: &str) -> bool {
 }
 
 fn korean_unquoted_direct(tail: &[&str]) -> bool {
-    const TERMINALS: &[&str] = &[
-        "바꿔",
-        "바꿔줘",
-        "바꿔주세요",
-        "바꾸고",
-        "변경",
-        "변경해",
-        "변경해줘",
-        "설정",
-        "설정해",
-        "설정해줘",
-    ];
     let Some((terminal, value)) = tail.split_last() else {
         return false;
     };
-    if !TERMINALS.contains(terminal)
+    if !KOREAN_DIRECT_TERMINALS.contains(terminal)
         || value.is_empty()
-        || value.len() > 2
+        || value.len() > 8
         || !value.iter().all(|token| valid_unquoted_value_token(token))
     {
         return false;
     }
-    value
-        .last()
-        .is_some_and(|token| *token == "로" || token.ends_with("로") || token.ends_with("으로"))
+    if matches!(value, ["로"] | ["으로"]) {
+        return true;
+    }
+    value.last().is_some_and(|particle| {
+        if *particle == "로" {
+            value.len() > 1
+        } else {
+            particle.ends_with("로") || particle.ends_with("으로")
+        }
+    })
 }
 
 fn valid_unquoted_affix(tail: &[&str]) -> bool {
@@ -228,7 +243,51 @@ fn korean_unquoted_affix(tail: &[&str]) -> bool {
     ) {
         return false;
     }
-    matches!(value, [literal, "로", "설정"] if valid_unquoted_value_token(literal))
+    matches!(value, ["로", "설정"] | ["으로", "설정"])
+        || matches!(value, [literal, "로", "설정"] if valid_unquoted_value_token(literal))
+}
+
+pub(super) fn punctuation_continues_korean_assignment(value: &str) -> bool {
+    if value.chars().next().is_none_or(char::is_whitespace) {
+        return false;
+    }
+    let mut tokens = value.split_whitespace();
+    let Some(value_tail) = tokens.next() else {
+        return false;
+    };
+    let Some(terminal) = tokens.next() else {
+        return false;
+    };
+    let terminal = terminal.trim_end_matches(['.', '!', '?', '。', '！', '？']);
+    (value_tail == "로" || value_tail == "으로" || value_tail.ends_with("로"))
+        && KOREAN_DIRECT_TERMINALS.contains(&terminal)
+}
+
+pub(super) fn unquoted_detail_literal_shape(
+    segment: &str,
+    expected_slot: DetailSlot,
+) -> Option<UnquotedDetailLiteralShape> {
+    let tokens = closed_detail_syntax_tokens(segment)?;
+    if tokens.iter().any(|token| {
+        token == LITERAL_SENTINEL || matches!(token.as_str(), "empty" | "빈" | "비운" | "비어")
+    }) {
+        return None;
+    }
+    let tokens = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let tokens = strip_detail_command_prefix(&tokens);
+    let tail = match match_detail_slot(tokens) {
+        Some((slot, tail)) if slot == expected_slot => tail,
+        Some(_) => return None,
+        None => tokens,
+    };
+    if expected_slot.value_shape() == DetailValueShape::Affix && korean_unquoted_affix(tail) {
+        return Some(UnquotedDetailLiteralShape::KoreanAffix);
+    }
+    if expected_slot.value_shape() == DetailValueShape::Direct && korean_unquoted_direct(tail) {
+        return Some(UnquotedDetailLiteralShape::KoreanDirect);
+    }
+    valid_unquoted_detail_assignment(expected_slot, tail)
+        .then_some(UnquotedDetailLiteralShape::FinalToken)
 }
 
 fn valid_unquoted_detail_continuation(tokens: &[&str], active_slot: DetailSlot) -> bool {
@@ -269,7 +328,7 @@ pub(super) fn strip_detail_command_prefix<'a>(tokens: &'a [&str]) -> &'a [&'a st
         .unwrap_or(tokens)
 }
 
-fn match_detail_slot<'a>(tokens: &'a [&'a str]) -> Option<(DetailSlot, &'a [&'a str])> {
+pub(super) fn match_detail_slot<'a>(tokens: &'a [&'a str]) -> Option<(DetailSlot, &'a [&'a str])> {
     const PATTERNS: &[(DetailSlot, &[&str])] = &[
         (
             DetailSlot::CreateButtonLabel,
@@ -433,9 +492,19 @@ fn valid_detail_assignment(slot: DetailSlot, tail: &[&str]) -> bool {
         &["접미사를", LITERAL_SENTINEL, "로", "설정"],
     ];
     match slot.value_shape() {
-        DetailValueShape::Direct => DIRECT.contains(&tail),
+        DetailValueShape::Direct => DIRECT.contains(&tail) || valid_korean_quoted_direct(tail),
         DetailValueShape::Affix => AFFIX.contains(&tail),
     }
+}
+
+fn valid_korean_quoted_direct(tail: &[&str]) -> bool {
+    matches!(
+        tail,
+        [literal, particle, terminal]
+            if *literal == LITERAL_SENTINEL
+                && matches!(*particle, "로" | "으로")
+                && KOREAN_DIRECT_TERMINALS.contains(terminal)
+    )
 }
 
 fn match_detail_continuation(tokens: &[&str], active_slot: DetailSlot) -> Option<DetailSlot> {

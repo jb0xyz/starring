@@ -1,5 +1,326 @@
 use super::intent_core::IntentRecipeDetailFacetV3;
-use super::intent_detail_syntax::{supported_detail_facets, supported_detail_fragment};
+use super::intent_detail_syntax::{
+    canonical_material_detail_expectations, canonical_material_detail_fields,
+    supported_detail_facets, supported_detail_fragment, supported_detail_syntax,
+    IntentRecipeDetailFieldV4,
+};
+
+fn fields(requirement: &str) -> Option<Vec<IntentRecipeDetailFieldV4>> {
+    supported_detail_syntax(requirement)
+        .map(|syntax| canonical_material_detail_fields(syntax.assignments()))
+}
+
+fn expectations(requirement: &str) -> Option<Vec<(IntentRecipeDetailFieldV4, String)>> {
+    supported_detail_syntax(requirement).map(|syntax| {
+        canonical_material_detail_expectations(syntax.assignments())
+            .iter()
+            .map(|expectation| (expectation.field(), expectation.literal().to_owned()))
+            .collect()
+    })
+}
+
+#[test]
+fn exact_literal_expectations_preserve_supported_quoted_and_unquoted_values() {
+    for (requirement, field, literal) in [
+        (
+            "modal title is 'Deep   Focus'",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "Deep   Focus",
+        ),
+        (
+            "channel name prefix to focus-",
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            "focus-",
+        ),
+        (
+            "모달 제목을 '집중 방'으로 변경해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "집중 방",
+        ),
+        (
+            "모달 제목을 집중 방으로 변경해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "집중 방",
+        ),
+        (
+            "채널 이름 접두사를 'focus-'로 설정",
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            "focus-",
+        ),
+        (
+            "채널 이름 접두사를 focus-로 설정",
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            "focus-",
+        ),
+        (
+            "모달 제목을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "Deep-Focus",
+        ),
+        (
+            "모달 제목을 집중/방으로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "집중/방",
+        ),
+        (
+            "모달 제목을 🎯(집중 방)으로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "🎯(집중 방)",
+        ),
+        (
+            "모달 제목을 A   B로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "A   B",
+        ),
+        (
+            "도움말 버튼 라벨을 안내!로 변경해줘",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내!",
+        ),
+        (
+            "도움말 버튼 라벨을 안내?로 변경해줘",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내?",
+        ),
+        (
+            "도움말 버튼 라벨을 안내!?🧭로 변경해줘",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "안내!?🧭",
+        ),
+        (
+            "모달 제목을 v1.0로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "v1.0",
+        ),
+        (
+            "모달 제목을 🧭로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+            "🧭",
+        ),
+        (
+            "도움말 버튼 라벨을 !로 변경해줘",
+            IntentRecipeDetailFieldV4::HelpLabel,
+            "!",
+        ),
+        (
+            "채널 이름 접두사를 🧭로 설정",
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+            "🧭",
+        ),
+    ] {
+        assert_eq!(
+            expectations(requirement),
+            Some(vec![(field, literal.to_owned())]),
+            "{requirement}"
+        );
+    }
+}
+
+#[test]
+fn korean_unquoted_symbol_only_values_require_raw_material() {
+    for requirement in [
+        "모달 제목을 로 설정해줘",
+        "모달 제목을 으로 설정해줘",
+        "채널 이름 접두사를 로 설정",
+        "채널 이름 접두사를 으로 설정",
+    ] {
+        assert_eq!(expectations(requirement), None, "{requirement}");
+    }
+}
+
+#[test]
+fn korean_unquoted_direct_literal_spans_cover_every_supported_direct_slot() {
+    for (requirement, field) in [
+        (
+            "런처 만들기 버튼 라벨을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::CreateButtonLabel,
+        ),
+        (
+            "모달 제목을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::ModalTitle,
+        ),
+        (
+            "도움말 버튼 라벨을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::HelpLabel,
+        ),
+        (
+            "도움말 응답을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::HelpResponse,
+        ),
+        (
+            "참가 버튼 라벨을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::JoinLabel,
+        ),
+        (
+            "참가 응답을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::JoinedResponse,
+        ),
+        (
+            "닫기 버튼 라벨을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::CloseLabel,
+        ),
+        (
+            "닫기 응답을 Deep-Focus로 설정해줘",
+            IntentRecipeDetailFieldV4::ClosedResponse,
+        ),
+    ] {
+        assert_eq!(
+            expectations(requirement),
+            Some(vec![(field, "Deep-Focus".to_owned())]),
+            "{requirement}"
+        );
+    }
+}
+
+#[test]
+fn exact_literal_expectations_are_canonical_and_omit_explicit_empty_values() {
+    let requirement = "closed response is 'Closed' and channel name prefix to Focus- and channel name uses an empty suffix and launcher content is 'Create now'";
+    assert_eq!(
+        expectations(requirement),
+        Some(vec![
+            (
+                IntentRecipeDetailFieldV4::LauncherContent,
+                "Create now".to_owned(),
+            ),
+            (
+                IntentRecipeDetailFieldV4::ChannelNamePrefix,
+                "Focus-".to_owned(),
+            ),
+            (
+                IntentRecipeDetailFieldV4::ClosedResponse,
+                "Closed".to_owned(),
+            ),
+        ])
+    );
+}
+
+#[test]
+fn every_serving_leaf_has_one_material_field_mapping() {
+    for (requirement, expected) in [
+        (
+            "launcher content is 'Create a room'",
+            IntentRecipeDetailFieldV4::LauncherContent,
+        ),
+        (
+            "launcher create button label is 'Start'",
+            IntentRecipeDetailFieldV4::CreateButtonLabel,
+        ),
+        (
+            "modal title is 'New room'",
+            IntentRecipeDetailFieldV4::ModalTitle,
+        ),
+        (
+            "room name label is 'Room name'",
+            IntentRecipeDetailFieldV4::RoomNameLabel,
+        ),
+        (
+            "welcome content prefix is 'Welcome '",
+            IntentRecipeDetailFieldV4::WelcomeContentPrefix,
+        ),
+        (
+            "welcome content suffix is ' ready'",
+            IntentRecipeDetailFieldV4::WelcomeContentSuffix,
+        ),
+        (
+            "hub announcement prefix is 'Created '",
+            IntentRecipeDetailFieldV4::HubAnnouncementPrefix,
+        ),
+        (
+            "hub announcement suffix is ' now'",
+            IntentRecipeDetailFieldV4::HubAnnouncementSuffix,
+        ),
+        (
+            "completed response prefix is 'Ready '",
+            IntentRecipeDetailFieldV4::CompletedResponsePrefix,
+        ),
+        (
+            "completed response suffix is ' done'",
+            IntentRecipeDetailFieldV4::CompletedResponseSuffix,
+        ),
+        (
+            "channel name prefix is 'focus-'",
+            IntentRecipeDetailFieldV4::ChannelNamePrefix,
+        ),
+        (
+            "channel name suffix is '-room'",
+            IntentRecipeDetailFieldV4::ChannelNameSuffix,
+        ),
+        (
+            "member role name prefix is 'team-'",
+            IntentRecipeDetailFieldV4::MemberRoleNamePrefix,
+        ),
+        (
+            "member role name suffix is '-members'",
+            IntentRecipeDetailFieldV4::MemberRoleNameSuffix,
+        ),
+        (
+            "Help button label is 'Guide'",
+            IntentRecipeDetailFieldV4::HelpLabel,
+        ),
+        (
+            "Help response is 'Read this'",
+            IntentRecipeDetailFieldV4::HelpResponse,
+        ),
+        (
+            "Join button label is 'Enter'",
+            IntentRecipeDetailFieldV4::JoinLabel,
+        ),
+        (
+            "joined response is 'Joined'",
+            IntentRecipeDetailFieldV4::JoinedResponse,
+        ),
+        (
+            "Close button label is 'Finish'",
+            IntentRecipeDetailFieldV4::CloseLabel,
+        ),
+        (
+            "closed response is 'Closed'",
+            IntentRecipeDetailFieldV4::ClosedResponse,
+        ),
+    ] {
+        assert_eq!(fields(requirement), Some(vec![expected]), "{requirement}");
+    }
+}
+
+#[test]
+fn material_fields_are_canonical_and_serialize_as_serving_leaf_names() {
+    let requirement = "closed response is 'Closed' and channel name suffix is '-room' and launcher content is 'Create' and Help button label is 'Guide'";
+    let fields = fields(requirement).unwrap();
+    assert_eq!(
+        fields,
+        vec![
+            IntentRecipeDetailFieldV4::LauncherContent,
+            IntentRecipeDetailFieldV4::ChannelNameSuffix,
+            IntentRecipeDetailFieldV4::HelpLabel,
+            IntentRecipeDetailFieldV4::ClosedResponse,
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(fields).unwrap(),
+        serde_json::json!([
+            "launcher_content",
+            "channel_name_suffix",
+            "help_label",
+            "closed_response"
+        ])
+    );
+    assert_eq!(
+        IntentRecipeDetailFieldV4::CompletedResponseSuffix.as_str(),
+        "completed_response_suffix"
+    );
+}
+
+#[test]
+fn explicit_empty_affixes_do_not_create_material_fields() {
+    assert_eq!(
+        fields("channel name prefix is 'focus-' and an empty suffix"),
+        Some(vec![IntentRecipeDetailFieldV4::ChannelNamePrefix])
+    );
+    assert_eq!(
+        fields("channel name uses an empty suffix"),
+        Some(Vec::new())
+    );
+}
 
 #[test]
 fn every_closed_detail_slot_maps_to_its_canonical_facet() {

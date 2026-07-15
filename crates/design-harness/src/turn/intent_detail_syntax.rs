@@ -1,10 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 
 use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_detail_grammar::{
-    parse_detail_requirement_segment, strip_detail_command_prefix, DetailSlot, DetailValueShape,
+    match_detail_slot, parse_detail_requirement_segment, strip_detail_command_prefix,
+    unquoted_detail_literal_shape, DetailSlot, DetailValueShape, UnquotedDetailLiteralShape,
 };
-use super::intent_detail_text::{closes_quote, normalized_whitespace, opening_quote};
+use super::intent_detail_text::{closes_quote, opening_quote};
 
 pub(super) const LITERAL_SENTINEL: &str = "__literal__";
 
@@ -20,6 +23,99 @@ const DETAIL_REQUIREMENT_CONNECTORS: &[&str] = &[
     " 및 ",
     " 또 ",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntentRecipeDetailFieldV4 {
+    LauncherContent,
+    CreateButtonLabel,
+    ModalTitle,
+    RoomNameLabel,
+    WelcomeContentPrefix,
+    WelcomeContentSuffix,
+    HubAnnouncementPrefix,
+    HubAnnouncementSuffix,
+    CompletedResponsePrefix,
+    CompletedResponseSuffix,
+    ChannelNamePrefix,
+    ChannelNameSuffix,
+    MemberRoleNamePrefix,
+    MemberRoleNameSuffix,
+    HelpLabel,
+    HelpResponse,
+    JoinLabel,
+    JoinedResponse,
+    CloseLabel,
+    ClosedResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IntentRecipeDetailExpectationV4 {
+    field: IntentRecipeDetailFieldV4,
+    literal: String,
+}
+
+impl IntentRecipeDetailExpectationV4 {
+    pub(crate) fn field(&self) -> IntentRecipeDetailFieldV4 {
+        self.field
+    }
+
+    pub(crate) fn literal(&self) -> &str {
+        &self.literal
+    }
+}
+
+impl IntentRecipeDetailFieldV4 {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LauncherContent => "launcher_content",
+            Self::CreateButtonLabel => "create_button_label",
+            Self::ModalTitle => "modal_title",
+            Self::RoomNameLabel => "room_name_label",
+            Self::WelcomeContentPrefix => "welcome_content_prefix",
+            Self::WelcomeContentSuffix => "welcome_content_suffix",
+            Self::HubAnnouncementPrefix => "hub_announcement_prefix",
+            Self::HubAnnouncementSuffix => "hub_announcement_suffix",
+            Self::CompletedResponsePrefix => "completed_response_prefix",
+            Self::CompletedResponseSuffix => "completed_response_suffix",
+            Self::ChannelNamePrefix => "channel_name_prefix",
+            Self::ChannelNameSuffix => "channel_name_suffix",
+            Self::MemberRoleNamePrefix => "member_role_name_prefix",
+            Self::MemberRoleNameSuffix => "member_role_name_suffix",
+            Self::HelpLabel => "help_label",
+            Self::HelpResponse => "help_response",
+            Self::JoinLabel => "join_label",
+            Self::JoinedResponse => "joined_response",
+            Self::CloseLabel => "close_label",
+            Self::ClosedResponse => "closed_response",
+        }
+    }
+
+    pub(crate) fn facet(self) -> IntentRecipeDetailFacetV3 {
+        match self {
+            Self::LauncherContent
+            | Self::CreateButtonLabel
+            | Self::ModalTitle
+            | Self::RoomNameLabel
+            | Self::WelcomeContentPrefix
+            | Self::WelcomeContentSuffix
+            | Self::HubAnnouncementPrefix
+            | Self::HubAnnouncementSuffix
+            | Self::CompletedResponsePrefix
+            | Self::CompletedResponseSuffix => IntentRecipeDetailFacetV3::Copy,
+            Self::ChannelNamePrefix
+            | Self::ChannelNameSuffix
+            | Self::MemberRoleNamePrefix
+            | Self::MemberRoleNameSuffix => IntentRecipeDetailFacetV3::Naming,
+            Self::HelpLabel
+            | Self::HelpResponse
+            | Self::JoinLabel
+            | Self::JoinedResponse
+            | Self::CloseLabel
+            | Self::ClosedResponse => IntentRecipeDetailFacetV3::Controls,
+        }
+    }
+}
 
 #[cfg(test)]
 pub(super) fn supported_detail_facets(requirement: &str) -> Option<Vec<IntentRecipeDetailFacetV3>> {
@@ -45,7 +141,7 @@ pub(super) fn supported_detail_syntax(requirement: &str) -> Option<SupportedDeta
         let assignment = DetailAssignmentClaim {
             slot,
             part: detail_value_part(&segment, slot)?,
-            value: detail_value_identity(&segment)?,
+            value: detail_value_identity(&segment, slot)?,
         };
         if let Some(existing) = assignments
             .iter()
@@ -121,8 +217,7 @@ enum DetailValuePart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DetailValueIdentity {
     Empty,
-    Quoted(String),
-    Unquoted(String),
+    Material(String),
 }
 
 pub(super) struct SupportedDetailSyntax {
@@ -172,6 +267,116 @@ impl DetailAssignmentClaim {
     pub(super) fn has_material_value(&self) -> bool {
         self.value != DetailValueIdentity::Empty
     }
+
+    pub(super) fn material_expectation(&self) -> Option<IntentRecipeDetailExpectationV4> {
+        let DetailValueIdentity::Material(literal) = &self.value else {
+            return None;
+        };
+        Some(IntentRecipeDetailExpectationV4 {
+            field: detail_assignment_field(self.slot, self.part),
+            literal: literal.clone(),
+        })
+    }
+}
+
+pub(super) fn canonical_material_detail_expectations(
+    assignments: &[DetailAssignmentClaim],
+) -> Vec<IntentRecipeDetailExpectationV4> {
+    assignments
+        .iter()
+        .filter_map(DetailAssignmentClaim::material_expectation)
+        .map(|expectation| (expectation.field, expectation))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn canonical_material_detail_fields(
+    assignments: &[DetailAssignmentClaim],
+) -> Vec<IntentRecipeDetailFieldV4> {
+    canonical_material_detail_expectations(assignments)
+        .iter()
+        .map(IntentRecipeDetailExpectationV4::field)
+        .collect()
+}
+
+fn detail_assignment_field(slot: DetailSlot, part: DetailValuePart) -> IntentRecipeDetailFieldV4 {
+    match (slot, part) {
+        (DetailSlot::LauncherContent, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::LauncherContent
+        }
+        (DetailSlot::CreateButtonLabel, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::CreateButtonLabel
+        }
+        (DetailSlot::ModalTitle, DetailValuePart::Direct) => IntentRecipeDetailFieldV4::ModalTitle,
+        (DetailSlot::RoomNameLabel, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::RoomNameLabel
+        }
+        (DetailSlot::WelcomeContent, DetailValuePart::Prefix) => {
+            IntentRecipeDetailFieldV4::WelcomeContentPrefix
+        }
+        (DetailSlot::WelcomeContent, DetailValuePart::Suffix) => {
+            IntentRecipeDetailFieldV4::WelcomeContentSuffix
+        }
+        (DetailSlot::HubAnnouncement, DetailValuePart::Prefix) => {
+            IntentRecipeDetailFieldV4::HubAnnouncementPrefix
+        }
+        (DetailSlot::HubAnnouncement, DetailValuePart::Suffix) => {
+            IntentRecipeDetailFieldV4::HubAnnouncementSuffix
+        }
+        (DetailSlot::CompletedResponse, DetailValuePart::Prefix) => {
+            IntentRecipeDetailFieldV4::CompletedResponsePrefix
+        }
+        (DetailSlot::CompletedResponse, DetailValuePart::Suffix) => {
+            IntentRecipeDetailFieldV4::CompletedResponseSuffix
+        }
+        (DetailSlot::ChannelName, DetailValuePart::Prefix) => {
+            IntentRecipeDetailFieldV4::ChannelNamePrefix
+        }
+        (DetailSlot::ChannelName, DetailValuePart::Suffix) => {
+            IntentRecipeDetailFieldV4::ChannelNameSuffix
+        }
+        (DetailSlot::MemberRoleName, DetailValuePart::Prefix) => {
+            IntentRecipeDetailFieldV4::MemberRoleNamePrefix
+        }
+        (DetailSlot::MemberRoleName, DetailValuePart::Suffix) => {
+            IntentRecipeDetailFieldV4::MemberRoleNameSuffix
+        }
+        (DetailSlot::HelpLabel, DetailValuePart::Direct) => IntentRecipeDetailFieldV4::HelpLabel,
+        (DetailSlot::HelpResponse, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::HelpResponse
+        }
+        (DetailSlot::JoinLabel, DetailValuePart::Direct) => IntentRecipeDetailFieldV4::JoinLabel,
+        (DetailSlot::JoinResponse, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::JoinedResponse
+        }
+        (DetailSlot::CloseLabel, DetailValuePart::Direct) => IntentRecipeDetailFieldV4::CloseLabel,
+        (DetailSlot::CloseResponse, DetailValuePart::Direct) => {
+            IntentRecipeDetailFieldV4::ClosedResponse
+        }
+        (
+            DetailSlot::LauncherContent
+            | DetailSlot::CreateButtonLabel
+            | DetailSlot::ModalTitle
+            | DetailSlot::RoomNameLabel
+            | DetailSlot::HelpLabel
+            | DetailSlot::HelpResponse
+            | DetailSlot::JoinLabel
+            | DetailSlot::JoinResponse
+            | DetailSlot::CloseLabel
+            | DetailSlot::CloseResponse,
+            DetailValuePart::Prefix | DetailValuePart::Suffix,
+        )
+        | (
+            DetailSlot::WelcomeContent
+            | DetailSlot::HubAnnouncement
+            | DetailSlot::CompletedResponse
+            | DetailSlot::ChannelName
+            | DetailSlot::MemberRoleName,
+            DetailValuePart::Direct,
+        ) => unreachable!(),
+    }
 }
 
 fn detail_value_part(segment: &str, slot: DetailSlot) -> Option<DetailValuePart> {
@@ -194,10 +399,16 @@ fn detail_value_part(segment: &str, slot: DetailSlot) -> Option<DetailValuePart>
     None
 }
 
-fn detail_value_identity(segment: &str) -> Option<DetailValueIdentity> {
+fn detail_value_identity(segment: &str, slot: DetailSlot) -> Option<DetailValueIdentity> {
     let tokens = closed_detail_syntax_tokens(segment)?;
     if tokens.iter().any(|token| token == LITERAL_SENTINEL) {
-        return quoted_detail_literal(segment).map(DetailValueIdentity::Quoted);
+        return quoted_detail_literal(segment)
+            .map(|literal| literal.replace("\r\n", "\n"))
+            .filter(|literal| !literal.trim().is_empty())
+            .filter(|literal| {
+                slot.value_shape() == DetailValueShape::Affix || literal.trim() == literal
+            })
+            .map(DetailValueIdentity::Material);
     }
     if tokens
         .iter()
@@ -205,9 +416,88 @@ fn detail_value_identity(segment: &str) -> Option<DetailValueIdentity> {
     {
         return Some(DetailValueIdentity::Empty);
     }
-    Some(DetailValueIdentity::Unquoted(
-        normalized_whitespace(segment).to_lowercase(),
-    ))
+    unquoted_detail_literal(segment, slot).map(DetailValueIdentity::Material)
+}
+
+fn unquoted_detail_literal(segment: &str, slot: DetailSlot) -> Option<String> {
+    let shape = unquoted_detail_literal_shape(segment, slot)?;
+    let segment = segment
+        .trim()
+        .trim_end_matches(['.', '!', '?', '。', '！', '？'])
+        .trim_end();
+    let literal = match shape {
+        UnquotedDetailLiteralShape::FinalToken => {
+            segment.split_whitespace().next_back()?.to_owned()
+        }
+        UnquotedDetailLiteralShape::KoreanDirect => korean_unquoted_direct_literal(segment, slot)?,
+        UnquotedDetailLiteralShape::KoreanAffix => korean_unquoted_affix_literal(segment, slot)?,
+    };
+    (!literal.is_empty()).then_some(literal)
+}
+
+fn korean_unquoted_affix_literal(segment: &str, expected_slot: DetailSlot) -> Option<String> {
+    let tokens = closed_detail_syntax_tokens(segment)?;
+    let token_values = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let stripped = strip_detail_command_prefix(&token_values);
+    let (slot, tail) = match_detail_slot(stripped)?;
+    if slot != expected_slot {
+        return None;
+    }
+    let tail_start = token_values.len().checked_sub(tail.len())?;
+    let spans = unquoted_alphanumeric_spans(segment);
+    if spans.len() != token_values.len() {
+        return None;
+    }
+    let value_start = spans.get(tail_start)?.1;
+    let terminal_start = spans.last()?.0;
+    let with_particle = segment.get(value_start..terminal_start)?.trim();
+    let literal = strip_korean_assignment_particle(with_particle)?.trim();
+    (!literal.is_empty() && literal.split_whitespace().count() <= 1).then(|| literal.to_owned())
+}
+
+fn korean_unquoted_direct_literal(segment: &str, expected_slot: DetailSlot) -> Option<String> {
+    let tokens = closed_detail_syntax_tokens(segment)?;
+    let token_values = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let stripped = strip_detail_command_prefix(&token_values);
+    let (slot, tail) = match_detail_slot(stripped)?;
+    if slot != expected_slot {
+        return None;
+    }
+    let tail_start = token_values.len().checked_sub(tail.len())?;
+    let spans = unquoted_alphanumeric_spans(segment);
+    if spans.len() != token_values.len() || tail_start == 0 {
+        return None;
+    }
+    let value_start = spans.get(tail_start.checked_sub(1)?)?.1;
+    let terminal_start = spans.last()?.0;
+    let with_particle = segment.get(value_start..terminal_start)?.trim();
+    let literal = strip_korean_assignment_particle(with_particle)?.trim();
+    let whitespace_tokens = literal.split_whitespace().count();
+    (!literal.is_empty() && whitespace_tokens <= 2).then(|| literal.to_owned())
+}
+
+fn unquoted_alphanumeric_spans(value: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_alphanumeric() {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            spans.push((start, index));
+        }
+    }
+    if let Some(start) = start {
+        spans.push((start, value.len()));
+    }
+    spans
+}
+
+fn strip_korean_assignment_particle(value: &str) -> Option<&str> {
+    value
+        .strip_suffix(" 로")
+        .or_else(|| value.strip_suffix("으로"))
+        .or_else(|| value.strip_suffix("로"))
+        .map(str::trim_end)
 }
 
 fn quoted_detail_literal(value: &str) -> Option<String> {
@@ -327,7 +617,7 @@ pub(super) fn detail_requirement_connector_len(value: &str) -> Option<usize> {
 }
 
 fn push_detail_requirement_segment(segments: &mut Vec<String>, current: &mut String) {
-    let segment = normalized_whitespace(current);
+    let segment = current.trim().to_owned();
     current.clear();
     if !segment.is_empty() {
         segments.push(segment);

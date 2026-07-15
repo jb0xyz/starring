@@ -213,13 +213,24 @@ function exactCallsPerTurn(entry) {
     turn.model_calls === expectedModelCalls[index]
       && turn.model_tool_calls === expectedToolCalls[index]
       && turn.model_call_metrics.length === turn.model_calls
-      && turn.model_call_metrics.every((metric) => metric.attempt === 1)
+      && turn.model_call_metrics.every((metric) => (
+        metric.attempt === 1
+          && metric.outcome === 'succeeded'
+          && metric.http_status >= 200
+          && metric.http_status < 300
+          && metric.served_model === entry.report.served_model
+          && metric.finish_reason === 'tool_calls'
+      ))
   ));
   return exactTurns
     && entry.report.observability?.model_calls === expectedModelCalls.reduce((sum, value) => sum + value, 0)
     && entry.report.observability?.tool_calls === expectedToolCalls.reduce((sum, value) => sum + value, 0)
     && entry.report.model_call_metrics.length === entry.report.observability.model_calls
-    && entry.report.model_call_metrics.every((metric) => metric.attempt === 1);
+    && entry.report.model_call_metrics.every((metric) => metric.attempt === 1)
+    && entry.report.observability.repair_attempts === 0
+    && entry.report.observability.repair_successes === 0
+    && entry.report.observability.repair_failures === 0
+    && entry.report.observability.repair_escalations === 0;
 }
 
 function zeroAutomaticRetries(entry) {

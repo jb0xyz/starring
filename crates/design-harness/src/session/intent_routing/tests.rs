@@ -132,7 +132,8 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         .contains("created channel or member-role name affixes"));
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
         .contains("controls.help_label, controls.help_response"));
-    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3.contains("Omit an explicitly empty affix"));
+    assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
+        .contains("An explicitly empty affix is absent from detail_fields"));
 }
 
 fn bindings(channel: &str, id: &str) -> ResourceBindingMap {
@@ -606,7 +607,13 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(detail_anchor, json!({"detail_facets": ["copy"]}));
+        assert_eq!(
+            detail_anchor,
+            json!({
+                "detail_facets": ["copy"],
+                "detail_fields": ["create_button_label"]
+            })
+        );
         assert_eq!(session.observability.model_calls, 2);
         assert_eq!(session.observability.tool_calls, 2);
         assert_eq!(session.observability.intent_commits, 1);
@@ -665,7 +672,7 @@ fn supported_detail_requirements_do_not_become_capability_gaps_and_restore() {
             "extract_private_study_room_details",
             json!({
                 "copy": {"create_button_label": "Start focus room"},
-                "naming": {"channel_name_prefix": "focus-", "channel_name_suffix": ""},
+                "naming": {"channel_name_prefix": "focus-"},
                 "controls": {"help_label": "Guide", "help_response": "Read this first"}
             }),
         );
@@ -814,6 +821,56 @@ fn ungrounded_recipe_detail_halts_before_digest_compile_or_commit() {
         assert_eq!(session.observability.intent_compile_attempts, 0);
         assert_eq!(session.observability.intent_compile_successes, 0);
         assert_eq!(session.observability.intent_commits, 0);
+    });
+}
+
+#[test]
+fn misassigned_recipe_detail_halts_without_retry_compile_or_mutation() {
+    block_on(async {
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({
+                "controls": {
+                    "help_label": "Read this first",
+                    "help_response": "Guide"
+                }
+            }),
+        );
+        let client = ScriptedClient::new(vec![
+            Ok(private_room(0, Some("community_hub"))),
+            Ok(details),
+        ]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root_draft = session.draft.clone();
+        let root_stage = session.snapshot().intent_recipe.unwrap().stage;
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst(
+                "Create private rooms in community_hub. Set the Help button label to 'Guide' and its response to 'Read this first'.",
+            )
+            .await
+        else {
+            panic!("expected misassigned detail halt")
+        };
+        assert_eq!(report.code, "RECIPE_DETAIL_LITERAL_MISMATCH");
+        assert_eq!(session.draft, root_draft);
+        assert_eq!(session.snapshot().intent_recipe.unwrap().stage, root_stage);
+        assert_eq!(session.observability.model_calls, 2);
+        assert_eq!(session.observability.tool_calls, 2);
+        assert_eq!(session.observability.intent_extraction_failures, 1);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_commits, 0);
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            session.snapshot(),
+            bindings("community_hub", "700"),
+        )
+        .expect("exact literal mismatch failure should restore");
+        assert_eq!(restored.draft, root_draft);
+        assert_eq!(restored.snapshot().intent_recipe.unwrap().stage, root_stage);
     });
 }
 
@@ -3364,9 +3421,109 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
             Err(error) => error,
             Ok(_) => panic!("tampered detail arguments restored"),
         };
-        assert!(error
-            .to_string()
-            .contains("detail recipe evidence does not reproduce"));
+        assert!(error.to_string().contains("RECIPE_DETAIL_LITERAL_MISMATCH"));
+    });
+}
+
+#[test]
+fn restore_rejects_same_facet_detail_field_ticket_substitution() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let (core, details) = private_room_with_copy_details(0, Some("community_hub"));
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(core), Ok(details)]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private rooms in community_hub. Set the launcher create-button label to 'Start exact focus'.",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let state = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| message.content.starts_with(INTENT_DETAIL_STATE_PREFIX))
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(
+            state
+                .content
+                .strip_prefix(INTENT_DETAIL_STATE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        value["detail_fields"] = json!(["launcher_content"]);
+        state.content = format!("{INTENT_DETAIL_STATE_PREFIX}{value}");
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("substituted detail field ticket restored"),
+        };
+        assert!(error.to_string().contains("detail state fields"));
+    });
+}
+
+#[test]
+fn restore_rejects_noncanonical_detail_facet_ticket_order() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let request = "Build a managed private study-room automation in community_hub. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'.";
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({
+                "copy": {"create_button_label": "Start focus room"},
+                "naming": {"channel_name_prefix": "focus-"},
+                "controls": {"help_label": "Guide", "help_response": "Read this first"}
+            }),
+        );
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![
+                Ok(private_room(0, Some("community_hub"))),
+                Ok(details),
+            ]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session.run_burst(request).await,
+            BurstOutcome::Ready { .. }
+        ));
+        let mut snapshot = session.snapshot();
+        let state = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| message.content.starts_with(INTENT_DETAIL_STATE_PREFIX))
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(
+            state
+                .content
+                .strip_prefix(INTENT_DETAIL_STATE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        value["detail_facets"] = json!(["controls", "naming", "copy"]);
+        state.content = format!("{INTENT_DETAIL_STATE_PREFIX}{value}");
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("noncanonical detail facet ticket restored"),
+        };
+        assert!(error.to_string().contains("noncanonical facets"));
     });
 }
 
@@ -3453,6 +3610,141 @@ fn restore_rejects_tampered_private_success_tool_results() {
         .expect("tampered detail-required result restored")
         .to_string()
         .contains("does not match its selected facets"));
+    });
+}
+
+#[test]
+fn restore_rejects_duplicate_persisted_tool_result_keys() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let original = session.snapshot();
+        for prefix in [r#""ok":false,"#, r#""status":"forged","#] {
+            let mut snapshot = original.clone();
+            let result = snapshot
+                .messages
+                .iter_mut()
+                .find(|message| {
+                    message.role == MessageRole::Tool
+                        && serde_json::from_str::<serde_json::Value>(&message.content)
+                            .ok()
+                            .and_then(|value| value.get("status").cloned())
+                            == Some(json!("preview_ready"))
+                })
+                .unwrap();
+            let body = result.content.strip_prefix('{').unwrap();
+            result.content = format!("{{{prefix}{body}");
+            refresh_transcript_integrity(&mut snapshot);
+            let error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                snapshot,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("duplicate tool-result key restored");
+            assert!(error.to_string().contains("duplicate object key"));
+        }
+    });
+}
+
+#[test]
+fn restore_preserves_non_object_tool_result_error_precedence() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let original = session.snapshot();
+        for content in ["null", "[]", r#""scalar""#] {
+            let mut snapshot = original.clone();
+            let result = snapshot
+                .messages
+                .iter_mut()
+                .find(|message| {
+                    message.role == MessageRole::Tool
+                        && serde_json::from_str::<serde_json::Value>(&message.content)
+                            .ok()
+                            .and_then(|value| value.get("status").cloned())
+                            == Some(json!("preview_ready"))
+                })
+                .unwrap();
+            result.content = content.to_owned();
+            refresh_transcript_integrity(&mut snapshot);
+            let error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                snapshot,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("non-object tool result restored");
+            let message = error.to_string();
+            assert!(message.contains("does not contain a typed outcome"));
+            assert!(!message.contains("not valid JSON"));
+        }
+    });
+}
+
+#[test]
+fn restore_rejects_duplicate_persisted_detail_argument_keys() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let (core, details) = private_room_with_copy_details(0, Some("community_hub"));
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(core), Ok(details)]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private rooms in community_hub. Set the launcher create-button label to 'Start exact focus'.",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let original = session.snapshot();
+        for arguments in [
+            r#"{"copy":{"create_button_label":"Start exact focus"},"copy":{"create_button_label":"Start exact focus"}}"#,
+            r#"{"copy":{"create_button_label":"Start exact focus","create_button_label":"Start exact focus"}}"#,
+        ] {
+            let mut snapshot = original.clone();
+            let call = snapshot
+                .messages
+                .iter_mut()
+                .flat_map(|message| &mut message.tool_calls)
+                .find(|call| call.name == "extract_private_study_room_details")
+                .unwrap();
+            call.arguments = arguments.to_owned();
+            refresh_transcript_integrity(&mut snapshot);
+            let error = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                snapshot,
+                resource_bindings.clone(),
+            )
+            .err()
+            .expect("duplicate detail argument key restored");
+            assert!(error
+                .to_string()
+                .contains("RECIPE_DETAIL_FRONTIER_MISMATCH"));
+        }
     });
 }
 

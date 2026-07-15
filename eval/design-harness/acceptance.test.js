@@ -8,7 +8,7 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '625d1cf7521753c4b113ca7fd73860d5184fdabe1674a45501a733a62eb380be';
+const REGISTRY_DIGEST = '2f657bb1b83bd3daa16a2b7fab30674fc749cce4f4094460b9a031bb166aee10';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -350,7 +350,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 10,
+      extractor_revision: 11,
       normalizer_revision: 7,
       compiler_revision: 1,
       simulator_revision: 1,
@@ -1001,7 +1001,7 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
 
 test('checkpoint rejects stale extractor, normalizer, and forged registry identities', () => {
   const oldExtractor = passingDocument();
-  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 9;
+  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 10;
   const oldExtractorAssessment = assess(oldExtractor);
   assert.equal(oldExtractorAssessment.pass, false);
   assert.equal(
@@ -1476,6 +1476,32 @@ test('checkpoint rejects any automatic HTTP retry attempt', () => {
   assert.equal(assessment.pass, false);
   assert.equal(
     assessment.checks.find((entry) => entry.name === 'zero_automatic_http_retries').pass,
+    false,
+  );
+});
+
+test('checkpoint rejects non-tool completion and repair activity', () => {
+  const stopped = passingDocument();
+  const stoppedReport = stopped.results.results[0].response.metadata;
+  stoppedReport.turns[0].model_call_metrics[0].finish_reason = 'stop';
+  stoppedReport.model_call_metrics[0].finish_reason = 'stop';
+  const stoppedAssessment = assess(stopped);
+  assert.equal(stoppedAssessment.pass, false);
+  assert.equal(
+    stoppedAssessment.checks.find(
+      (entry) => entry.name === 'exact_case_aware_calls_per_turn',
+    ).pass,
+    false,
+  );
+
+  const repaired = passingDocument();
+  repaired.results.results[0].response.metadata.observability.repair_attempts = 1;
+  const repairedAssessment = assess(repaired);
+  assert.equal(repairedAssessment.pass, false);
+  assert.equal(
+    repairedAssessment.checks.find(
+      (entry) => entry.name === 'exact_case_aware_calls_per_turn',
+    ).pass,
     false,
   );
 });

@@ -1,18 +1,22 @@
 use std::collections::BTreeSet;
 
 use super::intent_core::IntentRecipeDetailFacetV3;
+use super::intent_detail_grammar::punctuation_continues_korean_assignment;
 use super::intent_detail_policy::{
     declares_exact_override_list, default_detail_header_policy, is_unsafe_scope,
     DefaultDetailHeaderPolicy,
 };
 use super::intent_detail_syntax::{
-    detail_requirement_connector_len, supported_detail_fragment, supported_detail_syntax,
-    DetailAssignmentClaim,
+    canonical_material_detail_expectations, detail_requirement_connector_len,
+    supported_detail_fragment, supported_detail_syntax, DetailAssignmentClaim,
+    IntentRecipeDetailExpectationV4, IntentRecipeDetailFieldV4,
 };
 use super::intent_detail_text::{closes_quote, normalized_whitespace, opening_quote};
 
-pub(super) struct PrivateStudyRoomDetailAnalysis {
+pub(crate) struct PrivateStudyRoomDetailAnalysis {
     facets: Vec<IntentRecipeDetailFacetV3>,
+    expectations: Vec<IntentRecipeDetailExpectationV4>,
+    fields: Vec<IntentRecipeDetailFieldV4>,
     normalized_human: String,
     evidence_entries: Vec<IndexedDetailEvidence>,
 }
@@ -89,6 +93,14 @@ impl PrivateStudyRoomDetailAnalysis {
         &self.facets
     }
 
+    pub(crate) fn fields(&self) -> &[IntentRecipeDetailFieldV4] {
+        &self.fields
+    }
+
+    pub(crate) fn expectations(&self) -> &[IntentRecipeDetailExpectationV4] {
+        &self.expectations
+    }
+
     pub(super) fn explains_requirement(&self, requirement: &str) -> bool {
         let requirement = normalized_whitespace(requirement);
         if requirement.is_empty() || !supported_detail_fragment(&requirement) {
@@ -110,7 +122,7 @@ impl PrivateStudyRoomDetailAnalysis {
     }
 }
 
-pub(super) fn analyze_private_study_room_details(
+pub(crate) fn analyze_private_study_room_details(
     human_message: &str,
 ) -> PrivateStudyRoomDetailAnalysis {
     let mut facets = BTreeSet::new();
@@ -154,8 +166,18 @@ pub(super) fn analyze_private_study_room_details(
     if !all_slots_have_material_values(&assignments) {
         return empty_detail_analysis(human_message);
     }
+    let expectations = canonical_material_detail_expectations(&assignments);
+    let fields = expectations
+        .iter()
+        .map(IntentRecipeDetailExpectationV4::field)
+        .collect();
+    debug_assert!(expectations
+        .iter()
+        .all(|expectation| !expectation.literal().is_empty()));
     PrivateStudyRoomDetailAnalysis {
         facets: facets.into_iter().collect(),
+        expectations,
+        fields,
         normalized_human: normalized_whitespace(human_message),
         evidence_entries,
     }
@@ -191,6 +213,8 @@ fn all_slots_have_material_values(assignments: &[DetailAssignmentClaim]) -> bool
 fn empty_detail_analysis(human_message: &str) -> PrivateStudyRoomDetailAnalysis {
     PrivateStudyRoomDetailAnalysis {
         facets: Vec::new(),
+        expectations: Vec::new(),
+        fields: Vec::new(),
         normalized_human: normalized_whitespace(human_message),
         evidence_entries: Vec::new(),
     }
@@ -294,23 +318,18 @@ fn human_detail_sentences(value: &str) -> Vec<HumanDetailSentence> {
     let mut current = String::new();
     let mut active_quote = None;
     let mut previous = None;
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
+    let mut characters = value.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let next = characters.peek().map(|(_, character)| *character);
         if let Some(expected_close) = active_quote {
             current.push(character);
-            if closes_quote(
-                character,
-                expected_close,
-                previous,
-                characters.peek().copied(),
-            ) {
+            if closes_quote(character, expected_close, previous, next) {
                 active_quote = None;
             }
             previous = Some(character);
             continue;
         }
-        if let Some(expected_close) = opening_quote(character, previous, characters.peek().copied())
-        {
+        if let Some(expected_close) = opening_quote(character, previous, next) {
             active_quote = Some(expected_close);
             current.push(character);
             previous = Some(character);
@@ -324,8 +343,12 @@ fn human_detail_sentences(value: &str) -> Vec<HumanDetailSentence> {
                 .all(|character| character.is_ascii_digit())
             && characters
                 .peek()
-                .is_some_and(|character| character.is_whitespace());
-        if numbered_list_marker {
+                .is_some_and(|(_, character)| character.is_whitespace());
+        let particle_bound_punctuation = matches!(character, '.' | '!' | '?' | '。' | '！' | '？')
+            && punctuation_continues_korean_assignment(
+                &value[index.saturating_add(character.len_utf8())..],
+            );
+        if numbered_list_marker || particle_bound_punctuation {
             current.push(character);
             previous = Some(character);
         } else if matches!(
@@ -348,7 +371,7 @@ fn push_human_sentence(
     current: &mut String,
     terminator: Option<char>,
 ) {
-    let text = normalized_whitespace(current);
+    let text = current.trim().to_owned();
     current.clear();
     if !text.is_empty() {
         sentences.push(HumanDetailSentence { text, terminator });
@@ -369,7 +392,7 @@ fn detail_evidence_entries(sentence: &str) -> Option<Vec<DetailEvidenceEntry>> {
                     Some(DetailEvidenceEntry {
                         facets: syntax.facets().to_vec(),
                         assignments: syntax.assignments().to_vec(),
-                        text,
+                        text: normalized_whitespace(&text),
                     })
                 })
                 .collect();
@@ -428,7 +451,7 @@ fn general_detail_entries(value: &str) -> Option<Vec<DetailEvidenceEntry>> {
             Some(DetailEvidenceEntry {
                 facets: syntax.facets().to_vec(),
                 assignments: syntax.assignments().to_vec(),
-                text,
+                text: normalized_whitespace(&text),
             })
         })
         .collect()
@@ -507,18 +530,18 @@ fn split_unquoted_semicolons(value: &str) -> Vec<String> {
             active_quote = Some(expected_close);
             current.push(character);
         } else if matches!(character, ';' | '；') {
-            push_normalized_text(&mut entries, &mut current);
+            push_trimmed_text(&mut entries, &mut current);
         } else {
             current.push(character);
         }
         previous = Some(character);
     }
-    push_normalized_text(&mut entries, &mut current);
+    push_trimmed_text(&mut entries, &mut current);
     entries
 }
 
-fn push_normalized_text(values: &mut Vec<String>, current: &mut String) {
-    let value = normalized_whitespace(current);
+fn push_trimmed_text(values: &mut Vec<String>, current: &mut String) {
+    let value = current.trim().to_owned();
     current.clear();
     if !value.is_empty() {
         values.push(value);

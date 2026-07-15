@@ -7,8 +7,9 @@ use serde_json::json;
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
-    private_study_room_details_frontier_for, validate_intent_human_grounding_size,
-    IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    analyze_private_study_room_details, private_study_room_details_frontier_for_fields,
+    validate_intent_human_grounding_size, IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
@@ -78,6 +79,7 @@ struct IntentStateAnchorV1 {
 #[serde(deny_unknown_fields)]
 struct IntentDetailStateAnchorV3<'a> {
     detail_facets: &'a [IntentRecipeDetailFacetV3],
+    detail_fields: &'a [IntentRecipeDetailFieldV4],
 }
 
 fn intent_human_envelope(human_message: &str) -> String {
@@ -397,9 +399,11 @@ impl<C> DesignSession<C> {
     fn intent_detail_state<'a>(
         &self,
         selection: &'a PrivateStudyRoomSelectionV4,
+        detail_fields: &'a [IntentRecipeDetailFieldV4],
     ) -> Result<(IntentDetailStateAnchorV3<'a>, String), StructuredError> {
         let state = IntentDetailStateAnchorV3 {
             detail_facets: selection.detail_facets(),
+            detail_fields,
         };
         let content = serde_json::to_string(&state).map_err(|error| {
             intent_error(
@@ -758,15 +762,18 @@ impl<C: LlmClient> DesignSession<C> {
                         selection,
                         request_evidence,
                     }) => {
+                        let detail_analysis = analyze_private_study_room_details(human_message);
+                        let detail_fields = detail_analysis.fields().to_vec();
                         let (detail_state, detail_anchor) =
-                            match self.intent_detail_state(&selection) {
+                            match self.intent_detail_state(&selection, &detail_fields) {
                                 Ok(state) => state,
                                 Err(error) => {
                                     return self.finish_intent_tool_execution(call, Err(error));
                                 }
                             };
-                        let tools: Vec<_> = match private_study_room_details_frontier_for(
+                        let tools: Vec<_> = match private_study_room_details_frontier_for_fields(
                             selection.detail_facets(),
+                            &detail_fields,
                         ) {
                             Ok(frontier) => frontier.into(),
                             Err(error) => {
@@ -796,6 +803,7 @@ impl<C: LlmClient> DesignSession<C> {
                                 request_evidence,
                                 &detail_call.arguments,
                                 human_message,
+                                detail_analysis.expectations(),
                             )
                             .await;
                         self.finish_intent_tool_execution(detail_call, result)

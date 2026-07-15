@@ -11,9 +11,13 @@ mod schema;
 mod validation;
 
 pub use parse::parse_private_study_room_details;
+pub(crate) use parse::parse_private_study_room_details_for_active_serving;
+#[cfg(test)]
 pub(crate) use parse::parse_private_study_room_details_for_serving;
 pub use schema::private_study_room_details_frontier;
+#[cfg(test)]
 pub(crate) use schema::private_study_room_details_frontier_for;
+pub(crate) use schema::private_study_room_details_frontier_for_fields;
 
 pub const EXTRACT_PRIVATE_STUDY_ROOM_DETAILS: &str = "extract_private_study_room_details";
 

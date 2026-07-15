@@ -330,6 +330,23 @@ default-only request has no detail frontier. Quoted UI copy is excluded from
 safety-boundary grounding, and negated or hypothetical boundary language does
 not become an execution request.
 
+The same grounded detail analysis derives a canonical path-only ticket for the
+second call. The model sees only the selected facet objects and material leaf
+paths; unselected objects, unselected leaves, and explicitly empty affix
+counterparts are absent from the schema. Literal values remain outside the
+prompt-owned state. After the model proposes values, the harness compares every
+leaf with the exact slot-specific literal independently rederived from the
+current human turn. A literal that occurs elsewhere in the same turn cannot be
+substituted into another slot. Literal equality preserves case, punctuation,
+emoji, and internal whitespace; only CRLF line endings use the existing LF
+canonical form. Root keys, leaf keys, nonempty value shape, and duplicate JSON
+object keys are all checked before typed deserialization.
+Snapshot replay and transcript binding rederive the same path and literal
+expectations from preserved human evidence rather than trusting persisted
+model arguments. Persisted tool-result JSON also rejects duplicate object keys
+before any value projection or typed binding. Any mismatch fails closed without
+retry, repair, compilation, or Draft mutation.
+
 The decoder may accept the pre-release hidden boundary and detail fields for
 fixture and transcript compatibility, but serving schemas omit them and their
 values have no authority after human grounding. Missing hidden values always
@@ -550,8 +567,9 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 10, including the closed detail grammar,
-supported-base classification, runtime-versus-behavior evidence contract, and
+extractor revision moves from 4 to 11, including the closed detail grammar,
+path-only detail frontier, exact slot-literal verifier, supported-base
+classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay.
 The normalizer revision moves from 1 to 7, including exact capability-evidence
@@ -750,7 +768,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         10
+Recipe extractor revision         11
 Recipe normalizer revision         7
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -799,7 +817,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 9, normalizer revisions through 6, or
+branch-local extractor revisions through 10, normalizer revisions through 6, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -813,8 +831,8 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 10, and normalizer 7 is current;
-- a pre-release V4 prompt, extractor revision through 9, or normalizer revision
+- the exact V4 prompt with protocol 4, extractor 11, and normalizer 7 is current;
+- a pre-release V4 prompt, extractor revision through 10, or normalizer revision
   through 6 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
@@ -904,6 +922,11 @@ Additional required tests cover:
 - the stateful-game behavior set is exact, sorted, and identical in the Core
   decision and unclassified blocker evidence;
 - detail literals cannot be sourced from another turn;
+- detail values cannot be swapped between same-facet or cross-facet slots, and
+  duplicate root or leaf keys cannot satisfy the active frontier;
+- raw literals that differ only in whitespace cannot alias, Korean unquoted
+  punctuation remains in its original literal span, and persisted tool results
+  cannot use last-key-wins ambiguity;
 - every model-authored display field is absent from compiler inputs;
 - request evidence entry order, message index, revision, decision ID, path,
   option digest, and accepted value tampering is rejected;
