@@ -232,13 +232,15 @@ requested_outcome
 hub_channel
 language
 close_policy
-runtime_requirements
 other_unmapped_required_capabilities
 response
 ```
 
 An `objective` field is unknown in V4 and fails strict parsing. Build responses
 remain empty. Discussion responses remain presentation-only.
+Runtime requirements remain part of authoritative semantic IR but are hidden
+compatibility input on the structural parser, not a model frontier field.
+Serving and replay always replace them with current-human grounded values.
 
 The normalizer grounds request controls only from high-confidence, unquoted
 current-human language. It reuses the bounded sentence and clause scanner used
@@ -310,10 +312,13 @@ recipe-detail semantics before adjudication, so model field contradictions
 cannot mutate a Draft. A grounded build clears model response prose and cannot
 remain a model-authored discussion.
 
-Both Core arrays remain required on the model schema. The decoder may supply a
-missing array as empty only when the same current-human analysis positively
-grounds discussion mode. A build or ungrounded request with either array missing
-still fails closed. Discussion presentation is control-validated and bounded to
+Runtime infrastructure is no longer a model field. The harness derives it from
+the exact current human turn for both build and discussion, so the model cannot
+omit, invent, or weaken it. The unmapped-capability array remains required on
+the model schema. The decoder may supply that array as empty only when the same
+current-human analysis positively grounds discussion mode. A build or
+ungrounded request with that array missing still fails closed. Discussion
+presentation is control-validated and bounded to
 2,000 UTF-16 code units. Truncation reserves one unit for an ellipsis, prefers
 the last whitespace cut within the final quarter of the budget, and otherwise
 uses the last complete Unicode scalar that fits. The bounded value is the only
@@ -354,14 +359,18 @@ served to the model is reused for response parsing and structured error shape.
 The ticket and schema cache are ephemeral derivations; snapshots persist only
 the path ticket and independently reproduce it from the preserved human turn.
 
-The decoder may accept the pre-release hidden boundary and detail fields for
-fixture and transcript compatibility, but serving schemas omit them and their
-values have no authority after human grounding. Missing hidden values always
-decode to safe defaults.
+The decoder may accept the pre-release hidden boundary, detail, and runtime
+fields for fixture and transcript compatibility, but serving schemas omit them
+and their values have no authority after human grounding. Missing hidden values
+always decode to safe defaults. Invalid types, enum values, and duplicate keys
+still fail closed. The public structural parser supports fixtures and transport
+compatibility; only the human-aware serving and replay parsers establish
+authoritative semantics.
 
 The prompt must make these rules explicit:
 
-- every exposed Core field is required, including both arrays when empty;
+- every exposed Core field is required, including the unmapped-capability array
+  when empty;
 - unsafe and disallowed requests use the same single tool-only extraction path
   and are never refused as model prose;
 - the managed recipe's built-in room creation flow is represented by the closed
@@ -574,14 +583,15 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 11, including the closed detail grammar,
+extractor revision moves from 4 to 12, including the closed detail grammar,
 path-only detail frontier, exact slot-literal verifier, supported-base
 classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
-field before normalization and transcript replay.
+field before normalization and transcript replay, and removal of the redundant
+model-authored runtime field from the active frontier.
 The normalizer revision moves from 1 to 7, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
-grounding, discussion-only array recovery, bounded presentation, static-base
+grounding, discussion-only capability-array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
 external-precondition recovery, and current-human runtime grounding, and the
 recipe descriptor and registry digests rotate. Recipe version,
@@ -775,7 +785,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         11
+Recipe extractor revision         12
 Recipe normalizer revision         7
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -824,7 +834,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 10, normalizer revisions through 6, or
+branch-local extractor revisions through 11, normalizer revisions through 6, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -838,8 +848,8 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 11, and normalizer 7 is current;
-- a pre-release V4 prompt, extractor revision through 10, or normalizer revision
+- the exact V4 prompt with protocol 4, extractor 12, and normalizer 7 is current;
+- a pre-release V4 prompt, extractor revision through 11, or normalizer revision
   through 6 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
@@ -922,8 +932,10 @@ Additional required tests cover:
   closed payload-analysis command selects Discussion;
 - direct positive and negative preview grammar overrides the model only for a
   grounded build, and preview-looking UI copy remains presentation data;
-- discussion-only missing-array recovery is unavailable to build or ungrounded
-  turns, and a bounded discussion response is the only presentation persisted;
+- discussion-only missing-capability recovery is unavailable to build or
+  ungrounded turns, runtime infrastructure is always derived from current-human
+  evidence, and a bounded discussion response is the only presentation
+  persisted;
 - every positive unmapped requirement must be exact-grounded;
 - closed runtime properties cannot consume executable behavior evidence;
 - the stateful-game behavior set is exact, sorted, and identical in the Core

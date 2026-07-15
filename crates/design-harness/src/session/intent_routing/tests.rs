@@ -85,7 +85,7 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "the harness rebinds it authoritatively",
         "semantics come only from the latest INTENT_HUMAN",
         "use exact enums and fill every field",
-        "Always include runtime_requirements and other_unmapped_required_capabilities, using [] if empty",
+        "Always include other_unmapped_required_capabilities, using [] if empty",
         "request_mode=build when automation is requested and request_mode=discussion only when no build is requested",
         "requested_outcome=validated_preview only if requested, otherwise working_draft",
         "Discussion: requested_outcome=discussion and a complete natural response of 2-4 sentences within 480 UTF-16 units",
@@ -94,13 +94,10 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "custom_automation owns static buttons, modals, role/channel creation, permissions, role grants, posts, and ephemeral responses",
         "a control opening a modal whose submission returns an ephemeral response",
         "Never repeat behavior owned by either kind in other_unmapped_required_capabilities",
-        "runtime_requirements=[] unless explicit infrastructure is required",
-        "restart_persistent=state/data survives restarts",
-        "durable_timer=durable timer/scheduler",
-        "persistent_economy=persistent XP/economy/reward/balance storage",
-        "event_time_llm=LLM executes/decides during an event",
+        "The harness derives restart persistence, durable timers, persistent economy, and event-time LLM infrastructure directly from INTENT_HUMAN",
+        "these are not model fields and never belong in other_unmapped_required_capabilities",
         "preservation instructions select no runtime value",
-        "Runtime fields represent infrastructure only",
+        "Runtime infrastructure owns only infrastructure",
         "Copy each value verbatim as one shortest complete contiguous INTENT_HUMAN subject-predicate span",
         "source article, quantifier, or relative word like that",
         "Never alter words or order, or reduce an action to a noun fragment",
@@ -154,7 +151,6 @@ fn private_room_value(expected_revision: u64, hub: Option<&str>) -> serde_json::
         "hub_channel": hub,
         "language": "en",
         "close_policy": "disabled",
-        "runtime_requirements": [],
         "other_unmapped_required_capabilities": [],
         "response": ""
     })
@@ -186,7 +182,6 @@ fn creator_only(expected_revision: u64, response: &str) -> LlmResponse {
 fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, None);
     value["automation_kind"] = json!("custom_automation");
-    value["runtime_requirements"] = json!([]);
     value["other_unmapped_required_capabilities"] =
         json!(["do not reduce the request to static responses"]);
     value["response"] = json!(response);
@@ -1203,7 +1198,7 @@ fn model_core_revision_is_bound_by_the_harness_before_compilation() {
 }
 
 #[test]
-fn discussion_runtime_language_cannot_contaminate_the_next_build() {
+fn discussion_runtime_language_and_missing_model_runtime_cannot_contaminate_the_next_build() {
     block_on(async {
         let mut contaminated = private_room_value(99, Some("community_hub"));
         contaminated["runtime_requirements"] = json!([
@@ -1212,44 +1207,52 @@ fn discussion_runtime_language_cannot_contaminate_the_next_build() {
             "persistent_economy",
             "event_time_llm"
         ]);
-        let resource_bindings = bindings("community_hub", "700");
-        let client = ScriptedClient::new(vec![
-            Ok(discussion(
-                99,
-                "Private rooms can use timers, but they can also feel rigid.",
-            )),
-            Ok(interpretation_call("build", contaminated)),
-        ]);
-        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let omitted = private_room_value(99, Some("community_hub"));
+        for build in [contaminated, omitted] {
+            let resource_bindings = bindings("community_hub", "700");
+            let client = ScriptedClient::new(vec![
+                Ok(discussion(
+                    99,
+                    "Private rooms can use timers, but they can also feel rigid.",
+                )),
+                Ok(interpretation_call("build", build)),
+            ]);
+            let probe = client.clone();
+            let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
 
-        assert!(matches!(
-            session
-                .run_burst("Let's brainstorm private study-room tradeoffs only.")
-                .await,
-            BurstOutcome::Routed { .. }
-        ));
-        assert!(matches!(
-            session
-                .run_burst(
-                    "Now build the managed private study-room automation and prepare its validated preview. Use community_hub and leave closing disabled.",
-                )
-                .await,
-            BurstOutcome::Ready { .. }
-        ));
-        assert_eq!(session.observability.intent_commits, 1);
-        assert_eq!(session.observability.intent_stale_revision_rejections, 0);
+            assert!(matches!(
+                session
+                    .run_burst("Let's brainstorm private study-room tradeoffs only.")
+                    .await,
+                BurstOutcome::Routed { .. }
+            ));
+            assert!(matches!(
+                session
+                    .run_burst(
+                        "Now build the managed private study-room automation and prepare its validated preview. Use community_hub and leave closing disabled.",
+                    )
+                    .await,
+                BurstOutcome::Ready { .. }
+            ));
+            assert_eq!(probe.calls().len(), 2);
+            assert_eq!(session.observability.model_calls, 2);
+            assert_eq!(session.observability.tool_calls, 2);
+            assert_eq!(session.observability.repair_attempts, 0);
+            assert_eq!(session.observability.intent_commits, 1);
+            assert_eq!(session.observability.intent_stale_revision_rejections, 0);
 
-        let expected_draft = session.draft.clone();
-        let expected_receipt = receipt(&session);
-        let restored = DesignSession::restore_intent_recipe(
-            ScriptedClient::new(Vec::new()),
-            SessionConfig::default(),
-            session.snapshot(),
-            resource_bindings,
-        )
-        .unwrap();
-        assert_eq!(restored.draft, expected_draft);
-        assert_eq!(receipt(&restored), expected_receipt);
+            let expected_draft = session.draft.clone();
+            let expected_receipt = receipt(&session);
+            let restored = DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                session.snapshot(),
+                resource_bindings,
+            )
+            .unwrap();
+            assert_eq!(restored.draft, expected_draft);
+            assert_eq!(receipt(&restored), expected_receipt);
+        }
     });
 }
 
@@ -4219,7 +4222,7 @@ fn serving_projection_excludes_rejected_discussion_presentation() {
         rejected
             .as_object_mut()
             .unwrap()
-            .remove("runtime_requirements");
+            .remove("other_unmapped_required_capabilities");
         let client = ScriptedClient::new(vec![
             Ok(interpretation_call("rejected", rejected)),
             Ok(discussion(0, "Accepted presentation")),

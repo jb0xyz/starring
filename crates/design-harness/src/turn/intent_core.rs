@@ -143,7 +143,8 @@ struct InterpretIntentCoreWireV4 {
     hub_channel: RequiredNullableChannelV3,
     language: IntentLocaleHintV2,
     close_policy: CloseAuthorizationV2,
-    #[schemars(length(max = 4))]
+    #[serde(default)]
+    #[schemars(skip)]
     runtime_requirements: Vec<RuntimeRequirementV3>,
     #[serde(default)]
     #[schemars(skip)]
@@ -428,9 +429,9 @@ fn parse_grounded_intent_core(
         Ok(input) => input,
         Err(error)
             if grounded.mode == Some(IntentRequestModeV2::Discussion)
-                && missing_discussion_array(&error) =>
+                && missing_discussion_capabilities(&error) =>
         {
-            parse_core_wire(&supply_empty_discussion_arrays(arguments)?)?
+            parse_core_wire(&supply_empty_discussion_capabilities(arguments)?)?
         }
         Err(error) => return Err(error),
     };
@@ -466,16 +467,13 @@ fn parse_core_wire(arguments: &str) -> Result<InterpretIntentCoreWireV4, Structu
     })
 }
 
-fn missing_discussion_array(error: &StructuredError) -> bool {
+fn missing_discussion_capabilities(error: &StructuredError) -> bool {
     error.code == "MISSING_REQUIRED_FIELD"
-        && [
-            "tool.interpret_intent_core.arguments.runtime_requirements",
-            "tool.interpret_intent_core.arguments.other_unmapped_required_capabilities",
-        ]
-        .contains(&error.location.as_str())
+        && error.location
+            == "tool.interpret_intent_core.arguments.other_unmapped_required_capabilities"
 }
 
-fn supply_empty_discussion_arrays(arguments: &str) -> Result<String, StructuredError> {
+fn supply_empty_discussion_capabilities(arguments: &str) -> Result<String, StructuredError> {
     let mut value = serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
         translate_tool_arguments_error(
             INTERPRET_INTENT_CORE,
@@ -491,9 +489,6 @@ fn supply_empty_discussion_arrays(arguments: &str) -> Result<String, StructuredE
             "Return one complete interpret_intent_core object",
         )
     })?;
-    object
-        .entry("runtime_requirements")
-        .or_insert_with(|| serde_json::json!([]));
     object
         .entry("other_unmapped_required_capabilities")
         .or_insert_with(|| serde_json::json!([]));

@@ -50,7 +50,6 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
             "request_mode",
             "requested_outcome",
             "response",
-            "runtime_requirements",
             "hub_channel",
             "other_unmapped_required_capabilities",
         ])
@@ -74,6 +73,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
         "live_discord_mutation",
         "secret_disclosure",
         "custom_detail_facets",
+        "runtime_requirements",
     ] {
         assert!(!properties.contains(forbidden));
     }
@@ -122,12 +122,26 @@ fn core_parser_defaults_hidden_model_fields_to_safe_empty_semantics() {
         "live_discord_mutation",
         "secret_disclosure",
         "custom_detail_facets",
+        "runtime_requirements",
     ] {
         value.as_object_mut().unwrap().remove(field);
     }
     let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
     assert!(parsed.boundary_requests().is_empty());
     assert!(parsed.recipe_detail_facets().is_empty());
+    assert_eq!(
+        parsed.runtime_requirements().persistence,
+        PersistenceRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::None
+    );
+    assert_eq!(
+        parsed.runtime_requirements().economy,
+        EconomyRequirementV2::None
+    );
+    assert!(!parsed.runtime_requirements().event_time_llm);
 }
 
 #[test]
@@ -306,7 +320,11 @@ fn serving_runtime_grounding_overwrites_model_inference_and_omission() {
     );
     assert!(!parsed.runtime_requirements().event_time_llm);
 
-    let omitted = valid_core();
+    let mut omitted = valid_core();
+    omitted
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_requirements");
     let parsed = parse_interpret_intent_core_for_human(
         &omitted.to_string(),
         "Build a game where an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts.",
@@ -1143,7 +1161,7 @@ fn human_grounding_never_allows_model_build_over_an_explicit_hold() {
 }
 
 #[test]
-fn human_grounding_supplies_only_missing_discussion_arrays() {
+fn human_grounding_supplies_harness_runtime_and_only_discussion_capabilities() {
     let mut value = valid_core();
     value["request_mode"] = json!("discussion");
     value["automation_kind"] = json!("none");
@@ -1221,14 +1239,15 @@ fn embedded_discussion_copy_never_enables_discussion_array_defaults() {
         .unwrap()
         .remove("runtime_requirements");
 
+    let parsed = parse_interpret_intent_core_for_human(
+        &value.to_string(),
+        "Build an automation that displays the words discussion only. Its scheduler must be durable.",
+    )
+    .unwrap();
+    assert_eq!(parsed.request_mode(), super::IntentRequestModeV2::Build);
     assert_eq!(
-        parse_interpret_intent_core_for_human(
-            &value.to_string(),
-            "Build an automation that displays the words discussion only and requires durable timers."
-        )
-        .unwrap_err()
-        .code,
-        "MISSING_REQUIRED_FIELD"
+        parsed.runtime_requirements().timers,
+        TimerRequirementV2::Durable
     );
 }
 
