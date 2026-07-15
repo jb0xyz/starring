@@ -9,7 +9,7 @@ const INTENT_MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc
 const INTENT_PROTOCOL_VERSION = 4;
 const INTENT_ADJUDICATOR_VERSION = 3;
 const INTENT_IDENTITY_REVISION = 2;
-const INTENT_SNAPSHOT_VERSION = 7;
+const INTENT_SNAPSHOT_VERSION = 8;
 const SHA256 = /^[0-9a-f]{64}$/;
 const DECISION_KINDS = new Set([
   'private_study_room',
@@ -1561,6 +1561,121 @@ function intentAdjudicationDecision(output, context) {
   });
 }
 
+function normalizerDiscussionTurn(turn, location, failures) {
+  const counters = turn.intent_counters;
+  const fallbackRoutes = Object.entries(counters.fallback_routes)
+    .filter(([, count]) => count > 0);
+  if (turn.route_decision?.kind !== 'discussion'
+    || turn.outcome !== 'routed'
+    || turn.completed !== false
+    || turn.stage_before !== 'empty'
+    || turn.stage_after !== 'empty'
+    || turn.draft_changed !== false
+    || turn.draft_revision_before !== turn.draft_revision_after
+    || turn.deterministic_operations !== 0
+    || counters.route_calls !== 1
+    || counters.proposal_acceptances !== 0
+    || counters.compile_attempts !== 0
+    || counters.compile_successes !== 0
+    || counters.commits !== 0
+    || fallbackRoutes.length !== 1
+    || fallbackRoutes[0][0] !== 'discussion'
+    || fallbackRoutes[0][1] !== 1
+    || typeof turn.message !== 'string'
+    || turn.message.length === 0
+    || turn.question !== null) {
+    failures.push(`${location} is not an exact mutation-free discussion route`);
+  }
+}
+
+function normalizerPreviewTurn(turn, location, failures) {
+  if (turn.route_decision?.kind !== 'private_study_room'
+    || !sameJson(turn.route_decision.route_target, {
+      recipe_id: 'starring.private_study_room',
+      recipe_version: 1,
+    })
+    || turn.outcome !== 'ready'
+    || turn.completed !== true
+    || turn.stage_before !== 'empty'
+    || turn.stage_after !== 'preview_ready'
+    || turn.draft_changed !== true
+    || turn.deterministic_operations !== 22
+    || turn.model_calls !== 1
+    || turn.model_tool_calls !== 1
+    || turn.actual_gates.validation_current !== true
+    || turn.actual_gates.simulation_current !== true) {
+    failures.push(`${location} is not an exact one-call validated-preview route`);
+  }
+}
+
+function intentNormalizerV5Behavior(output, context) {
+  return checked(output, (report) => {
+    const expected = vars(context);
+    const contract = expected.normalizerV5Contract;
+    const failures = [];
+    const discussionContracts = new Set([
+      'same_target_hold',
+      'korean_compound_discussion',
+      'multi_sentence_metalinguistic_copy',
+    ]);
+    if (discussionContracts.has(contract)) {
+      if (report.turns.length !== 1) {
+        failures.push(`discussion contract turn count=${report.turns.length} expected=1`);
+      } else {
+        normalizerDiscussionTurn(report.turns[0], report.turns[0].id, failures);
+      }
+      if (report.final_intent.status !== 'empty'
+        || report.final_intent.receipt !== null
+        || report.persistence.connection_reopen_count !== 0
+        || report.persistence.roundtrip_verified !== false) {
+        failures.push('discussion contract persisted a preview or unexpected restart');
+      }
+    } else if (contract === 'validated_preview_disambiguation') {
+      if (expected.normalizerBaselineCase !== 'intent_private_study_room_en') {
+        failures.push('validated-preview disambiguation lacks its pinned equivalence baseline');
+      }
+      if (report.turns.length !== 1) {
+        failures.push(`validated-preview contract turn count=${report.turns.length} expected=1`);
+      } else {
+        normalizerPreviewTurn(report.turns[0], report.turns[0].id, failures);
+      }
+      if (report.final_intent.status !== 'preview_ready'
+        || report.final_intent.receipt?.compiled_operations !== 22
+        || report.actual_gates.validation_current !== true
+        || report.actual_gates.simulation_current !== true) {
+        failures.push('validated-preview disambiguation did not produce the default gated recipe');
+      }
+    } else if (contract === 'discussion_restart_restore') {
+      if (report.turns.length !== 2) {
+        failures.push(`discussion restart turn count=${report.turns.length} expected=2`);
+      } else {
+        const [discussion, build] = report.turns;
+        normalizerDiscussionTurn(discussion, discussion.id, failures);
+        normalizerPreviewTurn(build, build.id, failures);
+        if (discussion.restart_after !== true
+          || discussion.restart_performed !== true
+          || discussion.stage_after !== build.stage_before
+          || discussion.intent_revision_after !== build.intent_revision_before
+          || discussion.draft_revision_after !== build.draft_revision_before) {
+          failures.push('discussion route did not survive an exact restart boundary');
+        }
+      }
+      if (report.persistence.connection_reopen_count !== 1
+        || report.persistence.roundtrip_verified !== true
+        || report.persistence.store_writes !== 2
+        || report.persistence.final_generation !== 2
+        || report.final_intent.status !== 'preview_ready') {
+        failures.push('discussion restart persistence evidence is incomplete');
+      }
+    } else {
+      failures.push(`unknown normalizer V5 contract=${String(contract)}`);
+    }
+    return result(failures.length === 0, failures.length === 0
+      ? `normalizer V5 contract ${contract} matches the live route`
+      : failures.join(', '));
+  });
+}
+
 function intentHardLatency(output) {
   return checked(output, (report) => {
     const overLimit = report.turns.filter((turn) => turn.elapsed_ms > 60000);
@@ -1576,6 +1691,7 @@ module.exports = {
   intentDecisionFlow,
   intentHardLatency,
   intentNoMutationFallback,
+  intentNormalizerV5Behavior,
   intentOneCallTurns,
   intentOracleIsolation,
   intentProvenance,

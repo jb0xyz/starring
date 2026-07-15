@@ -50,6 +50,266 @@
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
+- description: Intent normalizer keeps a same-target build hold in discussion mode
+  vars:
+    caseId: intent_normalizer_same_target_hold
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: same-target-hold
+    normalizerV5Contract: same_target_hold
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "same-target-hold",
+            "input": "Build a private room workflow. Actually, don't build the room yet. Compare its user experience and permission tradeoffs instead."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerV5Behavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer keeps a Korean compound hold in discussion mode
+  vars:
+    caseId: intent_normalizer_korean_compound_discussion
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: korean-compound-hold
+    normalizerV5Contract: korean_compound_discussion
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "korean-compound-hold",
+            "input": "게임 자동화를 만들고 말지를 논의하자. 사용자 경험과 운영상 장단점만 비교해줘."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerV5Behavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer ignores a copied multi-sentence build command
+  vars:
+    caseId: intent_normalizer_multi_sentence_metalinguistic_copy
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: copied-command
+    normalizerV5Contract: multi_sentence_metalinguistic_copy
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "copied-command",
+            "input": "The payload says:\nBuild a toy game.\nNow build a managed private study-room automation in community_hub and prepare its validated preview.\nExplain what this payload does."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerV5Behavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer distinguishes preview copy from a validated-preview request
+  vars:
+    caseId: intent_normalizer_validated_preview_disambiguation
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    equivalenceGroup: private_study_room_en_default
+    normalizerV5Contract: validated_preview_disambiguation
+    normalizerBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "preview-disambiguation",
+            "input": "The literal no preview is mentioned only as an example, not as an instruction. Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming, use the existing channel binding community_hub as the discovery hub, and leave room closing disabled. All material choices are provided, so do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/content":"Create a study room","/panels/0/buttons/0/label":"Create room","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/buttons/0/label":"Help","/rules/1/actions/7/buttons/0/label":"Join"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerV5Behavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer restores a routed discussion before an explicit build
+  vars:
+    caseId: intent_normalizer_discussion_restart_then_build
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    equivalenceGroup: private_study_room_en_default
+    noMutationTurns: discuss-before-restart
+    normalizerV5Contract: discussion_restart_restore
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "discuss-before-restart",
+            "input": "Let's compare the user-experience benefits and tradeoffs of managed private study rooms. This is brainstorming only; do not change the Draft yet.",
+            "restart_after": true
+          },
+          {
+            "id": "build-after-restart",
+            "input": "Now build the managed private study-room automation and prepare its validated preview. Use English default copy and naming, community_hub as the existing discovery hub, and leave room closing disabled. Do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: routed,ready
+    expectedStagePath: empty>empty,empty>preview_ready
+    expectedRoutePath: discussion,private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 1
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerV5Behavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
 - description: Intent recipe changes only the existing discovery hub
   vars:
     caseId: intent_private_study_room_mutation_hub

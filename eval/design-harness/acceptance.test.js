@@ -2,12 +2,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 
 const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '864ef3cac2f5d2ea2d0ec2bffe59716e10be466bebc434b629722df3ce4f744a';
+const REGISTRY_DIGEST = '9832cff64316aa1523a446a4a0e043a020999c561cb1bb7eb667942aa64849f4';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -39,6 +40,10 @@ function routeDecision(kind = 'private_study_room', overrides = {}) {
       : null,
     ...overrides,
   };
+}
+
+function digest(value) {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 function evidence(id) {
@@ -345,7 +350,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 9,
-      normalizer_revision: 4,
+      normalizer_revision: 5,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -429,7 +434,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
       store_writes: turns.length,
       connection_reopen_count: 0,
       final_generation: turns.length,
-      snapshot_schema_version: 7,
+      snapshot_schema_version: 8,
       roundtrip_verified: false,
     },
     elapsed_ms: turns.reduce((sum, turn) => sum + turn.elapsed_ms, 0),
@@ -450,6 +455,15 @@ function refreshCandidateHashes(document) {
   Object.assign(document.final_intent.public_status.receipt, hashes);
 }
 
+function response(document) {
+  return {
+    get output() {
+      return JSON.stringify(this.metadata);
+    },
+    metadata: document,
+  };
+}
+
 function row(caseId, order, options = {}) {
   const document = report(order, options.inputHash || '1'.repeat(64), options.turns);
   if (options.ruleset) {
@@ -466,6 +480,12 @@ function row(caseId, order, options = {}) {
   if (options.requestHash) {
     document.final_intent.receipt.request_evidence_hash = options.requestHash;
     document.final_intent.public_status.receipt.request_evidence_hash = options.requestHash;
+    for (const turn of document.turns) {
+      if (turn.route_decision) {
+        turn.route_decision.request_evidence_hash = options.requestHash;
+      }
+    }
+    document.final_intent.route_decision.request_evidence_hash = options.requestHash;
   }
   if (options.routeHash) {
     for (const turn of document.turns) {
@@ -506,8 +526,30 @@ function row(caseId, order, options = {}) {
       ...options.vars,
     },
     success: true,
-    response: { metadata: document },
+    response: response(document),
   };
+}
+
+function setTerminalDecisionIdentities(document, identities) {
+  const terminalTurn = document.turns.findLast((turn) => turn.route_decision);
+  const decisions = [terminalTurn.route_decision, document.final_intent.route_decision];
+  if (identities.requestHash) {
+    for (const decision of decisions) {
+      decision.request_evidence_hash = identities.requestHash;
+    }
+    document.final_intent.receipt.request_evidence_hash = identities.requestHash;
+    document.final_intent.public_status.receipt.request_evidence_hash = identities.requestHash;
+  }
+  if (identities.routeHash) {
+    for (const decision of decisions) {
+      decision.semantic_ir_digest = identities.routeHash;
+    }
+  }
+  if (identities.adjudicationHash) {
+    for (const decision of decisions) {
+      decision.adjudication_digest = identities.adjudicationHash;
+    }
+  }
 }
 
 function passingDocument() {
@@ -560,8 +602,64 @@ function passingDocument() {
     };
     return [pending, resolve];
   };
+  const discussionBuildTurns = (restart) => {
+    const discussion = {
+      id: restart ? 'discuss-before-restart' : 'brainstorm',
+      input: 'Discuss first',
+      outcome: 'routed',
+      completed: false,
+      message: 'Discussion',
+      question: null,
+      halt_code: null,
+      last_error: null,
+      burst_elapsed_ms: 900,
+      stage_before: 'empty',
+      stage_after: 'empty',
+      intent_revision_before: 0,
+      intent_revision_after: 0,
+      route_decision: routeDecision('discussion', {
+        semantic_ir_digest: digest('route:discussion-en'),
+        request_evidence_hash: digest('request:brainstorming-sequence'),
+        adjudication_digest: digest('adjudication:brainstorming-sequence'),
+      }),
+      draft_changed: false,
+      draft_revision_before: 0,
+      draft_revision_after: 0,
+      model_calls: 1,
+      model_tool_calls: 1,
+      model_call_metrics: [metric()],
+      deterministic_operations: 0,
+      intent_counters: intentCounters({
+        proposal_acceptances: 0,
+        compile_attempts: 0,
+        compile_successes: 0,
+        commits: 0,
+        fallback_routes: { discussion: 1 },
+      }),
+      actual_gates: staleGates(),
+      elapsed_ms: 1000,
+      restart_after: restart,
+      restart_performed: restart,
+    };
+    const build = {
+      ...buildTurn(),
+      id: restart ? 'build-after-restart' : 'build',
+      intent_revision_before: 0,
+      intent_revision_after: 1,
+    };
+    return [discussion, build];
+  };
   const fallbackRow = (caseId, route, currentOrder) => {
     const decision = fallbackDecision(caseId, route);
+    const routeClass = {
+      intent_normalizer_same_target_hold: 'discussion-en',
+      intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion-en',
+      intent_typed_planner_fallback: 'custom-static-automation',
+      intent_redaction_copy_typed_planner: 'custom-static-automation',
+    }[caseId] || caseId;
+    decision.semantic_ir_digest = digest(`route:${routeClass}`);
+    decision.request_evidence_hash = digest(`request:${caseId}`);
+    decision.adjudication_digest = digest(`adjudication:${caseId}`);
     const fallbackReport = report(currentOrder, '5'.repeat(64), [{
       id: 'fallback',
       input: 'Fallback request',
@@ -617,17 +715,68 @@ function passingDocument() {
         expectedRoutePath: route,
       },
       success: true,
-      response: { metadata: fallbackReport },
+      response: response(fallbackReport),
     };
   };
   for (let index = 0; index < 10; index += 1) {
-    for (const caseId of ['intent_private_study_room_en', 'intent_discussion_then_build']) {
-      rows.push(row(caseId, order, {
+    rows.push(row('intent_private_study_room_en', order, {
+      inputHash: '1'.repeat(64),
+      vars: { completeRequest: true },
+    }));
+    order += 1;
+    const discussionBuild = row('intent_discussion_then_build', order, {
+      inputHash: '1'.repeat(64),
+      turns: discussionBuildTurns(false),
+      vars: {
+        completeRequest: true,
+        noMutationTurns: 'brainstorm',
+        expectedRoutePath: 'discussion,private_study_room',
+      },
+    });
+    discussionBuild.response.metadata.final_intent.receipt.intent_revision = 1;
+    discussionBuild.response.metadata.final_intent.public_status.receipt.intent_revision = 1;
+    setTerminalDecisionIdentities(discussionBuild.response.metadata, {
+      requestHash: digest('request:discussion-build-sequence'),
+      adjudicationHash: digest('adjudication:discussion-build-sequence'),
+    });
+    rows.push(discussionBuild);
+    order += 1;
+    rows.push(row('intent_normalizer_validated_preview_disambiguation', order, {
+      inputHash: '1'.repeat(64),
+      requestHash: digest('request:validated-preview-disambiguation'),
+      adjudicationHash: digest('adjudication:validated-preview-disambiguation'),
+      vars: {
+        completeRequest: true,
+        normalizerV5Contract: 'validated_preview_disambiguation',
+        normalizerBaselineCase: 'intent_private_study_room_en',
+      },
+    }));
+    order += 1;
+    const discussionRestart = row(
+      'intent_normalizer_discussion_restart_then_build',
+      order,
+      {
         inputHash: '1'.repeat(64),
-        vars: { completeRequest: true },
-      }));
-      order += 1;
-    }
+        turns: discussionBuildTurns(true),
+        vars: {
+          completeRequest: true,
+          expectedRestartCount: 1,
+          noMutationTurns: 'discuss-before-restart',
+          expectedRoutePath: 'discussion,private_study_room',
+          normalizerV5Contract: 'discussion_restart_restore',
+        },
+      },
+    );
+    discussionRestart.response.metadata.final_intent.receipt.intent_revision = 1;
+    discussionRestart.response.metadata.final_intent.public_status.receipt.intent_revision = 1;
+    setTerminalDecisionIdentities(discussionRestart.response.metadata, {
+      requestHash: digest('request:discussion-build-sequence'),
+      adjudicationHash: digest('adjudication:discussion-build-sequence'),
+    });
+    discussionRestart.response.metadata.persistence.connection_reopen_count = 1;
+    discussionRestart.response.metadata.persistence.roundtrip_verified = true;
+    rows.push(discussionRestart);
+    order += 1;
     rows.push(row('intent_private_study_room_ko', order, {
       inputHash: '7'.repeat(64),
       semanticHash: '7'.repeat(64),
@@ -641,6 +790,9 @@ function passingDocument() {
     order += 1;
     const missing = row('intent_private_study_room_missing_hub', order, {
       inputHash: '4'.repeat(64),
+      requestHash: '8'.repeat(64),
+      routeHash: '9'.repeat(64),
+      adjudicationHash: '6'.repeat(64),
       turns: decisionTurns(false),
       vars: { requiresDecision: true },
     });
@@ -648,6 +800,9 @@ function passingDocument() {
     order += 1;
     const restart = row('intent_private_study_room_restart_pending', order, {
       inputHash: '4'.repeat(64),
+      requestHash: '8'.repeat(64),
+      routeHash: '9'.repeat(64),
+      adjudicationHash: '6'.repeat(64),
       turns: decisionTurns(true),
       vars: { requiresDecision: true, expectedRestartCount: 1 },
     });
@@ -661,9 +816,12 @@ function passingDocument() {
     detailTurn.model_tool_calls = 2;
     detailTurn.model_call_metrics.push(metric('extract_private_study_room_details'));
     rows.push(row('intent_private_study_room_custom_details', order, {
-      inputHash: '9'.repeat(64),
-      semanticHash: 'a'.repeat(64),
-      planHash: 'b'.repeat(64),
+      inputHash: digest('compiler:custom-details'),
+      semanticHash: digest('semantic:custom-details'),
+      planHash: digest('plan:custom-details'),
+      requestHash: digest('request:custom-details'),
+      routeHash: digest('route:custom-details'),
+      adjudicationHash: digest('adjudication:custom-details'),
       ruleset: recipeRuleset({
         createLabel: 'Start focus room',
         channelName: 'focus-${input.room_name}',
@@ -768,6 +926,9 @@ function passingDocument() {
       order += 1;
     }
     for (const [caseId, route] of [
+      ['intent_normalizer_same_target_hold', 'discussion'],
+      ['intent_normalizer_korean_compound_discussion', 'discussion'],
+      ['intent_normalizer_multi_sentence_metalinguistic_copy', 'discussion'],
       ['intent_typed_planner_fallback', 'typed_planner'],
       ['intent_creator_only_close_gap', 'capability_gap'],
       ['intent_stateful_game_gap', 'capability_gap'],
@@ -789,7 +950,7 @@ test('checkpoint acceptance enforces repeated Gemma recipe quality and equivalen
   const assessment = assess(passingDocument());
 
   assert.equal(assessment.pass, true);
-  assert.equal(assessment.samples, 172);
+  assert.equal(assessment.samples, 222);
   assert.equal(assessment.p50_one_call_preview_turn_ms, 1000);
   assert.equal(assessment.p95_one_call_preview_turn_ms, 1000);
   assert.equal(assessment.p50_two_call_preview_turn_ms, 1000);
@@ -848,7 +1009,7 @@ test('checkpoint rejects stale extractor, normalizer, and forged registry identi
   );
 
   const oldNormalizer = passingDocument();
-  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 3;
+  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 4;
   const oldNormalizerAssessment = assess(oldNormalizer);
   assert.equal(oldNormalizerAssessment.pass, false);
   assert.equal(
@@ -978,6 +1139,53 @@ test('mutation adjudication identity must be stable and distinct from the defaul
   assert.equal(aliasMutation.distinct_from_default, false);
 });
 
+test('distinct semantic mutations cannot share an identity with each other', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results.filter((rowEntry) => (
+    rowEntry.vars.caseId === 'intent_private_study_room_mutation_naming'
+      || rowEntry.vars.caseId === 'intent_private_study_room_mutation_control'
+  ))) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = '7'.repeat(64);
+    }
+  }
+
+  const assessment = assess(document);
+  const naming = assessment.mutation_groups.find((entry) => entry.group === 'naming');
+  const control = assessment.mutation_groups.find((entry) => entry.group === 'control');
+  assert.equal(assessment.pass, false);
+  assert.equal(naming.distinct_from_default, true);
+  assert.equal(control.distinct_from_default, true);
+  assert.equal(naming.distinct_from_peer_mutations, false);
+  assert.equal(control.distinct_from_peer_mutations, false);
+});
+
+test('the full custom recipe cannot alias the default semantic identity', () => {
+  const document = passingDocument();
+  const defaultRoute = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_private_study_room_en',
+  ).response.metadata.final_intent.route_decision.semantic_ir_digest;
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_private_study_room_custom_details',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = defaultRoute;
+    }
+  }
+
+  const assessment = assess(document);
+  const fullCustom = assessment.mutation_groups.find((entry) => entry.group === 'full_custom');
+  assert.equal(assessment.pass, false);
+  assert.equal(fullCustom.distinct_from_default, false);
+  assert.equal(fullCustom.pass, false);
+});
+
 test('English RuleSet output cannot satisfy the Korean identity cohort', () => {
   const document = passingDocument();
   for (const entry of document.results.results.filter(
@@ -1017,4 +1225,276 @@ test('detail cases cannot pass the default one-call budget', () => {
     (entry) => entry.name === 'exact_case_aware_calls_per_turn',
   );
   assert.equal(check.pass, false);
+});
+
+test('checkpoint requires structurally equivalent output and metadata reports', () => {
+  const outputDrift = passingDocument();
+  const outputRow = outputDrift.results.results[0];
+  const badOutput = structuredClone(outputRow.response.metadata);
+  badOutput.requested_model = 'forged-model';
+  Object.defineProperty(outputRow.response, 'output', {
+    value: JSON.stringify(badOutput),
+    configurable: true,
+    enumerable: true,
+  });
+  const outputAssessment = assess(outputDrift);
+  assert.equal(outputAssessment.pass, false);
+  assert.equal(
+    outputAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+
+  const metadataDrift = passingDocument();
+  const metadataRow = metadataDrift.results.results[0];
+  const originalOutput = metadataRow.response.output;
+  Object.defineProperty(metadataRow.response, 'output', {
+    value: originalOutput,
+    configurable: true,
+    enumerable: true,
+  });
+  metadataRow.response.metadata.requested_model = 'forged-model';
+  const metadataAssessment = assess(metadataDrift);
+  assert.equal(metadataAssessment.pass, false);
+  assert.equal(
+    metadataAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+
+  const missingResponseOutput = passingDocument();
+  const missingOutputRow = missingResponseOutput.results.results[0];
+  missingOutputRow.output = JSON.stringify(missingOutputRow.response.metadata);
+  delete missingOutputRow.response.output;
+  const missingOutputAssessment = assess(missingResponseOutput);
+  assert.equal(missingOutputAssessment.pass, false);
+  assert.equal(
+    missingOutputAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+
+  const objectOutput = passingDocument();
+  const objectOutputRow = objectOutput.results.results[0];
+  Object.defineProperty(objectOutputRow.response, 'output', {
+    value: structuredClone(objectOutputRow.response.metadata),
+    configurable: true,
+    enumerable: true,
+  });
+  const objectOutputAssessment = assess(objectOutput);
+  assert.equal(objectOutputAssessment.pass, false);
+  assert.equal(
+    objectOutputAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+});
+
+test('different fallback projections cannot collapse to constant identities', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results) {
+    const reportDocument = entry.response.metadata;
+    if (reportDocument.final_intent.status === 'preview_ready') {
+      continue;
+    }
+    reportDocument.final_intent.route_decision.semantic_ir_digest = '1'.repeat(64);
+    reportDocument.final_intent.route_decision.adjudication_digest = '2'.repeat(64);
+    for (const turn of reportDocument.turns) {
+      if (turn.route_decision) {
+        turn.route_decision.semantic_ir_digest = '1'.repeat(64);
+        turn.route_decision.adjudication_digest = '2'.repeat(64);
+      }
+    }
+  }
+  const assessment = assess(document);
+  assert.equal(assessment.pass, false);
+  assert.equal(
+    assessment.checks.find(
+      (entry) => entry.name === 'cross_projection_identity_separation',
+    ).pass,
+    false,
+  );
+});
+
+test('nonterminal route decisions participate in identity collision detection', () => {
+  const document = passingDocument();
+  const fallback = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_typed_planner_fallback',
+  ).response.metadata.final_intent.route_decision;
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_normalizer_discussion_restart_then_build',
+  )) {
+    const decision = entry.response.metadata.turns[0].route_decision;
+    assert.equal(decision.kind, 'discussion');
+    decision.semantic_ir_digest = fallback.semantic_ir_digest;
+  }
+
+  const assessment = assess(document);
+  const separation = assessment.checks.find(
+    (entry) => entry.name === 'cross_projection_identity_separation',
+  );
+  assert.equal(assessment.pass, false);
+  assert.equal(separation.pass, false);
+  assert.ok(separation.actual.route_collisions.length > 0);
+});
+
+test('equivalent hidden Core route projections cannot diverge', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_redaction_copy_typed_planner',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = digest('route:forged-custom-static-split');
+    }
+  }
+
+  const assessment = assess(document);
+  const classMatrix = assessment.checks.find(
+    (entry) => entry.name === 'decision_identity_class_matrix',
+  );
+  assert.equal(assessment.pass, false);
+  assert.equal(classMatrix.pass, false);
+  const customStatic = classMatrix.actual.axes.route.classes.find(
+    (entry) => entry.class_id === 'custom_static_automation',
+  );
+  assert.equal(customStatic.identities.length, 2);
+});
+
+test('equivalent routes cannot collapse distinct request evidence', () => {
+  const document = passingDocument();
+  const typedPlanner = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_typed_planner_fallback',
+  ).response.metadata.final_intent.route_decision;
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_redaction_copy_typed_planner',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.request_evidence_hash = typedPlanner.request_evidence_hash;
+      decision.adjudication_digest = typedPlanner.adjudication_digest;
+    }
+  }
+
+  const assessment = assess(document);
+  const classMatrix = assessment.checks.find(
+    (entry) => entry.name === 'decision_identity_class_matrix',
+  );
+  assert.equal(assessment.pass, false);
+  assert.equal(classMatrix.pass, false);
+  assert.ok(classMatrix.actual.axes.request.collisions.length > 0);
+  assert.ok(classMatrix.actual.axes.adjudication.collisions.length > 0);
+});
+
+test('equivalent final decisions must retain the same identity', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_normalizer_validated_preview_disambiguation',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = '7'.repeat(64);
+    }
+  }
+
+  const assessment = assess(document);
+  const classMatrix = assessment.checks.find(
+    (entry) => entry.name === 'decision_identity_class_matrix',
+  );
+  const defaultClass = classMatrix.actual.axes.route.classes.find(
+    (entry) => entry.class_id === 'private_study_room_default',
+  );
+  assert.equal(assessment.pass, false);
+  assert.equal(classMatrix.pass, false);
+  assert.equal(defaultClass.identities.length, 2);
+});
+
+test('clarification and restart identities preserve their exact relationships', () => {
+  const collapsedRequest = passingDocument();
+  for (const entry of collapsedRequest.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_private_study_room_missing_hub',
+  )) {
+    const reportDocument = entry.response.metadata;
+    reportDocument.final_intent.receipt.request_evidence_hash = 'f'.repeat(64);
+    reportDocument.final_intent.public_status.receipt.request_evidence_hash = 'f'.repeat(64);
+    reportDocument.final_intent.route_decision.request_evidence_hash = 'f'.repeat(64);
+    for (const turn of reportDocument.turns) {
+      if (turn.route_decision) {
+        turn.route_decision.request_evidence_hash = 'f'.repeat(64);
+      }
+    }
+  }
+  const collapsedAssessment = assess(collapsedRequest);
+  assert.equal(collapsedAssessment.pass, false);
+  assert.equal(
+    collapsedAssessment.checks.find(
+      (entry) => entry.name === 'clarification_restart_identity_continuity',
+    ).pass,
+    false,
+  );
+
+  const restartDrift = passingDocument();
+  for (const entry of restartDrift.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_private_study_room_restart_pending',
+  )) {
+    const reportDocument = entry.response.metadata;
+    reportDocument.final_intent.route_decision.adjudication_digest = '7'.repeat(64);
+    for (const turn of reportDocument.turns) {
+      if (turn.route_decision) {
+        turn.route_decision.adjudication_digest = '7'.repeat(64);
+      }
+    }
+  }
+  const restartAssessment = assess(restartDrift);
+  assert.equal(restartAssessment.pass, false);
+  assert.equal(
+    restartAssessment.checks.find(
+      (entry) => entry.name === 'clarification_restart_identity_continuity',
+    ).pass,
+    false,
+  );
+});
+
+test('checkpoint rejects any automatic HTTP retry attempt', () => {
+  const document = passingDocument();
+  const reportDocument = document.results.results[0].response.metadata;
+  const succeeded = reportDocument.turns[0].model_call_metrics[0];
+  succeeded.attempt = 2;
+  const rejected = {
+    ...succeeded,
+    attempt: 1,
+    outcome: 'invalid_response',
+  };
+  reportDocument.turns[0].model_call_metrics = [rejected, succeeded];
+  reportDocument.model_call_metrics = reportDocument.turns
+    .flatMap((turn) => turn.model_call_metrics);
+  const assessment = assess(document);
+  assert.equal(assessment.pass, false);
+  assert.equal(
+    assessment.checks.find((entry) => entry.name === 'zero_automatic_http_retries').pass,
+    false,
+  );
+});
+
+test('two-call mutation previews participate in the latency gate', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results) {
+    if (![
+      'intent_private_study_room_mutation_naming',
+      'intent_private_study_room_mutation_control',
+    ].includes(entry.vars.caseId)) {
+      continue;
+    }
+    const reportDocument = entry.response.metadata;
+    reportDocument.turns[0].elapsed_ms = 31000;
+    reportDocument.elapsed_ms = 31000;
+  }
+  const assessment = assess(document);
+  assert.equal(assessment.pass, false);
+  assert.equal(
+    assessment.checks.find((entry) => entry.name === 'two_call_preview_p95_latency').pass,
+    false,
+  );
 });

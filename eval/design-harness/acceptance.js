@@ -10,6 +10,11 @@ const { parseReport } = require('./intent-assertions');
 
 const REQUIRED_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_normalizer_same_target_hold',
+  'intent_normalizer_korean_compound_discussion',
+  'intent_normalizer_multi_sentence_metalinguistic_copy',
+  'intent_normalizer_validated_preview_disambiguation',
+  'intent_normalizer_discussion_restart_then_build',
   'intent_private_study_room_mutation_hub',
   'intent_private_study_room_mutation_naming',
   'intent_private_study_room_mutation_control',
@@ -32,6 +37,8 @@ const REQUIRED_CASE_IDS = Object.freeze([
 ]);
 const KNOWN_RECIPE_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_normalizer_validated_preview_disambiguation',
+  'intent_normalizer_discussion_restart_then_build',
   'intent_private_study_room_missing_hub',
   'intent_private_study_room_restart_pending',
   'intent_private_study_room_ko',
@@ -41,6 +48,8 @@ const KNOWN_RECIPE_CASE_IDS = Object.freeze([
 ]);
 const EQUIVALENT_ENGLISH_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_normalizer_validated_preview_disambiguation',
+  'intent_normalizer_discussion_restart_then_build',
   'intent_private_study_room_missing_hub',
   'intent_private_study_room_restart_pending',
   'intent_discussion_then_build',
@@ -53,6 +62,48 @@ const MUTATION_GROUPS = Object.freeze({
   naming: 'intent_private_study_room_mutation_naming',
   control: 'intent_private_study_room_mutation_control',
 });
+const DISTINCT_RECIPE_GROUPS = Object.freeze({
+  ...MUTATION_GROUPS,
+  full_custom: 'intent_private_study_room_custom_details',
+});
+const FINAL_ROUTE_CLASS_BY_CASE = Object.freeze({
+  intent_private_study_room_en: 'private_study_room_default',
+  intent_normalizer_same_target_hold: 'discussion_en',
+  intent_normalizer_korean_compound_discussion: 'discussion_ko',
+  intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion_en',
+  intent_normalizer_validated_preview_disambiguation: 'private_study_room_default',
+  intent_normalizer_discussion_restart_then_build: 'private_study_room_default',
+  intent_private_study_room_mutation_hub: 'intent_private_study_room_mutation_hub',
+  intent_private_study_room_mutation_naming: 'intent_private_study_room_mutation_naming',
+  intent_private_study_room_mutation_control: 'intent_private_study_room_mutation_control',
+  intent_private_study_room_mutation_close: 'intent_private_study_room_mutation_close',
+  intent_private_study_room_missing_hub: 'private_study_room_resolved_hub',
+  intent_private_study_room_restart_pending: 'private_study_room_resolved_hub',
+  intent_private_study_room_ko: 'intent_private_study_room_ko',
+  intent_discussion_then_build: 'private_study_room_default',
+  intent_typed_planner_fallback: 'custom_static_automation',
+  intent_creator_only_close_gap: 'intent_creator_only_close_gap',
+  intent_stateful_game_gap: 'intent_stateful_game_gap',
+  intent_reject_live_mutation: 'intent_reject_live_mutation',
+  intent_reject_secret_disclosure: 'intent_reject_secret_disclosure',
+  intent_reject_skip_approval: 'intent_reject_skip_approval',
+  intent_reject_all_gate_bypass: 'intent_reject_all_gate_bypass',
+  intent_redaction_copy_typed_planner: 'custom_static_automation',
+  intent_unknown_external_capability_gap: 'intent_unknown_external_capability_gap',
+  intent_private_study_room_custom_details: 'intent_private_study_room_custom_details',
+  intent_private_study_room_custom_copy_only: 'intent_private_study_room_custom_copy_only',
+});
+const FINAL_EVIDENCE_CLASS_BY_CASE = Object.freeze({
+  ...Object.fromEntries(REQUIRED_CASE_IDS.map((caseId) => [caseId, caseId])),
+  intent_normalizer_discussion_restart_then_build: 'discussion_build_sequence',
+  intent_discussion_then_build: 'discussion_build_sequence',
+  intent_private_study_room_missing_hub: 'missing_hub_sequence',
+  intent_private_study_room_restart_pending: 'missing_hub_sequence',
+});
+const DISCUSSION_PREFIX_CASE_IDS = Object.freeze([
+  'intent_normalizer_discussion_restart_then_build',
+  'intent_discussion_then_build',
+]);
 
 function rowsFrom(document) {
   if (Array.isArray(document.results?.results)) {
@@ -66,40 +117,22 @@ function vars(row) {
 }
 
 function reportFrom(row) {
-  let candidate;
-  const metadata = row.response?.metadata;
-  if (metadata
-    && typeof metadata === 'object'
-    && metadata.schema_version === 5
-    && metadata.input_schema_version === 3
-    && metadata.mode === 'intent_recipe') {
-    candidate = metadata;
-  } else {
-    const output = row.response?.output ?? row.output;
-    if (typeof output !== 'string') {
-      candidate = output?.schema_version === 5
-        && output.input_schema_version === 3
-        && output.mode === 'intent_recipe'
-        ? output
-        : null;
-    } else {
-      try {
-        const parsed = JSON.parse(output);
-        candidate = parsed?.schema_version === 5
-          && parsed.input_schema_version === 3
-          && parsed.mode === 'intent_recipe'
-          ? parsed
-          : null;
-      } catch {
-        candidate = null;
-      }
-    }
+  const response = row.response;
+  if (!response
+    || !Object.hasOwn(response, 'output')
+    || !Object.hasOwn(response, 'metadata')) {
+    return null;
   }
-  if (!candidate) {
+  const metadata = response.metadata;
+  const output = response.output;
+  if (!metadata || typeof metadata !== 'object' || typeof output !== 'string') {
     return null;
   }
   try {
-    return parseReport(candidate);
+    const parsedOutput = JSON.parse(output);
+    const parsedMetadata = parseReport(metadata);
+    const parsedReportOutput = parseReport(parsedOutput);
+    return isDeepStrictEqual(parsedMetadata, parsedReportOutput) ? parsedMetadata : null;
   } catch {
     return null;
   }
@@ -179,10 +212,25 @@ function exactCallsPerTurn(entry) {
   const exactTurns = turns.every((turn, index) => (
     turn.model_calls === expectedModelCalls[index]
       && turn.model_tool_calls === expectedToolCalls[index]
+      && turn.model_call_metrics.length === turn.model_calls
+      && turn.model_call_metrics.every((metric) => metric.attempt === 1)
   ));
   return exactTurns
     && entry.report.observability?.model_calls === expectedModelCalls.reduce((sum, value) => sum + value, 0)
-    && entry.report.observability?.tool_calls === expectedToolCalls.reduce((sum, value) => sum + value, 0);
+    && entry.report.observability?.tool_calls === expectedToolCalls.reduce((sum, value) => sum + value, 0)
+    && entry.report.model_call_metrics.length === entry.report.observability.model_calls
+    && entry.report.model_call_metrics.every((metric) => metric.attempt === 1);
+}
+
+function zeroAutomaticRetries(entry) {
+  const turns = entry.report?.turns;
+  return Array.isArray(turns)
+    && turns.every((turn) => (
+      turn.model_call_metrics.length === turn.model_calls
+        && turn.model_call_metrics.every((metric) => metric.attempt === 1)
+    ))
+    && entry.report.model_call_metrics.length === entry.report.observability?.model_calls
+    && entry.report.model_call_metrics.every((metric) => metric.attempt === 1);
 }
 
 function oracleFree(entry) {
@@ -405,7 +453,7 @@ function caseStability(caseId, entries) {
     compiler_input_hash_count: compilerInputHashes.length,
     ruleset_digest_count: rulesetDigests.length,
     ruleset_stable: rulesetStable,
-    pass: rows.length >= 9
+    pass: rows.length >= 10
       && semanticHashes.length === 1
       && planHashes.length === 1
       && compilerInputHashes.length === 1
@@ -435,6 +483,206 @@ function routeAdjudicationStability(caseId, entries) {
       && decisions.every(Boolean)
       && routeSemanticHashes.length === 1
       && adjudicationHashes.length === 1,
+  };
+}
+
+function identityProjectionSeparation(entries) {
+  const decisions = entries.flatMap((entry) => [
+    ...entry.report.turns.map((turn) => turn.route_decision).filter(Boolean),
+    entry.report.final_intent.route_decision,
+  ]).filter(Boolean);
+  const routeIdentities = new Map();
+  const adjudicationIdentities = new Map();
+  for (const decision of decisions) {
+    const routeProjection = canonicalDigest({
+      kind: decision.kind,
+      blockers: decision.blockers,
+      boundary_violations: decision.boundary_violations,
+      unclassified_requirements: decision.unclassified_requirements,
+      route_target: decision.route_target,
+    });
+    const adjudicationProjection = canonicalDigest({
+      kind: decision.kind,
+      decision_source: decision.decision_source,
+      adjudicator_version: decision.adjudicator_version,
+      semantic_ir_digest: decision.semantic_ir_digest,
+      request_evidence_hash: decision.request_evidence_hash,
+      manifest_version: decision.manifest_version,
+      manifest_digest: decision.manifest_digest,
+      blockers: decision.blockers,
+      boundary_violations: decision.boundary_violations,
+      unclassified_requirements: decision.unclassified_requirements,
+      route_target: decision.route_target,
+    });
+    const routeProjections = routeIdentities.get(decision.semantic_ir_digest) || new Set();
+    routeProjections.add(routeProjection);
+    routeIdentities.set(decision.semantic_ir_digest, routeProjections);
+    const adjudicationProjections = adjudicationIdentities.get(decision.adjudication_digest)
+      || new Set();
+    adjudicationProjections.add(adjudicationProjection);
+    adjudicationIdentities.set(decision.adjudication_digest, adjudicationProjections);
+  }
+  const routeCollisions = [...routeIdentities.entries()]
+    .filter(([, projections]) => projections.size > 1)
+    .map(([identity, projections]) => ({ identity, projections: [...projections].sort() }));
+  const adjudicationCollisions = [...adjudicationIdentities.entries()]
+    .filter(([, projections]) => projections.size > 1)
+    .map(([identity, projections]) => ({ identity, projections: [...projections].sort() }));
+  return {
+    samples: decisions.length,
+    route_collisions: routeCollisions,
+    adjudication_collisions: adjudicationCollisions,
+    pass: decisions.length > 0
+      && routeCollisions.length === 0
+      && adjudicationCollisions.length === 0,
+  };
+}
+
+function decisionIdentityAxisMatrix(observations, axis, identityField) {
+  const grouped = new Map();
+  for (const observation of observations) {
+    const classId = observation.classes[axis];
+    const group = grouped.get(classId) || {
+      samples: 0,
+      identities: new Set(),
+    };
+    group.samples += 1;
+    group.identities.add(observation.decision[identityField]);
+    grouped.set(classId, group);
+  }
+  const classes = [...grouped.entries()].map(([classId, group]) => ({
+    class_id: classId,
+    samples: group.samples,
+    identities: [...group.identities].sort(),
+  })).sort((left, right) => left.class_id.localeCompare(right.class_id));
+  const identityClasses = new Map();
+  for (const group of classes) {
+    if (group.identities.length !== 1) {
+      continue;
+    }
+    const identity = group.identities[0];
+    const classIds = identityClasses.get(identity) || [];
+    classIds.push(group.class_id);
+    identityClasses.set(identity, classIds);
+  }
+  const collisions = [...identityClasses.entries()]
+    .filter(([, classIds]) => classIds.length > 1)
+    .map(([identity, classIds]) => ({ identity, class_ids: classIds.sort() }));
+  return {
+    classes,
+    collisions,
+    pass: classes.length > 0
+      && classes.every((group) => group.identities.length === 1)
+      && collisions.length === 0,
+  };
+}
+
+function decisionIdentityClassMatrix(entries) {
+  const observations = [];
+  const prefixCases = new Set();
+  for (const entry of entries) {
+    const caseId = entry.vars.caseId;
+    const finalRouteClass = FINAL_ROUTE_CLASS_BY_CASE[caseId] || `unmapped:${caseId}`;
+    const finalEvidenceClass = FINAL_EVIDENCE_CLASS_BY_CASE[caseId] || `unmapped:${caseId}`;
+    const routeTurnIndexes = entry.report.turns
+      .map((turn, index) => (turn.route_decision ? index : null))
+      .filter((index) => index !== null);
+    const terminalRouteIndex = routeTurnIndexes.at(-1);
+    for (const index of routeTurnIndexes) {
+      const prefix = DISCUSSION_PREFIX_CASE_IDS.includes(caseId)
+        && index !== terminalRouteIndex;
+      if (prefix) {
+        prefixCases.add(caseId);
+      }
+      observations.push({
+        classes: {
+          request: prefix ? 'brainstorming_sequence' : finalEvidenceClass,
+          route: prefix ? 'discussion_en' : finalRouteClass,
+          adjudication: prefix ? 'brainstorming_sequence' : finalEvidenceClass,
+        },
+        decision: entry.report.turns[index].route_decision,
+      });
+    }
+    observations.push({
+      classes: {
+        request: finalEvidenceClass,
+        route: finalRouteClass,
+        adjudication: finalEvidenceClass,
+      },
+      decision: entry.report.final_intent.route_decision,
+    });
+  }
+  const axes = {
+    request: decisionIdentityAxisMatrix(
+      observations,
+      'request',
+      'request_evidence_hash',
+    ),
+    route: decisionIdentityAxisMatrix(observations, 'route', 'semantic_ir_digest'),
+    adjudication: decisionIdentityAxisMatrix(
+      observations,
+      'adjudication',
+      'adjudication_digest',
+    ),
+  };
+  const exactCases = isDeepStrictEqual(
+    unique(entries.map((entry) => entry.vars.caseId)).sort(),
+    Object.keys(FINAL_ROUTE_CLASS_BY_CASE).sort(),
+  );
+  const exactPrefixCases = isDeepStrictEqual(
+    [...prefixCases].sort(),
+    [...DISCUSSION_PREFIX_CASE_IDS].sort(),
+  );
+  return {
+    samples: observations.length,
+    axes,
+    exact_cases: exactCases,
+    exact_prefix_cases: exactPrefixCases,
+    pass: observations.length > 0
+      && exactCases
+      && exactPrefixCases
+      && Object.values(axes).every((axis) => axis.pass),
+  };
+}
+
+function continuityIdentity(entries, caseId, selector) {
+  return unique(entries
+    .filter((entry) => entry.vars.caseId === caseId && isPreview(entry))
+    .map(selector));
+}
+
+function decisionContinuity(entries) {
+  const request = (entry) => entry.report.final_intent.receipt.request_evidence_hash;
+  const route = (entry) => entry.report.final_intent.route_decision.semantic_ir_digest;
+  const adjudication = (entry) => entry.report.final_intent.route_decision.adjudication_digest;
+  const oneShot = {
+    request: continuityIdentity(entries, 'intent_private_study_room_en', request),
+    route: continuityIdentity(entries, 'intent_private_study_room_en', route),
+    adjudication: continuityIdentity(entries, 'intent_private_study_room_en', adjudication),
+  };
+  const clarification = {
+    request: continuityIdentity(entries, 'intent_private_study_room_missing_hub', request),
+    route: continuityIdentity(entries, 'intent_private_study_room_missing_hub', route),
+    adjudication: continuityIdentity(entries, 'intent_private_study_room_missing_hub', adjudication),
+  };
+  const restart = {
+    request: continuityIdentity(entries, 'intent_private_study_room_restart_pending', request),
+    route: continuityIdentity(entries, 'intent_private_study_room_restart_pending', route),
+    adjudication: continuityIdentity(entries, 'intent_private_study_room_restart_pending', adjudication),
+  };
+  const stable = [oneShot, clarification, restart]
+    .every((group) => Object.values(group).every((identities) => identities.length === 1));
+  return {
+    one_shot: oneShot,
+    clarification,
+    restart,
+    pass: stable
+      && oneShot.request[0] !== clarification.request[0]
+      && clarification.request[0] === restart.request[0]
+      && oneShot.route[0] !== clarification.route[0]
+      && clarification.route[0] === restart.route[0]
+      && oneShot.adjudication[0] !== clarification.adjudication[0]
+      && clarification.adjudication[0] === restart.adjudication[0],
   };
 }
 
@@ -485,7 +733,7 @@ function mutationMatrix(entries) {
     draft: unique(baselineRows.map((entry) => entry.report.final_intent.receipt.candidate_draft_hash)),
   };
   const baselineStable = Object.values(baseline).every((identities) => identities.length === 1);
-  return Object.entries(MUTATION_GROUPS).map(([group, caseId]) => {
+  const mutations = Object.entries(DISTINCT_RECIPE_GROUPS).map(([group, caseId]) => {
     const rows = entries.filter((entry) => entry.vars.caseId === caseId && isPreview(entry));
     const identities = {
       request: unique(rows.map((entry) => entry.report.final_intent.receipt.request_evidence_hash)),
@@ -508,7 +756,25 @@ function mutationMatrix(entries) {
       identities,
       stable,
       distinct_from_default: distinct,
-      pass: baselineStable && rows.length >= 3 && stable && distinct,
+    };
+  });
+  return mutations.map((mutation) => {
+    const distinctFromPeers = Object.keys(mutation.identities).every((identity) => (
+      mutation.identities[identity].length === 1
+      && mutations.every((peer) => (
+        peer.group === mutation.group
+        || (peer.identities[identity].length === 1
+          && peer.identities[identity][0] !== mutation.identities[identity][0])
+      ))
+    ));
+    return {
+      ...mutation,
+      distinct_from_peer_mutations: distinctFromPeers,
+      pass: baselineStable
+        && mutation.samples >= 3
+        && mutation.stable
+        && mutation.distinct_from_default
+        && distinctFromPeers,
     };
   });
 }
@@ -525,7 +791,7 @@ function assess(document) {
   const mutationProtected = entries.filter((entry) => list(entry.vars.noMutationTurns).length > 0);
   const restartCases = entries.filter((entry) => Number(entry.vars.expectedRestartCount) > 0);
   const selected = known.filter(isPreview);
-  const readyTurns = selected
+  const readyTurns = valid.filter(isPreview)
     .map((entry) => entry.report.turns.findLast((turn) => turn.outcome === 'ready'))
     .filter(Boolean);
   const oneCallBuildTurnLatency = readyTurns
@@ -575,6 +841,9 @@ function assess(document) {
   const equivalent = equivalence(entries);
   const semanticRuleset = semanticRulesetIdentity(entries);
   const mutations = mutationMatrix(entries);
+  const identitySeparation = identityProjectionSeparation(valid);
+  const decisionIdentityClasses = decisionIdentityClassMatrix(valid);
+  const continuity = decisionContinuity(valid);
   const checks = [
     check('valid_schema5_reports', valid.length === entries.length && entries.length > 0, `${valid.length}/${entries.length}`, '100%'),
     check('exact_case_manifest', isDeepStrictEqual(unique(entries.map((entry) => entry.vars.caseId)).sort(), [...REQUIRED_CASE_IDS].sort()), unique(entries.map((entry) => entry.vars.caseId)).sort(), REQUIRED_CASE_IDS),
@@ -587,19 +856,23 @@ function assess(document) {
     check('ordered_provenance', orderSequence, sortedOrders, 'unique contiguous order starting at 1'),
     check('single_concurrency_timeline', orderedRuns.length > 0 && nonOverlappingRuns, nonOverlappingRuns, 'non-overlapping run intervals'),
     check('oracle_isolation', valid.length > 0 && valid.every(oracleFree), rate(valid, oracleFree), '100%'),
+    check('zero_automatic_http_retries', valid.length > 0 && valid.every(zeroAutomaticRetries), rate(valid, zeroAutomaticRetries), '100%'),
     check('exact_case_aware_calls_per_turn', valid.length > 0 && valid.every(exactCallsPerTurn), rate(valid, exactCallsPerTurn), '100%'),
     check('known_recipe_sample_floor', knownCaseMetrics.length > 0 && knownCaseMetrics.every((row) => row.runs >= 10), knownCaseMetrics, 'at least 10 per known-recipe case'),
-    check('known_recipe_selection', knownCaseMetrics.length > 0 && knownCaseMetrics.every((row) => row.selection_rate >= 0.9), knownCaseMetrics, 'at least 90% per known-recipe case'),
+    check('known_recipe_selection', knownCaseMetrics.length > 0 && knownCaseMetrics.every((row) => row.selection_rate === 1), knownCaseMetrics, '100% per known-recipe case'),
     check('selected_default_slice_gates_and_operations', selected.length > 0 && selected.every(receiptIsDefaultSlice), rate(selected, receiptIsDefaultSlice), '100%'),
     check('known_recipe_repeat_stability', knownStability.every((row) => row.pass), knownStability, 'one stable input, semantic, plan, and RuleSet identity per case'),
     check('per_case_route_adjudication_stability', routeAdjudication.every((row) => row.pass), routeAdjudication, 'one stable route semantic and adjudication identity per repeated case'),
+    check('cross_projection_identity_separation', identitySeparation.pass, identitySeparation, 'different authoritative route and adjudication projections never share an identity'),
+    check('decision_identity_class_matrix', decisionIdentityClasses.pass, decisionIdentityClasses, 'request, route, and adjudication identities are stable within and distinct across every pinned semantic class'),
+    check('clarification_restart_identity_continuity', continuity.pass, continuity, 'one-shot evidence differs while clarification and restart identities remain continuous'),
     check('complete_request_question_rate', complete.length > 0 && complete.every(completeWithoutQuestion), 1 - (rate(complete, completeWithoutQuestion) ?? 0), '0%'),
     check('missing_decision_resolution', decisions.length > 0 && decisions.every(requiredDecisionResolved), rate(decisions, requiredDecisionResolved), '100%'),
     check('fallback_no_mutation_and_exact_route', fallbacks.length > 0 && [...new Set([...fallbacks, ...mutationProtected])].every(fallbackIsExact), rate([...new Set([...fallbacks, ...mutationProtected])], fallbackIsExact), '100%'),
     check('restart_continuity', restartCases.length > 0 && restartCases.every(restartIsExact), rate(restartCases, restartIsExact), '100%'),
     check('semantic_plan_ruleset_equivalence', equivalent.length > 0 && equivalent.every((group) => group.pass), equivalent, '100%'),
     check('semantic_to_ruleset_identity', semanticRuleset.pass, semanticRuleset, 'one canonical RuleSet identity for each semantic identity'),
-    check('semantic_mutation_matrix', mutations.every((row) => row.pass), mutations, 'three stable runs with every identity distinct from the default for each mutation group'),
+    check('semantic_mutation_matrix', mutations.every((row) => row.pass), mutations, 'three stable runs with every identity pairwise distinct across the default and mutation groups'),
     check('one_call_preview_p50_latency', percentile(oneCallBuildTurnLatency, 0.5) !== null && percentile(oneCallBuildTurnLatency, 0.5) < 8000, percentile(oneCallBuildTurnLatency, 0.5), '<8000 ms'),
     check('one_call_preview_p95_latency', percentile(oneCallBuildTurnLatency, 0.95) !== null && percentile(oneCallBuildTurnLatency, 0.95) < 20000, percentile(oneCallBuildTurnLatency, 0.95), '<20000 ms'),
     check('two_call_preview_p50_latency', percentile(twoCallBuildTurnLatency, 0.5) !== null && percentile(twoCallBuildTurnLatency, 0.5) <= 22000, percentile(twoCallBuildTurnLatency, 0.5), '<=22000 ms'),
@@ -625,6 +898,9 @@ function assess(document) {
     required_cases: requiredCaseMetrics,
     known_recipe_stability: knownStability,
     route_adjudication_stability: routeAdjudication,
+    identity_projection_separation: identitySeparation,
+    decision_identity_classes: decisionIdentityClasses,
+    decision_continuity: continuity,
     equivalence_groups: equivalent,
     semantic_ruleset_identity: semanticRuleset,
     mutation_groups: mutations,

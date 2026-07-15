@@ -9,7 +9,7 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '864ef3cac2f5d2ea2d0ec2bffe59716e10be466bebc434b629722df3ce4f744a';
+const REGISTRY_DIGEST = '9832cff64316aa1523a446a4a0e043a020999c561cb1bb7eb667942aa64849f4';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -229,7 +229,7 @@ function report(overrides = {}) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 9,
-      normalizer_revision: 4,
+      normalizer_revision: 5,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -286,7 +286,7 @@ function report(overrides = {}) {
       store_writes: 1,
       connection_reopen_count: 0,
       final_generation: 1,
-      snapshot_schema_version: 7,
+      snapshot_schema_version: 8,
       roundtrip_verified: false,
     },
     elapsed_ms: 1000,
@@ -734,7 +734,7 @@ test('decision and restart assertions require a mutation-free pending turn and d
       store_writes: 2,
       connection_reopen_count: 1,
       final_generation: 2,
-      snapshot_schema_version: 7,
+      snapshot_schema_version: 8,
       roundtrip_verified: true,
     },
     elapsed_ms: 2000,
@@ -764,6 +764,114 @@ test('decision and restart assertions require a mutation-free pending turn and d
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(broken), expected).reason,
     /changed during resolution/,
+  );
+});
+
+test('normalizer V5 assertion pins discussion holds and metalinguistic copies to no mutation', () => {
+  const routeDecision = decision('discussion');
+  const document = routedDocument(
+    routeDecision,
+    'We can compare the tradeoffs without changing the Draft.',
+    'normalizer-discussion',
+  );
+  for (const normalizerV5Contract of [
+    'same_target_hold',
+    'korean_compound_discussion',
+    'multi_sentence_metalinguistic_copy',
+  ]) {
+    const expected = context({ normalizerV5Contract });
+    assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+  }
+
+  const mutated = JSON.parse(document);
+  mutated.turns[0].draft_changed = true;
+  assert.match(
+    checks.intentNormalizerV5Behavior(
+      JSON.stringify(mutated),
+      context({ normalizerV5Contract: 'same_target_hold' }),
+    ).reason,
+    /mutation-free discussion route/,
+  );
+});
+
+test('normalizer V5 assertion pins preview disambiguation to the default one-call recipe', () => {
+  const document = report();
+  const expected = context({
+    normalizerV5Contract: 'validated_preview_disambiguation',
+    normalizerBaselineCase: 'intent_private_study_room_en',
+  });
+  assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+
+  assert.match(
+    checks.intentNormalizerV5Behavior(
+      document,
+      context({ normalizerV5Contract: 'validated_preview_disambiguation' }),
+    ).reason,
+    /pinned equivalence baseline/,
+  );
+
+  const extraCall = JSON.parse(document);
+  extraCall.turns[0].model_calls = 2;
+  extraCall.turns[0].model_tool_calls = 2;
+  extraCall.turns[0].model_call_metrics.push(
+    metric('extract_private_study_room_details', 2),
+  );
+  extraCall.model_call_metrics = structuredClone(extraCall.turns[0].model_call_metrics);
+  extraCall.observability.model_calls = 2;
+  extraCall.observability.tool_calls = 2;
+  assert.match(
+    checks.intentNormalizerV5Behavior(JSON.stringify(extraCall), expected).reason,
+    /one-call validated-preview route/,
+  );
+});
+
+test('normalizer V5 assertion requires routed discussion replay across restart before build', () => {
+  const discussion = turn({
+    id: 'discuss-before-restart',
+    input: 'Discuss first',
+    outcome: 'routed',
+    completed: false,
+    message: 'We can compare the tradeoffs without changing the Draft.',
+    deterministic_operations: 0,
+    intent_counters: counters({
+      route_calls: 1,
+      fallback_routes: { discussion: 1 },
+    }),
+    stage_after: 'empty',
+    intent_revision_after: 0,
+    route_decision: decision('discussion'),
+    draft_revision_after: 0,
+    draft_changed: false,
+    actual_gates: staleGates(),
+    restart_after: true,
+    restart_performed: true,
+  });
+  const build = turn({
+    id: 'build-after-restart',
+    intent_revision_before: 0,
+    intent_revision_after: 1,
+  });
+  const document = report({
+    turns: [discussion, build],
+    observability: observability(2, 2),
+    persistence: {
+      backend: 'sqlite_file',
+      store_writes: 2,
+      connection_reopen_count: 1,
+      final_generation: 2,
+      snapshot_schema_version: 8,
+      roundtrip_verified: true,
+    },
+    elapsed_ms: 2000,
+  });
+  const expected = context({ normalizerV5Contract: 'discussion_restart_restore' });
+  assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+
+  const broken = JSON.parse(document);
+  broken.persistence.roundtrip_verified = false;
+  assert.match(
+    checks.intentNormalizerV5Behavior(JSON.stringify(broken), expected).reason,
+    /persistence evidence is incomplete/,
   );
 });
 
@@ -1056,7 +1164,7 @@ test('V4 report contract rejects version, evidence, and candidate identity drift
   assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
 
   const oldNormalizer = JSON.parse(report());
-  oldNormalizer.catalog_identity.normalizer_revision = 3;
+  oldNormalizer.catalog_identity.normalizer_revision = 4;
   assert.match(checks.intentReceipt(JSON.stringify(oldNormalizer), context()).reason, /catalog identity/);
 
   const forgedRegistry = JSON.parse(report());
