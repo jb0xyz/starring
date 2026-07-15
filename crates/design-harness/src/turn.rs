@@ -1,5 +1,7 @@
 mod execution;
 mod intent_boundary_grounding;
+#[cfg(test)]
+mod intent_boundary_grounding_tests;
 mod intent_capability_grounding;
 #[cfg(test)]
 mod intent_capability_grounding_tests;
