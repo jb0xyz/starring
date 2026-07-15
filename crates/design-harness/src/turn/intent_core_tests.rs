@@ -104,9 +104,9 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     }))
     .unwrap()
     .len();
-    assert!(schema_bytes <= 2_400, "core schema is {schema_bytes} bytes");
+    assert!(schema_bytes <= 1_600, "core schema is {schema_bytes} bytes");
     assert!(
-        structured_bytes <= 5_600,
+        structured_bytes <= 3_800,
         "core structured metadata is {structured_bytes} bytes"
     );
 }
