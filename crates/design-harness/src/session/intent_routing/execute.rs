@@ -347,10 +347,6 @@ impl<C> DesignSession<C> {
         let mut core = parse_interpret_intent_core(arguments).inspect_err(|_| {
             self.record_intent_extraction_failure();
         })?;
-        core.validate_human_evidence(human_message)
-            .inspect_err(|_| {
-                self.record_intent_extraction_failure();
-            })?;
         self.validate_expected_revision(core.expected_revision())?;
         let transcript_message_index =
             u64::try_from(self.current_human_message_index.ok_or_else(|| {
@@ -387,7 +383,10 @@ impl<C> DesignSession<C> {
             .collect::<Vec<_>>();
         let grounded_channel = deterministically_selected_option(human_message, &channel_options)
             .map(crate::intent::ExistingChannelKey);
-        core.apply_human_grounding(human_message, grounded_channel.as_ref());
+        core.apply_human_grounding(human_message, grounded_channel.as_ref())
+            .inspect_err(|_| {
+                self.record_intent_extraction_failure();
+            })?;
         let request_evidence = IntentRequestEvidenceChainV1::from_initial_human(
             &self.messages,
             transcript_message_index,

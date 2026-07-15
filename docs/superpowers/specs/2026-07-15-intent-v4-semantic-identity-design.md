@@ -273,7 +273,11 @@ The prompt must make these rules explicit:
   unmapped evidence unless another closed semantic field represents that
   behavior;
 - unmapped evidence must retain the shortest complete contiguous subject and
-  predicate, never a paraphrase or a noun fragment;
+  predicate, including its leading determiner, never a paraphrase or a noun
+  fragment;
+- imperative instructions whose object is preserving, weakening, reducing,
+  omitting, or simplifying the request, requirements, or instructions are
+  metadata about the design task rather than executable capabilities;
 - no positive requirement may exist only in response or presentation prose;
 - safety-boundary requests and detail-facet selection are harness-owned;
 - recipe identity, objective identity, compiler identity, and hashes are
@@ -291,6 +295,24 @@ produce one unclassified blocker containing those four evidence records in
 addition to the four runtime-property blockers. The evaluator requires the
 decision's unmapped requirement set and the unclassified blocker's evidence set
 to be identical.
+
+The model proposes exact human spans, while a bounded deterministic grounder
+owns their canonical form. It first requires a case-sensitive word-bounded
+occurrence in the whitespace-canonical human turn. Combining marks, joiners,
+variation selectors, hyphens, and in-word apostrophes remain part of the
+surrounding token and cannot manufacture a boundary. It removes only explicit
+top-level imperative meta-instructions about the request or its requirements;
+quoted, code-delimited, colon-introduced, compound, and behavior-bearing text is
+retained. When one candidate has exactly one bounded occurrence, omits an
+immediately preceding `a`, `an`, `the`, `each`, or `every`, and has the closed subject-predicate
+shape, the grounder expands the candidate to that exact larger human span.
+Ambiguous repairs, ungrounded or case-mismatched substrings, and repairs that
+exceed 160 UTF-16 code units fail closed. Noun phrases and unsupported predicates
+remain exact without speculative expansion. Grounding runs before recipe-detail
+classification, then the result is sorted and deduplicated before adjudication.
+At most eight candidates are scanned, so this work remains linear in the
+human-turn length under the fixed Core bound and reproduces identically during
+snapshot restore.
 
 ## Workspace and recipe boundary
 
@@ -368,8 +390,9 @@ compiled_operations
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
 extractor revision moves from 4 to 7, including the closed detail grammar and
-runtime-versus-behavior evidence contract, the normalizer revision from 1 to 2,
-and the recipe descriptor and registry digests rotate. Recipe version,
+runtime-versus-behavior evidence contract. The normalizer revision moves from 1
+to 3, including exact capability-evidence canonicalization, and the recipe
+descriptor and registry digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
 Durable awaiting-decision and preview-ready stages move to a V2 shape. They bind:
@@ -408,7 +431,7 @@ Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   7
 Recipe extractor revision          7
-Recipe normalizer revision         2
+Recipe normalizer revision         3
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -451,9 +474,18 @@ V3 Intent snapshots are not automatically migrated. Their authoritative
 objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
+Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
+the branch-local normalizer revision 2 or its earlier V4 prompt are pre-release
+evaluation artifacts, not a supported durable format. They are rejected by the
+exact fixed-prompt or recipe-registry identity checks and must be discarded
+rather than migrated. After V4 ships, a semantic prompt or normalizer change must
+either rotate the protocol or snapshot contract or retain an explicit verified
+restore-only compatibility path.
+
 Compatibility rules are:
 
 - V4 prompt with protocol 4 is current;
+- a pre-release V4 prompt or normalizer-2 recipe identity is rejected;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
 - any crossed prompt/protocol pair is an invalid invariant;
 - a V6 non-Intent adaptive or typed snapshot may be promoted in memory to V7;

@@ -1,12 +1,15 @@
 const { createHash } = require('node:crypto');
+const {
+  INTENT_EXTRACTOR_REVISION,
+  INTENT_NORMALIZER_REVISION,
+  INTENT_REGISTRY_DIGEST,
+} = require('./catalog-identity');
 
 const INTENT_MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
 const INTENT_PROTOCOL_VERSION = 4;
 const INTENT_ADJUDICATOR_VERSION = 3;
 const INTENT_IDENTITY_REVISION = 2;
 const INTENT_SNAPSHOT_VERSION = 7;
-const INTENT_EXTRACTOR_REVISION = 7;
-const INTENT_REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
 const SHA256 = /^[0-9a-f]{64}$/;
 const DECISION_KINDS = new Set([
   'private_study_room',
@@ -698,7 +701,7 @@ function parseReport(output) {
   if (report.catalog_identity.recipe_id !== 'starring.private_study_room'
     || report.catalog_identity.recipe_version !== 1
     || report.catalog_identity.extractor_revision !== INTENT_EXTRACTOR_REVISION
-    || report.catalog_identity.normalizer_revision !== 2
+    || report.catalog_identity.normalizer_revision !== INTENT_NORMALIZER_REVISION
     || report.catalog_identity.compiler_revision !== 1
     || report.catalog_identity.simulator_revision !== 1
     || report.catalog_identity.registry_digest !== INTENT_REGISTRY_DIGEST) {

@@ -7,7 +7,7 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
+const REGISTRY_DIGEST = 'b0e179f6bf7a5e99c52e8235f3b901c1d6714ab943e5196f651465b456802742';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -345,7 +345,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 7,
-      normalizer_revision: 2,
+      normalizer_revision: 3,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -837,13 +837,22 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
   assert.equal(assessment.checks.find((entry) => entry.name === 'single_cohort_boundary').pass, true);
 });
 
-test('checkpoint rejects stale extractor and forged registry identities', () => {
+test('checkpoint rejects stale extractor, normalizer, and forged registry identities', () => {
   const oldExtractor = passingDocument();
   oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 6;
   const oldExtractorAssessment = assess(oldExtractor);
   assert.equal(oldExtractorAssessment.pass, false);
   assert.equal(
     oldExtractorAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
+    false,
+  );
+
+  const oldNormalizer = passingDocument();
+  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 2;
+  const oldNormalizerAssessment = assess(oldNormalizer);
+  assert.equal(oldNormalizerAssessment.pass, false);
+  assert.equal(
+    oldNormalizerAssessment.checks.find((entry) => entry.name === 'valid_schema5_reports').pass,
     false,
   );
 

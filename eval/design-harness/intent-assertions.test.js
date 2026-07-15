@@ -9,7 +9,7 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6';
+const REGISTRY_DIGEST = 'b0e179f6bf7a5e99c52e8235f3b901c1d6714ab943e5196f651465b456802742';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -229,7 +229,7 @@ function report(overrides = {}) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 7,
-      normalizer_revision: 2,
+      normalizer_revision: 3,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -1065,6 +1065,10 @@ test('V4 report contract rejects version, evidence, and candidate identity drift
   const oldExtractor = JSON.parse(report());
   oldExtractor.catalog_identity.extractor_revision = 6;
   assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
+
+  const oldNormalizer = JSON.parse(report());
+  oldNormalizer.catalog_identity.normalizer_revision = 2;
+  assert.match(checks.intentReceipt(JSON.stringify(oldNormalizer), context()).reason, /catalog identity/);
 
   const forgedRegistry = JSON.parse(report());
   forgedRegistry.catalog_identity.registry_digest = '8'.repeat(64);

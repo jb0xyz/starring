@@ -525,8 +525,6 @@ fn validate_initial_semantics_replay(
         .as_deref()
         .ok_or_else(|| snapshot_error("initial Core arguments are missing"))?;
     let mut core = parse_interpret_intent_core(arguments).map_err(restored_semantics_error)?;
-    core.validate_human_evidence(&human)
-        .map_err(restored_semantics_error)?;
     if core.expected_revision() != *expected_revision
         || state.expected_revision != *expected_revision
     {
@@ -536,7 +534,8 @@ fn validate_initial_semantics_replay(
     }
     let grounded_channel = deterministically_selected_option(&human, &state.available_channel_keys)
         .map(ExistingChannelKey);
-    core.apply_human_grounding(&human, grounded_channel.as_ref());
+    core.apply_human_grounding(&human, grounded_channel.as_ref())
+        .map_err(restored_semantics_error)?;
     let adjudication =
         adjudicate_intent_core_v4(core, initial_head).map_err(restored_semantics_error)?;
     let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudication else {

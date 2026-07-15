@@ -295,6 +295,31 @@ fn core_parser_keeps_behaviors_separate_from_runtime_infrastructure() {
 }
 
 #[test]
+fn human_grounding_canonicalizes_live_stateful_evidence() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!([
+        "LLM decides rewards at event time",
+        "do not reduce the request to static responses",
+        "every message earns XP",
+        "levels unlock an economy",
+        "timers advance quests"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    parsed.apply_human_grounding(human, None).unwrap();
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &[
+            "an LLM decides rewards at event time",
+            "every message earns XP",
+            "levels unlock an economy",
+            "timers advance quests"
+        ]
+    );
+}
+
+#[test]
 fn core_capability_evidence_must_be_grounded_in_the_human_request() {
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
@@ -317,6 +342,36 @@ fn core_capability_evidence_must_be_grounded_in_the_human_request() {
             .code,
         "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE"
     );
+
+    value["other_unmapped_required_capabilities"] = json!(["LLM decides rewards at event time"]);
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed
+            .validate_human_evidence("An XLLM decides rewards at event time.")
+            .unwrap_err()
+            .code,
+        "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE"
+    );
+}
+
+#[test]
+fn failed_human_grounding_leaves_the_parsed_core_unchanged() {
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!(["fabricated capability"]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    let before = parsed.clone();
+    assert_eq!(
+        parsed
+            .apply_human_grounding(
+                "Build in community_hub with only the requested behavior.",
+                Some(&ExistingChannelKey("community_hub".to_string())),
+            )
+            .unwrap_err()
+            .code,
+        "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE"
+    );
+    assert_eq!(parsed, before);
 }
 
 #[test]
@@ -331,11 +386,12 @@ fn human_grounding_reclassifies_exact_supported_recipe_details() {
     ]);
     let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
 
-    parsed.validate_human_evidence(human).unwrap();
-    parsed.apply_human_grounding(
-        human,
-        Some(&ExistingChannelKey("community_hub".to_string())),
-    );
+    parsed
+        .apply_human_grounding(
+            human,
+            Some(&ExistingChannelKey("community_hub".to_string())),
+        )
+        .unwrap();
 
     assert!(parsed.unclassified_requirements().is_empty());
     assert_eq!(
@@ -359,11 +415,12 @@ fn human_grounding_preserves_external_capability_next_to_recipe_details() {
     ]);
     let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
 
-    parsed.validate_human_evidence(human).unwrap();
-    parsed.apply_human_grounding(
-        human,
-        Some(&ExistingChannelKey("community_hub".to_string())),
-    );
+    parsed
+        .apply_human_grounding(
+            human,
+            Some(&ExistingChannelKey("community_hub".to_string())),
+        )
+        .unwrap();
 
     assert_eq!(
         parsed.unclassified_requirements(),
@@ -382,8 +439,7 @@ fn human_grounding_never_reduces_dynamic_behavior_to_recipe_details() {
     value["other_unmapped_required_capabilities"] = json!(["channel name to 'closed'"]);
     let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
 
-    parsed.validate_human_evidence(human).unwrap();
-    parsed.apply_human_grounding(human, None);
+    parsed.apply_human_grounding(human, None).unwrap();
 
     assert_eq!(
         parsed.unclassified_requirements(),

@@ -80,15 +80,16 @@ pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V4: &str = concat!(
     " Never encode safety-boundary requests or supported copy, naming, and control literals as unmapped capabilities or response prose.",
     " other_unmapped_required_capabilities contains every additional positive behavior, authorization, lifecycle, runtime, or external-effect requirement that no closed field or supported recipe detail represents.",
     " It is not a summary and excludes anything represented by another field.",
-    " Do not copy meta-instructions about preserving or not weakening the request as capabilities.",
+    " Exclude meta-instructions whose object is the request, requirements, or instructions, such as do not weaken the instructions.",
     " Preserve each such capability as the shortest complete contiguous subject-and-predicate phrase copied exactly from the human text.",
+    " Keep the subject's leading a, an, the, each, or every.",
     " Never paraphrase it or reduce it to a noun fragment.",
     " No positive requirement may exist only in response text.",
     " Map a validated preview request to requested_outcome=validated_preview, another build to working_draft, and discussion to discussion.",
     " Every build response is empty.",
     " Mapping examples:",
     " state storage must survive process restarts and scheduled jobs must use durable timer infrastructure means runtime_requirements=[restart_persistent,durable_timer] and other_unmapped_required_capabilities=[].",
-    " durable scheduling infrastructure for a workflow where each approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[each approved invoice posts a signed audit record].",
+    " durable scheduling infrastructure for a workflow where an approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[an approved invoice posts a signed audit record].",
     " Recipe identity, objective identity, hashes, actions, permissions, and generated keys are harness-owned.",
     " Never invent fields, routes, capability identifiers, recipe metadata, actions, permissions, RuleSet JSON, deployment, activation, secrets, or live operations."
 );

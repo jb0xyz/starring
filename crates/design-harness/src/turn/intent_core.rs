@@ -9,6 +9,9 @@ use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
 use super::intent_boundary_grounding::ground_safety_boundary_requests;
+use super::intent_capability_grounding::{
+    ground_unmapped_capability_evidence, CapabilityEvidenceGroundingError,
+};
 use super::intent_detail_requirement::analyze_private_study_room_details;
 use super::intent_interpretation::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
@@ -203,19 +206,25 @@ impl IntentCoreInterpretationV4 {
         &mut self,
         human_message: &str,
         grounded_channel: Option<&ExistingChannelKey>,
-    ) {
-        self.apply_human_grounded_channel(grounded_channel);
-        self.boundary_requests = ground_safety_boundary_requests(human_message);
+    ) -> Result<(), StructuredError> {
+        let canonical_human = canonical_human_message(human_message);
+        let mut unclassified_requirements =
+            grounded_capability_evidence(&canonical_human, self.unclassified_requirements.clone())?;
         let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
             && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
-        self.detail_facets = if managed_private_study_room {
+        let detail_facets = if managed_private_study_room {
             let analysis = analyze_private_study_room_details(human_message);
-            self.unclassified_requirements
+            unclassified_requirements
                 .retain(|requirement| !analysis.explains_requirement(requirement));
             analysis.facets().to_vec()
         } else {
             Vec::new()
         };
+        self.apply_human_grounded_channel(grounded_channel);
+        self.boundary_requests = ground_safety_boundary_requests(human_message);
+        self.unclassified_requirements = unclassified_requirements;
+        self.detail_facets = detail_facets;
+        Ok(())
     }
 
     pub fn locale(&self) -> IntentLocaleHintV2 {
@@ -239,23 +248,8 @@ impl IntentCoreInterpretationV4 {
     }
 
     pub fn validate_human_evidence(&self, human_message: &str) -> Result<(), StructuredError> {
-        let human_message = human_message
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if self
-            .unclassified_requirements
-            .iter()
-            .all(|value| human_message.contains(value))
-        {
-            return Ok(());
-        }
-        Err(core_error(
-            "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
-            "intent.core.other_unmapped_required_capabilities",
-            "An unmapped capability is not an exact phrase from the human request",
-            "Copy a contiguous human phrase without synthesizing an identifier",
-        ))
+        let mut candidate = self.clone();
+        candidate.apply_human_grounding(human_message, None)
     }
 
     pub fn recipe_detail_facets(&self) -> &[IntentRecipeDetailFacetV3] {
@@ -265,6 +259,44 @@ impl IntentCoreInterpretationV4 {
     pub fn response(&self) -> &str {
         &self.response
     }
+}
+
+fn canonical_human_message(human_message: &str) -> String {
+    human_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn grounded_capability_evidence(
+    human_message: &str,
+    candidates: Vec<String>,
+) -> Result<Vec<String>, StructuredError> {
+    ground_unmapped_capability_evidence(
+        human_message,
+        candidates,
+        MAX_UNCLASSIFIED_REQUIREMENT_CHARS,
+    )
+    .map_err(|error| match error {
+        CapabilityEvidenceGroundingError::Ambiguous => core_error(
+            "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "An unmapped capability has multiple exact occurrences and cannot be repaired uniquely",
+            "Return one complete exact source phrase including its leading article",
+        ),
+        CapabilityEvidenceGroundingError::ExpandedTooLong => core_error(
+            "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "An exact grounded capability exceeds the supported UTF-16 length after repair",
+            "Return a shorter complete exact source phrase within 160 UTF-16 code units",
+        ),
+        CapabilityEvidenceGroundingError::Ungrounded => core_error(
+            "UNGROUNDED_INTENT_CAPABILITY_EVIDENCE",
+            "intent.core.other_unmapped_required_capabilities",
+            "An unmapped capability is not an exact phrase from the human request",
+            "Copy a contiguous human phrase without synthesizing an identifier",
+        ),
+    })
 }
 
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {

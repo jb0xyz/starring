@@ -91,8 +91,10 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("Never paraphrase it or reduce it to a noun fragment"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Do not copy meta-instructions about preserving or not weakening the request as capabilities"
+        "Exclude meta-instructions whose object is the request, requirements, or instructions, such as do not weaken the instructions"
     ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .contains("Keep the subject's leading a, an, the, each, or every"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("anti-weakening"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "Safety-boundary requests and recipe-detail frontiers are grounded directly from INTENT_HUMAN"
@@ -100,12 +102,16 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("custom_detail_facets"));
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "durable scheduling infrastructure for a workflow where each approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[each approved invoice posts a signed audit record]"
+        "durable scheduling infrastructure for a workflow where an approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[an approved invoice posts a signed audit record]"
     ));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("every message earns XP"));
+    assert!(
+        !INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("do not reduce the request to static responses")
+    );
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
         "Never encode safety-boundary requests or supported copy, naming, and control literals"
     ));
+    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.len() <= 3_500);
     assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
         .contains("No positive requirement may exist only in response text"));
     assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("belong only in objective"));
@@ -175,10 +181,11 @@ fn stateful_game(expected_revision: u64, response: &str) -> LlmResponse {
         "event_time_llm"
     ]);
     value["other_unmapped_required_capabilities"] = json!([
-        "timers advance quests",
+        "LLM decides rewards at event time",
+        "do not reduce the request to static responses",
         "every message earns XP",
-        "an LLM decides rewards at event time",
-        "levels unlock an economy"
+        "levels unlock an economy",
+        "timers advance quests"
     ]);
     value["response"] = json!(response);
     interpretation_call("interpret", value)
@@ -1297,7 +1304,7 @@ fn stateful_game_preserves_exact_sorted_behaviors_beside_runtime_infrastructure(
         let root = session.draft.clone();
 
         let BurstOutcome::Routed { fallback, decision } = session
-            .run_burst("Build a stateful game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts. Do not reduce or weaken any of these requirements")
+            .run_burst("Build a stateful game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.")
             .await
         else {
             panic!("expected capability gap")
@@ -1677,6 +1684,29 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
         current.intent_recipe.as_ref().unwrap().protocol_version,
         INTENT_RECIPE_PROTOCOL_VERSION_V4
     );
+
+    let prerelease_prompt = INTENT_RECIPE_SYSTEM_PROMPT_V4
+        .replace(
+            " Exclude meta-instructions whose object is the request, requirements, or instructions, such as do not weaken the instructions.",
+            " Do not copy meta-instructions about preserving or not weakening the request as capabilities.",
+        )
+        .replace(" Keep the subject's leading a, an, the, each, or every.", "")
+        .replace(
+            " durable scheduling infrastructure for a workflow where an approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[an approved invoice posts a signed audit record].",
+            " durable scheduling infrastructure for a workflow where each approved invoice posts a signed audit record means runtime_requirements=[durable_timer] and other_unmapped_required_capabilities=[each approved invoice posts a signed audit record].",
+        );
+    assert_ne!(prerelease_prompt, INTENT_RECIPE_SYSTEM_PROMPT_V4);
+    let mut prerelease = current.clone();
+    prerelease.messages[0] = Message::system(prerelease_prompt);
+    assert!(matches!(
+        DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            prerelease,
+            resource_bindings.clone(),
+        ),
+        Err(SessionSnapshotError::InvalidInvariant { .. })
+    ));
 
     let mut previous = current.clone();
     previous.messages[0] = Message::system(INTENT_RECIPE_SYSTEM_PROMPT_V3);
@@ -2319,6 +2349,77 @@ fn restore_preserves_history_and_serves_the_same_bounded_projection() {
             resource_bindings,
         )
         .expect("the unchanged append-only history should restore again");
+    });
+}
+
+#[test]
+fn restore_replays_article_repair_and_meta_filter_before_semantic_identity() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let mut core = private_room_value(0, Some("community_hub"));
+        core["other_unmapped_required_capabilities"] = json!([
+            "launcher content is 'Create a room'",
+            "preserve all requirements"
+        ]);
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({"copy": {"launcher_content": "Create a room"}}),
+        );
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![
+                Ok(interpretation_call("interpret", core)),
+                Ok(details),
+            ]),
+            resource_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Build a managed private study-room automation in community_hub. Use these exact overrides: the launcher content is 'Create a room'. preserve all requirements.")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let expected_receipt = receipt(&session);
+        let snapshot = session.snapshot();
+        let raw_core = snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .find(|call| call.name == "interpret_intent_core")
+            .unwrap();
+        assert!(raw_core
+            .arguments
+            .contains("launcher content is 'Create a room'"));
+        assert!(raw_core.arguments.contains("preserve all requirements"));
+
+        let mut prerelease_value = serde_json::to_value(snapshot.clone()).unwrap();
+        prerelease_value["intent_recipe"]["stage"]["recipe_evidence"]["registry_digest"] =
+            json!("507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6");
+        prerelease_value["intent_recipe"]["stage"]["recipe_evidence"]
+            ["selected_descriptor_digest"] =
+            json!("326c1923864ec079f31895a5bc4a675a5508855fd1db29887767ba3540090ea3");
+        let prerelease_snapshot = serde_json::from_value(prerelease_value).unwrap();
+        let prerelease_error = match DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            prerelease_snapshot,
+            resource_bindings.clone(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("pre-release normalizer snapshot restored"),
+        };
+        assert!(prerelease_error
+            .to_string()
+            .contains("INVALID_INTENT_RECIPE_EVIDENCE"));
+
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .unwrap();
+        assert_eq!(receipt(&restored), expected_receipt);
     });
 }
 
