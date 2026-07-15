@@ -988,6 +988,77 @@ fn missing_hub_asks_once_then_resumes_with_one_model_call_per_turn() {
 }
 
 #[test]
+fn raw_paraphrases_change_request_evidence_without_changing_compiled_identity() {
+    block_on(async {
+        let mut create = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            bindings("community_hub", "700"),
+        );
+        let mut build = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            bindings("community_hub", "700"),
+        );
+
+        assert!(matches!(
+            create
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert!(matches!(
+            build
+                .run_burst("Build private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let create_receipt = receipt(&create);
+        let build_receipt = receipt(&build);
+        assert_ne!(
+            create_receipt.request_evidence_hash,
+            build_receipt.request_evidence_hash
+        );
+        assert_eq!(create_receipt.request_evidence_entries, 1);
+        assert_eq!(build_receipt.request_evidence_entries, 1);
+        let create_decision = create.intent_recipe_route_decision().unwrap();
+        let build_decision = build.intent_recipe_route_decision().unwrap();
+        assert_eq!(
+            create_decision.semantic_ir_digest(),
+            build_decision.semantic_ir_digest()
+        );
+        assert_ne!(
+            create_decision.adjudication_digest(),
+            build_decision.adjudication_digest()
+        );
+        assert_eq!(
+            create_receipt.compiler_input_hash,
+            build_receipt.compiler_input_hash
+        );
+        assert_eq!(
+            create_receipt.semantic_intent_hash,
+            build_receipt.semantic_intent_hash
+        );
+        assert_eq!(
+            create_receipt.compiled_plan_hash,
+            build_receipt.compiled_plan_hash
+        );
+        assert_eq!(
+            create_receipt.candidate_ruleset_hash,
+            build_receipt.candidate_ruleset_hash
+        );
+        assert_eq!(
+            create_receipt.candidate_draft_hash,
+            build_receipt.candidate_draft_hash
+        );
+        assert_eq!(create.draft, build.draft);
+        assert_eq!(
+            serde_json::to_vec(&create.draft.ruleset).unwrap(),
+            serde_json::to_vec(&build.draft.ruleset).unwrap()
+        );
+    });
+}
+
+#[test]
 fn one_shot_and_resumed_routes_compile_to_the_same_semantics_plan_and_draft() {
     block_on(async {
         let mut one_shot = DesignSession::with_intent_recipe(
@@ -1046,11 +1117,14 @@ fn one_shot_and_resumed_routes_compile_to_the_same_semantics_plan_and_draft() {
 }
 
 #[test]
-fn awaiting_decision_snapshot_restarts_and_binding_drift_fails_closed() {
+fn awaiting_decision_snapshot_restores_identically_and_binding_drift_fails_closed() {
     block_on(async {
         let initial_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            ScriptedClient::new(vec![
+                Ok(private_room(0, None)),
+                Ok(resolve_channel(1, "community_hub")),
+            ]),
             initial_bindings.clone(),
         );
         assert!(matches!(
@@ -1081,6 +1155,16 @@ fn awaiting_decision_snapshot_restarts_and_binding_drift_fails_closed() {
             ),
             Err(SessionSnapshotError::InvalidInvariant { .. })
         ));
+        assert!(matches!(
+            session.run_burst("Use community_hub").await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert_eq!(
+            session.intent_recipe_route_decision(),
+            Some(&original_decision)
+        );
+        let uninterrupted_receipt = receipt(&session);
+        let uninterrupted_draft = session.draft.clone();
         let mut restored = DesignSession::restore_intent_recipe(
             ScriptedClient::new(vec![Ok(resolve_channel(1, "community_hub"))]),
             SessionConfig::default(),
@@ -1103,6 +1187,17 @@ fn awaiting_decision_snapshot_restarts_and_binding_drift_fails_closed() {
         assert_eq!(
             restored.intent_recipe_route_decision(),
             Some(&original_decision)
+        );
+        let restored_receipt = receipt(&restored);
+        assert_eq!(restored_receipt, uninterrupted_receipt);
+        assert_eq!(
+            serde_json::to_vec(&restored_receipt).unwrap(),
+            serde_json::to_vec(&uninterrupted_receipt).unwrap()
+        );
+        assert_eq!(restored.draft, uninterrupted_draft);
+        assert_eq!(
+            serde_json::to_vec(&restored.draft).unwrap(),
+            serde_json::to_vec(&uninterrupted_draft).unwrap()
         );
     });
 }

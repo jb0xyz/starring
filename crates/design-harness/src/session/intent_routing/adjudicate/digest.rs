@@ -115,6 +115,16 @@ pub(super) fn adjudication_digest_v2(
 pub(super) fn semantic_ir_digest_v4(
     core: &IntentCoreInterpretationV4,
 ) -> Result<String, StructuredError> {
+    let projection = canonical_semantic_ir_v4(core);
+    digest_serializable(
+        SEMANTIC_IR_DIGEST_DOMAIN_V4,
+        &projection,
+        "INTENT_SEMANTIC_IR_SERIALIZATION_FAILED",
+        "intent.semantic_ir",
+    )
+}
+
+fn canonical_semantic_ir_v4(core: &IntentCoreInterpretationV4) -> CanonicalSemanticIrV4<'_> {
     let mut boundary_requests = core
         .boundary_requests()
         .iter()
@@ -130,7 +140,7 @@ pub(super) fn semantic_ir_digest_v4(
         .into_iter()
         .collect();
     let detail_facets = canonical_detail_facets(core.recipe_detail_facets());
-    let projection = CanonicalSemanticIrV4 {
+    CanonicalSemanticIrV4 {
         protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V4,
         request_mode: request_mode_wire(core.request_mode()),
         automation_kind: automation_kind_wire(core.automation_kind()),
@@ -147,18 +157,24 @@ pub(super) fn semantic_ir_digest_v4(
         boundary_requests,
         unclassified_requirements,
         detail_facets,
-    };
-    digest_serializable(
-        SEMANTIC_IR_DIGEST_DOMAIN_V4,
-        &projection,
-        "INTENT_SEMANTIC_IR_SERIALIZATION_FAILED",
-        "intent.semantic_ir",
-    )
+    }
 }
 
 pub(super) fn adjudication_digest_v4(
     input: AdjudicationDigestInputV2<'_>,
 ) -> Result<String, StructuredError> {
+    let projection = canonical_adjudication_v4(input)?;
+    digest_serializable(
+        ADJUDICATION_DIGEST_DOMAIN_V4,
+        &projection,
+        "INTENT_ADJUDICATION_SERIALIZATION_FAILED",
+        "intent.adjudication",
+    )
+}
+
+fn canonical_adjudication_v4<'a>(
+    input: AdjudicationDigestInputV2<'a>,
+) -> Result<CanonicalAdjudicationV4<'a>, StructuredError> {
     let request_evidence_hash = input.request_evidence_hash.ok_or_else(|| {
         adjudication_error(
             "INTENT_REQUEST_EVIDENCE_MISSING",
@@ -167,7 +183,7 @@ pub(super) fn adjudication_digest_v4(
             "Bind the decision to the accepted initial human evidence chain",
         )
     })?;
-    let projection = CanonicalAdjudicationV4 {
+    Ok(CanonicalAdjudicationV4 {
         decision_source: input.decision_source,
         adjudicator_version: input.adjudicator_version,
         kind: input.kind,
@@ -183,13 +199,7 @@ pub(super) fn adjudication_digest_v4(
             recipe_id: target.recipe_id(),
             recipe_version: target.recipe_version(),
         }),
-    };
-    digest_serializable(
-        ADJUDICATION_DIGEST_DOMAIN_V4,
-        &projection,
-        "INTENT_ADJUDICATION_SERIALIZATION_FAILED",
-        "intent.adjudication",
-    )
+    })
 }
 
 pub(super) fn private_study_room_details_digest_v2(
@@ -424,4 +434,151 @@ struct CanonicalRecipeDetailsV2<'a> {
     copy: &'a crate::intent::PrivateStudyRoomCopyProposalV1,
     naming: &'a crate::intent::PrivateStudyRoomNamingProposalV1,
     controls: &'a crate::turn::PrivateStudyRoomControlsInterpretationV2,
+}
+
+#[cfg(test)]
+mod v4_golden_tests {
+    use serde_json::{json, Value};
+
+    use crate::session::intent_routing::IntentRouteDecisionV2;
+    use crate::turn::parse_interpret_intent_core;
+
+    use super::super::{adjudicate_intent_core_v4, IntentCoreAdjudicationV4};
+    use super::{
+        canonical_adjudication_v4, canonical_semantic_ir_v4, AdjudicationDigestInputV2,
+        ADJUDICATION_DIGEST_DOMAIN_V4, SEMANTIC_IR_DIGEST_DOMAIN_V4,
+    };
+
+    const REQUEST_EVIDENCE_HASH: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn core_value() -> Value {
+        json!({
+            "expected_revision": 0,
+            "request_mode": "build",
+            "automation_kind": "managed_private_study_room",
+            "requested_outcome": "validated_preview",
+            "hub_channel": "community_hub",
+            "language": "en",
+            "close_policy": "disabled",
+            "validation_gate": "enforce",
+            "preview_gate": "enforce",
+            "approval_gate": "enforce",
+            "live_discord_mutation": "no_live_mutation",
+            "secret_disclosure": "no_secret_disclosure",
+            "other_unmapped_required_capabilities": [],
+            "custom_detail_facets": [],
+            "response": ""
+        })
+    }
+
+    fn decision(value: &Value) -> IntentRouteDecisionV2 {
+        let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+        match adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap() {
+            IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
+            _ => panic!("expected private study-room selection"),
+        }
+    }
+
+    fn adjudication_projection(decision: &IntentRouteDecisionV2) -> Value {
+        serde_json::to_value(
+            canonical_adjudication_v4(AdjudicationDigestInputV2 {
+                decision_source: decision.decision_source().as_str(),
+                adjudicator_version: decision.adjudicator_version(),
+                kind: decision.kind().as_str(),
+                semantic_ir_digest: decision.semantic_ir_digest(),
+                request_evidence_hash: decision.request_evidence_hash(),
+                manifest_version: decision.manifest_version(),
+                manifest_digest: decision.manifest_digest(),
+                blockers: decision.blockers(),
+                boundary_violations: decision.boundary_violations(),
+                unclassified_requirements: decision.unclassified_requirements(),
+                route_target: decision.route_target(),
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v4_identity_domains_projections_and_digests_are_exact_goldens() {
+        assert_eq!(
+            SEMANTIC_IR_DIGEST_DOMAIN_V4,
+            b"starring.intent.semantic_ir.v4\0"
+        );
+        assert_eq!(
+            ADJUDICATION_DIGEST_DOMAIN_V4,
+            b"starring.intent.adjudication.v4\0"
+        );
+
+        let value = core_value();
+        let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(canonical_semantic_ir_v4(&core)).unwrap(),
+            json!({
+                "protocol_version": 4,
+                "request_mode": "build",
+                "automation_kind": "managed_private_study_room",
+                "requested_outcome": "validated_preview",
+                "hub_channel": "community_hub",
+                "locale": "en",
+                "close_authorization": "disabled",
+                "runtime_requirements": {
+                    "persistence": "none",
+                    "timers": "none",
+                    "economy": "none",
+                    "event_time_llm": false
+                },
+                "boundary_requests": [],
+                "unclassified_requirements": [],
+                "detail_facets": []
+            })
+        );
+        let baseline = decision(&value);
+        assert_eq!(
+            baseline.semantic_ir_digest(),
+            "9edb6a99acc1119ebbeaca929c6c26c11e00919dd217e278c520f65272df115e"
+        );
+        assert_eq!(
+            adjudication_projection(&baseline),
+            json!({
+                "decision_source": "deterministic_intent_adjudicator",
+                "adjudicator_version": 3,
+                "kind": "private_study_room",
+                "semantic_ir_digest": "9edb6a99acc1119ebbeaca929c6c26c11e00919dd217e278c520f65272df115e",
+                "request_evidence_hash": REQUEST_EVIDENCE_HASH,
+                "manifest_version": 1,
+                "manifest_digest": "68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53",
+                "blockers": [],
+                "boundary_violations": [],
+                "unclassified_requirements": [],
+                "route_target": {
+                    "kind": "recipe",
+                    "recipe_id": "starring.private_study_room",
+                    "recipe_version": 1
+                }
+            })
+        );
+        assert_eq!(
+            baseline.adjudication_digest(),
+            "45ea6fb31cc2f205995f040d352d5cabe7d1ed803cffc92249a4efa54c57fe4a"
+        );
+
+        let mut detailed_value = core_value();
+        detailed_value["custom_detail_facets"] = json!(["custom_copy"]);
+        let detailed = decision(&detailed_value);
+        assert_eq!(
+            detailed.semantic_ir_digest(),
+            "1342e9ed2325f2db5318f9b18c5f7eed830d07ca28ef3834f4134bccc17394d2"
+        );
+        assert_eq!(
+            detailed.adjudication_digest(),
+            "0ecfc354461649409df44e50e2296ff0332188455336aae848ca7e7d52489b99"
+        );
+        assert_ne!(baseline.semantic_ir_digest(), detailed.semantic_ir_digest());
+        assert_ne!(
+            baseline.adjudication_digest(),
+            detailed.adjudication_digest()
+        );
+    }
 }
