@@ -65,10 +65,12 @@ pub(crate) fn analyze_safety_boundaries(human_message: &str) -> SafetyBoundaryAn
     SafetyBoundaryAnalysis::analyze(human_message)
 }
 
+#[cfg(test)]
 pub(crate) fn ground_safety_boundary_requests(human_message: &str) -> Vec<IntentBoundaryRequestV2> {
     analyze_safety_boundaries(human_message).requests().to_vec()
 }
 
+#[cfg(test)]
 pub(crate) fn safety_boundary_owns_capability_evidence(
     human_message: &str,
     candidate: &str,
