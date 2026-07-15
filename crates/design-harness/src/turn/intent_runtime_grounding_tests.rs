@@ -910,8 +910,10 @@ fn runtime_grounding_owns_postposed_setup_and_llm_subjects() {
     for human in [
         "At runtime, use static rules, and use an LLM to generate copy during setup.",
         "At runtime, use static rules, and use an LLM to generate copy at setup time.",
+        "At runtime, use an LLM to generate copy during setup from a policy prepared during setup.",
         "At runtime, record which AI role a user chooses.",
         "At runtime, rewards chosen by users are sent to an LLM channel.",
+        "At runtime, call an LLM role.",
     ] {
         assert!(!ground(human).event_time_llm, "{human}");
     }

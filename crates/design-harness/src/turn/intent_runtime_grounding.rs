@@ -68,16 +68,7 @@ const SETUP_TIME_SUFFIXES: &[&str] = &[
     "컴파일 시점에",
     "컴파일할 때",
 ];
-const SETUP_ARTIFACT_QUALIFIERS: &[&str] = &[
-    " compiled at setup time",
-    " compiled during setup",
-    " created at setup time",
-    " created during setup",
-    " generated at setup time",
-    " generated during setup",
-    " prepared at setup time",
-    " prepared during setup",
-];
+const SETUP_ARTIFACT_PASSIVES: &[&str] = &["compiled", "created", "generated", "prepared"];
 const RESTART_MARKERS: &[&str] = &[
     "restart",
     "restarts",
@@ -1407,49 +1398,48 @@ fn event_context_barrier(text: &str) -> bool {
 }
 
 fn setup_scoped_llm_action(text: &str) -> bool {
-    has_any(text, SETUP_ONLY_LLM_CONTEXTS)
-        || (llm_before_action_near(text, SETUP_TIME_SUFFIXES, 16)
-            && !has_any(text, SETUP_ARTIFACT_QUALIFIERS))
+    has_any(text, SETUP_ONLY_LLM_CONTEXTS) || llm_before_setup_execution(text, 16)
 }
 
 fn llm_runtime_action_required(text: &str) -> bool {
-    llm_before_action_near(text, LLM_ACTIONS, 8)
-        || action_before_llm_near(text, LLM_PASSIVE_ACTIONS, 8)
-        || has_any(
-            text,
-            &[
-                "call an llm",
-                "call the llm",
-                "calls an llm",
-                "calls the llm",
-                "run an llm",
-                "run the llm",
-                "runs an llm",
-                "runs the llm",
-                "invoke an llm",
-                "invoke the llm",
-                "invokes an llm",
-                "invokes the llm",
-                "llm gets called",
-                "llm is called",
-                "the llm gets called",
-                "the llm is called",
-                "use an llm to",
-                "use the llm to",
-                "uses an llm to",
-                "uses the llm to",
-                "ask an llm to",
-                "ask the llm to",
-                "asks an llm to",
-                "asks the llm to",
-                "llm을 호출",
-                "llm을 실행",
-                "언어 모델을 호출",
-                "언어 모델을 실행",
-                "ai를 호출",
-                "ai를 실행",
-            ],
-        )
+    has_runtime_llm_marker(text)
+        && (llm_before_action_near(text, LLM_ACTIONS, 8)
+            || action_before_llm_near(text, LLM_PASSIVE_ACTIONS, 8)
+            || has_any(
+                text,
+                &[
+                    "call an llm",
+                    "call the llm",
+                    "calls an llm",
+                    "calls the llm",
+                    "run an llm",
+                    "run the llm",
+                    "runs an llm",
+                    "runs the llm",
+                    "invoke an llm",
+                    "invoke the llm",
+                    "invokes an llm",
+                    "invokes the llm",
+                    "llm gets called",
+                    "llm is called",
+                    "the llm gets called",
+                    "the llm is called",
+                    "use an llm to",
+                    "use the llm to",
+                    "uses an llm to",
+                    "uses the llm to",
+                    "ask an llm to",
+                    "ask the llm to",
+                    "asks an llm to",
+                    "asks the llm to",
+                    "llm을 호출",
+                    "llm을 실행",
+                    "언어 모델을 호출",
+                    "언어 모델을 실행",
+                    "ai를 호출",
+                    "ai를 실행",
+                ],
+            ))
 }
 
 fn persistence_rejected(text: &str) -> bool {
@@ -1502,9 +1492,10 @@ fn persistent_economy_rejected(text: &str) -> bool {
 fn event_time_llm_rejected(text: &str, inherited_event_scope: bool) -> bool {
     let event_scope = has_any(text, EVENT_TIME_MARKERS)
         || (inherited_event_scope && !event_context_barrier(text));
-    has_any(text, DIRECT_EVENT_LLM_NEGATIONS)
+    let runtime_llm = has_runtime_llm_marker(text);
+    (runtime_llm && has_any(text, DIRECT_EVENT_LLM_NEGATIONS))
         || (event_scope
-            && (has_any(text, EVENT_LLM_NEGATIONS)
+            && ((runtime_llm && has_any(text, EVENT_LLM_NEGATIONS))
                 || action_before_llm_near(text, NEGATING_ACTIONS, 8)
                 || llm_before_action_near(text, NEGATED_LLM_ACTIONS, 8)))
 }
@@ -1560,6 +1551,42 @@ fn llm_before_action_near(text: &str, actions: &[&str], maximum_words: usize) ->
                 && action_start.saturating_sub(subject_end) <= MAXIMUM_PROXIMITY_BYTES
                 && text[subject_end..action_start].split_whitespace().count() <= maximum_words
         })
+}
+
+fn llm_before_setup_execution(text: &str, maximum_words: usize) -> bool {
+    let missing = text.len().saturating_add(1);
+    let next_setup = next_occurrence_start(
+        text.len(),
+        SETUP_TIME_SUFFIXES
+            .iter()
+            .flat_map(|marker| term_occurrences(text, marker))
+            .map(|(start, _)| start)
+            .filter(|start| !setup_marker_qualifies_artifact(text, *start)),
+    );
+    runtime_llm_occurrences(text)
+        .into_iter()
+        .any(|(_, llm_end)| {
+            let setup_start = next_setup[llm_end];
+            setup_start != missing
+                && setup_start.saturating_sub(llm_end) <= MAXIMUM_PROXIMITY_BYTES
+                && text[llm_end..setup_start].split_whitespace().count() <= maximum_words
+        })
+}
+
+fn setup_marker_qualifies_artifact(text: &str, setup_start: usize) -> bool {
+    let mut prefix = text[..setup_start].trim_end();
+    while let Some(head) = ["earlier", "only", "once", "specifically"]
+        .iter()
+        .find_map(|adverb| prefix.strip_suffix(adverb))
+    {
+        if !head.chars().next_back().is_some_and(char::is_whitespace) {
+            break;
+        }
+        prefix = head.trim_end();
+    }
+    SETUP_ARTIFACT_PASSIVES
+        .iter()
+        .any(|passive| term_occurrences(prefix, passive).any(|(_, end)| end == prefix.len()))
 }
 
 fn action_before_llm_near(text: &str, actions: &[&str], maximum_words: usize) -> bool {
