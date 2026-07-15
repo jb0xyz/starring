@@ -87,8 +87,8 @@ function metric(frontierName = 'interpret_intent_core', callSequence = 1) {
     served_model: 'gemma4:12b-mlx',
     request_body_bytes: detail ? 4500 : 6500,
     message_bytes: 1200,
-    tool_bytes: detail ? 1600 : 2500,
-    duplicated_schema_bytes: detail ? 1200 : 2000,
+    tool_bytes: detail ? 1600 : 1300,
+    duplicated_schema_bytes: detail ? 1200 : 1100,
     prompt_tokens: 800,
     completion_tokens: 120,
     request_duration_ms: detail ? 350 : 450,
@@ -1054,6 +1054,44 @@ test('schema, model, oracle, calls, and hard latency regressions fail closed', (
   const malformed = JSON.parse(report());
   malformed.schema_version = 2;
   assert.match(checks.intentReceipt(JSON.stringify(malformed), context()).reason, /must be 5/);
+
+  const duplicatedSchemaBudget = JSON.parse(report());
+  for (const value of [
+    duplicatedSchemaBudget.turns[0].model_call_metrics[0],
+    duplicatedSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 1601;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(duplicatedSchemaBudget), context()).reason,
+    /exceeds the Core schema budget/,
+  );
+
+  const combinedSchemaBudget = JSON.parse(report());
+  for (const value of [
+    combinedSchemaBudget.turns[0].model_call_metrics[0],
+    combinedSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.tool_bytes = 2701;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(combinedSchemaBudget), context()).reason,
+    /exceeds the Core schema budget/,
+  );
+
+  const invalidByteAccounting = JSON.parse(report());
+  for (const value of [
+    invalidByteAccounting.turns[0].model_call_metrics[0],
+    invalidByteAccounting.model_call_metrics[0],
+  ]) {
+    value.request_body_bytes = value.message_bytes
+      + value.tool_bytes
+      + value.duplicated_schema_bytes;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(invalidByteAccounting), context()).reason,
+    /byte accounting is invalid/,
+  );
 
   const wrongModel = JSON.parse(report());
   wrongModel.served_model = 'other';

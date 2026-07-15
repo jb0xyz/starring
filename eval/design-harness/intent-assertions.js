@@ -448,8 +448,8 @@ function modelCallMetric(value, location) {
     throw new Error(`invalid intent eval report: ${location} byte accounting is invalid`);
   }
   if (value.frontier_name === 'interpret_intent_core'
-    && (value.duplicated_schema_bytes > 2400
-      || value.tool_bytes + value.duplicated_schema_bytes > 5600)) {
+    && (value.duplicated_schema_bytes > 1600
+      || value.tool_bytes + value.duplicated_schema_bytes > 3800)) {
     throw new Error(`invalid intent eval report: ${location} exceeds the Core schema budget`);
   }
   if (value.frontier_name === 'extract_private_study_room_details'
