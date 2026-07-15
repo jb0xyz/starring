@@ -288,6 +288,79 @@ fn core_capability_evidence_must_be_grounded_in_the_human_request() {
 }
 
 #[test]
+fn human_grounding_reclassifies_exact_supported_recipe_details() {
+    let human = "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.";
+    let mut value = valid_core();
+    value["other_unmapped_required_capabilities"] = json!([
+        "created channel name uses prefix 'focus-' and an empty suffix",
+        "ephemeral response is 'Read this first'",
+        "launcher create-button label is 'Start focus room'",
+        "room Help button label is 'Guide'"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.validate_human_evidence(human).unwrap();
+    parsed.apply_human_grounding(
+        human,
+        Some(&ExistingChannelKey("community_hub".to_string())),
+    );
+
+    assert!(parsed.unclassified_requirements().is_empty());
+    assert_eq!(
+        parsed.recipe_detail_facets(),
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Controls
+        ]
+    );
+}
+
+#[test]
+fn human_grounding_preserves_external_capability_next_to_recipe_details() {
+    let human = "Build a managed private study-room automation in community_hub. Use these exact overrides: the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Acquire an external consensus lease before responding.";
+    let mut value = valid_core();
+    value["other_unmapped_required_capabilities"] = json!([
+        "ephemeral response is 'Read this first'",
+        "external consensus lease",
+        "room Help button label is 'Guide'"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.validate_human_evidence(human).unwrap();
+    parsed.apply_human_grounding(
+        human,
+        Some(&ExistingChannelKey("community_hub".to_string())),
+    );
+
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["external consensus lease"]
+    );
+    assert_eq!(
+        parsed.recipe_detail_facets(),
+        &[IntentRecipeDetailFacetV3::Controls]
+    );
+}
+
+#[test]
+fn human_grounding_never_reduces_dynamic_behavior_to_recipe_details() {
+    let human = "Build a managed private study-room automation. When the Close button is clicked, change the channel name to 'closed'.";
+    let mut value = valid_core();
+    value["other_unmapped_required_capabilities"] = json!(["channel name to 'closed'"]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.validate_human_evidence(human).unwrap();
+    parsed.apply_human_grounding(human, None);
+
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["channel name to 'closed'"]
+    );
+    assert!(parsed.recipe_detail_facets().is_empty());
+}
+
+#[test]
 fn core_parser_discards_build_response_deterministically() {
     let mut value = valid_core();
     value["response"] = json!("This model-authored build response is ignored.");

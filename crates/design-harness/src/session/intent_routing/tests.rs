@@ -533,7 +533,7 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
 
         assert!(matches!(
             session
-                .run_burst("Create private rooms in community_hub with a Start exact focus button",)
+                .run_burst("Create private rooms in community_hub. Set the launcher create-button label to 'Start exact focus'.",)
                 .await,
             BurstOutcome::Ready { .. }
         ));
@@ -625,6 +625,60 @@ fn explicit_recipe_details_use_exactly_two_model_and_tool_calls() {
 }
 
 #[test]
+fn supported_detail_requirements_do_not_become_capability_gaps_and_restore() {
+    block_on(async {
+        let request = "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'. Leave room closing disabled.";
+        let mut value = private_room_value(0, Some("community_hub"));
+        value["other_unmapped_required_capabilities"] = json!([
+            "created channel name uses prefix 'focus-' and an empty suffix",
+            "ephemeral response is 'Read this first'",
+            "launcher create-button label is 'Start focus room'",
+            "room Help button label is 'Guide'"
+        ]);
+        let details = tool_call(
+            "details",
+            "extract_private_study_room_details",
+            json!({
+                "copy": {"create_button_label": "Start focus room"},
+                "naming": {"channel_name_prefix": "focus-", "channel_name_suffix": ""},
+                "controls": {"help_label": "Guide", "help_response": "Read this first"}
+            }),
+        );
+        let client = ScriptedClient::new(vec![
+            Ok(interpretation_call("interpret", value)),
+            Ok(details),
+        ]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session.run_burst(request).await,
+            BurstOutcome::Ready { .. }
+        ));
+        assert_eq!(probe.calls().len(), 2);
+        assert_eq!(
+            probe.calls()[1].1[0].parameters["required"],
+            json!(["controls", "copy", "naming"])
+        );
+        assert_eq!(
+            session.intent_recipe_route_decision().unwrap().kind(),
+            IntentRouteDecisionKindV2::PrivateStudyRoom
+        );
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            bindings("community_hub", "700"),
+        )
+        .unwrap();
+        assert_eq!(restored.draft, session.draft);
+        assert_eq!(receipt(&restored), receipt(&session));
+    });
+}
+
+#[test]
 fn human_grounding_adds_an_omitted_naming_frontier_and_restores_it() {
     block_on(async {
         let core = private_room(0, Some("community_hub"));
@@ -644,7 +698,7 @@ fn human_grounding_adds_an_omitted_naming_frontier_and_restores_it() {
         let probe = client.clone();
         let mut session =
             DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
-        let request = "Build a managed private study-room automation in community_hub. Keep default copy and controls, but set the channel name prefix to 'focus-' and suffix to '-room' and the member-role name prefix to 'team-' and suffix to '-members'.";
+        let request = "Build a managed private study-room automation in community_hub. Keep default copy and controls. Set the channel name prefix to 'focus-' and suffix to '-room' and the member-role name prefix to 'team-' and suffix to '-members'.";
 
         assert!(matches!(
             session.run_burst(request).await,
@@ -721,7 +775,7 @@ fn ungrounded_recipe_detail_halts_before_digest_compile_or_commit() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Create private rooms in community_hub with a custom button")
+            .run_burst("Create private rooms in community_hub. Set the launcher create-button label to 'Requested button'.")
             .await
         else {
             panic!("expected ungrounded detail halt")
@@ -765,7 +819,7 @@ fn recipe_detail_cannot_reuse_a_literal_from_an_earlier_human_turn() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Keep the same community_hub design but customize its button")
+            .run_burst("Keep the same community_hub design. Set the launcher create-button label to 'Current button'.")
             .await
         else {
             panic!("expected current-turn grounding halt")
@@ -1078,7 +1132,7 @@ fn second_detail_call_failure_preserves_draft_and_durable_stage() {
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
         let BurstOutcome::Halted(report) = session
-            .run_burst("Create private rooms in community_hub with a custom button")
+            .run_burst("Create private rooms in community_hub. Set the launcher create-button label to 'Requested button'.")
             .await
         else {
             panic!("expected detail failure")
@@ -2244,7 +2298,7 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
         assert!(matches!(
             session
                 .run_burst(
-                    "Create private rooms in community_hub with launcher create-button label 'Start exact focus'; keep 'Alternate exact label' as another literal",
+                    "Create private rooms in community_hub. Set the launcher create-button label to 'Start exact focus'. Keep 'Alternate exact label' as another literal",
                 )
                 .await,
             BurstOutcome::Ready { .. }

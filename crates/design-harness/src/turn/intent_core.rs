@@ -9,7 +9,7 @@ use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
 use super::intent_boundary_grounding::ground_safety_boundary_requests;
-use super::intent_detail_grounding::ground_private_study_room_detail_facets;
+use super::intent_detail_requirement::analyze_private_study_room_details;
 use super::intent_interpretation::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
@@ -206,10 +206,13 @@ impl IntentCoreInterpretationV4 {
     ) {
         self.apply_human_grounded_channel(grounded_channel);
         self.boundary_requests = ground_safety_boundary_requests(human_message);
-        self.detail_facets = if self.request_mode == IntentRequestModeV2::Build
-            && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom
-        {
-            ground_private_study_room_detail_facets(human_message)
+        let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
+            && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
+        self.detail_facets = if managed_private_study_room {
+            let analysis = analyze_private_study_room_details(human_message);
+            self.unclassified_requirements
+                .retain(|requirement| !analysis.explains_requirement(requirement));
+            analysis.facets().to_vec()
         } else {
             Vec::new()
         };

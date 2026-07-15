@@ -3,7 +3,15 @@ mod intent_boundary_grounding;
 mod intent_core;
 #[cfg(test)]
 mod intent_core_tests;
-mod intent_detail_grounding;
+mod intent_detail_grammar;
+mod intent_detail_policy;
+mod intent_detail_requirement;
+#[cfg(test)]
+mod intent_detail_requirement_tests;
+mod intent_detail_syntax;
+#[cfg(test)]
+mod intent_detail_syntax_tests;
+mod intent_detail_text;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
