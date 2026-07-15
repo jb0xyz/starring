@@ -812,6 +812,13 @@ test('fallback assertions require one explicit route and zero Draft mutation', (
   const broken = JSON.parse(document);
   broken.turns[0].intent_counters.commits = 1;
   assert.match(checks.intentNoMutationFallback(JSON.stringify(broken), expected).reason, /mutated or compiled/);
+
+  const halted = JSON.parse(document);
+  halted.turns[0].outcome = 'halted';
+  const haltedResult = checks.intentNoMutationFallback(JSON.stringify(halted), expected);
+  assert.equal(haltedResult.pass, false);
+  assert.match(haltedResult.reason, /did not reach a deterministic terminal route/);
+  assert.doesNotMatch(haltedResult.reason, /mutated or compiled/);
 });
 
 test('adjudication assertion enforces exact creator and stateful blocker contracts', () => {
@@ -926,16 +933,18 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
 });
 
 test('adjudication assertion preserves exact unclassified capability evidence', () => {
+  const exactRequirement =
+    'a static Discord button flow that must acquire an external consensus lease before responding';
   const unknown = blocker('unclassified_intent_requirement', 'unclassified');
   unknown.evidence = [evidence(
     'intent.core.unclassified_requirements.0',
-    'external consensus lease',
+    exactRequirement,
   )];
   const routeDecision = decision('capability_gap', {
     blockers: [unknown],
-    unclassified_requirements: ['external consensus lease'],
+    unclassified_requirements: [exactRequirement],
   });
-  const message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external consensus lease. I did not build a partial or weakened version.';
+  const message = `I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): ${exactRequirement}. I did not build a partial or weakened version.`;
   const expected = context({
     expectedOutcomes: 'routed',
     expectedStagePath: 'empty>empty',
@@ -944,13 +953,13 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
     expectedCompiledOperations: undefined,
     completeRequest: false,
     expectedBlockers: 'unclassified_intent_requirement|unclassified|',
-    expectedUnclassifiedRequirements: 'external consensus lease',
+    expectedUnclassifiedRequirements: exactRequirement,
   });
   const document = routedDocument(
     routeDecision,
     message,
     'external-capability',
-    'Build a flow that requires an external consensus lease',
+    `Build ${exactRequirement}. Preserve the external consensus lease requirement and do not replace it with a local approximation.`,
   );
   assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
 
@@ -962,36 +971,16 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
     /unclassified evidence does not match indexed unclassified_requirements/,
   );
 
-  const grounded = JSON.parse(document);
-  grounded.turns[0].input = 'Must acquire an external consensus lease before responding';
-  grounded.turns[0].route_decision.unclassified_requirements = [
-    'acquire an external consensus lease',
-  ];
-  grounded.turns[0].route_decision.blockers[0].evidence[0].description =
-    'acquire an external consensus lease';
-  grounded.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): acquire an external consensus lease. I did not build a partial or weakened version.';
-  grounded.message = grounded.turns[0].message;
-  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
-  const containsExpected = context({
-    ...expected.vars,
-    expectedUnclassifiedRequirements: undefined,
-    expectedUnclassifiedEvidenceContains: 'external consensus lease',
-  });
-  delete containsExpected.vars.expectedUnclassifiedRequirements;
-  assert.equal(
-    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).pass,
-    true,
-  );
-
-  grounded.turns[0].route_decision.unclassified_requirements = ['external_consensus_lease'];
-  grounded.turns[0].route_decision.blockers[0].evidence[0].description =
-    'external_consensus_lease';
-  grounded.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external_consensus_lease. I did not build a partial or weakened version.';
-  grounded.message = grounded.turns[0].message;
-  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
+  const shortened = JSON.parse(document);
+  shortened.turns[0].route_decision.unclassified_requirements = ['external consensus lease'];
+  shortened.turns[0].route_decision.blockers[0].evidence[0].description =
+    'external consensus lease';
+  shortened.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external consensus lease. I did not build a partial or weakened version.';
+  shortened.message = shortened.turns[0].message;
+  shortened.final_intent.route_decision = shortened.turns[0].route_decision;
   assert.match(
-    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).reason,
-    /expected grounded evidence containing=/,
+    checks.intentAdjudicationDecision(JSON.stringify(shortened), expected).reason,
+    /unclassified=.*expected=/,
   );
 });
 

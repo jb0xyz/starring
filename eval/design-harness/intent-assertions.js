@@ -1432,8 +1432,10 @@ function intentNoMutationFallback(output, context) {
     const failures = [];
     for (const turn of report.turns.filter((entry) => ids.has(entry.id))) {
       const counters = turn.intent_counters;
-      if (turn.outcome !== 'routed'
-        || turn.draft_changed !== false
+      if (turn.outcome !== 'routed') {
+        failures.push(`${turn.id} did not reach a deterministic terminal route`);
+      }
+      if (turn.draft_changed !== false
         || turn.draft_revision_before !== turn.draft_revision_after
         || turn.deterministic_operations !== 0
         || counters.compile_attempts !== 0

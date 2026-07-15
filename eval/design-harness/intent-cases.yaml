@@ -872,7 +872,7 @@
     expectedRestartCount: 0
     expectedBlockers: unclassified_intent_requirement|unclassified|
     expectedBoundaryViolations: ""
-    expectedUnclassifiedEvidenceContains: external consensus lease
+    expectedUnclassifiedRequirements: a static Discord button flow that must acquire an external consensus lease before responding
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
