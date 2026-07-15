@@ -6,8 +6,9 @@ use crate::intent::ExistingChannelKey;
 
 use super::{
     interpret_intent_core_frontier, parse_interpret_intent_core,
-    parse_interpret_intent_core_for_human, EconomyRequirementV2, IntentBoundaryRequestV2,
-    IntentRecipeDetailFacetV3, PersistenceRequirementV2, TimerRequirementV2, INTERPRET_INTENT_CORE,
+    parse_interpret_intent_core_for_human, parse_interpret_intent_core_for_serving,
+    EconomyRequirementV2, IntentBoundaryRequestV2, IntentRecipeDetailFacetV3,
+    PersistenceRequirementV2, TimerRequirementV2, INTERPRET_INTENT_CORE,
 };
 
 fn valid_core() -> Value {
@@ -172,6 +173,21 @@ fn core_parser_accepts_required_null_channel_and_normalizes_sets() {
             .selected_existing_channel(),
         Some(&ExistingChannelKey("---".to_string()))
     );
+}
+
+#[test]
+fn serving_parser_binds_the_harness_revision_over_model_transport() {
+    let mut value = valid_core();
+    value["expected_revision"] = json!(99);
+
+    let parsed = parse_interpret_intent_core_for_serving(
+        &value.to_string(),
+        "Build a managed private study room.",
+        7,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.expected_revision(), 7);
 }
 
 #[test]

@@ -512,8 +512,10 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 9, including the closed detail grammar,
-supported-base classification, and runtime-versus-behavior evidence contract.
+extractor revision moves from 4 to 10, including the closed detail grammar,
+supported-base classification, runtime-versus-behavior evidence contract, and
+harness-authoritative binding of the non-semantic expected-revision transport
+field before normalization and transcript replay.
 The normalizer revision moves from 1 to 5, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only array recovery, and bounded presentation, and the
@@ -708,7 +710,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision          9
+Recipe extractor revision         10
 Recipe normalizer revision         5
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -757,7 +759,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 8, normalizer revisions through 4, or
+branch-local extractor revisions through 9, normalizer revisions through 4, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -771,8 +773,8 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 9, and normalizer 5 is current;
-- a pre-release V4 prompt, extractor revision through 8, or normalizer revision
+- the exact V4 prompt with protocol 4, extractor 10, and normalizer 5 is current;
+- a pre-release V4 prompt, extractor revision through 9, or normalizer revision
   through 4 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;

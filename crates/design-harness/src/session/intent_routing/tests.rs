@@ -81,6 +81,8 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
     for expected in [
         "interpret_intent_core exactly once and emit no prose, even for unsafe requests",
+        "expected_revision is non-semantic transport metadata",
+        "the harness rebinds it authoritatively",
         "semantics come only from the latest INTENT_HUMAN",
         "use exact enums and fill every field",
         "Always include runtime_requirements and other_unmapped_required_capabilities, using [] if empty",
@@ -1117,13 +1119,46 @@ fn empty_and_preview_ready_snapshots_restore_with_typed_status_and_receipt() {
 }
 
 #[test]
-fn stale_revision_wrong_tool_and_llm_failure_each_halt_without_mutation_or_retry() {
+fn model_core_revision_is_bound_by_the_harness_before_compilation() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(99, Some("community_hub")))]);
+        let probe = client.clone();
+        let resource_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+
+        let outcome = session
+            .run_burst(
+                "Build managed private study rooms in community_hub and prepare a validated preview.",
+            )
+            .await;
+
+        assert!(matches!(outcome, BurstOutcome::Ready { .. }));
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.intent_commits, 1);
+        assert_eq!(session.draft.draft_revision, 22);
+
+        let expected_draft = session.draft.clone();
+        let expected_receipt = receipt(&session);
+        let snapshot: SessionSnapshot =
+            serde_json::from_str(&serde_json::to_string(&session.snapshot()).unwrap()).unwrap();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .unwrap();
+
+        assert_eq!(restored.draft, expected_draft);
+        assert_eq!(receipt(&restored), expected_receipt);
+    });
+}
+
+#[test]
+fn wrong_tool_and_llm_failure_each_halt_without_mutation_or_retry() {
     block_on(async {
         let cases = [
-            (
-                ScriptedClient::new(vec![Ok(private_room(99, Some("community_hub")))]),
-                "STALE_INTENT_WORKSPACE_REVISION",
-            ),
             (
                 ScriptedClient::new(vec![Ok(tool_call("wrong", "add_panel", json!({})))]),
                 "INTENT_FRONTIER_VIOLATION",

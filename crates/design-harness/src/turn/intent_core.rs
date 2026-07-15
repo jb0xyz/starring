@@ -324,9 +324,26 @@ pub fn parse_interpret_intent_core(
     normalize_core(parse_core_wire(arguments)?)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_interpret_intent_core_for_human(
     arguments: &str,
     human_message: &str,
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    parse_grounded_intent_core(arguments, human_message, None)
+}
+
+pub(crate) fn parse_interpret_intent_core_for_serving(
+    arguments: &str,
+    human_message: &str,
+    expected_revision: u64,
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    parse_grounded_intent_core(arguments, human_message, Some(expected_revision))
+}
+
+fn parse_grounded_intent_core(
+    arguments: &str,
+    human_message: &str,
+    expected_revision: Option<u64>,
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
     let grounded = grounded_request_controls(human_message);
     let mut input = match parse_core_wire(arguments) {
@@ -339,6 +356,9 @@ pub(crate) fn parse_interpret_intent_core_for_human(
         }
         Err(error) => return Err(error),
     };
+    if let Some(expected_revision) = expected_revision {
+        input.expected_revision = expected_revision;
+    }
     apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
     normalize_core(input)
 }

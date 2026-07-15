@@ -1,7 +1,7 @@
 use crate::errors::StructuredError;
 use crate::intent::ExistingChannelKey;
 use crate::llm::Message;
-use crate::turn::parse_interpret_intent_core_for_human;
+use crate::turn::parse_interpret_intent_core_for_serving;
 
 use super::super::SessionSnapshotError;
 use super::adjudicate::{
@@ -10,7 +10,7 @@ use super::adjudicate::{
 use super::decision::{IntentRouteDecisionKindV2, IntentRouteDecisionV2};
 use super::grounding::deterministically_selected_option;
 use super::request_evidence::IntentRequestEvidenceChainV1;
-use super::state::{intent_error, snapshot_error, IntentFallbackKind};
+use super::state::{snapshot_error, IntentFallbackKind};
 use super::transcript_restore::{
     parse_intent_state_anchor, restored_human_text, validate_intent_state_anchor,
 };
@@ -86,27 +86,12 @@ pub(super) fn replay_core_semantics(
     .map_err(CoreReplayErrorV4::Snapshot)?;
     validate_intent_state_anchor(&state).map_err(CoreReplayErrorV4::Snapshot)?;
     let failure_revision = state.expected_revision;
-    let mut core = parse_interpret_intent_core_for_human(arguments, &human).map_err(|error| {
-        CoreReplayErrorV4::Semantic {
-            error,
-            revision: failure_revision,
-        }
-    })?;
-    if core.expected_revision() != state.expected_revision {
-        return Err(CoreReplayErrorV4::Semantic {
-            error: intent_error(
-                "STALE_INTENT_WORKSPACE_REVISION",
-                "intent.expected_revision",
-                format!(
-                    "Intent revision {} does not match the current revision {}",
-                    core.expected_revision(),
-                    state.expected_revision
-                ),
-                format!("Retry with expected_revision {}", state.expected_revision),
-            ),
-            revision: failure_revision,
-        });
-    }
+    let mut core =
+        parse_interpret_intent_core_for_serving(arguments, &human, state.expected_revision)
+            .map_err(|error| CoreReplayErrorV4::Semantic {
+                error,
+                revision: failure_revision,
+            })?;
     let grounded_channel = deterministically_selected_option(&human, &state.available_channel_keys)
         .map(ExistingChannelKey);
     core.apply_human_grounding(&human, grounded_channel.as_ref())

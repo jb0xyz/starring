@@ -7,7 +7,7 @@ use crate::intent::{
     ValidatedIntentV2, INTENT_IDENTITY_REVISION,
 };
 use crate::turn::{
-    parse_interpret_intent_core_for_human, parse_private_study_room_details_for_serving,
+    parse_interpret_intent_core_for_serving, parse_private_study_room_details_for_serving,
     parse_resolve_intent_decision,
 };
 
@@ -110,9 +110,8 @@ impl<C> DesignSession<C> {
             .saturating_add(1);
     }
 
-    fn validate_expected_revision(&mut self, actual: u64) -> Result<(), StructuredError> {
-        let expected = self
-            .intent_recipe
+    fn expected_intent_revision(&self) -> Result<u64, StructuredError> {
+        self.intent_recipe
             .as_ref()
             .map(|runtime| runtime.expected_revision(self.draft.draft_revision))
             .ok_or_else(|| {
@@ -122,7 +121,11 @@ impl<C> DesignSession<C> {
                     "Intent recipe mode is not enabled",
                     "Construct the session with resource bindings",
                 )
-            })?;
+            })
+    }
+
+    fn validate_expected_revision(&mut self, actual: u64) -> Result<(), StructuredError> {
+        let expected = self.expected_intent_revision()?;
         if actual == expected {
             return Ok(());
         }
@@ -347,10 +350,12 @@ impl<C> DesignSession<C> {
     ) -> Result<IntentCoreExecutionV4, StructuredError> {
         self.observability.intent_route_calls =
             self.observability.intent_route_calls.saturating_add(1);
-        let mut core = parse_interpret_intent_core_for_human(arguments, human_message)
-            .inspect_err(|_| {
-                self.record_intent_extraction_failure();
-            })?;
+        let expected_revision = self.expected_intent_revision()?;
+        let mut core =
+            parse_interpret_intent_core_for_serving(arguments, human_message, expected_revision)
+                .inspect_err(|_| {
+                    self.record_intent_extraction_failure();
+                })?;
         self.validate_expected_revision(core.expected_revision())?;
         let transcript_message_index =
             u64::try_from(self.current_human_message_index.ok_or_else(|| {
