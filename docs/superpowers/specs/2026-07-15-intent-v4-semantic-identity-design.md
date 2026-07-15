@@ -312,19 +312,20 @@ recipe-detail semantics before adjudication, so model field contradictions
 cannot mutate a Draft. A grounded build clears model response prose and cannot
 remain a model-authored discussion.
 
-Runtime infrastructure is no longer a model field. The harness derives it from
-the exact current human turn for both build and discussion, so the model cannot
-omit, invent, or weaken it. The unmapped-capability array remains required on
-the model schema. The decoder may supply that array as empty only when the same
-current-human analysis positively grounds discussion mode. A build or
-ungrounded request with that array missing still fails closed. Discussion
-presentation is control-validated and bounded to
-2,000 UTF-16 code units. Truncation reserves one unit for an ellipsis, prefers
-the last whitespace cut within the final quarter of the budget, and otherwise
-uses the last complete Unicode scalar that fits. The bounded value is the only
-presentation admitted to serving history. Raw tool arguments remain in the
-append-only audit transcript but their overlong response has no semantic or
-presentation authority.
+Runtime infrastructure is no longer a model field. For a grounded build, the
+harness derives it from the exact current human turn, so the model cannot omit,
+invent, or weaken it. A grounded discussion clears all runtime semantics before
+adjudication, irrespective of model output. The unmapped-capability array
+remains a required model-schema field. It may be explicitly empty for any
+request with no unmapped capabilities. If the model omits it, the harness
+synthesizes `[]` only when current-human analysis positively grounds discussion
+mode; a build or ungrounded request with the array missing fails closed.
+Discussion presentation is control-validated and bounded to 480 UTF-16 code
+units. The harness never truncates presentation text: an overlong response fails
+closed before it can acquire semantic or presentation authority. Only a
+successfully parsed, grounded, and normalized response is admitted to serving
+history. Raw tool arguments remain in the append-only audit transcript, but an
+overlong response has no semantic or presentation authority.
 
 Safety-boundary requests and selected recipe-detail facets remain part of the
 closed Core semantic projection, but they are not model wire fields. A pure,
@@ -485,20 +486,20 @@ executes an unsupported capability.
 Normalizer V7 makes the four closed runtime properties harness-authoritative.
 The same quote-aware request scanner supplies only active current-human units;
 questions without a direct build, hypothetical language, copied prompt blocks,
-and UI-copy suffixes have no runtime authority. The runtime grounder recovers
-explicit restart persistence, durable timers, persistent economy storage, and
-event-time LLM execution even when the model omits them, and removes every model
-value without matching current-human evidence. Plain timer or economy behavior
-does not imply infrastructure. Detached, additive, and alternative links remain
-explicit through grounding. Non-authoritative scope continues only over connected
-units, event-time scope continues only over authoritative additive units, and an
-unresolved positive runtime alternative fails closed. A copied block can regain
-authority only after a closed terminator. Unbalanced quotes and conflicting
-positive and negative requirements fail closed before normalization. Bounded
-term indexes keep proximity classification linear in current-turn length. This
-replacement runs before runtime-versus-behavior deduplication and is replayed
-identically during snapshot verification, so presentation history cannot
-contaminate a later build.
+and UI-copy suffixes have no runtime authority. For grounded builds, the runtime
+grounder recovers explicit restart persistence, durable timers, persistent
+economy storage, and event-time LLM execution even when the model omits them,
+and removes every model value without matching current-human evidence. Plain
+timer or economy behavior does not imply infrastructure. Detached, additive,
+and alternative links remain explicit through grounding. Non-authoritative
+scope continues only over connected units, event-time scope continues only over
+authoritative additive units, and an unresolved positive runtime alternative
+fails closed. A copied block can regain authority only after a closed
+terminator. Unbalanced quotes and conflicting positive and negative requirements
+fail closed before normalization. Bounded term indexes keep proximity
+classification linear in current-turn length. This replacement runs before
+runtime-versus-behavior deduplication and is replayed identically during snapshot
+verification, so presentation history cannot contaminate a later build.
 
 Current-human grounding accepts at most 64 KiB and 2,048 semantic units per
 turn. Durable replay accepts at most 512 KiB of serialized `INTENT_HUMAN`
@@ -1083,7 +1084,7 @@ V4 live evaluation runs in this order:
 Latency is reported separately for one-call and two-call paths across every
 valid preview, including independent mutation cases. Default retains
 P50 below 8 seconds and P95 below 20 seconds. Detail reports P50 at or below 22
-seconds and P95 at or below 30 seconds. Every turn remains below 60 seconds.
+seconds and P95 at or below 30 seconds. Every turn remains at or below 60 seconds.
 A V3 comparison requires a separately supplied clean-source artifact from the
 same model, hardware, case slice, and concurrency policy. The current checkpoint
 has no such baseline input and therefore makes no automated V3 non-inferiority

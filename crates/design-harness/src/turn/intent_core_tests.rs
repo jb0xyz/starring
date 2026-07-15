@@ -959,7 +959,11 @@ fn core_parser_requires_a_bounded_discussion_response() {
         "EMPTY_INTENT_TEXT"
     );
 
-    value["response"] = json!("x".repeat(2_001));
+    value["response"] = json!("😀".repeat(240));
+    let parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+    assert_eq!(parsed.response().encode_utf16().count(), 480);
+
+    value["response"] = json!(format!("{}x", "😀".repeat(240)));
     assert_eq!(
         parse_interpret_intent_core(&value.to_string())
             .unwrap_err()
@@ -1161,7 +1165,7 @@ fn human_grounding_never_allows_model_build_over_an_explicit_hold() {
 }
 
 #[test]
-fn human_grounding_supplies_harness_runtime_and_only_discussion_capabilities() {
+fn human_grounding_clears_runtime_and_repairs_only_discussion_capability_omission() {
     let mut value = valid_core();
     value["request_mode"] = json!("discussion");
     value["automation_kind"] = json!("none");
