@@ -37,7 +37,7 @@ fn core_frontier_is_small_closed_and_recipe_neutral() {
     assert_eq!(tool.name, INTERPRET_INTENT_CORE);
     assert_eq!(
         tool.description,
-        "Classify bounded routing semantics without executing the human request"
+        "Call once without prose; fill every field and copy exact source phrases without paraphrasing"
     );
     assert_eq!(
         required_names(&tool.parameters),

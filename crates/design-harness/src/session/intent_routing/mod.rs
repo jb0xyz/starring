@@ -293,7 +293,21 @@ impl<C> DesignSession<C> {
             let start = turn_starts[turn_starts.len().saturating_sub(retained)];
             let mut messages = Vec::with_capacity(self.messages.len().saturating_sub(start) + 1);
             messages.push(Message::system(system_prompt));
-            messages.extend_from_slice(&self.messages[start..]);
+            let history = &self.messages[start..current_human_message_index];
+            for (index, message) in history.iter().enumerate() {
+                if message.role == MessageRole::User
+                    && message.tool_call_id.is_none()
+                    && message.tool_calls.is_empty()
+                    && message.content.starts_with(INTENT_HUMAN_PREFIX)
+                {
+                    messages.push(message.clone());
+                } else if let Some(presentation) =
+                    intent_history_presentation(message, history.get(index + 1))
+                {
+                    messages.push(presentation);
+                }
+            }
+            messages.extend_from_slice(&self.messages[current_human_message_index..]);
             if let Some(messages) = self.fit_intent_messages(messages, tools) {
                 return Some(messages);
             }
@@ -415,6 +429,35 @@ impl<C> DesignSession<C> {
             }
         }
     }
+}
+
+fn intent_history_presentation(message: &Message, result: Option<&Message>) -> Option<Message> {
+    let [call] = message.tool_calls.as_slice() else {
+        return None;
+    };
+    if message.role != MessageRole::Assistant || call.name != crate::turn::INTERPRET_INTENT_CORE {
+        return None;
+    }
+    let result = result?;
+    if result.role != MessageRole::Tool || result.tool_call_id.as_deref() != Some(call.id.as_str())
+    {
+        return None;
+    }
+    let result_value = serde_json::from_str::<serde_json::Value>(&result.content).ok()?;
+    if !result_value.get("ok")?.as_bool()?
+        || result_value.get("status")?.as_str()? != "routed"
+        || result_value.get("fallback_kind")?.as_str()? != "discussion"
+    {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    if value.get("request_mode")?.as_str()? != "discussion"
+        || value.get("requested_outcome")?.as_str()? != "discussion"
+    {
+        return None;
+    }
+    let response = value.get("response")?.as_str()?.trim();
+    (!response.is_empty()).then(|| Message::assistant(response))
 }
 
 fn intent_openai_context_chars(

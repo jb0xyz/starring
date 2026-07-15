@@ -256,12 +256,15 @@ decode to safe defaults.
 
 The prompt must make these rules explicit:
 
+- every exposed Core field is required, including both arrays when empty;
+- unsafe and disallowed requests use the same single tool-only extraction path
+  and are never refused as model prose;
 - the managed recipe's built-in room creation flow is represented by the closed
   automation kind and must not be restated as an unmapped capability;
 - `custom_automation` represents supported static buttons, modals, role and
   channel creation, permission-setting behavior, role grants, posts, and
-  ephemeral responses; represented primitives must not be restated as unmapped
-  capabilities;
+  ephemeral responses, including modal-open, modal-submit, and ephemeral-response
+  combinations; represented primitives must not be restated as unmapped capabilities;
 - deterministic human grounding selects concrete supported copy, naming, and
   control detail facets;
 - closed default wrappers retain their declared scope in inline and multiline
@@ -281,8 +284,13 @@ The prompt must make these rules explicit:
   unmapped evidence unless another closed semantic field represents that
   behavior;
 - unmapped evidence must retain the shortest complete contiguous subject and
-  predicate, including its leading determiner, never a paraphrase or a noun
-  fragment;
+  predicate, including the original determiner, quantifier, and relative word,
+  never a paraphrase or grammatical rewrite;
+- when the source states an action, extraction cannot reduce that action to a
+  noun fragment; a requirement stated only as a named capability may remain an
+  exact noun phrase;
+- leases, locks, and ordering preconditions are not runtime enums and retain
+  their complete actor, action, and constraint span;
 - imperative instructions whose object is preserving, weakening, reducing,
   omitting, or simplifying the request, requirements, or instructions are
   metadata about the design task rather than executable capabilities;
@@ -295,6 +303,14 @@ This keeps the Core duplicated schema at or below a 1.6 KB ceiling and should
 reduce both output tokens and structured metadata. The combined duplicated tool
 and response-format metadata remains capped at 3.8 KB. Detail schemas retain
 their current subset-specific ceilings.
+
+The durable transcript remains append-only. Core serving projects at most four
+recent human envelopes plus prior discussion presentation into conversational
+history, while removing prior tool calls, tool results, and their stale revision
+numbers. The exact current human envelope and authoritative state anchor remain
+last. This preserves useful dialogue context without inviting the model to copy
+an earlier tool schema or infer a revision increment. Snapshot verification still
+uses the complete unprojected transcript.
 
 For the stateful-game evaluation, `Preserve state across restarts` is represented
 only by `restart_persistent`. The anti-weakening sentence is not a capability.
@@ -397,7 +413,7 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 8, including the closed detail grammar,
+extractor revision moves from 4 to 9, including the closed detail grammar,
 supported-base classification, and runtime-versus-behavior evidence contract.
 The normalizer revision moves from 1 to 4, including exact capability-evidence
 canonicalization and typed safety-boundary evidence ownership, and the recipe
@@ -439,7 +455,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   7
-Recipe extractor revision          8
+Recipe extractor revision          9
 Recipe normalizer revision         4
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -484,7 +500,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 7, normalizer revisions through 3, or
+branch-local extractor revisions through 8, normalizer revisions through 3, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. They are rejected by the exact fixed-prompt or recipe-registry
 identity checks and must be discarded rather than migrated. After V4 ships, a
@@ -494,8 +510,8 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 8, and normalizer 4 is current;
-- a pre-release V4 prompt, extractor revision through 7, or normalizer revision
+- the exact V4 prompt with protocol 4, extractor 9, and normalizer 4 is current;
+- a pre-release V4 prompt, extractor revision through 8, or normalizer revision
   through 3 is rejected;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
 - any crossed prompt/protocol pair is an invalid invariant;

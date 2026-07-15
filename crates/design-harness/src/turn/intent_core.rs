@@ -306,7 +306,7 @@ fn grounded_capability_evidence(
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
     [ToolDefinition {
         name: INTERPRET_INTENT_CORE.to_string(),
-        description: "Classify bounded routing semantics without executing the human request"
+        description: "Call once without prose; fill every field and copy exact source phrases without paraphrasing"
             .to_string(),
         parameters: inline_schema_value::<InterpretIntentCoreWireV4>(),
     }]

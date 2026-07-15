@@ -79,72 +79,57 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> LlmResponse 
 
 #[test]
 fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("other_unmapped_required_capabilities"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Except expected_revision and response, only explicit INTENT_HUMAN text may set semantic fields"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "request_mode=build when automation is requested and request_mode=discussion only when no build is requested"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Build uses requested_outcome=working_draft or validated_preview with response=\"\""
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("discussion uses requested_outcome=discussion with a nonempty natural response"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Supported base is independent of blockers; extra unmapped requirements never change it"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "automation_kind=managed_private_study_room for the supported private-room base"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("automation_kind=custom_automation for another supported static base"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "automation_kind=none only for discussion, boundary-only requests, or builds with no supported base"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "custom_automation owns supported static buttons, modals, role/channel creation, permission-setting behavior"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Never repeat behavior owned by either kind in other_unmapped_required_capabilities"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "runtime_requirements=[] unless INTENT_HUMAN explicitly states a listed infrastructure property"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("restart_persistent=state or data survives process restarts"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("durable_timer=durable timer or scheduler infrastructure"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("event_time_llm=LLM executes or decides while handling an event"));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Leases, locks, approvals, timeouts, deadlines, waits, ordering, or preserving requirements select no runtime value"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Closed runtime fields represent infrastructure only; dependent business behavior belongs separately in other_unmapped_required_capabilities"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "For each distinct capability, emit its shortest exact contiguous subject-predicate phrase, including a leading article or quantifier"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Exclude summaries or preservation, anti-weakening, and anti-substitution restatements of captured requirements"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Harness-grounded boundaries and supported recipe copy, naming, or controls never belong in unmapped or response"
-    ));
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(
-        "Raw action and permission structures, recipe identity and hashes, and generated keys are harness-owned"
-    ));
-    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("validation_gate"));
-    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("custom_detail_facets"));
-    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("every message earns XP"));
-    assert!(
-        !INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("do not reduce the request to static responses")
+    for expected in [
+        "interpret_intent_core exactly once and emit no prose, even for unsafe requests",
+        "semantics come only from the latest INTENT_HUMAN",
+        "use exact enums and fill every field",
+        "Always include runtime_requirements and other_unmapped_required_capabilities, using [] if empty",
+        "request_mode=build when automation is requested and request_mode=discussion only when no build is requested",
+        "requested_outcome=validated_preview only if requested, otherwise working_draft",
+        "Discussion: requested_outcome=discussion and a nonempty natural response",
+        "Blockers do not change the supported base",
+        "custom_automation owns static buttons, modals, role/channel creation, permissions, role grants, posts, and ephemeral responses",
+        "a control opening a modal whose submission returns an ephemeral response",
+        "Never repeat behavior owned by either kind in other_unmapped_required_capabilities",
+        "runtime_requirements=[] unless explicit infrastructure is required",
+        "restart_persistent=state/data survives restarts",
+        "durable_timer=durable timer/scheduler",
+        "persistent_economy=persistent XP/economy/reward/balance storage",
+        "event_time_llm=LLM executes/decides during an event",
+        "preservation instructions select no runtime value",
+        "Runtime fields represent infrastructure only",
+        "Copy each value verbatim as one shortest complete contiguous INTENT_HUMAN subject-predicate span",
+        "source article, quantifier, or relative word like that",
+        "Never alter words or order, or reduce an action to a noun fragment",
+        "No build requirement may exist only in response",
+    ] {
+        assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(expected));
+    }
+    assert_eq!(
+        INTENT_RECIPE_SYSTEM_PROMPT_V4
+            .matches("each order posts a signed record")
+            .count(),
+        2
     );
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4.len() <= 3_500);
-    assert!(INTENT_RECIPE_SYSTEM_PROMPT_V4
-        .contains("In a build, no positive requirement may exist only in response"));
-    assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains("belong only in objective"));
+    assert_eq!(
+        INTENT_RECIPE_SYSTEM_PROMPT_V4
+            .matches("a worker that must obtain a cross-service lease before replying")
+            .count(),
+        2
+    );
+    assert_eq!(INTENT_RECIPE_SYSTEM_PROMPT_V4.len(), 3_493);
+    for forbidden in [
+        "validation_gate",
+        "custom_detail_facets",
+        "a button opens a paragraph modal",
+        "private thank-you response",
+        "every message earns XP",
+        "external consensus lease",
+        "do not reduce the request to static responses",
+        "belong only in objective",
+    ] {
+        assert!(!INTENT_RECIPE_SYSTEM_PROMPT_V4.contains(forbidden));
+    }
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
         .contains("launcher create-button label to copy.create_button_label"));
     assert!(INTENT_RECIPE_DETAIL_SYSTEM_PROMPT_V3
@@ -1716,8 +1701,8 @@ fn snapshot_prompt_and_protocol_matrix_rejects_legacy_and_crossed_pairs() {
     );
 
     let prerelease_prompt = INTENT_RECIPE_SYSTEM_PROMPT_V4.replace(
-        " Exclude summaries or preservation, anti-weakening, and anti-substitution restatements of captured requirements. Never paraphrase or use noun fragments.",
-        " Exclude summaries.",
+        " Never alter words or order, or reduce an action to a noun fragment.",
+        " Never alter words or order.",
     );
     assert_ne!(prerelease_prompt, INTENT_RECIPE_SYSTEM_PROMPT_V4);
     let mut prerelease = current.clone();
@@ -2532,6 +2517,47 @@ fn restore_rejects_grounded_but_tampered_detail_arguments() {
 }
 
 #[test]
+fn serving_projection_excludes_rejected_discussion_presentation() {
+    block_on(async {
+        let mut rejected = private_room_value(0, None);
+        rejected["request_mode"] = json!("discussion");
+        rejected["automation_kind"] = json!("none");
+        rejected["requested_outcome"] = json!("discussion");
+        rejected["response"] = json!("Rejected presentation");
+        rejected
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_requirements");
+        let client = ScriptedClient::new(vec![
+            Ok(interpretation_call("rejected", rejected)),
+            Ok(discussion(0, "Accepted presentation")),
+        ]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        let BurstOutcome::Halted(report) = session.run_burst("Compare rejected options").await
+        else {
+            panic!("expected rejected extraction")
+        };
+        assert_eq!(report.code, "MISSING_REQUIRED_FIELD");
+        assert!(matches!(
+            session
+                .run_burst("Compare accepted options requiring an external consensus lease")
+                .await,
+            BurstOutcome::Routed { .. }
+        ));
+
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1]
+            .0
+            .iter()
+            .all(|message| message.role != MessageRole::Assistant));
+    });
+}
+
+#[test]
 fn serving_projection_keeps_recent_conversation_without_growing_with_the_snapshot() {
     block_on(async {
         let responses = (0..6)
@@ -2558,16 +2584,33 @@ fn serving_projection_keeps_recent_conversation_without_growing_with_the_snapsho
             .into_iter()
             .filter(|message| message.content.starts_with(INTENT_HUMAN_PREFIX))
             .count();
-        let served_humans = client
-            .calls()
-            .last()
-            .unwrap()
-            .0
+        let served_calls = client.calls();
+        let served_messages = &served_calls.last().unwrap().0;
+        let served_humans = served_messages
             .iter()
             .filter(|message| message.content.starts_with(INTENT_HUMAN_PREFIX))
             .count();
         assert_eq!(snapshot_humans, 6);
         assert_eq!(served_humans, MAX_INTENT_SERVING_HISTORY_TURNS);
+        assert_eq!(
+            served_messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .count(),
+            MAX_INTENT_SERVING_HISTORY_TURNS - 1
+        );
+        assert!(served_messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .all(|message| message.content.starts_with("Comparison ")
+                && message.tool_calls.is_empty()));
+        assert!(served_messages
+            .iter()
+            .all(|message| message.role != MessageRole::Tool));
+        assert!(served_messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .all(|call| call.name != "interpret_intent_core"));
     });
 }
 
