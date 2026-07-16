@@ -77,6 +77,8 @@ struct WorkerHealth {
     reasoning_effort: String,
     auth_mode: String,
     codex_cli_version: String,
+    instance_id: String,
+    worker_source_sha256: String,
     active_requests: usize,
     queued_requests: usize,
 }
@@ -413,7 +415,15 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
         && health.model == SERVING_MODEL
         && health.reasoning_effort == SERVING_REASONING_EFFORT
         && health.auth_mode == SERVING_AUTH_MODE
-        && health.codex_cli_version == SERVING_CODEX_CLI_VERSION;
+        && health.codex_cli_version == SERVING_CODEX_CLI_VERSION
+        && !health.instance_id.is_empty()
+        && health.instance_id.len() <= 128
+        && health.instance_id.trim() == health.instance_id
+        && health.worker_source_sha256.len() == 64
+        && health
+            .worker_source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let _ = (health.active_requests, health.queued_requests);
     if valid {
         Ok(())
@@ -494,6 +504,8 @@ mod tests {
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
             "codex_cli_version": "codex-cli 0.144.2",
+            "instance_id": "test-worker-instance",
+            "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "active_requests": 0,
             "queued_requests": 0
         }))

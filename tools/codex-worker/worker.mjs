@@ -1,4 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -24,6 +25,23 @@ const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_QUEUE = 8;
 const DEFAULT_TIMEOUT_MS = 55_000;
 const DEFAULT_MAX_BODY_BYTES = 2_000_000;
+const SOURCE_FILES = [
+  "codex-runner.mjs",
+  "metrics-log.mjs",
+  "protocol.mjs",
+  "worker.mjs",
+];
+
+export async function workerSourceSha256() {
+  const digest = createHash("sha256");
+  for (const name of SOURCE_FILES) {
+    const content = await readFile(new URL(name, import.meta.url));
+    digest.update(String(Buffer.byteLength(name)));
+    digest.update(":" + name + ":" + String(content.length) + ":");
+    digest.update(content);
+  }
+  return digest.digest("hex");
+}
 
 class Scheduler {
   constructor(concurrency, maxQueue) {
@@ -380,12 +398,25 @@ export async function startWorker(options = {}) {
   if (verification.codex_cli_version !== CODEX_CLI_VERSION) {
     throw new WorkerError("invalid_codex_version", 503);
   }
+  const instanceId = options.instanceId ?? randomUUID();
+  if (typeof instanceId !== "string"
+    || instanceId.length === 0
+    || instanceId.length > 128
+    || instanceId !== instanceId.trim()) {
+    throw new WorkerError("invalid_instance_id", 500);
+  }
+  const sourceSha256 = options.workerSourceSha256 ?? await workerSourceSha256();
+  if (typeof sourceSha256 !== "string" || !/^[0-9a-f]{64}$/.test(sourceSha256)) {
+    throw new WorkerError("invalid_worker_source", 500);
+  }
   const identity = Object.freeze({
     provider: PROVIDER,
     model: MODEL,
     reasoning_effort: REASONING_EFFORT,
     auth_mode: AUTH_MODE,
     codex_cli_version: verification.codex_cli_version,
+    instance_id: instanceId,
+    worker_source_sha256: sourceSha256,
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
   const logPath = options.metricsPath

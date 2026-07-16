@@ -136,6 +136,8 @@ async function createFixture(options = {}) {
     timeoutMs: options.timeoutMs,
     metricsMaxBytes: options.metricsMaxBytes,
     metricsBackups: options.metricsBackups,
+    instanceId: options.instanceId ?? "test-worker-instance",
+    workerSourceSha256: options.workerSourceSha256 ?? "a".repeat(64),
   });
   const protocol = "http:";
   const base = `${protocol}/${"/"}${worker.address.address}:${worker.address.port}`;
@@ -208,12 +210,14 @@ test("health is authenticated, exact, and loopback only", async () => {
       "active_requests",
       "auth_mode",
       "codex_cli_version",
+      "instance_id",
       "model",
       "provider",
       "queued_requests",
       "reasoning_effort",
       "schema_version",
       "status",
+      "worker_source_sha256",
     ]);
     assert.deepEqual(health.body, {
       schema_version: 1,
@@ -223,6 +227,8 @@ test("health is authenticated, exact, and loopback only", async () => {
       reasoning_effort: REASONING_EFFORT,
       auth_mode: AUTH_MODE,
       codex_cli_version: VERSION,
+      instance_id: "test-worker-instance",
+      worker_source_sha256: "a".repeat(64),
       active_requests: 0,
       queued_requests: 0,
     });

@@ -179,6 +179,8 @@ export function healthEnvelope(identity, active, queued) {
     reasoning_effort: REASONING_EFFORT,
     auth_mode: AUTH_MODE,
     codex_cli_version: identity.codex_cli_version,
+    instance_id: identity.instance_id,
+    worker_source_sha256: identity.worker_source_sha256,
     active_requests: active,
     queued_requests: queued,
   };
