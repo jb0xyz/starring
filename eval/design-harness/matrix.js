@@ -1014,8 +1014,10 @@ function validStateRequestCounters(state, plan) {
     let last = initial;
     for (const [index, phaseState] of state.phases.entries()) {
       const expected = plan.phases[index]?.expected_model_calls;
+      const actual = phaseState.actual_model_calls;
       const record = phaseState.request_counters;
       if (phaseState.expected_model_calls !== expected
+        || (actual !== null && (!Number.isSafeInteger(actual) || actual < 0))
         || !record
         || !Object.hasOwn(record, 'before')
         || !Object.hasOwn(record, 'after')
@@ -1032,27 +1034,27 @@ function validStateRequestCounters(state, plan) {
         return false;
       }
       if (record.after !== null) {
-        if (record.before === null) {
+        if (record.before === null || actual === null) {
           return false;
         }
         const after = requestCounters(record.after, 'invalid_request_counter_state');
         const delta = requestCounters(record.delta, 'invalid_request_counter_state');
-        if (!countersEqual(counterDelta(record.before, after), delta)) {
+        if (!countersEqual(counterDelta(record.before, after), delta)
+          || delta.accepted_requests_total !== actual
+          || delta.settled_requests_total !== actual) {
           return false;
         }
       }
       if (phaseState.status === 'completed') {
-        if (record.before === null || record.after === null) {
-          return false;
-        }
-        const delta = requestCounters(record.delta, 'invalid_request_counter_state');
-        if (delta.accepted_requests_total !== expected
-          || delta.settled_requests_total !== expected) {
+        if (record.before === null || record.after === null || actual === null) {
           return false;
         }
         last = requestCounters(record.after, 'invalid_request_counter_state');
       } else if (phaseState.status === 'pending'
-        && (record.before !== null || record.after !== null || record.delta !== null)) {
+        && (actual !== null
+          || record.before !== null
+          || record.after !== null
+          || record.delta !== null)) {
         return false;
       }
     }
@@ -1098,6 +1100,7 @@ function initialState(plan, source, worker, tooling, now, runId) {
     phases: plan.phases.map((phase) => ({
       id: phase.id,
       expected_model_calls: phase.expected_model_calls,
+      actual_model_calls: null,
       request_counters: {
         before: null,
         after: null,
@@ -1180,7 +1183,7 @@ async function validateCompletedPhases(state, output, boundary, secret) {
     }
     const document = await readJson(artifact);
     const phaseRows = validatePhaseDocument(document, state.plan.phases[index], boundary);
-    if (modelCallsFromRows(phaseRows) !== state.plan.phases[index].expected_model_calls) {
+    if (modelCallsFromRows(phaseRows) !== phaseState.actual_model_calls) {
       throw new MatrixError('phase_model_call_count_mismatch');
     }
     rows.push(...phaseRows);
@@ -1280,6 +1283,7 @@ async function executePendingPhase({
   phaseState.error_code = null;
   phaseState.error_detail = null;
   phaseState.promptfoo_exit_code = null;
+  phaseState.actual_model_calls = null;
   state.status = 'running';
   state.updated_at = timestamp(now);
   await atomicWriteJson(statePath, state);
@@ -1362,6 +1366,7 @@ async function executePendingPhase({
     source_commit: state.source_commit,
   });
   const actualModelCalls = modelCallsFromRows(rows);
+  phaseState.actual_model_calls = actualModelCalls;
   const postflight = await dependencies.health(environment);
   assertWorkerBoundary(state.worker, postflight);
   assertSourceBoundary(state.source_commit, dependencies.sourceState(root));
@@ -1371,9 +1376,6 @@ async function executePendingPhase({
   phaseState.request_counters.delta = { ...delta };
   state.updated_at = timestamp(dependencies.now());
   await atomicWriteJson(statePath, state);
-  if (actualModelCalls !== phase.expected_model_calls) {
-    throw new MatrixError('phase_model_call_count_mismatch');
-  }
   if (delta.accepted_requests_total !== actualModelCalls
     || delta.settled_requests_total !== actualModelCalls) {
     throw new MatrixError('request_counter_delta_mismatch');
@@ -1419,9 +1421,11 @@ async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
     state.request_counters.last_observed,
   );
   const requestCounterClean = totalCounterDelta.accepted_requests_total === observed.model_calls
-    && totalCounterDelta.settled_requests_total === observed.model_calls
-    && observed.model_calls === state.plan.total_expected_model_calls;
+    && totalCounterDelta.settled_requests_total === observed.model_calls;
+  const modelCallPlanMet = observed.model_calls === state.plan.total_expected_model_calls;
   observed.request_counter_clean = requestCounterClean;
+  observed.model_call_plan_met = modelCallPlanMet;
+  observed.expected_model_calls = state.plan.total_expected_model_calls;
   observed.accepted_requests_delta = totalCounterDelta.accepted_requests_total;
   observed.settled_requests_delta = totalCounterDelta.settled_requests_total;
   const retryFree = state.phases.every((phase) => phase.attempts === 1);
@@ -1443,6 +1447,9 @@ async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
   }
   if (!requestCounterClean) {
     certificationFailures.push('request_counter_mismatch');
+  }
+  if (!modelCallPlanMet) {
+    certificationFailures.push('model_call_plan_mismatch');
   }
   if (acceptance.pass !== true) {
     certificationFailures.push('acceptance_checks_failed');

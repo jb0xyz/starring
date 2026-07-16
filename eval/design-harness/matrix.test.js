@@ -642,6 +642,12 @@ test('a complete Promptfoo assertion-failure phase is preserved without retry or
   const spawnPhase = async (request) => {
     invoked.push(request.phase.index);
     const document = phaseDocument(request.phase);
+    if (request.phase.index === 0) {
+      const naming = document.results.results.find((row) => (
+        row.vars.caseId === 'intent_private_study_room_mutation_naming'
+      ));
+      naming.response.metadata.observability.model_calls = 1;
+    }
     if (request.phase.index === 1) {
       document.results.results[0].success = false;
       document.results.results[0].gradingResult.componentResults = [{
@@ -670,19 +676,31 @@ test('a complete Promptfoo assertion-failure phase is preserved without retry or
     const state = JSON.parse(await fs.promises.readFile(path.join(output, 'state.json'), 'utf8'));
     assert.ok(state.phases.every((phase) => phase.status === 'completed'));
     assert.ok(state.phases.every((phase) => phase.attempts === 1));
+    assert.equal(state.phases[0].expected_model_calls, 34);
+    assert.equal(state.phases[0].actual_model_calls, 33);
     assert.equal(state.phases[1].promptfoo_exit_code, 100);
     assert.equal(state.observed.retry_free, true);
     assert.equal(state.observed.promptfoo_clean_exit, false);
+    assert.equal(state.observed.request_counter_clean, true);
+    assert.equal(state.observed.model_call_plan_met, false);
+    assert.equal(state.observed.model_calls, 297);
+    assert.equal(state.observed.expected_model_calls, 298);
     const acceptance = JSON.parse(
       await fs.promises.readFile(path.join(output, 'acceptance.json'), 'utf8'),
     );
     assert.equal(acceptance.model_acceptance_pass, true);
     assert.equal(acceptance.pass, false);
-    assert.deepEqual(acceptance.certification_failures, ['promptfoo_nonzero_exit']);
+    assert.deepEqual(acceptance.certification_failures, [
+      'promptfoo_nonzero_exit',
+      'model_call_plan_mismatch',
+    ]);
     const failures = JSON.parse(
       await fs.promises.readFile(path.join(output, 'failures.json'), 'utf8'),
     );
-    assert.deepEqual(failures.certification_failures, ['promptfoo_nonzero_exit']);
+    assert.deepEqual(failures.certification_failures, [
+      'promptfoo_nonzero_exit',
+      'model_call_plan_mismatch',
+    ]);
     assert.equal(failures.failures.length, 1);
     assert.deepEqual(failures.failures[0].failed_assertions, ['taskSemantics']);
   } finally {
