@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.starring.codex-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/node@24/bin/node</string>
+        <string>/Users/jungbogeon/starring/tools/codex-worker/worker.mjs</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/jungbogeon/starring</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>STARRING_CODEX_PATH</key>
+        <string>/Applications/ChatGPT.app/Contents/Resources/codex</string>
+        <key>STARRING_CODEX_WORKER_CONCURRENCY</key>
+        <string>2</string>
+        <key>STARRING_CODEX_WORKER_KEYCHAIN_ACCOUNT</key>
+        <string>llm-api</string>
+        <key>STARRING_CODEX_WORKER_KEYCHAIN_SERVICE</key>
+        <string>com.starring.llm-api-key</string>
+        <key>STARRING_CODEX_WORKER_MAX_QUEUE</key>
+        <string>8</string>
+        <key>STARRING_CODEX_WORKER_METRICS_LOG</key>
+        <string>/Users/jungbogeon/Library/Logs/starring-codex-worker/metrics.jsonl</string>
+        <key>STARRING_CODEX_WORKER_PORT</key>
+        <string>18181</string>
+        <key>STARRING_CODEX_WORKER_TIMEOUT_MS</key>
+        <string>55000</string>
+        <key>HOME</key>
+        <string>/Users/jungbogeon</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>65</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/jungbogeon/Library/Logs/starring-codex-worker/runtime.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jungbogeon/Library/Logs/starring-codex-worker/runtime.log</string>
+</dict>
+</plist>
