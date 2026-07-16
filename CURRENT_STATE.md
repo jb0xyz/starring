@@ -74,23 +74,42 @@ including RuleSet rollback and approval-bound activation, and is guarded by CI.
 
 The design-time authoring layer supports complete one-shot requests and bounded
 multi-turn conversation for the supported recipe: one hub-channel decision or
-a discussion followed by an explicit build turn. Intent protocol V3 uses one
+a discussion followed by an explicit build turn. Intent protocol V4 uses one
 bounded Gemma Core extraction for default, discussion, fallback, gap, and
-rejection paths. A successful private-study-room request with explicit copy,
-naming, or controls customization uses exactly one additional isolated detail
-extraction, for two model calls and two model tool calls total. For the
-`starring.private_study_room@1` capability, deterministic Rust code owns
-capability and safety adjudication, recipe selection, normalization, defaults,
-recipe versioning, generated keys, permission policy, references, action order,
-instance manifests, validation, simulation, and preview. The model never
-assembles the low-level RuleSet for this path.
+rejection paths. The active Core wire has no model-authored objective or safety,
+runtime, and recipe-detail authority. Deterministic current-human grounding owns
+request mode, direct-preview intent, live-mutation and gate-bypass safety roles,
+secret-disclosure roles, closed runtime requirements, mandatory-control
+restatements, and selected detail facets before adjudication. A successful
+private-study-room request with explicit copy, naming, or controls customization
+uses exactly one additional isolated detail extraction, for two model calls and
+two model tool calls total. For the `starring.private_study_room@1` capability,
+deterministic Rust code owns capability and safety adjudication, recipe
+selection, normalization, defaults, recipe versioning, generated keys,
+permission policy, references, action order, instance manifests, validation,
+simulation, and preview. The model never assembles the low-level RuleSet for
+this path.
+
+V4 separates provenance and semantic identity. An ordered request-evidence
+chain binds accepted human turns; a closed route-semantic digest is distinct
+from the evidence-bound adjudication digest; compiler-input identity remains
+distinct from revision-independent semantic-intent identity; and compiled-plan,
+candidate-RuleSet, candidate-Draft, stage, and complete-transcript bindings
+detect inconsistent local state. Model-authored discussion presentation is
+bounded and non-authoritative. V3 Intent snapshots and branch-local pre-release
+V4 snapshots are rejected rather than re-signed under the current protocol.
+These SHA-256 bindings detect corruption and inconsistent partial edits; they
+are not authentication against an attacker who can rewrite the SQLite snapshot
+and all of its digests.
 
 The active detail router exposes only the selected `copy`, `naming`, and
-`controls` roots. Its flat serving wire and parser share the same dynamically
-derived schema. The isolated second request sees only the current human turn
-and harness-owned detail state, and every accepted custom scalar or pattern
-affix must occur as an exact case-sensitive literal in that current turn before
-compilation.
+`controls` roots. Its flat serving wire and parser share the exact dynamically
+derived schema instance. The isolated second request sees only the current
+human turn and harness-owned detail state. A path-only ticket is derived before
+the call, and every accepted custom scalar or pattern affix must match the
+independently grounded slot-specific exact literal in that current turn before
+compilation. Duplicate keys, cross-slot substitutions, stale-turn literals, and
+path or value drift fail closed without repair or Draft mutation.
 
 The layer currently exists as the pure `design-harness` crate and the
 SQLite/HTTP `design-harness-cli` edge. It is a CLI and evaluation checkpoint,
@@ -99,9 +118,10 @@ study room recipe. Typed-planner fallback is classified but not yet handed off
 to an actual typed-planner session. No Layer 3 authoring path publishes or
 activates a design.
 
-The current V3 implementation, evidence, limitations, and ordered continuation
-plan are recorded in
-`docs/superpowers/handoffs/2026-07-15-gemma-intent-cohort-handoff.md`. The
+The current V4 implementation, evidence boundary, maintenance state, and ordered
+continuation plan are recorded in
+`docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
+The Gemma V3 cohort handoff remains the historical live baseline, and the
 2026-07-14 handoff remains background for the original Intent IR, Recipe
 Compiler, persistence, runtime, and server checkpoint.
 
@@ -199,10 +219,14 @@ skips approval but keeps every technical safeguard.
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
   job (six adapter packages' ignored integration tests, serial). No live Discord
   or LLM in CI.
-- **Test volume**: the complete Rust workspace suite, 44 design-harness
-  JavaScript tests, two Promptfoo configuration validations, and the ignored
-  PostgreSQL integration suites for contention, CAS, lease, partial-unique, and
-  reconnect behavior.
+- **Test volume**: the complete Rust workspace suite, the design-harness
+  JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
+  validations, and the ignored PostgreSQL integration suites for contention,
+  CAS, lease, partial-unique, and reconnect behavior. The V4 branch's focused
+  library run contains 648 passing tests. After the responsibility splits, the
+  full local workspace, clippy, formatting, JavaScript and Promptfoo static,
+  diff, dependency, comment, credential, and scope gates passed. GitHub CI and
+  live Gemma evaluation remain separate pending evidence.
 - **Live certification**: manual runbooks (real bot, guild, PostgreSQL) prove the
   end-to-end lifecycle; they are never wired into CI.
 
@@ -224,20 +248,29 @@ Stated as capabilities (durable across the phase numbering):
   fresh-readiness-at-apply).
 - Pure conversational Intent IR and deterministic Recipe Compiler for the first
   private-study-room recipe.
-- Bounded Gemma Intent frontiers with strict model pinning: default paths use
-  one call, while an explicit private-room detail path uses exactly two calls.
-  Dynamic facet routing, an isolated flat detail wire, exact current-turn
-  literal grounding, fail-closed parsing, binding-aware atomic candidates,
-  exact recipe simulation, durable SQLite generation CAS, and resumable pending
+- Intent protocol V4 semantic identity: ordered human request evidence; closed
+  route semantics and evidence-bound adjudication; distinct compiler-input and
+  semantic-intent identities; domain-separated compiled-plan and
+  candidate-RuleSet identities; Draft, stage, and complete-transcript bindings;
+  and fail-closed V3 or pre-release-V4 snapshot handling.
+- Bounded Gemma Intent frontiers with strict `gemma4:12b-mlx` and 16,384-token
+  benchmark pinning: default paths use one call, while an explicit private-room
+  detail path uses exactly two calls. Human-grounded request mode, safety,
+  runtime, mandatory-control, capability, and detail semantics; dynamic facet
+  routing; an isolated flat detail wire; slot-specific exact current-turn
+  literal grounding; fail-closed parsing; binding-aware atomic candidates;
+  exact recipe simulation; durable SQLite generation CAS; and resumable pending
   decisions remain harness-owned.
 - Modal input contracts and server-side normalization before interaction
   effects.
-- An evaluation framework with local-unsigned source/binary identity checks and
-  clean-source acceptance for the fixed Gemma checkpoint. Current live samples
+- An evaluation framework with local-unsigned source/binary identity checks,
+  strict model and context policy, per-attempt serving metrics, V4 identity-class
+  assertions, and clean-source acceptance rules. Historical live V3 samples
   include a 10/10 one-repetition baseline, 12/12 contrast results across three
   repetitions per case, 3/3 full custom-detail results, one copy-only pass, and
   a 14/14 clean-source post-refactor regression over the default and contrast
-  cases. The required ten-repeat-per-case live cohort is not yet complete.
+  cases. They remain historical evidence only. The V4 clean-source live cohort
+  and its required repeats are pending.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -256,13 +289,12 @@ Stated as capabilities (durable across the phase numbering):
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
   and recompilation, typed multi-turn preference accumulation, and bounded
   Intent transcript compression.
-- A versioned separation between authoritative semantic identity and
-  non-authoritative model-authored objective or display prose.
 - Whole-action-plan deterministic preflight before the first Discord side
   effect.
 - Provisioning-state persistence, compensation, reconciliation, and replay
   idempotency for partial external failures.
-- A clean-source ten-repeat-per-case Gemma Intent acceptance result.
+- A clean-source V4 Gemma Intent acceptance result with the required repeated
+  default, detail, mutation, and equivalence cohorts.
 
 ## Known Limitations
 
@@ -277,31 +309,40 @@ Stated as capabilities (durable across the phase numbering):
   incomplete state" and idempotent convergence, not distributed transactions.
 - Layer 1's live end-to-end maturity is not certified here.
 - The first recipe checkpoint does not certify commercial readiness. Custom
-  copy, naming, and controls now have bounded live samples, but the repeated
-  acceptance matrix, separate-process restart, concurrent load, throughput,
-  soak recovery, production API and identity boundary, and external Discord
-  failure recovery remain incomplete.
-- The three full-detail repetitions produced one RuleSet and one compiled-plan
-  identity, but two input-intent and semantic-intent hash variants. The likely
-  source is equivalent freeform model-authored objectives. Protocol V4 must
-  separate authoritative recipe identity from non-authoritative display prose
-  instead of silently weakening the V3 hash.
-- The checkpoint verifies structural consistency, routing, gates, equivalence,
-  call counts, and latency assertions, but has no independent oracle for the
-  requested hub, locale, objective, or copy. Its model check pins the exact
-  gateway-reported tag, not a weights or server-configuration digest.
+  copy, naming, and controls have bounded historical V3 live samples, but V4's
+  repeated acceptance matrix, separate-process restart, concurrent load,
+  throughput, soak recovery, production API and identity boundary, and external
+  Discord failure recovery remain incomplete.
+- V4 structurally removes the V3 identity defect in which three full-detail
+  repetitions produced one RuleSet and one compiled-plan identity but two
+  input-intent and semantic-intent hash variants. The deterministic identity
+  matrix is implemented, but no live V4 clean-source Promptfoo cohort has yet
+  shown repeat stability or latency on this branch. The V3 rows must not be
+  relabeled as V4 evidence.
+- The V4 evaluator verifies structural consistency, routing, gates, identity
+  classes, exact configured literals, call counts, and latency assertions, but
+  its model check pins the exact gateway-reported tag rather than a weights or
+  server-configuration digest. The declared 16,384-token context is a benchmark
+  policy; the current gateway does not report its active context window.
 - Runtime actions are still prepared and executed one at a time. A later
   deterministic failure can leave an earlier Discord mutation behind.
-- Snapshot V5-to-V6 migration is implemented at the CLI store edge, not in the
-  public `DesignSession::restore` API. New modal contract fields can also be
-  rejected by an older strict V1 reader. Both are rollout compatibility risks.
+- V3 Intent snapshots are deliberately incompatible with V4. V6 and V7
+  non-Intent snapshots can be promoted at the CLI store edge, but any V6 or V7
+  snapshot containing Intent state is rejected. Future protocol, prompt,
+  extractor, normalizer, or transcript-projection changes require an explicit
+  verified compatibility path or another version rotation.
+- V4's stage and transcript digests detect accidental corruption and
+  inconsistent local edits, not a malicious writer capable of replacing both
+  snapshot bytes and all unkeyed digests. A Keychain-backed authenticated
+  envelope remains future work before treating local persistence as
+  tamper-authenticated.
 - The pure-crate dependency guard scans the direct manifest denylist rather than
   the resolved transitive graph. The current graph is safe, but the invariant
   enforcement should be strengthened before external release.
 - The operational model is fixed to `gemma4:12b-mlx`; other local model
   artifacts may remain on disk but cannot be mixed into acceptance evidence.
 
-## Next Phase: Measure and Harden the Harness
+## Next Phase: Certify V4, Then Extend the Harness
 
 The direction is no longer an automation-versus-game product fork. The near-term
 Harness Track comes first; a separate Stateful Runtime Track follows only after
@@ -309,25 +350,30 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Design and implement a versioned Intent protocol V4 that gives known recipes
-   a harness-owned canonical semantic identity and keeps model-authored display
-   prose out of authoritative hashes. Define snapshot compatibility and digest
-   revisions before changing code.
-2. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
+1. Commit the V4 current-state and handoff documents. The completed
+   behavior-preserving responsibility splits and full local deterministic gates
+   are green; any later code change must rerun them before live evaluation.
+2. Run the V4 live evaluation in its fixed order against only
+   `gemma4:12b-mlx` with the declared 16,384-token policy: clean-source smoke;
+   ten-repeat default, custom-full, and copy-only cohorts; three-repeat hub,
+   locale, close, copy, naming, and control mutations; then one-shot,
+   clarification, restart, discussion-build, and paraphrase equivalence. Record
+   failures and latency honestly without importing V3 or other-model samples.
+3. Push the branch, open the main-target PR, require all GitHub Actions checks,
+   and merge only after an independent diff and safety-boundary review.
+4. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
    edit and recompile with explicit `keep`, `set`, and `reset_default`
    semantics.
-3. Complete the actual typed-planner handoff for supported custom static
+5. Complete the actual typed-planner handoff for supported custom static
    automation while preserving the same candidate gates and no-deploy boundary.
-4. Run the exact clean-source Gemma checkpoint with at least ten samples for
-   every acceptance case, without weakening assertions or mixing models.
-5. Add an authenticated authoring API/UI, guild-binding authority, session
+6. Add an authenticated authoring API/UI, guild-binding authority, session
    ownership, and the existing approval/publication/activation integration.
-6. Measure queueing, concurrency, saturation, and recovery on the Gemma-only
+7. Measure queueing, concurrency, saturation, and recovery on the Gemma-only
    Mac mini before setting a commercial SLO.
-7. Add whole-plan deterministic preflight before the first side effect, then
+8. Add whole-plan deterministic preflight before the first side effect, then
    provisioning state, compensation, reconciliation, and replay idempotency for
    uncertain external effects.
-8. Release a bounded next private-room recipe, expand the recipe catalog, then
+9. Release a bounded next private-room recipe, expand the recipe catalog, then
    begin the separate `StatefulSpec` runtime arc for state, conditions, timers,
    sessions, and games.
 
@@ -338,7 +384,11 @@ current evidence, commands, and known maintenance debt.
 
 - Design specs, plans, and runbooks: `docs/superpowers/{specs,plans,runbooks}/`
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
-- Current Gemma Intent/Recipe checkpoint handoff:
+- Current Intent V4 semantic-identity implementation handoff:
+  `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
+- V4 semantic-identity design and deterministic verification contract:
+  `docs/superpowers/specs/2026-07-15-intent-v4-semantic-identity-design.md`.
+- Historical Gemma V3 Intent/Recipe live checkpoint handoff:
   `docs/superpowers/handoffs/2026-07-15-gemma-intent-cohort-handoff.md`.
 - Original Intent IR, Recipe Compiler, persistence, runtime, and server
   checkpoint:
