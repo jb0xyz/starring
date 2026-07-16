@@ -433,7 +433,14 @@ export async function startWorker(options = {}) {
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
-      json(response, 200, healthEnvelope(identity, scheduler.active, scheduler.queue.length));
+      json(response, 200, healthEnvelope(
+        identity,
+        scheduler.active,
+        scheduler.queue.length,
+        concurrency,
+        maxQueue,
+        timeoutMs,
+      ));
       return;
     }
     if (request.method !== "POST" || request.url !== "/v1/frontier-completions") {

@@ -79,6 +79,9 @@ struct WorkerHealth {
     codex_cli_version: String,
     instance_id: String,
     worker_source_sha256: String,
+    concurrency_limit: usize,
+    queue_capacity: usize,
+    request_timeout_ms: u64,
     active_requests: usize,
     queued_requests: usize,
 }
@@ -423,7 +426,10 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
         && health
             .worker_source_sha256
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && (1..=8).contains(&health.concurrency_limit)
+        && health.queue_capacity <= 128
+        && health.request_timeout_ms == 55_000;
     let _ = (health.active_requests, health.queued_requests);
     if valid {
         Ok(())
@@ -506,6 +512,9 @@ mod tests {
             "codex_cli_version": "codex-cli 0.144.2",
             "instance_id": "test-worker-instance",
             "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "concurrency_limit": 2,
+            "queue_capacity": 8,
+            "request_timeout_ms": 55000,
             "active_requests": 0,
             "queued_requests": 0
         }))
