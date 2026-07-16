@@ -23,6 +23,7 @@ mod intent_detail_text;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
+mod intent_metalinguistic_scope;
 mod intent_operative_conditionals;
 mod intent_protocol;
 mod intent_quote_scanner;

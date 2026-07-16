@@ -11,10 +11,10 @@ use self::evidence::{
 };
 use self::syntax::{mask_quoted_text, sentence_spans, sentence_units, UnitLink};
 use super::intent_interpretation::IntentBoundaryRequestV2;
-use super::intent_quote_scanner::{QuotedSpan, QuotedText};
-use super::intent_request_mode_grounding::{
+use super::intent_metalinguistic_scope::{
     ends_metalinguistic_copy, metalinguistic_carrier, QuotedLiteralScope,
 };
+use super::intent_quote_scanner::{QuotedSpan, QuotedText};
 
 #[cfg(test)]
 use std::cell::Cell;

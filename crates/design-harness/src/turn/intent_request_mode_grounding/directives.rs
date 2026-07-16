@@ -1,5 +1,6 @@
-use super::lexical::{first_ascii_word_index, strip_repeated_prefixes};
+use super::lexical::strip_repeated_prefixes;
 use super::patterns::*;
+use crate::turn::intent_metalinguistic_scope::first_ascii_word_index;
 
 pub(super) struct BuildDirective {
     pub(super) targets: Vec<RequestTarget>,
