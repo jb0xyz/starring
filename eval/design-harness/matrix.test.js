@@ -184,6 +184,13 @@ function dependencies(
     summarize: () => [{ case_id: 'summary' }],
     now: () => new Date(Date.UTC(2026, 6, 17, 0, 0, tick++)),
     runId: () => 'matrix-run',
+    finalizerIdentity: (source) => ({
+      schema_version: 1,
+      source_commit: source.commit,
+      matrix_sha256: '2'.repeat(64),
+      acceptance_sha256: '3'.repeat(64),
+      summarize_sha256: '4'.repeat(64),
+    }),
     writeOutput: () => {},
     requestCounter,
   };
@@ -703,6 +710,55 @@ test('a complete Promptfoo assertion-failure phase is preserved without retry or
     ]);
     assert.equal(failures.failures.length, 1);
     assert.deepEqual(failures.failures[0].failed_assertions, ['taskSemantics']);
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a completed cohort can be finalized by a separately attested committed evaluator', async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'starring-matrix-finalize-'));
+  const output = path.join(root, 'run');
+  const requestCounter = createRequestCounter();
+  let calls = 0;
+  const spawnPhase = async (request) => {
+    calls += 1;
+    await fs.promises.writeFile(request.output, JSON.stringify(phaseDocument(request.phase)));
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+
+  try {
+    const first = dependencies(spawnPhase, 'worker-instance', root, requestCounter);
+    first.assess = () => {
+      throw new Error('aggregation defect');
+    };
+    await assert.rejects(
+      runMatrix({ output, resume: false, dryRun: false }, first),
+      /aggregation defect/,
+    );
+    assert.equal(calls, 27);
+    const failed = JSON.parse(await fs.promises.readFile(path.join(output, 'state.json'), 'utf8'));
+    assert.equal(failed.status, 'failed');
+    assert.ok(failed.phases.every((phase) => phase.status === 'completed'));
+
+    const finalizerCommit = 'b'.repeat(40);
+    const second = dependencies(async () => {
+      throw new Error('completed phases must not rerun');
+    }, 'worker-instance', root, requestCounter);
+    second.sourceState = () => ({ commit: finalizerCommit, dirty: false });
+    const result = await runMatrix({ output, resume: true, dryRun: false }, second);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(calls, 27);
+    const manifest = JSON.parse(
+      await fs.promises.readFile(path.join(output, 'manifest.json'), 'utf8'),
+    );
+    const acceptance = JSON.parse(
+      await fs.promises.readFile(path.join(output, 'acceptance.json'), 'utf8'),
+    );
+    assert.equal(manifest.source_commit, SOURCE_COMMIT);
+    assert.equal(manifest.finalizer.source_commit, finalizerCommit);
+    assert.equal(acceptance.evidence_source_commit, SOURCE_COMMIT);
+    assert.equal(acceptance.finalizer.source_commit, finalizerCommit);
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }

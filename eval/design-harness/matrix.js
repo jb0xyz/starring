@@ -290,6 +290,16 @@ function toolingIdentity() {
   };
 }
 
+function finalizerIdentity(source) {
+  return {
+    schema_version: MATRIX_SCHEMA_VERSION,
+    source_commit: source.commit,
+    matrix_sha256: digest(fs.readFileSync(__filename)),
+    acceptance_sha256: digest(fs.readFileSync(path.join(__dirname, 'acceptance.js'))),
+    summarize_sha256: digest(fs.readFileSync(path.join(__dirname, 'summarize.js'))),
+  };
+}
+
 function sourceState(root) {
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], {
     cwd: root,
@@ -1116,6 +1126,7 @@ function initialState(plan, source, worker, tooling, now, runId) {
     })),
     artifacts: null,
     observed: null,
+    finalizer: null,
   };
 }
 
@@ -1132,9 +1143,16 @@ function validateResumeState(state, plan, source, worker, tooling) {
     }
     return !incompleteSeen;
   });
+  const allPhasesCompleted = Array.isArray(state?.phases)
+    && state.phases.every((phase) => phase.status === 'completed');
+  const allGatesPassed = Array.isArray(state?.gates)
+    && state.gates.every((gate) => gate.status === 'passed');
+  const finalizationOnly = state?.source_commit !== source.commit
+    && allPhasesCompleted
+    && allGatesPassed;
   if (state?.schema_version !== MATRIX_SCHEMA_VERSION
     || state.profile !== MATRIX_PROFILE
-    || state.source_commit !== source.commit
+    || (state.source_commit !== source.commit && !finalizationOnly)
     || state.plan_digest !== digest(plan)
     || digest(state.plan) !== state.plan_digest
     || !state.tooling
@@ -1165,6 +1183,7 @@ function validateResumeState(state, plan, source, worker, tooling) {
   if (!countersEqual(state.request_counters.last_observed, requestCounters(worker))) {
     throw new MatrixError('resume_request_counter_mismatch');
   }
+  return { finalization_only: finalizationOnly };
 }
 
 async function validateCompletedPhases(state, output, boundary, secret) {
@@ -1406,7 +1425,14 @@ async function executePendingPhase({
   return rows;
 }
 
-async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
+async function writeFinalArtifacts(
+  state,
+  output,
+  rows,
+  dependencies,
+  secret,
+  finalizer,
+) {
   const combined = {
     schema_version: MATRIX_SCHEMA_VERSION,
     profile: MATRIX_PROFILE,
@@ -1457,6 +1483,8 @@ async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
   const status = certificationFailures.length === 0 ? 'passed' : 'failed';
   const acceptanceArtifact = {
     ...acceptance,
+    evidence_source_commit: state.source_commit,
+    finalizer,
     model_acceptance_pass: acceptance.pass === true,
     pass: status === 'passed',
     status,
@@ -1492,6 +1520,7 @@ async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
     status,
     run_id: state.run_id,
     source_commit: state.source_commit,
+    finalizer,
     plan_digest: state.plan_digest,
     worker: state.worker,
     tooling: state.tooling,
@@ -1516,6 +1545,7 @@ async function writeFinalArtifacts(state, output, rows, dependencies, secret) {
   state.completed_at = completedAt;
   state.artifacts = artifacts;
   state.observed = observed;
+  state.finalizer = finalizer;
   return { acceptance: acceptanceArtifact, failures, manifest, status };
 }
 
@@ -1533,6 +1563,7 @@ function defaultDependencies() {
     acquireLock: acquireMatrixLock,
     now: () => new Date(),
     runId: () => `luna-v4-${randomUUID()}`,
+    finalizerIdentity,
     writeOutput: (value) => process.stdout.write(value),
   };
 }
@@ -1548,6 +1579,7 @@ async function runMatrix(options, overrides = {}) {
     : await dependencies.acquireLock(dependencies.resultsRoot);
   let state;
   let executionStarted = false;
+  let finalizationOnly = false;
   try {
     if (options.resume) {
       await fs.promises.chmod(output, 0o700);
@@ -1581,7 +1613,8 @@ async function runMatrix(options, overrides = {}) {
       state = await readJson(statePath).catch(() => {
         throw new MatrixError('resume_state_missing');
       });
-      validateResumeState(state, plan, source, worker, tooling);
+      const resume = validateResumeState(state, plan, source, worker, tooling);
+      finalizationOnly = resume.finalization_only;
     } else {
       await fs.promises.mkdir(output, { recursive: false, mode: 0o700 }).catch((error) => {
         if (error.code === 'EEXIST') {
@@ -1657,13 +1690,19 @@ async function runMatrix(options, overrides = {}) {
     if (!countersEqual(state.request_counters.last_observed, requestCounters(postflight))) {
       throw new MatrixError('request_counter_discontinuity');
     }
-    assertSourceBoundary(state.source_commit, dependencies.sourceState(root));
+    const finalizerSource = dependencies.sourceState(root);
+    assertSourceBoundary(
+      finalizationOnly ? source.commit : state.source_commit,
+      finalizerSource,
+    );
+    const finalizer = dependencies.finalizerIdentity(finalizerSource);
     const final = await writeFinalArtifacts(
       state,
       output,
       rows,
       dependencies,
       environment.STARRING_CODEX_WORKER_TOKEN,
+      finalizer,
     );
     await atomicWriteJson(statePath, state);
     dependencies.writeOutput(`${JSON.stringify({
