@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AUTH_MODE,
+  CODEX_CLI_VERSION,
   MODEL,
   REASONING_EFFORT,
   WorkerError,
@@ -13,6 +14,48 @@ import {
 
 const DEFAULT_MAX_OUTPUT_BYTES = 12_000_000;
 const DEFAULT_VERIFY_TIMEOUT_MS = 10_000;
+
+export const DISABLED_CODEX_FEATURES = Object.freeze([
+  "apps",
+  "artifact",
+  "auth_elicitation",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "code_mode",
+  "code_mode_host",
+  "code_mode_only",
+  "computer_use",
+  "deferred_executor",
+  "enable_fanout",
+  "enable_mcp_apps",
+  "goals",
+  "guardian_approval",
+  "hooks",
+  "image_generation",
+  "in_app_browser",
+  "memories",
+  "multi_agent",
+  "multi_agent_v2",
+  "network_proxy",
+  "plugin_sharing",
+  "plugins",
+  "remote_plugin",
+  "request_permissions_tool",
+  "respect_system_proxy",
+  "shell_snapshot",
+  "shell_tool",
+  "shell_zsh_fork",
+  "skill_mcp_dependency_install",
+  "standalone_web_search",
+  "tool_call_mcp_elicitation",
+  "tool_suggest",
+  "unified_exec",
+  "unified_exec_zsh_fork",
+  "web_search_cached",
+  "web_search_request",
+  "workspace_dependencies",
+]);
 
 function childEnvironment(source = process.env) {
   const names = [
@@ -130,6 +173,7 @@ function captureProcess(command, args, options = {}) {
 export function codexArguments(workDirectory, schemaPath, outputPath) {
   return [
     "exec",
+    "--strict-config",
     "--ignore-user-config",
     "--ignore-rules",
     "--ephemeral",
@@ -147,20 +191,7 @@ export function codexArguments(workDirectory, schemaPath, outputPath) {
     "approval_policy=\"never\"",
     "-c",
     "web_search=\"disabled\"",
-    "--disable",
-    "shell_tool",
-    "--disable",
-    "apps",
-    "--disable",
-    "goals",
-    "--disable",
-    "hooks",
-    "--disable",
-    "multi_agent",
-    "--disable",
-    "remote_plugin",
-    "--disable",
-    "memories",
+    ...DISABLED_CODEX_FEATURES.flatMap((feature) => ["--disable", feature]),
     "-s",
     "read-only",
     "--output-schema",
@@ -188,7 +219,15 @@ export function buildTrustedPrompt(messages, frontier) {
 }
 
 export function isChatGptLoginStatus(stdout, stderr) {
-  return `${stdout}\n${stderr}`.includes("Logged in using ChatGPT");
+  const statusLines = `${stdout}\n${stderr}`
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("Logged in using "));
+  return statusLines.length === 1 && statusLines[0] === "Logged in using ChatGPT";
+}
+
+export function isSupportedCodexVersion(value) {
+  return value === CODEX_CLI_VERSION;
 }
 
 function usageFromJsonLines(stdout) {
@@ -307,25 +346,47 @@ export function createCodexRunner(options = {}) {
   const environment = childEnvironment(options.environment ?? process.env);
   const root = options.tempRoot ?? join(tmpdir(), "starring-codex-worker");
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const capture = options.captureProcess ?? captureProcess;
+  const execute = options.executeCodex ?? executeCodex;
   let codexCliVersion = null;
+
+  const observeIdentity = async () => {
+    const version = await capture(command, ["--version"], {
+      env: environment,
+      timeoutMs: options.verifyTimeoutMs,
+    });
+    const login = await capture(command, ["login", "status"], {
+      env: environment,
+      timeoutMs: options.verifyTimeoutMs,
+    });
+    return {
+      codex_cli_version: version.stdout,
+      chatgpt: isChatGptLoginStatus(login.stdout, login.stderr),
+    };
+  };
+
+  const assertStableIdentity = async () => {
+    let observed;
+    try {
+      observed = await observeIdentity();
+    } catch {
+      throw new WorkerError("codex_identity_changed", 503);
+    }
+    if (observed.codex_cli_version !== codexCliVersion || !observed.chatgpt) {
+      throw new WorkerError("codex_identity_changed", 503);
+    }
+  };
 
   return {
     async verify() {
-      const version = await captureProcess(command, ["--version"], {
-        env: environment,
-        timeoutMs: options.verifyTimeoutMs,
-      });
-      if (!/^codex-cli\s+\S+$/.test(version.stdout)) {
+      const observed = await observeIdentity();
+      if (!isSupportedCodexVersion(observed.codex_cli_version)) {
         throw new WorkerError("invalid_codex_version", 503);
       }
-      const login = await captureProcess(command, ["login", "status"], {
-        env: environment,
-        timeoutMs: options.verifyTimeoutMs,
-      });
-      if (!isChatGptLoginStatus(login.stdout, login.stderr)) {
+      if (!observed.chatgpt) {
         throw new WorkerError("chatgpt_login_required", 503);
       }
-      codexCliVersion = version.stdout;
+      codexCliVersion = observed.codex_cli_version;
       return {
         codex_cli_version: codexCliVersion,
         auth_mode: AUTH_MODE,
@@ -336,6 +397,7 @@ export function createCodexRunner(options = {}) {
       if (codexCliVersion === null) {
         throw new WorkerError("codex_not_verified", 503);
       }
+      await assertStableIdentity();
       await mkdir(root, { recursive: true, mode: 0o700 });
       await chmod(root, 0o700);
       const requestDirectory = await mkdtemp(join(root, "request-"));
@@ -348,7 +410,7 @@ export function createCodexRunner(options = {}) {
           flag: "wx",
           mode: 0o600,
         });
-        const stdout = await executeCodex(
+        const stdout = await execute(
           command,
           codexArguments(requestDirectory, schemaPath, outputPath),
           buildTrustedPrompt(messages, frontier),
@@ -359,6 +421,7 @@ export function createCodexRunner(options = {}) {
             signal,
           },
         );
+        await assertStableIdentity();
         const argumentsText = (await boundedRead(outputPath, maxOutputBytes)).trim();
         let parsed;
         try {

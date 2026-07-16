@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  DISABLED_CODEX_FEATURES,
   buildTrustedPrompt,
   codexArguments,
+  createCodexRunner,
   isChatGptLoginStatus,
+  isSupportedCodexVersion,
 } from "./codex-runner.mjs";
 import {
   AUTH_MODE,
+  CODEX_CLI_VERSION,
   MODEL,
   PROVIDER,
   REASONING_EFFORT,
@@ -17,7 +21,7 @@ import {
 import { startWorker } from "./worker.mjs";
 
 const TOKEN = "test-worker-token-1234567890";
-const VERSION = "codex-cli 0.144.2";
+const VERSION = CODEX_CLI_VERSION;
 
 function verification(overrides = {}) {
   return {
@@ -48,6 +52,25 @@ function fakeRunner(options = {}) {
   return {
     verify: options.verify ?? (async () => verification()),
     complete: options.complete ?? (async () => runnerResult()),
+  };
+}
+
+function captureIdentities(observations) {
+  let invocation = 0;
+  return async (_command, args) => {
+    const index = Math.min(Math.floor(invocation / 2), observations.length - 1);
+    const observation = observations[index];
+    invocation += 1;
+    if (args[0] === "--version") {
+      return {
+        stdout: observation.version ?? VERSION,
+        stderr: "",
+      };
+    }
+    return {
+      stdout: "",
+      stderr: observation.login ?? "Logged in using ChatGPT",
+    };
   };
 }
 
@@ -144,6 +167,22 @@ function deferred() {
     resolvePromise = resolveValue;
   });
   return { promise, resolve: resolvePromise };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function completionFetch(base, signal) {
+  return fetch(`${base}/v1/frontier-completions`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(completionRequest()),
+    signal,
+  });
 }
 
 test("health is authenticated, exact, and loopback only", async () => {
@@ -361,6 +400,170 @@ test("bounded queue rejects overflow without retrying", async () => {
   }
 });
 
+test("queued deadline removes stale work without calling the runner", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 1,
+    timeoutMs: 200,
+    runner: fakeRunner({
+      complete: async () => {
+        calls += 1;
+        await gate.promise;
+        return runnerResult();
+      },
+    }),
+  });
+  try {
+    const first = responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    await waitFor(() => fixture.worker.stats().active === 1);
+    const stale = responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    await waitFor(() => fixture.worker.stats().queued === 1);
+    const expired = await stale;
+    assert.equal(expired.status, 504);
+    assert.deepEqual(expired.body, { error: { code: "codex_timeout" } });
+    assert.equal(calls, 1);
+    assert.deepEqual(fixture.worker.stats(), { active: 1, queued: 0 });
+    gate.resolve();
+    const firstResult = await first;
+    assert.equal(firstResult.status, 504);
+  } finally {
+    gate.resolve();
+    await fixture.cleanup();
+  }
+});
+
+test("runner receives only the timeout budget remaining after queue wait", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 1,
+    timeoutMs: 2_000,
+    runner: fakeRunner({
+      complete: async ({ signal }) => {
+        calls += 1;
+        if (calls === 1) {
+          await gate.promise;
+          return runnerResult();
+        }
+        return new Promise((resolvePromise, rejectPromise) => {
+          const timer = setTimeout(() => resolvePromise(runnerResult()), 1_700);
+          const aborted = () => {
+            clearTimeout(timer);
+            rejectPromise(new Error("aborted"));
+          };
+          if (signal.aborted) {
+            aborted();
+          } else {
+            signal.addEventListener("abort", aborted, { once: true });
+          }
+        });
+      },
+    }),
+  });
+  try {
+    const first = responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    await waitFor(() => fixture.worker.stats().active === 1);
+    const second = responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    await waitFor(() => fixture.worker.stats().queued === 1);
+    await delay(600);
+    gate.resolve();
+    const firstResult = await first;
+    const secondResult = await second;
+    assert.equal(firstResult.status, 200);
+    assert.equal(secondResult.status, 504);
+    assert.deepEqual(secondResult.body, { error: { code: "codex_timeout" } });
+    assert.equal(calls, 2);
+  } finally {
+    gate.resolve();
+    await fixture.cleanup();
+  }
+});
+
+test("queued client disconnect removes work without calling the runner", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 1,
+    timeoutMs: 1_000,
+    runner: fakeRunner({
+      complete: async () => {
+        calls += 1;
+        await gate.promise;
+        return runnerResult();
+      },
+    }),
+  });
+  try {
+    const first = completionFetch(fixture.base);
+    await waitFor(() => fixture.worker.stats().active === 1);
+    const controller = new AbortController();
+    const queued = completionFetch(fixture.base, controller.signal);
+    await waitFor(() => fixture.worker.stats().queued === 1);
+    controller.abort();
+    await assert.rejects(queued);
+    await waitFor(() => fixture.worker.stats().queued === 0);
+    assert.equal(calls, 1);
+    gate.resolve();
+    assert.equal((await first).status, 200);
+  } finally {
+    gate.resolve();
+    await fixture.cleanup();
+  }
+});
+
+test("active client disconnect aborts the runner and leaves the worker responsive", async () => {
+  const started = deferred();
+  let aborts = 0;
+  const fixture = await createFixture({
+    concurrency: 1,
+    timeoutMs: 1_000,
+    runner: fakeRunner({
+      complete: async ({ signal }) => new Promise((resolvePromise, rejectPromise) => {
+        const aborted = () => {
+          aborts += 1;
+          rejectPromise(new Error("aborted"));
+        };
+        if (signal.aborted) {
+          aborted();
+          return;
+        }
+        signal.addEventListener("abort", aborted, { once: true });
+        started.resolve();
+      }),
+    }),
+  });
+  try {
+    const controller = new AbortController();
+    const active = completionFetch(fixture.base, controller.signal);
+    await started.promise;
+    controller.abort();
+    await assert.rejects(active);
+    await waitFor(() => aborts === 1 && fixture.worker.stats().active === 0);
+    const health = await responseJson(fixture.base, "/health");
+    assert.equal(health.status, 200);
+    assert.equal(health.body.active_requests, 0);
+    assert.equal(health.body.queued_requests, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("timeout and runner failure map to bounded transport errors", async () => {
   const timed = await createFixture({
     timeoutMs: 25,
@@ -483,13 +686,25 @@ test("startup requires verified ChatGPT login identity", async () => {
     }),
     (error) => error.code === "chatgpt_login_required",
   );
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      metricsPath: join(directory, "metrics-version.jsonl"),
+      runner: fakeRunner({
+        verify: async () => verification({ codex_cli_version: "codex-cli 0.145.0" }),
+      }),
+    }),
+    (error) => error.code === "invalid_codex_version",
+  );
   await rm(directory, { recursive: true, force: true });
 });
 
 test("Codex invocation is pinned, ephemeral, read-only, and tool-disabled", () => {
   const args = codexArguments("/tmp/work", "/tmp/schema", "/tmp/output");
-  assert.deepEqual(args.slice(0, 8), [
+  assert.deepEqual(args.slice(0, 9), [
     "exec",
+    "--strict-config",
     "--ignore-user-config",
     "--ignore-rules",
     "--ephemeral",
@@ -503,17 +718,13 @@ test("Codex invocation is pinned, ephemeral, read-only, and tool-disabled", () =
   assert.ok(args.includes("approval_policy=\"never\""));
   assert.ok(args.includes("web_search=\"disabled\""));
   assert.ok(args.includes("read-only"));
-  for (const feature of [
-    "shell_tool",
-    "apps",
-    "goals",
-    "hooks",
-    "multi_agent",
-    "remote_plugin",
-    "memories",
-  ]) {
+  for (const feature of DISABLED_CODEX_FEATURES) {
     assert.ok(args.includes(feature));
   }
+  assert.deepEqual(
+    args.flatMap((value, index) => (args[index - 1] === "--disable" ? [value] : [])),
+    DISABLED_CODEX_FEATURES,
+  );
   assert.ok(!args.some((value) => value.includes("dangerously")));
   const request = completionRequest();
   const prompt = buildTrustedPrompt(request.messages, request.frontier);
@@ -526,4 +737,58 @@ test("ChatGPT startup verification accepts the Codex status stream", () => {
   assert.equal(isChatGptLoginStatus("Logged in using ChatGPT", ""), true);
   assert.equal(isChatGptLoginStatus("", "Logged in using ChatGPT"), true);
   assert.equal(isChatGptLoginStatus("", "Logged in using API key"), false);
+  assert.equal(isChatGptLoginStatus("prefix Logged in using ChatGPT", ""), false);
+  assert.equal(
+    isChatGptLoginStatus("Logged in using ChatGPT", "Logged in using ChatGPT"),
+    false,
+  );
+  assert.equal(isSupportedCodexVersion(VERSION), true);
+  assert.equal(isSupportedCodexVersion("codex-cli 0.145.0"), false);
+});
+
+test("Codex identity drift fails closed before and after execution", async () => {
+  const request = completionRequest();
+  let executions = 0;
+  const before = createCodexRunner({
+    captureProcess: captureIdentities([
+      {},
+      { login: "Logged in using API key" },
+    ]),
+    executeCodex: async () => {
+      executions += 1;
+      return "";
+    },
+  });
+  await before.verify();
+  await assert.rejects(
+    before.complete({
+      messages: request.messages,
+      frontier: request.frontier,
+      signal: new AbortController().signal,
+    }),
+    (error) => error.code === "codex_identity_changed",
+  );
+  assert.equal(executions, 0);
+
+  const after = createCodexRunner({
+    captureProcess: captureIdentities([
+      {},
+      {},
+      { version: "codex-cli 0.145.0" },
+    ]),
+    executeCodex: async () => {
+      executions += 1;
+      return "";
+    },
+  });
+  await after.verify();
+  await assert.rejects(
+    after.complete({
+      messages: request.messages,
+      frontier: request.frontier,
+      signal: new AbortController().signal,
+    }),
+    (error) => error.code === "codex_identity_changed",
+  );
+  assert.equal(executions, 1);
 });

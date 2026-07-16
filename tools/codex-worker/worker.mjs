@@ -7,6 +7,7 @@ import { createCodexRunner, readKeychainToken } from "./codex-runner.mjs";
 import { MetricsLog } from "./metrics-log.mjs";
 import {
   AUTH_MODE,
+  CODEX_CLI_VERSION,
   MODEL,
   PROVIDER,
   REASONING_EFFORT,
@@ -34,47 +35,78 @@ class Scheduler {
     this.idleWaiters = [];
   }
 
-  submit(task) {
+  submit(task, signal) {
     if (!this.accepting) {
       return Promise.reject(new WorkerError("worker_shutting_down", 503));
     }
+    if (signal?.aborted) {
+      return Promise.reject(abortReason(signal));
+    }
     if (this.active < this.concurrency) {
-      return this.start(task);
+      return this.start(task, signal);
     }
     if (this.queue.length >= this.maxQueue) {
       return Promise.reject(new WorkerError("queue_full", 429));
     }
     return new Promise((resolvePromise, rejectPromise) => {
-      this.queue.push({ task, resolvePromise, rejectPromise });
+      const entry = {
+        task,
+        resolvePromise,
+        rejectPromise,
+        signal,
+        abort: null,
+      };
+      entry.abort = () => {
+        const index = this.queue.indexOf(entry);
+        if (index === -1) {
+          return;
+        }
+        this.queue.splice(index, 1);
+        this.detach(entry);
+        rejectPromise(abortReason(signal));
+        this.resolveIdle();
+      };
+      signal?.addEventListener("abort", entry.abort, { once: true });
+      this.queue.push(entry);
     });
   }
 
-  start(task) {
+  start(task, signal) {
     this.active += 1;
     return Promise.resolve()
-      .then(task)
+      .then(() => {
+        if (signal?.aborted) {
+          throw abortReason(signal);
+        }
+        return task();
+      })
       .finally(() => this.release());
   }
 
   release() {
     this.active -= 1;
-    const next = this.queue.shift();
-    if (next) {
-      this.start(next.task).then(next.resolvePromise, next.rejectPromise);
+    let next = this.queue.shift();
+    while (next?.signal?.aborted) {
+      this.detach(next);
+      next.rejectPromise(abortReason(next.signal));
+      next = this.queue.shift();
+    }
+    if (next !== undefined) {
+      this.detach(next);
+      this.start(next.task, next.signal).then(next.resolvePromise, next.rejectPromise);
       return;
     }
-    if (this.active === 0) {
-      const waiters = this.idleWaiters.splice(0);
-      waiters.forEach((resolvePromise) => resolvePromise());
-    }
+    this.resolveIdle();
   }
 
   stop() {
     this.accepting = false;
     const queued = this.queue.splice(0);
-    queued.forEach(({ rejectPromise }) => {
-      rejectPromise(new WorkerError("worker_shutting_down", 503));
+    queued.forEach((entry) => {
+      this.detach(entry);
+      entry.rejectPromise(new WorkerError("worker_shutting_down", 503));
     });
+    this.resolveIdle();
   }
 
   idle() {
@@ -83,9 +115,30 @@ class Scheduler {
     }
     return new Promise((resolvePromise) => this.idleWaiters.push(resolvePromise));
   }
+
+  detach(entry) {
+    entry.signal?.removeEventListener("abort", entry.abort);
+  }
+
+  resolveIdle() {
+    if (this.active !== 0 || this.queue.length !== 0) {
+      return;
+    }
+    const waiters = this.idleWaiters.splice(0);
+    waiters.forEach((resolvePromise) => resolvePromise());
+  }
+}
+
+function abortReason(signal) {
+  return signal?.reason instanceof WorkerError
+    ? signal.reason
+    : new WorkerError("client_disconnected", 499);
 }
 
 function json(response, status, value) {
+  if (response.destroyed || response.writableEnded || response.writableFinished) {
+    return false;
+  }
   const body = JSON.stringify(value);
   response.writeHead(status, {
     "content-type": "application/json",
@@ -94,12 +147,18 @@ function json(response, status, value) {
     "x-content-type-options": "nosniff",
   });
   response.end(body);
+  return true;
 }
 
 function errorResponse(response, error) {
+  const failure = errorDetails(error);
+  json(response, failure.status, { error: { code: failure.code } });
+  return failure;
+}
+
+function errorDetails(error) {
   const status = error instanceof WorkerError ? error.status : 502;
   const code = error instanceof WorkerError ? error.code : "runner_failure";
-  json(response, status, { error: { code } });
   return { status, code };
 }
 
@@ -148,12 +207,12 @@ async function readJsonBody(request, maxBytes) {
   }
 }
 
-function withTimeout(operation, timeoutMs) {
+function withTimeout(operation, timeoutMs, externalSignal) {
   const controller = new AbortController();
   const timeoutError = new WorkerError("codex_timeout", 504);
   return new Promise((resolvePromise, rejectPromise) => {
     let settled = false;
-    let timedOut = false;
+    let terminalError = null;
     let graceTimer = null;
     const finish = (error, value) => {
       if (settled) {
@@ -164,24 +223,56 @@ function withTimeout(operation, timeoutMs) {
       if (graceTimer !== null) {
         clearTimeout(graceTimer);
       }
+      externalSignal?.removeEventListener("abort", externalAbort);
       if (error) {
         rejectPromise(error);
       } else {
         resolvePromise(value);
       }
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      graceTimer = setTimeout(() => finish(timeoutError), 2_500);
-    }, timeoutMs);
+    const abort = (error) => {
+      if (terminalError !== null) {
+        return;
+      }
+      terminalError = error;
+      controller.abort(error);
+      graceTimer = setTimeout(() => finish(error), 2_500);
+    };
+    const externalAbort = () => abort(abortReason(externalSignal));
+    const timer = setTimeout(() => abort(timeoutError), timeoutMs);
+    if (externalSignal?.aborted) {
+      externalAbort();
+    } else {
+      externalSignal?.addEventListener("abort", externalAbort, { once: true });
+    }
     Promise.resolve()
       .then(() => operation(controller.signal))
       .then(
-        (value) => finish(timedOut ? timeoutError : null, value),
-        (error) => finish(timedOut ? timeoutError : error),
+        (value) => finish(terminalError, value),
+        (error) => finish(terminalError ?? error),
       );
   });
+}
+
+function watchDisconnect(request, response) {
+  const controller = new AbortController();
+  const disconnect = () => {
+    if (!response.writableEnded && !controller.signal.aborted) {
+      controller.abort(new WorkerError("client_disconnected", 499));
+    }
+  };
+  request.once("aborted", disconnect);
+  response.once("close", disconnect);
+  if (request.aborted || response.destroyed) {
+    disconnect();
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      request.removeListener("aborted", disconnect);
+      response.removeListener("close", disconnect);
+    },
+  };
 }
 
 function parsePositiveInteger(value, fallback, minimum, maximum, name) {
@@ -283,10 +374,11 @@ export async function startWorker(options = {}) {
     maxOutputBytes: options.maxOutputBytes,
   });
   const verification = await runner.verify();
-  if (verification?.auth_mode !== AUTH_MODE
-    || typeof verification.codex_cli_version !== "string"
-    || verification.codex_cli_version.length === 0) {
+  if (verification?.auth_mode !== AUTH_MODE) {
     throw new WorkerError("chatgpt_login_required", 503);
+  }
+  if (verification.codex_cli_version !== CODEX_CLI_VERSION) {
+    throw new WorkerError("invalid_codex_version", 503);
   }
   const identity = Object.freeze({
     provider: PROVIDER,
@@ -326,25 +418,29 @@ export async function startWorker(options = {}) {
     }
     const requestId = randomUUID();
     const started = Date.now();
+    const disconnect = watchDisconnect(request, response);
     try {
-      const result = await scheduler.submit(() => withTimeout(
-        (signal) => runner.complete({
+      const result = await withTimeout(
+        (signal) => scheduler.submit(() => runner.complete({
           requestId,
           model: MODEL,
           reasoningEffort: REASONING_EFFORT,
           messages: body.messages,
           frontier: body.frontier,
           signal,
-        }),
+        }), signal),
         timeoutMs,
-      ));
+        disconnect.signal,
+      );
       validateRunnerResult(result, identity);
       const durationMs = Date.now() - started;
-      json(
-        response,
-        200,
-        completionEnvelope(identity, requestId, body.frontier.name, result, durationMs),
-      );
+      if (!disconnect.signal.aborted) {
+        json(
+          response,
+          200,
+          completionEnvelope(identity, requestId, body.frontier.name, result, durationMs),
+        );
+      }
       await metrics.record(metricRecord({
         requestId,
         frontierName: body.frontier.name,
@@ -355,7 +451,10 @@ export async function startWorker(options = {}) {
       }));
     } catch (error) {
       const durationMs = Date.now() - started;
-      const failure = errorResponse(response, error);
+      const failure = errorDetails(error);
+      if (!disconnect.signal.aborted) {
+        json(response, failure.status, { error: { code: failure.code } });
+      }
       await metrics.record(metricRecord({
         requestId,
         frontierName: body.frontier.name,
@@ -364,6 +463,8 @@ export async function startWorker(options = {}) {
         durationMs,
         errorCode: failure.code,
       }));
+    } finally {
+      disconnect.cleanup();
     }
   });
   server.requestTimeout = DEFAULT_TIMEOUT_MS + 5_000;

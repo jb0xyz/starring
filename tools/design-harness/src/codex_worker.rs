@@ -14,6 +14,7 @@ use crate::config::{SERVING_AUTH_MODE, SERVING_MODEL, SERVING_PROVIDER, SERVING_
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
+const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.144.2";
 
 #[derive(Clone)]
 pub struct CodexWorkerClient {
@@ -152,6 +153,7 @@ impl CodexWorkerClient {
             ));
         }
         let http = reqwest::Client::builder()
+            .no_proxy()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| LlmError::Client(error.to_string()))?;
@@ -371,7 +373,7 @@ fn validate_response(
         && response.reasoning_effort == SERVING_REASONING_EFFORT
         && response.auth_mode == SERVING_AUTH_MODE
         && !response.request_id.trim().is_empty()
-        && !response.codex_cli_version.trim().is_empty();
+        && response.codex_cli_version == SERVING_CODEX_CLI_VERSION;
     if !identity_matches {
         return Err(LlmError::Client(
             "codex worker identity mismatch".to_string(),
@@ -411,7 +413,7 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
         && health.model == SERVING_MODEL
         && health.reasoning_effort == SERVING_REASONING_EFFORT
         && health.auth_mode == SERVING_AUTH_MODE
-        && !health.codex_cli_version.trim().is_empty();
+        && health.codex_cli_version == SERVING_CODEX_CLI_VERSION;
     let _ = (health.active_requests, health.queued_requests);
     if valid {
         Ok(())
@@ -465,6 +467,10 @@ mod tests {
         let mut wrong = response();
         wrong.reasoning_effort = "low".to_string();
         assert!(validate_response(wrong, "interpret_intent_core").is_err());
+
+        let mut wrong_version = response();
+        wrong_version.codex_cli_version = "codex-cli 0.145.0".to_string();
+        assert!(validate_response(wrong_version, "interpret_intent_core").is_err());
     }
 
     #[test]
@@ -480,7 +486,7 @@ mod tests {
 
     #[test]
     fn health_requires_chatgpt_luna_medium() {
-        let health: WorkerHealth = serde_json::from_value(json!({
+        let mut health: WorkerHealth = serde_json::from_value(json!({
             "schema_version": 1,
             "status": "ok",
             "provider": "codex_chatgpt",
@@ -493,6 +499,8 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_health(&health).is_ok());
+        health.codex_cli_version = "codex-cli 0.145.0".to_string();
+        assert!(validate_health(&health).is_err());
     }
 
     #[tokio::test]
@@ -528,6 +536,14 @@ mod tests {
             "test-token".to_string(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_transport_disables_proxy_autodiscovery() {
+        let source = include_str!("codex_worker.rs");
+        assert!(source.contains(
+            "reqwest::Client::builder()\n            .no_proxy()\n            .timeout(REQUEST_TIMEOUT)"
+        ));
     }
 
     #[test]
