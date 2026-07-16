@@ -98,6 +98,24 @@ struct MetricObservation {
     provider_duration_ms: Option<u64>,
 }
 
+fn request_metric_input(
+    body: &[u8],
+    messages: &[Message],
+    frontier: &ToolDefinition,
+) -> Result<MetricInput, LlmError> {
+    Ok(MetricInput {
+        frontier_name: frontier.name.clone(),
+        request_body_bytes: body.len(),
+        message_bytes: serde_json::to_vec(messages)
+            .map_err(|error| LlmError::Client(error.to_string()))?
+            .len(),
+        tool_bytes: serde_json::to_vec(frontier)
+            .map_err(|error| LlmError::Client(error.to_string()))?
+            .len(),
+        duplicated_schema_bytes: 0,
+    })
+}
+
 impl MetricObservation {
     fn failed(outcome: ModelCallOutcome, http_status: Option<u16>) -> Self {
         Self {
@@ -231,19 +249,7 @@ impl LlmClient for CodexWorkerClient {
         };
         let body =
             serde_json::to_vec(&request).map_err(|error| LlmError::Client(error.to_string()))?;
-        let metric_input = MetricInput {
-            frontier_name: frontier.name.clone(),
-            request_body_bytes: body.len(),
-            message_bytes: serde_json::to_vec(messages)
-                .map_err(|error| LlmError::Client(error.to_string()))?
-                .len(),
-            tool_bytes: serde_json::to_vec(frontier)
-                .map_err(|error| LlmError::Client(error.to_string()))?
-                .len(),
-            duplicated_schema_bytes: serde_json::to_vec(&frontier.parameters)
-                .map_err(|error| LlmError::Client(error.to_string()))?
-                .len(),
-        };
+        let metric_input = request_metric_input(&body, messages, frontier)?;
         let call_sequence = self
             .call_sequence
             .fetch_add(1, Ordering::Relaxed)
@@ -422,7 +428,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        validate_health, validate_response, CodexWorkerClient, WorkerHealth, WorkerResponse,
+        request_metric_input, validate_health, validate_response, CodexWorkerClient, WorkerHealth,
+        WorkerRequest, WorkerResponse,
     };
 
     fn response() -> WorkerResponse {
@@ -521,5 +528,41 @@ mod tests {
             "test-token".to_string(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_metrics_report_native_worker_payload_without_schema_duplication() {
+        let messages = vec![Message::user("build")];
+        let frontier = ToolDefinition {
+            name: "interpret_intent_core".to_string(),
+            description: "interpret".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        };
+        let request = WorkerRequest {
+            schema_version: 1,
+            model: "gpt-5.6-luna",
+            reasoning_effort: "medium",
+            messages: &messages,
+            frontier: &frontier,
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+
+        let metric = request_metric_input(&body, &messages, &frontier).unwrap();
+
+        assert_eq!(metric.request_body_bytes, body.len());
+        assert_eq!(
+            metric.message_bytes,
+            serde_json::to_vec(&messages).unwrap().len()
+        );
+        assert_eq!(
+            metric.tool_bytes,
+            serde_json::to_vec(&frontier).unwrap().len()
+        );
+        assert_eq!(metric.duplicated_schema_bytes, 0);
+        assert!(metric.request_body_bytes > metric.message_bytes + metric.tool_bytes);
     }
 }

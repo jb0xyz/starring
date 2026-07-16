@@ -1355,6 +1355,32 @@ test('discussion response quality rejects completion limits and structurally poo
 });
 
 test('schema, model, oracle, calls, and hard latency regressions fail closed', () => {
+  const nativeWorkerAccounting = JSON.parse(report());
+  for (const value of [
+    nativeWorkerAccounting.turns[0].model_call_metrics[0],
+    nativeWorkerAccounting.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 0;
+    value.request_body_bytes = value.message_bytes + value.tool_bytes + 1;
+  }
+  assert.equal(
+    checks.intentReceipt(JSON.stringify(nativeWorkerAccounting), context()).pass,
+    true,
+  );
+
+  const nativeWorkerUnderAccounting = JSON.parse(report());
+  for (const value of [
+    nativeWorkerUnderAccounting.turns[0].model_call_metrics[0],
+    nativeWorkerUnderAccounting.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 0;
+    value.request_body_bytes = value.message_bytes + value.tool_bytes;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(nativeWorkerUnderAccounting), context()).reason,
+    /byte accounting is invalid/,
+  );
+
   const malformed = JSON.parse(report());
   malformed.schema_version = 2;
   assert.match(checks.intentReceipt(JSON.stringify(malformed), context()).reason, /must be 5/);

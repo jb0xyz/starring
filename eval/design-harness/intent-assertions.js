@@ -493,7 +493,6 @@ function modelCallMetric(value, location) {
   if (value.request_body_bytes === 0
     || value.message_bytes === 0
     || value.tool_bytes === 0
-    || value.duplicated_schema_bytes === 0
     || value.request_body_bytes
       <= value.message_bytes + value.tool_bytes + value.duplicated_schema_bytes) {
     throw new Error(`invalid intent eval report: ${location} byte accounting is invalid`);
