@@ -1,5 +1,6 @@
 use super::intent_detail_requirement::{contains_quote_delimiter, split_first_unquoted_colon};
 use super::intent_detail_text::{closes_quote, normalized_whitespace, opening_quote};
+use super::intent_metalinguistic_scope::is_design_interaction_directive;
 
 const DYNAMIC_SCOPE_START_WORDS: &[&str] = &[
     "after",
@@ -44,7 +45,7 @@ pub(super) fn is_unsafe_scope(value: &str) -> bool {
     }
     let masked = masked_lowercase(value);
     let scope = strip_scope_modifiers(&masked);
-    if is_non_detail_interaction_directive(scope) {
+    if is_design_interaction_directive(scope) {
         return false;
     }
     let words = detail_words(scope);
@@ -80,20 +81,6 @@ pub(super) fn is_unsafe_scope(value: &str) -> bool {
         || negative_scope
         || hypothetical_scope
         || korean_scope
-}
-
-fn is_non_detail_interaction_directive(value: &str) -> bool {
-    matches!(
-        value,
-        "do not ask a follow-up question"
-            | "do not ask follow-up questions"
-            | "don't ask a follow-up question"
-            | "don't ask follow-up questions"
-            | "don’t ask a follow-up question"
-            | "don’t ask follow-up questions"
-            | "dont ask a follow-up question"
-            | "dont ask follow-up questions"
-    )
 }
 
 fn strip_scope_modifiers(mut value: &str) -> &str {

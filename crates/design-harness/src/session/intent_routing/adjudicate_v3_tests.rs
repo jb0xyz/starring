@@ -9,8 +9,8 @@ use crate::intent::{
     PreparedIntentWorkspaceV2,
 };
 use crate::turn::{
-    parse_interpret_intent_core, parse_interpret_intent_turn, parse_private_study_room_details,
-    IntentRecipeDetailFacetV3,
+    parse_interpret_intent_core_compatibility, parse_interpret_intent_turn,
+    parse_private_study_room_details, IntentRecipeDetailFacetV3,
 };
 
 use super::adjudicate::{
@@ -75,7 +75,7 @@ fn adjudicate_core_with_evidence(
     value: &Value,
     request_evidence_hash: &str,
 ) -> IntentCoreAdjudicationV4 {
-    let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+    let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
     adjudicate_intent_core_v4(core, request_evidence_hash).unwrap()
 }
 

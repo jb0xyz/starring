@@ -76,6 +76,19 @@ fn korean_meta_instruction_is_excluded_without_losing_state_behavior() {
 }
 
 #[test]
+fn terminal_semantic_delimiters_are_consistent_for_korean_meta_instructions() {
+    for delimiter in [".", "!", "?", "。", "！", "？", ";", "；", "\n", "\r"] {
+        let candidate = format!("요구사항을 누락하지 마{delimiter}");
+        assert!(
+            ground_unmapped_capability_evidence(&candidate, vec![candidate.clone()], 160)
+                .unwrap()
+                .is_empty(),
+            "terminal delimiter was not meta-filtered: {delimiter:?}"
+        );
+    }
+}
+
+#[test]
 fn word_boundary_spoofs_are_ungrounded() {
     for human in [
         "an XLLM decides rewards at event time",
@@ -206,6 +219,94 @@ fn only_closed_meta_instruction_grammar_is_removed() {
     )
     .unwrap()
     .is_empty());
+}
+
+#[test]
+fn design_interaction_directives_are_not_automation_capabilities() {
+    for candidate in [
+        "do not ask a follow-up question",
+        "do not ask follow-up questions",
+        "don't ask a follow-up question",
+        "don't ask follow-up questions",
+        "don’t ask a follow-up question",
+        "don’t ask follow-up questions",
+        "dont ask a follow-up question",
+        "dont ask follow-up questions",
+        "추가 질문은 하지 마",
+        "추가 질문은 하지 마세요",
+        "추가 질문을 하지 마",
+        "추가 질문하지 마",
+    ] {
+        let human = format!("Build the automation and {candidate}.");
+        assert!(
+            ground_unmapped_capability_evidence(&human, values(&[candidate]), 160)
+                .unwrap()
+                .is_empty(),
+            "design interaction directive remained for {candidate}"
+        );
+    }
+
+    let human = "Build the automation. Do not ask a follow-up question. Preserve this requirement.";
+    assert!(ground_unmapped_capability_evidence(
+        human,
+        values(&["Do not ask a follow-up question."]),
+        160,
+    )
+    .unwrap()
+    .is_empty());
+}
+
+#[test]
+fn bounded_so_connector_owns_only_an_exact_design_interaction_directive() {
+    let candidate = "do not ask a follow-up question";
+    let human = "All material choices are provided, so do not ask a follow-up question.";
+    assert!(
+        ground_unmapped_capability_evidence(human, values(&[candidate]), 160)
+            .unwrap()
+            .is_empty()
+    );
+
+    for human in [
+        "The panel says so do not ask a follow-up question.",
+        "Set the panel text to do not ask a follow-up question.",
+    ] {
+        assert_eq!(
+            ground_unmapped_capability_evidence(human, values(&[candidate]), 160).unwrap(),
+            values(&[candidate]),
+            "business copy was consumed for {human}"
+        );
+    }
+}
+
+#[test]
+fn follow_up_question_automation_behaviors_are_never_meta_filtered() {
+    for candidate in [
+        "The bot must not ask a follow-up question when Help is clicked",
+        "Ask a follow-up question in the modal",
+        "Do not ask a follow-up question and archive the channel",
+        "Do not ask a follow-up question before posting the panel",
+        "Set the panel text to do not ask a follow-up question",
+    ] {
+        assert_eq!(
+            ground_unmapped_capability_evidence(candidate, values(&[candidate]), 160).unwrap(),
+            values(&[candidate]),
+            "automation behavior was removed for {candidate}"
+        );
+    }
+
+    let candidate = "do not ask a follow-up question";
+    let human = "Post the message 'do not ask a follow-up question' when Help is clicked";
+    assert_eq!(
+        ground_unmapped_capability_evidence(human, values(&[candidate]), 160).unwrap(),
+        values(&[candidate])
+    );
+
+    let candidate = "don't ask follow-up questions";
+    let human = "When Help is clicked, send the answer and don't ask follow-up questions.";
+    assert_eq!(
+        ground_unmapped_capability_evidence(human, values(&[candidate]), 160).unwrap(),
+        values(&[candidate])
+    );
 }
 
 #[test]

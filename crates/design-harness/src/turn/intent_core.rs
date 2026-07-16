@@ -11,7 +11,8 @@ use crate::tools::ToolDefinition;
 use super::intent_boundary_grounding::analyze_safety_boundaries;
 use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
-    reconcile_unmapped_capabilities, CapabilityReconciliationError,
+    reconcile_unmapped_capabilities_with_context, CapabilityReconciliationError,
+    ManagedRecipeCoreContext,
 };
 use super::intent_detail_requirement::{
     analyze_private_study_room_details, PrivateStudyRoomDetailTicketV4,
@@ -21,7 +22,9 @@ use super::intent_interpretation::{
     IntentLocaleHintV2, IntentRequestModeV2, PersistenceRequirementV2, RuntimeRequirementsV2,
     TimerRequirementV2,
 };
-use super::intent_request_mode_grounding::{grounded_request_controls, GroundedSemanticUnit};
+use super::intent_request_mode_grounding::{
+    grounded_request_controls, ClosedAxisGroundingError, GroundedClosedAxes, GroundedSemanticUnit,
+};
 use super::intent_runtime_grounding::{
     ground_runtime_requirements, RuntimeGroundingAmbiguity, RuntimeGroundingError,
     RuntimeRequirementAxis,
@@ -141,7 +144,11 @@ struct InterpretIntentCoreWireV4 {
     #[serde(deserialize_with = "deserialize_required_nullable_channel")]
     #[schemars(required)]
     hub_channel: RequiredNullableChannelV3,
+    #[serde(default = "default_intent_locale")]
+    #[schemars(skip)]
     language: IntentLocaleHintV2,
+    #[serde(default = "default_close_authorization")]
+    #[schemars(skip)]
     close_policy: CloseAuthorizationV2,
     #[serde(default)]
     #[schemars(skip)]
@@ -168,6 +175,14 @@ struct InterpretIntentCoreWireV4 {
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
     #[schemars(length(max = 480))]
     response: String,
+}
+
+fn default_intent_locale() -> IntentLocaleHintV2 {
+    IntentLocaleHintV2::Unspecified
+}
+
+fn default_close_authorization() -> CloseAuthorizationV2 {
+    CloseAuthorizationV2::NotRequested
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +244,14 @@ impl IntentCoreInterpretationV4 {
         grounded_channel: Option<&ExistingChannelKey>,
     ) -> Result<PrivateStudyRoomDetailTicketV4, StructuredError> {
         let canonical_human = canonical_human_message(human_message);
+        let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
+            && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
+        let managed_context = managed_private_study_room.then_some(ManagedRecipeCoreContext {
+            requested_outcome: self.requested_outcome,
+            grounded_channel,
+            locale: self.locale,
+            close_authorization: self.close_authorization,
+        });
         let mut unclassified_requirements = if self.request_mode == IntentRequestModeV2::Discussion
         {
             Vec::new()
@@ -237,11 +260,10 @@ impl IntentCoreInterpretationV4 {
                 &canonical_human,
                 self.automation_kind,
                 &self.runtime_requirements,
+                managed_context.as_ref(),
                 self.unclassified_requirements.clone(),
             )?
         };
-        let managed_private_study_room = self.request_mode == IntentRequestModeV2::Build
-            && self.automation_kind == IntentAutomationKindV2::ManagedPrivateStudyRoom;
         let detail_ticket = if managed_private_study_room {
             let analysis = analyze_private_study_room_details(human_message);
             unclassified_requirements
@@ -311,11 +333,17 @@ fn reconciled_capability_evidence(
     human_message: &str,
     automation_kind: IntentAutomationKindV2,
     runtime: &RuntimeRequirementsV2,
+    managed_context: Option<&ManagedRecipeCoreContext<'_>>,
     candidates: Vec<String>,
 ) -> Result<Vec<String>, StructuredError> {
-    reconcile_unmapped_capabilities(human_message, automation_kind, runtime, candidates).map_err(
-        |error| {
-            match error {
+    reconcile_unmapped_capabilities_with_context(
+        human_message,
+        automation_kind,
+        runtime,
+        managed_context,
+        candidates,
+    )
+    .map_err(|error| match error {
         CapabilityReconciliationError::Grounding {
             reason: CapabilityEvidenceGroundingError::Ambiguous,
             ..
@@ -368,9 +396,7 @@ fn reconciled_capability_evidence(
             "Capability evidence cannot be reconciled across an unbalanced quoted span",
             "Close the quoted span so active requirements are unambiguous",
         ),
-    }
-        },
-    )
+    })
 }
 
 pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
@@ -380,6 +406,13 @@ pub fn interpret_intent_core_frontier() -> [ToolDefinition; 1] {
             .to_string(),
         parameters: inline_schema_value::<InterpretIntentCoreWireV4>(),
     }]
+}
+
+#[cfg(test)]
+pub(crate) fn parse_interpret_intent_core_compatibility(
+    arguments: &str,
+) -> Result<IntentCoreInterpretationV4, StructuredError> {
+    parse_interpret_intent_core(arguments)
 }
 
 pub fn parse_interpret_intent_core(
@@ -439,8 +472,65 @@ fn parse_grounded_intent_core(
         input.expected_revision = expected_revision;
     }
     apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
+    apply_grounded_closed_axes(&mut input, grounded.closed_axes)?;
     apply_grounded_runtime_requirements(&mut input, grounded.active_semantic_units.as_deref())?;
     normalize_core(input)
+}
+
+fn apply_grounded_closed_axes(
+    input: &mut InterpretIntentCoreWireV4,
+    grounded: GroundedClosedAxes,
+) -> Result<(), StructuredError> {
+    input.language = grounded.locale.map_err(closed_axis_grounding_error)?;
+    if input.request_mode != IntentRequestModeV2::Build {
+        input.close_policy = CloseAuthorizationV2::NotRequested;
+        return Ok(());
+    }
+    input.close_policy = grounded
+        .close_authorization
+        .map_err(closed_axis_grounding_error)?;
+    Ok(())
+}
+
+fn closed_axis_grounding_error(error: ClosedAxisGroundingError) -> StructuredError {
+    match error {
+        ClosedAxisGroundingError::AmbiguousLocale => core_error(
+            "AMBIGUOUS_INTENT_LOCALE_GROUNDING",
+            "intent.core.language",
+            "The human request leaves the response locale as an unresolved alternative",
+            "Choose one response locale before building the automation",
+        ),
+        ClosedAxisGroundingError::ConflictingLocale => core_error(
+            "CONFLICTING_INTENT_LOCALE_GROUNDING",
+            "intent.core.language",
+            "The human request selects conflicting response locales",
+            "Choose one response locale before building the automation",
+        ),
+        ClosedAxisGroundingError::UnsupportedLocale => core_error(
+            "UNSUPPORTED_INTENT_LOCALE_GROUNDING",
+            "intent.core.language",
+            "The human request appears to select a response locale using an unsupported form",
+            "State one locale directly, such as use English defaults or use Korean defaults",
+        ),
+        ClosedAxisGroundingError::AmbiguousClose => core_error(
+            "AMBIGUOUS_INTENT_CLOSE_GROUNDING",
+            "intent.core.close_policy",
+            "The human request leaves room closing as an unresolved alternative",
+            "Choose one room-close policy before building the automation",
+        ),
+        ClosedAxisGroundingError::ConflictingClose => core_error(
+            "CONFLICTING_INTENT_CLOSE_GROUNDING",
+            "intent.core.close_policy",
+            "The human request selects conflicting room-close policies",
+            "Choose one room-close policy before building the automation",
+        ),
+        ClosedAxisGroundingError::UnsupportedClose => core_error(
+            "UNSUPPORTED_INTENT_CLOSE_GROUNDING",
+            "intent.core.close_policy",
+            "The human request appears to select room-close authorization using an unsupported form",
+            "Choose disabled, any room member, or only the room creator explicitly",
+        ),
+    }
 }
 
 pub(crate) fn validate_intent_human_grounding_size(

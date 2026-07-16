@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 
 use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
+use super::intent_metalinguistic_scope::{
+    is_design_interaction_directive, semantic_unit_delimiter, trim_terminal_semantic_delimiters,
+};
+
 const DETERMINERS: &[&str] = &["a", "an", "each", "every", "the"];
 
 const PREDICATE_WORDS: &[&str] = &[
@@ -143,13 +147,27 @@ fn grounded_meta_instruction(human: &str, candidate: &str) -> bool {
     let Some((start, end)) = unique_bounded_occurrence(human, candidate) else {
         return false;
     };
+    let semantic_candidate = trim_terminal_semantic_delimiters(candidate);
+    let semantic_end = end.saturating_sub(candidate.len().saturating_sub(semantic_candidate.len()));
+    let design_interaction = is_design_interaction_directive(semantic_candidate);
+    let starts_owned_clause = if design_interaction {
+        starts_standalone_clause(human, start)
+            || starts_bounded_so_design_clause(human, start)
+            || starts_design_conjunct(human, start)
+    } else {
+        starts_imperative_clause(human, start)
+    };
     top_level_unquoted_at(human, start)
-        && starts_imperative_clause(human, start)
-        && ends_imperative_clause(human, end)
-        && (english_meta_instruction(candidate) || korean_meta_instruction(candidate))
+        && starts_owned_clause
+        && ends_imperative_clause(human, semantic_end)
+        && (english_meta_instruction(semantic_candidate)
+            || korean_meta_instruction(semantic_candidate))
 }
 
 fn english_meta_instruction(value: &str) -> bool {
+    if is_design_interaction_directive(value) {
+        return true;
+    }
     let lowercase = value.to_lowercase();
     let words = lowercase
         .split(|character: char| !character.is_alphanumeric())
@@ -413,15 +431,18 @@ fn starts_imperative_clause(human: &str, start: usize) -> bool {
     let Some(prefix) = human.get(..start) else {
         return false;
     };
-    let prefix = prefix.trim_end();
-    if prefix.is_empty() {
-        return true;
-    }
-    if prefix
+    let boundary_prefix = prefix.trim_end_matches(|character: char| {
+        character.is_whitespace() && !matches!(character, '\n' | '\r')
+    });
+    if boundary_prefix
         .chars()
         .next_back()
-        .is_some_and(|character| matches!(character, '.' | '!' | '?' | ';' | '。' | '！' | '？'))
+        .is_some_and(semantic_unit_delimiter)
     {
+        return true;
+    }
+    let prefix = prefix.trim_end();
+    if prefix.is_empty() {
         return true;
     }
     prefix
@@ -430,16 +451,107 @@ fn starts_imperative_clause(human: &str, start: usize) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("and") || word == "그리고")
 }
 
+fn starts_bounded_so_clause(human: &str, start: usize) -> bool {
+    let Some(prefix) = human.get(..start).map(str::trim_end) else {
+        return false;
+    };
+    let Some(connector) = prefix.split_whitespace().next_back() else {
+        return false;
+    };
+    if !connector.eq_ignore_ascii_case("so") {
+        return false;
+    }
+    prefix
+        .get(..prefix.len().saturating_sub(connector.len()))
+        .map(str::trim_end)
+        .and_then(|value| value.chars().next_back())
+        .is_some_and(|character| matches!(character, ',' | '，'))
+}
+
+fn starts_standalone_clause(human: &str, start: usize) -> bool {
+    let Some(prefix) = human.get(..start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end_matches(|character: char| {
+        character.is_whitespace() && !matches!(character, '\n' | '\r')
+    });
+    prefix.is_empty()
+        || prefix
+            .chars()
+            .next_back()
+            .is_some_and(semantic_unit_delimiter)
+}
+
+fn starts_bounded_so_design_clause(human: &str, start: usize) -> bool {
+    if !starts_bounded_so_clause(human, start) {
+        return false;
+    }
+    let prefix = human.get(..start).unwrap_or_default();
+    let context = prefix
+        .rsplit_once(',')
+        .map(|(context, _)| context)
+        .unwrap_or_default()
+        .to_lowercase();
+    [
+        "choice",
+        "choices",
+        "detail",
+        "details",
+        "everything",
+        "information",
+        "material",
+        "requirement",
+        "requirements",
+        "선택",
+        "요구사항",
+        "정보",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
+}
+
+fn starts_design_conjunct(human: &str, start: usize) -> bool {
+    let prefix = human.get(..start).unwrap_or_default().trim_end();
+    let Some(context) = prefix.strip_suffix("and").map(str::trim_end) else {
+        return false;
+    };
+    let context = context
+        .rsplit(semantic_unit_delimiter)
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let design_request = ["build", "create", "design", "make", "prepare", "set up"]
+        .iter()
+        .any(|verb| context.starts_with(verb) || context.starts_with(&format!("please {verb}")))
+        && [
+            "automation",
+            "bot",
+            "design",
+            "request",
+            "system",
+            "workflow",
+        ]
+        .iter()
+        .any(|target| context.contains(target));
+    let executable_scope = [" clicked", " sends ", " posts ", " responds ", "when "]
+        .iter()
+        .any(|marker| context.contains(marker));
+    design_request && !executable_scope
+}
+
 fn ends_imperative_clause(human: &str, end: usize) -> bool {
     let Some(suffix) = human.get(end..) else {
         return false;
     };
+    if suffix
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .any(|character| matches!(character, '\n' | '\r'))
+    {
+        return true;
+    }
     let suffix = suffix.trim_start();
-    suffix.is_empty()
-        || suffix
-            .chars()
-            .next()
-            .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'))
+    suffix.is_empty() || suffix.chars().next().is_some_and(semantic_unit_delimiter)
 }
 
 fn closing_quote_for(character: char) -> Option<char> {

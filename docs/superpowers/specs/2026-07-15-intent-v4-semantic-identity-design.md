@@ -230,8 +230,6 @@ request_mode
 automation_kind
 requested_outcome
 hub_channel
-language
-close_policy
 other_unmapped_required_capabilities
 response
 ```
@@ -241,6 +239,12 @@ remain empty. Discussion responses remain presentation-only.
 Runtime requirements remain part of authoritative semantic IR but are hidden
 compatibility input on the structural parser, not a model frontier field.
 Serving and replay always replace them with current-human grounded values.
+Language and close policy use the same compatibility rule: legacy raw tool
+arguments may contain them, but the active schema hides them and serving or
+replay always replaces them with deterministic current-human grounding.
+The existing one-argument crate-root parser remains a structural compatibility
+API. Only the human-aware serving and replay path establishes authoritative V4
+semantics.
 
 Gate-bypass grounding combines the existing bounded direct bypass verbs with a
 closed structural grammar. The structural forms cover dropping, eliminating,
@@ -399,13 +403,13 @@ served to the model is reused for response parsing and structured error shape.
 The ticket and schema cache are ephemeral derivations; snapshots persist only
 the path ticket and independently reproduce it from the preserved human turn.
 
-The decoder may accept the pre-release hidden boundary, detail, and runtime
-fields for fixture and transcript compatibility, but serving schemas omit them
-and their values have no authority after human grounding. Missing hidden values
-always decode to safe defaults. Invalid types, enum values, and duplicate keys
-still fail closed. The public structural parser supports fixtures and transport
-compatibility; only the human-aware serving and replay parsers establish
-authoritative semantics.
+The decoder may accept the pre-release hidden boundary, detail, runtime, locale,
+and close-policy fields for fixture and transcript compatibility, but serving
+schemas omit them and their values have no authority after human grounding.
+Missing hidden values always decode to safe defaults. Invalid types, enum values,
+and duplicate keys still fail closed. The existing public one-argument parser
+remains the structural compatibility API. Serving and replay use the same
+crate-internal human-aware grounding path to establish authoritative semantics.
 
 The prompt must make these rules explicit:
 
@@ -625,19 +629,21 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 12, including the closed detail grammar,
+extractor revision moves from 4 to 13, including the closed detail grammar,
 path-only detail frontier, exact slot-literal verifier, supported-base
 classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay, and removal of the redundant
-model-authored runtime field from the active frontier.
-The normalizer revision moves from 1 to 8, including exact capability-evidence
+model-authored runtime, language, and close-policy fields from the active frontier.
+The normalizer revision moves from 1 to 9, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only capability-array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
-external-precondition recovery, current-human runtime grounding, deterministic
-ownership of enforced safety-control restatements, and the recipe descriptor
-and registry digests rotate. Recipe version,
+external-precondition recovery, current-human runtime, locale, and close-policy
+grounding, exact ownership of non-executable interaction and managed-recipe
+restatements, bounded live-mutation pronoun continuation, deterministic ownership
+of enforced safety-control restatements, and the recipe descriptor and registry
+digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
 The root `IntentRecipeSessionSnapshotV2` requires a
@@ -828,8 +834,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         12
-Recipe normalizer revision         8
+Recipe extractor revision         13
+Recipe normalizer revision         9
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -877,7 +883,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 11, normalizer revisions through 7, or
+branch-local extractor revisions through 12, normalizer revisions through 8, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -891,9 +897,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 12, and normalizer 8 is current;
-- a pre-release V4 prompt, extractor revision through 11, or normalizer revision
-  through 7 is rejected;
+- the exact V4 prompt with protocol 4, extractor 13, and normalizer 9 is current;
+- a pre-release V4 prompt, extractor revision through 12, or normalizer revision
+  through 8 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;

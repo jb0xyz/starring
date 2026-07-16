@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use super::super::super::intent_interpretation::IntentBoundaryRequestV2;
 use super::super::classification::{
     boundary_action_is_effectively_preserved, closed_gate_control_weakening,
-    inherited_action_negation, starts_with_secret_target_object, BoundaryKind, UnitFacts,
+    inherited_action_negation, live_resource_antecedent, live_resource_pronoun_continuation,
+    starts_with_secret_target_object, BoundaryKind, LiveResourceAntecedent, UnitFacts,
     SECRET_ACTIONS,
 };
 use super::super::syntax::{word_continuation, BoundaryUnit, TextSpan, UnitLink};
@@ -115,13 +116,27 @@ pub(in super::super) fn evidence_groups(
                     && !facts[index].is_seed(kind)
                     && !facts[index + 1].is_seed(kind)
                     && combined.is_seed(kind);
+                let resource_pronoun_continuation =
+                    live_resource_pronoun_continuation(&units[index + 1].text);
+                let resource_antecedent = if resource_pronoun_continuation {
+                    live_resource_antecedent(&units[index].text)
+                } else {
+                    LiveResourceAntecedent::Unknown
+                };
+                let resource_coreference_bridge = matches!(
+                    units[index + 1].link,
+                    UnitLink::Additive | UnitLink::Sequential
+                ) && facts[index + 1].live_action
+                    && resource_antecedent == LiveResourceAntecedent::Operational;
                 if units[index].hypothetical
                     || units[index + 1].hypothetical
                     || matches!(
                         units[index + 1].link,
                         UnitLink::Alternative | UnitLink::NegativeAlternative
                     )
+                    || resource_antecedent == LiveResourceAntecedent::Descriptive
                     || (!sequential_role_bridge
+                        && !resource_coreference_bridge
                         && (!component_only[index] || !component_only[index + 1]))
                 {
                     continue;
@@ -156,10 +171,20 @@ pub(in super::super) fn cross_sentence_role_bridge(
     }
     let left_facts = UnitFacts::for_unit(left);
     let right_facts = UnitFacts::for_unit(right);
+    let live_continuation = match live_resource_pronoun_continuation(&right.text) {
+        true => match live_resource_antecedent(&left.text) {
+            LiveResourceAntecedent::Operational => true,
+            LiveResourceAntecedent::Descriptive => false,
+            LiveResourceAntecedent::Unknown => {
+                right_facts.live_action || closed_live_coreferential_continuation(&right.text)
+            }
+        },
+        false => right_facts.live_action || closed_live_coreferential_continuation(&right.text),
+    };
     let live = !left_facts.is_seed(BoundaryKind::Live)
         && !right_facts.is_seed(BoundaryKind::Live)
         && combine_facts(&left_facts, &right_facts).is_seed(BoundaryKind::Live)
-        && (right_facts.live_action || closed_live_coreferential_continuation(&right.text));
+        && live_continuation;
     let secret = left_facts.secret_unsafe_target
         && right_facts.secret_action
         && right_facts.secret_delivery

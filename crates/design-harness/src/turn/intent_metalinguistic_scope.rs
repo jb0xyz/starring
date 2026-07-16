@@ -45,6 +45,41 @@ pub(super) fn ends_metalinguistic_copy(unit: &str) -> bool {
     )
 }
 
+pub(super) fn semantic_unit_delimiter(character: char) -> bool {
+    matches!(
+        character,
+        '.' | '!' | '?' | ';' | '\n' | '\r' | '。' | '！' | '？' | '；'
+    )
+}
+
+pub(super) fn trim_terminal_semantic_delimiters(value: &str) -> &str {
+    value.trim_end_matches(|character: char| {
+        character.is_whitespace() || semantic_unit_delimiter(character)
+    })
+}
+
+pub(super) fn is_design_interaction_directive(value: &str) -> bool {
+    let value = trim_terminal_semantic_delimiters(value.trim_start()).to_lowercase();
+    let value = value.strip_prefix("please ").unwrap_or(&value);
+    matches!(
+        value,
+        "do not ask a follow-up question"
+            | "do not ask follow-up questions"
+            | "don't ask a follow-up question"
+            | "don't ask follow-up questions"
+            | "don’t ask a follow-up question"
+            | "don’t ask follow-up questions"
+            | "dont ask a follow-up question"
+            | "dont ask follow-up questions"
+            | "추가 질문은 하지 마"
+            | "추가 질문은 하지 마세요"
+            | "추가 질문을 하지 마"
+            | "추가 질문을 하지 마세요"
+            | "추가 질문하지 마"
+            | "추가 질문하지 마세요"
+    )
+}
+
 pub(super) fn first_ascii_word_index(value: &str, expected: &str) -> Option<usize> {
     value.match_indices(expected).find_map(|(start, _)| {
         let end = start.saturating_add(expected.len());
@@ -210,8 +245,7 @@ pub(super) fn metalinguistic_carrier(unit: &str) -> bool {
 
 fn quote_local_segment(value: &str) -> (&str, bool) {
     let boundary = value.char_indices().rev().find_map(|(index, character)| {
-        matches!(character, '.' | '!' | '?' | ';' | '\n' | '\r')
-            .then_some(index.saturating_add(character.len_utf8()))
+        semantic_unit_delimiter(character).then_some(index.saturating_add(character.len_utf8()))
     });
     boundary.map_or((value, false), |start| (&value[start..], true))
 }

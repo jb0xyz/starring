@@ -441,7 +441,7 @@ mod v4_golden_tests {
     use serde_json::{json, Value};
 
     use crate::session::intent_routing::IntentRouteDecisionV2;
-    use crate::turn::parse_interpret_intent_core;
+    use crate::turn::parse_interpret_intent_core_compatibility;
 
     use super::super::{adjudicate_intent_core_v4, IntentCoreAdjudicationV4};
     use super::{
@@ -473,7 +473,7 @@ mod v4_golden_tests {
     }
 
     fn decision(value: &Value) -> IntentRouteDecisionV2 {
-        let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+        let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
         match adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap() {
             IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
             _ => panic!("expected private study-room selection"),
@@ -512,7 +512,7 @@ mod v4_golden_tests {
         );
 
         let value = core_value();
-        let core = parse_interpret_intent_core(&value.to_string()).unwrap();
+        let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
         assert_eq!(
             serde_json::to_value(canonical_semantic_ir_v4(&core)).unwrap(),
             json!({

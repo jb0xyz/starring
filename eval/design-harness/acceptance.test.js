@@ -8,7 +8,7 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = 'c332cc4e248b7fe1cd00eb1b2a551a718f781cb11d0919ba9d211e3e83536dd1';
+const REGISTRY_DIGEST = '82016e79d8ce19904e010bc555b52394bcd033dc0813cabe184db32e05718fc8';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -350,8 +350,8 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 12,
-      normalizer_revision: 8,
+      extractor_revision: 13,
+      normalizer_revision: 9,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -619,7 +619,7 @@ function passingDocument() {
       intent_revision_before: 0,
       intent_revision_after: 0,
       route_decision: routeDecision('discussion', {
-        semantic_ir_digest: digest('route:discussion-en'),
+        semantic_ir_digest: digest('route:discussion-unspecified'),
         request_evidence_hash: digest('request:brainstorming-sequence'),
         adjudication_digest: digest('adjudication:brainstorming-sequence'),
       }),
@@ -653,8 +653,9 @@ function passingDocument() {
   const fallbackRow = (caseId, route, currentOrder) => {
     const decision = fallbackDecision(caseId, route);
     const routeClass = {
-      intent_normalizer_same_target_hold: 'discussion-en',
-      intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion-en',
+      intent_normalizer_same_target_hold: 'discussion-unspecified',
+      intent_normalizer_korean_compound_discussion: 'discussion-unspecified',
+      intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion-unspecified',
       intent_typed_planner_fallback: 'custom-static-automation',
       intent_redaction_copy_typed_planner: 'custom-static-automation',
     }[caseId] || caseId;
@@ -722,6 +723,13 @@ function passingDocument() {
   for (let index = 0; index < 10; index += 1) {
     rows.push(row('intent_private_study_room_en', order, {
       inputHash: '1'.repeat(64),
+      vars: { completeRequest: true },
+    }));
+    order += 1;
+    rows.push(row('intent_private_study_room_en_paraphrase', order, {
+      inputHash: '1'.repeat(64),
+      requestHash: digest('request:private-study-room-en-paraphrase'),
+      adjudicationHash: digest('adjudication:private-study-room-en-paraphrase'),
       vars: { completeRequest: true },
     }));
     order += 1;
@@ -951,7 +959,7 @@ test('checkpoint acceptance enforces repeated Gemma recipe quality and equivalen
   const assessment = assess(passingDocument());
 
   assert.equal(assessment.pass, true);
-  assert.equal(assessment.samples, 222);
+  assert.equal(assessment.samples, 232);
   assert.equal(assessment.p50_one_call_preview_turn_ms, 1000);
   assert.equal(assessment.p95_one_call_preview_turn_ms, 1000);
   assert.equal(assessment.p50_two_call_preview_turn_ms, 1000);
@@ -1001,7 +1009,7 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
 
 test('checkpoint rejects stale extractor, normalizer, and forged registry identities', () => {
   const oldExtractor = passingDocument();
-  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 11;
+  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 12;
   const oldExtractorAssessment = assess(oldExtractor);
   assert.equal(oldExtractorAssessment.pass, false);
   assert.equal(
@@ -1010,7 +1018,7 @@ test('checkpoint rejects stale extractor, normalizer, and forged registry identi
   );
 
   const oldNormalizer = passingDocument();
-  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 7;
+  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 8;
   const oldNormalizerAssessment = assess(oldNormalizer);
   assert.equal(oldNormalizerAssessment.pass, false);
   assert.equal(

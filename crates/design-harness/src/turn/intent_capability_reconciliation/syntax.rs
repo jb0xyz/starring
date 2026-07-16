@@ -1,3 +1,6 @@
+use super::super::intent_metalinguistic_scope::{
+    semantic_unit_delimiter, trim_terminal_semantic_delimiters,
+};
 use super::super::intent_operative_conditionals::operative_consequent_start;
 use super::super::intent_quote_scanner::{QuotedSpan, QuotedText};
 
@@ -69,7 +72,7 @@ impl<'a> SourceText<'a> {
         for (index, character) in source.char_indices() {
             let end = index.saturating_add(character.len_utf8());
             let hidden = overlaps_next_quote(quoted.spans(), &mut quote_index, index, end);
-            if !hidden && sentence_delimiter(character) {
+            if !hidden && semantic_unit_delimiter(character) {
                 push_trimmed_sentence_span(
                     source,
                     sentence_start,
@@ -154,10 +157,10 @@ impl<'a> SourceText<'a> {
         }
         let mut cursor = OccurrenceAuthorityCursor::new(&self.quoted, &self.sentences);
         self.source.match_indices(value).any(|(start, _)| {
-            let span = Span {
+            let span = self.authority_span(Span {
                 start,
                 end: start.saturating_add(value.len()),
-            };
+            });
             cursor.authority(span).0
         })
     }
@@ -170,10 +173,10 @@ impl<'a> SourceText<'a> {
         let mut found = false;
         for (start, _) in self.source.match_indices(value) {
             found = true;
-            let span = Span {
+            let span = self.authority_span(Span {
                 start,
                 end: start.saturating_add(value.len()),
-            };
+            });
             if !cursor.authority(span).1 {
                 return false;
             }
@@ -197,6 +200,7 @@ impl<'a> SourceText<'a> {
         if value.is_empty() {
             return None;
         }
+        let value = trim_terminal_semantic_delimiters(value);
         let mut matching = self.clauses.iter().filter(|clause| {
             !clause.hypothetical
                 && !self.overlaps_quote(clause.span)
@@ -215,6 +219,49 @@ impl<'a> SourceText<'a> {
                 .map(|token| token.lower.clone())
                 .collect(),
         )
+    }
+
+    pub(super) fn unique_complete_asserted_sentence_tokens(
+        &self,
+        value: &str,
+    ) -> Option<Vec<String>> {
+        if value.is_empty() {
+            return None;
+        }
+        let value = trim_terminal_semantic_delimiters(value);
+        let mut matching = self.sentences.iter().filter(|sentence| {
+            sentence.authoritative_span(sentence.span)
+                && !self.overlaps_quote(sentence.span)
+                && self
+                    .value(sentence.span)
+                    .is_some_and(|sentence| sentence.eq_ignore_ascii_case(value))
+        });
+        let sentence = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(
+            sentence
+                .tokens
+                .iter()
+                .map(|token| token.lower.clone())
+                .collect(),
+        )
+    }
+
+    fn authority_span(&self, mut span: Span) -> Span {
+        while let Some((relative, character)) = self
+            .source
+            .get(span.start..span.end)
+            .and_then(|value| value.char_indices().next_back())
+        {
+            let start = span.start.saturating_add(relative);
+            if !semantic_unit_delimiter(character) || self.quoted.overlaps(start, span.end) {
+                break;
+            }
+            span.end = start;
+        }
+        span
     }
 
     pub(super) fn overlaps_quote(&self, span: Span) -> bool {
@@ -459,13 +506,6 @@ fn continues_shared_negative_alternative(tokens: &[Token]) -> bool {
         }
         _ => false,
     }
-}
-
-fn sentence_delimiter(character: char) -> bool {
-    matches!(
-        character,
-        '.' | '!' | '?' | ';' | '\n' | '。' | '！' | '？' | '；'
-    )
 }
 
 fn push_trimmed_sentence_span(

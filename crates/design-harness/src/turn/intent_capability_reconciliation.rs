@@ -1,13 +1,17 @@
 mod classification;
 mod control_restatement;
+mod managed_recipe;
 mod syntax;
 
 use std::collections::BTreeSet;
 
 use self::classification::{
-    closed_fields_or_preservation_own, custom_automation_owns, external_requirement_spans,
-    has_external_marker, runtime_business_spans,
+    closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
+    custom_automation_owns, external_requirement_spans, has_external_marker,
+    runtime_business_spans,
 };
+use self::managed_recipe::managed_recipe_restatement_owns;
+pub(super) use self::managed_recipe::ManagedRecipeCoreContext;
 use self::syntax::{SourceSyntaxError, SourceText};
 use super::intent_capability_grounding::{
     ground_unmapped_capability_evidence, CapabilityEvidenceGroundingError,
@@ -38,10 +42,27 @@ pub(super) enum CapabilityReconciliationError {
     UnbalancedQuote,
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_unmapped_capabilities(
     canonical_human: &str,
     automation_kind: IntentAutomationKindV2,
     runtime: &RuntimeRequirementsV2,
+    candidates: Vec<String>,
+) -> Result<Vec<String>, CapabilityReconciliationError> {
+    reconcile_unmapped_capabilities_with_context(
+        canonical_human,
+        automation_kind,
+        runtime,
+        None,
+        candidates,
+    )
+}
+
+pub(super) fn reconcile_unmapped_capabilities_with_context(
+    canonical_human: &str,
+    automation_kind: IntentAutomationKindV2,
+    runtime: &RuntimeRequirementsV2,
+    managed_context: Option<&ManagedRecipeCoreContext<'_>>,
     candidates: Vec<String>,
 ) -> Result<Vec<String>, CapabilityReconciliationError> {
     let source = SourceText::analyze(canonical_human).map_err(|error| match error {
@@ -63,11 +84,6 @@ pub(super) fn reconcile_unmapped_capabilities(
                         external_candidate.get_or_insert(candidate_index);
                         continue;
                     }
-                    if custom_automation_owns(&source, automation_kind, &value)
-                        || closed_fields_or_preservation_own(&source, &value, runtime)
-                    {
-                        continue;
-                    }
                     if !source.has_asserted_occurrence(&value) {
                         if source.has_only_proven_irrelevant_occurrences(&value) {
                             continue;
@@ -76,6 +92,15 @@ pub(super) fn reconcile_unmapped_capabilities(
                             candidate_index,
                             reason: CapabilityEvidenceGroundingError::Ungrounded,
                         });
+                    }
+                    if custom_automation_owns(&source, automation_kind, &value)
+                        || closed_route_selection_restatement_owns(&source, automation_kind, &value)
+                        || closed_fields_or_preservation_own(&source, &value, runtime)
+                        || managed_context.is_some_and(|context| {
+                            managed_recipe_restatement_owns(&source, context, &value)
+                        })
+                    {
+                        continue;
                     }
                     insert_checked(&mut reconciled, value)?;
                 }

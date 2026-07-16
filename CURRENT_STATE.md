@@ -79,8 +79,9 @@ bounded Gemma Core extraction for default, discussion, fallback, gap, and
 rejection paths. The active Core wire has no model-authored objective or safety,
 runtime, and recipe-detail authority. Deterministic current-human grounding owns
 request mode, direct-preview intent, live-mutation and gate-bypass safety roles,
-secret-disclosure roles, closed runtime requirements, mandatory-control
-restatements, and selected detail facets before adjudication. A successful
+secret-disclosure roles, locale, room-close authorization, closed runtime
+requirements, mandatory-control restatements, and selected detail facets before
+adjudication. A successful
 private-study-room request with explicit copy, naming, or controls customization
 uses exactly one additional isolated detail extraction, for two model calls and
 two model tool calls total. For the `starring.private_study_room@1` capability,
@@ -256,7 +257,8 @@ Stated as capabilities (durable across the phase numbering):
 - Bounded Gemma Intent frontiers with strict `gemma4:12b-mlx` and 16,384-token
   benchmark pinning: default paths use one call, while an explicit private-room
   detail path uses exactly two calls. Human-grounded request mode, safety,
-  runtime, mandatory-control, capability, and detail semantics; dynamic facet
+  locale, room-close authorization, runtime, mandatory-control, capability, and
+  detail semantics; dynamic facet
   routing; an isolated flat detail wire; slot-specific exact current-turn
   literal grounding; fail-closed parsing; binding-aware atomic candidates;
   exact recipe simulation; durable SQLite generation CAS; and resumable pending

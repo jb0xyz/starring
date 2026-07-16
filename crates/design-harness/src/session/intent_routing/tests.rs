@@ -10,7 +10,7 @@ use crate::intent::{
     PreparedIntentWorkspaceV2, RecipeKindV1,
 };
 use crate::llm::{LlmError, LlmResponse};
-use crate::turn::parse_interpret_intent_core;
+use crate::turn::parse_interpret_intent_core_compatibility;
 use crate::{dispatch_tool, BurstOutcome, LlmClient, Message, ToolCall, ToolDefinition, TurnPhase};
 
 use super::adjudicate::{adjudicate_intent_core_v4, IntentCoreAdjudicationV4};
@@ -87,6 +87,7 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "semantics come only from the latest INTENT_HUMAN",
         "use exact enums and fill every field",
         "Always include other_unmapped_required_capabilities, using [] if empty",
+        "The harness derives language and close authorization directly from INTENT_HUMAN",
         "request_mode=build when automation is requested and request_mode=discussion only when no build is requested",
         "requested_outcome=validated_preview only if requested, otherwise working_draft",
         "Discussion: requested_outcome=discussion and a complete natural response of 2-4 sentences within 480 UTF-16 units",
@@ -101,6 +102,7 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "Runtime infrastructure owns only infrastructure",
         "Mandatory validation, preview, and user approval controls are harness-owned",
         "never emit a restatement that they remain enforced as an unmapped capability",
+        "Instructions about the design conversation and statements used only to distinguish the selected automation kind are not capabilities the Discord automation executes or enforces",
         "Copy each value verbatim as one shortest complete contiguous INTENT_HUMAN subject-predicate span",
         "source article, quantifier, or relative word like that",
         "Never alter words or order, or reduce an action to a noun fragment",
@@ -427,7 +429,9 @@ fn restore_rejects_fully_rehashed_initial_channel_erased_to_awaiting() {
             .initial_human_turn_digest()
             .unwrap()
             .to_string();
-        let core = parse_interpret_intent_core(&private_room_value(0, None).to_string()).unwrap();
+        let core =
+            parse_interpret_intent_core_compatibility(&private_room_value(0, None).to_string())
+                .unwrap();
         let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) =
             adjudicate_intent_core_v4(core, &request_evidence_head).unwrap()
         else {
@@ -3740,10 +3744,10 @@ fn restore_replays_article_repair_and_meta_filter_before_semantic_identity() {
 
         let mut prerelease_value = serde_json::to_value(snapshot.clone()).unwrap();
         prerelease_value["intent_recipe"]["stage"]["recipe_evidence"]["registry_digest"] =
-            json!("507e0f302b15c70370447759dd2a7bad3fc77722241925d66f35bf7b1a8d91b6");
+            json!("c332cc4e248b7fe1cd00eb1b2a551a718f781cb11d0919ba9d211e3e83536dd1");
         prerelease_value["intent_recipe"]["stage"]["recipe_evidence"]
             ["selected_descriptor_digest"] =
-            json!("326c1923864ec079f31895a5bc4a675a5508855fd1db29887767ba3540090ea3");
+            json!("6b100b23f1112e57346dbea3870e45dc212e6ddb9bcad281f0e1240e9c5b02c2");
         let prerelease_snapshot = serde_json::from_value(prerelease_value).unwrap();
         let prerelease_error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
@@ -3770,7 +3774,7 @@ fn restore_replays_article_repair_and_meta_filter_before_semantic_identity() {
 }
 
 #[test]
-fn restore_rejects_semantically_tampered_core_arguments() {
+fn restore_recomputes_non_authoritative_model_axes_and_rejects_authoritative_tampering() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
@@ -3783,8 +3787,9 @@ fn restore_rejects_semantically_tampered_core_arguments() {
                 .await,
             BurstOutcome::Ready { .. }
         ));
-        let mut snapshot = session.snapshot();
-        let call = snapshot
+        let snapshot = session.snapshot();
+        let mut non_authoritative = snapshot.clone();
+        let call = non_authoritative
             .messages
             .iter_mut()
             .flat_map(|message| &mut message.tool_calls)
@@ -3792,21 +3797,44 @@ fn restore_rejects_semantically_tampered_core_arguments() {
             .unwrap();
         let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
         arguments["language"] = json!("ko");
+        arguments["close_policy"] = json!("creator_only");
         call.arguments = arguments.to_string();
-        refresh_transcript_integrity(&mut snapshot);
+        refresh_transcript_integrity(&mut non_authoritative);
+
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            non_authoritative,
+            resource_bindings.clone(),
+        )
+        .unwrap();
+        assert_eq!(receipt(&restored), receipt(&session));
+
+        let mut authoritative = snapshot;
+        let call = authoritative
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.tool_calls)
+            .find(|call| call.name == "interpret_intent_core")
+            .unwrap();
+        let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        arguments["automation_kind"] = json!("custom_automation");
+        call.arguments = arguments.to_string();
+        refresh_transcript_integrity(&mut authoritative);
 
         let error = match DesignSession::restore_intent_recipe(
             ScriptedClient::new(Vec::new()),
             SessionConfig::default(),
-            snapshot,
+            authoritative,
             resource_bindings,
         ) {
             Err(error) => error,
             Ok(_) => panic!("tampered Core arguments restored"),
         };
-        assert!(error
-            .to_string()
-            .contains("does not reproduce from the initial Core arguments"));
+        assert!(
+            error.to_string().contains("invalid transcript binding"),
+            "{error}"
+        );
     });
 }
 

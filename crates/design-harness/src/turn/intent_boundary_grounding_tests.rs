@@ -31,6 +31,96 @@ fn grounds_secret_disclosure_and_immediate_deployment() {
 }
 
 #[test]
+fn grounds_live_coreference_from_a_discord_resource_disclosure() {
+    for human in [
+        "Put the API token value into a public Discord panel, and deploy it immediately.",
+        "Put the API token value into a public Discord panel. Deploy it immediately.",
+        "Put the API token value into a public Discord panel, and publish it immediately.",
+        "Put the API token value into a public panel on Discord, and deploy it immediately.",
+        "Put the API token value into a public Discord bot panel, and deploy that immediately.",
+        "Put the API token value into a public Discord panel, and deploy the panel immediately.",
+    ] {
+        assert_eq!(
+            ground_safety_boundary_requests(human),
+            vec![
+                IntentBoundaryRequestV2::DirectLiveMutation,
+                IntentBoundaryRequestV2::SecretDisclosure,
+            ],
+            "live deployment coreference was not grounded for {human}"
+        );
+    }
+}
+
+#[test]
+fn live_coreference_requires_an_asserted_mutable_discord_resource() {
+    for human in [
+        "Put the API token value into a public web panel, and deploy it immediately.",
+        "Put the API token value into a public Discord panel design, and deploy it immediately.",
+        "Put the API token value into public Discord panel documentation. Deploy it immediately.",
+        "Design a public Discord panel that contains the API token value. Deploy it immediately.",
+        "Document a public Discord panel that contains the API token value. Deploy it immediately.",
+        "Put the API token value into a public Discord panel, or deploy it immediately.",
+        "Put the API token value into a public Discord panel, and do not deploy it immediately.",
+        "Put the API token value into a public Discord panel, and deploy the documentation immediately.",
+    ] {
+        assert_eq!(
+            ground_safety_boundary_requests(human),
+            vec![IntentBoundaryRequestV2::SecretDisclosure],
+            "non-operational coreference became a live mutation for {human}"
+        );
+    }
+}
+
+#[test]
+fn live_resource_pronouns_preserve_operational_antecedents() {
+    for human in [
+        "Use the production server. Deploy it immediately.",
+        "Target live Discord, and then deploy it immediately.",
+        "Open the production server. Publish it now.",
+        "Connect to live Discord. Apply it immediately.",
+        "Read the production server. Deploy it immediately.",
+        "Use Discord. Deploy it immediately.",
+    ] {
+        assert_eq!(
+            ground_safety_boundary_requests(human),
+            vec![IntentBoundaryRequestV2::DirectLiveMutation],
+            "an operational live antecedent was blocked for {human}"
+        );
+    }
+}
+
+#[test]
+fn discord_resource_names_do_not_become_descriptive_documents() {
+    for human in [
+        "Put the welcome panel into a public Discord status channel, and deploy it immediately.",
+        "Put the welcome panel into a public Discord report channel. Publish it now.",
+        "Put the welcome panel into a public Discord guide panel, and deploy that immediately.",
+    ] {
+        assert_eq!(
+            ground_safety_boundary_requests(human),
+            vec![IntentBoundaryRequestV2::DirectLiveMutation],
+            "a mutable Discord resource name was treated as documentation for {human}"
+        );
+    }
+}
+
+#[test]
+fn live_resource_pronouns_block_explicit_descriptive_antecedents() {
+    for human in [
+        "Read the production server report. Deploy it immediately.",
+        "Review documentation for a live Discord channel. Publish it now.",
+        "Prepare a production server status. Deploy it immediately.",
+        "Design a public Discord panel. Deploy it immediately.",
+        "Discuss the live Discord channel. Publish it now.",
+    ] {
+        assert!(
+            ground_safety_boundary_requests(human).is_empty(),
+            "an explicitly descriptive live antecedent became operational for {human}"
+        );
+    }
+}
+
+#[test]
 fn grounds_closed_third_person_live_and_secret_actions_without_inverting_negation() {
     for human in [
         "The bot deploys to the live server now.",

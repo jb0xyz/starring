@@ -50,6 +50,9 @@ pub(super) use action_polarity::{prefix_negates_action, suffix_negates_action};
 pub(super) use gate_control::closed_gate_control_weakening;
 #[allow(unused_imports)]
 pub(super) use live_scope::{contains_any, live_weak_context};
+pub(super) use live_scope::{
+    live_resource_antecedent, live_resource_pronoun_continuation, LiveResourceAntecedent,
+};
 pub(super) use secret_disclosure::{
     secret_target_is_locally_safe, starts_with_secret_target_object,
 };

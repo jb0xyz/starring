@@ -1,11 +1,13 @@
 use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
-    reconcile_unmapped_capabilities, CapabilityReconciliationError,
+    reconcile_unmapped_capabilities, reconcile_unmapped_capabilities_with_context,
+    CapabilityReconciliationError, ManagedRecipeCoreContext,
 };
 use super::{
-    EconomyRequirementV2, IntentAutomationKindV2, PersistenceRequirementV2, RuntimeRequirementsV2,
-    TimerRequirementV2,
+    CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentLocaleHintV2,
+    PersistenceRequirementV2, RuntimeRequirementsV2, TimerRequirementV2,
 };
+use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 
 fn no_runtime() -> RuntimeRequirementsV2 {
     RuntimeRequirementsV2 {
@@ -45,6 +47,187 @@ fn custom_modal_and_private_submission_response_are_owned() {
         .unwrap(),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn terminal_sentence_delimiters_preserve_authority_without_changing_evidence() {
+    for delimiter in [".", "!", "?", "。", "！", "？", ";", "；", "\n", "\r"] {
+        let candidate = format!("Every message earns XP{delimiter}");
+        let human = format!("{candidate} Build the game.");
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                &human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                vec![candidate.clone()],
+            )
+            .unwrap_or_else(|error| panic!("{delimiter:?}: {error:?}")),
+            vec![candidate.clone()],
+            "terminal delimiter changed authority for {delimiter:?}"
+        );
+    }
+}
+
+#[test]
+fn managed_recipe_owns_only_exact_base_hub_and_outcome_restatements() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let validated = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    for candidate in [
+        "Build a managed private study-room automation in community_hub and prepare its validated preview.",
+        "Build a managed private study room automation in community_hub and prepare its validated preview.",
+        "Build a managed private study room in community_hub and prepare its validated preview.",
+    ] {
+        assert!(reconcile_unmapped_capabilities_with_context(
+            candidate,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            Some(&validated),
+            strings(&[candidate]),
+        )
+        .unwrap()
+        .is_empty(), "exact managed restatement remained for {candidate}");
+    }
+
+    let working = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::WorkingDraft,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    let candidate = "Build a managed private study room in community_hub.";
+    assert!(reconcile_unmapped_capabilities_with_context(
+        candidate,
+        IntentAutomationKindV2::ManagedPrivateStudyRoom,
+        &no_runtime(),
+        Some(&working),
+        strings(&[candidate]),
+    )
+    .unwrap()
+    .is_empty());
+}
+
+#[test]
+fn managed_recipe_base_ownership_never_swallows_behavior_or_context_mismatch() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let context = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    for candidate in [
+        "Build a managed private study-room automation in community_hub and prepare its validated preview and archive every transcript.",
+        "Build a managed private study-room automation in other_hub and prepare its validated preview.",
+        "Build a managed private study-room automation in community_hub.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities_with_context(
+                candidate,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&context),
+                strings(&[candidate]),
+            )
+            .unwrap(),
+            strings(&[candidate]),
+            "context mismatch or added behavior was consumed for {candidate}"
+        );
+    }
+}
+
+#[test]
+fn terminal_delimiter_normalization_never_promotes_irrelevant_or_cross_sentence_text() {
+    assert!(reconcile_unmapped_capabilities(
+        "What if every message earns XP? Build the game.",
+        IntentAutomationKindV2::CustomAutomation,
+        &no_runtime(),
+        strings(&["every message earns XP?"]),
+    )
+    .unwrap()
+    .is_empty());
+
+    assert!(reconcile_unmapped_capabilities(
+        "Post the message 'Every message earns XP.' when clicked.",
+        IntentAutomationKindV2::CustomAutomation,
+        &no_runtime(),
+        strings(&["Every message earns XP."]),
+    )
+    .unwrap()
+    .is_empty());
+
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            "What if timers advance quests? Build a game.",
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&["timers advance quests? Build a game"]),
+        )
+        .unwrap_err(),
+        CapabilityReconciliationError::Grounding {
+            candidate_index: 0,
+            reason: CapabilityEvidenceGroundingError::Ungrounded,
+        }
+    );
+}
+
+#[test]
+fn route_selection_restatement_is_owned_only_by_the_selected_custom_route() {
+    let human = "I want this designed now, but it is not a study-room feature.";
+    let candidate = "it is not a study-room feature.";
+    assert!(reconcile_unmapped_capabilities(
+        human,
+        IntentAutomationKindV2::CustomAutomation,
+        &no_runtime(),
+        strings(&[candidate]),
+    )
+    .unwrap()
+    .is_empty());
+
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            strings(&[candidate]),
+        )
+        .unwrap(),
+        strings(&[candidate])
+    );
+}
+
+#[test]
+fn route_selection_restatement_never_consumes_business_behavior() {
+    for candidate in [
+        "The panel posts that it is not a study-room feature",
+        "it is not a study-room feature and it archives the thread",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                candidate,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap(),
+            strings(&[candidate]),
+            "business behavior was consumed for {candidate}"
+        );
+    }
+
+    let candidate = "it is not a study-room feature";
+    assert!(reconcile_unmapped_capabilities(
+        "Post the message 'it is not a study-room feature' when clicked.",
+        IntentAutomationKindV2::CustomAutomation,
+        &no_runtime(),
+        strings(&[candidate]),
+    )
+    .unwrap()
+    .is_empty());
 }
 
 #[test]

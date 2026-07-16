@@ -122,6 +122,17 @@ pub(super) fn custom_automation_owns(
     button_opens_modal || modal_submission_response
 }
 
+pub(super) fn closed_route_selection_restatement_owns(
+    source: &SourceText<'_>,
+    automation_kind: IntentAutomationKindV2,
+    value: &str,
+) -> bool {
+    automation_kind == IntentAutomationKindV2::CustomAutomation
+        && source
+            .unique_complete_asserted_clause_tokens(value)
+            .is_some_and(|words| words == ["it", "is", "not", "a", "study-room", "feature"])
+}
+
 pub(super) fn closed_fields_or_preservation_own(
     source: &SourceText<'_>,
     value: &str,

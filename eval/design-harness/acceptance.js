@@ -10,6 +10,7 @@ const { parseReport } = require('./intent-assertions');
 
 const REQUIRED_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_private_study_room_en_paraphrase',
   'intent_normalizer_same_target_hold',
   'intent_normalizer_korean_compound_discussion',
   'intent_normalizer_multi_sentence_metalinguistic_copy',
@@ -37,6 +38,7 @@ const REQUIRED_CASE_IDS = Object.freeze([
 ]);
 const KNOWN_RECIPE_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_private_study_room_en_paraphrase',
   'intent_normalizer_validated_preview_disambiguation',
   'intent_normalizer_discussion_restart_then_build',
   'intent_private_study_room_missing_hub',
@@ -48,6 +50,7 @@ const KNOWN_RECIPE_CASE_IDS = Object.freeze([
 ]);
 const EQUIVALENT_ENGLISH_CASE_IDS = Object.freeze([
   'intent_private_study_room_en',
+  'intent_private_study_room_en_paraphrase',
   'intent_normalizer_validated_preview_disambiguation',
   'intent_normalizer_discussion_restart_then_build',
   'intent_private_study_room_missing_hub',
@@ -68,9 +71,10 @@ const DISTINCT_RECIPE_GROUPS = Object.freeze({
 });
 const FINAL_ROUTE_CLASS_BY_CASE = Object.freeze({
   intent_private_study_room_en: 'private_study_room_default',
-  intent_normalizer_same_target_hold: 'discussion_en',
-  intent_normalizer_korean_compound_discussion: 'discussion_ko',
-  intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion_en',
+  intent_private_study_room_en_paraphrase: 'private_study_room_default',
+  intent_normalizer_same_target_hold: 'discussion_unspecified',
+  intent_normalizer_korean_compound_discussion: 'discussion_unspecified',
+  intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion_unspecified',
   intent_normalizer_validated_preview_disambiguation: 'private_study_room_default',
   intent_normalizer_discussion_restart_then_build: 'private_study_room_default',
   intent_private_study_room_mutation_hub: 'intent_private_study_room_mutation_hub',
@@ -608,7 +612,7 @@ function decisionIdentityClassMatrix(entries) {
       observations.push({
         classes: {
           request: prefix ? 'brainstorming_sequence' : finalEvidenceClass,
-          route: prefix ? 'discussion_en' : finalRouteClass,
+          route: prefix ? 'discussion_unspecified' : finalRouteClass,
           adjudication: prefix ? 'brainstorming_sequence' : finalEvidenceClass,
         },
         decision: entry.report.turns[index].route_decision,

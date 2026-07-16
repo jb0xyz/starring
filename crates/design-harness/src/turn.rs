@@ -48,6 +48,8 @@ pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
 };
 #[cfg(test)]
+pub(crate) use intent_core::parse_interpret_intent_core_compatibility;
+#[cfg(test)]
 pub(crate) use intent_core::parse_interpret_intent_core_for_human;
 pub(crate) use intent_core::parse_interpret_intent_core_for_serving;
 pub(crate) use intent_core::validate_intent_human_grounding_size;

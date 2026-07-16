@@ -1,3 +1,4 @@
+use super::closed_axes::{closed_axis_semantic_authority, ClosedAxesAccumulator};
 use super::directives::{request_directive, HoldDirective, RequestDirective};
 use super::lexical::strip_repeated_prefixes;
 use super::patterns::{
@@ -18,6 +19,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             mode: None,
             preview: None,
             active_semantic_units: None,
+            closed_axes: ClosedAxesAccumulator::default().finish(),
         };
     };
     let mut mode = None;
@@ -25,6 +27,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
     let mut preview = None;
     let mut copied_block = false;
     let mut active_semantic_units = Vec::new();
+    let mut closed_axes = ClosedAxesAccumulator::default();
     for sentence in &grounding.sentences {
         let mut question_build_scope = false;
         let mut non_authoritative_scope = false;
@@ -33,6 +36,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         let mut ui_copy_scope = false;
         for (index, unit) in sentence.iter().enumerate() {
             if copied_block {
+                closed_axes.break_ephemeral_scope();
                 non_authoritative_scope = false;
                 conditional_scope = false;
                 runtime_negation_scope = false;
@@ -48,6 +52,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 continue;
             }
             if metalinguistic_carrier(&unit.text) {
+                closed_axes.break_ephemeral_scope();
                 copied_block = true;
                 non_authoritative_scope = false;
                 conditional_scope = false;
@@ -56,6 +61,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 continue;
             }
             if ui_copy_scope {
+                closed_axes.break_ephemeral_scope();
                 active_semantic_units.push(GroundedSemanticUnit {
                     text: unit.text.clone(),
                     authoritative: false,
@@ -66,6 +72,10 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             }
             let continuation = sentence
                 .get(index.saturating_add(1))
+                .map(|unit| unit.text.as_str());
+            let alternative_continuation = sentence
+                .get(index.saturating_add(1))
+                .filter(|unit| unit.link == UnquotedGroundingLink::Alternative)
                 .map(|unit| unit.text.as_str());
             if unit.link == UnquotedGroundingLink::Detached {
                 non_authoritative_scope = false;
@@ -142,6 +152,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             let authoritative = authoritative && !non_authoritative_scope && active.is_some();
             let mut text = active.unwrap_or_else(|| unit.text.clone());
             if authoritative {
+                closed_axes.observe(&text, unit.link, continuation, alternative_continuation);
                 if unit.link == UnquotedGroundingLink::Detached
                     || starts_positive_runtime_scope(&text)
                 {
@@ -158,6 +169,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                     text = format!("do not use {text}");
                 }
             } else {
+                closed_axes.break_ephemeral_scope();
                 runtime_negation_scope = false;
                 question_build_scope = false;
             }
@@ -171,11 +183,13 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 ui_copy_scope = true;
             }
         }
+        closed_axes.end_semantic_sentence();
     }
     GroundedRequestControls {
         mode,
         preview,
         active_semantic_units: Some(active_semantic_units),
+        closed_axes: closed_axes.finish(),
     }
 }
 
@@ -336,12 +350,20 @@ fn has_authoritative_scope_wrapper(unit: &str) -> bool {
         if let Some(tail) = [
             "actually, ",
             "actually ",
+            "correction: ",
+            "correction ",
             "definitely ",
             "instead ",
+            "no, ",
+            "no ",
             "now, ",
             "now ",
+            "아니, ",
+            "아니 ",
             "반드시 ",
             "이제 ",
+            "정정: ",
+            "정정 ",
         ]
         .iter()
         .find_map(|prefix| value.strip_prefix(prefix))
@@ -367,17 +389,25 @@ fn non_authoritative_semantic_unit(unit: &str) -> bool {
         &[
             "actually ",
             "actually, ",
+            "correction ",
+            "correction: ",
             "definitely ",
             "instead ",
+            "no ",
+            "no, ",
             "now ",
             "now, ",
             "please ",
             "please, ",
+            "아니 ",
+            "아니, ",
             "반드시 ",
             "이제 ",
+            "정정 ",
+            "정정: ",
         ],
     );
-    ENGLISH_METALINGUISTIC_PREDICATES
+    let explicit_scope = ENGLISH_METALINGUISTIC_PREDICATES
         .iter()
         .any(|predicate| semantic_unit.contains(predicate))
         || [
@@ -426,30 +456,39 @@ fn non_authoritative_semantic_unit(unit: &str) -> bool {
             "써도 됩니다",
         ]
         .iter()
-        .any(|suffix| semantic_unit.ends_with(suffix))
-        || [
-            " could be useful",
-            " could be used",
-            " may need ",
-            " may use ",
-            " may be useful",
-            " may be used",
-            " might need ",
-            " might use ",
-            " might be useful",
-            " might be required",
-            " can be used",
-            "쓸 수도",
-            "쓸 수도 있지만",
-            "사용할 수도",
-            "사용할 수도 있지만",
-            " may be required",
-            "필요할 수도",
-            "필요할 수도 있지만",
-        ]
-        .iter()
-        .any(|marker| semantic_unit.contains(marker))
+        .any(|suffix| semantic_unit.ends_with(suffix));
+    if explicit_scope {
+        return true;
+    }
+    let english_optional_expression = [
+        " could be useful",
+        " could be used",
+        " may need ",
+        " may use ",
+        " may be useful",
+        " may be used",
+        " might need ",
+        " might use ",
+        " might be useful",
+        " might be required",
+        " can be used",
+        " may be required",
+    ]
+    .iter()
+    .any(|marker| semantic_unit.contains(marker));
+    let korean_optional_expression = [
+        "쓸 수도",
+        "쓸 수도 있지만",
+        "사용할 수도",
+        "사용할 수도 있지만",
+        "필요할 수도",
+        "필요할 수도 있지만",
+    ]
+    .iter()
+    .any(|marker| semantic_unit.contains(marker));
+    korean_optional_expression
         || metalinguistic_runtime_comparison(semantic_unit)
+        || (english_optional_expression && !closed_axis_semantic_authority(semantic_unit))
 }
 
 fn conditional_non_authoritative_semantic_unit(unit: &str) -> bool {
@@ -458,14 +497,22 @@ fn conditional_non_authoritative_semantic_unit(unit: &str) -> bool {
         &[
             "actually ",
             "actually, ",
+            "correction ",
+            "correction: ",
             "definitely ",
             "instead ",
+            "no ",
+            "no, ",
             "now ",
             "now, ",
             "please ",
             "please, ",
+            "아니 ",
+            "아니, ",
             "반드시 ",
             "이제 ",
+            "정정 ",
+            "정정: ",
         ],
     );
     [
@@ -692,4 +739,33 @@ fn starts_positive_runtime_scope(unit: &str) -> bool {
     .iter()
     .any(|pattern| unit.starts_with(pattern));
     (action_first || subject_first) && !distributes_runtime_negation(unit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locale_alternative_branches_remain_authoritative() {
+        let controls = grounded_request_controls(
+            "Build a managed private study-room automation. Use English or 한국어 기본 문구하고 이름을 사용해.",
+        );
+        let units = controls.active_semantic_units.unwrap();
+        let locale_units = units
+            .iter()
+            .filter(|unit| unit.text.contains("english") || unit.text.contains("한국어"))
+            .collect::<Vec<_>>();
+        assert_eq!(locale_units.len(), 2);
+        assert_eq!(locale_units[0].text, "use english");
+        assert_eq!(locale_units[1].text, "한국어 기본 문구");
+        assert!(locale_units.iter().all(|unit| unit.authoritative));
+        assert!(matches!(
+            locale_units[1].link,
+            UnquotedGroundingLink::Alternative
+        ));
+        assert_eq!(
+            controls.closed_axes.locale,
+            Err(super::super::closed_axes::ClosedAxisGroundingError::AmbiguousLocale)
+        );
+    }
 }

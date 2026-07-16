@@ -185,6 +185,26 @@ semantics before adjudication. Grounded build clears model discussion prose.
 Discussion presentation is non-authoritative, control-validated, capped at 480
 UTF-16 code units, and rejected rather than truncated when overlong.
 
+### Locale and close authorization
+
+The active Core schema no longer asks the model to author locale or room-close
+policy. Legacy transcript arguments may still carry both compatibility fields,
+but serving and restore replace them from the current human turn before
+normalization. Missing language becomes `unspecified`; missing close intent
+becomes `not_requested`. Direct English and Korean defaults, explicit disabled,
+any-member, and creator-only close forms are recognized. Quoted copy,
+hypotheticals, detectors, general ticket-closing behavior, negated locale use,
+non-exclusive creator mentions, alternatives, and conflicts cannot silently
+select these recipe axes. Correction and alternative authority survives only
+the immediately connected clause, and the scanner keeps constant state with
+linear measured work.
+
+The existing crate-root Core parser remains a one-argument structural
+compatibility boundary. It cannot establish serving semantics from
+model-authored hidden fields alone. Serving and replay use the crate-internal
+human-aware parser, which always replaces those fields from the current human
+turn before normalization.
+
 ### Safety boundaries
 
 Safety requests are derived from current-human language rather than accepted
@@ -270,9 +290,9 @@ not resent. Every eligible history turn is replayed once before context-fit
 trimming; failed or non-discussion results contribute no assistant prose.
 
 Snapshot schema 8 requires the exact V4 prompt, protocol 4, extractor revision
-12, normalizer revision 8, component identities, stage bindings, and a complete
+13, normalizer revision 9, component identities, stage bindings, and a complete
 transcript-integrity digest even for an Empty stage. V3 Intent snapshots and
-pre-release V4 extractor revisions through 11 or normalizer revisions through 7
+pre-release V4 extractor revisions through 12 or normalizer revisions through 8
 are rejected. V6 and V7 non-Intent snapshots may be promoted at the CLI edge;
 V6 or V7 snapshots containing Intent state are rejected.
 
@@ -294,8 +314,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         12
-Recipe normalizer revision         8
+Recipe extractor revision         13
+Recipe normalizer revision         9
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -311,7 +331,7 @@ OpenAI-compatible gateway           http://127.0.0.1:18080/v1
 The current recipe-registry digest pinned by the evaluator is:
 
 ```text
-c332cc4e248b7fe1cd00eb1b2a551a718f781cb11d0919ba9d211e3e83536dd1
+82016e79d8ce19904e010bc555b52394bcd033dc0813cabe184db32e05718fc8
 ```
 
 The gateway-reported model tag is checked exactly. It is not a weights digest.
@@ -402,13 +422,13 @@ before adding any further refactor and avoid over-decomposition.
 
 ## Evaluation contract and evidence boundary
 
-The V4 evaluator contains 25 fixed Intent cases covering English and Korean
-defaults; independent hub, locale, close, copy, naming, and control mutations;
-hub clarification and SQLite reopen; discussion then build; typed-planner
-classification; creator-only and stateful-runtime gaps; gate bypass and safe
-restatement distinctions; redaction; exact unknown capability; full custom and
-copy-only details; live mutation and secret disclosure; and request-grounding
-regressions.
+The V4 evaluator contains 26 fixed Intent cases covering English and Korean
+defaults; a pure single-turn English paraphrase; independent hub, locale, close,
+copy, naming, and control mutations; hub clarification and SQLite reopen;
+discussion then build; typed-planner classification; creator-only and
+stateful-runtime gaps; gate bypass and safe restatement distinctions; redaction;
+exact unknown capability; full custom and copy-only details; live mutation and
+secret disclosure; and request-grounding regressions.
 
 Acceptance requires exact model and context policy, clean committed source,
 matching source and binary identity, no cache, concurrency one, non-overlapping
