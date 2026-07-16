@@ -219,7 +219,7 @@ fn parse_harness_mode(
         };
     }
     match legacy_planned {
-        None => Ok(HarnessMode::Adaptive),
+        None => Ok(HarnessMode::IntentRecipe),
         Some(value) if value == "0" || value == "false" => Ok(HarnessMode::Adaptive),
         Some(value) if value == "1" || value == "true" => Ok(HarnessMode::TypedPlan),
         Some(_) => Err(ConfigError::InvalidPlannedMode),
@@ -515,13 +515,18 @@ mod tests {
     }
 
     #[test]
-    fn persistence_defaults_under_home_and_accepts_overrides() {
-        let defaults =
-            persistence_config_from(|name| (name == "HOME").then(|| "/home/tester".to_string()))
-                .unwrap();
+    fn persistence_defaults_to_intent_under_home_and_accepts_overrides() {
+        let defaults = persistence_config_from(|name| match name {
+            "HOME" => Some("/home/tester".to_string()),
+            "STARRING_HARNESS_BINDINGS_JSON" => Some(
+                r#"{"schema_version":1,"channel_bindings":[{"key":"hub","id":"700"}]}"#.to_string(),
+            ),
+            _ => None,
+        })
+        .unwrap();
         assert_eq!(defaults.session_id, "default");
-        assert_eq!(defaults.mode, HarnessMode::Adaptive);
-        assert!(defaults.bindings.is_none());
+        assert_eq!(defaults.mode, HarnessMode::IntentRecipe);
+        assert!(defaults.bindings.is_some());
         assert_eq!(
             defaults.db_path,
             std::path::Path::new("/home/tester/.local/share/starring/design-harness.sqlite3")
@@ -542,7 +547,9 @@ mod tests {
     #[test]
     fn persistence_rejects_empty_values_and_missing_home() {
         assert!(matches!(
-            persistence_config_from(|_| None),
+            persistence_config_from(|name| {
+                (name == "STARRING_HARNESS_MODE").then(|| "adaptive".to_string())
+            }),
             Err(ConfigError::MissingHomeForDefaultDatabasePath)
         ));
         assert!(matches!(
@@ -555,6 +562,7 @@ mod tests {
         ));
         assert!(matches!(
             persistence_config_from(|name| match name {
+                "STARRING_HARNESS_MODE" => Some("adaptive".to_string()),
                 "STARRING_HARNESS_DB_PATH" => Some(String::new()),
                 _ => None,
             }),
@@ -685,10 +693,17 @@ mod tests {
         assert!(matches!(
             persistence_config_from(|name| match name {
                 "STARRING_HARNESS_DB_PATH" => Some("/tmp/harness.db".to_string()),
+                "STARRING_HARNESS_MODE" => Some("adaptive".to_string()),
                 "STARRING_HARNESS_BINDINGS_JSON" => Some("{}".to_string()),
                 _ => None,
             }),
             Err(ConfigError::BindingsRequireIntentMode)
+        ));
+        assert!(matches!(
+            persistence_config_from(|name| {
+                (name == "STARRING_HARNESS_DB_PATH").then(|| "/tmp/harness.db".to_string())
+            }),
+            Err(ConfigError::MissingIntentBindings)
         ));
         assert!(matches!(
             persistence_config_from(|name| match name {
