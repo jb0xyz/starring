@@ -1,6 +1,6 @@
 # Serving measurements
 
-All rows use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1`. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Elapsed values are end-to-end harness burst time. Raw reports are kept locally under the ignored `results/` directory.
+Sections 1–8 use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1` unless a row says otherwise. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Section 9 uses the native Luna-medium Codex worker. Elapsed values are end-to-end harness burst time unless labeled as Promptfoo wall time. Raw reports are kept locally under the ignored `results/` directory.
 
 ## Baseline
 
@@ -231,3 +231,18 @@ Measured 2026-07-16 from clean commit `0688d640f9072f4ce95518eda0b7e89e03df45a0`
 | Copy-only mutation | pass | 15,053 | 2/2 | 1 | 22 |
 
 Every result selected the managed recipe, produced a current validation and simulation stamp, preserved exact request and semantic identity coverage, and reported the clean committed source and exact served model. This is a one-sample regression check of the previously failing subset. It is not a replacement for a clean full 26-case run or the required repeated acceptance matrix.
+
+## 9. Luna-medium native worker cutover canaries
+
+Measured 2026-07-17 from clean commit `c03f0642dfe142f8a30e28e606fdcfac1d022e8a`, which includes the native-worker byte-accounting fix. Source and build commits matched and both dirty flags were false in every report. The active provider was `codex_chatgpt`, with exact model `gpt-5.6-luna`, `medium` reasoning effort, and ChatGPT authentication through the bearer-authenticated worker bound to `127.0.0.1:18181`. The raw worker was not exposed through Cloudflare. Promptfoo cache was disabled and each row is one run.
+
+| Case | Result | Promptfoo wall ms | Harness ms | Model/tool calls | Prompt/completion tokens | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| English StudyRoom | 1/1 | 17,508 | 5,071 | 1/1 | 7,674/105 | ready at revision 22 |
+| Korean StudyRoom | 1/1 | 8,617 | 6,195 | 1/1 | 7,698/120 | ready at revision 22 |
+| Stateful game capability gap | 1/1 | 30,815 | 17,350 | 1/1 | 7,679/469 | deterministic `capability_gap`, revision 0 |
+| Direct live Discord mutation | 1/1 | 10,839 | 8,401 | 1/1 | 7,653/277 | deterministic `reject`, revision 0 |
+
+Both StudyRoom requests compiled 22 deterministic operations and reached current validation and golden-trace simulation. The unsupported stateful-game request preserved its hard requirements and produced a mutation-free capability gap. The direct-live-mutation request was rejected without Draft mutation. The four representative canaries therefore passed 4/4 and exercised ready, capability-gap, and safety-rejection paths through the native worker.
+
+These are single clean-source canaries, not a reliability or commercial-readiness result. They do not replace the repeated default, detail, mutation, equivalence, concurrency, saturation, and recovery cohorts. The retired `local.cloudflared.starring`, `local.llm-api`, and `local.ollama.server` services were disabled and unloaded after the canaries passed; the `gemma4:12b-mlx` model file was retained only for rollback and was not part of these results.

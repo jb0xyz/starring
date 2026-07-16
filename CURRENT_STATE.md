@@ -12,7 +12,7 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **30 crates and 5
+Discord with a natural-language frontend." A Rust workspace of **30 crates and 6
 tools**, PostgreSQL-backed at its durable runtime boundaries, organized into
 three layers. The defining safety principle is constant across all layers:
 
@@ -75,7 +75,7 @@ including RuleSet rollback and approval-bound activation, and is guarded by CI.
 The design-time authoring layer supports complete one-shot requests and bounded
 multi-turn conversation for the supported recipe: one hub-channel decision or
 a discussion followed by an explicit build turn. Intent protocol V4 uses one
-bounded Gemma Core extraction for default, discussion, fallback, gap, and
+bounded Luna-medium Core extraction for default, discussion, fallback, gap, and
 rejection paths. The active Core wire has no model-authored objective or safety,
 runtime, and recipe-detail authority. Deterministic current-human grounding owns
 request mode, direct-preview intent, live-mutation and gate-bypass safety roles,
@@ -113,11 +113,19 @@ compilation. Duplicate keys, cross-slot substitutions, stale-turn literals, and
 path or value drift fail closed without repair or Draft mutation.
 
 The layer currently exists as the pure `design-harness` crate and the
-SQLite/HTTP `design-harness-cli` edge. It is a CLI and evaluation checkpoint,
-not a production API or UI. The only implemented product recipe is the private
-study room recipe. Typed-planner fallback is classified but not yet handed off
-to an actual typed-planner session. No Layer 3 authoring path publishes or
-activates a design.
+SQLite/loopback-worker `design-harness-cli` edge. It is a CLI and evaluation
+checkpoint, not a production API or UI. The only implemented product recipe is
+the private study room recipe. Typed-planner fallback is classified but not yet
+handed off to an actual typed-planner session. No Layer 3 authoring path
+publishes or activates a design.
+
+The active authoring provider is `codex_chatgpt`, pinned to
+`gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
+CLI reaches it only through the bearer-authenticated worker bound to
+`127.0.0.1:18181`; that raw worker is not a Cloudflare origin. The retired
+`local.cloudflared.starring`, `local.llm-api`, and `local.ollama.server`
+services are disabled and unloaded. The `gemma4:12b-mlx` model file remains on
+disk only as rollback material.
 
 The current V4 implementation, evidence boundary, maintenance state, and ordered
 continuation plan are recorded in
@@ -128,7 +136,7 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-30 crates, 5 tools. The recurring pattern is **pure core + edge adapter**: pure
+30 crates, 6 tools. The recurring pattern is **pure core + edge adapter**: pure
 crates hold the domain and logic and are forbidden `sqlx`/`twilight`
 dependencies (guarded by `dependency_guard` tests); a paired `*-postgres`
 adapter (or the `automation-runtime` Twilight edge) provides persistence and
@@ -152,7 +160,8 @@ Discord I/O.
   `automation-instance-teardown`, `automation-panel-installation` + `-postgres`.
 - **Tools**: `interaction-smoke` (Layer 2 live runner + activation CLI),
   `executor-smoke`, `starring-demo`, `ai-eval`, `design-harness`
-  (Gemma/SQLite CLI and evaluation edge).
+  (Luna-medium/SQLite CLI and evaluation edge), and `codex-worker` (private
+  loopback ChatGPT-login Codex execution boundary).
 
 Persistence is six migrations under `/migrations` (instances, rulesets,
 instance-version pin, panel installations, deleting-status, activation-requests).
@@ -226,8 +235,9 @@ skips approval but keeps every technical safeguard.
   CAS, lease, partial-unique, and reconnect behavior. The V4 branch's focused
   library run contains 648 passing tests. After the responsibility splits, the
   full local workspace, clippy, formatting, JavaScript and Promptfoo static,
-  diff, dependency, comment, credential, and scope gates passed. GitHub CI and
-  live Gemma evaluation remain separate pending evidence.
+  diff, dependency, comment, credential, and scope gates passed. The initial
+  clean-source Luna cutover canaries passed 4/4; GitHub CI and the required
+  repeated Luna acceptance matrix remain separate evidence boundaries.
 - **Live certification**: manual runbooks (real bot, guild, PostgreSQL) prove the
   end-to-end lifecycle; they are never wired into CI.
 
@@ -254,8 +264,9 @@ Stated as capabilities (durable across the phase numbering):
   semantic-intent identities; domain-separated compiled-plan and
   candidate-RuleSet identities; Draft, stage, and complete-transcript bindings;
   and fail-closed V3 or pre-release-V4 snapshot handling.
-- Bounded Gemma Intent frontiers with strict `gemma4:12b-mlx` and 16,384-token
-  benchmark pinning: default paths use one call, while an explicit private-room
+- Bounded Luna-medium Intent frontiers with strict `codex_chatgpt`,
+  `gpt-5.6-luna`, `medium`, ChatGPT-auth, and declared 16,384-token evaluation
+  policy pinning: default paths use one call, while an explicit private-room
   detail path uses exactly two calls. Human-grounded request mode, safety,
   locale, room-close authorization, runtime, mandatory-control, capability, and
   detail semantics; dynamic facet
@@ -271,8 +282,9 @@ Stated as capabilities (durable across the phase numbering):
   include a 10/10 one-repetition baseline, 12/12 contrast results across three
   repetitions per case, 3/3 full custom-detail results, one copy-only pass, and
   a 14/14 clean-source post-refactor regression over the default and contrast
-  cases. They remain historical evidence only. The V4 clean-source live cohort
-  and its required repeats are pending.
+  cases. They remain historical evidence only. The initial V4 Luna cutover
+  canaries passed 4/4 from a clean source; the full cohort and required repeats
+  remain pending.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -295,8 +307,8 @@ Stated as capabilities (durable across the phase numbering):
   effect.
 - Provisioning-state persistence, compensation, reconciliation, and replay
   idempotency for partial external failures.
-- A clean-source V4 Gemma Intent acceptance result with the required repeated
-  default, detail, mutation, and equivalence cohorts.
+- A full clean-source V4 Luna-medium Intent acceptance result with the required
+  repeated default, detail, mutation, and equivalence cohorts.
 
 ## Known Limitations
 
@@ -318,14 +330,15 @@ Stated as capabilities (durable across the phase numbering):
 - V4 structurally removes the V3 identity defect in which three full-detail
   repetitions produced one RuleSet and one compiled-plan identity but two
   input-intent and semantic-intent hash variants. The deterministic identity
-  matrix is implemented, but no live V4 clean-source Promptfoo cohort has yet
-  shown repeat stability or latency on this branch. The V3 rows must not be
-  relabeled as V4 evidence.
+  matrix is implemented, and four clean-source Luna cutover canaries passed
+  once each. They do not establish repeat stability, concurrent behavior, or a
+  latency distribution. The V3 rows must not be relabeled as V4 evidence.
 - The V4 evaluator verifies structural consistency, routing, gates, identity
-  classes, exact configured literals, call counts, and latency assertions, but
-  its model check pins the exact gateway-reported tag rather than a weights or
-  server-configuration digest. The declared 16,384-token context is a benchmark
-  policy; the current gateway does not report its active context window.
+  classes, exact configured literals, call counts, and latency assertions. Its
+  serving check pins the worker-reported provider, model, reasoning effort, and
+  authentication mode, not a weights or remote backend-configuration digest.
+  The declared 16,384-token context remains an evaluation policy; the worker
+  does not attest the remote model's active context window.
 - Runtime actions are still prepared and executed one at a time. A later
   deterministic failure can leave an earlier Discord mutation behind.
 - V3 Intent snapshots are deliberately incompatible with V4. V6 and V7
@@ -341,8 +354,10 @@ Stated as capabilities (durable across the phase numbering):
 - The pure-crate dependency guard scans the direct manifest denylist rather than
   the resolved transitive graph. The current graph is safe, but the invariant
   enforcement should be strengthened before external release.
-- The operational model is fixed to `gemma4:12b-mlx`; other local model
-  artifacts may remain on disk but cannot be mixed into acceptance evidence.
+- The operational authoring model is fixed to `gpt-5.6-luna` at `medium`
+  reasoning through the private ChatGPT-auth Codex worker. The retained local
+  Gemma artifact is rollback material and cannot be mixed into Luna acceptance
+  evidence.
 
 ## Next Phase: Certify V4, Then Extend the Harness
 
@@ -352,11 +367,12 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Commit the V4 current-state and handoff documents. The completed
-   behavior-preserving responsibility splits and full local deterministic gates
-   are green; any later code change must rerun them before live evaluation.
+1. Preserve the completed Luna cutover as the serving baseline: keep the raw
+   worker loopback-only, retain exact provider/model/effort/auth pinning, and
+   rerun the full deterministic gates after every later code change.
 2. Run the V4 live evaluation in its fixed order against only
-   `gemma4:12b-mlx` with the declared 16,384-token policy: clean-source smoke;
+   `gpt-5.6-luna` at `medium` with the declared 16,384-token policy:
+   clean-source smoke;
    ten-repeat default, custom-full, and copy-only cohorts; three-repeat hub,
    locale, close, copy, naming, and control mutations; then one-shot,
    clarification, restart, discussion-build, and paraphrase equivalence. Record
@@ -370,8 +386,8 @@ The immediate sequence is:
    automation while preserving the same candidate gates and no-deploy boundary.
 6. Add an authenticated authoring API/UI, guild-binding authority, session
    ownership, and the existing approval/publication/activation integration.
-7. Measure queueing, concurrency, saturation, and recovery on the Gemma-only
-   Mac mini before setting a commercial SLO.
+7. Measure queueing, concurrency, saturation, and recovery through the
+   Luna-medium worker on the Mac mini before setting a commercial SLO.
 8. Add whole-plan deterministic preflight before the first side effect, then
    provisioning state, compensation, reconciliation, and replay idempotency for
    uncertain external effects.
