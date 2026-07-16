@@ -214,6 +214,7 @@ test("health is authenticated, exact, and loopback only", async () => {
     const health = await responseJson(fixture.base, "/health");
     assert.equal(health.status, 200);
     assert.deepEqual(sortedKeys(health.body), [
+      "accepted_requests_total",
       "active_requests",
       "auth_mode",
       "codex_cli_version",
@@ -226,6 +227,7 @@ test("health is authenticated, exact, and loopback only", async () => {
       "reasoning_effort",
       "request_timeout_ms",
       "schema_version",
+      "settled_requests_total",
       "status",
       "worker_source_sha256",
     ]);
@@ -244,6 +246,8 @@ test("health is authenticated, exact, and loopback only", async () => {
       request_timeout_ms: 55_000,
       active_requests: 0,
       queued_requests: 0,
+      accepted_requests_total: 0,
+      settled_requests_total: 0,
     });
   } finally {
     await fixture.cleanup();
@@ -291,6 +295,9 @@ test("request identity and sole frontier shape fail closed", async () => {
     });
     assert.equal(extraFrontier.status, 400);
     assert.equal(extraFrontier.body.error.code, "invalid_frontier");
+    const health = await responseJson(fixture.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 0);
+    assert.equal(health.body.settled_requests_total, 0);
   } finally {
     await fixture.cleanup();
   }
@@ -350,6 +357,11 @@ test("successful completion returns the exact native envelope", async () => {
     assert.equal(calls[0].model, MODEL);
     assert.equal(calls[0].reasoningEffort, REASONING_EFFORT);
     assert.deepEqual(calls[0].messages, completionRequest().messages);
+    const health = await responseJson(fixture.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 1);
+    assert.equal(health.body.settled_requests_total, 1);
+    assert.equal(health.body.active_requests, 0);
+    assert.equal(health.body.queued_requests, 0);
   } finally {
     await fixture.cleanup();
   }
@@ -397,11 +409,21 @@ test("bounded queue rejects overflow without retrying", async () => {
       body: completionRequest(),
     });
     await waitFor(() => fixture.worker.stats().active === 2);
+    const activeHealth = await responseJson(fixture.base, "/health");
+    assert.equal(activeHealth.body.accepted_requests_total, 2);
+    assert.equal(activeHealth.body.settled_requests_total, 0);
+    assert.equal(activeHealth.body.active_requests, 2);
+    assert.equal(activeHealth.body.queued_requests, 0);
     const third = responseJson(fixture.base, "/v1/frontier-completions", {
       method: "POST",
       body: completionRequest(),
     });
     await waitFor(() => fixture.worker.stats().queued === 1);
+    const queuedHealth = await responseJson(fixture.base, "/health");
+    assert.equal(queuedHealth.body.accepted_requests_total, 3);
+    assert.equal(queuedHealth.body.settled_requests_total, 0);
+    assert.equal(queuedHealth.body.active_requests, 2);
+    assert.equal(queuedHealth.body.queued_requests, 1);
     const overflow = await responseJson(fixture.base, "/v1/frontier-completions", {
       method: "POST",
       body: completionRequest(),
@@ -409,10 +431,20 @@ test("bounded queue rejects overflow without retrying", async () => {
     assert.equal(overflow.status, 429);
     assert.deepEqual(overflow.body, { error: { code: "queue_full" } });
     assert.equal(calls, 2);
+    const rejectedHealth = await responseJson(fixture.base, "/health");
+    assert.equal(rejectedHealth.body.accepted_requests_total, 4);
+    assert.equal(rejectedHealth.body.settled_requests_total, 1);
+    assert.equal(rejectedHealth.body.active_requests, 2);
+    assert.equal(rejectedHealth.body.queued_requests, 1);
     gate.resolve();
     const accepted = await Promise.all([first, second, third]);
     assert.deepEqual(accepted.map((entry) => entry.status), [200, 200, 200]);
     assert.equal(calls, 3);
+    const settledHealth = await responseJson(fixture.base, "/health");
+    assert.equal(settledHealth.body.accepted_requests_total, 4);
+    assert.equal(settledHealth.body.settled_requests_total, 4);
+    assert.equal(settledHealth.body.active_requests, 0);
+    assert.equal(settledHealth.body.queued_requests, 0);
   } finally {
     gate.resolve();
     await fixture.cleanup();
@@ -450,9 +482,17 @@ test("queued deadline removes stale work without calling the runner", async () =
     assert.deepEqual(expired.body, { error: { code: "codex_timeout" } });
     assert.equal(calls, 1);
     assert.deepEqual(fixture.worker.stats(), { active: 1, queued: 0 });
+    const staleHealth = await responseJson(fixture.base, "/health");
+    assert.equal(staleHealth.body.accepted_requests_total, 2);
+    assert.equal(staleHealth.body.settled_requests_total, 1);
+    assert.equal(staleHealth.body.active_requests, 1);
+    assert.equal(staleHealth.body.queued_requests, 0);
     gate.resolve();
     const firstResult = await first;
     assert.equal(firstResult.status, 504);
+    const settledHealth = await responseJson(fixture.base, "/health");
+    assert.equal(settledHealth.body.accepted_requests_total, 2);
+    assert.equal(settledHealth.body.settled_requests_total, 2);
   } finally {
     gate.resolve();
     await fixture.cleanup();
@@ -538,6 +578,11 @@ test("queued client disconnect removes work without calling the runner", async (
     await assert.rejects(queued);
     await waitFor(() => fixture.worker.stats().queued === 0);
     assert.equal(calls, 1);
+    const disconnectedHealth = await responseJson(fixture.base, "/health");
+    assert.equal(disconnectedHealth.body.accepted_requests_total, 2);
+    assert.equal(disconnectedHealth.body.settled_requests_total, 1);
+    assert.equal(disconnectedHealth.body.active_requests, 1);
+    assert.equal(disconnectedHealth.body.queued_requests, 0);
     gate.resolve();
     assert.equal((await first).status, 200);
   } finally {
@@ -578,6 +623,8 @@ test("active client disconnect aborts the runner and leaves the worker responsiv
     assert.equal(health.status, 200);
     assert.equal(health.body.active_requests, 0);
     assert.equal(health.body.queued_requests, 0);
+    assert.equal(health.body.accepted_requests_total, 1);
+    assert.equal(health.body.settled_requests_total, 1);
   } finally {
     await fixture.cleanup();
   }
@@ -599,6 +646,11 @@ test("timeout and runner failure map to bounded transport errors", async () => {
     });
     assert.equal(timeout.status, 504);
     assert.deepEqual(timeout.body, { error: { code: "codex_timeout" } });
+    const health = await responseJson(timed.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 1);
+    assert.equal(health.body.settled_requests_total, 1);
+    assert.equal(health.body.active_requests, 0);
+    assert.equal(health.body.queued_requests, 0);
   } finally {
     await timed.cleanup();
   }
@@ -617,6 +669,11 @@ test("timeout and runner failure map to bounded transport errors", async () => {
     });
     assert.equal(failure.status, 502);
     assert.deepEqual(failure.body, { error: { code: "runner_failure" } });
+    const health = await responseJson(failed.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 1);
+    assert.equal(health.body.settled_requests_total, 1);
+    assert.equal(health.body.active_requests, 0);
+    assert.equal(health.body.queued_requests, 0);
   } finally {
     await failed.cleanup();
   }

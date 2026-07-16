@@ -147,6 +147,45 @@ class Scheduler {
   }
 }
 
+class RequestCounters {
+  constructor() {
+    this.accepted = 0;
+    this.settled = 0;
+  }
+
+  submit(scheduler, task, signal) {
+    if (this.accepted === Number.MAX_SAFE_INTEGER) {
+      return Promise.reject(new WorkerError("request_counter_exhausted", 503));
+    }
+    this.accepted += 1;
+    let submitted;
+    try {
+      submitted = scheduler.submit(task, signal);
+    } catch (error) {
+      this.settled += 1;
+      throw error;
+    }
+    return Promise.resolve(submitted).finally(() => {
+      this.settled += 1;
+    });
+  }
+
+  snapshot(active, queued) {
+    if (!Number.isSafeInteger(this.accepted)
+      || !Number.isSafeInteger(this.settled)
+      || this.accepted < 0
+      || this.settled < 0
+      || this.settled > this.accepted
+      || this.accepted - this.settled !== active + queued) {
+      throw new WorkerError("invalid_request_counters", 500);
+    }
+    return {
+      accepted: this.accepted,
+      settled: this.settled,
+    };
+  }
+}
+
 function abortReason(signal) {
   return signal?.reason instanceof WorkerError
     ? signal.reason
@@ -419,6 +458,7 @@ export async function startWorker(options = {}) {
     worker_source_sha256: sourceSha256,
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
+  const counters = new RequestCounters();
   const logPath = options.metricsPath
     ?? process.env.STARRING_CODEX_WORKER_METRICS_LOG
     ?? join(homedir(), "Library", "Logs", "Starring", "codex-worker.jsonl");
@@ -433,6 +473,7 @@ export async function startWorker(options = {}) {
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
+      const counterSnapshot = counters.snapshot(scheduler.active, scheduler.queue.length);
       json(response, 200, healthEnvelope(
         identity,
         scheduler.active,
@@ -440,6 +481,8 @@ export async function startWorker(options = {}) {
         concurrency,
         maxQueue,
         timeoutMs,
+        counterSnapshot.accepted,
+        counterSnapshot.settled,
       ));
       return;
     }
@@ -459,7 +502,7 @@ export async function startWorker(options = {}) {
     const disconnect = watchDisconnect(request, response);
     try {
       const result = await withTimeout(
-        (signal) => scheduler.submit(() => runner.complete({
+        (signal) => counters.submit(scheduler, () => runner.complete({
           requestId,
           model: MODEL,
           reasoningEffort: REASONING_EFFORT,

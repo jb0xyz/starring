@@ -177,6 +177,8 @@ export function healthEnvelope(
   concurrencyLimit,
   queueCapacity,
   requestTimeoutMs,
+  acceptedRequestsTotal,
+  settledRequestsTotal,
 ) {
   return {
     schema_version: SCHEMA_VERSION,
@@ -193,6 +195,8 @@ export function healthEnvelope(
     request_timeout_ms: requestTimeoutMs,
     active_requests: active,
     queued_requests: queued,
+    accepted_requests_total: acceptedRequestsTotal,
+    settled_requests_total: settledRequestsTotal,
   };
 }
 
