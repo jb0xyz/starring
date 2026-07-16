@@ -1,12 +1,12 @@
 use serde_json::json;
 
-use super::model::{FeatureConfigurationV1, IntentValueSource, IntentWorkspaceV1};
-use super::normalize::PreparedIntentWorkspaceV1;
+use super::model::{FeatureConfigurationV1, IntentValueSource, IntentWorkspaceV2};
+use super::normalize::PreparedIntentWorkspaceV2;
 use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
 use super::{
-    ExistingChannelKey, IntentLocaleV1, IntentProposalOutcomeV1, IntentRequestedOutcome,
+    ExistingChannelKey, IntentLocaleV1, IntentProposalOutcomeV2, IntentRequestedOutcome,
     IntentResolutionContext, PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
-    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1,
+    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,
 };
 
 fn context() -> IntentResolutionContext {
@@ -16,9 +16,8 @@ fn context() -> IntentResolutionContext {
     ])
 }
 
-fn proposal(locale: IntentLocaleV1) -> PrivateStudyRoomProposalV1 {
-    PrivateStudyRoomProposalV1 {
-        objective: "  Create a private study room  ".to_string(),
+fn proposal(locale: IntentLocaleV1) -> PrivateStudyRoomProposalV2 {
+    PrivateStudyRoomProposalV2 {
         requested_outcome: IntentRequestedOutcome::ValidatedPreview,
         hub_channel: None,
         locale: Some(locale),
@@ -31,8 +30,8 @@ fn proposal(locale: IntentLocaleV1) -> PrivateStudyRoomProposalV1 {
     }
 }
 
-fn incomplete_workspace() -> IntentWorkspaceV1 {
-    let PreparedIntentWorkspaceV1::NeedsInput {
+fn incomplete_workspace() -> IntentWorkspaceV2 {
+    let PreparedIntentWorkspaceV2::NeedsInput {
         workspace,
         decisions,
     } = prepare_private_study_room(proposal(IntentLocaleV1::En), &context())
@@ -46,7 +45,7 @@ fn incomplete_workspace() -> IntentWorkspaceV1 {
 
 #[test]
 fn incomplete_preparation_preserves_normalized_resumable_state() {
-    let PreparedIntentWorkspaceV1::NeedsInput {
+    let PreparedIntentWorkspaceV2::NeedsInput {
         workspace,
         decisions,
     } = prepare_private_study_room(proposal(IntentLocaleV1::En), &context())
@@ -55,7 +54,7 @@ fn incomplete_preparation_preserves_normalized_resumable_state() {
         panic!("expected missing input");
     };
     assert_eq!(workspace.revision, 1);
-    assert_eq!(workspace.objective, "Create a private study room");
+    assert_eq!(workspace.schema_version, 2);
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].id, "private_study_room.hub_channel");
     assert_eq!(decisions[0].options, vec!["community", "study_hub"]);
@@ -82,7 +81,7 @@ fn incomplete_preparation_preserves_normalized_resumable_state() {
 #[test]
 fn existing_channel_decision_resumes_and_resolves_once() {
     let workspace = incomplete_workspace();
-    let PreparedIntentWorkspaceV1::Resolved { workspace, intent } =
+    let PreparedIntentWorkspaceV2::Resolved { workspace, intent } =
         apply_existing_channel_decision(
             &workspace,
             1,
@@ -149,13 +148,13 @@ fn unavailable_binding_fails_without_advancing_caller_workspace() {
 fn normalized_workspace_json_snapshot_roundtrip_resumes_identically() {
     let workspace = incomplete_workspace();
     let snapshot = serde_json::to_value(&workspace).expect("workspace should serialize");
-    let restored: IntentWorkspaceV1 =
+    let restored: IntentWorkspaceV2 =
         serde_json::from_value(snapshot.clone()).expect("workspace should restore");
     assert_eq!(
         serde_json::to_value(&restored).expect("restored workspace should serialize"),
         snapshot
     );
-    let PreparedIntentWorkspaceV1::Resolved {
+    let PreparedIntentWorkspaceV2::Resolved {
         workspace: resumed,
         intent,
     } = apply_existing_channel_decision(
@@ -176,7 +175,7 @@ fn normalized_workspace_json_snapshot_roundtrip_resumes_identically() {
 fn public_proposal_outcome_keeps_workspace_out_of_its_wire_shape() {
     let outcome = super::propose_private_study_room(proposal(IntentLocaleV1::En), &context())
         .expect("proposal should be accepted");
-    let IntentProposalOutcomeV1::NeedsInput {
+    let IntentProposalOutcomeV2::NeedsInput {
         revision,
         decisions,
     } = &outcome
@@ -194,7 +193,7 @@ fn public_proposal_outcome_keeps_workspace_out_of_its_wire_shape() {
 
 #[test]
 fn missing_channel_decision_uses_the_proposal_locale() {
-    let PreparedIntentWorkspaceV1::NeedsInput { decisions, .. } =
+    let PreparedIntentWorkspaceV2::NeedsInput { decisions, .. } =
         prepare_private_study_room(proposal(IntentLocaleV1::Ko), &context())
             .expect("proposal should prepare")
     else {

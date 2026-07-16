@@ -1,25 +1,33 @@
+use futures::executor::block_on;
+use resource_resolution::ResourceBindingMap;
 use serde_json::{json, Value};
 
+use crate::draft::Draft;
 use crate::intent::{
-    compile_intent, ExistingChannelKey, IntentCapabilityIdV2, IntentResolutionContext,
-    IntentSafetyBoundaryIdV2, PreparedIntentWorkspaceV1,
+    candidate_ruleset_hash, compile_intent, prepare_intent_candidate, ExistingChannelKey,
+    IntentCapabilityIdV2, IntentResolutionContext, IntentSafetyBoundaryIdV2,
+    PreparedIntentWorkspaceV2,
 };
 use crate::turn::{
-    parse_interpret_intent_core, parse_interpret_intent_turn, parse_private_study_room_details,
-    IntentRecipeDetailFacetV3,
+    parse_interpret_intent_core_compatibility, parse_interpret_intent_turn,
+    parse_private_study_room_details, IntentRecipeDetailFacetV3,
 };
 
 use super::adjudicate::{
-    adjudicate_intent_core_v3, adjudicate_intent_v2, IntentAdjudicationV2, IntentCoreAdjudicationV3,
+    adjudicate_intent_core_v4, adjudicate_intent_v2, IntentAdjudicationV2, IntentCoreAdjudicationV4,
 };
 use super::decision::{IntentRouteDecisionKindV2, IntentRouteDecisionV2};
+
+const REQUEST_EVIDENCE_HASH: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const SOURCE_HUMAN_TURN_DIGEST: &str =
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn core_value() -> Value {
     json!({
         "expected_revision": 0,
         "request_mode": "build",
         "automation_kind": "managed_private_study_room",
-        "objective": "Create private study rooms",
         "requested_outcome": "validated_preview",
         "hub_channel": "community_hub",
         "language": "en",
@@ -59,16 +67,23 @@ fn v2_value() -> Value {
     })
 }
 
-fn adjudicate_core(value: &Value) -> IntentCoreAdjudicationV3 {
-    let core = parse_interpret_intent_core(&value.to_string()).unwrap();
-    adjudicate_intent_core_v3(core).unwrap()
+fn adjudicate_core(value: &Value) -> IntentCoreAdjudicationV4 {
+    adjudicate_core_with_evidence(value, REQUEST_EVIDENCE_HASH)
+}
+
+fn adjudicate_core_with_evidence(
+    value: &Value,
+    request_evidence_hash: &str,
+) -> IntentCoreAdjudicationV4 {
+    let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
+    adjudicate_intent_core_v4(core, request_evidence_hash).unwrap()
 }
 
 fn core_decision(value: &Value) -> IntentRouteDecisionV2 {
     match adjudicate_core(value) {
-        IntentCoreAdjudicationV3::PrivateStudyRoom(selection) => selection.decision().clone(),
-        IntentCoreAdjudicationV3::TypedPlanner(permit) => permit.decision().clone(),
-        IntentCoreAdjudicationV3::Terminal(permit) => permit.decision().clone(),
+        IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
+        IntentCoreAdjudicationV4::TypedPlanner(permit) => permit.decision().clone(),
+        IntentCoreAdjudicationV4::Terminal(permit) => permit.decision().clone(),
     }
 }
 
@@ -78,15 +93,24 @@ fn context() -> IntentResolutionContext {
     )])
 }
 
+fn bindings() -> ResourceBindingMap {
+    let mut bindings = ResourceBindingMap::default();
+    bindings.channel_bindings.insert(
+        serde_json::from_value(json!("community_hub")).unwrap(),
+        "700".parse().unwrap(),
+    );
+    bindings
+}
+
 #[test]
-fn v3_default_path_reuses_the_existing_recipe_compiler() {
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&core_value())
+fn v4_default_path_reuses_the_existing_recipe_compiler() {
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudicate_core(&core_value())
     else {
         panic!("expected private study-room selection");
     };
     assert!(selection.detail_facets().is_empty());
     let permit = selection.finalize(None).unwrap();
-    let (_, PreparedIntentWorkspaceV1::Resolved { intent, .. }) =
+    let (_, PreparedIntentWorkspaceV2::Resolved { intent, .. }) =
         permit.prepare(&context()).unwrap()
     else {
         panic!("expected resolved recipe");
@@ -97,41 +121,109 @@ fn v3_default_path_reuses_the_existing_recipe_compiler() {
 }
 
 #[test]
-fn v2_and_v3_route_the_same_semantics_to_the_same_target() {
+fn v2_and_v4_route_the_same_semantics_to_the_same_target() {
     let interpretation = parse_interpret_intent_turn(&v2_value().to_string()).unwrap();
     let IntentAdjudicationV2::PrivateStudyRoom(v2) = adjudicate_intent_v2(interpretation).unwrap()
     else {
         panic!("expected V2 private study-room permit");
     };
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(v3) = adjudicate_core(&core_value()) else {
-        panic!("expected V3 private study-room selection");
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(v4) = adjudicate_core(&core_value()) else {
+        panic!("expected V4 private study-room selection");
     };
-    assert_eq!(v2.decision().kind(), v3.decision().kind());
-    assert_eq!(v2.decision().blockers(), v3.decision().blockers());
+    assert_eq!(v2.decision().kind(), v4.decision().kind());
+    assert_eq!(v2.decision().blockers(), v4.decision().blockers());
     assert_eq!(
         v2.decision().boundary_violations(),
-        v3.decision().boundary_violations()
+        v4.decision().boundary_violations()
     );
     assert_eq!(
         v2.decision().route_target().unwrap().recipe_id(),
-        v3.decision().route_target().unwrap().recipe_id()
+        v4.decision().route_target().unwrap().recipe_id()
     );
     assert_ne!(
         v2.decision().semantic_ir_digest(),
-        v3.decision().semantic_ir_digest()
+        v4.decision().semantic_ir_digest()
+    );
+    assert_eq!(
+        v4.decision().request_evidence_hash(),
+        Some(REQUEST_EVIDENCE_HASH)
     );
 }
 
 #[test]
-fn v3_digest_is_transport_independent_and_detail_sensitive() {
+fn pre_v4_legacy_equivalent_and_v4_emit_byte_identical_requirements_and_candidates() {
+    block_on(async {
+        let interpretation = parse_interpret_intent_turn(&v2_value().to_string()).unwrap();
+        let IntentAdjudicationV2::PrivateStudyRoom(legacy_permit) =
+            adjudicate_intent_v2(interpretation).unwrap()
+        else {
+            panic!("expected legacy private study-room permit");
+        };
+        let (_, PreparedIntentWorkspaceV2::Resolved { intent: legacy, .. }) =
+            legacy_permit.prepare(&context()).unwrap()
+        else {
+            panic!("expected resolved legacy recipe");
+        };
+        let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudicate_core(&core_value())
+        else {
+            panic!("expected V4 private study-room selection");
+        };
+        let (_, PreparedIntentWorkspaceV2::Resolved { intent: v4, .. }) = selection
+            .finalize(None)
+            .unwrap()
+            .prepare(&context())
+            .unwrap()
+        else {
+            panic!("expected resolved V4 recipe");
+        };
+
+        let legacy_compilation = compile_intent(&legacy).unwrap();
+        let v4_compilation = compile_intent(&v4).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy_compilation.requirements).unwrap(),
+            serde_json::to_vec(&v4_compilation.requirements).unwrap()
+        );
+        assert_eq!(
+            legacy_compilation.manifest.semantic_intent_hash,
+            v4_compilation.manifest.semantic_intent_hash
+        );
+        assert_eq!(
+            legacy_compilation.manifest.compiled_plan_hash,
+            v4_compilation.manifest.compiled_plan_hash
+        );
+
+        let root = Draft::new();
+        let bindings = bindings();
+        let legacy_candidate = prepare_intent_candidate(&root, &legacy, &bindings)
+            .await
+            .unwrap();
+        let v4_candidate = prepare_intent_candidate(&root, &v4, &bindings)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy_candidate.compilation().requirements).unwrap(),
+            serde_json::to_vec(&v4_candidate.compilation().requirements).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&legacy_candidate.candidate().ruleset).unwrap(),
+            serde_json::to_vec(&v4_candidate.candidate().ruleset).unwrap()
+        );
+        assert_eq!(
+            candidate_ruleset_hash(legacy_candidate.candidate()).unwrap(),
+            candidate_ruleset_hash(v4_candidate.candidate()).unwrap()
+        );
+        assert_eq!(legacy_candidate.execution(), v4_candidate.execution());
+    });
+}
+
+#[test]
+fn v4_digest_is_transport_independent_and_detail_sensitive() {
     let baseline = core_decision(&core_value());
+    assert_eq!(baseline.semantic_ir_digest().len(), 64);
+    assert_eq!(baseline.adjudication_digest().len(), 64);
     assert_eq!(
-        baseline.semantic_ir_digest(),
-        "0be31e7271eb469b3e2f6fd26d9ad67d6a098207735126857a835c8480a225bb"
-    );
-    assert_eq!(
-        baseline.adjudication_digest(),
-        "d36e6b1032004ef49b9875515ef95f51d71e91b01f596c638625855ad34104ec"
+        baseline.request_evidence_hash(),
+        Some(REQUEST_EVIDENCE_HASH)
     );
     let mut transport = core_value();
     transport["expected_revision"] = json!(91);
@@ -159,10 +251,33 @@ fn v3_digest_is_transport_independent_and_detail_sensitive() {
 }
 
 #[test]
-fn v3_detail_path_binds_core_and_preserves_exact_literals() {
+fn v4_request_evidence_changes_audited_adjudication_not_route_semantics() {
+    let baseline = core_decision(&core_value());
+    let alternate_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let alternate = match adjudicate_core_with_evidence(&core_value(), alternate_hash) {
+        IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
+        _ => panic!("expected private study-room selection"),
+    };
+    assert_eq!(
+        baseline.semantic_ir_digest(),
+        alternate.semantic_ir_digest()
+    );
+    assert_ne!(
+        baseline.adjudication_digest(),
+        alternate.adjudication_digest()
+    );
+    assert_eq!(
+        baseline.request_evidence_hash(),
+        Some(REQUEST_EVIDENCE_HASH)
+    );
+    assert_eq!(alternate.request_evidence_hash(), Some(alternate_hash));
+}
+
+#[test]
+fn v4_detail_path_binds_core_human_evidence_and_preserves_exact_literals() {
     let mut value = core_value();
     value["custom_detail_facets"] = json!(["custom_copy"]);
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&value) else {
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudicate_core(&value) else {
         panic!("expected private study-room selection");
     };
     let arguments = json!({
@@ -178,13 +293,18 @@ fn v3_detail_path_binds_core_and_preserves_exact_literals() {
         selection.semantic_ir_digest(),
     )
     .unwrap();
-    let detail_digest = selection.details_digest(&details).unwrap();
-    assert_eq!(
+    let detail_digest = selection
+        .details_digest(SOURCE_HUMAN_TURN_DIGEST, &details)
+        .unwrap();
+    assert_eq!(detail_digest.len(), 64);
+    assert_ne!(
         detail_digest,
-        "0ed1ce0bb9c25a51b06d0efed8ae9e04e1f8fdd02e7ced7bb1f379f5b13a8771"
+        selection
+            .details_digest(REQUEST_EVIDENCE_HASH, &details)
+            .unwrap()
     );
     let permit = selection.finalize(Some(details)).unwrap();
-    let (_, PreparedIntentWorkspaceV1::Resolved { intent, .. }) =
+    let (_, PreparedIntentWorkspaceV2::Resolved { intent, .. }) =
         permit.prepare(&context()).unwrap()
     else {
         panic!("expected resolved recipe");
@@ -196,10 +316,10 @@ fn v3_detail_path_binds_core_and_preserves_exact_literals() {
 }
 
 #[test]
-fn v3_missing_spurious_and_contradictory_details_fail_closed() {
+fn v4_missing_spurious_and_contradictory_details_fail_closed() {
     let mut custom = core_value();
     custom["custom_detail_facets"] = json!(["custom_controls"]);
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&custom) else {
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudicate_core(&custom) else {
         panic!("expected private study-room selection");
     };
     let Err(error) = selection.finalize(None) else {
@@ -207,7 +327,7 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
     };
     assert_eq!(error.code, "MISSING_RECIPE_DETAILS");
 
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(default_selection) =
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(default_selection) =
         adjudicate_core(&core_value())
     else {
         panic!("expected private study-room selection");
@@ -230,7 +350,7 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
     };
     assert_eq!(error.code, "UNEXPECTED_RECIPE_DETAILS");
 
-    let IntentCoreAdjudicationV3::PrivateStudyRoom(selection) = adjudicate_core(&custom) else {
+    let IntentCoreAdjudicationV4::PrivateStudyRoom(selection) = adjudicate_core(&custom) else {
         panic!("expected private study-room selection");
     };
     let arguments = json!({
@@ -253,11 +373,11 @@ fn v3_missing_spurious_and_contradictory_details_fail_closed() {
 }
 
 #[test]
-fn v3_safety_and_capability_precedence_terminate_before_details() {
+fn v4_safety_and_capability_precedence_terminate_before_details() {
     let mut creator = core_value();
     creator["close_policy"] = json!("creator_only");
     creator["custom_detail_facets"] = json!(["custom_controls"]);
-    let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&creator) else {
+    let IntentCoreAdjudicationV4::Terminal(permit) = adjudicate_core(&creator) else {
         panic!("creator-only must terminate");
     };
     assert_eq!(
@@ -272,7 +392,7 @@ fn v3_safety_and_capability_precedence_terminate_before_details() {
     let mut boundary = core_value();
     boundary["live_discord_mutation"] = json!("mutate_live_now");
     boundary["custom_detail_facets"] = json!(["custom_copy"]);
-    let IntentCoreAdjudicationV3::Terminal(permit) = adjudicate_core(&boundary) else {
+    let IntentCoreAdjudicationV4::Terminal(permit) = adjudicate_core(&boundary) else {
         panic!("boundary request must terminate");
     };
     assert_eq!(permit.decision().kind(), IntentRouteDecisionKindV2::Reject);

@@ -38,6 +38,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build unsafe development activation
         run: cargo build -p interaction-smoke --features unsafe-dev-activation
+      - name: Check Codex worker
+        run: npm --prefix tools/codex-worker run check
+      - name: Test Codex worker
+        run: npm --prefix tools/codex-worker test
       - name: Install design harness evaluation dependencies
         run: npm --prefix eval/design-harness ci
       - name: Check design harness evaluations

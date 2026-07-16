@@ -2,7 +2,7 @@ use crate::errors::StructuredError;
 
 pub(super) fn normalized_required_text(
     value: &str,
-    max_chars: usize,
+    max_utf16_units: usize,
     multiline: bool,
     reject_template: bool,
     path: &str,
@@ -16,22 +16,28 @@ pub(super) fn normalized_required_text(
             "Provide a non-empty semantic value",
         ));
     }
-    validate_text_shape(&normalized, max_chars, multiline, reject_template, path)?;
+    validate_text_shape(
+        &normalized,
+        max_utf16_units,
+        multiline,
+        reject_template,
+        path,
+    )?;
     Ok(normalized)
 }
 
 pub(super) fn validate_text_shape(
     value: &str,
-    max_chars: usize,
+    max_utf16_units: usize,
     multiline: bool,
     reject_template: bool,
     path: &str,
 ) -> Result<(), StructuredError> {
-    if value.encode_utf16().count() > max_chars {
+    if value.encode_utf16().count() > max_utf16_units {
         return Err(intent_error(
             "INTENT_TEXT_TOO_LONG",
             path,
-            format!("The intent text exceeds {max_chars} characters"),
+            format!("The intent text exceeds {max_utf16_units} UTF-16 code units"),
             "Shorten the value",
         ));
     }

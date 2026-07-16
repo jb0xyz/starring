@@ -4,14 +4,14 @@ use crate::turn::{
     TurnBrief, TurnIntent, TurnVerification,
 };
 
-use super::normalize::PreparedIntentWorkspaceV1;
+use super::normalize::PreparedIntentWorkspaceV2;
 use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
 use super::{
     compile_intent, propose_private_study_room, recipe_descriptor_digest_v1,
     recipe_registry_digest_v1, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
-    IntentProposalOutcomeV1, IntentRequestedOutcome, IntentResolutionContext,
+    IntentProposalOutcomeV2, IntentRequestedOutcome, IntentResolutionContext,
     PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
-    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1, RecipeKindV1, ValidatedIntentV1,
+    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2, RecipeKindV1, ValidatedIntentV2,
 };
 
 fn context() -> IntentResolutionContext {
@@ -22,14 +22,14 @@ fn intent(
     requested_outcome: IntentRequestedOutcome,
     close_policy: Option<ClosePolicyV1>,
     launcher_content: Option<&str>,
-) -> ValidatedIntentV1 {
+) -> ValidatedIntentV2 {
     let proposal = proposal(
         requested_outcome,
         close_policy,
         launcher_content,
         Some(ExistingChannelKey("study_hub".to_string())),
     );
-    let IntentProposalOutcomeV1::Resolved { intent, .. } =
+    let IntentProposalOutcomeV2::Resolved { intent, .. } =
         propose_private_study_room(proposal, &context()).expect("proposal should resolve")
     else {
         panic!("expected a resolved intent");
@@ -42,9 +42,8 @@ fn proposal(
     close_policy: Option<ClosePolicyV1>,
     launcher_content: Option<&str>,
     hub_channel: Option<ExistingChannelKey>,
-) -> PrivateStudyRoomProposalV1 {
-    PrivateStudyRoomProposalV1 {
-        objective: "Create a private study room".to_string(),
+) -> PrivateStudyRoomProposalV2 {
+    PrivateStudyRoomProposalV2 {
         requested_outcome,
         hub_channel,
         locale: Some(IntentLocaleV1::En),
@@ -60,13 +59,13 @@ fn proposal(
     }
 }
 
-fn resumed_intent() -> ValidatedIntentV1 {
+fn resumed_intent() -> ValidatedIntentV2 {
     let prepared = prepare_private_study_room(
         proposal(IntentRequestedOutcome::ValidatedPreview, None, None, None),
         &context(),
     )
     .expect("incomplete proposal should prepare");
-    let PreparedIntentWorkspaceV1::NeedsInput {
+    let PreparedIntentWorkspaceV2::NeedsInput {
         workspace,
         decisions,
     } = prepared
@@ -75,7 +74,7 @@ fn resumed_intent() -> ValidatedIntentV1 {
     };
     assert_eq!(decisions.len(), 1);
     let expected_revision = workspace.revision;
-    let PreparedIntentWorkspaceV1::Resolved { intent, .. } = apply_existing_channel_decision(
+    let PreparedIntentWorkspaceV2::Resolved { intent, .. } = apply_existing_channel_decision(
         &workspace,
         expected_revision,
         ExistingChannelKey("study_hub".to_string()),
@@ -150,12 +149,22 @@ fn disabled_close_compiles_deterministically_without_dead_controls() {
         recipe_descriptor_digest_v1(RecipeKindV1::PrivateStudyRoomV1)
             .expect("descriptor should hash")
     );
-    assert_eq!(first.manifest.input_intent_hash.len(), 64);
+    assert_eq!(first.manifest.compiler_input_hash.len(), 64);
     assert_eq!(first.manifest.semantic_intent_hash.len(), 64);
     assert_eq!(first.manifest.compiled_plan_hash.len(), 64);
+    assert_eq!(first.manifest.identity_revision, 2);
+    assert_eq!(first.manifest.compiler_revision, 1);
+    assert_eq!(
+        first.manifest.compiler_input_hash,
+        "0a21e7663c7cbed2c83481964e0e9f047038b00e32a51a8aba58dc910616ff08"
+    );
+    assert_eq!(
+        first.manifest.semantic_intent_hash,
+        "72d5a64668bae28df5b174a7144414c4ab2b67665a0c853fa33697b87698945f"
+    );
     assert_eq!(
         first.manifest.compiled_plan_hash,
-        "a0ef96c74dc7605635c960b958dd1ecd47e1ccdf9e5aaeda0f1b771c732b57f1"
+        "060723d30880df827504b939dc84c8dd79581c4a33c4116f31cb5dd23218dee3"
     );
 }
 
@@ -178,9 +187,9 @@ fn explicit_any_member_close_adds_one_live_control_and_handler() {
         compiled.manifest.generated_objects["close_room"],
         "private_study_room__close_room"
     );
-    assert_eq!(
+    assert_ne!(
         compiled.manifest.compiled_plan_hash,
-        "84fd08a36052420663523cc89f44f45649d1900a9f14495b03b8d66aef03e5b5"
+        "060723d30880df827504b939dc84c8dd79581c4a33c4116f31cb5dd23218dee3"
     );
     assert!(compiled.requirements.iter().any(|requirement| {
         matches!(
@@ -240,8 +249,8 @@ fn copy_changes_plan_hash_without_changing_generated_ownership() {
     ))
     .expect("custom intent should compile");
     assert_ne!(
-        first.manifest.input_intent_hash,
-        second.manifest.input_intent_hash
+        first.manifest.compiler_input_hash,
+        second.manifest.compiler_input_hash
     );
     assert_ne!(
         first.manifest.semantic_intent_hash,
@@ -267,8 +276,8 @@ fn semantic_hash_ignores_revision_and_value_provenance() {
     let one_shot = compile_intent(&one_shot).expect("one-shot intent should compile");
     let resumed = compile_intent(&resumed).expect("resumed intent should compile");
     assert_ne!(
-        one_shot.manifest.input_intent_hash,
-        resumed.manifest.input_intent_hash
+        one_shot.manifest.compiler_input_hash,
+        resumed.manifest.compiler_input_hash
     );
     assert_eq!(
         one_shot.manifest.semantic_intent_hash,
@@ -279,4 +288,155 @@ fn semantic_hash_ignores_revision_and_value_provenance() {
         resumed.manifest.compiled_plan_hash
     );
     assert_eq!(one_shot.requirements, resumed.requirements);
+}
+
+#[test]
+fn compiler_input_identity_tracks_revision_independently() {
+    let baseline = intent(IntentRequestedOutcome::ValidatedPreview, None, None);
+    let mut revised = baseline.clone();
+    revised.resolved_mut().revision += 1;
+
+    let baseline = compile_intent(&baseline).expect("baseline intent should compile");
+    let revised = compile_intent(&revised).expect("revised intent should compile");
+
+    assert_ne!(
+        baseline.manifest.compiler_input_hash,
+        revised.manifest.compiler_input_hash
+    );
+    assert_eq!(
+        baseline.manifest.semantic_intent_hash,
+        revised.manifest.semantic_intent_hash
+    );
+    assert_eq!(
+        baseline.manifest.compiled_plan_hash,
+        revised.manifest.compiled_plan_hash
+    );
+}
+
+#[test]
+fn compiler_input_identity_tracks_value_provenance_independently() {
+    let baseline = intent(IntentRequestedOutcome::ValidatedPreview, None, None);
+    let mut reprovenanced = baseline.clone();
+    let super::model::ResolvedFeatureConfigurationV1::ManagedPrivateRoom(room) =
+        &mut reprovenanced.resolved_mut().features[0].configuration;
+    room.hub_channel.source = super::model::IntentValueSource::UserConfirmed;
+
+    let baseline = compile_intent(&baseline).expect("baseline intent should compile");
+    let reprovenanced =
+        compile_intent(&reprovenanced).expect("reprovenanced intent should compile");
+
+    assert_ne!(
+        baseline.manifest.compiler_input_hash,
+        reprovenanced.manifest.compiler_input_hash
+    );
+    assert_eq!(
+        baseline.manifest.semantic_intent_hash,
+        reprovenanced.manifest.semantic_intent_hash
+    );
+    assert_eq!(
+        baseline.manifest.compiled_plan_hash,
+        reprovenanced.manifest.compiled_plan_hash
+    );
+}
+
+#[test]
+fn requested_outcome_is_semantic_even_when_the_plan_is_identical() {
+    let working = compile_intent(&intent(IntentRequestedOutcome::WorkingDraft, None, None))
+        .expect("working draft intent should compile");
+    let preview = compile_intent(&intent(
+        IntentRequestedOutcome::ValidatedPreview,
+        None,
+        None,
+    ))
+    .expect("preview intent should compile");
+
+    assert_ne!(
+        working.manifest.compiler_input_hash,
+        preview.manifest.compiler_input_hash
+    );
+    assert_ne!(
+        working.manifest.semantic_intent_hash,
+        preview.manifest.semantic_intent_hash
+    );
+    assert_eq!(
+        working.manifest.compiled_plan_hash,
+        preview.manifest.compiled_plan_hash
+    );
+    assert_eq!(working.requirements, preview.requirements);
+}
+
+#[test]
+fn executable_semantic_mutations_change_semantic_and_plan_identity() {
+    let baseline_proposal = proposal(
+        IntentRequestedOutcome::ValidatedPreview,
+        None,
+        None,
+        Some(ExistingChannelKey("study_hub".to_string())),
+    );
+    let baseline = compile_proposal(baseline_proposal.clone(), context());
+
+    let mut hub = baseline_proposal.clone();
+    hub.hub_channel = Some(ExistingChannelKey("archive_hub".to_string()));
+    let hub_context = IntentResolutionContext::from_channel_bindings([
+        ExistingChannelKey("study_hub".to_string()),
+        ExistingChannelKey("archive_hub".to_string()),
+    ]);
+
+    let mut locale = baseline_proposal.clone();
+    locale.locale = Some(IntentLocaleV1::Ko);
+
+    let mut copy = baseline_proposal.clone();
+    copy.copy.launcher_content = Some("Open a focused study room".to_string());
+
+    let mut naming = baseline_proposal.clone();
+    naming.naming.channel_name = Some(super::RoomNamePatternV1 {
+        prefix: "focus-".to_string(),
+        suffix: String::new(),
+    });
+
+    let mut control = baseline_proposal.clone();
+    control.controls.help_label = Some("Guide".to_string());
+
+    let mut close = baseline_proposal;
+    close.controls.close_policy = Some(ClosePolicyV1::AnyMember);
+
+    let variants = [
+        ("hub", compile_proposal(hub, hub_context)),
+        ("locale", compile_proposal(locale, context())),
+        ("copy", compile_proposal(copy, context())),
+        ("naming", compile_proposal(naming, context())),
+        ("control", compile_proposal(control, context())),
+        ("close", compile_proposal(close, context())),
+    ];
+
+    for (name, variant) in variants {
+        assert_ne!(
+            baseline.manifest.compiler_input_hash, variant.manifest.compiler_input_hash,
+            "{name} did not change compiler input identity"
+        );
+        assert_ne!(
+            baseline.manifest.semantic_intent_hash, variant.manifest.semantic_intent_hash,
+            "{name} did not change semantic intent identity"
+        );
+        assert_ne!(
+            baseline.manifest.compiled_plan_hash, variant.manifest.compiled_plan_hash,
+            "{name} did not change compiled plan identity"
+        );
+        assert_ne!(
+            baseline.requirements, variant.requirements,
+            "{name} did not change executable requirements"
+        );
+    }
+}
+
+fn compile_proposal(
+    proposal: PrivateStudyRoomProposalV2,
+    context: IntentResolutionContext,
+) -> super::CompiledIntentV2 {
+    let IntentProposalOutcomeV2::Resolved { intent, .. } =
+        propose_private_study_room(proposal, &context).expect("proposal should resolve")
+    else {
+        panic!("expected a resolved intent");
+    };
+    compile_intent(&intent).expect("resolved intent should compile")
 }

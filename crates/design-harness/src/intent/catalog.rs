@@ -1,17 +1,17 @@
 use std::collections::BTreeSet;
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
 
+use super::identity::{compatibility_json_digest, IdentityErrorSpec};
 use super::model::{PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION};
 
 pub(super) const COMPILER_REVISION: u32 = 1;
 pub(super) const MAX_COMPILED_REQUIREMENTS: usize = 31;
 
-const PRIVATE_STUDY_ROOM_EXTRACTOR_REVISION: u32 = 4;
-const PRIVATE_STUDY_ROOM_NORMALIZER_REVISION: u32 = 1;
+const PRIVATE_STUDY_ROOM_EXTRACTOR_REVISION: u32 = 14;
+const PRIVATE_STUDY_ROOM_NORMALIZER_REVISION: u32 = 9;
 const PRIVATE_STUDY_ROOM_SIMULATOR_REVISION: u32 = 1;
 const PRIVATE_STUDY_ROOM_MIN_REQUIREMENTS: usize = 22;
 const PRIVATE_STUDY_ROOM_MAX_REQUIREMENTS: usize = 26;
@@ -212,20 +212,15 @@ fn catalog_digest(
     location: &str,
 ) -> Result<String, StructuredError> {
     let envelope = CatalogDigestEnvelope { domain, value };
-    let bytes = serde_json::to_vec(&envelope).map_err(|error| {
-        registry_error(
+    compatibility_json_digest(
+        b"",
+        &envelope,
+        IdentityErrorSpec::new(
             "INTENT_RECIPE_REGISTRY_SERIALIZATION_FAILED",
             location,
             "A deterministic recipe registry artifact could not be serialized",
-            error.to_string(),
-        )
-    })?;
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    Ok(output)
+        ),
+    )
 }
 
 fn registry_error(

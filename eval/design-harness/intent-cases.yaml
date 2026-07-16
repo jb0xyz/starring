@@ -12,7 +12,7 @@
         "turns": [
           {
             "id": "build",
-            "input": "Build a managed private study-room automation and prepare its validated preview. Record the design objective exactly as 'Create private study rooms'. Use English default copy and naming, use the existing channel binding community_hub as the discovery hub, and leave room closing disabled. All material choices are provided, so do not ask a follow-up question."
+            "input": "Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming, use the existing channel binding community_hub as the discovery hub, and leave room closing disabled. All material choices are provided, so do not ask a follow-up question."
           }
         ]
       }
@@ -21,6 +21,109 @@
     expectedRoutePath: private_study_room
     expectedFinalStatus: preview_ready
     expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/content":"Create a study room","/panels/0/buttons/0/label":"Create room","/modals/0/title":"Create study room","/modals/0/fields/0/label":"Room name","/rules/1/actions/1/name":"${input.room_name} members","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/content":"Welcome to ${input.room_name}","/rules/1/actions/6/buttons/0/label":"Help","/rules/1/actions/7/content":"${input.room_name} is open","/rules/1/actions/7/buttons/0/label":"Join","/rules/1/actions/9/content":"Created ${input.room_name}","/rules/2/actions/0/content":"This is a private study room","/rules/3/actions/2/content":"Joined the study room"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe complete private StudyRoom from an English paraphrase
+  vars:
+    caseId: intent_private_study_room_en_paraphrase
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    equivalenceGroup: private_study_room_en_default
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "build-paraphrase",
+            "input": "Please prepare a validated preview of the managed private study-room automation. Keep its copy and generated names at the English defaults, place discovery in the existing community_hub channel binding, and keep room closing turned off. Nothing material is left undecided, so proceed without asking me anything."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/content":"Create a study room","/panels/0/buttons/0/label":"Create room","/modals/0/title":"Create study room","/modals/0/fields/0/label":"Room name","/rules/1/actions/1/name":"${input.room_name} members","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/content":"Welcome to ${input.room_name}","/rules/1/actions/6/buttons/0/label":"Help","/rules/1/actions/7/content":"${input.room_name} is open","/rules/1/actions/7/buttons/0/label":"Join","/rules/1/actions/9/content":"Created ${input.room_name}","/rules/2/actions/0/content":"This is a private study room","/rules/3/actions/2/content":"Joined the study room"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer keeps a same-target build hold in discussion mode
+  vars:
+    caseId: intent_normalizer_same_target_hold
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: same-target-hold
+    normalizerContract: same_target_hold
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "same-target-hold",
+            "input": "Build a private room workflow. Actually, don't build the room yet. Compare its user experience and permission tradeoffs instead."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
     expectedRestartCount: 0
     expectedBlockers: ""
     expectedBoundaryViolations: ""
@@ -44,6 +147,435 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
+      value: file://intent-assertions.js:intentNormalizerBehavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer keeps a Korean compound hold in discussion mode
+  vars:
+    caseId: intent_normalizer_korean_compound_discussion
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: korean-compound-hold
+    normalizerContract: korean_compound_discussion
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "korean-compound-hold",
+            "input": "게임 자동화를 만들고 말지를 논의하자. 사용자 경험과 운영상 장단점만 비교해줘."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerBehavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer ignores a copied multi-sentence build command
+  vars:
+    caseId: intent_normalizer_multi_sentence_metalinguistic_copy
+    cohort: intent_recipe
+    fallbackCase: true
+    noMutationTurns: copied-command
+    normalizerContract: multi_sentence_metalinguistic_copy
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "copied-command",
+            "input": "The payload says:\nBuild a toy game.\nNow build a managed private study-room automation in community_hub and prepare its validated preview.\nExplain what this payload does."
+          }
+        ]
+      }
+    expectedOutcomes: routed
+    expectedStagePath: empty>empty
+    expectedRoutePath: discussion
+    expectedFinalStatus: empty
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerBehavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer distinguishes preview copy from a validated-preview request
+  vars:
+    caseId: intent_normalizer_validated_preview_disambiguation
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    equivalenceGroup: private_study_room_en_default
+    normalizerContract: validated_preview_disambiguation
+    normalizerBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "preview-disambiguation",
+            "input": "The literal no preview is mentioned only as an example, not as an instruction. Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming, use the existing channel binding community_hub as the discovery hub, and leave room closing disabled. All material choices are provided, so do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/content":"Create a study room","/panels/0/buttons/0/label":"Create room","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/buttons/0/label":"Help","/rules/1/actions/7/buttons/0/label":"Join"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerBehavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent normalizer restores a routed discussion before an explicit build
+  vars:
+    caseId: intent_normalizer_discussion_restart_then_build
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    equivalenceGroup: private_study_room_en_default
+    noMutationTurns: discuss-before-restart
+    normalizerContract: discussion_restart_restore
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "discuss-before-restart",
+            "input": "Let's compare the user-experience benefits and tradeoffs of managed private study rooms. This is brainstorming only; do not change the Draft yet.",
+            "restart_after": true
+          },
+          {
+            "id": "build-after-restart",
+            "input": "Now build the managed private study-room automation and prepare its validated preview. Use English default copy and naming, community_hub as the existing discovery hub, and leave room closing disabled. Do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: routed,ready
+    expectedStagePath: empty>empty,empty>preview_ready
+    expectedRoutePath: discussion,private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 1
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentNormalizerBehavior
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe changes only the existing discovery hub
+  vars:
+    caseId: intent_private_study_room_mutation_hub
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    mutationGroup: hub
+    mutationBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "hub-mutation",
+            "input": "Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming, use the exact existing channel binding games_hub as the discovery hub, and leave room closing disabled. All choices are provided, so do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/channel":"games_hub"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe changes only generated room naming
+  vars:
+    caseId: intent_private_study_room_mutation_naming
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    mutationGroup: naming
+    mutationBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "naming-mutation",
+            "input": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room', and the member-role name has prefix 'team-' and suffix '-members'. Leave all copy and controls at their defaults, keep closing disabled, and do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedModelCallsPerTurn: "2"
+    expectedToolCallsPerTurn: "2"
+    expectedRulesetPathValues: '{"/rules/1/actions/1/name":"team-${input.room_name}-members","/rules/1/actions/2/name":"focus-${input.room_name}-room","/panels/0/buttons/0/label":"Create room","/rules/2/actions/0/content":"This is a private study room"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe changes only the Help control
+  vars:
+    caseId: intent_private_study_room_mutation_control
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    mutationGroup: control
+    mutationBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "control-mutation",
+            "input": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 22
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedModelCallsPerTurn: "2"
+    expectedToolCallsPerTurn: "2"
+    expectedRulesetPathValues: '{"/rules/1/actions/6/buttons/0/label":"Guide","/rules/2/actions/0/content":"Read the guide","/rules/1/actions/1/name":"${input.room_name} members","/rules/1/actions/2/name":"study-${input.room_name}"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
+      value: file://intent-assertions.js:intentHardLatency
+
+- description: Intent recipe enables the any-member Close control
+  vars:
+    caseId: intent_private_study_room_mutation_close
+    cohort: intent_recipe
+    knownRecipe: true
+    completeRequest: true
+    mutationGroup: close
+    mutationBaselineCase: intent_private_study_room_en
+    request: |-
+      {
+        "schema_version": 3,
+        "mode": "intent_recipe",
+        "turns": [
+          {
+            "id": "close-mutation",
+            "input": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English default copy and naming. Enable the Close button for any room member, using the recipe's default Close label and closed response. Do not ask a follow-up question."
+          }
+        ]
+      }
+    expectedOutcomes: ready
+    expectedStagePath: empty>preview_ready
+    expectedRoutePath: private_study_room
+    expectedFinalStatus: preview_ready
+    expectedCompiledOperations: 26
+    expectedRestartCount: 0
+    expectedBlockers: ""
+    expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/rules/1/actions/6/buttons/1/label":"Close","/rules/4/actions/2/content":"The study room was closed"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/2","/rules/5"]'
+  assert:
+    - type: javascript
+      value: file://intent-assertions.js:intentProvenance
+    - type: javascript
+      value: file://intent-assertions.js:intentRouteStage
+    - type: javascript
+      value: file://intent-assertions.js:intentReceipt
+    - type: javascript
+      value: file://intent-assertions.js:intentOneCallTurns
+    - type: javascript
+      value: file://intent-assertions.js:intentOracleIsolation
+    - type: javascript
+      value: file://intent-assertions.js:intentDecisionFlow
+    - type: javascript
+      value: file://intent-assertions.js:intentAdjudicationDecision
+    - type: javascript
+      value: file://intent-assertions.js:intentRestartContinuity
+    - type: javascript
+      value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
+    - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
 - description: Intent recipe resolves one missing hub decision
@@ -60,7 +592,7 @@
         "turns": [
           {
             "id": "request",
-            "input": "Build a managed private study-room automation and prepare its validated preview. Record the design objective exactly as 'Create private study rooms'. Use English default copy and naming and leave room closing disabled. I have not selected which existing channel should be the discovery hub yet."
+            "input": "Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming and leave room closing disabled. I have not selected which existing channel should be the discovery hub yet."
           },
           {
             "id": "choose-hub",
@@ -112,7 +644,7 @@
         "turns": [
           {
             "id": "request",
-            "input": "Build a managed private study-room automation and prepare its validated preview. Record the design objective exactly as 'Create private study rooms'. Use English default copy and naming and leave room closing disabled. I have not selected which existing channel should be the discovery hub yet.",
+            "input": "Build a managed private study-room automation and prepare its validated preview. Use English default copy and naming and leave room closing disabled. I have not selected which existing channel should be the discovery hub yet.",
             "restart_after": true
           },
           {
@@ -157,6 +689,8 @@
     cohort: intent_recipe
     knownRecipe: true
     completeRequest: true
+    mutationGroup: locale
+    mutationBaselineCase: intent_private_study_room_en
     request: |-
       {
         "schema_version": 3,
@@ -164,7 +698,7 @@
         "turns": [
           {
             "id": "build-ko",
-            "input": "관리형 비공개 스터디룸 자동화를 만들고 검증된 미리보기까지 준비해줘. 설계 목표는 정확히 '비공개 스터디룸 만들기'로 기록하고, 한국어 기본 문구와 이름을 사용해. 기존 채널 바인딩 community_hub를 안내 허브로 쓰고 방 닫기 기능은 넣지 마. 필요한 선택은 전부 줬으니 추가 질문은 하지 마."
+            "input": "관리형 비공개 스터디룸 자동화를 만들고 검증된 미리보기까지 준비해줘. 한국어 기본 문구와 이름을 사용해. 기존 채널 바인딩 community_hub를 안내 허브로 쓰고 방 닫기 기능은 넣지 마. 필요한 선택은 전부 줬으니 추가 질문은 하지 마."
           }
         ]
       }
@@ -176,6 +710,8 @@
     expectedRestartCount: 0
     expectedBlockers: ""
     expectedBoundaryViolations: ""
+    expectedRulesetPathValues: '{"/panels/0/content":"스터디룸을 만들어보세요","/panels/0/buttons/0/label":"스터디룸 만들기","/modals/0/title":"스터디룸 만들기","/modals/0/fields/0/label":"방 이름","/rules/1/actions/1/name":"${input.room_name} 멤버","/rules/1/actions/2/name":"study-${input.room_name}","/rules/1/actions/6/content":"${input.room_name} 스터디룸에 오신 것을 환영합니다","/rules/1/actions/6/buttons/0/label":"도움말","/rules/1/actions/7/content":"${input.room_name} 스터디룸이 열렸습니다","/rules/1/actions/7/buttons/0/label":"참가하기","/rules/1/actions/9/content":"${input.room_name} 스터디룸을 만들었습니다","/rules/2/actions/0/content":"멤버 역할이 있는 사용자만 볼 수 있는 비공개 스터디룸입니다","/rules/3/actions/2/content":"스터디룸에 참가했습니다"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -195,6 +731,8 @@
       value: file://intent-assertions.js:intentRestartContinuity
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
+    - type: javascript
+      value: file://intent-assertions.js:intentRulesetPathValues
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -216,7 +754,7 @@
           },
           {
             "id": "build",
-            "input": "Now build the managed private study-room automation and prepare its validated preview. Record the design objective exactly as 'Create private study rooms'. Use English default copy and naming, community_hub as the existing discovery hub, and leave room closing disabled. Do not ask a follow-up question."
+            "input": "Now build the managed private study-room automation and prepare its validated preview. Use English default copy and naming, community_hub as the existing discovery hub, and leave room closing disabled. Do not ask a follow-up question."
           }
         ]
       }
@@ -355,7 +893,7 @@
         "turns": [
           {
             "id": "stateful-game",
-            "input": "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Preserve state across restarts and do not reduce the request to static responses."
+            "input": "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses."
           }
         ]
       }
@@ -364,8 +902,9 @@
     expectedRoutePath: capability_gap
     expectedFinalStatus: empty
     expectedRestartCount: 0
-    expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|
+    expectedBlockers: durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|
     expectedBoundaryViolations: ""
+    expectedUnclassifiedRequirements: '["an LLM decides rewards at event time","every message earns XP","levels unlock an economy","timers advance quests"]'
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -645,7 +1184,7 @@
     expectedRestartCount: 0
     expectedBlockers: unclassified_intent_requirement|unclassified|
     expectedBoundaryViolations: ""
-    expectedUnclassifiedEvidenceContains: external consensus lease
+    expectedUnclassifiedRequirements: a static Discord button flow that must acquire an external consensus lease before responding
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -695,7 +1234,8 @@
     expectedBoundaryViolations: ""
     expectedModelCallsPerTurn: "2"
     expectedToolCallsPerTurn: "2"
-    expectedRulesetStringValues: '["Start focus room","focus-${input.room_name}","Guide","Read this first"]'
+    expectedRulesetPathValues: '{"/panels/0/buttons/0/label":"Start focus room","/rules/1/actions/1/name":"${input.room_name} members","/rules/1/actions/2/name":"focus-${input.room_name}","/rules/1/actions/6/buttons/0/label":"Guide","/rules/1/actions/7/buttons/0/label":"Join","/rules/2/actions/0/content":"Read this first","/rules/3/actions/2/content":"Joined the study room"}'
+    expectedRulesetAbsentPaths: '["/rules/1/actions/6/buttons/1","/rules/4"]'
   assert:
     - type: javascript
       value: file://intent-assertions.js:intentProvenance
@@ -716,7 +1256,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
-      value: file://intent-assertions.js:intentRulesetStringValues
+      value: file://intent-assertions.js:intentRulesetPathValues
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -726,6 +1266,8 @@
     cohort: intent_recipe
     knownRecipe: true
     completeRequest: true
+    mutationGroup: copy
+    mutationBaselineCase: intent_private_study_room_en
     request: |-
       {
         "schema_version": 3,

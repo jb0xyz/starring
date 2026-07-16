@@ -9,17 +9,33 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
+const REGISTRY_DIGEST = '23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d';
+const RUNTIME_EVIDENCE = {
+  durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
+  event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
+  persistent_economy_ledger: [
+    'intent.core.runtime_requirements.economy',
+    'persistent_ledger',
+  ],
+  restart_persistent_state: [
+    'intent.core.runtime_requirements.persistence',
+    'restart_persistent',
+  ],
+};
 
 function evidence(semanticPath = 'intent.automation_kind', description = 'Requested automation') {
   return { semantic_path: semanticPath, description };
 }
 
 function blocker(id, status, policyId = null) {
+  const runtimeEvidence = RUNTIME_EVIDENCE[id];
   return {
     id,
     status,
     policy_id: policyId,
-    evidence: [evidence(`intent.runtime_requirements.${id}`, `Requires ${id}`)],
+    evidence: [runtimeEvidence
+      ? evidence(runtimeEvidence[0], runtimeEvidence[1])
+      : evidence(`intent.runtime_requirements.${id}`, `Requires ${id}`)],
   };
 }
 
@@ -34,8 +50,9 @@ function decision(kind = 'private_study_room', overrides = {}) {
   return {
     kind,
     decision_source: 'deterministic_intent_adjudicator',
-    adjudicator_version: 2,
+    adjudicator_version: 3,
     semantic_ir_digest: 'a'.repeat(64),
+    request_evidence_hash: 'c'.repeat(64),
     manifest_version: 1,
     manifest_digest: MANIFEST_DIGEST,
     adjudication_digest: 'b'.repeat(64),
@@ -66,6 +83,75 @@ function counters(overrides = {}) {
   };
 }
 
+function staleGates() {
+  return {
+    validated_revision: null,
+    simulated_revision: null,
+    validation_current: false,
+    simulation_current: false,
+  };
+}
+
+function metric(frontierName = 'interpret_intent_core', callSequence = 1) {
+  const detail = frontierName === 'extract_private_study_room_details';
+  return {
+    call_sequence: callSequence,
+    attempt: 1,
+    frontier_name: frontierName,
+    outcome: 'succeeded',
+    http_status: 200,
+    served_model: 'gpt-5.6-luna',
+    request_body_bytes: detail ? 4500 : 6500,
+    message_bytes: 1200,
+    tool_bytes: detail ? 1600 : 1300,
+    duplicated_schema_bytes: detail ? 1200 : 1100,
+    prompt_tokens: 800,
+    completion_tokens: 120,
+    finish_reason: 'tool_calls',
+    request_duration_ms: detail ? 350 : 450,
+    gateway_model_duration_ms: null,
+  };
+}
+
+function observability(modelCalls = 1, toolCalls = 1) {
+  return {
+    model_calls: modelCalls,
+    tool_calls: toolCalls,
+    distinct_mutation_tools: [],
+    mutation_tool_calls: {},
+    clarification_count: 0,
+    validation_failures: 0,
+    simulation_failures: 0,
+    failure_signatures: {},
+    repeated_errors: 0,
+    repair_attempts: 0,
+    repair_successes: 0,
+    repair_failures: 0,
+    repair_escalations: 0,
+    nudge_count: 0,
+    plan_submissions: 0,
+    plan_acceptances: 0,
+    planned_requirements: 0,
+    plan_compiled_tool_calls: 0,
+    plan_execution_failures: 0,
+    plan_rollbacks: 0,
+    plan_commits: 0,
+    plan_conflicts: 0,
+    intent_route_calls: 0,
+    intent_proposal_acceptances: 0,
+    intent_resolution_acceptances: 0,
+    intent_compile_attempts: 0,
+    intent_compile_successes: 0,
+    intent_commits: 0,
+    intent_rollbacks: 0,
+    intent_conflicts: 0,
+    intent_stale_revision_rejections: 0,
+    intent_extraction_failures: 0,
+    intent_fallback_routes: {},
+    intent_compiled_operations: 0,
+  };
+}
+
 function turn(overrides = {}) {
   return {
     id: 'build',
@@ -76,7 +162,9 @@ function turn(overrides = {}) {
     question: null,
     halt_code: null,
     last_error: null,
+    burst_elapsed_ms: 900,
     elapsed_ms: 1000,
+    model_call_metrics: [metric()],
     model_calls: 1,
     model_tool_calls: 1,
     deterministic_operations: 22,
@@ -95,7 +183,12 @@ function turn(overrides = {}) {
     draft_revision_before: 0,
     draft_revision_after: 22,
     draft_changed: true,
-    actual_gates: { validation_current: true, simulation_current: true },
+    actual_gates: {
+      validated_revision: 22,
+      simulated_revision: 22,
+      validation_current: true,
+      simulation_current: true,
+    },
     restart_after: false,
     restart_performed: false,
     ...overrides,
@@ -104,27 +197,44 @@ function turn(overrides = {}) {
 
 function receipt() {
   return {
+    identity_revision: 2,
     intent_revision: 1,
     candidate_revision: 22,
-    input_intent_hash: '1'.repeat(64),
+    request_evidence_hash: 'c'.repeat(64),
+    request_evidence_entries: 1,
+    compiler_input_hash: '1'.repeat(64),
     semantic_intent_hash: '2'.repeat(64),
     compiled_plan_hash: '3'.repeat(64),
+    candidate_ruleset_hash: '5'.repeat(64),
+    candidate_draft_hash: '6'.repeat(64),
     compiled_operations: 22,
   };
 }
 
 function report(overrides = {}) {
   const turns = overrides.turns || [turn()];
-  return JSON.stringify({
-    schema_version: 3,
+  const document = {
+    schema_version: 5,
     input_schema_version: 3,
     mode: 'intent_recipe',
-    requested_model: 'gemma4:12b-mlx',
-    served_model: 'gemma4:12b-mlx',
+    intent_protocol_version: 4,
+    intent_adjudicator_version: 3,
+    intent_identity_revision: 2,
+    requested_model: 'gpt-5.6-luna',
+    served_model: 'gpt-5.6-luna',
     gateway_id: `sha256-${'9'.repeat(64)}`,
     declared_context_tokens: 16384,
     context_declaration_source: 'evaluation_provider',
     gateway_context_observed_tokens: null,
+    catalog_identity: {
+      recipe_id: 'starring.private_study_room',
+      recipe_version: 1,
+      extractor_revision: 14,
+      normalizer_revision: 9,
+      compiler_revision: 1,
+      simulator_revision: 1,
+      registry_digest: REGISTRY_DIGEST,
+    },
     provenance: {
       source_commit: 'a'.repeat(40),
       source_dirty: false,
@@ -150,14 +260,25 @@ function report(overrides = {}) {
     question: null,
     halt_code: null,
     turns,
+    model_call_metrics: turns.flatMap((entry) => entry.model_call_metrics),
     draft_revision: 22,
     ruleset: { version: 1, panels: [], modals: [], rules: [] },
-    actual_gates: { validation_current: true, simulation_current: true },
-    observability: { model_calls: 1, tool_calls: 1 },
+    actual_gates: {
+      validated_revision: 22,
+      simulated_revision: 22,
+      validation_current: true,
+      simulation_current: true,
+    },
+    observability: observability(),
     final_intent: {
       status: 'preview_ready',
       receipt: receipt(),
-      public_status: { status: 'preview_ready', receipt: receipt() },
+      public_status: {
+        status: 'preview_ready',
+        root_draft_revision: 0,
+        workspace_revision: 1,
+        receipt: receipt(),
+      },
       route_decision: turns[turns.length - 1].route_decision,
       binding_fingerprint: '4'.repeat(64),
     },
@@ -166,12 +287,27 @@ function report(overrides = {}) {
       store_writes: 1,
       connection_reopen_count: 0,
       final_generation: 1,
-      snapshot_schema_version: 6,
+      snapshot_schema_version: 8,
       roundtrip_verified: false,
     },
     elapsed_ms: 1000,
     ...overrides,
+  };
+  if (document.final_intent.status === 'preview_ready') {
+    const hashes = checks.candidateIdentityHashes(document);
+    Object.assign(document.final_intent.receipt, hashes);
+    Object.assign(document.final_intent.public_status.receipt, hashes);
+  }
+  document.model_call_metrics.forEach((entry, index) => {
+    entry.call_sequence = index + 1;
   });
+  return JSON.stringify(document);
+}
+
+function refreshCandidateHashes(document) {
+  const hashes = checks.candidateIdentityHashes(document);
+  Object.assign(document.final_intent.receipt, hashes);
+  Object.assign(document.final_intent.public_status.receipt, hashes);
 }
 
 function context(overrides = {}) {
@@ -191,10 +327,10 @@ function context(overrides = {}) {
   };
 }
 
-function routedDocument(routeDecision, message, id = 'routed') {
+function routedDocument(routeDecision, message, id = 'routed', input = 'Route this request') {
   const routed = turn({
     id,
-    input: 'Route this request',
+    input,
     outcome: 'routed',
     completed: false,
     message,
@@ -208,7 +344,7 @@ function routedDocument(routeDecision, message, id = 'routed') {
     route_decision: routeDecision,
     draft_revision_after: 0,
     draft_changed: false,
-    actual_gates: { validation_current: false, simulation_current: false },
+    actual_gates: staleGates(),
   });
   return report({
     outcome: 'routed',
@@ -216,7 +352,7 @@ function routedDocument(routeDecision, message, id = 'routed') {
     message,
     turns: [routed],
     draft_revision: 0,
-    actual_gates: { validation_current: false, simulation_current: false },
+    actual_gates: staleGates(),
     final_intent: {
       status: 'empty',
       receipt: null,
@@ -262,35 +398,154 @@ test('one-shot intent report satisfies provenance, route, receipt, call, and iso
   assert.equal(checks.intentHardLatency(document, expected).pass, true);
 });
 
-test('detail-path assertions require two calls and preserve exact RuleSet strings', () => {
+test('served model provenance is independent of tool calls and retry attempts stay observable', () => {
+  const textResponse = JSON.parse(report());
+  textResponse.turns[0].model_tool_calls = 0;
+  textResponse.observability.tool_calls = 0;
+  assert.equal(
+    checks.intentProvenance(JSON.stringify(textResponse), context()).pass,
+    true,
+  );
+
+  const retry = JSON.parse(report());
+  const failed = retry.turns[0].model_call_metrics[0];
+  failed.outcome = 'transport_error';
+  failed.http_status = null;
+  failed.served_model = null;
+  failed.prompt_tokens = null;
+  failed.completion_tokens = null;
+  failed.finish_reason = null;
+  failed.request_duration_ms = 100;
+  const succeeded = metric();
+  succeeded.attempt = 2;
+  retry.turns[0].model_call_metrics.push(succeeded);
+  retry.model_call_metrics = structuredClone(retry.turns[0].model_call_metrics);
+
+  assert.equal(checks.intentReceipt(JSON.stringify(retry), context()).pass, true);
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(retry), context()).reason,
+    /successful tool-call completion/,
+  );
+});
+
+test('bounded call assertion rejects non-tool completion and repair counters', () => {
+  const stopped = JSON.parse(report());
+  stopped.turns[0].model_call_metrics[0].finish_reason = 'stop';
+  stopped.model_call_metrics[0].finish_reason = 'stop';
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(stopped), context()).reason,
+    /successful tool-call completion/,
+  );
+
+  const repaired = JSON.parse(report());
+  repaired.observability.repair_attempts = 1;
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(repaired), context()).reason,
+    /repair_attempts=1 expected=0/,
+  );
+});
+
+test('detail-path assertions require two calls and pin every custom value to its RuleSet path', () => {
   const custom = JSON.parse(report());
   custom.turns[0].model_calls = 2;
   custom.turns[0].model_tool_calls = 2;
+  const detailMetric = metric('extract_private_study_room_details', 2);
+  custom.turns[0].model_call_metrics.push(detailMetric);
+  custom.model_call_metrics.push(detailMetric);
   custom.observability.model_calls = 2;
   custom.observability.tool_calls = 2;
   custom.ruleset = {
     version: 1,
     panels: [{ buttons: [{ label: 'Start focus room' }] }],
     modals: [],
-    rules: [{ actions: [{ name: 'focus-${input.room_name}' }, { content: 'Read this first' }] }],
+    rules: [
+      {},
+      {
+        actions: [
+          {},
+          { name: '${input.room_name} members' },
+          { name: 'focus-${input.room_name}' },
+          {},
+          {},
+          {},
+          { buttons: [{ label: 'Guide' }] },
+          { buttons: [{ label: 'Join' }] },
+        ],
+      },
+      { actions: [{ content: 'Read this first' }] },
+      { actions: [{}, {}, { content: 'Joined the study room' }] },
+    ],
   };
+  refreshCandidateHashes(custom);
   const expected = context({
     expectedModelCallsPerTurn: '2',
     expectedToolCallsPerTurn: '2',
-    expectedRulesetStringValues: JSON.stringify([
-      'Start focus room',
-      'focus-${input.room_name}',
-      'Read this first',
+    expectedRulesetPathValues: JSON.stringify({
+      '/panels/0/buttons/0/label': 'Start focus room',
+      '/rules/1/actions/1/name': '${input.room_name} members',
+      '/rules/1/actions/2/name': 'focus-${input.room_name}',
+      '/rules/1/actions/6/buttons/0/label': 'Guide',
+      '/rules/1/actions/7/buttons/0/label': 'Join',
+      '/rules/2/actions/0/content': 'Read this first',
+      '/rules/3/actions/2/content': 'Joined the study room',
+    }),
+    expectedRulesetAbsentPaths: JSON.stringify([
+      '/rules/1/actions/6/buttons/1',
+      '/rules/4',
     ]),
   });
   const document = JSON.stringify(custom);
   assert.equal(checks.intentOneCallTurns(document, expected).pass, true);
-  assert.equal(checks.intentRulesetStringValues(document, expected).pass, true);
+  assert.equal(checks.intentRulesetPathValues(document, expected).pass, true);
 
-  custom.ruleset.rules[0].actions.pop();
+  custom.ruleset.rules[1].actions[6].buttons[0].label = 'Read this first';
+  custom.ruleset.rules[2].actions[0].content = 'Guide';
+  refreshCandidateHashes(custom);
   assert.match(
-    checks.intentRulesetStringValues(JSON.stringify(custom), expected).reason,
-    /missing RuleSet string values=/,
+    checks.intentRulesetPathValues(JSON.stringify(custom), expected).reason,
+    /path=\/rules\/1\/actions\/6\/buttons\/0\/label.*path=\/rules\/2\/actions\/0\/content/,
+  );
+});
+
+test('report observability is strict and sequential request durations fit inside the burst', () => {
+  const extra = JSON.parse(report());
+  extra.observability.unknown_counter = 0;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(extra), context()).reason,
+    /observability has invalid fields/,
+  );
+
+  const missing = JSON.parse(report());
+  delete missing.observability.intent_compiled_operations;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(missing), context()).reason,
+    /observability has invalid fields/,
+  );
+
+  const invalidMap = JSON.parse(report());
+  invalidMap.observability.intent_fallback_routes = [];
+  assert.match(
+    checks.intentReceipt(JSON.stringify(invalidMap), context()).reason,
+    /missing object observability.intent_fallback_routes/,
+  );
+
+  const sequential = JSON.parse(report());
+  sequential.turns[0].model_calls = 2;
+  sequential.turns[0].model_tool_calls = 2;
+  sequential.turns[0].model_call_metrics.push(metric('extract_private_study_room_details', 2));
+  sequential.model_call_metrics = sequential.turns[0].model_call_metrics;
+  sequential.observability.model_calls = 2;
+  sequential.observability.tool_calls = 2;
+  assert.equal(
+    checks.intentReceipt(JSON.stringify(sequential), context()).pass,
+    true,
+  );
+
+  sequential.turns[0].model_call_metrics[0].request_duration_ms = 500;
+  sequential.turns[0].model_call_metrics[1].request_duration_ms = 500;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(sequential), context()).reason,
+    /request duration exceeds burst duration/,
   );
 });
 
@@ -318,6 +573,7 @@ test('detail-path assertion pins custom copy and untouched naming and control de
       { actions: [{}, {}, { content: 'Joined the study room' }] },
     ],
   };
+  refreshCandidateHashes(custom);
   const expected = context({
     expectedRulesetPathValues: JSON.stringify({
       '/panels/0/buttons/0/label': 'Begin deep work',
@@ -336,16 +592,65 @@ test('detail-path assertion pins custom copy and untouched naming and control de
   assert.equal(checks.intentRulesetPathValues(JSON.stringify(custom), expected).pass, true);
 
   custom.ruleset.rules[1].actions[2].name = 'focus-${input.room_name}';
+  refreshCandidateHashes(custom);
   assert.match(
     checks.intentRulesetPathValues(JSON.stringify(custom), expected).reason,
     /path=\/rules\/1\/actions\/2\/name/,
   );
   custom.ruleset.rules[1].actions[2].name = 'study-${input.room_name}';
   custom.ruleset.rules[1].actions[6].buttons.push({ label: 'Close' });
+  refreshCandidateHashes(custom);
   assert.match(
     checks.intentRulesetPathValues(JSON.stringify(custom), expected).reason,
     /unexpected RuleSet path=\/rules\/1\/actions\/6\/buttons\/1/,
   );
+});
+
+test('Korean RuleSet expectations reject an English default RuleSet', () => {
+  const english = JSON.parse(report());
+  english.ruleset = {
+    version: 1,
+    panels: [{ content: 'Create a study room', buttons: [{ label: 'Create room' }] }],
+    modals: [{ title: 'Create study room', fields: [{ label: 'Room name' }] }],
+    rules: [
+      {},
+      {
+        actions: [
+          {},
+          { name: '${input.room_name} members' },
+          { name: 'study-${input.room_name}' },
+          {},
+          {},
+          {},
+          { content: 'Welcome to ${input.room_name}', buttons: [{ label: 'Help' }] },
+          { content: '${input.room_name} is open', buttons: [{ label: 'Join' }] },
+          {},
+          { content: 'Created ${input.room_name}' },
+        ],
+      },
+      { actions: [{ content: 'This is a private study room' }] },
+      { actions: [{}, {}, { content: 'Joined the study room' }] },
+    ],
+  };
+  refreshCandidateHashes(english);
+  const korean = context({
+    expectedRulesetPathValues: JSON.stringify({
+      '/panels/0/content': '스터디룸을 만들어보세요',
+      '/panels/0/buttons/0/label': '스터디룸 만들기',
+      '/modals/0/title': '스터디룸 만들기',
+      '/modals/0/fields/0/label': '방 이름',
+      '/rules/1/actions/1/name': '${input.room_name} 멤버',
+      '/rules/1/actions/6/buttons/0/label': '도움말',
+      '/rules/1/actions/7/buttons/0/label': '참가하기',
+      '/rules/2/actions/0/content': '멤버 역할이 있는 사용자만 볼 수 있는 비공개 스터디룸입니다',
+      '/rules/3/actions/2/content': '스터디룸에 참가했습니다',
+    }),
+  });
+
+  const result = checks.intentRulesetPathValues(JSON.stringify(english), korean);
+  assert.equal(result.pass, false);
+  assert.match(result.reason, /path=\/panels\/0\/content/);
+  assert.match(result.reason, /path=\/rules\/3\/actions\/2\/content/);
 });
 
 test('structural assertions ignore key order and reject contract drift', () => {
@@ -359,11 +664,16 @@ test('structural assertions ignore key order and reject contract drift', () => {
   const value = reordered.final_intent.public_status.receipt;
   reordered.final_intent.public_status.receipt = {
     compiled_operations: value.compiled_operations,
+    candidate_draft_hash: value.candidate_draft_hash,
+    candidate_ruleset_hash: value.candidate_ruleset_hash,
     compiled_plan_hash: value.compiled_plan_hash,
     semantic_intent_hash: value.semantic_intent_hash,
-    input_intent_hash: value.input_intent_hash,
+    compiler_input_hash: value.compiler_input_hash,
+    request_evidence_entries: value.request_evidence_entries,
+    request_evidence_hash: value.request_evidence_hash,
     candidate_revision: value.candidate_revision,
     intent_revision: value.intent_revision,
+    identity_revision: value.identity_revision,
   };
 
   assert.equal(checks.intentProvenance(JSON.stringify(reordered), context()).pass, true);
@@ -388,11 +698,16 @@ test('structural assertions remain exact in the Promptfoo VM realm', () => {
   const value = reordered.final_intent.public_status.receipt;
   reordered.final_intent.public_status.receipt = {
     compiled_operations: value.compiled_operations,
+    candidate_draft_hash: value.candidate_draft_hash,
+    candidate_ruleset_hash: value.candidate_ruleset_hash,
     compiled_plan_hash: value.compiled_plan_hash,
     semantic_intent_hash: value.semantic_intent_hash,
-    input_intent_hash: value.input_intent_hash,
+    compiler_input_hash: value.compiler_input_hash,
+    request_evidence_entries: value.request_evidence_entries,
+    request_evidence_hash: value.request_evidence_hash,
     candidate_revision: value.candidate_revision,
     intent_revision: value.intent_revision,
+    identity_revision: value.identity_revision,
   };
 
   assert.equal(vmChecks.intentProvenance(JSON.stringify(reordered), context()).pass, true);
@@ -417,7 +732,7 @@ test('decision and restart assertions require a mutation-free pending turn and d
     intent_revision_after: 1,
     draft_revision_after: 0,
     draft_changed: false,
-    actual_gates: { validation_current: false, simulation_current: false },
+    actual_gates: staleGates(),
     restart_after: true,
     restart_performed: true,
   });
@@ -436,13 +751,13 @@ test('decision and restart assertions require a mutation-free pending turn and d
   });
   const document = report({
     turns: [pending, resolved],
-    observability: { model_calls: 2, tool_calls: 2 },
+    observability: observability(2, 2),
     persistence: {
       backend: 'sqlite_file',
       store_writes: 2,
       connection_reopen_count: 1,
       final_generation: 2,
-      snapshot_schema_version: 6,
+      snapshot_schema_version: 8,
       roundtrip_verified: true,
     },
     elapsed_ms: 2000,
@@ -475,6 +790,114 @@ test('decision and restart assertions require a mutation-free pending turn and d
   );
 });
 
+test('normalizer assertion pins discussion holds and metalinguistic copies to no mutation', () => {
+  const routeDecision = decision('discussion');
+  const document = routedDocument(
+    routeDecision,
+    'We can compare the tradeoffs without changing the Draft.',
+    'normalizer-discussion',
+  );
+  for (const normalizerContract of [
+    'same_target_hold',
+    'korean_compound_discussion',
+    'multi_sentence_metalinguistic_copy',
+  ]) {
+    const expected = context({ normalizerContract });
+    assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
+  }
+
+  const mutated = JSON.parse(document);
+  mutated.turns[0].draft_changed = true;
+  assert.match(
+    checks.intentNormalizerBehavior(
+      JSON.stringify(mutated),
+      context({ normalizerContract: 'same_target_hold' }),
+    ).reason,
+    /mutation-free discussion route/,
+  );
+});
+
+test('normalizer assertion pins preview disambiguation to the default one-call recipe', () => {
+  const document = report();
+  const expected = context({
+    normalizerContract: 'validated_preview_disambiguation',
+    normalizerBaselineCase: 'intent_private_study_room_en',
+  });
+  assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
+
+  assert.match(
+    checks.intentNormalizerBehavior(
+      document,
+      context({ normalizerContract: 'validated_preview_disambiguation' }),
+    ).reason,
+    /pinned equivalence baseline/,
+  );
+
+  const extraCall = JSON.parse(document);
+  extraCall.turns[0].model_calls = 2;
+  extraCall.turns[0].model_tool_calls = 2;
+  extraCall.turns[0].model_call_metrics.push(
+    metric('extract_private_study_room_details', 2),
+  );
+  extraCall.model_call_metrics = structuredClone(extraCall.turns[0].model_call_metrics);
+  extraCall.observability.model_calls = 2;
+  extraCall.observability.tool_calls = 2;
+  assert.match(
+    checks.intentNormalizerBehavior(JSON.stringify(extraCall), expected).reason,
+    /one-call validated-preview route/,
+  );
+});
+
+test('normalizer assertion requires routed discussion replay across restart before build', () => {
+  const discussion = turn({
+    id: 'discuss-before-restart',
+    input: 'Discuss first',
+    outcome: 'routed',
+    completed: false,
+    message: 'We can compare the tradeoffs without changing the Draft.',
+    deterministic_operations: 0,
+    intent_counters: counters({
+      route_calls: 1,
+      fallback_routes: { discussion: 1 },
+    }),
+    stage_after: 'empty',
+    intent_revision_after: 0,
+    route_decision: decision('discussion'),
+    draft_revision_after: 0,
+    draft_changed: false,
+    actual_gates: staleGates(),
+    restart_after: true,
+    restart_performed: true,
+  });
+  const build = turn({
+    id: 'build-after-restart',
+    intent_revision_before: 0,
+    intent_revision_after: 1,
+  });
+  const document = report({
+    turns: [discussion, build],
+    observability: observability(2, 2),
+    persistence: {
+      backend: 'sqlite_file',
+      store_writes: 2,
+      connection_reopen_count: 1,
+      final_generation: 2,
+      snapshot_schema_version: 8,
+      roundtrip_verified: true,
+    },
+    elapsed_ms: 2000,
+  });
+  const expected = context({ normalizerContract: 'discussion_restart_restore' });
+  assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
+
+  const broken = JSON.parse(document);
+  broken.persistence.roundtrip_verified = false;
+  assert.match(
+    checks.intentNormalizerBehavior(JSON.stringify(broken), expected).reason,
+    /persistence evidence is incomplete/,
+  );
+});
+
 test('fallback assertions require one explicit route and zero Draft mutation', () => {
   const routed = turn({
     id: 'custom',
@@ -487,14 +910,14 @@ test('fallback assertions require one explicit route and zero Draft mutation', (
     route_decision: decision('typed_planner'),
     draft_revision_after: 0,
     draft_changed: false,
-    actual_gates: { validation_current: false, simulation_current: false },
+    actual_gates: staleGates(),
   });
   const document = report({
     outcome: 'routed',
     completed: false,
     turns: [routed],
     draft_revision: 0,
-    actual_gates: { validation_current: false, simulation_current: false },
+    actual_gates: staleGates(),
     final_intent: {
       status: 'empty',
       receipt: null,
@@ -520,6 +943,13 @@ test('fallback assertions require one explicit route and zero Draft mutation', (
   const broken = JSON.parse(document);
   broken.turns[0].intent_counters.commits = 1;
   assert.match(checks.intentNoMutationFallback(JSON.stringify(broken), expected).reason, /mutated or compiled/);
+
+  const halted = JSON.parse(document);
+  halted.turns[0].outcome = 'halted';
+  const haltedResult = checks.intentNoMutationFallback(JSON.stringify(halted), expected);
+  assert.equal(haltedResult.pass, false);
+  assert.match(haltedResult.reason, /did not reach a deterministic terminal route/);
+  assert.doesNotMatch(haltedResult.reason, /mutated or compiled/);
 });
 
 test('adjudication assertion enforces exact creator and stateful blocker contracts', () => {
@@ -550,8 +980,23 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
     blocker('persistent_economy_ledger', 'unavailable'),
     blocker('restart_persistent_state', 'unavailable'),
   ];
-  const statefulDecision = decision('capability_gap', { blockers: statefulBlockers });
-  const statefulMessage = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Durable timers (unavailable), Event-time LLM decisions (forbidden by policy), Persistent economy ledger (unavailable), State preserved across restarts (unavailable). I did not build a partial or weakened version.';
+  const statefulRequirements = [
+    'an LLM decides rewards at event time',
+    'every message earns XP',
+    'levels unlock an economy',
+    'timers advance quests',
+  ];
+  const statefulUnclassified = blocker('unclassified_intent_requirement', 'unclassified');
+  statefulUnclassified.evidence = statefulRequirements.map((description, index) => evidence(
+    `intent.core.unclassified_requirements.${index}`,
+    description,
+  ));
+  statefulBlockers.push(statefulUnclassified);
+  const statefulDecision = decision('capability_gap', {
+    blockers: statefulBlockers,
+    unclassified_requirements: statefulRequirements,
+  });
+  const statefulMessage = `I preserved the request, but did not compile it because these required capabilities are not currently supported: Durable timers (unavailable), Event-time LLM decisions (forbidden by policy), Persistent economy ledger (unavailable), State preserved across restarts (unavailable), Unclassified hard requirement (unclassified): ${statefulRequirements.join(', ')}. I did not build a partial or weakened version.`;
   const statefulExpected = context({
     caseId: 'intent_stateful_game_gap',
     expectedOutcomes: 'routed',
@@ -560,13 +1005,57 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
     expectedFinalStatus: 'empty',
     expectedCompiledOperations: undefined,
     completeRequest: false,
-    expectedBlockers: 'durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|',
+    expectedBlockers: 'durable_timer|unavailable|,event_time_llm_decision|forbidden_policy|event_time_llm_execution_forbidden_v1,persistent_economy_ledger|unavailable|,restart_persistent_state|unavailable|,unclassified_intent_requirement|unclassified|',
+    expectedUnclassifiedRequirements: JSON.stringify(statefulRequirements),
   });
-  const stateful = routedDocument(statefulDecision, statefulMessage, 'stateful-game');
+  const statefulInput = `Build a stateful game where ${statefulRequirements.join(', ')}. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts.`;
+  const stateful = routedDocument(
+    statefulDecision,
+    statefulMessage,
+    'stateful-game',
+    statefulInput,
+  );
   assert.equal(checks.intentAdjudicationDecision(stateful, statefulExpected).pass, true);
 
+  const ungrounded = JSON.parse(stateful);
+  ungrounded.turns[0].input = 'Build a generic stateful game';
+  assert.match(
+    checks.intentAdjudicationDecision(JSON.stringify(ungrounded), statefulExpected).reason,
+    /unclassified evidence not grounded/,
+  );
+
+  const swappedUnclassifiedPaths = JSON.parse(stateful);
+  const unclassifiedEvidence =
+    swappedUnclassifiedPaths.turns[0].route_decision.blockers[4].evidence;
+  [unclassifiedEvidence[0].semantic_path, unclassifiedEvidence[1].semantic_path] =
+    [unclassifiedEvidence[1].semantic_path, unclassifiedEvidence[0].semantic_path];
+  unclassifiedEvidence.sort((left, right) => left.semantic_path.localeCompare(right.semantic_path));
+  swappedUnclassifiedPaths.final_intent.route_decision =
+    swappedUnclassifiedPaths.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(
+      JSON.stringify(swappedUnclassifiedPaths),
+      statefulExpected,
+    ).reason,
+    /unclassified evidence does not match indexed unclassified_requirements/,
+  );
+
+  const swappedRuntimeEvidence = JSON.parse(stateful);
+  const runtimeBlockers = swappedRuntimeEvidence.turns[0].route_decision.blockers;
+  [runtimeBlockers[0].evidence, runtimeBlockers[1].evidence] =
+    [runtimeBlockers[1].evidence, runtimeBlockers[0].evidence];
+  swappedRuntimeEvidence.final_intent.route_decision =
+    swappedRuntimeEvidence.turns[0].route_decision;
+  assert.match(
+    checks.intentAdjudicationDecision(
+      JSON.stringify(swappedRuntimeEvidence),
+      statefulExpected,
+    ).reason,
+    /capability evidence contract/,
+  );
+
   const missing = JSON.parse(stateful);
-  missing.turns[0].route_decision.blockers.pop();
+  missing.turns[0].route_decision.blockers.shift();
   missing.final_intent.route_decision = missing.turns[0].route_decision;
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(missing), statefulExpected).reason,
@@ -575,16 +1064,18 @@ test('adjudication assertion enforces exact creator and stateful blocker contrac
 });
 
 test('adjudication assertion preserves exact unclassified capability evidence', () => {
+  const exactRequirement =
+    'a static Discord button flow that must acquire an external consensus lease before responding';
   const unknown = blocker('unclassified_intent_requirement', 'unclassified');
   unknown.evidence = [evidence(
     'intent.core.unclassified_requirements.0',
-    'external consensus lease',
+    exactRequirement,
   )];
   const routeDecision = decision('capability_gap', {
     blockers: [unknown],
-    unclassified_requirements: ['external consensus lease'],
+    unclassified_requirements: [exactRequirement],
   });
-  const message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external consensus lease. I did not build a partial or weakened version.';
+  const message = `I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): ${exactRequirement}. I did not build a partial or weakened version.`;
   const expected = context({
     expectedOutcomes: 'routed',
     expectedStagePath: 'empty>empty',
@@ -593,9 +1084,14 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
     expectedCompiledOperations: undefined,
     completeRequest: false,
     expectedBlockers: 'unclassified_intent_requirement|unclassified|',
-    expectedUnclassifiedRequirements: 'external consensus lease',
+    expectedUnclassifiedRequirements: exactRequirement,
   });
-  const document = routedDocument(routeDecision, message, 'external-capability');
+  const document = routedDocument(
+    routeDecision,
+    message,
+    'external-capability',
+    `Build ${exactRequirement}. Preserve the external consensus lease requirement and do not replace it with a local approximation.`,
+  );
   assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
 
   const changed = JSON.parse(document);
@@ -603,31 +1099,19 @@ test('adjudication assertion preserves exact unclassified capability evidence', 
   changed.final_intent.route_decision = changed.turns[0].route_decision;
   assert.match(
     checks.intentAdjudicationDecision(JSON.stringify(changed), expected).reason,
-    /unclassified=/,
+    /unclassified evidence does not match indexed unclassified_requirements/,
   );
 
-  const grounded = JSON.parse(document);
-  grounded.turns[0].input = 'Must acquire an external consensus lease before responding';
-  grounded.turns[0].route_decision.unclassified_requirements = [
-    'acquire an external consensus lease',
-  ];
-  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
-  const containsExpected = context({
-    ...expected.vars,
-    expectedUnclassifiedRequirements: undefined,
-    expectedUnclassifiedEvidenceContains: 'external consensus lease',
-  });
-  delete containsExpected.vars.expectedUnclassifiedRequirements;
-  assert.equal(
-    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).pass,
-    true,
-  );
-
-  grounded.turns[0].route_decision.unclassified_requirements = ['external_consensus_lease'];
-  grounded.final_intent.route_decision = grounded.turns[0].route_decision;
+  const shortened = JSON.parse(document);
+  shortened.turns[0].route_decision.unclassified_requirements = ['external consensus lease'];
+  shortened.turns[0].route_decision.blockers[0].evidence[0].description =
+    'external consensus lease';
+  shortened.turns[0].message = 'I preserved the request, but did not compile it because these required capabilities are not currently supported: Unclassified hard requirement (unclassified): external consensus lease. I did not build a partial or weakened version.';
+  shortened.message = shortened.turns[0].message;
+  shortened.final_intent.route_decision = shortened.turns[0].route_decision;
   assert.match(
-    checks.intentAdjudicationDecision(JSON.stringify(grounded), containsExpected).reason,
-    /expected grounded evidence containing=/,
+    checks.intentAdjudicationDecision(JSON.stringify(shortened), expected).reason,
+    /unclassified=.*expected=/,
   );
 });
 
@@ -683,6 +1167,77 @@ test('route decision parser rejects source, manifest digest, and shape drift', (
   const shape = JSON.parse(report());
   shape.turns[0].route_decision.extra = true;
   assert.match(checks.intentReceipt(JSON.stringify(shape), context()).reason, /invalid fields/);
+
+  const evidenceHash = JSON.parse(report());
+  delete evidenceHash.turns[0].route_decision.request_evidence_hash;
+  assert.match(checks.intentReceipt(JSON.stringify(evidenceHash), context()).reason, /invalid fields/);
+});
+
+test('V4 report contract rejects version, evidence, and candidate identity drift', () => {
+  const protocol = JSON.parse(report());
+  protocol.intent_protocol_version = 3;
+  assert.match(checks.intentReceipt(JSON.stringify(protocol), context()).reason, /contract identity/);
+
+  const adjudicator = JSON.parse(report());
+  adjudicator.intent_adjudicator_version = 2;
+  assert.match(checks.intentReceipt(JSON.stringify(adjudicator), context()).reason, /contract identity/);
+
+  const oldExtractor = JSON.parse(report());
+  oldExtractor.catalog_identity.extractor_revision = 13;
+  assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
+
+  const oldNormalizer = JSON.parse(report());
+  oldNormalizer.catalog_identity.normalizer_revision = 8;
+  assert.match(checks.intentReceipt(JSON.stringify(oldNormalizer), context()).reason, /catalog identity/);
+
+  const forgedRegistry = JSON.parse(report());
+  forgedRegistry.catalog_identity.registry_digest = '8'.repeat(64);
+  assert.match(checks.intentReceipt(JSON.stringify(forgedRegistry), context()).reason, /catalog identity/);
+
+  const identity = JSON.parse(report());
+  identity.final_intent.receipt.identity_revision = 1;
+  identity.final_intent.public_status.receipt.identity_revision = 1;
+  assert.match(checks.intentReceipt(JSON.stringify(identity), context()).reason, /identity_revision/);
+
+  const legacyCompiler = JSON.parse(report());
+  for (const value of [
+    legacyCompiler.final_intent.receipt,
+    legacyCompiler.final_intent.public_status.receipt,
+  ]) {
+    value.input_intent_hash = value.compiler_input_hash;
+    delete value.compiler_input_hash;
+  }
+  assert.match(checks.intentReceipt(JSON.stringify(legacyCompiler), context()).reason, /invalid fields/);
+
+  const evidence = JSON.parse(report());
+  evidence.final_intent.receipt.request_evidence_entries = 0;
+  evidence.final_intent.public_status.receipt.request_evidence_entries = 0;
+  assert.match(checks.intentReceipt(JSON.stringify(evidence), context()).reason, /must be positive/);
+
+  const candidate = JSON.parse(report());
+  candidate.final_intent.receipt.candidate_draft_hash = 'invalid';
+  candidate.final_intent.public_status.receipt.candidate_draft_hash = 'invalid';
+  assert.match(checks.intentReceipt(JSON.stringify(candidate), context()).reason, /candidate_draft_hash/);
+
+  const forgedRuleset = JSON.parse(report());
+  forgedRuleset.final_intent.receipt.candidate_ruleset_hash = '7'.repeat(64);
+  forgedRuleset.final_intent.public_status.receipt.candidate_ruleset_hash = '7'.repeat(64);
+  assert.match(
+    checks.intentReceipt(JSON.stringify(forgedRuleset), context()).reason,
+    /candidate_ruleset_hash does not match/,
+  );
+
+  const forgedDraft = JSON.parse(report());
+  forgedDraft.final_intent.receipt.candidate_draft_hash = '7'.repeat(64);
+  forgedDraft.final_intent.public_status.receipt.candidate_draft_hash = '7'.repeat(64);
+  assert.match(
+    checks.intentReceipt(JSON.stringify(forgedDraft), context()).reason,
+    /candidate_draft_hash does not match/,
+  );
+
+  const snapshot = JSON.parse(report());
+  snapshot.persistence.snapshot_schema_version = 6;
+  assert.match(checks.intentReceipt(JSON.stringify(snapshot), context()).reason, /SQLite persistence/);
 });
 
 test('terminal responses and final decisions cannot diverge from deterministic evidence', () => {
@@ -715,10 +1270,192 @@ test('terminal responses and final decisions cannot diverge from deterministic e
   );
 });
 
+test('discussion response quality accepts concise complete English and Korean prose', () => {
+  const routeDecision = decision('discussion');
+  const expected = context({
+    expectedOutcomes: 'routed',
+    expectedStagePath: 'empty>empty',
+    expectedRoutePath: 'discussion',
+    expectedFinalStatus: 'empty',
+    expectedCompiledOperations: undefined,
+    completeRequest: false,
+  });
+  for (const message of [
+    'Private rooms improve focus and privacy. They add discovery friction and moderation overhead. We can compare those tradeoffs before changing the Draft.',
+    '비공개 방은 몰입감과 안전성을 높입니다. 대신 방 탐색과 관리 비용이 늘어날 수 있습니다. Draft를 바꾸지 않고 이 균형을 먼저 비교해보겠습니다.',
+    'We can compare the tradeoffs without changing the Draft.',
+  ]) {
+    const document = routedDocument(routeDecision, message, 'discussion-quality');
+    assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
+  }
+  const promotedJson = JSON.parse(routedDocument(
+    routeDecision,
+    'We can compare the tradeoffs without changing the Draft.',
+    'discussion-quality',
+  ));
+  promotedJson.turns[0].model_call_metrics[0].finish_reason = 'stop';
+  promotedJson.model_call_metrics[0].finish_reason = 'stop';
+  assert.equal(
+    checks.intentAdjudicationDecision(JSON.stringify(promotedJson), expected).pass,
+    true,
+  );
+});
+
+test('discussion response quality rejects completion limits and structurally poor endings', () => {
+  const routeDecision = decision('discussion');
+  const expected = context({
+    expectedOutcomes: 'routed',
+    expectedStagePath: 'empty>empty',
+    expectedRoutePath: 'discussion',
+    expectedFinalStatus: 'empty',
+    expectedCompiledOperations: undefined,
+    completeRequest: false,
+  });
+  const qualityFailure = (message, reason, mutate = () => {}, contextOverride = expected) => {
+    const document = JSON.parse(routedDocument(routeDecision, message, 'discussion-quality'));
+    mutate(document);
+    const actual = checks.intentAdjudicationDecision(JSON.stringify(document), contextOverride);
+    assert.equal(actual.pass, false);
+    assert.match(actual.reason, reason);
+  };
+
+  qualityFailure(
+    'This concise comparison is complete.',
+    /completion-token cap/,
+    (document) => {
+      document.turns[0].model_call_metrics[0].completion_tokens = 512;
+      document.model_call_metrics[0].completion_tokens = 512;
+    },
+  );
+  qualityFailure(
+    'This concise comparison is complete.',
+    /completion-limit finish reason/,
+    (document) => {
+      document.turns[0].model_call_metrics[0].finish_reason = 'length';
+      document.model_call_metrics[0].finish_reason = 'length';
+    },
+  );
+  qualityFailure(`${'A focused comparison remains useful. '.repeat(30)}`, /overly long/);
+  qualityFailure(`${'😀'.repeat(300)}.`, /overly long/);
+  qualityFailure('### Tradeoffs\nPrivacy improves, while discovery becomes harder.', /Markdown heading/);
+  qualityFailure(
+    'Choice | Benefit | Cost\n--- | --- | ---\nPrivate | Focus | Discovery friction',
+    /Markdown table/,
+  );
+  qualityFailure(
+    '- Focus\n- Privacy\n- Safety\n- Moderation\n- Discovery',
+    /long list/,
+  );
+  qualityFailure('Privacy improves, but the next tradeoff is…', /unfinished ending/);
+  qualityFailure('Privacy improves (with stricter access.', /unbalanced delimiters/);
+  qualityFailure(
+    'Focus improves. Privacy improves. Discovery becomes harder. Moderation costs rise. The balance depends on the community.',
+    /more than four sentences/,
+  );
+});
+
 test('schema, model, oracle, calls, and hard latency regressions fail closed', () => {
+  const nativeWorkerAccounting = JSON.parse(report());
+  for (const value of [
+    nativeWorkerAccounting.turns[0].model_call_metrics[0],
+    nativeWorkerAccounting.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 0;
+    value.request_body_bytes = value.message_bytes + value.tool_bytes + 1;
+  }
+  assert.equal(
+    checks.intentReceipt(JSON.stringify(nativeWorkerAccounting), context()).pass,
+    true,
+  );
+
+  const nativeWorkerUnderAccounting = JSON.parse(report());
+  for (const value of [
+    nativeWorkerUnderAccounting.turns[0].model_call_metrics[0],
+    nativeWorkerUnderAccounting.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 0;
+    value.request_body_bytes = value.message_bytes + value.tool_bytes;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(nativeWorkerUnderAccounting), context()).reason,
+    /byte accounting is invalid/,
+  );
+
   const malformed = JSON.parse(report());
   malformed.schema_version = 2;
-  assert.match(checks.intentReceipt(JSON.stringify(malformed), context()).reason, /must be 3/);
+  assert.match(checks.intentReceipt(JSON.stringify(malformed), context()).reason, /must be 5/);
+
+  const duplicatedSchemaBudget = JSON.parse(report());
+  for (const value of [
+    duplicatedSchemaBudget.turns[0].model_call_metrics[0],
+    duplicatedSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.duplicated_schema_bytes = 1601;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(duplicatedSchemaBudget), context()).reason,
+    /exceeds the Core schema budget/,
+  );
+
+  const combinedSchemaBudget = JSON.parse(report());
+  for (const value of [
+    combinedSchemaBudget.turns[0].model_call_metrics[0],
+    combinedSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.tool_bytes = 2701;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(combinedSchemaBudget), context()).reason,
+    /exceeds the Core schema budget/,
+  );
+
+  const detailSchemaBudget = JSON.parse(report());
+  for (const value of [
+    detailSchemaBudget.turns[0].model_call_metrics[0],
+    detailSchemaBudget.model_call_metrics[0],
+  ]) {
+    value.frontier_name = 'extract_private_study_room_details';
+    value.duplicated_schema_bytes = 2100;
+    value.request_body_bytes = 7000;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(detailSchemaBudget), context()).reason,
+    /exceeds the detail schema budget/,
+  );
+
+  const invalidByteAccounting = JSON.parse(report());
+  for (const value of [
+    invalidByteAccounting.turns[0].model_call_metrics[0],
+    invalidByteAccounting.model_call_metrics[0],
+  ]) {
+    value.request_body_bytes = value.message_bytes
+      + value.tool_bytes
+      + value.duplicated_schema_bytes;
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(invalidByteAccounting), context()).reason,
+    /byte accounting is invalid/,
+  );
+
+  const missingFinishReason = JSON.parse(report());
+  delete missingFinishReason.turns[0].model_call_metrics[0].finish_reason;
+  delete missingFinishReason.model_call_metrics[0].finish_reason;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(missingFinishReason), context()).reason,
+    /model_call_metrics\[0\] has invalid fields/,
+  );
+
+  const failedFinishReason = JSON.parse(report());
+  for (const value of [
+    failedFinishReason.turns[0].model_call_metrics[0],
+    failedFinishReason.model_call_metrics[0],
+  ]) {
+    value.outcome = 'invalid_response';
+  }
+  assert.match(
+    checks.intentReceipt(JSON.stringify(failedFinishReason), context()).reason,
+    /failed response has a finish reason/,
+  );
 
   const wrongModel = JSON.parse(report());
   wrongModel.served_model = 'other';
@@ -730,9 +1467,35 @@ test('schema, model, oracle, calls, and hard latency regressions fail closed', (
 
   const calls = JSON.parse(report());
   calls.turns[0].model_calls = 2;
-  assert.match(checks.intentOneCallTurns(JSON.stringify(calls), context()).reason, /expected=1\/1/);
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(calls), context()).reason,
+    /metric call count differs from model_calls/,
+  );
+
+  const attempt = JSON.parse(report());
+  attempt.turns[0].model_call_metrics[0].attempt = 2;
+  attempt.model_call_metrics[0].attempt = 2;
+  assert.match(
+    checks.intentOneCallTurns(JSON.stringify(attempt), context()).reason,
+    /attempts are not contiguous/,
+  );
+
+  const fabricatedUsage = JSON.parse(report());
+  for (const value of [
+    fabricatedUsage.turns[0].model_call_metrics[0],
+    fabricatedUsage.model_call_metrics[0],
+  ]) {
+    value.outcome = 'transport_error';
+    value.http_status = null;
+    value.served_model = null;
+  }
+  assert.match(
+    checks.intentProvenance(JSON.stringify(fabricatedUsage), context()).reason,
+    /fabricated token usage/,
+  );
 
   const latency = JSON.parse(report());
   latency.turns[0].elapsed_ms = 60001;
+  latency.elapsed_ms = 60001;
   assert.match(checks.intentHardLatency(JSON.stringify(latency), context()).reason, /exceeded/);
 });

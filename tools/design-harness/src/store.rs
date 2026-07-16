@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 const STORE_SCHEMA_VERSION: u32 = 2;
-const LATEST_MIGRATABLE_SNAPSHOT_VERSION: u32 = 5;
+const LATEST_MIGRATABLE_SNAPSHOT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedSession {
@@ -142,6 +142,7 @@ impl SessionStore {
                 found: snapshot.schema_version,
             });
         }
+        snapshot.validate_durable_size()?;
         let snapshot_json = serde_json::to_string(snapshot)?;
         let transaction = self.connection.transaction()?;
         let next_generation = if expected_generation == 0 {
@@ -244,7 +245,7 @@ fn decode_snapshot(session_id: &str, snapshot_json: &str) -> Result<SessionSnaps
             session_id: session_id.to_string(),
         })?;
     if found != SESSION_SNAPSHOT_VERSION {
-        if (2..=LATEST_MIGRATABLE_SNAPSHOT_VERSION).contains(&found) {
+        if snapshot_can_migrate(&value, found) {
             migrate_snapshot(&mut value, found);
         } else {
             return Err(StoreError::UnsupportedSnapshotVersion {
@@ -260,6 +261,14 @@ fn decode_snapshot(session_id: &str, snapshot_json: &str) -> Result<SessionSnaps
         }
     })?;
     Ok(snapshot)
+}
+
+fn snapshot_can_migrate(value: &serde_json::Value, found: u32) -> bool {
+    (2..=LATEST_MIGRATABLE_SNAPSHOT_VERSION).contains(&found)
+        && matches!(
+            value.get("intent_recipe"),
+            None | Some(serde_json::Value::Null)
+        )
 }
 
 fn parse_generation(session_id: &str, generation: i64) -> Result<u64, StoreError> {
@@ -351,6 +360,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("session snapshot serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("session snapshot cannot be persisted: {0}")]
+    InvalidSnapshot(#[from] design_harness::SessionSnapshotError),
     #[error("session database schema version is corrupt: {value}")]
     CorruptSchemaVersion { value: String },
     #[error("unsupported session database schema version {found}; expected {expected}")]
@@ -383,7 +394,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use design_harness::{
-        DesignSession, SessionConfig, DEFAULT_SYSTEM_PROMPT, SESSION_SNAPSHOT_VERSION,
+        DesignSession, ResourceBindingMap, SessionConfig, DEFAULT_SYSTEM_PROMPT,
+        SESSION_SNAPSHOT_VERSION,
     };
     use rusqlite::Connection;
 
@@ -398,6 +410,47 @@ mod tests {
             "starring-design-harness-{label}-{}-{unique}.sqlite3",
             std::process::id()
         ))
+    }
+
+    fn insert_snapshot_row(
+        store: &SessionStore,
+        session_id: &str,
+        snapshot_json: &str,
+        updated_at: i64,
+        generation: i64,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO harness_sessions (
+                     session_id,
+                     snapshot_json,
+                     updated_at,
+                     generation
+                 )
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![session_id, snapshot_json, updated_at, generation],
+            )
+            .unwrap();
+    }
+
+    fn stored_snapshot_row(store: &SessionStore, session_id: &str) -> (String, i64, i64) {
+        store
+            .connection
+            .query_row(
+                "SELECT snapshot_json, generation, updated_at
+                 FROM harness_sessions
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -424,6 +477,38 @@ mod tests {
         store.save("planned", &planned).unwrap();
         assert_eq!(store.load("planned").unwrap(), Some(planned));
         assert_eq!(store.load("missing").unwrap(), None);
+
+        let intent =
+            DesignSession::with_intent_recipe((), ResourceBindingMap::default()).snapshot();
+        let digest = serde_json::to_value(&intent).unwrap()["intent_recipe"]
+            ["transcript_integrity_digest"]
+            .clone();
+        assert_eq!(digest.as_str().unwrap().len(), 64);
+        store.save("intent", &intent).unwrap();
+        let restored = store.load("intent").unwrap().unwrap();
+        assert_eq!(restored, intent);
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["intent_recipe"]["transcript_integrity_digest"],
+            digest
+        );
+    }
+
+    #[test]
+    fn store_rejects_an_intent_snapshot_that_cannot_be_restored() {
+        let mut snapshot =
+            DesignSession::with_intent_recipe((), ResourceBindingMap::default()).snapshot();
+        snapshot
+            .messages
+            .push(design_harness::Message::user("x".repeat(4 * 1024 * 1024)));
+        let mut store = SessionStore::open_in_memory().unwrap();
+
+        assert!(matches!(
+            store.save_compare_and_swap("oversized", 0, &snapshot),
+            Err(StoreError::InvalidSnapshot(
+                design_harness::SessionSnapshotError::InvalidInvariant { .. }
+            ))
+        ));
+        assert!(store.load_versioned("oversized").unwrap().is_none());
     }
 
     #[test]
@@ -877,6 +962,99 @@ mod tests {
         assert_eq!(migrated_value["intent_recipe"], serde_json::Value::Null);
         assert_eq!(migrated.observability.intent_route_calls, 0);
         assert!(migrated.observability.intent_fallback_routes.is_empty());
+    }
+
+    #[test]
+    fn version_six_and_seven_non_intent_snapshots_migrate_without_rewriting_rows() {
+        assert_eq!(SESSION_SNAPSHOT_VERSION, 8);
+        for version in [6, 7] {
+            for intent_recipe in [None, Some(serde_json::Value::Null)] {
+                let id = format!(
+                    "v{version}-{}",
+                    if intent_recipe.is_some() {
+                        "null"
+                    } else {
+                        "missing"
+                    }
+                );
+                let store = SessionStore::open_in_memory().unwrap();
+                let mut value = serde_json::to_value(DesignSession::new(()).snapshot()).unwrap();
+                value["schema_version"] = serde_json::json!(version);
+                match intent_recipe {
+                    Some(intent_recipe) => {
+                        value["intent_recipe"] = intent_recipe;
+                    }
+                    None => {
+                        value.as_object_mut().unwrap().remove("intent_recipe");
+                    }
+                }
+                let stored_json = value.to_string();
+                insert_snapshot_row(&store, &id, &stored_json, 41, 9);
+
+                let first = store.load_versioned(&id).unwrap().unwrap();
+                let second = store.load_versioned(&id).unwrap().unwrap();
+
+                assert_eq!(first, second);
+                assert_eq!(first.generation, 9);
+                assert_eq!(first.snapshot.schema_version, SESSION_SNAPSHOT_VERSION);
+                assert_eq!(
+                    serde_json::to_value(&first.snapshot).unwrap()["intent_recipe"],
+                    serde_json::Value::Null
+                );
+                assert!(
+                    DesignSession::restore((), SessionConfig::default(), first.snapshot).is_ok()
+                );
+                let persisted = stored_snapshot_row(&store, &id);
+                assert_eq!(persisted, (stored_json, 9, 41));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_intent_snapshots_are_rejected_without_rewriting_rows() {
+        assert_eq!(SESSION_SNAPSHOT_VERSION, 8);
+        let current_empty = serde_json::to_value(
+            DesignSession::with_intent_recipe((), Default::default()).snapshot(),
+        )
+        .unwrap()["intent_recipe"]
+            .clone();
+        let mut v3_empty = current_empty.clone();
+        v3_empty["protocol_version"] = serde_json::json!(3);
+        let mut v7_pre_identity = current_empty;
+        for field in [
+            "extractor_revision",
+            "normalizer_revision",
+            "transcript_integrity_digest",
+        ] {
+            v7_pre_identity.as_object_mut().unwrap().remove(field);
+        }
+        let cases = [
+            (2, "v2-intent", v3_empty.clone()),
+            (3, "v3-intent", v3_empty.clone()),
+            (4, "v4-intent", v3_empty.clone()),
+            (5, "v5-intent", v3_empty.clone()),
+            (6, "v6-intent-empty", v3_empty),
+            (6, "v6-intent-arbitrary", serde_json::json!(false)),
+            (7, "v7-intent-pre-identity", v7_pre_identity),
+            (7, "v7-intent-arbitrary", serde_json::json!(false)),
+        ];
+
+        for (version, id, intent_recipe) in cases {
+            let store = SessionStore::open_in_memory().unwrap();
+            let mut value = serde_json::to_value(DesignSession::new(()).snapshot()).unwrap();
+            value["schema_version"] = serde_json::json!(version);
+            value["intent_recipe"] = intent_recipe;
+            let stored_json = value.to_string();
+            insert_snapshot_row(&store, id, &stored_json, 53, 11);
+
+            assert!(matches!(
+                store.load_versioned(id),
+                Err(StoreError::UnsupportedSnapshotVersion { expected, found })
+                    if expected == SESSION_SNAPSHOT_VERSION && found == version
+            ));
+            let persisted = stored_snapshot_row(&store, id);
+            assert_eq!(persisted, (stored_json, 11, 53));
+        }
     }
 
     #[test]

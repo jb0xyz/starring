@@ -1,13 +1,14 @@
-description: Starring Gemma4 oracle-free close-disabled intent checkpoint
+description: Starring Luna medium oracle-free Intent V4 private-room checkpoint
 prompts:
   - label: intent-request
     raw: "{{request}}"
 providers:
   - id: file://provider.js
-    label: gemma4-12b-mlx-intent
+    label: gpt-5-6-luna-medium-intent
     config:
       intentOnly: true
-      model: gemma4:12b-mlx
+      model: gpt-5.6-luna
+      reasoningEffort: medium
       timeoutMs: 60000
       maxOutputBytes: 4194304
       bindings:

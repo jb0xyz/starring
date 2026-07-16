@@ -3,9 +3,12 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use super::{
-    parse_private_study_room_details, parse_private_study_room_details_for_serving,
-    private_study_room_details_frontier, private_study_room_details_frontier_for,
-    IntentRecipeDetailFacetV3, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    analyze_private_study_room_details, parse_private_study_room_details,
+    parse_private_study_room_details_for_active_serving,
+    parse_private_study_room_details_for_active_serving_with_parameters,
+    parse_private_study_room_details_for_serving, private_study_room_details_frontier,
+    private_study_room_details_frontier_for, private_study_room_details_frontier_for_fields,
+    IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 const CORE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -49,6 +52,452 @@ fn active_detail_frontier_exposes_and_requires_only_selected_facets() {
     assert!(
         schema_bytes < 1_800,
         "routed detail schema is {schema_bytes} bytes"
+    );
+}
+
+#[test]
+fn active_field_frontier_exposes_and_requires_only_grounded_material_leaves() {
+    let human = "Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let fields = analysis.fields();
+    let [tool] = private_study_room_details_frontier_for_fields(
+        &[
+            IntentRecipeDetailFacetV3::Copy,
+            IntentRecipeDetailFacetV3::Naming,
+            IntentRecipeDetailFacetV3::Controls,
+        ],
+        fields,
+    )
+    .unwrap();
+
+    assert_eq!(
+        property_names(&tool.parameters["properties"]["copy"]),
+        ["create_button_label"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    assert_eq!(
+        property_names(&tool.parameters["properties"]["naming"]),
+        ["channel_name_prefix"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    assert_eq!(
+        property_names(&tool.parameters["properties"]["controls"]),
+        ["help_label", "help_response"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    for facet in ["copy", "naming", "controls"] {
+        assert_eq!(
+            required_names(&tool.parameters["properties"][facet]),
+            property_names(&tool.parameters["properties"][facet])
+        );
+    }
+    assert!(!tool.parameters.to_string().contains("channel_name_suffix"));
+    assert!(serde_json::to_vec(&tool.parameters).unwrap().len() < 900);
+}
+
+#[test]
+fn every_detail_field_name_matches_serde_and_its_single_leaf_schema() {
+    let fields = [
+        IntentRecipeDetailFieldV4::LauncherContent,
+        IntentRecipeDetailFieldV4::CreateButtonLabel,
+        IntentRecipeDetailFieldV4::ModalTitle,
+        IntentRecipeDetailFieldV4::RoomNameLabel,
+        IntentRecipeDetailFieldV4::WelcomeContentPrefix,
+        IntentRecipeDetailFieldV4::WelcomeContentSuffix,
+        IntentRecipeDetailFieldV4::HubAnnouncementPrefix,
+        IntentRecipeDetailFieldV4::HubAnnouncementSuffix,
+        IntentRecipeDetailFieldV4::CompletedResponsePrefix,
+        IntentRecipeDetailFieldV4::CompletedResponseSuffix,
+        IntentRecipeDetailFieldV4::ChannelNamePrefix,
+        IntentRecipeDetailFieldV4::ChannelNameSuffix,
+        IntentRecipeDetailFieldV4::MemberRoleNamePrefix,
+        IntentRecipeDetailFieldV4::MemberRoleNameSuffix,
+        IntentRecipeDetailFieldV4::HelpLabel,
+        IntentRecipeDetailFieldV4::HelpResponse,
+        IntentRecipeDetailFieldV4::JoinLabel,
+        IntentRecipeDetailFieldV4::JoinedResponse,
+        IntentRecipeDetailFieldV4::CloseLabel,
+        IntentRecipeDetailFieldV4::ClosedResponse,
+    ];
+    for field in fields {
+        assert_eq!(serde_json::to_value(field).unwrap(), json!(field.as_str()));
+        let facet = field.facet();
+        let facet_name = match facet {
+            IntentRecipeDetailFacetV3::Copy => "copy",
+            IntentRecipeDetailFacetV3::Naming => "naming",
+            IntentRecipeDetailFacetV3::Controls => "controls",
+        };
+        let [tool] = private_study_room_details_frontier_for_fields(&[facet], &[field]).unwrap();
+        assert_eq!(
+            property_names(&tool.parameters),
+            [facet_name.to_string()].into()
+        );
+        assert_eq!(
+            required_names(&tool.parameters),
+            [facet_name.to_string()].into()
+        );
+        assert_eq!(
+            property_names(&tool.parameters["properties"][facet_name]),
+            [field.as_str().to_string()].into()
+        );
+        assert_eq!(
+            required_names(&tool.parameters["properties"][facet_name]),
+            [field.as_str().to_string()].into()
+        );
+    }
+    let facets = [
+        IntentRecipeDetailFacetV3::Copy,
+        IntentRecipeDetailFacetV3::Naming,
+        IntentRecipeDetailFacetV3::Controls,
+    ];
+    let [tool] = private_study_room_details_frontier_for_fields(&facets, &fields).unwrap();
+    let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
+    assert!(
+        schema_bytes < 2_100,
+        "all-field schema is {schema_bytes} bytes"
+    );
+}
+
+#[test]
+fn active_field_parser_requires_exact_leaf_shape_and_restores_empty_affix_counterpart() {
+    let human = "Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let fields = [
+        IntentRecipeDetailFieldV4::CreateButtonLabel,
+        IntentRecipeDetailFieldV4::ChannelNamePrefix,
+        IntentRecipeDetailFieldV4::HelpLabel,
+        IntentRecipeDetailFieldV4::HelpResponse,
+    ];
+    let facets = [
+        IntentRecipeDetailFacetV3::Copy,
+        IntentRecipeDetailFacetV3::Naming,
+        IntentRecipeDetailFacetV3::Controls,
+    ];
+    assert_eq!(analysis.fields(), &fields);
+    let arguments = json!({
+        "copy": {"create_button_label": "Start focus room"},
+        "naming": {"channel_name_prefix": "focus-"},
+        "controls": {"help_label": "Guide", "help_response": "Read this first"}
+    });
+    let parsed = parse_private_study_room_details_for_active_serving(
+        &arguments.to_string(),
+        &facets,
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    assert_eq!(parsed.naming().channel_name.as_ref().unwrap().suffix, "");
+
+    for invalid in [
+        json!({
+            "copy": {"create_button_label": "Start focus room"},
+            "naming": {"channel_name_prefix": "focus-", "channel_name_suffix": ""},
+            "controls": {"help_label": "Guide", "help_response": "Read this first"}
+        }),
+        json!({
+            "copy": {"create_button_label": "Start focus room"},
+            "naming": {"channel_name_prefix": "focus-"},
+            "controls": {"help_label": "Guide"}
+        }),
+        json!({
+            "copy": {"create_button_label": "Start focus room"},
+            "naming": {"channel_name_prefix": "focus-"},
+            "controls": {"help_label": "Guide", "help_response": null}
+        }),
+    ] {
+        let error = parse_private_study_room_details_for_active_serving(
+            &invalid.to_string(),
+            &facets,
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_FRONTIER_MISMATCH");
+    }
+}
+
+#[test]
+fn active_field_parser_reuses_the_exact_served_schema_without_contract_drift() {
+    let human = "Set the Help button label to 'Guide' and its response to 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let facets = [IntentRecipeDetailFacetV3::Controls];
+    let [tool] =
+        private_study_room_details_frontier_for_fields(&facets, analysis.fields()).unwrap();
+    let arguments = json!({
+        "controls": {"help_label": "Guide", "help_response": "Read this first"}
+    })
+    .to_string();
+    let rebuilt = parse_private_study_room_details_for_active_serving(
+        &arguments,
+        &facets,
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    let reused = parse_private_study_room_details_for_active_serving_with_parameters(
+        &arguments,
+        &facets,
+        analysis.expectations(),
+        &tool.parameters,
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    assert_eq!(reused, rebuilt);
+
+    let invalid = r#"{"controls":{"help_label":"Guide"}}"#;
+    let rebuilt = parse_private_study_room_details_for_active_serving(
+        invalid,
+        &facets,
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap_err();
+    let reused = parse_private_study_room_details_for_active_serving_with_parameters(
+        invalid,
+        &facets,
+        analysis.expectations(),
+        &tool.parameters,
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap_err();
+    assert_eq!(reused.code, rebuilt.code);
+    assert_eq!(reused.location, rebuilt.location);
+}
+
+#[test]
+fn active_field_parser_rejects_duplicate_root_and_leaf_keys_before_deserialization() {
+    let human = "Set the Help button label to 'Guide' and its response to 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let facets = [IntentRecipeDetailFacetV3::Controls];
+    let fields = [
+        IntentRecipeDetailFieldV4::HelpLabel,
+        IntentRecipeDetailFieldV4::HelpResponse,
+    ];
+    assert_eq!(analysis.fields(), &fields);
+    for arguments in [
+        r#"{"controls":{"help_label":"Guide","help_response":"Read this first"},"controls":{"help_label":"Guide","help_response":"Read this first"}}"#,
+        r#"{"controls":{"help_label":"Guide","help_label":"Guide","help_response":"Read this first"}}"#,
+    ] {
+        let error = parse_private_study_room_details_for_active_serving(
+            arguments,
+            &facets,
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_FRONTIER_MISMATCH");
+        assert!(error
+            .location
+            .starts_with("intent.details.arguments.controls"));
+    }
+}
+
+#[test]
+fn active_field_parser_reports_non_object_frontier_locations_deterministically() {
+    let human = "Set the Help button label to 'Guide'.";
+    let analysis = analyze_private_study_room_details(human);
+    for (arguments, location) in [
+        ("null", "intent.details.arguments"),
+        ("[]", "intent.details.arguments"),
+        (r#""scalar""#, "intent.details.arguments"),
+        (r#"{"controls":null}"#, "intent.details.arguments.controls"),
+        (r#"{"controls":[]}"#, "intent.details.arguments.controls"),
+        (
+            r#"{"controls":"scalar"}"#,
+            "intent.details.arguments.controls",
+        ),
+    ] {
+        let error = parse_private_study_room_details_for_active_serving(
+            arguments,
+            &[IntentRecipeDetailFacetV3::Controls],
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_FRONTIER_MISMATCH");
+        assert_eq!(error.location, location);
+    }
+}
+
+#[test]
+fn active_field_parser_binds_each_literal_to_its_exact_grounded_slot() {
+    let human = "Exact overrides: the launcher create-button label is 'Start focus room'; the Help button label is 'Guide' and its response is 'Read this first'.";
+    let analysis = analyze_private_study_room_details(human);
+    let facets = [
+        IntentRecipeDetailFacetV3::Copy,
+        IntentRecipeDetailFacetV3::Controls,
+    ];
+    for arguments in [
+        json!({
+            "copy": {"create_button_label": "Start focus room"},
+            "controls": {"help_label": "Read this first", "help_response": "Guide"}
+        }),
+        json!({
+            "copy": {"create_button_label": "Guide"},
+            "controls": {"help_label": "Start focus room", "help_response": "Read this first"}
+        }),
+        json!({
+            "copy": {"create_button_label": "a"},
+            "controls": {"help_label": "Guide", "help_response": "Read this first"}
+        }),
+    ] {
+        let error = parse_private_study_room_details_for_active_serving(
+            &arguments.to_string(),
+            &facets,
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_LITERAL_MISMATCH");
+        assert!(!error.message.contains("Guide"));
+        assert!(!error.message.contains("Read this first"));
+    }
+}
+
+#[test]
+fn active_field_parser_rejects_swaps_between_raw_literals_with_equal_normalized_text() {
+    for (human, facets, valid, swapped) in [
+        (
+            "Set the Help button label to 'A  B' and its response to 'A B'.",
+            vec![IntentRecipeDetailFacetV3::Controls],
+            json!({"controls": {"help_label": "A  B", "help_response": "A B"}}),
+            json!({"controls": {"help_label": "A B", "help_response": "A  B"}}),
+        ),
+        (
+            "Set the launcher create-button label to 'A  B' and the Help button label to 'A B'.",
+            vec![
+                IntentRecipeDetailFacetV3::Copy,
+                IntentRecipeDetailFacetV3::Controls,
+            ],
+            json!({
+                "copy": {"create_button_label": "A  B"},
+                "controls": {"help_label": "A B"}
+            }),
+            json!({
+                "copy": {"create_button_label": "A B"},
+                "controls": {"help_label": "A  B"}
+            }),
+        ),
+    ] {
+        let analysis = analyze_private_study_room_details(human);
+        parse_private_study_room_details_for_active_serving(
+            &valid.to_string(),
+            &facets,
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap();
+        let error = parse_private_study_room_details_for_active_serving(
+            &swapped.to_string(),
+            &facets,
+            analysis.expectations(),
+            4,
+            CORE_DIGEST,
+            human,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "RECIPE_DETAIL_LITERAL_MISMATCH");
+    }
+}
+
+#[test]
+fn active_field_parser_accepts_one_exact_literal_intentionally_shared_by_two_slots() {
+    let human = "Set the Help button label to 'Same text' and its response to 'Same text'.";
+    let analysis = analyze_private_study_room_details(human);
+    let parsed = parse_private_study_room_details_for_active_serving(
+        &json!({
+            "controls": {"help_label": "Same text", "help_response": "Same text"}
+        })
+        .to_string(),
+        &[IntentRecipeDetailFacetV3::Controls],
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    assert_eq!(parsed.controls().help_label.as_deref(), Some("Same text"));
+    assert_eq!(
+        parsed.controls().help_response.as_deref(),
+        Some("Same text")
+    );
+}
+
+#[test]
+fn active_field_parser_preserves_exact_human_whitespace_after_slot_matching() {
+    let human = "Set the modal title to 'Deep   Focus'.";
+    let analysis = analyze_private_study_room_details(human);
+    let parsed = parse_private_study_room_details_for_active_serving(
+        &json!({"copy": {"modal_title": "Deep   Focus"}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Copy],
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap();
+    assert_eq!(parsed.copy().modal_title.as_deref(), Some("Deep   Focus"));
+
+    let error = parse_private_study_room_details_for_active_serving(
+        &json!({"copy": {"modal_title": "Deep Focus"}}).to_string(),
+        &[IntentRecipeDetailFacetV3::Copy],
+        analysis.expectations(),
+        4,
+        CORE_DIGEST,
+        human,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "UNGROUNDED_RECIPE_DETAIL_LITERAL");
+}
+
+#[test]
+fn active_field_frontier_rejects_duplicate_or_cross_facet_tickets() {
+    assert_eq!(
+        private_study_room_details_frontier_for_fields(
+            &[IntentRecipeDetailFacetV3::Copy],
+            &[
+                IntentRecipeDetailFieldV4::CreateButtonLabel,
+                IntentRecipeDetailFieldV4::CreateButtonLabel,
+            ],
+        )
+        .unwrap_err()
+        .code,
+        "DUPLICATE_RECIPE_DETAIL_FIELD"
+    );
+    assert_eq!(
+        private_study_room_details_frontier_for_fields(
+            &[IntentRecipeDetailFacetV3::Copy],
+            &[IntentRecipeDetailFieldV4::HelpLabel],
+        )
+        .unwrap_err()
+        .code,
+        "INVALID_RECIPE_DETAIL_FIELD_FRONTIER"
     );
 }
 
@@ -399,7 +848,7 @@ fn detail_frontier_is_one_closed_recipe_specific_tool() {
     assert!(!schema_text.contains("$ref"));
     let schema_bytes = serde_json::to_vec(&tool.parameters).unwrap().len();
     assert!(
-        schema_bytes <= 2_100,
+        schema_bytes < 2_100,
         "detail schema is {schema_bytes} bytes"
     );
 }

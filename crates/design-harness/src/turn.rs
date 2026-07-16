@@ -1,14 +1,42 @@
 mod execution;
+mod intent_boundary_grounding;
+#[cfg(test)]
+mod intent_boundary_grounding_tests;
+mod intent_capability_grounding;
+#[cfg(test)]
+mod intent_capability_grounding_tests;
+mod intent_capability_reconciliation;
+#[cfg(test)]
+mod intent_capability_reconciliation_tests;
 mod intent_core;
 #[cfg(test)]
 mod intent_core_tests;
+mod intent_detail_grammar;
+mod intent_detail_policy;
+mod intent_detail_requirement;
+#[cfg(test)]
+mod intent_detail_requirement_tests;
+mod intent_detail_syntax;
+#[cfg(test)]
+mod intent_detail_syntax_tests;
+mod intent_detail_text;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
+mod intent_metalinguistic_scope;
+mod intent_operative_conditionals;
 mod intent_protocol;
+mod intent_quote_scanner;
 mod intent_recipe_details;
 #[cfg(test)]
 mod intent_recipe_details_tests;
+mod intent_request_mode_grounding;
+#[cfg(test)]
+mod intent_request_mode_grounding_tests;
+mod intent_runtime_grounding;
+#[cfg(test)]
+mod intent_runtime_grounding_tests;
+mod intent_safety_control_grammar;
 mod intent_text;
 mod plan;
 mod plan_input;
@@ -19,10 +47,20 @@ mod scope;
 pub(crate) use execution::{
     execute_plan_atomically, execute_plan_atomically_with_bindings, ExecutionRecord,
 };
+#[cfg(test)]
+pub(crate) use intent_core::parse_interpret_intent_core_compatibility;
+#[cfg(test)]
+pub(crate) use intent_core::parse_interpret_intent_core_for_human;
+pub(crate) use intent_core::parse_interpret_intent_core_for_serving;
+pub(crate) use intent_core::validate_intent_human_grounding_size;
 pub use intent_core::{
-    interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV3,
+    interpret_intent_core_frontier, parse_interpret_intent_core, IntentCoreInterpretationV4,
     IntentRecipeDetailFacetV3, INTERPRET_INTENT_CORE,
 };
+#[cfg(test)]
+pub(crate) use intent_detail_requirement::analyze_private_study_room_details;
+pub(crate) use intent_detail_requirement::PrivateStudyRoomDetailTicketV4;
+pub(crate) use intent_detail_syntax::{IntentRecipeDetailExpectationV4, IntentRecipeDetailFieldV4};
 pub use intent_interpretation::{
     interpret_intent_turn_frontier, parse_interpret_intent_turn, CloseAuthorizationV2,
     EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2, IntentInterpretationV2,
@@ -36,11 +74,18 @@ pub use intent_protocol::{
     route_intent_turn_frontier, IntentRouteInputV1, ResolveIntentDecisionInputV1,
     RouteIntentTurnInputV1,
 };
-pub(crate) use intent_recipe_details::parse_private_study_room_details_for_serving;
-pub(crate) use intent_recipe_details::private_study_room_details_frontier_for;
 pub use intent_recipe_details::{
     parse_private_study_room_details, private_study_room_details_frontier,
     PrivateStudyRoomDetailsV1, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+};
+#[cfg(test)]
+pub(crate) use intent_recipe_details::{
+    parse_private_study_room_details_for_active_serving,
+    parse_private_study_room_details_for_serving, private_study_room_details_frontier_for,
+};
+pub(crate) use intent_recipe_details::{
+    parse_private_study_room_details_for_active_serving_with_parameters,
+    private_study_room_details_frontier_for_fields,
 };
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{

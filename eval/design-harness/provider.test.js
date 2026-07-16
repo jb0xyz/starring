@@ -28,11 +28,15 @@ async function call(binary, config = {}, prompt = 'test prompt') {
     binary: process.env.STARRING_HARNESS_BIN,
     baseUrl: process.env.STARRING_LLM_BASE_URL,
     apiKey: process.env.STARRING_LLM_API_KEY,
+    workerUrl: process.env.STARRING_CODEX_WORKER_URL,
+    workerToken: process.env.STARRING_CODEX_WORKER_TOKEN,
     timeoutMs: process.env.STARRING_EVAL_TIMEOUT_MS,
   };
   process.env.STARRING_HARNESS_BIN = binary;
   process.env.STARRING_LLM_BASE_URL = 'http://127.0.0.1:1/v1';
   process.env.STARRING_LLM_API_KEY = 'test-only';
+  process.env.STARRING_CODEX_WORKER_URL = 'http://127.0.0.1:2/v1';
+  process.env.STARRING_CODEX_WORKER_TOKEN = 'worker-test-only';
   try {
     return await new DesignHarnessProvider({ config }).callApi(prompt);
   } finally {
@@ -40,6 +44,8 @@ async function call(binary, config = {}, prompt = 'test prompt') {
       ['STARRING_HARNESS_BIN', previous.binary],
       ['STARRING_LLM_BASE_URL', previous.baseUrl],
       ['STARRING_LLM_API_KEY', previous.apiKey],
+      ['STARRING_CODEX_WORKER_URL', previous.workerUrl],
+      ['STARRING_CODEX_WORKER_TOKEN', previous.workerToken],
       ['STARRING_EVAL_TIMEOUT_MS', previous.timeoutMs],
     ]) {
       if (value === undefined) {
@@ -184,11 +190,11 @@ test('intent checkpoint resolves cargo through the active rustup toolchain', () 
   }), /release:/);
 });
 
-test('intent provider pins Gemma4 and passes bindings and provenance only through env', async () => {
+test('intent provider pins Luna medium and passes worker credentials and provenance through env', async () => {
   const binary = executable([
     'read payload',
     'payload_b64=$(printf %s "$payload" | base64 | tr -d \'\\n\')',
-    'printf \'{"payload_b64":"%s","model":"%s","mode":"%s","bindings":%s,"gateway":"%s","declared_context":"%s","commit":"%s","dirty":"%s","binary":"%s","run_id":"%s","run_order":"%s","max_model":"%s","max_tool":"%s","max_gate":"%s","context_chars":"%s"}\\n\' "$payload_b64" "$STARRING_LLM_MODEL" "$STARRING_HARNESS_MODE" "$STARRING_HARNESS_BINDINGS_JSON" "$STARRING_EVAL_GATEWAY_ID" "$STARRING_EVAL_DECLARED_CONTEXT_TOKENS" "$STARRING_EVAL_SOURCE_COMMIT" "$STARRING_EVAL_SOURCE_DIRTY" "$STARRING_EVAL_BINARY_SHA256" "$STARRING_EVAL_RUN_ID" "$STARRING_EVAL_RUN_ORDER" "$STARRING_HARNESS_MAX_MODEL_CALLS" "$STARRING_HARNESS_MAX_TOOL_CALLS" "$STARRING_HARNESS_MAX_GATE_FAILURES" "$STARRING_HARNESS_CONTEXT_CHARS"',
+    'printf \'{"payload_b64":"%s","model":"%s","reasoning_effort":"%s","worker_url":"%s","worker_token":"%s","mode":"%s","bindings":%s,"gateway":"%s","declared_context":"%s","commit":"%s","dirty":"%s","binary":"%s","run_id":"%s","run_order":"%s","max_model":"%s","max_tool":"%s","max_gate":"%s","context_chars":"%s"}\\n\' "$payload_b64" "$STARRING_LLM_MODEL" "$STARRING_CODEX_REASONING_EFFORT" "$STARRING_CODEX_WORKER_URL" "$STARRING_CODEX_WORKER_TOKEN" "$STARRING_HARNESS_MODE" "$STARRING_HARNESS_BINDINGS_JSON" "$STARRING_EVAL_GATEWAY_ID" "$STARRING_EVAL_DECLARED_CONTEXT_TOKENS" "$STARRING_EVAL_SOURCE_COMMIT" "$STARRING_EVAL_SOURCE_DIRTY" "$STARRING_EVAL_BINARY_SHA256" "$STARRING_EVAL_RUN_ID" "$STARRING_EVAL_RUN_ORDER" "$STARRING_HARNESS_MAX_MODEL_CALLS" "$STARRING_HARNESS_MAX_TOOL_CALLS" "$STARRING_HARNESS_MAX_GATE_FAILURES" "$STARRING_HARNESS_CONTEXT_CHARS"',
   ].join('\n'));
   const input = JSON.stringify({
     schema_version: 3,
@@ -198,7 +204,8 @@ test('intent provider pins Gemma4 and passes bindings and provenance only throug
   const response = await call(binary, {
     intentOnly: true,
     allowHarnessOverrideForTest: true,
-    model: 'gemma4:12b-mlx',
+    model: 'gpt-5.6-luna',
+    reasoningEffort: 'medium',
     bindings: {
       schema_version: 1,
       channel_bindings: [{ key: 'community_hub', id: '700' }],
@@ -208,14 +215,18 @@ test('intent provider pins Gemma4 and passes bindings and provenance only throug
   const metadata = response.metadata;
 
   assert.equal(Buffer.from(metadata.payload_b64, 'base64').toString('utf8'), input);
-  assert.equal(metadata.model, 'gemma4:12b-mlx');
+  assert.equal(metadata.model, 'gpt-5.6-luna');
+  assert.equal(metadata.reasoning_effort, 'medium');
+  assert.equal(metadata.worker_url, 'http://127.0.0.1:2/v1');
+  assert.equal(metadata.worker_token, 'worker-test-only');
   assert.equal(metadata.mode, 'intent_recipe');
   assert.deepEqual(metadata.bindings, {
     schema_version: 1,
     channel_bindings: [{ key: 'community_hub', id: '700' }],
     role_bindings: [],
   });
-  assert.match(metadata.gateway, /^sha256-[0-9a-f]{64}$/);
+  assert.equal(metadata.gateway, gatewayIdentity('http://127.0.0.1:2/v1'));
+  assert.notEqual(metadata.gateway, gatewayIdentity('http://127.0.0.1:1/v1'));
   assert.equal(metadata.declared_context, '16384');
   assert.match(metadata.commit, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
   assert.match(metadata.dirty, /^(true|false)$/);
@@ -236,7 +247,90 @@ test('intent provider pins Gemma4 and passes bindings and provenance only throug
       channel_bindings: [{ key: 'community_hub', id: '700' }],
     },
   }, input);
-  assert.match(wrongModel.error, /model must be exactly gemma4:12b-mlx/);
+  assert.match(wrongModel.error, /model must be exactly gpt-5\.6-luna/);
+
+  const wrongEffort = await call(binary, {
+    intentOnly: true,
+    allowHarnessOverrideForTest: true,
+    model: 'gpt-5.6-luna',
+    reasoningEffort: 'high',
+    bindings: {
+      schema_version: 1,
+      channel_bindings: [{ key: 'community_hub', id: '700' }],
+    },
+  }, input);
+  assert.match(wrongEffort.error, /reasoning effort must be exactly medium/);
+});
+
+test('intent provider requires the Codex worker endpoint and token', async () => {
+  const previousUrl = process.env.STARRING_CODEX_WORKER_URL;
+  const previousToken = process.env.STARRING_CODEX_WORKER_TOKEN;
+  const input = JSON.stringify({
+    schema_version: 3,
+    mode: 'intent_recipe',
+    turns: [{ id: 'build', input: 'Build a private study room' }],
+  });
+  const provider = new DesignHarnessProvider({
+    config: {
+      intentOnly: true,
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'medium',
+    },
+  });
+  try {
+    delete process.env.STARRING_CODEX_WORKER_URL;
+    delete process.env.STARRING_CODEX_WORKER_TOKEN;
+    assert.equal(
+      (await provider.callApi(input)).error,
+      'STARRING_CODEX_WORKER_URL is required',
+    );
+    process.env.STARRING_CODEX_WORKER_URL = 'http://127.0.0.1:2/v1';
+    assert.equal(
+      (await provider.callApi(input)).error,
+      'STARRING_CODEX_WORKER_TOKEN is required',
+    );
+  } finally {
+    if (previousUrl === undefined) {
+      delete process.env.STARRING_CODEX_WORKER_URL;
+    } else {
+      process.env.STARRING_CODEX_WORKER_URL = previousUrl;
+    }
+    if (previousToken === undefined) {
+      delete process.env.STARRING_CODEX_WORKER_TOKEN;
+    } else {
+      process.env.STARRING_CODEX_WORKER_TOKEN = previousToken;
+    }
+  }
+});
+
+test('legacy provider still requires the legacy gateway endpoint and API key', async () => {
+  const previousUrl = process.env.STARRING_LLM_BASE_URL;
+  const previousKey = process.env.STARRING_LLM_API_KEY;
+  const provider = new DesignHarnessProvider();
+  try {
+    delete process.env.STARRING_LLM_BASE_URL;
+    delete process.env.STARRING_LLM_API_KEY;
+    assert.equal(
+      (await provider.callApi('legacy prompt')).error,
+      'STARRING_LLM_BASE_URL is required',
+    );
+    process.env.STARRING_LLM_BASE_URL = 'http://127.0.0.1:1/v1';
+    assert.equal(
+      (await provider.callApi('legacy prompt')).error,
+      'STARRING_LLM_API_KEY is required',
+    );
+  } finally {
+    if (previousUrl === undefined) {
+      delete process.env.STARRING_LLM_BASE_URL;
+    } else {
+      process.env.STARRING_LLM_BASE_URL = previousUrl;
+    }
+    if (previousKey === undefined) {
+      delete process.env.STARRING_LLM_API_KEY;
+    } else {
+      process.env.STARRING_LLM_API_KEY = previousKey;
+    }
+  }
 });
 
 test('intent checkpoint forbids an alternate harness executable', async () => {
@@ -247,7 +341,8 @@ test('intent checkpoint forbids an alternate harness executable', async () => {
   });
   const response = await call(executable('cat >/dev/null'), {
     intentOnly: true,
-    model: 'gemma4:12b-mlx',
+    model: 'gpt-5.6-luna',
+    reasoningEffort: 'medium',
     bindings: {
       schema_version: 1,
       channel_bindings: [{ key: 'community_hub', id: '700' }],

@@ -1,23 +1,29 @@
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use design_harness::{
     LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall, ToolDefinition,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
 const INTENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LEGACY_HTTP_RETRIES: usize = 1;
+#[cfg(test)]
 const INTENT_HTTP_RETRIES: usize = 0;
-pub const INTENT_SERVING_MODEL: &str = crate::config::SERVING_MODEL;
+const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
+#[cfg(test)]
+pub const INTENT_SERVING_MODEL: &str = crate::config::LEGACY_SERVING_MODEL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TransportPolicy {
@@ -33,6 +39,7 @@ impl TransportPolicy {
         redact_request_errors: false,
     };
 
+    #[cfg(test)]
     const INTENT_SERVING: Self = Self {
         request_timeout: INTENT_REQUEST_TIMEOUT,
         max_http_retries: INTENT_HTTP_RETRIES,
@@ -44,11 +51,53 @@ impl TransportPolicy {
 pub struct GemmaClient {
     http: reqwest::Client,
     endpoint: String,
+    #[cfg(test)]
     models_endpoint: String,
     api_key: String,
     model: String,
     transport_policy: TransportPolicy,
     adapted_call_sequence: Arc<AtomicU64>,
+    model_call_sequence: Arc<AtomicU64>,
+    model_call_metrics: Arc<Mutex<VecDeque<ModelCallMetric>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCallOutcome {
+    Succeeded,
+    TransportError,
+    HttpError,
+    ResponseBodyError,
+    MalformedJson,
+    InvalidResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ModelCallMetric {
+    pub call_sequence: u64,
+    pub attempt: usize,
+    pub frontier_name: String,
+    pub outcome: ModelCallOutcome,
+    pub http_status: Option<u16>,
+    pub served_model: Option<String>,
+    pub request_body_bytes: usize,
+    pub message_bytes: usize,
+    pub tool_bytes: usize,
+    pub duplicated_schema_bytes: usize,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub finish_reason: Option<String>,
+    pub request_duration_ms: u64,
+    pub gateway_model_duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestMetricInput {
+    frontier_name: String,
+    request_body_bytes: usize,
+    message_bytes: usize,
+    tool_bytes: usize,
+    duplicated_schema_bytes: usize,
 }
 
 impl GemmaClient {
@@ -56,6 +105,7 @@ impl GemmaClient {
         Self::with_policy(base_url, api_key, model, TransportPolicy::LEGACY)
     }
 
+    #[cfg(test)]
     pub fn new_intent_serving(base_url: String, api_key: String) -> Result<Self, LlmError> {
         Self::with_policy(
             base_url,
@@ -79,14 +129,25 @@ impl GemmaClient {
         Ok(Self {
             http,
             endpoint: format!("{base_url}/chat/completions"),
+            #[cfg(test)]
             models_endpoint: format!("{base_url}/models"),
             api_key,
             model,
             transport_policy,
             adapted_call_sequence: Arc::new(AtomicU64::new(0)),
+            model_call_sequence: Arc::new(AtomicU64::new(0)),
+            model_call_metrics: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
+    pub fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
+        self.model_call_metrics
+            .lock()
+            .map(|metrics| metrics.iter().cloned().collect())
+            .map_err(|_| LlmError::Client("model call metrics are unavailable".to_string()))
+    }
+
+    #[cfg(test)]
     pub async fn preflight_model(&self) -> Result<(), LlmError> {
         let response = self
             .http
@@ -120,6 +181,64 @@ impl GemmaClient {
             LlmError::Client(error.to_string())
         }
     }
+
+    fn record_model_call_metric(
+        &self,
+        input: &RequestMetricInput,
+        call_sequence: u64,
+        attempt: usize,
+        observation: AttemptObservation,
+        request_duration: Duration,
+    ) -> Result<(), LlmError> {
+        let metric = ModelCallMetric {
+            call_sequence,
+            attempt,
+            frontier_name: input.frontier_name.clone(),
+            outcome: observation.outcome,
+            http_status: observation.http_status,
+            served_model: observation.served_model,
+            request_body_bytes: input.request_body_bytes,
+            message_bytes: input.message_bytes,
+            tool_bytes: input.tool_bytes,
+            duplicated_schema_bytes: input.duplicated_schema_bytes,
+            prompt_tokens: observation.prompt_tokens,
+            completion_tokens: observation.completion_tokens,
+            finish_reason: observation.finish_reason,
+            request_duration_ms: u64::try_from(request_duration.as_millis()).unwrap_or(u64::MAX),
+            gateway_model_duration_ms: None,
+        };
+        let mut metrics = self
+            .model_call_metrics
+            .lock()
+            .map_err(|_| LlmError::Client("model call metrics are unavailable".to_string()))?;
+        if metrics.len() >= MAX_RETAINED_MODEL_CALL_METRICS {
+            metrics.pop_front();
+        }
+        metrics.push_back(metric);
+        Ok(())
+    }
+}
+
+struct AttemptObservation {
+    outcome: ModelCallOutcome,
+    http_status: Option<u16>,
+    served_model: Option<String>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    finish_reason: Option<String>,
+}
+
+impl AttemptObservation {
+    fn failed(outcome: ModelCallOutcome, http_status: Option<u16>) -> Self {
+        Self {
+            outcome,
+            http_status,
+            served_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            finish_reason: None,
+        }
+    }
 }
 
 impl LlmClient for GemmaClient {
@@ -129,7 +248,14 @@ impl LlmClient for GemmaClient {
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, LlmError> {
         let body = build_request_body(messages, tools, &self.model)?;
+        let metric_input = request_metric_input(&body, tools)?;
+        let call_sequence = self
+            .model_call_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         for attempt in 0..=self.transport_policy.max_http_retries {
+            let attempt_number = attempt.saturating_add(1);
+            let started = Instant::now();
             let response = self
                 .http
                 .post(&self.endpoint)
@@ -143,36 +269,187 @@ impl LlmClient for GemmaClient {
                     if attempt < self.transport_policy.max_http_retries
                         && is_transient_transport_error(&error) =>
                 {
+                    self.record_model_call_metric(
+                        &metric_input,
+                        call_sequence,
+                        attempt_number,
+                        AttemptObservation::failed(ModelCallOutcome::TransportError, None),
+                        started.elapsed(),
+                    )?;
                     tokio::time::sleep(RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(error) => return Err(self.request_error(error)),
+                Err(error) => {
+                    let request_error = self.request_error(error);
+                    self.record_model_call_metric(
+                        &metric_input,
+                        call_sequence,
+                        attempt_number,
+                        AttemptObservation::failed(ModelCallOutcome::TransportError, None),
+                        started.elapsed(),
+                    )?;
+                    return Err(request_error);
+                }
             };
-            if !response.status().is_success() {
-                if attempt < self.transport_policy.max_http_retries
-                    && is_retryable_status(response.status())
-                {
+            let status = response.status();
+            if !status.is_success() {
+                self.record_model_call_metric(
+                    &metric_input,
+                    call_sequence,
+                    attempt_number,
+                    AttemptObservation::failed(ModelCallOutcome::HttpError, Some(status.as_u16())),
+                    started.elapsed(),
+                )?;
+                if attempt < self.transport_policy.max_http_retries && is_retryable_status(status) {
                     tokio::time::sleep(RETRY_BACKOFF).await;
                     continue;
                 }
                 return Err(LlmError::Client(format!(
                     "gateway returned HTTP {}",
-                    response.status().as_u16()
+                    status.as_u16()
                 )));
             }
-            let value = response
-                .json::<Value>()
-                .await
-                .map_err(|error| self.request_error(error))?;
-            let response = parse_response_value(value, &self.model)?;
-            return Ok(adapt_single_frontier_response(
-                response,
-                tools,
-                &self.adapted_call_sequence,
-            ));
+            let response_bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let request_error = self.request_error(error);
+                    self.record_model_call_metric(
+                        &metric_input,
+                        call_sequence,
+                        attempt_number,
+                        AttemptObservation::failed(
+                            ModelCallOutcome::ResponseBodyError,
+                            Some(status.as_u16()),
+                        ),
+                        started.elapsed(),
+                    )?;
+                    return Err(request_error);
+                }
+            };
+            let value = match serde_json::from_slice::<Value>(&response_bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.record_model_call_metric(
+                        &metric_input,
+                        call_sequence,
+                        attempt_number,
+                        AttemptObservation::failed(
+                            ModelCallOutcome::MalformedJson,
+                            Some(status.as_u16()),
+                        ),
+                        started.elapsed(),
+                    )?;
+                    return Err(LlmError::Client(error.to_string()));
+                }
+            };
+            let (prompt_tokens, completion_tokens) = completion_usage(&value);
+            let served_model = response_model(&value);
+            let finish_reason = response_finish_reason(&value);
+            let response = match parse_response_value(value, &self.model) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.record_model_call_metric(
+                        &metric_input,
+                        call_sequence,
+                        attempt_number,
+                        AttemptObservation {
+                            outcome: ModelCallOutcome::InvalidResponse,
+                            http_status: Some(status.as_u16()),
+                            served_model,
+                            prompt_tokens,
+                            completion_tokens,
+                            finish_reason: None,
+                        },
+                        started.elapsed(),
+                    )?;
+                    return Err(error);
+                }
+            };
+            let response =
+                adapt_single_frontier_response(response, tools, &self.adapted_call_sequence);
+            self.record_model_call_metric(
+                &metric_input,
+                call_sequence,
+                attempt_number,
+                AttemptObservation {
+                    outcome: ModelCallOutcome::Succeeded,
+                    http_status: Some(status.as_u16()),
+                    served_model,
+                    prompt_tokens,
+                    completion_tokens,
+                    finish_reason,
+                },
+                started.elapsed(),
+            )?;
+            return Ok(response);
         }
         unreachable!()
     }
+}
+
+fn request_metric_input(
+    body: &Value,
+    tools: &[ToolDefinition],
+) -> Result<RequestMetricInput, LlmError> {
+    let message_bytes = serialized_value_bytes(
+        body.get("messages")
+            .ok_or_else(|| LlmError::Client("request body is missing messages".to_string()))?,
+    )?;
+    let tool_bytes = serialized_value_bytes(
+        body.get("tools")
+            .ok_or_else(|| LlmError::Client("request body is missing tools".to_string()))?,
+    )?;
+    let duplicated_schema_bytes = match tools {
+        [tool] => serialized_value_bytes(&tool.parameters)?,
+        _ => 0,
+    };
+    let frontier_name = match tools {
+        [tool] => tool.name.clone(),
+        [] => "no_tool_frontier".to_string(),
+        _ => "multi_tool_frontier".to_string(),
+    };
+    Ok(RequestMetricInput {
+        frontier_name,
+        request_body_bytes: serialized_value_bytes(body)?,
+        message_bytes,
+        tool_bytes,
+        duplicated_schema_bytes,
+    })
+}
+
+fn serialized_value_bytes(value: &Value) -> Result<usize, LlmError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|error| LlmError::Client(error.to_string()))
+}
+
+fn completion_usage(value: &Value) -> (Option<u64>, Option<u64>) {
+    let usage = value.get("usage");
+    (
+        usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64),
+        usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_u64),
+    )
+}
+
+fn response_model(value: &Value) -> Option<String> {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn response_finish_reason(value: &Value) -> Option<String> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -257,7 +534,7 @@ fn build_request_body(
         tools: openai_tools,
         tool_choice: "auto",
         parallel_tool_calls: false,
-        temperature: 0.1,
+        temperature: request_temperature(tools),
         seed: 0,
         stream: false,
     })
@@ -279,6 +556,13 @@ fn build_request_body(
         );
     }
     Ok(body)
+}
+
+fn request_temperature(tools: &[ToolDefinition]) -> f64 {
+    match tools {
+        [tool] if tool.name == EXTRACT_PRIVATE_STUDY_ROOM_DETAILS => 0.0,
+        _ => 0.1,
+    }
 }
 
 fn adapt_single_frontier_response(
@@ -355,11 +639,13 @@ struct ChatCompletionResponse {
     choices: Vec<ResponseChoice>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
@@ -433,12 +719,16 @@ mod tests {
         time::Duration,
     };
 
-    use design_harness::{tool_definitions, LlmClient, LlmError, LlmResponse, Message, ToolCall};
+    use design_harness::{
+        tool_definitions, LlmClient, LlmError, LlmResponse, Message, ToolCall, ToolDefinition,
+        EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    };
     use serde_json::json;
 
     use super::{
-        adapt_single_frontier_response, build_request_body, is_retryable_status,
-        parse_response_value, GemmaClient, TransportPolicy, INTENT_SERVING_MODEL,
+        adapt_single_frontier_response, build_request_body, completion_usage, is_retryable_status,
+        parse_response_value, request_metric_input, GemmaClient, ModelCallOutcome, TransportPolicy,
+        INTENT_SERVING_MODEL,
     };
 
     fn read_request(stream: &mut TcpStream) -> String {
@@ -523,7 +813,7 @@ mod tests {
     }
 
     fn success_response() -> &'static str {
-        r#"{"model":"test-model","choices":[{"message":{"content":"done"}}]}"#
+        r#"{"model":"test-model","choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#
     }
 
     fn spawn_capture_server(
@@ -559,6 +849,23 @@ mod tests {
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());
+            1
+        });
+        (address, handle)
+    }
+
+    fn spawn_truncated_response_server() -> (SocketAddr, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = r#"{"model":"test-model"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + 20
+            );
+            stream.write_all(response.as_bytes()).unwrap();
             1
         });
         (address, handle)
@@ -680,6 +987,68 @@ mod tests {
     }
 
     #[test]
+    fn recipe_detail_frontier_uses_deterministic_sampling() {
+        let definitions = vec![ToolDefinition {
+            name: EXTRACT_PRIVATE_STUDY_ROOM_DETAILS.to_string(),
+            description: "extract details".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }];
+
+        let body = build_request_body(&[Message::user("build")], &definitions, "model").unwrap();
+
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["seed"], 0);
+    }
+
+    #[test]
+    fn request_metrics_measure_the_exact_serialized_frontier_payload() {
+        let definitions = vec![tool_definitions().remove(0)];
+        let body = build_request_body(&[Message::user("build")], &definitions, "model").unwrap();
+
+        let metric = request_metric_input(&body, &definitions).unwrap();
+
+        assert_eq!(metric.frontier_name, "add_panel");
+        assert_eq!(
+            metric.request_body_bytes,
+            serde_json::to_vec(&body).unwrap().len()
+        );
+        assert_eq!(
+            metric.message_bytes,
+            serde_json::to_vec(&body["messages"]).unwrap().len()
+        );
+        assert_eq!(
+            metric.tool_bytes,
+            serde_json::to_vec(&body["tools"]).unwrap().len()
+        );
+        assert_eq!(
+            metric.duplicated_schema_bytes,
+            serde_json::to_vec(&definitions[0].parameters)
+                .unwrap()
+                .len()
+        );
+        assert!(metric.request_body_bytes > metric.message_bytes + metric.tool_bytes);
+    }
+
+    #[test]
+    fn request_metrics_label_empty_and_multiple_frontiers_deterministically() {
+        let empty_body = build_request_body(&[], &[], "model").unwrap();
+        let definitions = tool_definitions().into_iter().take(2).collect::<Vec<_>>();
+        let multiple_body = build_request_body(&[], &definitions, "model").unwrap();
+
+        let empty = request_metric_input(&empty_body, &[]).unwrap();
+        let multiple = request_metric_input(&multiple_body, &definitions).unwrap();
+
+        assert_eq!(empty.frontier_name, "no_tool_frontier");
+        assert_eq!(empty.duplicated_schema_bytes, 0);
+        assert_eq!(multiple.frontier_name, "multi_tool_frontier");
+        assert_eq!(multiple.duplicated_schema_bytes, 0);
+    }
+
+    #[test]
     fn sole_frontier_json_content_is_promoted_to_the_routed_tool() {
         let definitions = vec![tool_definitions().remove(0)];
         let sequence = AtomicU64::new(0);
@@ -785,6 +1154,20 @@ mod tests {
     }
 
     #[test]
+    fn response_usage_is_optional_and_independently_typed() {
+        assert_eq!(completion_usage(&json!({})), (None, None));
+        assert_eq!(
+            completion_usage(&json!({
+                "usage": {
+                    "prompt_tokens": 41,
+                    "completion_tokens": "invalid"
+                }
+            })),
+            (Some(41), None)
+        );
+    }
+
+    #[test]
     fn response_model_must_match_the_requested_model() {
         let response = json!({
             "model":"gemma4:12b-mlx",
@@ -886,20 +1269,98 @@ mod tests {
                 (status, r#"{"error":"transient"}"#),
                 (200, success_response()),
             ]);
-            let response = test_client(address).complete(&[], &[]).await.unwrap();
+            let client = test_client(address);
+            let response = client.complete(&[], &[]).await.unwrap();
 
             assert_eq!(response, LlmResponse::Text("done".to_string()));
+            let metrics = client.model_call_metrics().unwrap();
+            assert_eq!(metrics.len(), 2);
+            assert_eq!(metrics[0].call_sequence, 1);
+            assert_eq!(metrics[1].call_sequence, 1);
+            assert_eq!(metrics[0].attempt, 1);
+            assert_eq!(metrics[1].attempt, 2);
+            assert_eq!(metrics[0].outcome, ModelCallOutcome::HttpError);
+            assert_eq!(metrics[1].outcome, ModelCallOutcome::Succeeded);
+            assert_eq!(metrics[0].http_status, Some(status));
+            assert_eq!(metrics[1].http_status, Some(200));
+            assert_eq!(metrics[0].served_model, None);
+            assert_eq!(metrics[1].served_model.as_deref(), Some("test-model"));
             assert_eq!(server.join().unwrap(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn successful_call_records_usage_and_payload_metrics_across_clones() {
+        let response = r#"{"model":"test-model","usage":{"prompt_tokens":321,"completion_tokens":17},"choices":[{"message":{"content":"done"},"finish_reason":"length"}]}"#;
+        let (address, server) = spawn_server(vec![(200, response)]);
+        let client = test_client(address);
+        let probe = client.clone();
+        let definitions = vec![tool_definitions().remove(0)];
+        let messages = vec![Message::user("build")];
+        let body = build_request_body(&messages, &definitions, "test-model").unwrap();
+        let expected = request_metric_input(&body, &definitions).unwrap();
+
+        let result = client.complete(&messages, &definitions).await.unwrap();
+
+        assert_eq!(result, LlmResponse::Text("done".to_string()));
+        let metrics = probe.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].call_sequence, 1);
+        assert_eq!(metrics[0].attempt, 1);
+        assert_eq!(metrics[0].frontier_name, expected.frontier_name);
+        assert_eq!(metrics[0].outcome, ModelCallOutcome::Succeeded);
+        assert_eq!(metrics[0].http_status, Some(200));
+        assert_eq!(metrics[0].served_model.as_deref(), Some("test-model"));
+        assert_eq!(metrics[0].request_body_bytes, expected.request_body_bytes);
+        assert_eq!(metrics[0].message_bytes, expected.message_bytes);
+        assert_eq!(metrics[0].tool_bytes, expected.tool_bytes);
+        assert_eq!(
+            metrics[0].duplicated_schema_bytes,
+            expected.duplicated_schema_bytes
+        );
+        assert_eq!(metrics[0].prompt_tokens, Some(321));
+        assert_eq!(metrics[0].completion_tokens, Some(17));
+        assert_eq!(metrics[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(metrics[0].gateway_model_duration_ms, None);
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_tool_call_records_the_gateway_tool_calls_finish_reason() {
+        let response = r#"{"model":"test-model","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"add_panel","arguments":"{\"key\":\"panel\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let (address, server) = spawn_server(vec![(200, response)]);
+        let client = test_client(address);
+        let definitions = vec![tool_definitions().remove(0)];
+
+        let result = client
+            .complete(&[Message::user("build")], &definitions)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, LlmResponse::ToolCalls(_)));
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(server.join().unwrap(), 1);
     }
 
     #[tokio::test]
     async fn retries_a_transient_transport_failure_once() {
         let (address, server) = spawn_disconnect_then_success();
 
-        let response = test_client(address).complete(&[], &[]).await.unwrap();
+        let client = test_client(address);
+        let response = client.complete(&[], &[]).await.unwrap();
 
         assert_eq!(response, LlmResponse::Text("done".to_string()));
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].call_sequence, 1);
+        assert_eq!(metrics[1].call_sequence, 1);
+        assert_eq!(metrics[0].attempt, 1);
+        assert_eq!(metrics[1].attempt, 2);
+        assert_eq!(metrics[0].outcome, ModelCallOutcome::TransportError);
+        assert_eq!(metrics[1].outcome, ModelCallOutcome::Succeeded);
+        assert_eq!(metrics[0].http_status, None);
+        assert_eq!(metrics[1].served_model.as_deref(), Some("test-model"));
         assert_eq!(server.join().unwrap(), 2);
     }
 
@@ -907,10 +1368,21 @@ mod tests {
     async fn does_not_retry_other_client_errors() {
         let (address, server) = spawn_server(vec![(400, r#"{"error":"bad request"}"#)]);
 
-        let error = test_client(address).complete(&[], &[]).await.unwrap_err();
+        let client = test_client(address);
+        let error = client.complete(&[], &[]).await.unwrap_err();
 
         let LlmError::Client(message) = error;
         assert_eq!(message, "gateway returned HTTP 400");
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, ModelCallOutcome::HttpError);
+        assert_eq!(metrics[0].http_status, Some(400));
+        assert_eq!(metrics[0].served_model, None);
+        assert_eq!(metrics[0].finish_reason, None);
+        assert_eq!(
+            serde_json::to_value(&metrics[0]).unwrap()["finish_reason"],
+            serde_json::Value::Null
+        );
         assert_eq!(server.join().unwrap(), 1);
     }
 
@@ -921,21 +1393,34 @@ mod tests {
             (503, r#"{"error":"second"}"#),
         ]);
 
-        let error = test_client(address).complete(&[], &[]).await.unwrap_err();
+        let client = test_client(address);
+        let error = client.complete(&[], &[]).await.unwrap_err();
 
         let LlmError::Client(message) = error;
         assert_eq!(message, "gateway returned HTTP 503");
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert!(metrics
+            .iter()
+            .all(|metric| metric.outcome == ModelCallOutcome::HttpError));
+        assert_eq!(metrics[0].attempt, 1);
+        assert_eq!(metrics[1].attempt, 2);
         assert_eq!(server.join().unwrap(), 2);
     }
 
     #[tokio::test]
     async fn intent_serving_does_not_retry_retryable_http_statuses() {
         let (address, server) = spawn_server(vec![(503, r#"{"error":"transient"}"#)]);
+        let client = intent_client(address);
 
-        let error = intent_client(address).complete(&[], &[]).await.unwrap_err();
+        let error = client.complete(&[], &[]).await.unwrap_err();
 
         let LlmError::Client(message) = error;
         assert_eq!(message, "gateway returned HTTP 503");
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, ModelCallOutcome::HttpError);
+        assert_eq!(metrics[0].http_status, Some(503));
         assert_eq!(server.join().unwrap(), 1);
     }
 
@@ -958,6 +1443,63 @@ mod tests {
 
         let LlmError::Client(message) = error;
         assert_eq!(message, "model request failed");
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, ModelCallOutcome::TransportError);
+        assert_eq!(metrics[0].http_status, None);
+        assert!(metrics[0].request_duration_ms >= 20);
         assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_invalid_success_responses_keep_attempt_cost_and_model_provenance() {
+        let (malformed_address, malformed_server) = spawn_server(vec![(200, "not-json")]);
+        let malformed_client = test_client(malformed_address);
+
+        let _ = malformed_client.complete(&[], &[]).await.unwrap_err();
+
+        let malformed_metrics = malformed_client.model_call_metrics().unwrap();
+        assert_eq!(malformed_metrics.len(), 1);
+        assert_eq!(
+            malformed_metrics[0].outcome,
+            ModelCallOutcome::MalformedJson
+        );
+        assert_eq!(malformed_metrics[0].http_status, Some(200));
+        assert_eq!(malformed_metrics[0].served_model, None);
+        assert_eq!(malformed_server.join().unwrap(), 1);
+
+        let response = r#"{"model":"other-model","choices":[{"message":{"content":"done"}}]}"#;
+        let (invalid_address, invalid_server) = spawn_server(vec![(200, response)]);
+        let invalid_client = test_client(invalid_address);
+
+        let _ = invalid_client.complete(&[], &[]).await.unwrap_err();
+
+        let invalid_metrics = invalid_client.model_call_metrics().unwrap();
+        assert_eq!(invalid_metrics.len(), 1);
+        assert_eq!(
+            invalid_metrics[0].outcome,
+            ModelCallOutcome::InvalidResponse
+        );
+        assert_eq!(invalid_metrics[0].http_status, Some(200));
+        assert_eq!(
+            invalid_metrics[0].served_model.as_deref(),
+            Some("other-model")
+        );
+        assert_eq!(invalid_server.join().unwrap(), 1);
+
+        let (truncated_address, truncated_server) = spawn_truncated_response_server();
+        let truncated_client = test_client(truncated_address);
+
+        let _ = truncated_client.complete(&[], &[]).await.unwrap_err();
+
+        let truncated_metrics = truncated_client.model_call_metrics().unwrap();
+        assert_eq!(truncated_metrics.len(), 1);
+        assert_eq!(
+            truncated_metrics[0].outcome,
+            ModelCallOutcome::ResponseBodyError
+        );
+        assert_eq!(truncated_metrics[0].http_status, Some(200));
+        assert_eq!(truncated_metrics[0].served_model, None);
+        assert_eq!(truncated_server.join().unwrap(), 1);
     }
 }

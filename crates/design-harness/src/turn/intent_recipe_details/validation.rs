@@ -8,6 +8,7 @@ use crate::intent::{
 use super::super::intent_interpretation::{
     normalize_private_study_room_details, PrivateStudyRoomControlsInterpretationV2,
 };
+use super::super::IntentRecipeDetailExpectationV4;
 use super::{
     IntentRecipeDetailFacetV3, PrivateStudyRoomDetailsCandidateV1, PrivateStudyRoomDetailsV1,
 };
@@ -112,6 +113,99 @@ pub(super) fn finalize_private_study_room_details(
         controls: input.controls,
         covered_facets,
     })
+}
+
+pub(super) fn validate_expected_detail_literals(
+    details: &PrivateStudyRoomDetailsV1,
+    expectations: &[IntentRecipeDetailExpectationV4],
+) -> Result<(), StructuredError> {
+    for expectation in expectations {
+        let field = expectation.field();
+        let actual = detail_literal(details, field);
+        if actual != Some(expectation.literal()) {
+            return Err(detail_error(
+                "RECIPE_DETAIL_LITERAL_MISMATCH",
+                format!(
+                    "intent.details.{}.{}",
+                    facet_name(field.facet()),
+                    field.as_str()
+                ),
+                "A recipe detail value does not match its grounded human slot",
+                "Copy the exact literal assigned to this exposed material leaf",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn detail_literal(
+    details: &PrivateStudyRoomDetailsV1,
+    field: super::super::IntentRecipeDetailFieldV4,
+) -> Option<&str> {
+    use super::super::IntentRecipeDetailFieldV4 as Field;
+
+    match field {
+        Field::LauncherContent => details.copy.launcher_content.as_deref(),
+        Field::CreateButtonLabel => details.copy.create_button_label.as_deref(),
+        Field::ModalTitle => details.copy.modal_title.as_deref(),
+        Field::RoomNameLabel => details.copy.room_name_label.as_deref(),
+        Field::WelcomeContentPrefix => details
+            .copy
+            .welcome_content
+            .as_ref()
+            .map(|value| value.prefix.as_str()),
+        Field::WelcomeContentSuffix => details
+            .copy
+            .welcome_content
+            .as_ref()
+            .map(|value| value.suffix.as_str()),
+        Field::HubAnnouncementPrefix => details
+            .copy
+            .hub_announcement
+            .as_ref()
+            .map(|value| value.prefix.as_str()),
+        Field::HubAnnouncementSuffix => details
+            .copy
+            .hub_announcement
+            .as_ref()
+            .map(|value| value.suffix.as_str()),
+        Field::CompletedResponsePrefix => details
+            .copy
+            .completed_response
+            .as_ref()
+            .map(|value| value.prefix.as_str()),
+        Field::CompletedResponseSuffix => details
+            .copy
+            .completed_response
+            .as_ref()
+            .map(|value| value.suffix.as_str()),
+        Field::ChannelNamePrefix => details
+            .naming
+            .channel_name
+            .as_ref()
+            .map(|value| value.prefix.as_str()),
+        Field::ChannelNameSuffix => details
+            .naming
+            .channel_name
+            .as_ref()
+            .map(|value| value.suffix.as_str()),
+        Field::MemberRoleNamePrefix => details
+            .naming
+            .member_role_name
+            .as_ref()
+            .map(|value| value.prefix.as_str()),
+        Field::MemberRoleNameSuffix => details
+            .naming
+            .member_role_name
+            .as_ref()
+            .map(|value| value.suffix.as_str()),
+        Field::HelpLabel => details.controls.help_label.as_deref(),
+        Field::HelpResponse => details.controls.help_response.as_deref(),
+        Field::JoinLabel => details.controls.join_label.as_deref(),
+        Field::JoinedResponse => details.controls.joined_response.as_deref(),
+        Field::CloseLabel => details.controls.close_label.as_deref(),
+        Field::ClosedResponse => details.controls.closed_response.as_deref(),
+    }
 }
 
 fn validate_optional_literal(

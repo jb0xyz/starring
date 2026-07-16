@@ -7,10 +7,10 @@ use crate::errors::StructuredError;
 
 use super::model::{
     ClosePolicyV1, FeatureConfigurationV1, FeatureId, IntentLocaleV1, IntentResolutionContext,
-    IntentValue, IntentWorkspaceV1, ManagedPrivateRoomControlsDraftV1,
+    IntentValue, IntentWorkspaceV2, ManagedPrivateRoomControlsDraftV1,
     ManagedPrivateRoomCopyDraftV1, ManagedPrivateRoomDraftV1, ManagedPrivateRoomNamingDraftV1,
     MissingDecision, MissingDecisionKind, ResolvedCloseControlV1, ResolvedFeatureConfigurationV1,
-    ResolvedFeatureIntentV1, ResolvedHelpControlV1, ResolvedIntentV1, ResolvedJoinControlV1,
+    ResolvedFeatureIntentV1, ResolvedHelpControlV1, ResolvedIntentV2, ResolvedJoinControlV1,
     ResolvedManagedPrivateRoomControlsV1, ResolvedManagedPrivateRoomCopyV1,
     ResolvedManagedPrivateRoomNamingV1, ResolvedManagedPrivateRoomV1, RoomNamePatternV1,
     INTENT_SCHEMA_VERSION, PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
@@ -18,9 +18,9 @@ use super::model::{
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(transparent)]
-pub struct ValidatedIntentV1(ResolvedIntentV1);
+pub struct ValidatedIntentV2(ResolvedIntentV2);
 
-impl ValidatedIntentV1 {
+impl ValidatedIntentV2 {
     pub fn schema_version(&self) -> u16 {
         self.0.schema_version
     }
@@ -29,46 +29,46 @@ impl ValidatedIntentV1 {
         self.0.revision
     }
 
-    pub fn objective(&self) -> &str {
-        &self.0.objective
-    }
-
     pub fn requested_outcome(&self) -> super::model::IntentRequestedOutcome {
         self.0.requested_outcome
     }
 
-    pub(super) fn resolved(&self) -> &ResolvedIntentV1 {
+    pub(super) fn resolved(&self) -> &ResolvedIntentV2 {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(super) fn resolved_mut(&mut self) -> &mut ResolvedIntentV2 {
+        &mut self.0
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg(test)]
-pub(super) enum IntentResolutionV1 {
+pub(super) enum IntentResolutionV2 {
     NeedsInput {
-        workspace: IntentWorkspaceV1,
+        workspace: IntentWorkspaceV2,
         decisions: Vec<MissingDecision>,
     },
     Resolved {
-        intent: ValidatedIntentV1,
+        intent: ValidatedIntentV2,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedIntentWorkspaceV1 {
+pub(crate) enum PreparedIntentWorkspaceV2 {
     NeedsInput {
-        workspace: IntentWorkspaceV1,
+        workspace: IntentWorkspaceV2,
         decisions: Vec<MissingDecision>,
     },
     Resolved {
-        workspace: IntentWorkspaceV1,
-        intent: ValidatedIntentV1,
+        workspace: IntentWorkspaceV2,
+        intent: ValidatedIntentV2,
     },
 }
 
 const MAX_FEATURES: usize = 1;
-const MAX_OBJECTIVE_CHARS: usize = 2_048;
 const MAX_FEATURE_ID_CHARS: usize = 32;
 const MAX_BINDING_KEY_CHARS: usize = 64;
 const MAX_MESSAGE_CHARS: usize = 2_000;
@@ -78,27 +78,27 @@ const MAX_NAME_AFFIX_CHARS: usize = 80;
 
 #[cfg(test)]
 pub(super) fn resolve_intent_workspace(
-    workspace: IntentWorkspaceV1,
+    workspace: IntentWorkspaceV2,
     context: &IntentResolutionContext,
-) -> Result<IntentResolutionV1, StructuredError> {
+) -> Result<IntentResolutionV2, StructuredError> {
     match prepare_intent_workspace(workspace, context)? {
-        PreparedIntentWorkspaceV1::NeedsInput {
+        PreparedIntentWorkspaceV2::NeedsInput {
             workspace,
             decisions,
-        } => Ok(IntentResolutionV1::NeedsInput {
+        } => Ok(IntentResolutionV2::NeedsInput {
             workspace,
             decisions,
         }),
-        PreparedIntentWorkspaceV1::Resolved { intent, .. } => {
-            Ok(IntentResolutionV1::Resolved { intent })
+        PreparedIntentWorkspaceV2::Resolved { intent, .. } => {
+            Ok(IntentResolutionV2::Resolved { intent })
         }
     }
 }
 
 pub(crate) fn prepare_intent_workspace(
-    mut workspace: IntentWorkspaceV1,
+    mut workspace: IntentWorkspaceV2,
     context: &IntentResolutionContext,
-) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
+) -> Result<PreparedIntentWorkspaceV2, StructuredError> {
     if workspace.schema_version != INTENT_SCHEMA_VERSION {
         return Err(intent_error(
             "UNSUPPORTED_INTENT_SCHEMA_VERSION",
@@ -110,13 +110,6 @@ pub(crate) fn prepare_intent_workspace(
             format!("Use intent schema version {INTENT_SCHEMA_VERSION}"),
         ));
     }
-    workspace.objective = normalized_required_text(
-        &workspace.objective,
-        MAX_OBJECTIVE_CHARS,
-        true,
-        false,
-        "intent.objective",
-    )?;
     if workspace.features.is_empty() {
         return Err(intent_error(
             "EMPTY_INTENT_FEATURES",
@@ -180,16 +173,15 @@ pub(crate) fn prepare_intent_workspace(
     decisions.truncate(1);
 
     if decisions.is_empty() {
-        let intent = ValidatedIntentV1(ResolvedIntentV1 {
+        let intent = ValidatedIntentV2(ResolvedIntentV2 {
             schema_version: workspace.schema_version,
             revision: workspace.revision,
-            objective: workspace.objective.clone(),
             requested_outcome: workspace.requested_outcome,
             features: resolved_features,
         });
-        Ok(PreparedIntentWorkspaceV1::Resolved { workspace, intent })
+        Ok(PreparedIntentWorkspaceV2::Resolved { workspace, intent })
     } else {
-        Ok(PreparedIntentWorkspaceV1::NeedsInput {
+        Ok(PreparedIntentWorkspaceV2::NeedsInput {
             workspace,
             decisions,
         })

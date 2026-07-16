@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 
 use serde::Serialize;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::errors::StructuredError;
+use crate::intent::identity::{canonical_json_digest, IdentityErrorSpec};
 use crate::intent::{
     IntentCapabilityBlockerV2, IntentRequestedOutcome, IntentSafetyBoundaryViolationV2,
 };
@@ -12,28 +11,29 @@ use crate::intent::{
 use crate::turn::IntentInterpretationV2;
 use crate::turn::{
     CloseAuthorizationV2, EconomyRequirementV2, IntentAutomationKindV2, IntentBoundaryRequestV2,
-    IntentCoreInterpretationV3, IntentLocaleHintV2, IntentRecipeDetailFacetV3, IntentRequestModeV2,
+    IntentCoreInterpretationV4, IntentLocaleHintV2, IntentRecipeDetailFacetV3, IntentRequestModeV2,
     PersistenceRequirementV2, PrivateStudyRoomDetailsV1, TimerRequirementV2,
 };
 
 #[cfg(test)]
 use super::super::decision::INTENT_RECIPE_PROTOCOL_VERSION_V2;
-use super::super::decision::{PinnedIntentRecipeV2, INTENT_RECIPE_PROTOCOL_VERSION_V3};
+use super::super::decision::{PinnedIntentRecipeV2, INTENT_RECIPE_PROTOCOL_VERSION_V4};
 use super::adjudication_error;
 
 #[cfg(test)]
 const SEMANTIC_IR_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.semantic_ir.v2\0";
 #[cfg(test)]
 const ADJUDICATION_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.adjudication.v2\0";
-const SEMANTIC_IR_DIGEST_DOMAIN_V3: &[u8] = b"starring.intent.semantic_ir.v3\0";
-const ADJUDICATION_DIGEST_DOMAIN_V3: &[u8] = b"starring.intent.adjudication.v3\0";
-const RECIPE_DETAILS_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.recipe_details.v1\0";
+const SEMANTIC_IR_DIGEST_DOMAIN_V4: &[u8] = b"starring.intent.semantic_ir.v4\0";
+const ADJUDICATION_DIGEST_DOMAIN_V4: &[u8] = b"starring.intent.adjudication.v4\0";
+const RECIPE_DETAILS_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.recipe_details.v2\0";
 
 pub(super) struct AdjudicationDigestInputV2<'a> {
     pub(super) decision_source: &'static str,
     pub(super) adjudicator_version: u16,
     pub(super) kind: &'static str,
     pub(super) semantic_ir_digest: &'a str,
+    pub(super) request_evidence_hash: Option<&'a str>,
     pub(super) manifest_version: u16,
     pub(super) manifest_digest: &'a str,
     pub(super) blockers: &'a [IntentCapabilityBlockerV2],
@@ -112,9 +112,19 @@ pub(super) fn adjudication_digest_v2(
     )
 }
 
-pub(super) fn semantic_ir_digest_v3(
-    core: &IntentCoreInterpretationV3,
+pub(super) fn semantic_ir_digest_v4(
+    core: &IntentCoreInterpretationV4,
 ) -> Result<String, StructuredError> {
+    let projection = canonical_semantic_ir_v4(core);
+    digest_serializable(
+        SEMANTIC_IR_DIGEST_DOMAIN_V4,
+        &projection,
+        "INTENT_SEMANTIC_IR_SERIALIZATION_FAILED",
+        "intent.semantic_ir",
+    )
+}
+
+fn canonical_semantic_ir_v4(core: &IntentCoreInterpretationV4) -> CanonicalSemanticIrV4<'_> {
     let mut boundary_requests = core
         .boundary_requests()
         .iter()
@@ -130,11 +140,10 @@ pub(super) fn semantic_ir_digest_v3(
         .into_iter()
         .collect();
     let detail_facets = canonical_detail_facets(core.recipe_detail_facets());
-    let projection = CanonicalSemanticIrV3 {
-        protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V3,
+    CanonicalSemanticIrV4 {
+        protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V4,
         request_mode: request_mode_wire(core.request_mode()),
         automation_kind: automation_kind_wire(core.automation_kind()),
-        objective: core.objective(),
         requested_outcome: requested_outcome_wire(core.requested_outcome()),
         hub_channel: core.selected_existing_channel().map(|value| value.as_str()),
         locale: locale_wire(core.locale()),
@@ -148,23 +157,38 @@ pub(super) fn semantic_ir_digest_v3(
         boundary_requests,
         unclassified_requirements,
         detail_facets,
-    };
+    }
+}
+
+pub(super) fn adjudication_digest_v4(
+    input: AdjudicationDigestInputV2<'_>,
+) -> Result<String, StructuredError> {
+    let projection = canonical_adjudication_v4(input)?;
     digest_serializable(
-        SEMANTIC_IR_DIGEST_DOMAIN_V3,
+        ADJUDICATION_DIGEST_DOMAIN_V4,
         &projection,
-        "INTENT_SEMANTIC_IR_SERIALIZATION_FAILED",
-        "intent.semantic_ir",
+        "INTENT_ADJUDICATION_SERIALIZATION_FAILED",
+        "intent.adjudication",
     )
 }
 
-pub(super) fn adjudication_digest_v3(
-    input: AdjudicationDigestInputV2<'_>,
-) -> Result<String, StructuredError> {
-    let projection = CanonicalAdjudicationV2 {
+fn canonical_adjudication_v4<'a>(
+    input: AdjudicationDigestInputV2<'a>,
+) -> Result<CanonicalAdjudicationV4<'a>, StructuredError> {
+    let request_evidence_hash = input.request_evidence_hash.ok_or_else(|| {
+        adjudication_error(
+            "INTENT_REQUEST_EVIDENCE_MISSING",
+            "intent.adjudication.request_evidence_hash",
+            "Protocol V4 adjudication requires initial request evidence",
+            "Bind the decision to the accepted initial human evidence chain",
+        )
+    })?;
+    Ok(CanonicalAdjudicationV4 {
         decision_source: input.decision_source,
         adjudicator_version: input.adjudicator_version,
         kind: input.kind,
         semantic_ir_digest: input.semantic_ir_digest,
+        request_evidence_hash,
         manifest_version: input.manifest_version,
         manifest_digest: input.manifest_digest,
         blockers: input.blockers,
@@ -175,30 +199,26 @@ pub(super) fn adjudication_digest_v3(
             recipe_id: target.recipe_id(),
             recipe_version: target.recipe_version(),
         }),
-    };
-    digest_serializable(
-        ADJUDICATION_DIGEST_DOMAIN_V3,
-        &projection,
-        "INTENT_ADJUDICATION_SERIALIZATION_FAILED",
-        "intent.adjudication",
-    )
+    })
 }
 
-pub(super) fn private_study_room_details_digest_v1(
+pub(super) fn private_study_room_details_digest_v2(
     core_semantic_digest: &str,
+    source_human_turn_digest: &str,
     details: &PrivateStudyRoomDetailsV1,
 ) -> Result<String, StructuredError> {
-    let projection = CanonicalRecipeDetailsV1 {
+    let projection = CanonicalRecipeDetailsV2 {
         recipe_id: crate::intent::PRIVATE_STUDY_ROOM_RECIPE_ID,
         recipe_version: crate::intent::PRIVATE_STUDY_ROOM_RECIPE_VERSION,
         core_semantic_digest,
+        source_human_turn_digest,
         covered_facets: canonical_detail_facets(details.covered_facets()),
         copy: details.copy(),
         naming: details.naming(),
         controls: details.controls(),
     };
     digest_serializable(
-        RECIPE_DETAILS_DIGEST_DOMAIN_V1,
+        RECIPE_DETAILS_DIGEST_DOMAIN_V2,
         &projection,
         "INTENT_RECIPE_DETAILS_SERIALIZATION_FAILED",
         "intent.recipe_details",
@@ -224,44 +244,15 @@ fn digest_serializable(
     code: &str,
     location: &str,
 ) -> Result<String, StructuredError> {
-    let value = serde_json::to_value(value).map_err(|error| {
-        adjudication_error(
+    canonical_json_digest(
+        domain,
+        value,
+        IdentityErrorSpec::new(
             code,
             location,
             "The deterministic intent projection could not be serialized",
-            error.to_string(),
-        )
-    })?;
-    let canonical = canonicalize_json(value);
-    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
-        adjudication_error(
-            code,
-            location,
-            "The canonical intent projection could not be serialized",
-            error.to_string(),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(bytes);
-    Ok(hex_digest(hasher.finalize()))
-}
-
-fn canonicalize_json(value: Value) -> Value {
-    match value {
-        Value::Object(values) => {
-            let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, canonicalize_json(value)))
-                    .collect(),
-            )
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
-        value => value,
-    }
+        ),
+    )
 }
 
 fn request_mode_wire(value: IntentRequestModeV2) -> &'static str {
@@ -353,16 +344,6 @@ fn detail_facet_wire(value: IntentRecipeDetailFacetV3) -> &'static str {
     }
 }
 
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    output
-}
-
 #[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalSemanticIrV2<'a> {
@@ -384,11 +365,10 @@ struct CanonicalSemanticIrV2<'a> {
 }
 
 #[derive(Serialize)]
-struct CanonicalSemanticIrV3<'a> {
+struct CanonicalSemanticIrV4<'a> {
     protocol_version: u16,
     request_mode: &'static str,
     automation_kind: &'static str,
-    objective: &'a str,
     requested_outcome: &'static str,
     hub_channel: Option<&'a str>,
     locale: &'static str,
@@ -400,6 +380,21 @@ struct CanonicalSemanticIrV3<'a> {
 }
 
 #[derive(Serialize)]
+struct CanonicalAdjudicationV4<'a> {
+    decision_source: &'static str,
+    adjudicator_version: u16,
+    kind: &'static str,
+    semantic_ir_digest: &'a str,
+    request_evidence_hash: &'a str,
+    manifest_version: u16,
+    manifest_digest: &'a str,
+    blockers: &'a [IntentCapabilityBlockerV2],
+    boundary_violations: &'a [IntentSafetyBoundaryViolationV2],
+    unclassified_requirements: &'a [String],
+    route_target: Option<CanonicalRouteTargetV2<'a>>,
+}
+
+#[derive(Serialize)]
 struct CanonicalRuntimeRequirementsV2 {
     persistence: &'static str,
     timers: &'static str,
@@ -407,6 +402,7 @@ struct CanonicalRuntimeRequirementsV2 {
     event_time_llm: bool,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalAdjudicationV2<'a> {
     decision_source: &'static str,
@@ -429,12 +425,160 @@ struct CanonicalRouteTargetV2<'a> {
 }
 
 #[derive(Serialize)]
-struct CanonicalRecipeDetailsV1<'a> {
+struct CanonicalRecipeDetailsV2<'a> {
     recipe_id: &'static str,
     recipe_version: u32,
     core_semantic_digest: &'a str,
+    source_human_turn_digest: &'a str,
     covered_facets: Vec<&'static str>,
     copy: &'a crate::intent::PrivateStudyRoomCopyProposalV1,
     naming: &'a crate::intent::PrivateStudyRoomNamingProposalV1,
     controls: &'a crate::turn::PrivateStudyRoomControlsInterpretationV2,
+}
+
+#[cfg(test)]
+mod v4_golden_tests {
+    use serde_json::{json, Value};
+
+    use crate::session::intent_routing::IntentRouteDecisionV2;
+    use crate::turn::parse_interpret_intent_core_compatibility;
+
+    use super::super::{adjudicate_intent_core_v4, IntentCoreAdjudicationV4};
+    use super::{
+        canonical_adjudication_v4, canonical_semantic_ir_v4, AdjudicationDigestInputV2,
+        ADJUDICATION_DIGEST_DOMAIN_V4, SEMANTIC_IR_DIGEST_DOMAIN_V4,
+    };
+
+    const REQUEST_EVIDENCE_HASH: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn core_value() -> Value {
+        json!({
+            "expected_revision": 0,
+            "request_mode": "build",
+            "automation_kind": "managed_private_study_room",
+            "requested_outcome": "validated_preview",
+            "hub_channel": "community_hub",
+            "language": "en",
+            "close_policy": "disabled",
+            "validation_gate": "enforce",
+            "preview_gate": "enforce",
+            "approval_gate": "enforce",
+            "live_discord_mutation": "no_live_mutation",
+            "secret_disclosure": "no_secret_disclosure",
+            "other_unmapped_required_capabilities": [],
+            "custom_detail_facets": [],
+            "response": ""
+        })
+    }
+
+    fn decision(value: &Value) -> IntentRouteDecisionV2 {
+        let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
+        match adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap() {
+            IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
+            _ => panic!("expected private study-room selection"),
+        }
+    }
+
+    fn adjudication_projection(decision: &IntentRouteDecisionV2) -> Value {
+        serde_json::to_value(
+            canonical_adjudication_v4(AdjudicationDigestInputV2 {
+                decision_source: decision.decision_source().as_str(),
+                adjudicator_version: decision.adjudicator_version(),
+                kind: decision.kind().as_str(),
+                semantic_ir_digest: decision.semantic_ir_digest(),
+                request_evidence_hash: decision.request_evidence_hash(),
+                manifest_version: decision.manifest_version(),
+                manifest_digest: decision.manifest_digest(),
+                blockers: decision.blockers(),
+                boundary_violations: decision.boundary_violations(),
+                unclassified_requirements: decision.unclassified_requirements(),
+                route_target: decision.route_target(),
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v4_identity_domains_projections_and_digests_are_exact_goldens() {
+        assert_eq!(
+            SEMANTIC_IR_DIGEST_DOMAIN_V4,
+            b"starring.intent.semantic_ir.v4\0"
+        );
+        assert_eq!(
+            ADJUDICATION_DIGEST_DOMAIN_V4,
+            b"starring.intent.adjudication.v4\0"
+        );
+
+        let value = core_value();
+        let core = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(canonical_semantic_ir_v4(&core)).unwrap(),
+            json!({
+                "protocol_version": 4,
+                "request_mode": "build",
+                "automation_kind": "managed_private_study_room",
+                "requested_outcome": "validated_preview",
+                "hub_channel": "community_hub",
+                "locale": "en",
+                "close_authorization": "disabled",
+                "runtime_requirements": {
+                    "persistence": "none",
+                    "timers": "none",
+                    "economy": "none",
+                    "event_time_llm": false
+                },
+                "boundary_requests": [],
+                "unclassified_requirements": [],
+                "detail_facets": []
+            })
+        );
+        let baseline = decision(&value);
+        assert_eq!(
+            baseline.semantic_ir_digest(),
+            "9edb6a99acc1119ebbeaca929c6c26c11e00919dd217e278c520f65272df115e"
+        );
+        assert_eq!(
+            adjudication_projection(&baseline),
+            json!({
+                "decision_source": "deterministic_intent_adjudicator",
+                "adjudicator_version": 3,
+                "kind": "private_study_room",
+                "semantic_ir_digest": "9edb6a99acc1119ebbeaca929c6c26c11e00919dd217e278c520f65272df115e",
+                "request_evidence_hash": REQUEST_EVIDENCE_HASH,
+                "manifest_version": 1,
+                "manifest_digest": "68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53",
+                "blockers": [],
+                "boundary_violations": [],
+                "unclassified_requirements": [],
+                "route_target": {
+                    "kind": "recipe",
+                    "recipe_id": "starring.private_study_room",
+                    "recipe_version": 1
+                }
+            })
+        );
+        assert_eq!(
+            baseline.adjudication_digest(),
+            "45ea6fb31cc2f205995f040d352d5cabe7d1ed803cffc92249a4efa54c57fe4a"
+        );
+
+        let mut detailed_value = core_value();
+        detailed_value["custom_detail_facets"] = json!(["custom_copy"]);
+        let detailed = decision(&detailed_value);
+        assert_eq!(
+            detailed.semantic_ir_digest(),
+            "1342e9ed2325f2db5318f9b18c5f7eed830d07ca28ef3834f4134bccc17394d2"
+        );
+        assert_eq!(
+            detailed.adjudication_digest(),
+            "0ecfc354461649409df44e50e2296ff0332188455336aae848ca7e7d52489b99"
+        );
+        assert_ne!(baseline.semantic_ir_digest(), detailed.semantic_ir_digest());
+        assert_ne!(
+            baseline.adjudication_digest(),
+            detailed.adjudication_digest()
+        );
+    }
 }

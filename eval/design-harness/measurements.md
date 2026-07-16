@@ -1,6 +1,6 @@
 # Serving measurements
 
-All rows use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1`. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Elapsed values are end-to-end harness burst time. Raw reports are kept locally under the ignored `results/` directory.
+Sections 1–8 use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1` unless a row says otherwise. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Section 9 uses the native Luna-medium Codex worker. Elapsed values are end-to-end harness burst time unless labeled as Promptfoo wall time. Raw reports are kept locally under the ignored `results/` directory.
 
 ## Baseline
 
@@ -216,3 +216,39 @@ Development checkpoints preceding the passing custom sample are retained as evid
 After the detail implementation was split into facade, schema, parse, and validation modules, cases 0–13 were rerun once from clean commit `c1e9a37266df0ae460748c5220402c48be7f5755`. The report `results/v3-precustom-final-regression-1run.json` passed 14/14 with no provider errors. All five preview-ready paths compiled 22 operations and had current validation and simulation; all nine routed discussion, fallback, capability-gap, and rejection paths kept Draft revision zero with no compiled operation. Source and build commits matched, `source_dirty` was false, and every response served the exact pinned model. This verifies behavior preservation for that one post-refactor sample; it is not the required repeated acceptance cohort.
 
 The measured custom path is fast enough for an internal preview interaction on this machine, but this section does not certify commercial readiness. It has no concurrent-load measurement, no long-session edit/recompile evidence, no stable semantic receipt identity, no production API or authentication benchmark, and no whole-plan Discord side-effect preflight. The historical typed-planner path remains useful for unsupported recipes, but its latency and variance make it a fallback rather than the first commercial path.
+
+## 8. Intent V4 targeted failure rerun
+
+Measured 2026-07-16 from clean commit `0688d640f9072f4ce95518eda0b7e89e03df45a0` against `gemma4:12b-mlx` with the declared 16,384-token context, disabled cache, and concurrency one. The evaluator selected only the six assertion-failing cases from `results/gemma4-intent-v4-smoke-d7884418f8c1.json`. The original clean-source smoke passed 20/26; this targeted rerun passed 6/6 with no provider errors, automatic HTTP retries, repair attempts, or repeated errors.
+
+| Case | Result | Harness ms | Model/tool calls | Turns | Compiled operations |
+| --- | --- | ---: | ---: | ---: | ---: |
+| English paraphrase | pass | 19,017 | 1/1 | 1 | 22 |
+| Control mutation | pass | 10,356 | 2/2 | 1 | 22 |
+| Missing hub | pass | 9,777 | 2/2 | 2 | 22 |
+| Missing hub after restart | pass | 7,082 | 2/2 | 2 | 22 |
+| Korean defaults | pass | 6,943 | 1/1 | 1 | 22 |
+| Copy-only mutation | pass | 15,053 | 2/2 | 1 | 22 |
+
+Every result selected the managed recipe, produced a current validation and simulation stamp, preserved exact request and semantic identity coverage, and reported the clean committed source and exact served model. This is a one-sample regression check of the previously failing subset. It is not a replacement for a clean full 26-case run or the required repeated acceptance matrix.
+
+## 9. Luna-medium native worker cutover canaries
+
+Measured 2026-07-17 from clean commit `c03f0642dfe142f8a30e28e606fdcfac1d022e8a`, which includes the native-worker byte-accounting fix. Source and build commits matched and both dirty flags were false in every report. The active provider was `codex_chatgpt`, with exact model `gpt-5.6-luna`, `medium` reasoning effort, and ChatGPT authentication through the bearer-authenticated worker bound to `127.0.0.1:18181`. The raw worker was not exposed through Cloudflare. Promptfoo cache was disabled and each row is one run.
+
+| Case | Result | Promptfoo wall ms | Harness ms | Model/tool calls | Prompt/completion tokens | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| English StudyRoom | 1/1 | 17,508 | 5,071 | 1/1 | 7,674/105 | ready at revision 22 |
+| Korean StudyRoom | 1/1 | 8,617 | 6,195 | 1/1 | 7,698/120 | ready at revision 22 |
+| Stateful game capability gap | 1/1 | 30,815 | 17,350 | 1/1 | 7,679/469 | deterministic `capability_gap`, revision 0 |
+| Direct live Discord mutation | 1/1 | 10,839 | 8,401 | 1/1 | 7,653/277 | deterministic `reject`, revision 0 |
+
+Both StudyRoom requests compiled 22 deterministic operations and reached current validation and golden-trace simulation. The unsupported stateful-game request preserved its hard requirements and produced a mutation-free capability gap. The direct-live-mutation request was rejected without Draft mutation. The four representative canaries therefore passed 4/4 and exercised ready, capability-gap, and safety-rejection paths through the native worker.
+
+These are single clean-source canaries, not a reliability or commercial-readiness result. They do not replace the repeated default, detail, mutation, equivalence, concurrency, saturation, and recovery cohorts. The retired `local.cloudflared.starring`, `local.llm-api`, and `local.ollama.server` services were disabled and unloaded after the canaries passed; the `gemma4:12b-mlx` model file was retained only for rollback and was not part of these results.
+
+### Post-hardening two-call canary
+
+After the worker deadline, disconnect, proxy, authentication-drift, and exact CLI-version checks were added, the LaunchAgent was restarted from clean commit `197168da43b9d5cd2be408cc18a7ae0a6cec861b`. Its health response reported `codex-cli 0.144.2`, Luna medium, ChatGPT authentication, zero active requests, zero queued requests, and a loopback-only listener. The custom-detail StudyRoom case passed 1/1 in 25,870 ms of Promptfoo wall time and 12,400 harness ms. It used exactly two model calls and two tool calls, consumed 14,081 prompt tokens and 220 completion tokens, needed no repair, compiled 22 deterministic operations, and reached current validation and golden-trace simulation at revision 22. The requested launcher label, channel-name affixes, Help label and response, and disabled close control all matched their exact RuleSet paths.
+
+This is one clean-source end-to-end canary of the bounded two-call path. It confirms that the hardened native worker still serves the most detailed managed-recipe route; it is not a repeated reliability, concurrency, or commercial-readiness result.

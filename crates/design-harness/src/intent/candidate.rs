@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
+
 use resource_resolution::ResourceBindingMap;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -11,10 +14,15 @@ use crate::turn::{
 };
 
 use super::catalog::MAX_COMPILED_REQUIREMENTS;
-use super::compile::{compile_intent, CompiledIntentV1};
+use super::compile::{compile_intent, CompiledIntentV2};
+use super::identity::{canonical_json_digest, IdentityErrorSpec};
 use super::model::IntentRequestedOutcome;
-use super::normalize::ValidatedIntentV1;
+use super::normalize::ValidatedIntentV2;
 use super::simulation::simulate_compiled_intent;
+
+const MANAGED_PRIVATE_STUDY_ROOM_OBJECTIVE: &str = "Build managed private study rooms";
+const CANDIDATE_RULESET_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.candidate_ruleset.v1\0";
+const DRAFT_STATE_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.draft_state.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +39,7 @@ pub struct IntentExecutionReportV1 {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommittedIntentCandidateV1 {
-    pub compilation: CompiledIntentV1,
+    pub compilation: CompiledIntentV2,
     pub preview: DraftPreview,
     pub execution: IntentExecutionReportV1,
 }
@@ -40,14 +48,18 @@ pub struct CommittedIntentCandidateV1 {
 pub struct PreparedIntentCandidateV1 {
     root: Draft,
     candidate: Draft,
-    compilation: CompiledIntentV1,
+    compilation: CompiledIntentV2,
     preview: DraftPreview,
     execution: IntentExecutionReportV1,
 }
 
 impl PreparedIntentCandidateV1 {
-    pub fn compilation(&self) -> &CompiledIntentV1 {
+    pub fn compilation(&self) -> &CompiledIntentV2 {
         &self.compilation
+    }
+
+    pub(crate) fn candidate(&self) -> &Draft {
+        &self.candidate
     }
 
     pub fn preview(&self) -> &DraftPreview {
@@ -84,13 +96,15 @@ impl PreparedIntentCandidateV1 {
 
 pub async fn prepare_intent_candidate(
     root: &Draft,
-    intent: &ValidatedIntentV1,
+    intent: &ValidatedIntentV2,
     bindings: &ResourceBindingMap,
 ) -> Result<PreparedIntentCandidateV1, StructuredError> {
-    let compiled = compile_intent(intent)?;
-    verify_external_bindings(&compiled, bindings)?;
-    let mut brief = recipe_turn_brief(intent)?;
-    brief.requirements = normalize_turn_plan(root, &brief, compiled.requirements.clone())?;
+    let available_channel_keys = bindings
+        .channel_bindings
+        .keys()
+        .map(|key| key.0.clone())
+        .collect::<Vec<_>>();
+    let (compiled, brief) = intent_candidate_preflight(root, intent, &available_channel_keys)?;
     let execution =
         execute_plan_atomically_with_bindings(root, &brief, bindings, MAX_COMPILED_REQUIREMENTS)
             .await
@@ -118,20 +132,52 @@ pub async fn prepare_intent_candidate(
     })
 }
 
-fn verify_external_bindings(
-    compiled: &CompiledIntentV1,
+pub(crate) fn replay_intent_candidate_preparation(
+    root: &Draft,
+    intent: &ValidatedIntentV2,
     bindings: &ResourceBindingMap,
+) -> Result<(), StructuredError> {
+    block_on_candidate_replay(prepare_intent_candidate(root, intent, bindings)).map(|_| ())
+}
+
+fn block_on_candidate_replay<F, T>(future: F) -> Result<T, StructuredError>
+where
+    F: Future<Output = Result<T, StructuredError>>,
+{
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => Err(candidate_error(
+            "INTENT_CANDIDATE_REPLAY_NOT_SYNCHRONOUS",
+            "intent.candidate.replay",
+            "Candidate preparation crossed an asynchronous boundary during snapshot replay",
+            "Keep candidate preparation side-effect-free and immediately ready during restore",
+        )),
+    }
+}
+
+fn intent_candidate_preflight(
+    root: &Draft,
+    intent: &ValidatedIntentV2,
+    available_channel_keys: &[String],
+) -> Result<(CompiledIntentV2, TurnBrief), StructuredError> {
+    let compiled = compile_intent(intent)?;
+    verify_external_channel_keys(&compiled, available_channel_keys)?;
+    let mut brief = recipe_turn_brief(intent)?;
+    brief.requirements = normalize_turn_plan(root, &brief, compiled.requirements.clone())?;
+    Ok((compiled, brief))
+}
+
+fn verify_external_channel_keys(
+    compiled: &CompiledIntentV2,
+    available_channel_keys: &[String],
 ) -> Result<(), StructuredError> {
     let missing = compiled
         .manifest
         .external_channel_bindings
         .iter()
-        .filter(|required| {
-            !bindings
-                .channel_bindings
-                .keys()
-                .any(|available| available.0.as_str() == required.as_str())
-        })
+        .filter(|required| !available_channel_keys.contains(required))
         .cloned()
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -148,7 +194,31 @@ fn verify_external_bindings(
     ))
 }
 
-fn recipe_turn_brief(intent: &ValidatedIntentV1) -> Result<TurnBrief, StructuredError> {
+pub(crate) fn candidate_ruleset_hash(candidate: &Draft) -> Result<String, StructuredError> {
+    canonical_json_digest(
+        CANDIDATE_RULESET_DIGEST_DOMAIN_V1,
+        &candidate.ruleset,
+        IdentityErrorSpec::new(
+            "INTENT_CANDIDATE_SERIALIZATION_FAILED",
+            "intent.candidate.ruleset_hash",
+            "The candidate RuleSet could not be serialized deterministically",
+        ),
+    )
+}
+
+pub(crate) fn draft_state_hash(draft: &Draft) -> Result<String, StructuredError> {
+    canonical_json_digest(
+        DRAFT_STATE_DIGEST_DOMAIN_V1,
+        draft,
+        IdentityErrorSpec::new(
+            "INTENT_CANDIDATE_SERIALIZATION_FAILED",
+            "intent.candidate.draft_state_hash",
+            "The candidate Draft state could not be serialized deterministically",
+        ),
+    )
+}
+
+fn recipe_turn_brief(intent: &ValidatedIntentV2) -> Result<TurnBrief, StructuredError> {
     let requested_outcome = match intent.requested_outcome() {
         IntentRequestedOutcome::WorkingDraft => RequestedOutcome::DraftUpdate,
         IntentRequestedOutcome::ValidatedPreview => RequestedOutcome::ValidatedPreview,
@@ -163,7 +233,7 @@ fn recipe_turn_brief(intent: &ValidatedIntentV1) -> Result<TurnBrief, Structured
     };
     Ok(TurnBrief {
         intent: TurnIntent::Build,
-        objective: intent.objective().to_string(),
+        objective: MANAGED_PRIVATE_STUDY_ROOM_OBJECTIVE.to_string(),
         requested_outcome,
         requirements: Vec::new(),
         assumptions: Vec::new(),
@@ -192,14 +262,13 @@ mod tests {
     use super::*;
     use crate::intent::{
         propose_private_study_room, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
-        IntentProposalOutcomeV1, IntentResolutionContext, PrivateStudyRoomControlsProposalV1,
+        IntentProposalOutcomeV2, IntentResolutionContext, PrivateStudyRoomControlsProposalV1,
         PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1,
-        PrivateStudyRoomProposalV1,
+        PrivateStudyRoomProposalV2,
     };
 
-    fn resolved_intent(hub: &str, close_policy: Option<ClosePolicyV1>) -> ValidatedIntentV1 {
-        let proposal = PrivateStudyRoomProposalV1 {
-            objective: "Create private study rooms".to_string(),
+    fn resolved_intent(hub: &str, close_policy: Option<ClosePolicyV1>) -> ValidatedIntentV2 {
+        let proposal = PrivateStudyRoomProposalV2 {
             requested_outcome: IntentRequestedOutcome::ValidatedPreview,
             hub_channel: Some(ExistingChannelKey(hub.to_string())),
             locale: Some(IntentLocaleV1::En),
@@ -212,12 +281,77 @@ mod tests {
         };
         let context =
             IntentResolutionContext::from_channel_bindings([ExistingChannelKey(hub.to_string())]);
-        let IntentProposalOutcomeV1::Resolved { intent, .. } =
+        let IntentProposalOutcomeV2::Resolved { intent, .. } =
             propose_private_study_room(proposal, &context).unwrap()
         else {
             panic!("expected resolved intent");
         };
         intent
+    }
+
+    #[test]
+    fn candidate_turn_brief_uses_a_harness_owned_objective() {
+        let intent = resolved_intent("community_hub", None);
+
+        let brief = recipe_turn_brief(&intent).unwrap();
+
+        assert_eq!(brief.objective, MANAGED_PRIVATE_STUDY_ROOM_OBJECTIVE);
+    }
+
+    #[test]
+    fn candidate_and_draft_identities_are_stable_and_separate() {
+        block_on(async {
+            let intent = resolved_intent("community_hub", None);
+            let root = Draft::new();
+            let first = prepare_intent_candidate(&root, &intent, &bindings("community_hub"))
+                .await
+                .unwrap();
+            let second = prepare_intent_candidate(&root, &intent, &bindings("community_hub"))
+                .await
+                .unwrap();
+
+            let first_ruleset = candidate_ruleset_hash(first.candidate()).unwrap();
+            let second_ruleset = candidate_ruleset_hash(second.candidate()).unwrap();
+            let first_draft = draft_state_hash(first.candidate()).unwrap();
+            let second_draft = draft_state_hash(second.candidate()).unwrap();
+
+            assert_eq!(first.candidate(), second.candidate());
+            assert_eq!(first_ruleset, second_ruleset);
+            assert_eq!(first_draft, second_draft);
+            assert_ne!(first_ruleset, first_draft);
+            assert_eq!(
+                first_ruleset,
+                "3b3e4480d50fdc7146c83a14032be818e01e41b12207bcc8ad16b33794de346c"
+            );
+            assert_eq!(
+                first_draft,
+                "8f282e34b267099cdf1446451cd43580d8e67e94868bfa50e974d383309c746b"
+            );
+
+            let mut metadata_only = first.candidate().clone();
+            metadata_only.draft_revision += 1;
+            assert_eq!(
+                candidate_ruleset_hash(first.candidate()).unwrap(),
+                candidate_ruleset_hash(&metadata_only).unwrap()
+            );
+            assert_ne!(
+                draft_state_hash(first.candidate()).unwrap(),
+                draft_state_hash(&metadata_only).unwrap()
+            );
+
+            let mut content_changed = first.candidate().clone();
+            content_changed.ruleset.panels[0]
+                .content
+                .push_str(" changed");
+            assert_ne!(
+                candidate_ruleset_hash(first.candidate()).unwrap(),
+                candidate_ruleset_hash(&content_changed).unwrap()
+            );
+            assert_ne!(
+                draft_state_hash(first.candidate()).unwrap(),
+                draft_state_hash(&content_changed).unwrap()
+            );
+        });
     }
 
     fn bindings(hub: &str) -> ResourceBindingMap {
@@ -250,6 +384,31 @@ mod tests {
             assert_eq!(root.simulated_revision, Some(root.draft_revision));
             assert_eq!(committed.execution.candidate_revision, root.draft_revision);
         });
+    }
+
+    #[test]
+    fn candidate_replay_runs_the_complete_preparation_boundary() {
+        let intent = resolved_intent("community_hub", None);
+
+        replay_intent_candidate_preparation(&Draft::new(), &intent, &bindings("community_hub"))
+            .unwrap();
+
+        let close_intent = resolved_intent("community_hub", Some(ClosePolicyV1::AnyMember));
+        replay_intent_candidate_preparation(
+            &Draft::new(),
+            &close_intent,
+            &bindings("community_hub"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn candidate_replay_fails_closed_at_an_async_boundary() {
+        let error =
+            block_on_candidate_replay(std::future::pending::<Result<(), StructuredError>>())
+                .unwrap_err();
+
+        assert_eq!(error.code, "INTENT_CANDIDATE_REPLAY_NOT_SYNCHRONOUS");
     }
 
     #[test]

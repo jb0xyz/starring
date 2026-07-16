@@ -1,15 +1,15 @@
 use super::model::{
     ClosePolicyV1, ExistingChannelKey, FeatureConfigurationV1, FeatureId, FeatureIntentV1,
     IntentLocaleV1, IntentRequestedOutcome, IntentResolutionContext, IntentValue,
-    IntentValueSource, IntentWorkspaceV1, ManagedPrivateRoomControlsDraftV1,
+    IntentValueSource, IntentWorkspaceV2, ManagedPrivateRoomControlsDraftV1,
     ManagedPrivateRoomCopyDraftV1, ManagedPrivateRoomDraftV1, ManagedPrivateRoomNamingDraftV1,
     RecipeRef, RoomNamePatternV1, INTENT_SCHEMA_VERSION, PRIVATE_STUDY_ROOM_RECIPE_ID,
     PRIVATE_STUDY_ROOM_RECIPE_VERSION,
 };
-use super::normalize::{resolve_intent_workspace, IntentResolutionV1, ValidatedIntentV1};
+use super::normalize::{resolve_intent_workspace, IntentResolutionV2, ValidatedIntentV2};
 use super::proposal::{
-    propose_private_study_room, IntentProposalOutcomeV1, PrivateStudyRoomControlsProposalV1,
-    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV1,
+    propose_private_study_room, IntentProposalOutcomeV2, PrivateStudyRoomControlsProposalV1,
+    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,
 };
 use serde_json::json;
 
@@ -20,11 +20,10 @@ fn recipe() -> RecipeRef {
     }
 }
 
-fn workspace(configuration: ManagedPrivateRoomDraftV1) -> IntentWorkspaceV1 {
-    IntentWorkspaceV1 {
+fn workspace(configuration: ManagedPrivateRoomDraftV1) -> IntentWorkspaceV2 {
+    IntentWorkspaceV2 {
         schema_version: INTENT_SCHEMA_VERSION,
         revision: 1,
-        objective: "  Create a private study room  ".to_string(),
         requested_outcome: IntentRequestedOutcome::ValidatedPreview,
         features: vec![FeatureIntentV1 {
             feature_id: FeatureId(" study_rooms ".to_string()),
@@ -38,7 +37,7 @@ fn explicit<T>(value: T) -> IntentValue<T> {
     IntentValue::new(value, IntentValueSource::UserExplicit)
 }
 
-fn resolve(input: IntentWorkspaceV1) -> Result<IntentResolutionV1, crate::StructuredError> {
+fn resolve(input: IntentWorkspaceV2) -> Result<IntentResolutionV2, crate::StructuredError> {
     let context = IntentResolutionContext::from_channel_bindings([
         ExistingChannelKey("study_hub".to_string()),
         ExistingChannelKey("second_hub".to_string()),
@@ -46,7 +45,7 @@ fn resolve(input: IntentWorkspaceV1) -> Result<IntentResolutionV1, crate::Struct
     resolve_intent_workspace(input, &context)
 }
 
-fn resolved_room(intent: &ValidatedIntentV1) -> serde_json::Value {
+fn resolved_room(intent: &ValidatedIntentV2) -> serde_json::Value {
     serde_json::to_value(intent).expect("validated intent should serialize")["features"][0]
         ["configuration"]["parameters"]
         .clone()
@@ -56,14 +55,14 @@ fn resolved_room(intent: &ValidatedIntentV1) -> serde_json::Value {
 fn missing_hub_channel_returns_one_stable_decision_without_guessing() {
     let resolution = resolve(workspace(ManagedPrivateRoomDraftV1::default()))
         .expect("workspace should normalize");
-    let IntentResolutionV1::NeedsInput {
+    let IntentResolutionV2::NeedsInput {
         workspace,
         decisions,
     } = resolution
     else {
         panic!("expected a missing decision");
     };
-    assert_eq!(workspace.objective, "Create a private study room");
+    assert_eq!(workspace.schema_version, 2);
     assert_eq!(workspace.features[0].feature_id.as_str(), "study_rooms");
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].id, "study_rooms.hub_channel");
@@ -82,7 +81,7 @@ fn complete_workspace_materializes_deterministic_defaults_with_provenance() {
     let first = resolve(workspace(configuration.clone())).expect("workspace should resolve");
     let second = resolve(workspace(configuration)).expect("repeat should resolve");
     assert_eq!(first, second);
-    let IntentResolutionV1::Resolved { intent } = first else {
+    let IntentResolutionV2::Resolved { intent } = first else {
         panic!("expected a resolved intent");
     };
     let room = resolved_room(&intent);
@@ -109,7 +108,7 @@ fn locale_selects_one_consistent_recipe_copy_set() {
         locale: Some(explicit(IntentLocaleV1::Ko)),
         ..ManagedPrivateRoomDraftV1::default()
     };
-    let IntentResolutionV1::Resolved { intent } =
+    let IntentResolutionV2::Resolved { intent } =
         resolve(workspace(configuration)).expect("workspace should resolve")
     else {
         panic!("expected a resolved intent");
@@ -155,7 +154,7 @@ fn close_control_has_no_inactive_copy_and_requires_an_explicit_policy() {
         },
         ..ManagedPrivateRoomDraftV1::default()
     };
-    let IntentResolutionV1::Resolved { intent } =
+    let IntentResolutionV2::Resolved { intent } =
         resolve(workspace(enabled)).expect("workspace should resolve")
     else {
         panic!("expected a resolved intent");
@@ -188,7 +187,7 @@ fn explicit_copy_is_trimmed_but_affix_spacing_is_preserved() {
         },
         controls: ManagedPrivateRoomControlsDraftV1::default(),
     };
-    let IntentResolutionV1::Resolved { intent } =
+    let IntentResolutionV2::Resolved { intent } =
         resolve(workspace(configuration)).expect("workspace should resolve")
     else {
         panic!("expected a resolved intent");
@@ -283,9 +282,8 @@ fn syntactically_valid_but_unavailable_channel_binding_is_rejected() {
 #[test]
 fn strict_serialization_rejects_unknown_recipe_fields() {
     let value = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "revision": 0,
-        "objective": "Create a room",
         "requested_outcome": "validated_preview",
         "features": [{
             "feature_id": "study_rooms",
@@ -305,7 +303,7 @@ fn strict_serialization_rejects_unknown_recipe_fields() {
             }
         }]
     });
-    let error = serde_json::from_value::<IntentWorkspaceV1>(value).unwrap_err();
+    let error = serde_json::from_value::<IntentWorkspaceV2>(value).unwrap_err();
     assert!(error.to_string().contains("unknown field"));
 }
 
@@ -334,7 +332,7 @@ fn multiline_labels_are_rejected_while_messages_remain_multiline() {
     };
     assert!(matches!(
         resolve(workspace(good_message)),
-        Ok(IntentResolutionV1::Resolved { .. })
+        Ok(IntentResolutionV2::Resolved { .. })
     ));
 }
 
@@ -344,11 +342,11 @@ fn model_facing_proposal_rejects_harness_owned_metadata() {
         "schema_version",
         "revision",
         "feature_id",
+        "objective",
         "recipe",
         "source",
     ] {
         let mut value = json!({
-            "objective": "Create a private study room",
             "requested_outcome": "validated_preview",
             "hub_channel": "study_hub"
         });
@@ -356,7 +354,7 @@ fn model_facing_proposal_rejects_harness_owned_metadata() {
             .as_object_mut()
             .expect("proposal should be an object")
             .insert(field.to_string(), json!(1));
-        let error = serde_json::from_value::<PrivateStudyRoomProposalV1>(value).unwrap_err();
+        let error = serde_json::from_value::<PrivateStudyRoomProposalV2>(value).unwrap_err();
         assert!(
             error.to_string().contains("unknown field"),
             "{field}: {error}"
@@ -369,8 +367,7 @@ fn proposal_ingestion_stamps_identity_revision_and_provenance() {
     let context = IntentResolutionContext::from_channel_bindings([ExistingChannelKey(
         "study_hub".to_string(),
     )]);
-    let proposal = PrivateStudyRoomProposalV1 {
-        objective: "Create a private study room".to_string(),
+    let proposal = PrivateStudyRoomProposalV2 {
         requested_outcome: IntentRequestedOutcome::ValidatedPreview,
         hub_channel: Some(ExistingChannelKey("study_hub".to_string())),
         locale: Some(IntentLocaleV1::En),
@@ -378,20 +375,20 @@ fn proposal_ingestion_stamps_identity_revision_and_provenance() {
         naming: PrivateStudyRoomNamingProposalV1::default(),
         controls: PrivateStudyRoomControlsProposalV1::default(),
     };
-    let IntentProposalOutcomeV1::Resolved { revision, intent } =
+    let IntentProposalOutcomeV2::Resolved { revision, intent } =
         propose_private_study_room(proposal, &context).expect("proposal should resolve")
     else {
         panic!("expected a resolved proposal");
     };
     assert_eq!(revision, 1);
     assert_eq!(intent.revision(), 1);
-    assert_eq!(intent.schema_version(), 1);
-    assert_eq!(intent.objective(), "Create a private study room");
+    assert_eq!(intent.schema_version(), 2);
     assert_eq!(
         intent.requested_outcome(),
         IntentRequestedOutcome::ValidatedPreview
     );
     let serialized = serde_json::to_value(&intent).expect("validated intent should serialize");
+    assert!(serialized.get("objective").is_none());
     assert_eq!(
         serialized["features"][0]["feature_id"],
         "private_study_room"

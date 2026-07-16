@@ -6,21 +6,19 @@ use crate::errors::StructuredError;
 use super::model::{
     ClosePolicyV1, ExistingChannelKey, FeatureConfigurationV1, FeatureId, FeatureIntentV1,
     IntentLocaleV1, IntentRequestedOutcome, IntentResolutionContext, IntentValue,
-    IntentValueSource, IntentWorkspaceV1, ManagedPrivateRoomControlsDraftV1,
+    IntentValueSource, IntentWorkspaceV2, ManagedPrivateRoomControlsDraftV1,
     ManagedPrivateRoomCopyDraftV1, ManagedPrivateRoomDraftV1, ManagedPrivateRoomNamingDraftV1,
     MissingDecision, RecipeRef, RoomNamePatternV1, INTENT_SCHEMA_VERSION,
     PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
 };
-use super::normalize::{prepare_intent_workspace, PreparedIntentWorkspaceV1, ValidatedIntentV1};
+use super::normalize::{prepare_intent_workspace, PreparedIntentWorkspaceV2, ValidatedIntentV2};
 
 const INITIAL_INTENT_REVISION: u64 = 1;
 const PRIVATE_STUDY_ROOM_FEATURE_ID: &str = "private_study_room";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PrivateStudyRoomProposalV1 {
-    #[schemars(description = "Concise summary of the complete requested automation")]
-    pub objective: String,
+pub struct PrivateStudyRoomProposalV2 {
     #[schemars(
         description = "Exact requested result: discussion, working_draft, or validated_preview"
     )]
@@ -87,31 +85,31 @@ pub struct PrivateStudyRoomControlsProposalV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum IntentProposalOutcomeV1 {
+pub enum IntentProposalOutcomeV2 {
     NeedsInput {
         revision: u64,
         decisions: Vec<MissingDecision>,
     },
     Resolved {
         revision: u64,
-        intent: ValidatedIntentV1,
+        intent: ValidatedIntentV2,
     },
 }
 
 pub fn propose_private_study_room(
-    proposal: PrivateStudyRoomProposalV1,
+    proposal: PrivateStudyRoomProposalV2,
     context: &IntentResolutionContext,
-) -> Result<IntentProposalOutcomeV1, StructuredError> {
+) -> Result<IntentProposalOutcomeV2, StructuredError> {
     match prepare_private_study_room(proposal, context)? {
-        PreparedIntentWorkspaceV1::NeedsInput {
+        PreparedIntentWorkspaceV2::NeedsInput {
             workspace,
             decisions,
-        } => Ok(IntentProposalOutcomeV1::NeedsInput {
+        } => Ok(IntentProposalOutcomeV2::NeedsInput {
             revision: workspace.revision,
             decisions,
         }),
-        PreparedIntentWorkspaceV1::Resolved { intent, .. } => {
-            Ok(IntentProposalOutcomeV1::Resolved {
+        PreparedIntentWorkspaceV2::Resolved { intent, .. } => {
+            Ok(IntentProposalOutcomeV2::Resolved {
                 revision: intent.revision(),
                 intent,
             })
@@ -120,18 +118,18 @@ pub fn propose_private_study_room(
 }
 
 pub(crate) fn prepare_private_study_room(
-    proposal: PrivateStudyRoomProposalV1,
+    proposal: PrivateStudyRoomProposalV2,
     context: &IntentResolutionContext,
-) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
+) -> Result<PreparedIntentWorkspaceV2, StructuredError> {
     prepare_intent_workspace(workspace_from_proposal(proposal), context)
 }
 
 pub(crate) fn apply_existing_channel_decision(
-    workspace: &IntentWorkspaceV1,
+    workspace: &IntentWorkspaceV2,
     expected_revision: u64,
     channel: ExistingChannelKey,
     context: &IntentResolutionContext,
-) -> Result<PreparedIntentWorkspaceV1, StructuredError> {
+) -> Result<PreparedIntentWorkspaceV2, StructuredError> {
     if workspace.revision != expected_revision {
         return Err(StructuredError::new(
             "STALE_INTENT_WORKSPACE_REVISION",
@@ -169,11 +167,10 @@ pub(crate) fn apply_existing_channel_decision(
     prepare_intent_workspace(updated, context)
 }
 
-fn workspace_from_proposal(proposal: PrivateStudyRoomProposalV1) -> IntentWorkspaceV1 {
-    IntentWorkspaceV1 {
+fn workspace_from_proposal(proposal: PrivateStudyRoomProposalV2) -> IntentWorkspaceV2 {
+    IntentWorkspaceV2 {
         schema_version: INTENT_SCHEMA_VERSION,
         revision: INITIAL_INTENT_REVISION,
-        objective: proposal.objective,
         requested_outcome: proposal.requested_outcome,
         features: vec![FeatureIntentV1 {
             feature_id: FeatureId(PRIVATE_STUDY_ROOM_FEATURE_ID.to_string()),

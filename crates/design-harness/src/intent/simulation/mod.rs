@@ -17,12 +17,12 @@ use serde::Serialize;
 use crate::draft::Draft;
 use crate::errors::StructuredError;
 
-use super::compile::{compile_intent, CompiledIntentV1};
+use super::compile::{compile_intent, CompiledIntentV2};
 use super::model::{
     ResolvedCloseControlV1, ResolvedFeatureConfigurationV1, ResolvedManagedPrivateRoomV1,
     PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION,
 };
-use super::normalize::ValidatedIntentV1;
+use super::normalize::ValidatedIntentV2;
 use oracle::prove_close_disabled;
 use support::{ensure_hub_binding, identity_error, simulation_error, INSTANCE_ID};
 use trace::{run_close_trace, run_help_trace, run_join_trace, run_open_trace, run_submit_trace};
@@ -68,8 +68,8 @@ struct SimulationRuntime<'a> {
 
 pub(crate) async fn simulate_compiled_intent(
     candidate: &mut Draft,
-    intent: &ValidatedIntentV1,
-    compiled: &CompiledIntentV1,
+    intent: &ValidatedIntentV2,
+    compiled: &CompiledIntentV2,
     bindings: &ResourceBindingMap,
 ) -> Result<IntentSimulationReportV1, StructuredError> {
     candidate.simulated_revision = None;
@@ -82,8 +82,8 @@ pub(crate) async fn simulate_compiled_intent(
 
 async fn simulate_private_study_room(
     candidate: &Draft,
-    intent: &ValidatedIntentV1,
-    compiled: &CompiledIntentV1,
+    intent: &ValidatedIntentV2,
+    compiled: &CompiledIntentV2,
     bindings: &ResourceBindingMap,
 ) -> Result<IntentSimulationReportV1, StructuredError> {
     if candidate.validated_revision != Some(candidate.draft_revision) {
@@ -193,7 +193,7 @@ async fn simulate_private_study_room(
 }
 
 fn recipe_keys(
-    compiled: &CompiledIntentV1,
+    compiled: &CompiledIntentV2,
     room: &ResolvedManagedPrivateRoomV1,
 ) -> Result<RecipeKeys, StructuredError> {
     let generated = &compiled.manifest.generated_objects;
