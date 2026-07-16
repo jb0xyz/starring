@@ -1201,10 +1201,10 @@ function hashesAreValid(receipt) {
 function intentProvenance(output) {
   return checked(output, (report) => {
     const failures = [];
-    if (report.requested_model !== 'gemma4:12b-mlx') {
+    if (report.requested_model !== 'gpt-5.6-luna') {
       failures.push(`requested_model=${report.requested_model}`);
     }
-    if (report.served_model !== 'gemma4:12b-mlx') {
+    if (report.served_model !== 'gpt-5.6-luna') {
       failures.push(`served_model=${report.served_model}`);
     }
     if (!/^sha256-[0-9a-f]{64}$/.test(report.gateway_id)) {
@@ -1258,7 +1258,7 @@ function intentProvenance(output) {
       failures.push('gateway token usage is missing from model call metrics');
     }
     return result(failures.length === 0, failures.length === 0
-      ? 'Gemma4 cohort source, binary, and declared context policy are exact and clean'
+      ? 'Luna medium cohort source, binary, and declared context policy are exact and clean'
       : failures.join(', '));
   });
 }

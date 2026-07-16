@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const fixtures = require('./fixtures.json');
 
-const INTENT_MODEL = 'gemma4:12b-mlx';
+const INTENT_MODEL = 'gpt-5.6-luna';
+const INTENT_REASONING_EFFORT = 'medium';
 const INTENT_CONTEXT_TOKENS = 16384;
 const INTENT_TIMEOUT_MS = 60000;
 const INTENT_SESSION_CONFIG = Object.freeze({
@@ -191,7 +192,7 @@ function sourceState(root) {
 function gatewayIdentity(baseUrl) {
   const gateway = new URL(baseUrl);
   if (!['http:', 'https:'].includes(gateway.protocol) || gateway.username || gateway.password) {
-    throw new Error('STARRING_LLM_BASE_URL must identify an HTTP gateway without credentials');
+    throw new Error('the model worker URL must identify an HTTP endpoint without credentials');
   }
   const normalized = `${gateway.origin}${gateway.pathname.replace(/\/$/, '')}`;
   return `sha256-${createHash('sha256').update(normalized).digest('hex')}`;
@@ -233,17 +234,26 @@ class DesignHarnessProvider {
   }
 
   async callApi(prompt) {
-    if (!process.env.STARRING_LLM_BASE_URL) {
-      return { error: 'STARRING_LLM_BASE_URL is required' };
-    }
-    if (!process.env.STARRING_LLM_API_KEY) {
-      return { error: 'STARRING_LLM_API_KEY is required' };
-    }
     let prepared;
     try {
       prepared = preparePrompt(prompt, this.config.intentOnly === true);
     } catch (error) {
       return { error: `invalid evaluation input: ${error.message}` };
+    }
+    if (prepared.intent) {
+      if (!process.env.STARRING_CODEX_WORKER_URL) {
+        return { error: 'STARRING_CODEX_WORKER_URL is required' };
+      }
+      if (!process.env.STARRING_CODEX_WORKER_TOKEN) {
+        return { error: 'STARRING_CODEX_WORKER_TOKEN is required' };
+      }
+    } else {
+      if (!process.env.STARRING_LLM_BASE_URL) {
+        return { error: 'STARRING_LLM_BASE_URL is required' };
+      }
+      if (!process.env.STARRING_LLM_API_KEY) {
+        return { error: 'STARRING_LLM_API_KEY is required' };
+      }
     }
     const root = path.resolve(__dirname, '..', '..');
     const binaryOverride = process.env.STARRING_HARNESS_BIN;
@@ -272,13 +282,21 @@ class DesignHarnessProvider {
         if (this.config.model !== INTENT_MODEL) {
           throw new Error(`intent provider model must be exactly ${INTENT_MODEL}`);
         }
+        if (this.config.reasoningEffort !== INTENT_REASONING_EFFORT) {
+          throw new Error(
+            `intent provider reasoning effort must be exactly ${INTENT_REASONING_EFFORT}`,
+          );
+        }
         const bindings = bindingDocument(this.config.bindings);
         const source = sourceState(root);
         intentRunOrder += 1;
         env.STARRING_LLM_MODEL = INTENT_MODEL;
+        env.STARRING_CODEX_REASONING_EFFORT = INTENT_REASONING_EFFORT;
         env.STARRING_HARNESS_MODE = 'intent_recipe';
         env.STARRING_HARNESS_BINDINGS_JSON = bindings;
-        env.STARRING_EVAL_GATEWAY_ID = gatewayIdentity(process.env.STARRING_LLM_BASE_URL);
+        env.STARRING_EVAL_GATEWAY_ID = gatewayIdentity(
+          process.env.STARRING_CODEX_WORKER_URL,
+        );
         env.STARRING_EVAL_DECLARED_CONTEXT_TOKENS = String(INTENT_CONTEXT_TOKENS);
         env.STARRING_EVAL_SOURCE_COMMIT = source.commit;
         env.STARRING_EVAL_SOURCE_DIRTY = String(source.dirty);

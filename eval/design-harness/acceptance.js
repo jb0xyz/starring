@@ -867,7 +867,7 @@ function assess(document) {
     check('single_cohort_boundary', boundaries.length === 1, boundaries.length, 1),
     check('exact_cohort_metadata', valid.length > 0 && valid.every(metadataIsExact), rate(valid, metadataIsExact), '100%'),
     check('clean_exact_source', valid.length > 0 && valid.every((entry) => entry.report.provenance?.source_dirty === false && entry.report.provenance?.build_source_dirty === false), rate(valid, (entry) => entry.report.provenance?.source_dirty === false && entry.report.provenance?.build_source_dirty === false), '100%'),
-    check('gemma4_only', valid.length > 0 && valid.every((entry) => entry.report.requested_model === 'gemma4:12b-mlx' && entry.report.served_model === 'gemma4:12b-mlx'), rate(valid, (entry) => entry.report.requested_model === 'gemma4:12b-mlx' && entry.report.served_model === 'gemma4:12b-mlx'), '100%'),
+    check('luna_only', valid.length > 0 && valid.every((entry) => entry.report.requested_model === 'gpt-5.6-luna' && entry.report.served_model === 'gpt-5.6-luna'), rate(valid, (entry) => entry.report.requested_model === 'gpt-5.6-luna' && entry.report.served_model === 'gpt-5.6-luna'), '100%'),
     check('ordered_provenance', orderSequence, sortedOrders, 'unique contiguous order starting at 1'),
     check('single_concurrency_timeline', orderedRuns.length > 0 && nonOverlappingRuns, nonOverlappingRuns, 'non-overlapping run intervals'),
     check('oracle_isolation', valid.length > 0 && valid.every(oracleFree), rate(valid, oracleFree), '100%'),

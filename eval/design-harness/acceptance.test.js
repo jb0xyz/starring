@@ -173,7 +173,7 @@ function metric(frontierName = 'interpret_intent_core') {
     frontier_name: frontierName,
     outcome: 'succeeded',
     http_status: 200,
-    served_model: 'gemma4:12b-mlx',
+    served_model: 'gpt-5.6-luna',
     request_body_bytes: detail ? 4500 : 6500,
     message_bytes: 1200,
     tool_bytes: detail ? 1600 : 1300,
@@ -341,8 +341,8 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     intent_protocol_version: 4,
     intent_adjudicator_version: 3,
     intent_identity_revision: 2,
-    requested_model: 'gemma4:12b-mlx',
-    served_model: 'gemma4:12b-mlx',
+    requested_model: 'gpt-5.6-luna',
+    served_model: 'gpt-5.6-luna',
     declared_context_tokens: 16384,
     context_declaration_source: 'evaluation_provider',
     gateway_context_observed_tokens: null,
@@ -955,7 +955,7 @@ function passingDocument() {
   return { results: { results: rows } };
 }
 
-test('checkpoint acceptance enforces repeated Gemma recipe quality and equivalence', () => {
+test('checkpoint acceptance enforces repeated Luna recipe quality and equivalence', () => {
   const assessment = assess(passingDocument());
 
   assert.equal(assessment.pass, true);
@@ -1053,7 +1053,7 @@ test('mixed semantics, models, failed assertions, or missing cases cannot pass t
   model.results.results[0].response.metadata.model_call_metrics.forEach((entry) => {
     entry.served_model = 'other';
   });
-  assert.equal(assess(model).checks.find((entry) => entry.name === 'gemma4_only').pass, false);
+  assert.equal(assess(model).checks.find((entry) => entry.name === 'luna_only').pass, false);
 
   const samples = passingDocument();
   samples.results.results = samples.results.results.filter(
