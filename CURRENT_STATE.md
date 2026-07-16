@@ -129,6 +129,12 @@ disk only as rollback material. Interactive CLI startup now defaults to Intent
 Recipe mode and fails closed before network access when its bindings are absent.
 Adaptive and Typed Plan remain explicit legacy rollback modes only.
 
+The worker health contract exposes its stable process instance, source digest,
+capacity, timeout, and monotonic accepted and settled completion counters. The
+Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
+that every phase counter delta equals that phase's reported model calls; another
+valid completion request invalidates the cohort instead of contaminating it.
+
 The current V4 implementation and evidence internals are recorded in
 `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
 Its Gemma serving and continuation instructions are superseded by this document
@@ -239,8 +245,9 @@ skips approval but keeps every technical safeguard.
   library run contains 648 passing tests. After the responsibility splits, the
   full local workspace, clippy, formatting, JavaScript and Promptfoo static,
   diff, dependency, comment, credential, and scope gates passed. The initial
-  clean-source Luna cutover canaries passed 4/4; GitHub CI and the required
-  repeated Luna acceptance matrix remain separate evidence boundaries.
+  clean-source Luna cutover canaries passed 4/4. The exact resumable repeated
+  Luna matrix is implemented and statically verified; its live 232-sample run
+  and GitHub CI remain separate evidence boundaries.
 - **Live certification**: manual runbooks (real bot, guild, PostgreSQL) prove the
   end-to-end lifecycle; they are never wired into CI.
 
@@ -286,8 +293,10 @@ Stated as capabilities (durable across the phase numbering):
   repetitions per case, 3/3 full custom-detail results, one copy-only pass, and
   a 14/14 clean-source post-refactor regression over the default and contrast
   cases. They remain historical evidence only. The initial V4 Luna cutover
-  canaries passed 4/4 from a clean source; the full cohort and required repeats
-  remain pending.
+  canaries passed 4/4 from a clean source. A durable 27-phase orchestrator now
+  pins the exact 26-case, 232-sample, 272-turn, 298-call acceptance schedule,
+  retry-free gates, worker/source/tooling boundaries, request-counter isolation,
+  and atomic evidence; its live cohort remains pending.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -373,7 +382,8 @@ The immediate sequence is:
 1. Preserve the completed Luna cutover as the serving baseline: keep the raw
    worker loopback-only, retain exact provider/model/effort/auth pinning, and
    rerun the full deterministic gates after every later code change.
-2. Run the V4 live evaluation in its fixed order against only
+2. Run `npm run matrix:intent` for the V4 live evaluation in its fixed 27-phase
+   order against only
    `gpt-5.6-luna` at `medium` with the declared 16,384-token policy:
    clean-source smoke;
    ten-repeat default, custom-full, and copy-only cohorts; three-repeat hub,
