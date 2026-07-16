@@ -23,7 +23,9 @@ mod intent_detail_text;
 mod intent_interpretation;
 #[cfg(test)]
 mod intent_interpretation_tests;
+mod intent_operative_conditionals;
 mod intent_protocol;
+mod intent_quote_scanner;
 mod intent_recipe_details;
 #[cfg(test)]
 mod intent_recipe_details_tests;
@@ -33,6 +35,7 @@ mod intent_request_mode_grounding_tests;
 mod intent_runtime_grounding;
 #[cfg(test)]
 mod intent_runtime_grounding_tests;
+mod intent_safety_control_grammar;
 mod intent_text;
 mod plan;
 mod plan_input;

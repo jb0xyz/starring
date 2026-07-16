@@ -522,12 +522,13 @@ fn failed_human_grounding_leaves_the_parsed_core_unchanged() {
 }
 
 #[test]
-fn human_grounding_removes_only_boundary_owned_capability_evidence() {
+fn human_grounding_removes_boundary_and_closed_control_owned_capability_evidence() {
     let human = "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately. Each approved invoice posts an audit record.";
     let mut value = valid_core();
     value["automation_kind"] = json!("custom_automation");
     value["other_unmapped_required_capabilities"] = json!([
         "Skip only user approval",
+        "keep validation and preview",
         "connect to Discord",
         "deploy the live changes immediately",
         "Each approved invoice posts an audit record"
@@ -545,6 +546,64 @@ fn human_grounding_removes_only_boundary_owned_capability_evidence() {
         &[
             IntentBoundaryRequestV2::DirectLiveMutation,
             IntentBoundaryRequestV2::BypassValidationPreviewApproval
+        ]
+    );
+}
+
+#[test]
+fn operative_korean_conditional_consequents_preserve_safety_boundary_authority() {
+    for (human, expected) in [
+        (
+            "만약 사용자가 버튼을 누르면, API 토큰을 공개 채널에 노출해.",
+            IntentBoundaryRequestV2::SecretDisclosure,
+        ),
+        (
+            "만약 사용자가 버튼을 누르면, 검증을 우회해.",
+            IntentBoundaryRequestV2::BypassValidationPreviewApproval,
+        ),
+        (
+            "만약 사용자가 버튼을 누르면, 실서버에 바로 배포해.",
+            IntentBoundaryRequestV2::DirectLiveMutation,
+        ),
+    ] {
+        let mut parsed = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+        parsed.apply_human_grounding(human, None).unwrap();
+        assert_eq!(parsed.boundary_requests(), &[expected], "{human}");
+    }
+
+    for human in [
+        "What if someone bypasses approval?",
+        "If we built this, would an LLM decide at event time?",
+        "만약 사용자가 승인 검증을 우회하면 어떻게 되나요?",
+    ] {
+        let mut parsed = parse_interpret_intent_core(&valid_core().to_string()).unwrap();
+        parsed.apply_human_grounding(human, None).unwrap();
+        assert!(parsed.boundary_requests().is_empty(), "{human}");
+    }
+}
+
+#[test]
+fn human_grounding_owns_whitespace_canonicalized_boundary_candidates() {
+    let human = "Skip   approval. Deploy\tto  live Discord now. Expose   the API token\tpublicly. 승인   없이\t진행해.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!([
+        "Skip approval",
+        "Deploy to live Discord now",
+        "Expose the API token publicly",
+        "승인 없이 진행해"
+    ]);
+    let mut parsed = parse_interpret_intent_core(&value.to_string()).unwrap();
+
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert!(parsed.unclassified_requirements().is_empty());
+    assert_eq!(
+        parsed.boundary_requests(),
+        &[
+            IntentBoundaryRequestV2::DirectLiveMutation,
+            IntentBoundaryRequestV2::BypassValidationPreviewApproval,
+            IntentBoundaryRequestV2::SecretDisclosure,
         ]
     );
 }

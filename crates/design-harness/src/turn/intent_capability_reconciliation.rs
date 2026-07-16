@@ -1,4 +1,5 @@
 mod classification;
+mod control_restatement;
 mod syntax;
 
 use std::collections::BTreeSet;
@@ -62,11 +63,19 @@ pub(super) fn reconcile_unmapped_capabilities(
                         external_candidate.get_or_insert(candidate_index);
                         continue;
                     }
-                    if !source.has_asserted_occurrence(&value)
-                        || custom_automation_owns(&source, automation_kind, &value)
-                        || closed_fields_or_preservation_own(&value, runtime)
+                    if custom_automation_owns(&source, automation_kind, &value)
+                        || closed_fields_or_preservation_own(&source, &value, runtime)
                     {
                         continue;
+                    }
+                    if !source.has_asserted_occurrence(&value) {
+                        if source.has_only_proven_irrelevant_occurrences(&value) {
+                            continue;
+                        }
+                        return Err(CapabilityReconciliationError::Grounding {
+                            candidate_index,
+                            reason: CapabilityEvidenceGroundingError::Ungrounded,
+                        });
                     }
                     insert_checked(&mut reconciled, value)?;
                 }

@@ -27,6 +27,27 @@ fn runtime_grounding_recovers_each_explicit_infrastructure_axis() {
 }
 
 #[test]
+fn operative_event_condition_carries_context_into_authoritative_llm_consequence() {
+    for human in [
+        "If a user clicks the Judge button, an LLM decides whether to grant the role.",
+        "If a user clicks the Judge button then an LLM decides whether to grant the role.",
+    ] {
+        let controls = grounded_request_controls(human);
+        assert_eq!(controls.mode, Some(IntentRequestModeV2::Build));
+        let grounded =
+            ground_runtime_requirements(&controls.active_semantic_units.unwrap()).unwrap();
+        assert!(grounded.event_time_llm, "{human}");
+    }
+
+    for counterfactual in [
+        "What if an LLM decides whether to grant the role when a user clicks?",
+        "If we built this, would an LLM decide at event time?",
+    ] {
+        assert!(!ground(counterfactual).event_time_llm, "{counterfactual}");
+    }
+}
+
+#[test]
 fn runtime_grounding_clears_inferred_recipe_infrastructure() {
     for human in [
         "Now build the managed private study-room automation and prepare its validated preview. Use English default copy and naming, community_hub as the existing discovery hub, and leave room closing disabled.",

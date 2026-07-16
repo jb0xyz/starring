@@ -6,6 +6,16 @@ mod lexical;
 mod patterns;
 mod semantic_authority;
 
+pub(super) use semantic_authority::QuotedLiteralScope;
+
+pub(super) fn ends_metalinguistic_copy(unit: &str) -> bool {
+    lexical::ends_metalinguistic_copy(unit)
+}
+
+pub(super) fn metalinguistic_carrier(unit: &str) -> bool {
+    semantic_authority::metalinguistic_carrier(unit)
+}
+
 pub(super) struct GroundedRequestControls {
     pub(super) mode: Option<IntentRequestModeV2>,
     pub(super) preview: Option<bool>,
@@ -16,6 +26,7 @@ pub(super) struct GroundedSemanticUnit {
     pub(super) text: String,
     pub(super) authoritative: bool,
     pub(super) link: UnquotedGroundingLink,
+    pub(super) operative_antecedent: bool,
 }
 
 pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls {

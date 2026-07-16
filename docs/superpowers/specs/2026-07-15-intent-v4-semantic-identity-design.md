@@ -242,6 +242,35 @@ Runtime requirements remain part of authoritative semantic IR but are hidden
 compatibility input on the structural parser, not a model frontier field.
 Serving and replay always replace them with current-human grounded values.
 
+Gate-bypass grounding combines the existing bounded direct bypass verbs with a
+closed structural grammar. The structural forms cover dropping, eliminating,
+or removing a control; making one optional; stating that one is optional, not
+needed, or not required; negating a requirement; and prohibiting enforcement or
+requirement. Their targets come from one shared closed set containing validation,
+the validator, preview, approval, approval and safety gates, safety checks, and
+safeguards. Bounded `all`, `any`, `each`, `every`, `just`, or `only` target
+modifiers and a closed one-to-four-token workflow, actor, or event scope are
+allowed. A following business noun or an unknown scope such as approval records,
+events, requests, latency, or a seven-day retention term closes no structural
+match and therefore supplies no boundary authority.
+
+Action polarity is local to the final sixteen complete whitespace-delimited
+tokens before the action. Ordinary negations and the closed avoidance,
+disallowance, prohibition, prevention, refusal, and stopping wrappers toggle
+that polarity. A wrapper may contain a bounded determiner and one or two actor
+terms before `from`; bounded action modifiers do not break the relation. An
+additive or alternative continuation that begins with another closed
+preservation action inherits preservation, including a bare infinitive; a
+sequential continuation resets it. Direct destructive action and
+permission to perform it request a bypass, while a closed passive prohibition
+preserves the control. Requirement verbs have the opposite base meaning, so
+negating or prohibiting the requirement requests a bypass. Every English target,
+action, control, and evidence marker uses token boundaries. Evidence matching is
+ASCII-case-insensitive, whitespace tolerant for structural expressions, unique,
+visible, and bounded, so substrings, quoted copies, safe adjacent clauses, and
+case-only duplicates have no authority. `after` and `before` may join a closed
+gate scope but remain detached for general request grounding.
+
 The normalizer grounds request controls only from high-confidence, unquoted
 current-human language. It reuses the bounded sentence and clause scanner used
 by safety grounding. A direct construction imperative whose command object is
@@ -336,6 +365,16 @@ default-only request has no detail frontier. Quoted UI copy is excluded from
 safety-boundary grounding, and negated or hypothetical boundary language does
 not become an execution request.
 
+Mandatory validation, preview, and user-approval controls are likewise
+harness-owned. After exact capability-evidence grounding, the normalizer removes
+an unmapped phrase only when it is a closed restatement that those controls stay
+enforced. This ownership rule cannot consume a request to bypass a
+control, a direct-live-mutation request, or a substantive behavior that merely
+mentions validation, preview, or approval. Those requests retain their existing
+boundary or unmapped evidence and fail closed through the ordinary adjudication
+path. Live normalization and snapshot verification apply the same deterministic
+reconciliation.
+
 The same grounded detail analysis derives a canonical path-only ticket for the
 second call. The model sees only the selected facet objects and material leaf
 paths; unselected objects, unselected leaves, and explicitly empty affix
@@ -411,6 +450,8 @@ The prompt must make these rules explicit:
   metadata about the design task rather than executable capabilities;
 - no positive requirement may exist only in response or presentation prose;
 - safety-boundary requests and detail-facet selection are harness-owned;
+- closed restatements that mandatory validation, preview, and user approval stay
+  enforced are harness-owned and must not be emitted as unmapped capabilities;
 - recipe identity, objective identity, compiler identity, and hashes are
   harness-owned and never model outputs.
 
@@ -590,12 +631,13 @@ classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay, and removal of the redundant
 model-authored runtime field from the active frontier.
-The normalizer revision moves from 1 to 7, including exact capability-evidence
+The normalizer revision moves from 1 to 8, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only capability-array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
-external-precondition recovery, and current-human runtime grounding, and the
-recipe descriptor and registry digests rotate. Recipe version,
+external-precondition recovery, current-human runtime grounding, deterministic
+ownership of enforced safety-control restatements, and the recipe descriptor
+and registry digests rotate. Recipe version,
 capability manifest version, and simulator revision remain unchanged.
 
 The root `IntentRecipeSessionSnapshotV2` requires a
@@ -787,7 +829,7 @@ Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
 Recipe extractor revision         12
-Recipe normalizer revision         7
+Recipe normalizer revision         8
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -835,7 +877,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 11, normalizer revisions through 6, or
+branch-local extractor revisions through 11, normalizer revisions through 7, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -849,9 +891,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 12, and normalizer 7 is current;
+- the exact V4 prompt with protocol 4, extractor 12, and normalizer 8 is current;
 - a pre-release V4 prompt, extractor revision through 11, or normalizer revision
-  through 6 is rejected;
+  through 7 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
@@ -938,6 +980,9 @@ Additional required tests cover:
   evidence, and a bounded discussion response is the only presentation
   persisted;
 - every positive unmapped requirement must be exact-grounded;
+- closed restatements that mandatory validation, preview, and user approval stay
+  enforced are deterministically reconciled to harness ownership, while bypass, live
+  mutation, and substantive safety-related requirements remain represented;
 - closed runtime properties cannot consume executable behavior evidence;
 - the stateful-game behavior set is exact, sorted, and identical in the Core
   decision and unclassified blocker evidence;

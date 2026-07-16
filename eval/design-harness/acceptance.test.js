@@ -8,7 +8,7 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = 'ff36b90981fd1b0898f5b63b7350eead34a91a08c2d95cab53a11752ea3f5d20';
+const REGISTRY_DIGEST = 'c332cc4e248b7fe1cd00eb1b2a551a718f781cb11d0919ba9d211e3e83536dd1';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -351,7 +351,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 12,
-      normalizer_revision: 7,
+      normalizer_revision: 8,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -1010,7 +1010,7 @@ test('checkpoint rejects stale extractor, normalizer, and forged registry identi
   );
 
   const oldNormalizer = passingDocument();
-  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 6;
+  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 7;
   const oldNormalizerAssessment = assess(oldNormalizer);
   assert.equal(oldNormalizerAssessment.pass, false);
   assert.equal(

@@ -1,5 +1,8 @@
 use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
+use super::super::intent_operative_conditionals::operative_consequent_start;
+use super::super::intent_quote_scanner::QuotedText;
+
 const BOUNDARY_UNIT_CONNECTORS: &[&str] = &[
     " in order to ",
     " because ",
@@ -18,6 +21,7 @@ const BOUNDARY_UNIT_CONNECTORS: &[&str] = &[
     " then ",
     " and ",
     " but ",
+    " nor ",
     " or ",
     "하기 전에 ",
     "한 후에 ",
@@ -47,7 +51,10 @@ pub(super) enum UnitLink {
     Start,
     Additive,
     Alternative,
+    NegativeAlternative,
     ConditionalAlternative,
+    Sequential,
+    Scope,
     Barrier,
 }
 
@@ -57,14 +64,10 @@ pub(super) struct BoundaryUnit {
     pub(super) link: UnitLink,
     pub(super) text: String,
     pub(super) hypothetical: bool,
-    pub(super) inherited_action_negation: bool,
-}
-
-#[derive(Clone, Copy)]
-struct QuoteState {
-    end: char,
-    fence_len: usize,
-    start: usize,
+    pub(super) non_authoritative_event: bool,
+    pub(super) inherited_gate_action_negation: bool,
+    pub(super) inherited_live_action_negation: bool,
+    pub(super) inherited_secret_action_negation: bool,
 }
 
 pub(super) struct QuoteMask {
@@ -89,12 +92,32 @@ pub(super) fn sentence_spans(visible: &[char]) -> Vec<(TextSpan, bool)> {
     spans
 }
 
-pub(super) fn sentence_units(visible: &[char], sentence: TextSpan) -> Vec<BoundaryUnit> {
+pub(super) fn sentence_units(
+    visible: &[char],
+    sentence: TextSpan,
+    question: bool,
+) -> (Vec<BoundaryUnit>, Option<usize>) {
+    let source = visible[sentence.start..sentence.end]
+        .iter()
+        .collect::<String>();
+    let operative_start = operative_consequent_start(question, &source).map(|start| {
+        sentence
+            .start
+            .saturating_add(source[..start].chars().count())
+    });
     let mut units = Vec::new();
     let mut start = sentence.start;
     let mut link = UnitLink::Start;
     let mut index = sentence.start;
+    let mut forced_split = operative_start;
     while index < sentence.end {
+        if forced_split == Some(index) {
+            push_boundary_unit(&mut units, visible, start, index, link);
+            start = index;
+            link = UnitLink::Additive;
+            forced_split = None;
+            continue;
+        }
         if matches!(visible[index], ',' | '，' | '、') {
             push_boundary_unit(&mut units, visible, start, index, link);
             start = index.saturating_add(1);
@@ -112,7 +135,7 @@ pub(super) fn sentence_units(visible: &[char], sentence: TextSpan) -> Vec<Bounda
         index = index.saturating_add(1);
     }
     push_boundary_unit(&mut units, visible, start, sentence.end, link);
-    units
+    (units, operative_start)
 }
 
 fn push_boundary_unit(
@@ -136,7 +159,10 @@ fn push_boundary_unit(
         link,
         text,
         hypothetical: false,
-        inherited_action_negation: false,
+        non_authoritative_event: false,
+        inherited_gate_action_negation: false,
+        inherited_live_action_negation: false,
+        inherited_secret_action_negation: false,
     });
 }
 
@@ -164,20 +190,18 @@ fn connector_at(visible: &[char], start: usize, end: usize) -> Option<(usize, Un
 fn connector_link(connector: &str) -> UnitLink {
     if connector == " or " {
         UnitLink::Alternative
+    } else if connector == " nor " {
+        UnitLink::NegativeAlternative
     } else if connector == " unless " {
         UnitLink::ConditionalAlternative
+    } else if matches!(connector, " after " | " before ") {
+        UnitLink::Scope
     } else if matches!(
         connector,
-        " and then "
-            | " then "
-            | " and "
-            | " 그리고 "
-            | " 다음 "
-            | "한 다음 "
-            | "한 뒤 "
-            | "하고 "
-            | "하며 "
+        " and then " | " then " | " 다음 " | "한 다음 " | "한 뒤 "
     ) {
+        UnitLink::Sequential
+    } else if matches!(connector, " and " | " 그리고 " | "하고 " | "하며 ") {
         UnitLink::Additive
     } else {
         UnitLink::Barrier
@@ -215,105 +239,11 @@ pub(super) fn word_continuation(character: char) -> bool {
 }
 
 pub(super) fn mask_quoted_text(value: &str) -> QuoteMask {
-    let characters = value.chars().collect::<Vec<_>>();
-    let mut masked = characters.clone();
-    let mut quote: Option<QuoteState> = None;
-    let mut index = 0usize;
-    while index < characters.len() {
-        if let Some(active) = quote {
-            if active.end == '`' && characters[index] == '`' {
-                let run = repeated_character_count(&characters, index, '`');
-                if run >= active.fence_len {
-                    for value in masked.iter_mut().skip(index).take(active.fence_len) {
-                        *value = ' ';
-                    }
-                    index = index.saturating_add(active.fence_len);
-                    quote = None;
-                    continue;
-                }
-            } else if characters[index] == active.end
-                && !is_escaped(&characters, index)
-                && !is_inner_apostrophe(&characters, index)
-            {
-                masked[index] = ' ';
-                index = index.saturating_add(1);
-                quote = None;
-                continue;
-            }
-            masked[index] = ' ';
-            index = index.saturating_add(1);
-            continue;
-        }
-
-        let Some((end, fence_len)) = opening_quote(&characters, index) else {
-            index = index.saturating_add(1);
-            continue;
-        };
-        if is_escaped(&characters, index) || is_inner_apostrophe(&characters, index) {
-            index = index.saturating_add(1);
-            continue;
-        }
-        let start = index;
-        for value in masked.iter_mut().skip(index).take(fence_len) {
-            *value = ' ';
-        }
-        index = index.saturating_add(fence_len);
-        quote = Some(QuoteState {
-            end,
-            fence_len,
-            start,
-        });
-    }
-    let unmatched = quote.is_some();
-    if let Some(active) = quote {
-        masked[active.start..].copy_from_slice(&characters[active.start..]);
-    }
+    let quoted = QuotedText::scan(value);
     QuoteMask {
-        visible: masked,
-        unmatched,
+        visible: quoted.masked_characters(value),
+        unmatched: quoted.unmatched(),
     }
-}
-
-fn opening_quote(characters: &[char], index: usize) -> Option<(char, usize)> {
-    match characters[index] {
-        '"' => Some(('"', 1)),
-        '\'' => Some(('\'', 1)),
-        '`' => Some(('`', repeated_character_count(characters, index, '`'))),
-        '“' => Some(('”', 1)),
-        '‘' => Some(('’', 1)),
-        '«' => Some(('»', 1)),
-        '‹' => Some(('›', 1)),
-        '〈' => Some(('〉', 1)),
-        '《' => Some(('》', 1)),
-        '「' => Some(('」', 1)),
-        '『' => Some(('』', 1)),
-        '【' => Some(('】', 1)),
-        _ => None,
-    }
-}
-
-fn repeated_character_count(characters: &[char], start: usize, expected: char) -> usize {
-    characters[start..]
-        .iter()
-        .take_while(|character| **character == expected)
-        .count()
-}
-
-fn is_escaped(characters: &[char], index: usize) -> bool {
-    let preceding_slashes = characters[..index]
-        .iter()
-        .rev()
-        .take_while(|character| **character == '\\')
-        .count();
-    preceding_slashes % 2 == 1
-}
-
-fn is_inner_apostrophe(characters: &[char], index: usize) -> bool {
-    characters[index] == '\''
-        && index > 0
-        && index + 1 < characters.len()
-        && characters[index - 1].is_alphanumeric()
-        && characters[index + 1].is_alphanumeric()
 }
 
 fn is_sentence_boundary(character: char) -> bool {

@@ -45,6 +45,37 @@ fn explicit_construction_language_grounds_build_mode() {
 }
 
 #[test]
+fn operative_trigger_conditionals_ground_build_but_counterfactuals_do_not() {
+    for value in [
+        "If a user clicks the Judge button, an LLM decides whether to grant the role.",
+        "If a user clicks the Judge button then an LLM decides whether to grant the role.",
+        "When a user clicks the Judge button, have an LLM decide whether to grant the role.",
+        "만약 사용자가 버튼을 누르면, LLM이 역할 부여 여부를 결정하는 자동화를 만들어줘.",
+        "만약 사용자가 버튼을 누르면 LLM이 역할 부여 여부를 결정하는 자동화를 만들어줘.",
+        "사용자가 버튼을 누를 때, LLM이 역할 부여 여부를 결정하는 자동화를 만들어줘.",
+    ] {
+        assert_eq!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "operative consequence lost build authority for {value}"
+        );
+    }
+
+    for value in [
+        "What if someone bypasses approval?",
+        "If we built this, would an LLM decide at event time?",
+        "When available, build a static panel.",
+        "만약 사용자가 버튼을 누르면 어떻게 되나요?",
+    ] {
+        assert_ne!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "counterfactual gained build authority for {value}"
+        );
+    }
+}
+
+#[test]
 fn korean_compound_build_predicates_survive_boundary_unit_splitting() {
     for value in [
         "게임 자동화를 설계하고 검증해줘.",

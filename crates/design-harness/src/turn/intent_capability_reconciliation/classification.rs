@@ -2,6 +2,7 @@ use super::super::intent_interpretation::{
     EconomyRequirementV2, IntentAutomationKindV2, PersistenceRequirementV2, RuntimeRequirementsV2,
     TimerRequirementV2,
 };
+use super::control_restatement::enforced_safety_control_restatement;
 use super::syntax::{SourceText, Span, Token};
 
 const ECONOMY_MARKERS: &[&str] = &[
@@ -122,9 +123,13 @@ pub(super) fn custom_automation_owns(
 }
 
 pub(super) fn closed_fields_or_preservation_own(
+    source: &SourceText<'_>,
     value: &str,
     runtime: &RuntimeRequirementsV2,
 ) -> bool {
+    if enforced_safety_control_restatement(source, value) {
+        return true;
+    }
     let lowercase = value.to_lowercase();
     let words = words(&lowercase);
     if words.is_empty() {

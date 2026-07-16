@@ -77,6 +77,7 @@ pub(in crate::session) const INTENT_RECIPE_SYSTEM_PROMPT_V4: &str = concat!(
     " Leases, locks, approvals, timeouts, deadlines, waits, ordering, or preservation instructions select no runtime value.",
     " Runtime infrastructure owns only infrastructure; separately preserve each dependent business behavior unless an automation kind owns it.",
     " Harness-grounded boundaries and supported recipe copy, naming, or controls never belong in unmapped or response.",
+    " Mandatory validation, preview, and user approval controls are harness-owned; never emit a restatement that they remain enforced as an unmapped capability.",
     " other_unmapped_required_capabilities contains each distinct required unsupported or unrepresented behavior, authorization, lifecycle or runtime rule, or external effect.",
     " Copy each value verbatim as one shortest complete contiguous INTENT_HUMAN subject-predicate span, preserving the whole requirement and source article, quantifier, or relative word like that. Never alter words or order, or reduce an action to a noun fragment.",
     " Exclude summaries and instructions to preserve, weaken, or substitute captured requirements. No build requirement may exist only in response.",

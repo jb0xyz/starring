@@ -24,6 +24,9 @@ pub(super) fn deterministically_selected_option(
     human_message: &str,
     options: &[String],
 ) -> Option<String> {
+    if options_have_colliding_display_forms(options) {
+        return None;
+    }
     let message_tokens = normalized_selection_tokens(human_message);
     let display_occurrences = maximal_display_occurrences(
         options
@@ -91,6 +94,17 @@ pub(super) fn deterministically_selected_option(
         return None;
     }
     Some(selected.to_string())
+}
+
+fn options_have_colliding_display_forms(options: &[String]) -> bool {
+    let mut forms = std::collections::BTreeSet::new();
+    options.iter().any(|option| {
+        let form = normalized_selection_tokens(option)
+            .into_iter()
+            .map(|token| token.value)
+            .collect::<Vec<_>>();
+        !form.is_empty() && !forms.insert(form)
+    })
 }
 
 fn raw_occurrences(option: &str, human_message: &str) -> Vec<SelectionOccurrence> {
@@ -348,15 +362,15 @@ mod tests {
     }
 
     #[test]
-    fn option_grounding_gives_exact_raw_keys_precedence() {
+    fn option_grounding_rejects_colliding_display_forms_even_for_exact_keys() {
         let colliding = vec!["community_hub".to_string(), "community-hub".to_string()];
         assert_eq!(
             deterministically_selected_option("Please use community_hub.", &colliding),
-            Some("community_hub".to_string())
+            None
         );
         assert_eq!(
             deterministically_selected_option("Please use community-hub.", &colliding),
-            Some("community-hub".to_string())
+            None
         );
         assert_eq!(
             deterministically_selected_option("Please use Community Hub.", &colliding),

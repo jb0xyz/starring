@@ -59,6 +59,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                     text: unit.text.clone(),
                     authoritative: false,
                     link: unit.link,
+                    operative_antecedent: false,
                 });
                 continue;
             }
@@ -69,10 +70,20 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 non_authoritative_scope = false;
                 conditional_scope = false;
             }
+            let operative_consequent = unit.operative_authority == Some(true);
+            if operative_consequent {
+                non_authoritative_scope = false;
+                conditional_scope = false;
+                question_build_scope = false;
+            }
             let directive = request_directive(&unit.text, continuation);
             let directive_is_build = matches!(&directive, Some(RequestDirective::Build(_)));
-            let scope_break = breaks_non_authoritative_scope(&unit.text, directive_is_build)
-                || (!conditional_scope && starts_positive_runtime_scope(&unit.text));
+            let directive_missing = directive.is_none();
+            let scope_break = operative_consequent
+                || has_authoritative_scope_wrapper(&unit.text)
+                || (!conditional_scope
+                    && (breaks_non_authoritative_scope(&unit.text, directive_is_build)
+                        || starts_positive_runtime_scope(&unit.text)));
             let directive_authoritative = !non_authoritative_scope || scope_break;
             if let Some(directive) = directive.filter(|_| directive_authoritative) {
                 match directive {
@@ -100,6 +111,10 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                     }
                 }
             }
+            if operative_consequent && directive_missing {
+                mode = Some(IntentRequestModeV2::Build);
+                active_build_targets.clear();
+            }
             if directive_authoritative {
                 if let Some(preference) = preview_directive(&unit.text) {
                     preview = Some(preference);
@@ -117,9 +132,11 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             if unit.question && directive_is_build && directive_authoritative {
                 question_build_scope = true;
             }
-            let authoritative = !unit.question
-                || (directive_is_build && directive_authoritative)
-                || question_build_scope;
+            let authoritative = unit.operative_authority.unwrap_or({
+                !unit.question
+                    || (directive_is_build && directive_authoritative)
+                    || question_build_scope
+            });
             let active = active_semantic_unit(&unit.text);
             let authoritative = authoritative && !non_authoritative_scope && active.is_some();
             let mut text = active.unwrap_or_else(|| unit.text.clone());
@@ -147,6 +164,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 text,
                 authoritative,
                 link: unit.link,
+                operative_antecedent: unit.operative_authority == Some(false),
             });
             if opens_ui_copy_scope(&unit.text) {
                 ui_copy_scope = true;
@@ -341,6 +359,142 @@ fn first_copy_carrier_index(unit: &str) -> Option<usize> {
         .chain(korean)
         .chain(korean_ui_content_start(unit).map(|_| 0))
         .min()
+}
+
+#[derive(Default)]
+pub(in crate::turn) struct QuotedLiteralScope {
+    active: bool,
+}
+
+impl QuotedLiteralScope {
+    pub(in crate::turn) fn classify(&mut self, between: &str, suffix: &str) -> bool {
+        let (local, sentence_reset) = quote_local_segment(between);
+        if sentence_reset {
+            self.active = false;
+        }
+        let local = local.trim().to_lowercase();
+        let literal_here = quote_prefix_is_literal(&local);
+        if let Some(reset) = last_authoritative_quote_reset_index(&local) {
+            self.active = quote_prefix_is_literal(&local[reset..]);
+        } else if literal_here {
+            self.active = true;
+        }
+        self.active || quote_suffix_is_literal(suffix)
+    }
+}
+
+fn quote_local_segment(value: &str) -> (&str, bool) {
+    let boundary = value.char_indices().rev().find_map(|(index, character)| {
+        matches!(character, '.' | '!' | '?' | ';' | '\n' | '\r')
+            .then_some(index.saturating_add(character.len_utf8()))
+    });
+    boundary.map_or((value, false), |start| (&value[start..], true))
+}
+
+fn quote_prefix_is_literal(prefix: &str) -> bool {
+    let explicit_ui_copy = [
+        "button labeled",
+        "buttons labeled",
+        "label it",
+        "panel titled",
+        "panels titled",
+        "use the button label",
+        "use the label",
+        "use the panel title",
+    ]
+    .iter()
+    .any(|carrier| prefix.contains(carrier));
+    let ui_copy = english_ui_owner_before(prefix, prefix.len())
+        && [
+            " label",
+            " label it",
+            " labeled",
+            " labelled",
+            " text",
+            " title",
+            " with copy",
+        ]
+        .iter()
+        .any(|carrier| prefix.ends_with(carrier) || prefix.contains(carrier));
+    first_copy_carrier_index(prefix).is_some()
+        || explicit_ui_copy
+        || ui_copy
+        || metalinguistic_carrier(prefix)
+        || [
+            "example",
+            "example prompt",
+            "literal",
+            "sample",
+            "sample prompt",
+            "the user said",
+            "user said",
+            "예시",
+            "예시 프롬프트",
+            "사용자가 말함",
+        ]
+        .iter()
+        .any(|carrier| prefix.ends_with(carrier))
+}
+
+fn quote_suffix_is_literal(suffix: &str) -> bool {
+    let suffix = suffix
+        .trim_start()
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .to_lowercase();
+    ["as documentation", "as literal text", "as text"]
+        .iter()
+        .any(|carrier| suffix.starts_with(carrier))
+}
+
+fn last_authoritative_quote_reset_index(value: &str) -> Option<usize> {
+    [
+        "apply",
+        "carry out",
+        "do this",
+        "execute",
+        "follow",
+        "implement",
+        "obey",
+        "perform",
+        "run",
+        "수행",
+        "실행",
+        "적용",
+    ]
+    .iter()
+    .filter_map(|marker| last_ascii_word_index_before(value, marker, value.len()))
+    .filter(|start| direct_quote_reset_boundary(value, *start))
+    .max()
+}
+
+fn direct_quote_reset_boundary(value: &str, start: usize) -> bool {
+    let prefix = value[..start].trim_end();
+    if prefix.is_empty()
+        || prefix
+            .chars()
+            .next_back()
+            .is_some_and(|character| matches!(character, ',' | ':' | '，' | '、'))
+    {
+        return true;
+    }
+    prefix.split_whitespace().next_back().is_some_and(|word| {
+        matches!(
+            word,
+            "actually"
+                | "and"
+                | "but"
+                | "instead"
+                | "next"
+                | "now"
+                | "please"
+                | "then"
+                | "그리고"
+                | "대신"
+                | "이제"
+        )
+    })
 }
 
 fn active_semantic_unit(unit: &str) -> Option<String> {
@@ -800,7 +954,7 @@ fn starts_positive_runtime_scope(unit: &str) -> bool {
     (action_first || subject_first) && !distributes_runtime_negation(unit)
 }
 
-fn metalinguistic_carrier(unit: &str) -> bool {
+pub(super) fn metalinguistic_carrier(unit: &str) -> bool {
     let unit = unit.trim();
     [
         "example:",

@@ -103,7 +103,7 @@ pub(crate) fn ground_runtime_requirements(
             }
         }
         if !unit.authoritative {
-            event_scope = false;
+            event_scope = unit.operative_antecedent;
             previous = Some(unit);
             continue;
         }

@@ -21,7 +21,7 @@ fn private_study_room_descriptor_pins_every_component_and_bound() {
     assert_eq!(descriptor.id, PRIVATE_STUDY_ROOM_RECIPE_ID);
     assert_eq!(descriptor.version, PRIVATE_STUDY_ROOM_RECIPE_VERSION);
     assert_eq!(descriptor.extractor_revision, 12);
-    assert_eq!(descriptor.normalizer_revision, 7);
+    assert_eq!(descriptor.normalizer_revision, 8);
     assert_eq!(descriptor.compiler_revision, COMPILER_REVISION);
     assert_eq!(descriptor.simulator_revision, 1);
     assert_eq!(descriptor.min_requirements, 22);
@@ -39,11 +39,11 @@ fn selected_descriptor_and_full_registry_have_distinct_stable_digests() {
     assert_ne!(selected, registry);
     assert_eq!(
         selected,
-        "d396fb75f5db2df49419ca13eb8840887530fec90586674f2e9d13b91f3b1fab"
+        "6b100b23f1112e57346dbea3870e45dc212e6ddb9bcad281f0e1240e9c5b02c2"
     );
     assert_eq!(
         registry,
-        "ff36b90981fd1b0898f5b63b7350eead34a91a08c2d95cab53a11752ea3f5d20"
+        "c332cc4e248b7fe1cd00eb1b2a551a718f781cb11d0919ba9d211e3e83536dd1"
     );
     assert_eq!(
         selected,
