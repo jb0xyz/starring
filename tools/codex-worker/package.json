@@ -1,0 +1,14 @@
+{
+  "name": "starring-codex-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "check": "node --check protocol.mjs && node --check metrics-log.mjs && node --check codex-runner.mjs && node --check worker.mjs && node --check worker.test.mjs",
+    "start": "node worker.mjs",
+    "test": "node --test worker.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
