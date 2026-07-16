@@ -447,7 +447,7 @@ mod tests {
 
     use super::{
         request_metric_input, validate_health, validate_response, CodexWorkerClient, WorkerHealth,
-        WorkerRequest, WorkerResponse,
+        WorkerRequest, WorkerResponse, SERVING_CODEX_CLI_VERSION,
     };
 
     fn response() -> WorkerResponse {
@@ -521,6 +521,18 @@ mod tests {
         .unwrap();
         assert!(validate_health(&health).is_ok());
         health.codex_cli_version = "codex-cli 0.145.0".to_string();
+        assert!(validate_health(&health).is_err());
+        health.codex_cli_version = SERVING_CODEX_CLI_VERSION.to_string();
+        health.instance_id.clear();
+        assert!(validate_health(&health).is_err());
+        health.instance_id = "test-worker-instance".to_string();
+        health.worker_source_sha256 = "g".repeat(64);
+        assert!(validate_health(&health).is_err());
+        health.worker_source_sha256 = "a".repeat(64);
+        health.concurrency_limit = 0;
+        assert!(validate_health(&health).is_err());
+        health.concurrency_limit = 2;
+        health.request_timeout_ms = 54_999;
         assert!(validate_health(&health).is_err());
     }
 
