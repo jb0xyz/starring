@@ -1147,6 +1147,13 @@ function validateResumeState(state, plan, source, worker, tooling) {
     && state.phases.every((phase) => phase.status === 'completed');
   const allGatesPassed = Array.isArray(state?.gates)
     && state.gates.every((gate) => gate.status === 'passed');
+  const alreadyFinalized = state?.completed_at !== null
+    || state?.artifacts !== null
+    || state?.observed !== null
+    || (state?.finalizer !== null && state?.finalizer !== undefined);
+  if (allPhasesCompleted && alreadyFinalized) {
+    throw new MatrixError('cohort_already_finalized');
+  }
   const finalizationOnly = state?.source_commit !== source.commit
     && allPhasesCompleted
     && allGatesPassed;
@@ -1432,6 +1439,7 @@ async function writeFinalArtifacts(
   dependencies,
   secret,
   finalizer,
+  recovery,
 ) {
   const combined = {
     schema_version: MATRIX_SCHEMA_VERSION,
@@ -1481,10 +1489,26 @@ async function writeFinalArtifacts(
     certificationFailures.push('acceptance_checks_failed');
   }
   const status = certificationFailures.length === 0 ? 'passed' : 'failed';
+  const effectiveFinalizer = { ...finalizer };
+  let recoveryFile = null;
+  if (recovery) {
+    const recoveryDirectory = path.join(output, 'recovery');
+    await fs.promises.mkdir(recoveryDirectory, { mode: 0o700 });
+    recoveryFile = path.join(recoveryDirectory, 'prior-finalization-failure.json');
+    await atomicWriteJson(recoveryFile, recovery);
+    await assertSecretAbsent(recoveryFile, secret);
+    effectiveFinalizer.recovery_input = {
+      path: relativeArtifact(output, recoveryFile),
+      sha256: await fileDigest(recoveryFile),
+      original_path: recovery.original_path,
+      original_sha256: recovery.original_sha256,
+      matrix_error: recovery.document.matrix_error,
+    };
+  }
   const acceptanceArtifact = {
     ...acceptance,
     evidence_source_commit: state.source_commit,
-    finalizer,
+    finalizer: effectiveFinalizer,
     model_acceptance_pass: acceptance.pass === true,
     pass: status === 'passed',
     status,
@@ -1497,6 +1521,9 @@ async function writeFinalArtifacts(
     acceptance: path.join(output, OUTPUT_FILES.acceptance),
     failures: path.join(output, OUTPUT_FILES.failures),
   };
+  if (recoveryFile) {
+    files.recovery_input = recoveryFile;
+  }
   await atomicWriteJson(files.combined, combined);
   await atomicWriteJson(files.summary, summary);
   await atomicWriteJson(files.acceptance, acceptanceArtifact);
@@ -1520,7 +1547,7 @@ async function writeFinalArtifacts(
     status,
     run_id: state.run_id,
     source_commit: state.source_commit,
-    finalizer,
+    finalizer: effectiveFinalizer,
     plan_digest: state.plan_digest,
     worker: state.worker,
     tooling: state.tooling,
@@ -1545,7 +1572,7 @@ async function writeFinalArtifacts(
   state.completed_at = completedAt;
   state.artifacts = artifacts;
   state.observed = observed;
-  state.finalizer = finalizer;
+  state.finalizer = effectiveFinalizer;
   return { acceptance: acceptanceArtifact, failures, manifest, status };
 }
 
@@ -1695,7 +1722,25 @@ async function runMatrix(options, overrides = {}) {
       finalizationOnly ? source.commit : state.source_commit,
       finalizerSource,
     );
-    const finalizer = dependencies.finalizerIdentity(finalizerSource);
+    const finalizer = {
+      ...dependencies.finalizerIdentity(finalizerSource),
+      mode: finalizationOnly ? 'deferred_completed_phase_artifacts' : 'inline_run',
+      ...(finalizationOnly ? { model_requests_executed: 0 } : {}),
+    };
+    let recovery = null;
+    if (finalizationOnly) {
+      const priorFailurePath = path.join(output, OUTPUT_FILES.failures);
+      await assertSecretAbsent(priorFailurePath, environment.STARRING_CODEX_WORKER_TOKEN);
+      recovery = {
+        schema_version: MATRIX_SCHEMA_VERSION,
+        original_path: relativeArtifact(output, priorFailurePath),
+        original_sha256: await fileDigest(priorFailurePath),
+        document: await readJson(priorFailurePath),
+      };
+      if (!recovery.document.matrix_error) {
+        throw new MatrixError('deferred_finalization_failure_evidence_missing');
+      }
+    }
     const final = await writeFinalArtifacts(
       state,
       output,
@@ -1703,6 +1748,7 @@ async function runMatrix(options, overrides = {}) {
       dependencies,
       environment.STARRING_CODEX_WORKER_TOKEN,
       finalizer,
+      recovery,
     );
     await atomicWriteJson(statePath, state);
     dependencies.writeOutput(`${JSON.stringify({

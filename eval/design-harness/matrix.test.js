@@ -635,7 +635,7 @@ test('resume preserves completed evidence and retries only unfinished phases on 
         { output, resume: true, dryRun: false },
         dependencies(resumeSpawn, 'replacement-worker', root, requestCounter),
       ),
-      { code: 'resume_boundary_mismatch' },
+      { code: 'cohort_already_finalized' },
     );
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
@@ -745,10 +745,20 @@ test('a completed cohort can be finalized by a separately attested committed eva
       throw new Error('completed phases must not rerun');
     }, 'worker-instance', root, requestCounter);
     second.sourceState = () => ({ commit: finalizerCommit, dirty: false });
+    let healthCalls = 0;
+    const health = second.health;
+    second.health = async (...args) => {
+      healthCalls += 1;
+      return health(...args);
+    };
+    second.runGate = async () => {
+      throw new Error('completed gates must not rerun');
+    };
     const result = await runMatrix({ output, resume: true, dryRun: false }, second);
 
     assert.equal(result.status, 'passed');
     assert.equal(calls, 27);
+    assert.equal(healthCalls, 2);
     const manifest = JSON.parse(
       await fs.promises.readFile(path.join(output, 'manifest.json'), 'utf8'),
     );
@@ -757,8 +767,22 @@ test('a completed cohort can be finalized by a separately attested committed eva
     );
     assert.equal(manifest.source_commit, SOURCE_COMMIT);
     assert.equal(manifest.finalizer.source_commit, finalizerCommit);
+    assert.equal(manifest.finalizer.mode, 'deferred_completed_phase_artifacts');
+    assert.equal(manifest.finalizer.model_requests_executed, 0);
     assert.equal(acceptance.evidence_source_commit, SOURCE_COMMIT);
     assert.equal(acceptance.finalizer.source_commit, finalizerCommit);
+    const recovery = JSON.parse(
+      await fs.promises.readFile(
+        path.join(output, manifest.finalizer.recovery_input.path),
+        'utf8',
+      ),
+    );
+    assert.equal(recovery.document.matrix_error.detail, 'aggregation defect');
+    assert.equal(manifest.artifacts.recovery_input.sha256, manifest.finalizer.recovery_input.sha256);
+    await assert.rejects(
+      runMatrix({ output, resume: true, dryRun: false }, second),
+      { code: 'cohort_already_finalized' },
+    );
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }
