@@ -1037,6 +1037,26 @@ test('checkpoint records a missing final decision as failed evidence without cra
   ]);
 });
 
+test('every nullable final decision fails closed without crashing the checkpoint', () => {
+  for (const caseId of REQUIRED_CASE_IDS) {
+    const document = passingDocument();
+    const failed = document.results.results.find((entry) => entry.vars.caseId === caseId);
+    failed.success = false;
+    failed.response.metadata.outcome = 'halted';
+    failed.response.metadata.halt_code = 'MISSING_FINAL_DECISION';
+    failed.response.metadata.final_intent.route_decision = null;
+
+    const assessment = assess(document);
+
+    assert.equal(assessment.pass, false, caseId);
+    assert.equal(
+      assessment.decision_identity_classes.missing_final_decision_cases.includes(caseId),
+      true,
+      caseId,
+    );
+  }
+});
+
 test('checkpoint exports the exact 232-sample case schedule', () => {
   assert.deepEqual(MINIMUM_RUNS_BY_CASE_ID, EXPECTED_MINIMUM_RUNS_BY_CASE_ID);
   assert.deepEqual(Object.keys(MINIMUM_RUNS_BY_CASE_ID), REQUIRED_CASE_IDS);

@@ -706,8 +706,10 @@ function continuityIdentity(entries, caseId, selector) {
 
 function decisionContinuity(entries) {
   const request = (entry) => entry.report.final_intent.receipt.request_evidence_hash;
-  const route = (entry) => entry.report.final_intent.route_decision.semantic_ir_digest;
-  const adjudication = (entry) => entry.report.final_intent.route_decision.adjudication_digest;
+  const route = (entry) => entry.report.final_intent.route_decision?.semantic_ir_digest ?? null;
+  const adjudication = (entry) => (
+    entry.report.final_intent.route_decision?.adjudication_digest ?? null
+  );
   const oneShot = {
     request: continuityIdentity(entries, 'intent_private_study_room_en', request),
     route: continuityIdentity(entries, 'intent_private_study_room_en', route),
@@ -724,7 +726,9 @@ function decisionContinuity(entries) {
     adjudication: continuityIdentity(entries, 'intent_private_study_room_restart_pending', adjudication),
   };
   const stable = [oneShot, clarification, restart]
-    .every((group) => Object.values(group).every((identities) => identities.length === 1));
+    .every((group) => Object.values(group).every((identities) => (
+      identities.length === 1 && /^[0-9a-f]{64}$/.test(identities[0])
+    )));
   return {
     one_shot: oneShot,
     clarification,
