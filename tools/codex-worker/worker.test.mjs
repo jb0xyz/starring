@@ -18,10 +18,17 @@ import {
   PROVIDER,
   REASONING_EFFORT,
 } from "./protocol.mjs";
-import { startWorker } from "./worker.mjs";
+import { startWorker, workerSourceSha256 } from "./worker.mjs";
 
 const TOKEN = "test-worker-token-1234567890";
 const VERSION = CODEX_CLI_VERSION;
+
+test("worker source identity is stable and exact", async () => {
+  const first = await workerSourceSha256();
+  const second = await workerSourceSha256();
+  assert.match(first, /^[0-9a-f]{64}$/);
+  assert.equal(first, second);
+});
 
 function verification(overrides = {}) {
   return {
