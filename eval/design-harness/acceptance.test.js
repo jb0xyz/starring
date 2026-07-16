@@ -4,7 +4,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 
-const { assess } = require('./acceptance');
+const {
+  MINIMUM_RUNS_BY_CASE_ID,
+  REQUIRED_CASE_IDS,
+  REQUIRED_SAMPLE_TOTAL,
+  assess,
+} = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
@@ -20,6 +25,34 @@ const RUNTIME_EVIDENCE = {
     'intent.core.runtime_requirements.persistence',
     'restart_persistent',
   ],
+};
+const EXPECTED_MINIMUM_RUNS_BY_CASE_ID = {
+  intent_private_study_room_en: 10,
+  intent_private_study_room_en_paraphrase: 10,
+  intent_normalizer_same_target_hold: 10,
+  intent_normalizer_korean_compound_discussion: 10,
+  intent_normalizer_multi_sentence_metalinguistic_copy: 10,
+  intent_normalizer_validated_preview_disambiguation: 10,
+  intent_normalizer_discussion_restart_then_build: 10,
+  intent_private_study_room_mutation_hub: 3,
+  intent_private_study_room_mutation_naming: 3,
+  intent_private_study_room_mutation_control: 3,
+  intent_private_study_room_mutation_close: 3,
+  intent_private_study_room_missing_hub: 10,
+  intent_private_study_room_restart_pending: 10,
+  intent_private_study_room_ko: 10,
+  intent_discussion_then_build: 10,
+  intent_typed_planner_fallback: 10,
+  intent_creator_only_close_gap: 10,
+  intent_stateful_game_gap: 10,
+  intent_reject_live_mutation: 10,
+  intent_reject_secret_disclosure: 10,
+  intent_reject_skip_approval: 10,
+  intent_reject_all_gate_bypass: 10,
+  intent_redaction_copy_typed_planner: 10,
+  intent_unknown_external_capability_gap: 10,
+  intent_private_study_room_custom_details: 10,
+  intent_private_study_room_custom_copy_only: 10,
 };
 
 function routeDecision(kind = 'private_study_room', overrides = {}) {
@@ -979,6 +1012,16 @@ test('checkpoint acceptance enforces repeated Luna recipe quality and equivalenc
   assert.equal(
     assessment.checks.find((entry) => entry.name === 'exact_case_aware_calls_per_turn').pass,
     true,
+  );
+});
+
+test('checkpoint exports the exact 232-sample case schedule', () => {
+  assert.deepEqual(MINIMUM_RUNS_BY_CASE_ID, EXPECTED_MINIMUM_RUNS_BY_CASE_ID);
+  assert.deepEqual(Object.keys(MINIMUM_RUNS_BY_CASE_ID), REQUIRED_CASE_IDS);
+  assert.equal(REQUIRED_SAMPLE_TOTAL, 232);
+  assert.equal(
+    Object.values(MINIMUM_RUNS_BY_CASE_ID).reduce((sum, runs) => sum + runs, 0),
+    232,
   );
 });
 
