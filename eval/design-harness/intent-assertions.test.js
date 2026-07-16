@@ -790,45 +790,45 @@ test('decision and restart assertions require a mutation-free pending turn and d
   );
 });
 
-test('normalizer V5 assertion pins discussion holds and metalinguistic copies to no mutation', () => {
+test('normalizer assertion pins discussion holds and metalinguistic copies to no mutation', () => {
   const routeDecision = decision('discussion');
   const document = routedDocument(
     routeDecision,
     'We can compare the tradeoffs without changing the Draft.',
     'normalizer-discussion',
   );
-  for (const normalizerV5Contract of [
+  for (const normalizerContract of [
     'same_target_hold',
     'korean_compound_discussion',
     'multi_sentence_metalinguistic_copy',
   ]) {
-    const expected = context({ normalizerV5Contract });
-    assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+    const expected = context({ normalizerContract });
+    assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
   }
 
   const mutated = JSON.parse(document);
   mutated.turns[0].draft_changed = true;
   assert.match(
-    checks.intentNormalizerV5Behavior(
+    checks.intentNormalizerBehavior(
       JSON.stringify(mutated),
-      context({ normalizerV5Contract: 'same_target_hold' }),
+      context({ normalizerContract: 'same_target_hold' }),
     ).reason,
     /mutation-free discussion route/,
   );
 });
 
-test('normalizer V5 assertion pins preview disambiguation to the default one-call recipe', () => {
+test('normalizer assertion pins preview disambiguation to the default one-call recipe', () => {
   const document = report();
   const expected = context({
-    normalizerV5Contract: 'validated_preview_disambiguation',
+    normalizerContract: 'validated_preview_disambiguation',
     normalizerBaselineCase: 'intent_private_study_room_en',
   });
-  assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+  assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
 
   assert.match(
-    checks.intentNormalizerV5Behavior(
+    checks.intentNormalizerBehavior(
       document,
-      context({ normalizerV5Contract: 'validated_preview_disambiguation' }),
+      context({ normalizerContract: 'validated_preview_disambiguation' }),
     ).reason,
     /pinned equivalence baseline/,
   );
@@ -843,12 +843,12 @@ test('normalizer V5 assertion pins preview disambiguation to the default one-cal
   extraCall.observability.model_calls = 2;
   extraCall.observability.tool_calls = 2;
   assert.match(
-    checks.intentNormalizerV5Behavior(JSON.stringify(extraCall), expected).reason,
+    checks.intentNormalizerBehavior(JSON.stringify(extraCall), expected).reason,
     /one-call validated-preview route/,
   );
 });
 
-test('normalizer V5 assertion requires routed discussion replay across restart before build', () => {
+test('normalizer assertion requires routed discussion replay across restart before build', () => {
   const discussion = turn({
     id: 'discuss-before-restart',
     input: 'Discuss first',
@@ -887,13 +887,13 @@ test('normalizer V5 assertion requires routed discussion replay across restart b
     },
     elapsed_ms: 2000,
   });
-  const expected = context({ normalizerV5Contract: 'discussion_restart_restore' });
-  assert.equal(checks.intentNormalizerV5Behavior(document, expected).pass, true);
+  const expected = context({ normalizerContract: 'discussion_restart_restore' });
+  assert.equal(checks.intentNormalizerBehavior(document, expected).pass, true);
 
   const broken = JSON.parse(document);
   broken.persistence.roundtrip_verified = false;
   assert.match(
-    checks.intentNormalizerV5Behavior(JSON.stringify(broken), expected).reason,
+    checks.intentNormalizerBehavior(JSON.stringify(broken), expected).reason,
     /persistence evidence is incomplete/,
   );
 });

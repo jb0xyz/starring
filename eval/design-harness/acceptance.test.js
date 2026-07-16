@@ -748,7 +748,7 @@ function passingDocument() {
       adjudicationHash: digest('adjudication:validated-preview-disambiguation'),
       vars: {
         completeRequest: true,
-        normalizerV5Contract: 'validated_preview_disambiguation',
+        normalizerContract: 'validated_preview_disambiguation',
         normalizerBaselineCase: 'intent_private_study_room_en',
       },
     }));
@@ -764,7 +764,7 @@ function passingDocument() {
           expectedRestartCount: 1,
           noMutationTurns: 'discuss-before-restart',
           expectedRoutePath: 'discussion,private_study_room',
-          normalizerV5Contract: 'discussion_restart_restore',
+          normalizerContract: 'discussion_restart_restore',
         },
       },
     );

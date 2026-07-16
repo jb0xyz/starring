@@ -56,7 +56,7 @@
     cohort: intent_recipe
     fallbackCase: true
     noMutationTurns: same-target-hold
-    normalizerV5Contract: same_target_hold
+    normalizerContract: same_target_hold
     request: |-
       {
         "schema_version": 3,
@@ -95,7 +95,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
-      value: file://intent-assertions.js:intentNormalizerV5Behavior
+      value: file://intent-assertions.js:intentNormalizerBehavior
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -105,7 +105,7 @@
     cohort: intent_recipe
     fallbackCase: true
     noMutationTurns: korean-compound-hold
-    normalizerV5Contract: korean_compound_discussion
+    normalizerContract: korean_compound_discussion
     request: |-
       {
         "schema_version": 3,
@@ -144,7 +144,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
-      value: file://intent-assertions.js:intentNormalizerV5Behavior
+      value: file://intent-assertions.js:intentNormalizerBehavior
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -154,7 +154,7 @@
     cohort: intent_recipe
     fallbackCase: true
     noMutationTurns: copied-command
-    normalizerV5Contract: multi_sentence_metalinguistic_copy
+    normalizerContract: multi_sentence_metalinguistic_copy
     request: |-
       {
         "schema_version": 3,
@@ -193,7 +193,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
-      value: file://intent-assertions.js:intentNormalizerV5Behavior
+      value: file://intent-assertions.js:intentNormalizerBehavior
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -204,7 +204,7 @@
     knownRecipe: true
     completeRequest: true
     equivalenceGroup: private_study_room_en_default
-    normalizerV5Contract: validated_preview_disambiguation
+    normalizerContract: validated_preview_disambiguation
     normalizerBaselineCase: intent_private_study_room_en
     request: |-
       {
@@ -249,7 +249,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentRulesetPathValues
     - type: javascript
-      value: file://intent-assertions.js:intentNormalizerV5Behavior
+      value: file://intent-assertions.js:intentNormalizerBehavior
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 
@@ -261,7 +261,7 @@
     completeRequest: true
     equivalenceGroup: private_study_room_en_default
     noMutationTurns: discuss-before-restart
-    normalizerV5Contract: discussion_restart_restore
+    normalizerContract: discussion_restart_restore
     request: |-
       {
         "schema_version": 3,
@@ -306,7 +306,7 @@
     - type: javascript
       value: file://intent-assertions.js:intentNoMutationFallback
     - type: javascript
-      value: file://intent-assertions.js:intentNormalizerV5Behavior
+      value: file://intent-assertions.js:intentNormalizerBehavior
     - type: javascript
       value: file://intent-assertions.js:intentHardLatency
 

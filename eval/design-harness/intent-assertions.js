@@ -1777,10 +1777,10 @@ function normalizerPreviewTurn(turn, location, failures) {
   }
 }
 
-function intentNormalizerV5Behavior(output, context) {
+function intentNormalizerBehavior(output, context) {
   return checked(output, (report) => {
     const expected = vars(context);
-    const contract = expected.normalizerV5Contract;
+    const contract = expected.normalizerContract;
     const failures = [];
     const discussionContracts = new Set([
       'same_target_hold',
@@ -1837,10 +1837,10 @@ function intentNormalizerV5Behavior(output, context) {
         failures.push('discussion restart persistence evidence is incomplete');
       }
     } else {
-      failures.push(`unknown normalizer V5 contract=${String(contract)}`);
+      failures.push(`unknown normalizer contract=${String(contract)}`);
     }
     return result(failures.length === 0, failures.length === 0
-      ? `normalizer V5 contract ${contract} matches the live route`
+      ? `normalizer contract ${contract} matches the live route`
       : failures.join(', '));
   });
 }
@@ -1860,7 +1860,7 @@ module.exports = {
   intentDecisionFlow,
   intentHardLatency,
   intentNoMutationFallback,
-  intentNormalizerV5Behavior,
+  intentNormalizerBehavior,
   intentOneCallTurns,
   intentOracleIsolation,
   intentProvenance,
