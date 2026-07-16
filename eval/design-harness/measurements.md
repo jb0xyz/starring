@@ -216,3 +216,18 @@ Development checkpoints preceding the passing custom sample are retained as evid
 After the detail implementation was split into facade, schema, parse, and validation modules, cases 0–13 were rerun once from clean commit `c1e9a37266df0ae460748c5220402c48be7f5755`. The report `results/v3-precustom-final-regression-1run.json` passed 14/14 with no provider errors. All five preview-ready paths compiled 22 operations and had current validation and simulation; all nine routed discussion, fallback, capability-gap, and rejection paths kept Draft revision zero with no compiled operation. Source and build commits matched, `source_dirty` was false, and every response served the exact pinned model. This verifies behavior preservation for that one post-refactor sample; it is not the required repeated acceptance cohort.
 
 The measured custom path is fast enough for an internal preview interaction on this machine, but this section does not certify commercial readiness. It has no concurrent-load measurement, no long-session edit/recompile evidence, no stable semantic receipt identity, no production API or authentication benchmark, and no whole-plan Discord side-effect preflight. The historical typed-planner path remains useful for unsupported recipes, but its latency and variance make it a fallback rather than the first commercial path.
+
+## 8. Intent V4 targeted failure rerun
+
+Measured 2026-07-16 from clean commit `0688d640f9072f4ce95518eda0b7e89e03df45a0` against `gemma4:12b-mlx` with the declared 16,384-token context, disabled cache, and concurrency one. The evaluator selected only the six assertion-failing cases from `results/gemma4-intent-v4-smoke-d7884418f8c1.json`. The original clean-source smoke passed 20/26; this targeted rerun passed 6/6 with no provider errors, automatic HTTP retries, repair attempts, or repeated errors.
+
+| Case | Result | Harness ms | Model/tool calls | Turns | Compiled operations |
+| --- | --- | ---: | ---: | ---: | ---: |
+| English paraphrase | pass | 19,017 | 1/1 | 1 | 22 |
+| Control mutation | pass | 10,356 | 2/2 | 1 | 22 |
+| Missing hub | pass | 9,777 | 2/2 | 2 | 22 |
+| Missing hub after restart | pass | 7,082 | 2/2 | 2 | 22 |
+| Korean defaults | pass | 6,943 | 1/1 | 1 | 22 |
+| Copy-only mutation | pass | 15,053 | 2/2 | 1 | 22 |
+
+Every result selected the managed recipe, produced a current validation and simulation stamp, preserved exact request and semantic identity coverage, and reported the clean committed source and exact served model. This is a one-sample regression check of the previously failing subset. It is not a replacement for a clean full 26-case run or the required repeated acceptance matrix.
