@@ -21,6 +21,7 @@ authentication and product-level admission remain the backend's responsibility.
 | listen address | `127.0.0.1:18181` |
 | model | `gpt-5.6-luna` |
 | reasoning effort | `medium` |
+| Codex CLI version | `codex-cli 0.144.2` |
 | active request limit | `2` |
 | queue capacity | `8` |
 | request timeout | `55000 ms` |
@@ -45,6 +46,7 @@ cd /Users/jungbogeon/starring
 test -x /opt/homebrew/opt/node@24/bin/node
 test -x /Applications/ChatGPT.app/Contents/Resources/codex
 test -f tools/codex-worker/worker.mjs
+/Applications/ChatGPT.app/Contents/Resources/codex --version | grep -Fx 'codex-cli 0.144.2'
 /Applications/ChatGPT.app/Contents/Resources/codex login status
 security find-generic-password -s com.starring.llm-api-key -a llm-api >/dev/null
 plutil -lint ops/macos/local.starring.codex-worker.plist
@@ -83,9 +85,9 @@ DOMAIN="gui/$(id -u)"
 launchctl print "$DOMAIN/local.starring.codex-worker"
 lsof -nP -iTCP:18181 -sTCP:LISTEN
 API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
-curl -fsS http://127.0.0.1:18181/health \
-  -H "Authorization: Bearer ${API_KEY}" \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and (.active_requests | type) == "number" and (.queued_requests | type) == "number"'
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/health -H @- \
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.active_requests | type) == "number" and (.queued_requests | type) == "number"'
 ```
 
 The listener output must show `127.0.0.1:18181`. Stop immediately if it shows
@@ -95,9 +97,10 @@ Exercise one authenticated Luna request without placing the secret in a file or
 printing it:
 
 ```zsh
-curl -fsS http://127.0.0.1:18181/v1/frontier-completions \
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/v1/frontier-completions \
+  -H @- \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${API_KEY}" \
   --data-binary '{"schema_version":1,"model":"gpt-5.6-luna","reasoning_effort":"medium","messages":[{"role":"user","content":"Return the requested worker smoke status."}],"frontier":{"name":"worker_smoke","description":"Return an object whose status is exactly luna-worker-ok.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["luna-worker-ok"]}},"required":["status"],"additionalProperties":false}}}' \
   | jq -e '.provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and (.tool_call.arguments | fromjson | .status) == "luna-worker-ok"'
 unset API_KEY
@@ -163,7 +166,9 @@ lsof -nP -iTCP:18080 -sTCP:LISTEN
 lsof -nP -iTCP:11434 -sTCP:LISTEN
 ollama ps
 API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
-curl -fsS http://127.0.0.1:18181/health -H "Authorization: Bearer ${API_KEY}" | jq
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/health -H @- \
+  | jq
 unset API_KEY
 ```
 

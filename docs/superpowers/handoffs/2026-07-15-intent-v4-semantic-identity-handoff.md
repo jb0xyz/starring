@@ -1,5 +1,11 @@
 # Intent V4 Semantic Identity Handoff
 
+> Serving update, 2026-07-17: the Gemma-only evaluation and continuation
+> instructions in this handoff are historical. Active serving is the private
+> Luna-medium Codex worker described in `CURRENT_STATE.md` and
+> `docs/superpowers/runbooks/2026-07-17-macos-codex-worker-operations.md`.
+> Do not restart or use the retired Gemma path for current acceptance evidence.
+
 ## Document status
 
 This handoff records the implemented Intent V4 semantic-identity checkpoint and

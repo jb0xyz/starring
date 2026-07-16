@@ -125,11 +125,14 @@ CLI reaches it only through the bearer-authenticated worker bound to
 `127.0.0.1:18181`; that raw worker is not a Cloudflare origin. The retired
 `local.cloudflared.starring`, `local.llm-api`, and `local.ollama.server`
 services are disabled and unloaded. The `gemma4:12b-mlx` model file remains on
-disk only as rollback material.
+disk only as rollback material. Interactive CLI startup now defaults to Intent
+Recipe mode and fails closed before network access when its bindings are absent.
+Adaptive and Typed Plan remain explicit legacy rollback modes only.
 
-The current V4 implementation, evidence boundary, maintenance state, and ordered
-continuation plan are recorded in
+The current V4 implementation and evidence internals are recorded in
 `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
+Its Gemma serving and continuation instructions are superseded by this document
+and the 2026-07-17 Luna worker operations runbook.
 The Gemma V3 cohort handoff remains the historical live baseline, and the
 2026-07-14 handoff remains background for the original Intent IR, Recipe
 Compiler, persistence, runtime, and server checkpoint.
