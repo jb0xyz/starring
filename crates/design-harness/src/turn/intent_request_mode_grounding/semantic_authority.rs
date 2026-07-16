@@ -60,7 +60,15 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 question_build_scope = false;
                 continue;
             }
+            let conditional_detail_consequent = unit.operative_authority == Some(true)
+                || unit.link == UnquotedGroundingLink::Additive
+                    && index
+                        .checked_sub(1)
+                        .and_then(|previous| sentence.get(previous))
+                        .is_some_and(|previous| conditional_detail_antecedent(&previous.text));
             if ui_copy_scope {
+                closed_axes
+                    .observe_copy_scope_continuation(&unit.text, conditional_detail_consequent);
                 closed_axes.break_ephemeral_scope();
                 active_semantic_units.push(GroundedSemanticUnit {
                     text: unit.text.clone(),
@@ -70,13 +78,9 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 });
                 continue;
             }
-            let continuation = sentence
-                .get(index.saturating_add(1))
-                .map(|unit| unit.text.as_str());
-            let alternative_continuation = sentence
-                .get(index.saturating_add(1))
-                .filter(|unit| unit.link == UnquotedGroundingLink::Alternative)
-                .map(|unit| unit.text.as_str());
+            let continuation_unit = sentence.get(index.saturating_add(1));
+            let continuation = continuation_unit.map(|unit| unit.text.as_str());
+            let continuation_link = continuation_unit.map(|unit| unit.link);
             if unit.link == UnquotedGroundingLink::Detached {
                 non_authoritative_scope = false;
                 conditional_scope = false;
@@ -152,7 +156,14 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             let authoritative = authoritative && !non_authoritative_scope && active.is_some();
             let mut text = active.unwrap_or_else(|| unit.text.clone());
             if authoritative {
-                closed_axes.observe(&text, unit.link, continuation, alternative_continuation);
+                closed_axes.observe_with_source(
+                    &text,
+                    &unit.text,
+                    unit.link,
+                    continuation,
+                    continuation_link,
+                    conditional_detail_consequent,
+                );
                 if unit.link == UnquotedGroundingLink::Detached
                     || starts_positive_runtime_scope(&text)
                 {
@@ -527,6 +538,42 @@ fn conditional_non_authoritative_semantic_unit(unit: &str) -> bool {
     ]
     .iter()
     .any(|prefix| unit.starts_with(prefix))
+}
+
+fn conditional_detail_antecedent(unit: &str) -> bool {
+    let unit = strip_repeated_prefixes(
+        unit,
+        &[
+            "actually ",
+            "actually, ",
+            "please ",
+            "please, ",
+            "이제 ",
+            "정정 ",
+            "정정: ",
+        ],
+    );
+    [
+        "after ",
+        "before ",
+        "during ",
+        "following ",
+        "for mobile",
+        "for weekdays",
+        "for weekends",
+        "on ",
+        "unless ",
+        "when ",
+        "whenever ",
+        "while ",
+        "만약 ",
+    ]
+    .iter()
+    .any(|prefix| unit.starts_with(prefix))
+        || unit
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.ends_with('면'))
 }
 
 fn metalinguistic_runtime_comparison(unit: &str) -> bool {

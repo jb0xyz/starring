@@ -81,6 +81,7 @@ fn managed_recipe_owns_only_exact_base_hub_and_outcome_restatements() {
         "Build a managed private study-room automation in community_hub and prepare its validated preview.",
         "Build a managed private study room automation in community_hub and prepare its validated preview.",
         "Build a managed private study room in community_hub and prepare its validated preview.",
+        "Please prepare a validated preview of the managed private study-room automation.",
     ] {
         assert!(reconcile_unmapped_capabilities_with_context(
             candidate,
@@ -138,6 +139,341 @@ fn managed_recipe_base_ownership_never_swallows_behavior_or_context_mismatch() {
             "context mismatch or added behavior was consumed for {candidate}"
         );
     }
+}
+
+#[test]
+fn managed_recipe_owns_asserted_closed_axis_suffix_restatements() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    for (human, locale, candidates) in [
+        (
+            "Use English default copy and naming and leave room closing disabled.",
+            IntentLocaleHintV2::En,
+            vec![
+                "Use English default copy and naming",
+                "leave room closing disabled",
+            ],
+        ),
+        (
+            "Use English defaults, and leave room closing disabled.",
+            IntentLocaleHintV2::En,
+            vec!["Use English defaults", "leave room closing disabled"],
+        ),
+        (
+            "Use English default copy and naming, use the existing channel binding community_hub as the discovery hub, and leave room closing disabled.",
+            IntentLocaleHintV2::En,
+            vec![
+                "Use English default copy and naming",
+                "leave room closing disabled",
+            ],
+        ),
+        (
+            "Keep its copy and generated names at the English defaults, place discovery in the existing community_hub channel binding, and keep room closing turned off. Nothing material is left undecided, so proceed without asking me anything.",
+            IntentLocaleHintV2::En,
+            vec![
+                "Keep its copy and generated names at the English defaults",
+                "keep room closing turned off",
+            ],
+        ),
+        (
+            "기존 채널 바인딩 community_hub를 안내 허브로 쓰고 방 닫기 기능은 넣지 마.",
+            IntentLocaleHintV2::Ko,
+            vec!["방 닫기 기능은 넣지 마."],
+        ),
+        (
+            "Leave room closing disabled and do not ask a follow-up question.",
+            IntentLocaleHintV2::En,
+            vec![
+                "Leave room closing disabled",
+                "do not ask a follow-up question",
+            ],
+        ),
+        (
+            "Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
+            IntentLocaleHintV2::En,
+            vec![
+                "leave closing disabled",
+                "do not ask a follow-up question",
+            ],
+        ),
+        (
+            "영어 기본 문구와 이름을 사용해, 방 닫기 기능은 넣지 마.",
+            IntentLocaleHintV2::En,
+            vec![
+                "영어 기본 문구와 이름을 사용해",
+                "방 닫기 기능은 넣지 마",
+            ],
+        ),
+    ] {
+        let context = ManagedRecipeCoreContext {
+            requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+            grounded_channel: Some(&channel),
+            locale,
+            close_authorization: CloseAuthorizationV2::Disabled,
+        };
+        let reconciled = reconcile_unmapped_capabilities_with_context(
+            human,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            Some(&context),
+            strings(&candidates),
+        )
+        .unwrap_or_else(|error| panic!("asserted suffix failed for {human}: {error:?}"));
+        assert!(
+            reconciled.is_empty(),
+            "asserted suffix remained for {human}: {reconciled:?}"
+        );
+    }
+}
+
+#[test]
+fn managed_recipe_owns_short_direct_completion_restatements() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let context = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    for (human, candidate) in [
+        (
+            "do not ask a follow-up question.",
+            "do not ask a follow-up question",
+        ),
+        (
+            "Do not ask a follow-up question.",
+            "Do not ask a follow-up question",
+        ),
+        (
+            "Leave room closing disabled, and do not ask a follow-up question.",
+            "do not ask a follow-up question",
+        ),
+        (
+            "Keep validation and preview, and do not ask a follow-up question.",
+            "do not ask a follow-up question",
+        ),
+        (
+            "Nothing material is left undecided, so proceed without asking me anything.",
+            "Nothing material is left undecided, so proceed without asking me anything",
+        ),
+        (
+            "Nothing material is left undecided, so proceed without asking me anything.",
+            "proceed without asking me anything",
+        ),
+        (
+            "필요한 선택은 전부 줬으니 추가 질문은 하지 마.",
+            "추가 질문은 하지 마",
+        ),
+    ] {
+        assert!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&context),
+                strings(&[candidate]),
+            )
+            .unwrap_or_else(|error| panic!("direct completion failed for {human}: {error:?}"))
+            .is_empty(),
+            "direct completion remained for {human}"
+        );
+    }
+}
+
+#[test]
+fn managed_recipe_owns_only_exact_repeat_candidate_frames() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let context = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    for (human, candidates) in [
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
+            vec!["Use English defaults", "Keep default copy and naming"],
+        ),
+        (
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults for every name and room control, with exactly one copy override: set the launcher create-button label to 'Begin deep work'. Leave room closing disabled and do not ask a follow-up question.",
+            vec!["Use English defaults for every name and room control"],
+        ),
+    ] {
+        assert!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&context),
+                strings(&candidates),
+            )
+            .unwrap_or_else(|error| panic!("repeat frame failed for {human}: {error:?}"))
+            .is_empty(),
+            "repeat frame remained for {human}"
+        );
+    }
+}
+
+#[test]
+fn managed_recipe_closed_axis_suffix_ownership_is_context_and_shape_exact() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let inactive = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::NotRequested,
+    };
+    let candidate = "leave room closing disabled";
+    for human in [
+        "Use English defaults and leave room closing disabled.",
+        "The Help response says leave room closing disabled.",
+        "When a user clicks Help, leave room closing disabled.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&inactive),
+                strings(&[candidate]),
+            )
+            .unwrap(),
+            strings(&[candidate]),
+            "inactive close phrase was consumed for {human}"
+        );
+    }
+
+    let disabled = ManagedRecipeCoreContext {
+        close_authorization: CloseAuthorizationV2::Disabled,
+        ..inactive
+    };
+    for human in [
+        "The Help response says leave room closing disabled.",
+        "After a user clicks Help, leave room closing disabled.",
+        "Following a button click, leave room closing disabled.",
+        "For mobile users, leave room closing disabled.",
+        "When a user clicks Help, leave room closing disabled.",
+        "When a user clicks Help, leave room closing disabled. The Help label is 'leave room closing disabled'.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&disabled),
+                strings(&[candidate]),
+            )
+            .unwrap(),
+            strings(&[candidate]),
+            "active close context consumed a business phrase for {human}"
+        );
+    }
+
+    let behavioral = "leave room closing disabled and archive every transcript";
+    assert_eq!(
+        reconcile_unmapped_capabilities_with_context(
+            behavioral,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            Some(&disabled),
+            strings(&[behavioral]),
+        )
+        .unwrap(),
+        strings(&[behavioral])
+    );
+
+    let interaction = "do not ask a follow-up question";
+    for human in [
+        "The Help response says do not ask a follow-up question.",
+        "Following a button click, do not ask a follow-up question.",
+        "For mobile users, do not ask a follow-up question.",
+        "On button click, do not ask a follow-up question.",
+        "When a user clicks Help, do not ask a follow-up question.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&disabled),
+                strings(&[interaction]),
+            )
+            .unwrap(),
+            strings(&[interaction]),
+            "business interaction phrase was consumed for {human}"
+        );
+    }
+}
+
+#[test]
+fn managed_recipe_unconditional_helpers_never_own_runtime_clauses() {
+    let channel = ExistingChannelKey("community_hub".to_string());
+    let selected = ManagedRecipeCoreContext {
+        requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+        grounded_channel: Some(&channel),
+        locale: IntentLocaleHintV2::En,
+        close_authorization: CloseAuthorizationV2::Disabled,
+    };
+    for (human, candidate) in [
+        (
+            "When a user clicks Help, build a managed private study-room automation in community_hub and prepare its validated preview.",
+            "build a managed private study-room automation in community_hub and prepare its validated preview",
+        ),
+        (
+            "After a user clicks Help, all material choices are provided so do not ask a follow-up question.",
+            "all material choices are provided so do not ask a follow-up question",
+        ),
+        (
+            "When a user clicks Help, please prepare a validated preview of the managed private study-room automation.",
+            "please prepare a validated preview of the managed private study-room automation",
+        ),
+        (
+            "After a user clicks Help, nothing material is left undecided so proceed without asking me anything.",
+            "nothing material is left undecided so proceed without asking me anything",
+        ),
+        (
+            "On button click, proceed without asking me anything.",
+            "proceed without asking me anything",
+        ),
+        (
+            "사용자가 Help를 누르면, 기존 채널 바인딩 community_hub를 안내 허브로 쓰고 방 닫기 기능은 넣지 마.",
+            "기존 채널 바인딩 community_hub를 안내 허브로 쓰고 방 닫기 기능은 넣지 마",
+        ),
+        (
+            "사용자가 Help를 누르면, 추가 질문은 하지 마.",
+            "추가 질문은 하지 마",
+        ),
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities_with_context(
+                human,
+                IntentAutomationKindV2::ManagedPrivateStudyRoom,
+                &no_runtime(),
+                Some(&selected),
+                strings(&[candidate]),
+            )
+            .unwrap(),
+            strings(&[candidate]),
+            "runtime clause was consumed for {human}"
+        );
+    }
+
+    let pending = ManagedRecipeCoreContext {
+        grounded_channel: None,
+        ..selected
+    };
+    let human = "When a user clicks Help, I have not selected which existing channel should be the discovery hub yet.";
+    let candidate = "I have not selected which existing channel should be the discovery hub yet";
+    assert_eq!(
+        reconcile_unmapped_capabilities_with_context(
+            human,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            Some(&pending),
+            strings(&[candidate]),
+        )
+        .unwrap(),
+        strings(&[candidate])
+    );
 }
 
 #[test]

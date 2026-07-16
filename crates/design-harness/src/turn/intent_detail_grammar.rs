@@ -14,6 +14,213 @@ const KOREAN_DIRECT_TERMINALS: &[&str] = &[
     "설정해줘",
 ];
 
+const DETAIL_COMMAND_PREFIXES: &[&[&str]] = &[
+    &["set", "the"],
+    &["set"],
+    &["use", "the"],
+    &["use"],
+    &["change", "the"],
+    &["change"],
+    &["customize", "the"],
+    &["customize"],
+    &["override", "the"],
+    &["override"],
+    &["rename", "the"],
+    &["rename"],
+    &["설정"],
+    &["변경"],
+    &["지정"],
+    &["재정의"],
+];
+
+const QUOTED_DIRECT_ASSIGNMENTS: &[&[&str]] = &[
+    &[LITERAL_SENTINEL],
+    &["is", LITERAL_SENTINEL],
+    &["is", "exactly", LITERAL_SENTINEL],
+    &["are", LITERAL_SENTINEL],
+    &["to", LITERAL_SENTINEL],
+    &["set", "to", LITERAL_SENTINEL],
+    &["is", "set", "to", LITERAL_SENTINEL],
+    &["as", LITERAL_SENTINEL],
+    &["named", LITERAL_SENTINEL],
+    &[LITERAL_SENTINEL, "로", "바꿔"],
+    &[LITERAL_SENTINEL, "로", "바꿔줘"],
+    &[LITERAL_SENTINEL, "로", "바꿔주세요"],
+    &[LITERAL_SENTINEL, "로", "바꾸고"],
+    &[LITERAL_SENTINEL, "로", "변경"],
+    &[LITERAL_SENTINEL, "로", "변경해"],
+    &[LITERAL_SENTINEL, "로", "변경해줘"],
+    &[LITERAL_SENTINEL, "로", "설정"],
+    &[LITERAL_SENTINEL, "로", "설정해"],
+    &[LITERAL_SENTINEL, "로", "설정해줘"],
+];
+
+const QUOTED_AFFIX_ASSIGNMENTS: &[&[&str]] = &[
+    &["uses", "prefix", LITERAL_SENTINEL],
+    &["uses", "suffix", LITERAL_SENTINEL],
+    &["has", "prefix", LITERAL_SENTINEL],
+    &["has", "suffix", LITERAL_SENTINEL],
+    &["with", "prefix", LITERAL_SENTINEL],
+    &["with", "suffix", LITERAL_SENTINEL],
+    &["prefix", LITERAL_SENTINEL],
+    &["suffix", LITERAL_SENTINEL],
+    &["prefix", "is", LITERAL_SENTINEL],
+    &["suffix", "is", LITERAL_SENTINEL],
+    &["prefix", "to", LITERAL_SENTINEL],
+    &["suffix", "to", LITERAL_SENTINEL],
+    &["uses", "an", "empty", "prefix"],
+    &["uses", "an", "empty", "suffix"],
+    &["uses", "empty", "prefix"],
+    &["uses", "empty", "suffix"],
+    &["has", "an", "empty", "prefix"],
+    &["has", "an", "empty", "suffix"],
+    &["has", "empty", "prefix"],
+    &["has", "empty", "suffix"],
+    &["with", "an", "empty", "prefix"],
+    &["with", "an", "empty", "suffix"],
+    &["with", "empty", "prefix"],
+    &["with", "empty", "suffix"],
+    &["an", "empty", "prefix"],
+    &["an", "empty", "suffix"],
+    &["empty", "prefix"],
+    &["empty", "suffix"],
+    &["접두사", LITERAL_SENTINEL],
+    &["접두사", LITERAL_SENTINEL, "로", "설정"],
+    &["접두사는", LITERAL_SENTINEL],
+    &["접두사는", LITERAL_SENTINEL, "로", "설정"],
+    &["접두사를", LITERAL_SENTINEL],
+    &["접두사를", LITERAL_SENTINEL, "로", "설정"],
+    &["접미사", LITERAL_SENTINEL],
+    &["접미사", LITERAL_SENTINEL, "로", "설정"],
+    &["접미사는", LITERAL_SENTINEL],
+    &["접미사는", LITERAL_SENTINEL, "로", "설정"],
+    &["접미사를", LITERAL_SENTINEL],
+    &["접미사를", LITERAL_SENTINEL, "로", "설정"],
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GroundedDetailAssignment {
+    Static,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroundedDetailLead {
+    Assignment,
+    Conditional,
+    Irrelevant,
+}
+
+pub(super) fn valid_masked_direct_assignment_tail(tail: &[&str]) -> bool {
+    valid_masked_assignment_tail(QUOTED_DIRECT_ASSIGNMENTS, tail)
+        || matches!(
+            tail,
+            [particle, terminal]
+                if matches!(*particle, "로" | "으로")
+                    && KOREAN_DIRECT_TERMINALS.contains(terminal)
+        )
+}
+
+pub(super) fn grounded_detail_assignment_with_slot(
+    tokens: &[&str],
+) -> Option<(GroundedDetailAssignment, DetailSlot)> {
+    (0..tokens.len()).find_map(|index| {
+        let (slot, tail) = match_detail_slot(&tokens[index..])?;
+        let valid_masked = match slot.value_shape() {
+            DetailValueShape::Direct => valid_masked_direct_assignment_tail(tail),
+            DetailValueShape::Affix => valid_masked_assignment_tail(QUOTED_AFFIX_ASSIGNMENTS, tail),
+        };
+        let valid_unquoted = valid_unquoted_detail_assignment(slot, tail);
+        let valid = valid_masked || valid_unquoted;
+        match grounded_detail_lead(&tokens[..index]) {
+            GroundedDetailLead::Assignment => Some((
+                if valid {
+                    GroundedDetailAssignment::Static
+                } else {
+                    GroundedDetailAssignment::Unsupported
+                },
+                slot,
+            )),
+            GroundedDetailLead::Conditional if valid || conditional_detail_mutation_tail(tail) => {
+                Some((GroundedDetailAssignment::Unsupported, slot))
+            }
+            GroundedDetailLead::Conditional | GroundedDetailLead::Irrelevant => None,
+        }
+    })
+}
+
+fn grounded_detail_lead(tokens: &[&str]) -> GroundedDetailLead {
+    let tokens = tokens.strip_prefix(&["please"]).unwrap_or(tokens);
+    if tokens.is_empty()
+        || matches!(tokens, ["a"] | ["an"] | ["the"])
+        || DETAIL_COMMAND_PREFIXES.contains(&tokens)
+    {
+        return GroundedDetailLead::Assignment;
+    }
+    if conditional_detail_lead(tokens) {
+        return GroundedDetailLead::Conditional;
+    }
+    let locale_wrapper = tokens.first().is_some_and(|word| {
+        matches!(
+            *word,
+            "english" | "except" | "keep" | "korean" | "use" | "영어" | "한국어"
+        )
+    }) && tokens
+        .iter()
+        .any(|word| matches!(*word, "except" | "override" | "overrides" | "재정의"));
+    if locale_wrapper {
+        GroundedDetailLead::Assignment
+    } else {
+        GroundedDetailLead::Irrelevant
+    }
+}
+
+fn conditional_detail_lead(tokens: &[&str]) -> bool {
+    tokens.first().is_some_and(|word| {
+        matches!(
+            *word,
+            "after"
+                | "before"
+                | "during"
+                | "following"
+                | "on"
+                | "unless"
+                | "when"
+                | "whenever"
+                | "while"
+                | "만약"
+        ) || word.ends_with('면')
+    })
+}
+
+fn conditional_detail_mutation_tail(tail: &[&str]) -> bool {
+    tail.first().is_some_and(|word| {
+        matches!(
+            *word,
+            "become"
+                | "becomes"
+                | "change"
+                | "changes"
+                | "switch"
+                | "switches"
+                | "vary"
+                | "varies"
+                | "변경"
+                | "바뀌어"
+        )
+    })
+}
+
+fn valid_masked_assignment_tail(patterns: &[&[&str]], tail: &[&str]) -> bool {
+    patterns.iter().any(|pattern| {
+        pattern
+            .iter()
+            .copied()
+            .filter(|token| *token != LITERAL_SENTINEL)
+            .eq(tail.iter().copied())
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DetailSlot {
     LauncherContent,
@@ -298,25 +505,7 @@ fn valid_unquoted_detail_continuation(tokens: &[&str], active_slot: DetailSlot) 
 }
 
 pub(super) fn strip_detail_command_prefix<'a>(tokens: &'a [&str]) -> &'a [&'a str] {
-    const PREFIXES: &[&[&str]] = &[
-        &["set", "the"],
-        &["set"],
-        &["use", "the"],
-        &["use"],
-        &["change", "the"],
-        &["change"],
-        &["customize", "the"],
-        &["customize"],
-        &["override", "the"],
-        &["override"],
-        &["rename", "the"],
-        &["rename"],
-        &["설정"],
-        &["변경"],
-        &["지정"],
-        &["재정의"],
-    ];
-    for prefix in PREFIXES {
+    for prefix in DETAIL_COMMAND_PREFIXES {
         if tokens.starts_with(prefix) {
             return &tokens[prefix.len()..];
         }
@@ -428,72 +617,11 @@ pub(super) fn match_detail_slot<'a>(tokens: &'a [&'a str]) -> Option<(DetailSlot
 }
 
 fn valid_detail_assignment(slot: DetailSlot, tail: &[&str]) -> bool {
-    const DIRECT: &[&[&str]] = &[
-        &[LITERAL_SENTINEL],
-        &["is", LITERAL_SENTINEL],
-        &["is", "exactly", LITERAL_SENTINEL],
-        &["are", LITERAL_SENTINEL],
-        &["to", LITERAL_SENTINEL],
-        &["set", "to", LITERAL_SENTINEL],
-        &["is", "set", "to", LITERAL_SENTINEL],
-        &["as", LITERAL_SENTINEL],
-        &["named", LITERAL_SENTINEL],
-        &[LITERAL_SENTINEL, "로", "바꿔"],
-        &[LITERAL_SENTINEL, "로", "바꿔줘"],
-        &[LITERAL_SENTINEL, "로", "바꿔주세요"],
-        &[LITERAL_SENTINEL, "로", "바꾸고"],
-        &[LITERAL_SENTINEL, "로", "변경"],
-        &[LITERAL_SENTINEL, "로", "변경해"],
-        &[LITERAL_SENTINEL, "로", "변경해줘"],
-        &[LITERAL_SENTINEL, "로", "설정"],
-        &[LITERAL_SENTINEL, "로", "설정해"],
-        &[LITERAL_SENTINEL, "로", "설정해줘"],
-    ];
-    const AFFIX: &[&[&str]] = &[
-        &["uses", "prefix", LITERAL_SENTINEL],
-        &["uses", "suffix", LITERAL_SENTINEL],
-        &["has", "prefix", LITERAL_SENTINEL],
-        &["has", "suffix", LITERAL_SENTINEL],
-        &["with", "prefix", LITERAL_SENTINEL],
-        &["with", "suffix", LITERAL_SENTINEL],
-        &["prefix", LITERAL_SENTINEL],
-        &["suffix", LITERAL_SENTINEL],
-        &["prefix", "is", LITERAL_SENTINEL],
-        &["suffix", "is", LITERAL_SENTINEL],
-        &["prefix", "to", LITERAL_SENTINEL],
-        &["suffix", "to", LITERAL_SENTINEL],
-        &["uses", "an", "empty", "prefix"],
-        &["uses", "an", "empty", "suffix"],
-        &["uses", "empty", "prefix"],
-        &["uses", "empty", "suffix"],
-        &["has", "an", "empty", "prefix"],
-        &["has", "an", "empty", "suffix"],
-        &["has", "empty", "prefix"],
-        &["has", "empty", "suffix"],
-        &["with", "an", "empty", "prefix"],
-        &["with", "an", "empty", "suffix"],
-        &["with", "empty", "prefix"],
-        &["with", "empty", "suffix"],
-        &["an", "empty", "prefix"],
-        &["an", "empty", "suffix"],
-        &["empty", "prefix"],
-        &["empty", "suffix"],
-        &["접두사", LITERAL_SENTINEL],
-        &["접두사", LITERAL_SENTINEL, "로", "설정"],
-        &["접두사는", LITERAL_SENTINEL],
-        &["접두사는", LITERAL_SENTINEL, "로", "설정"],
-        &["접두사를", LITERAL_SENTINEL],
-        &["접두사를", LITERAL_SENTINEL, "로", "설정"],
-        &["접미사", LITERAL_SENTINEL],
-        &["접미사", LITERAL_SENTINEL, "로", "설정"],
-        &["접미사는", LITERAL_SENTINEL],
-        &["접미사는", LITERAL_SENTINEL, "로", "설정"],
-        &["접미사를", LITERAL_SENTINEL],
-        &["접미사를", LITERAL_SENTINEL, "로", "설정"],
-    ];
     match slot.value_shape() {
-        DetailValueShape::Direct => DIRECT.contains(&tail) || valid_korean_quoted_direct(tail),
-        DetailValueShape::Affix => AFFIX.contains(&tail),
+        DetailValueShape::Direct => {
+            QUOTED_DIRECT_ASSIGNMENTS.contains(&tail) || valid_korean_quoted_direct(tail)
+        }
+        DetailValueShape::Affix => QUOTED_AFFIX_ASSIGNMENTS.contains(&tail),
     }
 }
 

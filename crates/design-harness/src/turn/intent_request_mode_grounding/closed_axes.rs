@@ -1,3 +1,4 @@
+use crate::turn::intent_detail_syntax::grounded_detail_assignment_scope_with_slot;
 use crate::turn::intent_interpretation::{CloseAuthorizationV2, IntentLocaleHintV2};
 use crate::turn::intent_metalinguistic_scope::first_copy_carrier_index;
 
@@ -76,6 +77,7 @@ impl Default for ClosedAxesAccumulator {
 }
 
 impl ClosedAxesAccumulator {
+    #[cfg(test)]
     pub(super) fn observe(
         &mut self,
         raw_value: &str,
@@ -83,9 +85,37 @@ impl ClosedAxesAccumulator {
         continuation: Option<&str>,
         alternative_continuation: Option<&str>,
     ) {
-        let value = raw_value
-            .get(..first_copy_carrier_index(raw_value).unwrap_or(raw_value.len()))
-            .unwrap_or(raw_value);
+        self.observe_with_source(
+            raw_value,
+            raw_value,
+            link,
+            continuation,
+            continuation.map(|_| {
+                if alternative_continuation.is_some() {
+                    UnquotedGroundingLink::Alternative
+                } else {
+                    UnquotedGroundingLink::Additive
+                }
+            }),
+            false,
+        );
+    }
+
+    pub(super) fn observe_with_source(
+        &mut self,
+        active_value: &str,
+        source_value: &str,
+        link: UnquotedGroundingLink,
+        continuation: Option<&str>,
+        continuation_link: Option<UnquotedGroundingLink>,
+        operative_consequent: bool,
+    ) {
+        let alternative_continuation =
+            continuation.filter(|_| continuation_link == Some(UnquotedGroundingLink::Alternative));
+        let copy_carrier_index = first_copy_carrier_index(source_value);
+        let value = active_value
+            .get(..first_copy_carrier_index(active_value).unwrap_or(active_value.len()))
+            .unwrap_or(active_value);
         if self.detector_scope
             && link == UnquotedGroundingLink::Additive
             && starts_closed_axis_imperative(value)
@@ -213,8 +243,34 @@ impl ClosedAxesAccumulator {
         }
         let exhaustive_locale_scope = alternative_continuation
             .is_some_and(|continuation| exhaustive_locale_scope(value, continuation));
+        let managed_detail_assignment = grounded_detail_assignment_scope_with_slot(source_value);
+        let copy_carrier_locale = locale_branch
+            .or(self.previous_locale_branch)
+            .or((self.locale != IntentLocaleHintV2::Unspecified).then_some(self.locale));
         if !exhaustive_locale_scope
-            && unsupported_locale_modifier(value, directive_words, locale_branch)
+            && (unsupported_locale_modifier(value, directive_words, locale_branch)
+                || unsupported_managed_detail_locale_grounding(
+                    managed_detail_assignment,
+                    continuation,
+                    continuation_link,
+                    copy_carrier_locale,
+                    operative_consequent,
+                )
+                || copy_carrier_index.is_some_and(|index| {
+                    managed_detail_assignment.is_none()
+                        && legacy_copy_carrier_locale_scope(source_value, index)
+                        && (operative_consequent
+                            || source_value.get(index..).is_some_and(|tail| {
+                                unsupported_copy_carrier_locale_modifier(tail, copy_carrier_locale)
+                            })
+                            || continuation.is_some_and(|tail| {
+                                unsupported_copy_carrier_locale_continuation(
+                                    tail,
+                                    continuation_link,
+                                    copy_carrier_locale,
+                                )
+                            }))
+                }))
         {
             self.record_locale_error(ClosedAxisGroundingError::UnsupportedLocale);
         }
@@ -259,7 +315,8 @@ impl ClosedAxesAccumulator {
             && !deferred_bare_locale
             && continued_locale.is_none()
             && pending_locale_fragment.is_none()
-            && unsupported_locale_request(value, directive_words)
+            && (unsupported_locale_request(value, directive_words)
+                || unsupported_accumulated_locale_request(value, directive_words, self.locale))
         {
             self.record_locale_error(ClosedAxisGroundingError::UnsupportedLocale);
         }
@@ -380,6 +437,27 @@ impl ClosedAxesAccumulator {
             };
         }
         self.pending_correction = standalone_correction;
+    }
+
+    pub(super) fn observe_copy_scope_continuation(
+        &mut self,
+        source_value: &str,
+        operative_consequent: bool,
+    ) {
+        let source_words = words(source_value);
+        let selected = (self.locale != IntentLocaleHintV2::Unspecified).then_some(self.locale);
+        let managed_detail_assignment = grounded_detail_assignment_scope_with_slot(source_value);
+        if unsupported_accumulated_locale_request(source_value, &source_words, self.locale)
+            || unsupported_managed_detail_locale_grounding(
+                managed_detail_assignment,
+                None,
+                None,
+                selected,
+                operative_consequent,
+            )
+        {
+            self.record_locale_error(ClosedAxisGroundingError::UnsupportedLocale);
+        }
     }
 
     pub(super) fn finish(mut self) -> GroundedClosedAxes {
@@ -539,6 +617,159 @@ pub(in crate::turn) fn grounded_closed_axis_restatement(
 mod tests {
     use super::*;
 
+    #[test]
+    fn copy_carrier_locale_scope_ignores_independent_runtime_continuations() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and when clicked post the help panel.",
+        );
+        assert_eq!(controls.closed_axes.locale, Ok(IntentLocaleHintV2::En));
+    }
+
+    #[test]
+    fn copy_carriers_without_a_locale_never_synthesize_locale_authority() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation where the Help button label is 'Guide' and create a separate summary panel.",
+        );
+        assert_eq!(
+            controls.closed_axes.locale,
+            Ok(IntentLocaleHintV2::Unspecified)
+        );
+    }
+
+    #[test]
+    fn copy_carrier_locale_scope_rejects_late_scoped_foreign_defaults() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and its response is exactly 'Read' and on weekends use French defaults.",
+        );
+        assert_eq!(
+            controls.closed_axes.locale,
+            Err(ClosedAxisGroundingError::UnsupportedLocale)
+        );
+    }
+
+    #[test]
+    fn locale_scope_uses_the_complete_static_detail_assignment_grammar() {
+        for human in [
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label is set to 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label as 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label named 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label is Guide.",
+            "Build a managed private study-room automation. Use English defaults except that the Help button label is Mobile.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the channel name uses prefix 'study-'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the modal title is 'Room' plus the Help button label is 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label is 'Guide' plus the modal title is 'Room'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label is 'Guide' and the modal title is 'Room'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help button label is 'Guide' and the channel name uses prefix 'study-'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the launcher create-button label is 'Start focus room'; the created channel name uses prefix 'focus-' and an empty suffix; the room Help button label is 'Guide' and its ephemeral response is 'Read this first'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the modal title is 'Room', and leave room closing disabled.",
+            "Build a managed private study-room automation. Use English defaults except that the Help button label is 'Guide' and leave room closing disabled.",
+            "Build a managed private study-room automation. Use English defaults except that Help button label is 'Guide' and leave room closing disabled.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: 도움말 버튼 라벨을 「안내」로 변경해.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: 도움말 버튼 라벨을 「안내」으로 변경해.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: 도움말 버튼 라벨을 안내로 변경해.",
+            "Build a managed private study-room automation. Use English defaults. Archive the Help button label in an audit log.",
+            "Build a managed private study-room automation. Use English defaults. For clarity, set the Help button label to 'Guide'.",
+        ] {
+            let controls = super::super::grounded_request_controls(human);
+            assert_eq!(
+                controls.closed_axes.locale,
+                Ok(IntentLocaleHintV2::En),
+                "static detail assignment was rejected for {human}"
+            );
+        }
+    }
+
+    #[test]
+    fn locale_scope_rejects_conditional_details_across_managed_surfaces() {
+        for human in [
+            "Build a managed private study-room automation. Use English defaults. When the room is archived, change the Help button label to 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults. On weekends set the Help button label to 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults. On weekends, set the Help button label to 'Guide'.",
+            "Build a managed private study-room automation. Use English defaults. After a restart, set the modal title to 'Room'.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the modal title changes when archived.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the launcher content changes on weekends.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the room name label changes after a restart.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the Help response changes when archived.",
+            "Build a managed private study-room automation. Use English defaults except for these exact overrides: the channel name uses prefix 'study-' when archived.",
+        ] {
+            let controls = super::super::grounded_request_controls(human);
+            assert_eq!(
+                controls.closed_axes.locale,
+                Err(ClosedAxisGroundingError::UnsupportedLocale),
+                "conditional detail was accepted for {human}"
+            );
+        }
+    }
+
+    #[test]
+    fn operative_detail_consequents_reach_the_closed_axis_guard() {
+        let human = "Build a managed private study-room automation. Use English defaults. When the room is archived, change the Help button label to 'Guide'.";
+        let grounding = crate::turn::intent_boundary_grounding::unquoted_grounding_text(human)
+            .expect("grounding text");
+        let detail = grounding
+            .sentences
+            .iter()
+            .flatten()
+            .find(|unit| unit.text.contains("help button label"))
+            .expect("detail consequent");
+        assert_eq!(detail.operative_authority, Some(true));
+        assert_eq!(
+            crate::turn::intent_detail_syntax::grounded_detail_assignment_scope(&detail.text),
+            Some(crate::turn::intent_detail_grammar::GroundedDetailAssignment::Static)
+        );
+        let controls = super::super::grounded_request_controls(human);
+        assert_eq!(
+            controls.closed_axes.locale,
+            Err(ClosedAxisGroundingError::UnsupportedLocale)
+        );
+    }
+
+    #[test]
+    fn copy_scope_continuations_preserve_late_locale_evidence() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults except that the Help button says 'Guide' and its response is 'Read' and on weekends use French defaults.",
+        );
+        assert_eq!(
+            controls.closed_axes.locale,
+            Err(ClosedAxisGroundingError::UnsupportedLocale)
+        );
+    }
+
+    #[test]
+    fn copy_carrier_locale_scope_rejects_attached_dynamic_continuations() {
+        for human in [
+            "Build a managed private study-room automation. Use English defaults except that the room Help button label is exactly 'Guide' and changes on weekends.",
+            "Build a managed private study-room automation. Use English defaults except that the room Help button label is exactly 'Guide' when archived.",
+            "Build a managed private study-room automation. Use English defaults except that the room Help button label is exactly 'Guide' and set its response to 'Read' on weekends.",
+        ] {
+            let controls = super::super::grounded_request_controls(human);
+            assert_eq!(
+                controls.closed_axes.locale,
+                Err(ClosedAxisGroundingError::UnsupportedLocale),
+                "dynamic copy continuation was accepted for {human}"
+            );
+        }
+    }
+
+    #[test]
+    fn accumulated_locale_scope_allows_explicit_foreign_default_exclusion() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults. Do not use French defaults.",
+        );
+        assert_eq!(controls.closed_axes.locale, Ok(IntentLocaleHintV2::En));
+    }
+
+    #[test]
+    fn accumulated_locale_scope_rejects_selected_default_retraction() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults. Do not use English defaults.",
+        );
+        assert_eq!(
+            controls.closed_axes.locale,
+            Err(ClosedAxisGroundingError::UnsupportedLocale)
+        );
+    }
+
     fn measured_work(repetitions: usize) -> usize {
         reset_closed_axis_work();
         let mut accumulator = ClosedAxesAccumulator::default();
@@ -612,6 +843,11 @@ mod tests {
                 "allow all members to use the close button",
                 CloseAuthorizationV2::AnyMember,
             ),
+            (
+                "keep room closing turned off",
+                CloseAuthorizationV2::Disabled,
+            ),
+            ("leave closing turned off", CloseAuthorizationV2::Disabled),
         ] {
             assert_eq!(grounded_closed_axis_restatement(value).1, Some(expected));
         }

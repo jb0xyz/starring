@@ -629,7 +629,7 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 13, including the closed detail grammar,
+extractor revision moves from 4 to 14, including the closed detail grammar,
 path-only detail frontier, exact slot-literal verifier, supported-base
 classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
@@ -834,7 +834,7 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         13
+Recipe extractor revision         14
 Recipe normalizer revision         9
 Recipe compiler revision           1
 Recipe simulator revision          1
@@ -883,7 +883,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 12, normalizer revisions through 8, or
+branch-local extractor revisions through 13, normalizer revisions through 8, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -897,8 +897,8 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 13, and normalizer 9 is current;
-- a pre-release V4 prompt, extractor revision through 12, or normalizer revision
+- the exact V4 prompt with protocol 4, extractor 14, and normalizer 9 is current;
+- a pre-release V4 prompt, extractor revision through 13, or normalizer revision
   through 8 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;

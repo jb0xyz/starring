@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use super::intent_core::IntentRecipeDetailFacetV3;
 use super::intent_detail_grammar::{
-    match_detail_slot, parse_detail_requirement_segment, strip_detail_command_prefix,
-    unquoted_detail_literal_shape, DetailSlot, DetailValueShape, UnquotedDetailLiteralShape,
+    grounded_detail_assignment_with_slot, match_detail_slot, parse_detail_requirement_segment,
+    strip_detail_command_prefix, unquoted_detail_literal_shape, DetailSlot, DetailValueShape,
+    GroundedDetailAssignment, UnquotedDetailLiteralShape,
 };
 use super::intent_detail_text::{closes_quote, opening_quote};
 
@@ -190,6 +191,39 @@ pub(super) fn supported_detail_fragment(requirement: &str) -> bool {
             | ["일회성", "응답을", LITERAL_SENTINEL]
             | ["에페메랄", "응답을", LITERAL_SENTINEL]
     )
+}
+
+pub(super) fn grounded_detail_assignment_scope(
+    requirement: &str,
+) -> Option<GroundedDetailAssignment> {
+    grounded_detail_assignment_scope_with_slot(requirement).map(|(assignment, _)| assignment)
+}
+
+pub(super) fn grounded_detail_assignment_scope_with_slot(
+    requirement: &str,
+) -> Option<(GroundedDetailAssignment, DetailSlot)> {
+    let mut observed = None;
+    for segment in detail_requirement_segments(requirement) {
+        let tokens = closed_detail_syntax_tokens(&segment)?;
+        let tokens = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        match grounded_detail_assignment_with_slot(&tokens) {
+            Some((GroundedDetailAssignment::Unsupported, slot)) => {
+                return Some((GroundedDetailAssignment::Unsupported, slot));
+            }
+            Some((GroundedDetailAssignment::Static, slot)) => {
+                observed = Some((GroundedDetailAssignment::Static, slot));
+            }
+            None => {}
+        }
+    }
+    observed
+}
+
+pub(super) fn grounded_static_detail_continuation(
+    requirement: &str,
+    active_slot: DetailSlot,
+) -> bool {
+    parse_detail_requirement_segment(requirement, Some(active_slot)).is_some()
 }
 
 fn has_unsupported_structural_prefix(value: &str) -> bool {

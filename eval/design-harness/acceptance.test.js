@@ -8,7 +8,7 @@ const { assess } = require('./acceptance');
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '82016e79d8ce19904e010bc555b52394bcd033dc0813cabe184db32e05718fc8';
+const REGISTRY_DIGEST = '23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -350,7 +350,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 13,
+      extractor_revision: 14,
       normalizer_revision: 9,
       compiler_revision: 1,
       simulator_revision: 1,
@@ -1009,7 +1009,7 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
 
 test('checkpoint rejects stale extractor, normalizer, and forged registry identities', () => {
   const oldExtractor = passingDocument();
-  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 12;
+  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 13;
   const oldExtractorAssessment = assess(oldExtractor);
   assert.equal(oldExtractorAssessment.pass, false);
   assert.equal(

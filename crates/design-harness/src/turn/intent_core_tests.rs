@@ -1181,6 +1181,9 @@ fn serving_closed_axes_cover_direct_product_language() {
         "Build a managed private study-room automation. The response should be in Korean.",
         "Build a managed private study-room automation. Set the response language to Korean.",
         "Build a managed private study-room automation. Set the interface to Korean.",
+        "Build a managed private study-room automation. Switch to Korean.",
+        "Build a managed private study-room automation. Keep all labels in Korean.",
+        "Build a managed private study-room automation. Keep UI copy in Korean.",
         "Build a classifier and use Korean defaults.",
         "Build a managed private study-room automation. Use Korean responses in the customer-facing classifier settings panel.",
         "Build a managed private study-room automation. Use Korean labels in the customer-facing classifier training interface.",
@@ -1211,17 +1214,14 @@ fn serving_closed_axes_cover_direct_product_language() {
             "wrong any-member policy for {human}"
         );
     }
-    for human in [
-        "Build a managed private study-room automation. The room creator alone may close the room.",
-    ] {
-        let parsed =
-            parse_interpret_intent_core_for_human(&valid_core().to_string(), human).unwrap();
-        assert_eq!(
-            parsed.close_authorization(),
-            CloseAuthorizationV2::CreatorOnly,
-            "wrong creator-only policy for {human}"
-        );
-    }
+    let human =
+        "Build a managed private study-room automation. The room creator alone may close the room.";
+    let parsed = parse_interpret_intent_core_for_human(&valid_core().to_string(), human).unwrap();
+    assert_eq!(
+        parsed.close_authorization(),
+        CloseAuthorizationV2::CreatorOnly,
+        "wrong creator-only policy for {human}"
+    );
     let error = parse_interpret_intent_core_for_human(
         &valid_core().to_string(),
         "관리형 비공개 스터디룸 자동화를 만들어줘. 방장은 방을 닫을 수 있어.",
@@ -1723,6 +1723,70 @@ fn human_grounding_reclassifies_evaluation_detail_wrappers() {
             "unexpected facets for {human}"
         );
     }
+}
+
+#[test]
+fn serving_closed_axes_accept_control_detail_locale_exception() {
+    for human in [
+        "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
+        "Build a managed private study-room automation. Use English defaults except that the room Help button label is exactly 'French defaults when archived'. Leave room closing disabled.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button says 'Guide' and create a separate summary panel. Leave room closing disabled.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button says 'Guide' and also create a separate summary panel. Leave room closing disabled.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button says 'Guide' and add a separate summary panel. Leave room closing disabled.",
+        "Please prepare a validated preview of the managed private study-room automation. Keep its copy and generated names at the English defaults, place discovery in the existing community_hub channel binding, and keep room closing turned off. Nothing material is left undecided, so proceed without asking me anything.",
+    ] {
+        let parsed = parse_interpret_intent_core_for_human(&valid_core().to_string(), human)
+            .unwrap_or_else(|error| panic!("supported locale frame failed for {human}: {error:?}"));
+
+        assert_eq!(parsed.locale(), IntentLocaleHintV2::En);
+        assert_eq!(
+            parsed.close_authorization(),
+            CloseAuthorizationV2::Disabled
+        );
+    }
+}
+
+#[test]
+fn serving_closed_axes_reject_foreign_locale_detail_exceptions() {
+    for human in [
+        "Build a managed private study-room automation. Use English defaults except that the room Help control uses French defaults.",
+        "Build a managed private study-room automation. Use English defaults except that the room Help button label uses French defaults.",
+        "Build a managed private study-room automation. Use English defaults except that the room Help control changes on weekends.",
+        "Build a managed private study-room automation. Use English defaults except that the room Help button label changes on weekends.",
+        "Build a managed private study-room automation. Use English defaults except that the room Help button label changes when the room is archived.",
+        "Build a managed private study-room automation. Use English defaults. Except that the room Help button label uses French defaults.",
+        "Build a managed private study-room automation. Use English defaults. The room Help button label changes when the room is archived.",
+        "Build a managed private study-room automation. Use English defaults. Respond in French.",
+        "Build a managed private study-room automation. Use English defaults. Write responses in Japanese.",
+        "Build a managed private study-room automation. Use Swedish defaults.",
+        "Build a managed private study-room automation. Keep its copy and generated names at the French defaults.",
+        "Build a managed private study-room automation. Keep all labels at Swedish defaults.",
+        "Build a managed private study-room automation. Keep all labels in Swedish.",
+        "Build a managed private study-room automation. Keep labels in Swedish.",
+        "Build a managed private study-room automation. Keep UI copy in Swedish.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button says 'Guide' and switch to Swedish.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide', but only at night.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and just at night.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and at night only.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and solely at night.",
+        "Build a managed private study-room automation. Use English defaults except that the Help button label is exactly 'Guide' and also just at night.",
+    ] {
+        let error = match parse_interpret_intent_core_for_human(&valid_core().to_string(), human) {
+            Ok(parsed) => {
+                panic!("foreign locale detail exception was accepted for {human}: {parsed:?}")
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "UNSUPPORTED_INTENT_LOCALE_GROUNDING");
+    }
+
+    let error = parse_interpret_intent_core_for_human(
+        &valid_core().to_string(),
+        "Build a managed private study-room automation. Use English or Swedish defaults.",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "AMBIGUOUS_INTENT_LOCALE_GROUNDING");
 }
 
 #[test]

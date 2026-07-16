@@ -342,10 +342,14 @@ fn operative_consequent(words: &[ConditionalWord]) -> bool {
                 | "bypasses"
                 | "call"
                 | "calls"
+                | "change"
+                | "changes"
                 | "choose"
                 | "chooses"
                 | "create"
                 | "creates"
+                | "customize"
+                | "customizes"
                 | "decide"
                 | "decides"
                 | "deny"
@@ -371,18 +375,26 @@ fn operative_consequent(words: &[ConditionalWord]) -> bool {
                 | "makes"
                 | "notify"
                 | "notifies"
+                | "override"
+                | "overrides"
                 | "post"
                 | "posts"
                 | "publish"
                 | "publishes"
                 | "reveal"
                 | "reveals"
+                | "rename"
+                | "renames"
                 | "run"
                 | "runs"
                 | "send"
                 | "sends"
+                | "set"
+                | "sets"
                 | "skip"
                 | "skips"
+                | "update"
+                | "updates"
                 | "use"
                 | "uses"
         ) || [
@@ -423,6 +435,11 @@ mod tests {
         assert!(split(
             "If a message arrives, an LLM decides whether to grant the role",
             "an LLM decides whether to grant the role",
+        )
+        .is_some());
+        assert!(split(
+            "When the room is archived, change the Help button label to 'Guide'",
+            "change the Help button label to 'Guide'",
         )
         .is_some());
         assert!(split(

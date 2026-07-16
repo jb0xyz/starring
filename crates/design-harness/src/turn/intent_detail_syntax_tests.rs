@@ -1,8 +1,9 @@
 use super::intent_core::IntentRecipeDetailFacetV3;
+use super::intent_detail_grammar::GroundedDetailAssignment;
 use super::intent_detail_syntax::{
     canonical_material_detail_expectations, canonical_material_detail_fields,
-    supported_detail_facets, supported_detail_fragment, supported_detail_syntax,
-    IntentRecipeDetailFieldV4,
+    grounded_detail_assignment_scope, supported_detail_facets, supported_detail_fragment,
+    supported_detail_syntax, IntentRecipeDetailFieldV4,
 };
 
 fn fields(requirement: &str) -> Option<Vec<IntentRecipeDetailFieldV4>> {
@@ -601,5 +602,38 @@ fn contractions_inside_single_quoted_values_remain_one_literal() {
     assert_eq!(
         supported_detail_facets("Help response is 'disabled'"),
         Some(vec![IntentRecipeDetailFacetV3::Controls])
+    );
+}
+
+#[test]
+fn grounded_masked_detail_scope_reuses_the_complete_closed_grammar() {
+    for requirement in [
+        "use english defaults except for exact overrides modal title is plus help button label is",
+        "change the help button label to",
+        "도움말 버튼 라벨을 로 변경해",
+        "도움말 버튼 라벨을 으로 변경해",
+    ] {
+        assert_eq!(
+            grounded_detail_assignment_scope(requirement),
+            Some(GroundedDetailAssignment::Static),
+            "static grounded detail rejected for {requirement}"
+        );
+    }
+    for requirement in [
+        "modal title changes when archived",
+        "on weekends set the help button label to",
+        "welcome content changes on weekends",
+        "help response changes after a restart",
+    ] {
+        assert_eq!(
+            grounded_detail_assignment_scope(requirement),
+            Some(GroundedDetailAssignment::Unsupported),
+            "unsupported grounded detail accepted for {requirement}"
+        );
+    }
+    assert_eq!(grounded_detail_assignment_scope("copy and naming"), None);
+    assert_eq!(
+        grounded_detail_assignment_scope("archive the help button label in an audit log"),
+        None
     );
 }

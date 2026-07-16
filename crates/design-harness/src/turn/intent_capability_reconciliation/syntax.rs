@@ -249,6 +249,20 @@ impl<'a> SourceText<'a> {
         )
     }
 
+    pub(super) fn has_unique_complete_asserted_sentence_frame(&self, value: &str) -> bool {
+        if value.is_empty() {
+            return false;
+        }
+        let value = trim_terminal_semantic_delimiters(value);
+        let mut matching = self.sentences.iter().filter(|sentence| {
+            sentence.authoritative_span(sentence.span)
+                && self
+                    .value(sentence.span)
+                    .is_some_and(|sentence| sentence.eq_ignore_ascii_case(value))
+        });
+        matching.next().is_some() && matching.next().is_none()
+    }
+
     fn authority_span(&self, mut span: Span) -> Span {
         while let Some((relative, character)) = self
             .source
