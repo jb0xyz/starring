@@ -11,13 +11,24 @@ use discord_model::{ChannelId, RoleId};
 use serde::Deserialize;
 
 const DEFAULT_BASE_URL: &str = "https://llm-api.starring.co.kr/v1";
-pub const SERVING_MODEL: &str = "gemma4:12b-mlx";
+const DEFAULT_CODEX_WORKER_URL: &str = "http://127.0.0.1:18181";
+pub const SERVING_AUTH_MODE: &str = "chatgpt";
+pub const SERVING_MODEL: &str = "gpt-5.6-luna";
+pub const SERVING_PROVIDER: &str = "codex_chatgpt";
+pub const SERVING_REASONING_EFFORT: &str = "medium";
+pub(crate) const LEGACY_SERVING_MODEL: &str = "gemma4:12b-mlx";
 const DEFAULT_SESSION_ID: &str = "default";
 
 pub struct EdgeConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub session_config: SessionConfig,
+}
+
+pub struct CodexWorkerConfig {
+    pub base_url: String,
+    pub token: String,
     pub session_config: SessionConfig,
 }
 
@@ -47,6 +58,12 @@ impl EdgeConfig {
     }
 }
 
+impl CodexWorkerConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        codex_worker_config_from(|name| env::var(name).ok())
+    }
+}
+
 pub fn intent_bindings_from_env() -> Result<ResourceBindingMap, ConfigError> {
     let document = env::var("STARRING_HARNESS_BINDINGS_JSON")
         .map_err(|_| ConfigError::MissingIntentBindings)?;
@@ -65,11 +82,11 @@ where
     if api_key.trim().is_empty() {
         return Err(ConfigError::MissingApiKey);
     }
-    let model = value("STARRING_LLM_MODEL").unwrap_or_else(|| SERVING_MODEL.to_string());
+    let model = value("STARRING_LLM_MODEL").unwrap_or_else(|| LEGACY_SERVING_MODEL.to_string());
     if model.trim().is_empty() {
         return Err(ConfigError::EmptyModel);
     }
-    if model != SERVING_MODEL {
+    if model != LEGACY_SERVING_MODEL {
         return Err(ConfigError::UnsupportedModel);
     }
     let session_config = session_config_from(value)?;
@@ -77,6 +94,26 @@ where
         base_url,
         api_key,
         model,
+        session_config,
+    })
+}
+
+fn codex_worker_config_from<F>(mut value: F) -> Result<CodexWorkerConfig, ConfigError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let base_url =
+        value("STARRING_CODEX_WORKER_URL").unwrap_or_else(|| DEFAULT_CODEX_WORKER_URL.to_string());
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::EmptyCodexWorkerUrl);
+    }
+    let token = value("STARRING_CODEX_WORKER_TOKEN")
+        .filter(|token| !token.trim().is_empty())
+        .ok_or(ConfigError::MissingCodexWorkerToken)?;
+    let session_config = session_config_from(value)?;
+    Ok(CodexWorkerConfig {
+        base_url,
+        token,
         session_config,
     })
 }
@@ -278,6 +315,7 @@ pub enum ConfigError {
     DuplicateBindingKey,
     EmptyDatabasePath,
     EmptyBaseUrl,
+    EmptyCodexWorkerUrl,
     EmptyModel,
     EmptySessionId,
     InvalidBindingId,
@@ -287,6 +325,7 @@ pub enum ConfigError {
     InvalidHarnessMode,
     InvalidPlannedMode,
     MissingApiKey,
+    MissingCodexWorkerToken,
     MissingChannelBinding,
     MissingHomeForDefaultDatabasePath,
     MissingIntentBindings,
@@ -313,6 +352,9 @@ impl fmt::Display for ConfigError {
                 formatter.write_str("STARRING_HARNESS_DB_PATH must not be empty")
             }
             Self::EmptyBaseUrl => formatter.write_str("STARRING_LLM_BASE_URL must not be empty"),
+            Self::EmptyCodexWorkerUrl => {
+                formatter.write_str("STARRING_CODEX_WORKER_URL must not be empty")
+            }
             Self::EmptyModel => formatter.write_str("STARRING_LLM_MODEL must not be empty"),
             Self::EmptySessionId => {
                 formatter.write_str("STARRING_HARNESS_SESSION_ID must not be empty")
@@ -334,6 +376,9 @@ impl fmt::Display for ConfigError {
                 formatter.write_str("STARRING_HARNESS_PLANNED must be 0, 1, false, or true")
             }
             Self::MissingApiKey => formatter.write_str("STARRING_LLM_API_KEY is required"),
+            Self::MissingCodexWorkerToken => {
+                formatter.write_str("STARRING_CODEX_WORKER_TOKEN is required")
+            }
             Self::MissingChannelBinding => formatter.write_str(
                 "intent_recipe mode requires at least one existing channel binding",
             ),
@@ -349,7 +394,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::UnsupportedModel => write!(
                 formatter,
-                "STARRING_LLM_MODEL must be {SERVING_MODEL}"
+                "STARRING_LLM_MODEL must be {LEGACY_SERVING_MODEL}"
             ),
         }
     }
@@ -362,8 +407,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        edge_config_from, parse_bindings, persistence_config_from, session_config_from,
-        ConfigError, HarnessMode, SERVING_MODEL,
+        codex_worker_config_from, edge_config_from, parse_bindings, persistence_config_from,
+        session_config_from, ConfigError, HarnessMode, LEGACY_SERVING_MODEL,
     };
 
     #[test]
@@ -372,7 +417,7 @@ mod tests {
             (name == "STARRING_LLM_API_KEY").then(|| "test-secret".to_string())
         })
         .unwrap();
-        assert_eq!(defaults.model, SERVING_MODEL);
+        assert_eq!(defaults.model, LEGACY_SERVING_MODEL);
         assert_eq!(defaults.base_url, "https://llm-api.starring.co.kr/v1");
 
         let unsupported = match edge_config_from(|name| match name {
@@ -391,6 +436,32 @@ mod tests {
         assert!(matches!(
             edge_config_from(|_| None),
             Err(ConfigError::MissingApiKey)
+        ));
+    }
+
+    #[test]
+    fn codex_worker_config_pins_loopback_and_keeps_token_out_of_errors() {
+        let defaults = codex_worker_config_from(|name| {
+            (name == "STARRING_CODEX_WORKER_TOKEN").then(|| "test-secret".to_string())
+        })
+        .unwrap();
+        assert_eq!(defaults.base_url, "http://127.0.0.1:18181");
+        assert_eq!(defaults.token, "test-secret");
+
+        let empty_url = match codex_worker_config_from(|name| match name {
+            "STARRING_CODEX_WORKER_TOKEN" => Some("secret-marker".to_string()),
+            "STARRING_CODEX_WORKER_URL" => Some(String::new()),
+            _ => None,
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("empty worker URL was accepted"),
+        };
+        assert!(matches!(empty_url, ConfigError::EmptyCodexWorkerUrl));
+        assert!(!empty_url.to_string().contains("secret-marker"));
+
+        assert!(matches!(
+            codex_worker_config_from(|_| None),
+            Err(ConfigError::MissingCodexWorkerToken)
         ));
     }
 

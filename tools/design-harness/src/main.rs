@@ -1,4 +1,5 @@
 mod client;
+mod codex_worker;
 mod config;
 mod eval;
 mod store;
@@ -23,8 +24,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::{GemmaClient, ModelCallMetric};
+use crate::codex_worker::CodexWorkerClient;
 use crate::config::{
-    intent_bindings_from_env, EdgeConfig, HarnessMode, PersistenceConfig, SERVING_MODEL,
+    intent_bindings_from_env, CodexWorkerConfig, EdgeConfig, HarnessMode, PersistenceConfig,
+    SERVING_MODEL,
 };
 use crate::store::{SessionStore, StoreError};
 
@@ -38,6 +41,12 @@ trait IntentMetricsSource {
 impl IntentMetricsSource for GemmaClient {
     fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
         GemmaClient::model_call_metrics(self)
+    }
+}
+
+impl IntentMetricsSource for CodexWorkerClient {
+    fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
+        CodexWorkerClient::model_call_metrics(self)
     }
 }
 
@@ -79,27 +88,39 @@ fn required_intent_bindings(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = EdgeConfig::from_env()?;
     if env::args().nth(1).as_deref() == Some("--eval-json") {
-        return run_eval(config).await;
+        return run_eval().await;
     }
     let persistence = PersistenceConfig::from_env()?;
-    let client = match persistence.mode {
+    match persistence.mode {
         HarnessMode::IntentRecipe => {
-            let client = GemmaClient::new_intent_serving(config.base_url, config.api_key)?;
-            client.preflight_model().await?;
-            client
+            let config = CodexWorkerConfig::from_env()?;
+            let client = CodexWorkerClient::new(config.base_url, config.token)?;
+            client.preflight().await?;
+            run_interactive(client, config.session_config, persistence).await
         }
         HarnessMode::Adaptive | HarnessMode::TypedPlan => {
-            GemmaClient::new(config.base_url, config.api_key, config.model)?
+            let config = EdgeConfig::from_env()?;
+            let client = GemmaClient::new(config.base_url, config.api_key, config.model)?;
+            run_interactive(client, config.session_config, persistence).await
         }
-    };
+    }
+}
+
+async fn run_interactive<C>(
+    client: C,
+    config: SessionConfig,
+    persistence: PersistenceConfig,
+) -> Result<(), Box<dyn Error>>
+where
+    C: LlmClient + Clone,
+{
     let mut store = SessionStore::open(&persistence.db_path)?;
     let loaded = store.load_versioned(&persistence.session_id)?;
     let mut generation = loaded.as_ref().map_or(0, |loaded| loaded.generation);
     let mut session = create_interactive_session(
         client.clone(),
-        config.session_config.clone(),
+        config.clone(),
         loaded.map(|loaded| loaded.snapshot),
         persistence.mode,
         persistence.bindings.clone(),
@@ -129,7 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 generation = loaded.as_ref().map_or(0, |loaded| loaded.generation);
                 session = create_interactive_session(
                     client.clone(),
-                    config.session_config.clone(),
+                    config.clone(),
                     loaded.map(|loaded| loaded.snapshot),
                     persistence.mode,
                     persistence.bindings.clone(),
@@ -169,16 +190,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn run_eval(config: EdgeConfig) -> Result<(), Box<dyn Error>> {
+async fn run_eval() -> Result<(), Box<dyn Error>> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).await?;
     let scenario = parse_eval_input(&input)?;
     let document = match scenario.mode {
         EvalMode::IntentRecipe => {
+            let config = CodexWorkerConfig::from_env()?;
             let provenance = IntentEvalProvenance::from_env()?;
             let bindings = intent_bindings_from_env()?;
-            let client = GemmaClient::new_intent_serving(config.base_url, config.api_key)?;
-            client.preflight_model().await?;
+            let client = CodexWorkerClient::new(config.base_url, config.token)?;
+            client.preflight().await?;
             execute_intent_eval(
                 client,
                 config.session_config,
@@ -189,6 +211,7 @@ async fn run_eval(config: EdgeConfig) -> Result<(), Box<dyn Error>> {
             .await?
         }
         EvalMode::Adaptive | EvalMode::TypedPlan => {
+            let config = EdgeConfig::from_env()?;
             let client = GemmaClient::new(config.base_url, config.api_key, config.model)?;
             execute_legacy_eval(client, config.session_config, scenario).await?
         }
@@ -1871,8 +1894,8 @@ mod tests {
 
         assert_eq!(document["schema_version"], 5);
         assert_eq!(document["mode"], "intent_recipe");
-        assert_eq!(document["requested_model"], "gemma4:12b-mlx");
-        assert_eq!(document["served_model"], "gemma4:12b-mlx");
+        assert_eq!(document["requested_model"], "gpt-5.6-luna");
+        assert_eq!(document["served_model"], "gpt-5.6-luna");
         assert_eq!(document["declared_context_tokens"], 16_384);
         assert!(document["gateway_context_observed_tokens"].is_null());
         assert_eq!(

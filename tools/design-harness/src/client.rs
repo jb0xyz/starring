@@ -16,11 +16,14 @@ use serde_json::Value;
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
 const INTENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LEGACY_HTTP_RETRIES: usize = 1;
+#[cfg(test)]
 const INTENT_HTTP_RETRIES: usize = 0;
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
-pub const INTENT_SERVING_MODEL: &str = crate::config::SERVING_MODEL;
+#[cfg(test)]
+pub const INTENT_SERVING_MODEL: &str = crate::config::LEGACY_SERVING_MODEL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TransportPolicy {
@@ -36,6 +39,7 @@ impl TransportPolicy {
         redact_request_errors: false,
     };
 
+    #[cfg(test)]
     const INTENT_SERVING: Self = Self {
         request_timeout: INTENT_REQUEST_TIMEOUT,
         max_http_retries: INTENT_HTTP_RETRIES,
@@ -47,6 +51,7 @@ impl TransportPolicy {
 pub struct GemmaClient {
     http: reqwest::Client,
     endpoint: String,
+    #[cfg(test)]
     models_endpoint: String,
     api_key: String,
     model: String,
@@ -100,6 +105,7 @@ impl GemmaClient {
         Self::with_policy(base_url, api_key, model, TransportPolicy::LEGACY)
     }
 
+    #[cfg(test)]
     pub fn new_intent_serving(base_url: String, api_key: String) -> Result<Self, LlmError> {
         Self::with_policy(
             base_url,
@@ -123,6 +129,7 @@ impl GemmaClient {
         Ok(Self {
             http,
             endpoint: format!("{base_url}/chat/completions"),
+            #[cfg(test)]
             models_endpoint: format!("{base_url}/models"),
             api_key,
             model,
@@ -140,6 +147,7 @@ impl GemmaClient {
             .map_err(|_| LlmError::Client("model call metrics are unavailable".to_string()))
     }
 
+    #[cfg(test)]
     pub async fn preflight_model(&self) -> Result<(), LlmError> {
         let response = self
             .http
@@ -631,11 +639,13 @@ struct ChatCompletionResponse {
     choices: Vec<ResponseChoice>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
