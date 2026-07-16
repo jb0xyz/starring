@@ -625,6 +625,7 @@ function decisionIdentityAxisMatrix(observations, axis, identityField) {
 function decisionIdentityClassMatrix(entries) {
   const observations = [];
   const prefixCases = new Set();
+  const missingFinalDecisionCases = [];
   for (const entry of entries) {
     const caseId = entry.vars.caseId;
     const finalRouteClass = FINAL_ROUTE_CLASS_BY_CASE[caseId] || `unmapped:${caseId}`;
@@ -648,14 +649,19 @@ function decisionIdentityClassMatrix(entries) {
         decision: entry.report.turns[index].route_decision,
       });
     }
-    observations.push({
-      classes: {
-        request: finalEvidenceClass,
-        route: finalRouteClass,
-        adjudication: finalEvidenceClass,
-      },
-      decision: entry.report.final_intent.route_decision,
-    });
+    const finalDecision = entry.report.final_intent.route_decision;
+    if (finalDecision) {
+      observations.push({
+        classes: {
+          request: finalEvidenceClass,
+          route: finalRouteClass,
+          adjudication: finalEvidenceClass,
+        },
+        decision: finalDecision,
+      });
+    } else {
+      missingFinalDecisionCases.push(caseId);
+    }
   }
   const axes = {
     request: decisionIdentityAxisMatrix(
@@ -683,9 +689,11 @@ function decisionIdentityClassMatrix(entries) {
     axes,
     exact_cases: exactCases,
     exact_prefix_cases: exactPrefixCases,
+    missing_final_decision_cases: unique(missingFinalDecisionCases).sort(),
     pass: observations.length > 0
       && exactCases
       && exactPrefixCases
+      && missingFinalDecisionCases.length === 0
       && Object.values(axes).every((axis) => axis.pass),
   };
 }

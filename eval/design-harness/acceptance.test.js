@@ -1015,6 +1015,28 @@ test('checkpoint acceptance enforces repeated Luna recipe quality and equivalenc
   );
 });
 
+test('checkpoint records a missing final decision as failed evidence without crashing', () => {
+  const document = passingDocument();
+  const failed = document.results.results.find((entry) => (
+    entry.vars.caseId === 'intent_normalizer_multi_sentence_metalinguistic_copy'
+  ));
+  failed.success = false;
+  failed.response.metadata.outcome = 'halted';
+  failed.response.metadata.halt_code = 'EMPTY_INTENT_TEXT';
+  failed.response.metadata.final_intent.route_decision = null;
+
+  const assessment = assess(document);
+  const identityMatrix = assessment.checks.find(
+    (entry) => entry.name === 'decision_identity_class_matrix',
+  );
+
+  assert.equal(assessment.pass, false);
+  assert.equal(identityMatrix.pass, false);
+  assert.deepEqual(identityMatrix.actual.missing_final_decision_cases, [
+    'intent_normalizer_multi_sentence_metalinguistic_copy',
+  ]);
+});
+
 test('checkpoint exports the exact 232-sample case schedule', () => {
   assert.deepEqual(MINIMUM_RUNS_BY_CASE_ID, EXPECTED_MINIMUM_RUNS_BY_CASE_ID);
   assert.deepEqual(Object.keys(MINIMUM_RUNS_BY_CASE_ID), REQUIRED_CASE_IDS);
