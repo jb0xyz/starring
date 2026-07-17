@@ -100,11 +100,8 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
     let source = SourceText::analyze(canonical_human).map_err(|error| match error {
         SourceSyntaxError::UnbalancedQuote => CapabilityReconciliationError::UnbalancedQuote,
     })?;
-    let candidates = if custom_static_redaction_request_is_closed(&source, automation_kind) {
-        Vec::new()
-    } else {
-        candidates
-    };
+    let closed_static_redaction_request =
+        custom_static_redaction_request_is_closed(&source, automation_kind);
     let mut reconciled = BTreeSet::new();
     let mut external_candidate = None;
     let mut external_grounding_failure = None;
@@ -149,6 +146,8 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                     insert_checked(&mut reconciled, value)?;
                 }
             }
+            Err(CapabilityEvidenceGroundingError::Ungrounded)
+                if redundant_static_redaction || closed_static_redaction_request => {}
             Err(reason)
                 if candidate_mentions_external
                     && reason == CapabilityEvidenceGroundingError::Ungrounded =>
@@ -156,7 +155,6 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                 external_candidate.get_or_insert(candidate_index);
                 external_grounding_failure.get_or_insert((candidate_index, reason));
             }
-            Err(CapabilityEvidenceGroundingError::Ungrounded) if redundant_static_redaction => {}
             Err(reason) => {
                 return Err(CapabilityReconciliationError::Grounding {
                     candidate_index,

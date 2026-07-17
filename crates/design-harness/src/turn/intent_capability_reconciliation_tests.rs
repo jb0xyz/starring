@@ -97,6 +97,22 @@ fn closed_static_redaction_request_ignores_model_only_capabilities() {
 }
 
 #[test]
+fn closed_static_redaction_request_preserves_grounded_independent_requirements() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Replace any message.";
+    let independent = "Replace any message";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&[independent]),
+        )
+        .unwrap(),
+        strings(&[independent])
+    );
+}
+
+#[test]
 fn custom_static_redaction_ownership_preserves_unsupported_requirements() {
     let safe = "secrets are redacted and substituted with [REDACTED]";
     for unsupported in [
