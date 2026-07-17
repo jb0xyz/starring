@@ -4832,8 +4832,7 @@ fn incomplete_discussion_halts_without_mutation_and_restores_exactly() {
             0,
             "Privacy improves. The key tradeoff is",
         ))]);
-        let mut session =
-            DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
         let root_draft = session.draft.clone();
         let root_stage = session.snapshot().intent_recipe.unwrap().stage;
 
