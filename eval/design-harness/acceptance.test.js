@@ -13,7 +13,7 @@ const {
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '87493c40def9ffc1c9163a28bd487fed9567d3676d4798172094900303c404cc';
+const REGISTRY_DIGEST = 'fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -384,7 +384,7 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
       extractor_revision: 16,
-      normalizer_revision: 14,
+      normalizer_revision: 15,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,

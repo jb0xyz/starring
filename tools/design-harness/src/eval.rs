@@ -577,7 +577,7 @@ mod tests {
         );
         assert_eq!(document["catalog_identity"]["recipe_version"], 1);
         assert_eq!(document["catalog_identity"]["extractor_revision"], 16);
-        assert_eq!(document["catalog_identity"]["normalizer_revision"], 14);
+        assert_eq!(document["catalog_identity"]["normalizer_revision"], 15);
         assert_eq!(document["catalog_identity"]["compiler_revision"], 1);
         assert_eq!(document["catalog_identity"]["simulator_revision"], 1);
         assert_eq!(
