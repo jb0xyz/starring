@@ -1,3 +1,8 @@
+> Historical checkpoint: current Luna V4 acceptance evidence and continuation
+> live in
+> `docs/superpowers/handoffs/2026-07-17-luna-v4-acceptance-hardening-handoff.md`.
+> Preserve the body below as the pre-certification Intent V4 record.
+
 # Intent V4 Semantic Identity Handoff
 
 > Serving update, 2026-07-17: the Gemma-only evaluation and continuation

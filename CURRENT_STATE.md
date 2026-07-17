@@ -134,18 +134,21 @@ capacity, timeout, and monotonic accepted and settled completion counters. The
 Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
-The 2026-07-17 matrix completed all 232 samples and failed acceptance at
-203/232 Promptfoo rows with 295/298 planned model calls. Its worker counters,
-retry isolation, deterministic gates, and latency gates passed. Seven cases
-were non-perfect; metalinguistic copied-command isolation, naming mutation, and
-secret-disclosure rejection were 0%, so no Luna V4 acceptance or commercial
-readiness is claimed. The routine worker has been restored to two active and
-eight queued requests after the dedicated run.
+The final 2026-07-17 clean-source matrix at
+`60bcf398bbf10eb7c4fbe7c40f03ddd966455fba` passed all 232/232 Promptfoo rows
+and executed the exact 298 model/tool calls with zero provider errors, repair
+attempts, or retries. Every route and adjudication identity class was stable.
+The certified catalog identity is extractor revision 16, normalizer revision
+12, and registry digest
+`5ab0dac8c5d445f01fad4bffaa91bf2eb8cfaa2b15c70ce6aa888b06be4253b7`.
+This certifies the bounded single-worker authoring cohort, not commercial
+concurrency, soak behavior, high availability, or live Discord execution.
 
-The current V4 implementation and evidence internals are recorded in
-`docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
-Its Gemma serving and continuation instructions are superseded by this document
-and the 2026-07-17 Luna worker operations runbook.
+The current Luna V4 evidence and continuation state are recorded in
+`docs/superpowers/handoffs/2026-07-17-luna-v4-acceptance-hardening-handoff.md`.
+The original V4 implementation internals remain recorded in
+`docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`;
+its serving and continuation instructions are historical.
 The Gemma V3 cohort handoff remains the historical live baseline, and the
 2026-07-14 handoff remains background for the original Intent IR, Recipe
 Compiler, persistence, runtime, and server checkpoint.
@@ -248,17 +251,19 @@ skips approval but keeps every technical safeguard.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
   validations, and the ignored PostgreSQL integration suites for contention,
-  CAS, lease, partial-unique, and reconnect behavior. The V4 branch's focused
-  library run contains 845 passing tests, and the current JavaScript evaluator
-  suite contains 103 passing tests. After the responsibility splits, the
-  full local workspace, clippy, formatting, JavaScript and Promptfoo static,
-  diff, dependency, comment, credential, and scope gates passed. The initial
-  clean-source Luna cutover canaries passed 4/4. The exact resumable repeated
-  Luna matrix is implemented, statically verified, and completed live. The
-  authoritative result is a failed 203/232 acceptance cohort with 295/298
-  planned model calls; GitHub CI remains a separate evidence boundary.
-- **Live certification**: manual runbooks (real bot, guild, PostgreSQL) prove the
-  end-to-end lifecycle; they are never wired into CI.
+  CAS, lease, partial-unique, and reconnect behavior. At the final Luna V4
+  checkpoint, the focused `design-harness` library gate passed 740 tests, the
+  CLI gate passed 82 tests plus its dependency guard, and the JavaScript gate
+  passed 106 tests. Relevant clippy `-D warnings` and formatting gates also
+  passed. An earlier full-workspace attempt encountered the macOS host startup
+  stall described under Known Limitations, so these results must not be
+  relabeled as a newly completed full-workspace gate. The exact resumable
+  repeated Luna matrix is implemented, statically verified, and passed live at
+  232/232 samples and 298/298 planned model calls. GitHub CI remains a separate
+  evidence boundary until the branch is published.
+- **Live certification**: Layer 2 manual runbooks (real bot, guild, PostgreSQL)
+  prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
+  authoring cohort did not run a live Discord integration.
 
 ## What Is Complete
 
@@ -305,13 +310,13 @@ Stated as capabilities (durable across the phase numbering):
   canaries passed 4/4 from a clean source. A durable 27-phase orchestrator now
   pins the exact 26-case, 232-sample, 272-turn, 298-call acceptance schedule,
   retry-free gates, worker/source/tooling boundaries, request-counter isolation,
-  and atomic evidence. Its first complete live cohort ran every phase once,
-  passed 27/33 acceptance checks, and failed the remaining six. Deferred
-  finalization preserved the original evidence source and crash document while
-  separately attesting the fixed evaluator commit and executing zero additional
-  model requests. Future deferred recovery binds the initial failure document
-  and digest in the atomic state journal and resumes idempotently across a
-  partial final-artifact write.
+  and atomic evidence. After targeted failure-cluster hardening, the final
+  clean-source cohort passed 232/232 rows, all acceptance checks, the exact 298
+  model/tool calls, request-counter isolation, retry-free execution, and every
+  route/adjudication identity class. The earlier failed cohorts remain immutable
+  diagnostic history and are not pooled into the passing denominator. Deferred
+  recovery binds the initial failure document and digest in the atomic state
+  journal and resumes idempotently across a partial final-artifact write.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -327,9 +332,6 @@ Stated as capabilities (durable across the phase numbering):
   constraint).
 - Any non-Discord adapter.
 - Any product recipe beyond `starring.private_study_room@1`.
-- A passing repeated Luna V4 acceptance cohort. The completed 2026-07-17 run
-  failed seven case-level reliability paths despite passing every latency and
-  serving-isolation gate.
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
   and recompilation, typed multi-turn preference accumulation, and bounded
   Intent transcript compression.
@@ -337,8 +339,8 @@ Stated as capabilities (durable across the phase numbering):
   effect.
 - Provisioning-state persistence, compensation, reconciliation, and replay
   idempotency for partial external failures.
-- A full clean-source V4 Luna-medium Intent acceptance result with the required
-  repeated default, detail, mutation, and equivalence cohorts.
+- Publication of the Luna V4 hardening branch, GitHub PR and CI evidence, and
+  merge to `main`.
 
 ## Known Limitations
 
@@ -353,16 +355,17 @@ Stated as capabilities (durable across the phase numbering):
   incomplete state" and idempotent convergence, not distributed transactions.
 - Layer 1's live end-to-end maturity is not certified here.
 - The first recipe checkpoint does not certify commercial readiness. Custom
-  copy, naming, and controls have bounded historical V3 live samples, but V4's
-  repeated acceptance matrix, separate-process restart, concurrent load,
-  throughput, soak recovery, production API and identity boundary, and external
-  Discord failure recovery remain incomplete.
+  copy, naming, and controls now have a passing repeated V4 acceptance matrix,
+  but concurrent load, throughput, soak recovery, high availability, a
+  production API and identity boundary, live Discord execution, and external
+  Discord failure recovery remain uncertified.
 - V4 structurally removes the V3 identity defect in which three full-detail
   repetitions produced one RuleSet and one compiled-plan identity but two
   input-intent and semantic-intent hash variants. The deterministic identity
-  matrix is implemented, and four clean-source Luna cutover canaries passed
-  once each. They do not establish repeat stability, concurrent behavior, or a
-  latency distribution. The V3 rows must not be relabeled as V4 evidence.
+  matrix is implemented, and the final 232-sample Luna V4 cohort established
+  repeat stability and its bounded single-worker latency distribution. It does
+  not establish concurrent or sustained-load behavior. The V3 rows must not be
+  relabeled as V4 evidence.
 - The V4 evaluator verifies structural consistency, routing, gates, identity
   classes, exact configured literals, call counts, and latency assertions. Its
   serving check pins the worker-reported provider, model, reasoning effort, and
@@ -388,8 +391,16 @@ Stated as capabilities (durable across the phase numbering):
   reasoning through the private ChatGPT-auth Codex worker. The retained local
   Gemma artifact is rollback material and cannot be mixed into Luna acceptance
   evidence.
+- On this Mac mini, some newly linked Rust host binaries can stall before test
+  process entry while macOS AMFI/trust evaluation runs. Relevant scoped gates
+  are green, but this operational issue prevents claiming that the latest full
+  workspace gate completed locally and should be resolved before relying on
+  repeated whole-workspace runs.
+- The data volume is about 86% used with roughly 31 GiB free. Recover at least
+  another 20 GiB before retaining additional large build or evaluation cohorts;
+  this is an operational capacity target, not a certified production margin.
 
-## Next Phase: Certify V4, Then Extend the Harness
+## Next Phase: Publish V4, Then Prove Commercial Operation
 
 The direction is no longer an automation-versus-game product fork. The near-term
 Harness Track comes first; a separate Stateful Runtime Track follows only after
@@ -397,26 +408,23 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Preserve the completed failed cohort and serving baseline: keep the raw
-   worker loopback-only, retain exact provider/model/effort/auth pinning, and
-   keep the manifest-bound phase and recovery artifacts immutable.
-2. Fix the measured failure classes without weakening assertions: copied-command
-   intent grounding, naming-detail locale grounding, stable secret-rejection
-   adjudication, redaction fallback, and repeat-stable gap/rejection identity.
-   Use targeted repeated cohorts first, then run a fresh full 27-phase matrix
-   from one clean source and a new worker instance. Do not pool the failed cohort
-   or post-fix targeted samples into the new acceptance denominator.
-3. Push the branch, open the main-target PR, require all GitHub Actions checks,
+1. Preserve the passing clean-source cohort and the earlier failed diagnostic
+   cohorts as immutable, separate evidence. Keep the raw worker loopback-only
+   and retain exact provider/model/effort/auth pinning.
+2. Push the branch, open the main-target PR, require all GitHub Actions checks,
    and merge only after an independent diff and safety-boundary review.
-4. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
+3. Measure queueing, concurrency, saturation, long-running soak recovery, and
+   worker high availability on the Mac mini before setting a commercial SLO.
+4. Run the existing live Discord and PostgreSQL safety scenarios for the
+   integrated authoring-to-approval path; the passing authoring matrix itself
+   did not exercise Discord.
+5. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
    edit and recompile with explicit `keep`, `set`, and `reset_default`
    semantics.
-5. Complete the actual typed-planner handoff for supported custom static
+6. Complete the actual typed-planner handoff for supported custom static
    automation while preserving the same candidate gates and no-deploy boundary.
-6. Add an authenticated authoring API/UI, guild-binding authority, session
+7. Add an authenticated authoring API/UI, guild-binding authority, session
    ownership, and the existing approval/publication/activation integration.
-7. Measure queueing, concurrency, saturation, and recovery through the
-   Luna-medium worker on the Mac mini before setting a commercial SLO.
 8. Add whole-plan deterministic preflight before the first side effect, then
    provisioning state, compensation, reconciliation, and replay idempotency for
    uncertain external effects.
@@ -433,6 +441,8 @@ current evidence, commands, and known maintenance debt.
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
 - Current Intent V4 semantic-identity implementation handoff:
   `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
+- Current Luna V4 acceptance and hardening handoff:
+  `docs/superpowers/handoffs/2026-07-17-luna-v4-acceptance-hardening-handoff.md`.
 - V4 semantic-identity design and deterministic verification contract:
   `docs/superpowers/specs/2026-07-15-intent-v4-semantic-identity-design.md`.
 - Historical Gemma V3 Intent/Recipe live checkpoint handoff:

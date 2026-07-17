@@ -289,3 +289,38 @@ Row pass rate is not the entire repeat-stability contract. `intent_reject_skip_a
 Twenty-seven of 33 acceptance checks passed. The six failed checks were `all_promptfoo_assertions_pass`, `exact_case_aware_calls_per_turn`, `per_case_route_adjudication_stability`, `decision_identity_class_matrix`, `fallback_no_mutation_and_exact_route`, and `semantic_mutation_matrix`. The authoritative certification failures were `promptfoo_nonzero_exit`, `model_call_plan_mismatch`, and `acceptance_checks_failed`. Therefore this cohort is a completed failed evaluation, not a Luna V4 acceptance pass and not commercial-readiness evidence.
 
 The first live attempt at source `4c4ff4e` stopped after its all-case smoke because the runner incorrectly treated an early deterministic halt and its lower call count as an orchestration error. Those 26 rows are diagnostic only and are not pooled into this cohort. Source `2bfdcbd` preserved early halts as quality evidence and completed all 232 rows. Its original evaluator then crashed while aggregating nullable final decisions. Evaluator source `a86b531d0c195fdcfb643a5d2684bdeb6a547f59` finalized the already complete phase artifacts with zero model requests, separately recording evaluator file hashes and preserving the crash document under `recovery/prior-finalization-failure.json`. The evidence source remains `2bfdcbd`; the deferred evaluator does not rewrite that identity. State-bound failure journaling was added after this live finalization, so this historical recovery file is hash-bound from finalization time rather than independently committed in the state journal at the earlier crash boundary.
+
+## 11. Luna V4 failure-cluster hardening and certified matrix
+
+Measured 2026-07-17 on branch `feat/luna-v4-failure-cluster-hardening`. Historical failed cohorts above remain authoritative for their own revisions; the results in this section are new evidence and are not pooled backward into those pass rates.
+
+The targeted failure-cluster run `luna-v4-failure-cluster-20260717T053045Z` used clean source `898807f2e2b232ee6e61085dc09786e134d29c93`. Its canary, naming supplement, and repeated supplement produced 73/73 passing samples and 86/86 first-attempt model and tool calls. There were no provider errors, repairs, automatic retries, repeated errors, or within-case route/adjudication identity drifts in the eight selected cases. This isolated result established that the previously hardened boundary, redaction, naming, and restart cases were stable in that sample; it did not certify the complete 26-case schedule.
+
+The first complete matrix at `results/luna-v4-acceptance-20260717T055208Z` used the same clean source and executed all 232 rows and all 298 planned calls. Every Promptfoo row passed, provider errors, repairs, and automatic retries were zero, and prompt/completion usage was 2,143,644/47,978 tokens. One-call preview latency was 5,814 ms P50 and 9,154 ms P95; two-call preview latency was 11,383 ms P50 and 14,731 ms P95; maximum interactive turn latency was 20,994 ms. Certification still failed, solely because `decision_identity_class_matrix` assigned `intent_reject_live_mutation` and `intent_reject_skip_approval` to different route classes even though V4 intentionally projects both to the same closed aggregate gate-bypass plus live-mutation route. Their request-evidence and adjudication identities remained distinct. This was an evaluator taxonomy contradiction, not a model-row or production-identity failure.
+
+Commit `65b655715a4ce8f05eaa09d0e7b86c6ec1bd911d` aligned that evaluator route class with the V4 contract while retaining separate request and adjudication classes. The fresh complete matrix at `results/luna-v4-acceptance-20260717T065650Z` then executed 232 rows and 298 calls with clean counters, zero provider errors, zero repairs, and zero retries, but passed only 230/232 rows. One concise, complete discussion response was rejected because total completion tokens included reasoning usage and reached a hardcoded cap; commit `a964ef6597ad7ec98f6dd64297a715d58eb9491b` removed that false proxy while retaining explicit finish-reason and response-shape truncation checks. The other failure was genuine semantic variance: the stateful-game model output redundantly wrapped the runtime objective as an unmapped capability. Commit `60bcf398bbf10eb7c4fbe7c40f03ddd966455fba` added syntax-bounded ownership for that exact runtime-only objective framing and rotated the normalizer identity from 11 to 12.
+
+Before another full matrix, source `60bcf398bbf10eb7c4fbe7c40f03ddd966455fba` passed two live targeted cohorts: 30/30 stateful-game rows in `luna-v4-normalizer-v12-stateful-30-20260717T082144Z-live.json` and 10/10 multi-sentence discussion rows in `luna-v4-normalizer-v12-discussion-10-20260717T082144Z-live.json`. Each sample used exactly one model call and one tool call, with no provider errors or repairs. These targeted passes justified the fresh full run; they were not substituted for it.
+
+The final matrix at `results/luna-v4-acceptance-20260717T083524Z` is the certified result. Its run ID is `luna-v4-07dbba25-307e-41b7-8458-43c3f7d83e1b`, evidence source is clean commit `60bcf398bbf10eb7c4fbe7c40f03ddd966455fba`, and status is `passed`.
+
+| Aggregate | Observed | Result |
+| --- | ---: | --- |
+| Promptfoo rows | 232/232 | pass |
+| Model/tool calls | 298/298 | pass |
+| Provider errors / repairs / automatic retries | 0 / 0 / 0 | pass |
+| Worker accepted/settled counter delta | 298/298 | pass |
+| Prompt/completion tokens | 2,143,640 / 49,668 | measured |
+| One-call preview P50 / P95 | 5,297 / 9,972 ms | pass |
+| Two-call preview P50 / P95 | 10,193 / 14,813 ms | pass |
+| Acceptance hard-limit maximum | 21,454 ms | pass |
+| Request / route / adjudication classes | 25 / 17 / 25 | stable |
+| Identity collisions | 0 | pass |
+
+All 232 reports were valid, every acceptance check passed, all 26 case identities were stable within their declared classes, and the registry identity was `5ab0dac8c5d445f01fad4bffaa91bf2eb8cfaa2b15c70ce6aa888b06be4253b7` with extractor revision 16 and normalizer revision 12. Both deterministic gates passed once without retry, and Promptfoo exited cleanly.
+
+The dedicated worker reported `codex_chatgpt`, exact model `gpt-5.6-luna`, `medium` reasoning effort, ChatGPT authentication, `codex-cli 0.144.2`, one active slot, zero queue capacity, and a 55,000 ms request timeout. Its instance ID was `def63586-24fd-4993-9207-f12e7ca7c7ac` and worker source digest was `afe1de6c201300c2734d862b854fa1faa104ea1e213f2bd83b7310f3f2e8da51`.
+
+The final manifest binds `combined.json` as `4de58b36f240bde1f9edb2536f9284983f1a85ee54dc3263e942ddaf75d5fd21`, `summary.json` as `c330c9bfd7292f0075c929dad1a3b7ef9c95912d45b97dc83c99b06660addf9d`, `acceptance.json` as `59d42d18d8156700cbe9dd0197662ea652028913a16b61e7e6a96728d0db9e77`, and `failures.json` as `4041b703721391b2c974efe3a62469d3d11083b1bc8f1db6eb32d91b9178575a`. It also pins matrix, acceptance-evaluator, and summarizer source hashes in its finalizer record.
+
+This certifies the fixed Luna V4 single-worker functional acceptance scope only. It does not certify commercial concurrency, sustained-load or soak behavior, live Discord side effects, horizontal availability, failover, disaster recovery, or high availability. The continuation order is branch push, pull request, complete CI including PostgreSQL, independent review, merge to `main`, and only then a separate commercial SLO program covering concurrency, saturation, recovery, observability, and operating limits.
