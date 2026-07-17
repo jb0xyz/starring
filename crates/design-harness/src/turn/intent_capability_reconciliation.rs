@@ -10,6 +10,7 @@ use self::classification::{
     custom_automation_owns, custom_static_redaction_candidate_is_redundant,
     external_requirement_spans, has_external_marker, runtime_business_spans,
 };
+use self::control_restatement::enforced_safety_control_restatement;
 use self::managed_recipe::managed_recipe_restatement_owns;
 pub(super) use self::managed_recipe::ManagedRecipeCoreContext;
 use self::syntax::{SourceSyntaxError, SourceText};
@@ -20,6 +21,18 @@ use super::intent_interpretation::{IntentAutomationKindV2, RuntimeRequirementsV2
 
 const MAX_CAPABILITIES: usize = 8;
 const MAX_CAPABILITY_UTF16: usize = 160;
+
+pub(super) fn asserted_safety_control_restatements(
+    canonical_human: &str,
+    candidates: &[&str],
+) -> bool {
+    let Ok(source) = SourceText::analyze(canonical_human) else {
+        return false;
+    };
+    candidates
+        .iter()
+        .all(|candidate| enforced_safety_control_restatement(&source, candidate))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CapabilityReconciliationError {

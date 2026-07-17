@@ -8,11 +8,13 @@ use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
-use super::intent_boundary_grounding::analyze_safety_boundaries;
+use super::intent_boundary_grounding::{
+    analyze_safety_boundaries, SafetyBoundaryAnalysis, UnquotedGroundingLink,
+};
 use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
-    reconcile_unmapped_capabilities_with_context, CapabilityReconciliationError,
-    ManagedRecipeCoreContext,
+    asserted_safety_control_restatements, reconcile_unmapped_capabilities_with_context,
+    CapabilityReconciliationError, ManagedRecipeCoreContext,
 };
 use super::intent_detail_requirement::{
     analyze_private_study_room_details, PrivateStudyRoomDetailTicketV4,
@@ -23,8 +25,7 @@ use super::intent_interpretation::{
     TimerRequirementV2,
 };
 use super::intent_request_mode_grounding::{
-    grounded_request_controls, safety_boundary_request_mode, ClosedAxisGroundingError,
-    GroundedClosedAxes, GroundedSemanticUnit,
+    grounded_request_controls, ClosedAxisGroundingError, GroundedClosedAxes, GroundedSemanticUnit,
 };
 use super::intent_runtime_grounding::{
     ground_runtime_requirements, RuntimeGroundingAmbiguity, RuntimeGroundingError,
@@ -445,9 +446,15 @@ fn parse_grounded_intent_core(
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
     validate_intent_human_grounding_size(human_message)?;
     let grounded = grounded_request_controls(human_message);
-    let grounded_mode = grounded
-        .mode
-        .or_else(|| safety_boundary_request_mode(human_message));
+    let boundary_analysis = analyze_safety_boundaries(human_message);
+    let grounded_mode = grounded.mode.or_else(|| {
+        (!boundary_analysis.requests().is_empty()).then_some(IntentRequestModeV2::Build)
+    });
+    let boundary_only = boundary_only_request(
+        &boundary_analysis,
+        human_message,
+        grounded.active_semantic_units.as_deref(),
+    );
     if grounded
         .active_semantic_units
         .as_ref()
@@ -475,7 +482,7 @@ fn parse_grounded_intent_core(
     if let Some(expected_revision) = expected_revision {
         input.expected_revision = expected_revision;
     }
-    apply_grounded_request_mode(&mut input, grounded_mode, grounded.preview);
+    apply_grounded_request_mode(&mut input, grounded_mode, grounded.preview, boundary_only);
     apply_grounded_closed_axes(&mut input, grounded.closed_axes)?;
     apply_grounded_runtime_requirements(&mut input, grounded.active_semantic_units.as_deref())?;
     normalize_core(input)
@@ -600,6 +607,7 @@ fn apply_grounded_request_mode(
     input: &mut InterpretIntentCoreWireV4,
     grounded_mode: Option<IntentRequestModeV2>,
     grounded_preview: Option<bool>,
+    boundary_only: bool,
 ) {
     match grounded_mode {
         Some(IntentRequestModeV2::Discussion) => {
@@ -614,6 +622,11 @@ fn apply_grounded_request_mode(
         }
         Some(IntentRequestModeV2::Build) => {
             input.request_mode = IntentRequestModeV2::Build;
+            if boundary_only {
+                input.automation_kind = IntentAutomationKindV2::None;
+                input.hub_channel = RequiredNullableChannelV3(None);
+                input.custom_detail_facets.clear();
+            }
             input.requested_outcome = match grounded_preview {
                 Some(true) => IntentRequestedOutcome::ValidatedPreview,
                 Some(false) | None => IntentRequestedOutcome::WorkingDraft,
@@ -622,6 +635,52 @@ fn apply_grounded_request_mode(
         }
         None => {}
     }
+}
+
+fn boundary_only_request(
+    analysis: &SafetyBoundaryAnalysis,
+    human_message: &str,
+    active_semantic_units: Option<&[GroundedSemanticUnit]>,
+) -> bool {
+    if analysis.requests().is_empty() {
+        return false;
+    }
+    let Some(active_semantic_units) = active_semantic_units else {
+        return false;
+    };
+    let mut has_authoritative = false;
+    let mut unowned: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for unit in active_semantic_units
+        .iter()
+        .filter(|unit| unit.authoritative)
+    {
+        has_authoritative = true;
+        if analysis.owns_capability_evidence(&unit.text) {
+            if let Some(current) = current.take() {
+                unowned.push(current);
+            }
+            continue;
+        }
+        if unit.link == UnquotedGroundingLink::Additive {
+            if let Some(current) = current.as_mut() {
+                current.push_str(" and ");
+                current.push_str(&unit.text);
+                continue;
+            }
+        }
+        if let Some(current) = current.replace(unit.text.clone()) {
+            unowned.push(current);
+        }
+    }
+    if let Some(current) = current {
+        unowned.push(current);
+    }
+    if !has_authoritative {
+        return false;
+    }
+    let unowned = unowned.iter().map(String::as_str).collect::<Vec<_>>();
+    unowned.is_empty() || asserted_safety_control_restatements(human_message, &unowned)
 }
 
 fn apply_grounded_runtime_requirements(

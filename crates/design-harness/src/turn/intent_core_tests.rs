@@ -2287,6 +2287,86 @@ fn human_grounding_defaults_gate_bypass_builds_without_an_outcome_request() {
 }
 
 #[test]
+fn human_grounding_normalizes_boundary_only_model_kinds() {
+    let cases = [
+        (
+            "Connect to Discord now and deploy the live changes immediately.",
+            "Connect to Discord now and deploy the live changes immediately",
+        ),
+        (
+            "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately.",
+            "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately",
+        ),
+        (
+            "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
+            "Skip only user approval",
+        ),
+    ];
+    for (human, candidate) in cases {
+        let mut baseline = None;
+        for kind in ["none", "custom_automation", "managed_private_study_room"] {
+            let mut value = valid_core();
+            value["automation_kind"] = json!(kind);
+            value["hub_channel"] = json!("invented_hub");
+            value["other_unmapped_required_capabilities"] = json!([candidate]);
+            value["custom_detail_facets"] = json!(["custom_naming"]);
+            let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human)
+                .unwrap_or_else(|error| panic!("{human} {kind}: {error:?}"));
+            parsed.apply_human_grounding(human, None).unwrap();
+
+            assert_eq!(
+                parsed.automation_kind(),
+                super::IntentAutomationKindV2::None
+            );
+            assert_eq!(parsed.selected_existing_channel(), None);
+            assert!(parsed.recipe_detail_facets().is_empty());
+            assert!(parsed.unclassified_requirements().is_empty());
+            assert!(!parsed.boundary_requests().is_empty());
+            if let Some(baseline) = &baseline {
+                assert_eq!(&parsed, baseline, "boundary identity drifted for {kind}");
+            } else {
+                baseline = Some(parsed);
+            }
+        }
+    }
+}
+
+#[test]
+fn human_grounding_preserves_independent_supported_bases_with_boundaries() {
+    for (human, kind) in [
+        (
+            "Build a static moderation panel, then deploy it to live Discord now.",
+            "custom_automation",
+        ),
+        (
+            "Build a managed private study-room automation, then deploy it to live Discord now.",
+            "managed_private_study_room",
+        ),
+        (
+            "Post a panel and deploy it to live Discord now.",
+            "custom_automation",
+        ),
+        (
+            "Build a static moderation panel and do not deploy it to live Discord.",
+            "custom_automation",
+        ),
+    ] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!(kind);
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+        assert_eq!(
+            parsed.automation_kind(),
+            if kind == "managed_private_study_room" {
+                super::IntentAutomationKindV2::ManagedPrivateStudyRoom
+            } else {
+                super::IntentAutomationKindV2::CustomAutomation
+            },
+            "supported base was erased for {human}"
+        );
+    }
+}
+
+#[test]
 fn human_grounding_does_not_promote_preview_copy_to_an_outcome() {
     for human in [
         "Build an automation that detects validated preview failures.",
