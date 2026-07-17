@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use self::classification::{
     closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
-    custom_automation_owns, external_requirement_spans, has_external_marker,
-    runtime_business_spans,
+    custom_automation_owns, custom_static_redaction_candidate_is_redundant,
+    external_requirement_spans, has_external_marker, runtime_business_spans,
 };
 use self::managed_recipe::managed_recipe_restatement_owns;
 pub(super) use self::managed_recipe::ManagedRecipeCoreContext;
@@ -73,6 +73,8 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
     let mut external_grounding_failure = None;
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {
         let candidate_mentions_external = has_external_marker(&candidate);
+        let redundant_static_redaction =
+            custom_static_redaction_candidate_is_redundant(&source, automation_kind, &candidate);
         match ground_unmapped_capability_evidence(
             canonical_human,
             vec![candidate],
@@ -112,6 +114,7 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                 external_candidate.get_or_insert(candidate_index);
                 external_grounding_failure.get_or_insert((candidate_index, reason));
             }
+            Err(CapabilityEvidenceGroundingError::Ungrounded) if redundant_static_redaction => {}
             Err(reason) => {
                 return Err(CapabilityReconciliationError::Grounding {
                     candidate_index,

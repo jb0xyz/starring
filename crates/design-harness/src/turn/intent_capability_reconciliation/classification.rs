@@ -119,7 +119,80 @@ pub(super) fn custom_automation_owns(
             ],
         )
         && has_any(&words, &["ephemeral", "private", "privately"]);
-    button_opens_modal || modal_submission_response
+    button_opens_modal
+        || modal_submission_response
+        || custom_static_redaction_copy_owns(source, &words, value)
+}
+
+pub(super) fn custom_static_redaction_candidate_is_redundant(
+    source: &SourceText<'_>,
+    automation_kind: IntentAutomationKindV2,
+    candidate: &str,
+) -> bool {
+    if automation_kind != IntentAutomationKindV2::CustomAutomation || has_external_marker(candidate)
+    {
+        return false;
+    }
+    let lowercase = candidate.to_lowercase();
+    let words = words(&lowercase);
+    custom_static_redaction_copy_owns(source, &words, candidate)
+}
+
+fn custom_static_redaction_copy_owns(source: &SourceText<'_>, words: &[&str], value: &str) -> bool {
+    let static_message = source.contains_asserted_token("static")
+        && source.contains_asserted_token("panel")
+        && source.contains_asserted_token("message")
+        && ["say", "says", "show", "shows", "display", "displays"]
+            .iter()
+            .any(|marker| source.contains_asserted_token(marker));
+    let redaction_copy = has_any(words, &["redacted", "redaction"])
+        && (has_any(
+            words,
+            &["substitute", "substituted", "substitution", "placeholder"],
+        ) || value.to_lowercase().contains("[redacted]"));
+    static_message && redaction_copy && closed_static_redaction_copy_words(words)
+}
+
+fn closed_static_redaction_copy_words(words: &[&str]) -> bool {
+    words.iter().all(|word| {
+        matches!(
+            *word,
+            "a" | "actual"
+                | "and"
+                | "are"
+                | "build"
+                | "copy"
+                | "design"
+                | "display"
+                | "displays"
+                | "is"
+                | "message"
+                | "moderation"
+                | "panel"
+                | "placeholder"
+                | "redact"
+                | "redacted"
+                | "redaction"
+                | "replace"
+                | "replaced"
+                | "replacement"
+                | "say"
+                | "says"
+                | "secret"
+                | "secrets"
+                | "show"
+                | "shows"
+                | "static"
+                | "substitute"
+                | "substituted"
+                | "substitution"
+                | "the"
+                | "value"
+                | "values"
+                | "with"
+                | "whose"
+        )
+    })
 }
 
 pub(super) fn closed_route_selection_restatement_owns(
