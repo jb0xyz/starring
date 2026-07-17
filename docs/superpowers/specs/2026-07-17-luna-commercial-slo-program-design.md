@@ -2,7 +2,7 @@
 
 Date: 2026-07-17
 
-Status: implementation target
+Status: diagnostic implementation measured; commercial certification blocked
 
 Branch: `feat/luna-commercial-slo-program`
 
@@ -18,6 +18,9 @@ The immediate outcome is a reproducible diagnostic baseline. Commercial SLO
 certification remains a later outcome and requires the sample floors, recovery
 tests, and soak duration in this document. A short canary must never be
 relabeled as an availability or production-capacity certificate.
+
+The first live canary and step-load results are recorded in
+[`eval/codex-worker-slo/measurements.md`](../../../eval/codex-worker-slo/measurements.md).
 
 ## Current baseline
 
