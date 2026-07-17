@@ -3,15 +3,17 @@
 This runbook operates the Starring Codex worker on the Mac mini. The worker runs
 `tools/codex-worker/worker.mjs` as launchd service `local.starring.codex-worker`,
 binds only to `127.0.0.1:18181`, and invokes Luna with medium reasoning effort.
-The operating limits are two active requests, eight queued requests, and a
-55-second request timeout.
+The routine service profile allows two active requests and eight queued requests
+with a 55-second request timeout. The repeated Intent V4 acceptance run uses a
+temporary dedicated profile with one active request, no queue, and the same
+55000 ms timeout.
 
 The worker is an internal process boundary. Do not publish port `18181`, do not
 make it a Cloudflare Tunnel origin, and do not add a public DNS record for it.
 An application backend may call it only from the same Mac mini. Public
 authentication and product-level admission remain the backend's responsibility.
 
-## Fixed configuration
+## Routine service configuration
 
 | Setting | Value |
 | --- | --- |
@@ -87,7 +89,7 @@ lsof -nP -iTCP:18181 -sTCP:LISTEN
 API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
 printf 'Authorization: Bearer %s\n' "${API_KEY}" \
   | curl -fsS http://127.0.0.1:18181/health -H @- \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.active_requests | type) == "number" and (.queued_requests | type) == "number"'
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 2 and .queue_capacity == 8 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and (.accepted_requests_total | type) == "number" and (.settled_requests_total | type) == "number" and .accepted_requests_total == .settled_requests_total'
 ```
 
 The listener output must show `127.0.0.1:18181`. Stop immediately if it shows
@@ -109,6 +111,126 @@ unset API_KEY
 Proceed only if health is successful, the authenticated request succeeds, the
 response names the requested model, and the runtime log contains no credential
 or repeated restart loop.
+
+## Dedicated Luna V4 acceptance profile
+
+The repeated matrix is a local certification boundary, not routine serving. It
+contains 26 cases, exactly 232 samples, 272 scripted turns, and 298 expected Luna
+calls in 27 interruption-bounded phases. The first phase runs every case once;
+26 supplemental phases fill the case-specific ten-run and three-run floors.
+The 45–60 minute duration is a pre-run estimate from earlier canaries, not a
+completed matrix measurement.
+
+Commit every intended source and documentation change first. The repository
+must remain clean for the whole run. The worker source digest must match the
+committed local modules, and the worker instance must not restart between a new
+run and any valid continuation.
+
+```zsh
+cd /Users/jungbogeon/starring
+test -z "$(git status --porcelain --untracked-files=normal)"
+git rev-parse HEAD
+API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/health -H @- \
+  | jq -e '.active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
+```
+
+Stop every backend or manual client that can send a valid completion request to
+port 18181. Then install an acceptance-only copy of the LaunchAgent plist. This
+changes the installed file outside the repository; it does not edit the tracked
+routine template.
+
+```zsh
+cd /Users/jungbogeon/starring
+DOMAIN="gui/$(id -u)"
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.codex-worker.plist"
+install -m 600 ops/macos/local.starring.codex-worker.plist "$INSTALLED"
+/usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:STARRING_CODEX_WORKER_CONCURRENCY 1' "$INSTALLED"
+/usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:STARRING_CODEX_WORKER_MAX_QUEUE 0' "$INSTALLED"
+/usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:STARRING_CODEX_WORKER_TIMEOUT_MS 55000' "$INSTALLED"
+plutil -lint "$INSTALLED"
+launchctl bootout "$DOMAIN/local.starring.codex-worker"
+launchctl bootstrap "$DOMAIN" "$INSTALLED"
+launchctl kickstart -k "$DOMAIN/local.starring.codex-worker"
+```
+
+Verify the dedicated capacity, idle state, monotonic counter balance, exact
+identity, and loopback listener. Do not issue the completion smoke request after
+this point; health requests do not increment completion counters.
+
+```zsh
+lsof -nP -iTCP:18181 -sTCP:LISTEN
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/health -H @- \
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 1 and .queue_capacity == 0 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
+test -z "$(git status --porcelain --untracked-files=normal)"
+```
+
+Run `matrix.js` through the commands in the evaluation README. `--dry-run`
+requires `--output` but contacts no worker and creates no result directory. A
+new run uses `--output`; `--resume` uses that exact directory and is accepted
+only while the source, tooling, worker source, and worker instance remain the
+same. Completed phases are reused. Rerunning an unfinished or failed phase keeps
+its higher attempt count and makes the result non-certifying even if its model
+checks later pass.
+
+There is one narrow recovery exception. If both deterministic gates and all 27
+phases completed but an evaluator defect prevented final artifacts, a later
+clean committed evaluator may use `--resume` for deferred finalization only.
+The plan, tooling, original worker instance and source, and final request
+counters must still match. No gate, phase, or model request runs again. The
+manifest preserves the evidence source, separately attests the evaluator commit
+and file hashes, records zero finalization model requests, and binds a preserved
+copy of the prior failure document. That document is first embedded with its
+serialized digest in the atomic state journal, so a missing or overwritten root
+failure file cannot replace the original recovery input. Partial final artifact
+writes can resume from the journal and idempotent recovery copy. Finalization is
+one-shot; already finalized evidence cannot be overwritten. A deferred result
+is authoritative only after `state.json` records its completed finalizer and
+artifact set. This exception never applies to an incomplete phase sequence.
+
+For every phase the matrix records the worker's monotonic accepted and settled
+completion counters. It requires an idle worker at both boundaries and requires
+both counter deltas to equal the model calls reported by that phase. Any other
+valid client request, unsettled request, worker restart, or counter mismatch
+invalidates the run rather than contaminating latency and token evidence.
+
+The authoritative result is the combination of `manifest.json` and
+`acceptance.json` in the selected output directory. A passing console line or
+`summary.json` is insufficient. Both authoritative artifacts must report
+`status: "passed"`; `acceptance.json` must also have `pass: true` and no
+certification failures, and the artifact hashes bound by the manifest must
+match. The worker records cached-input and reasoning-output token subdivisions,
+but those fields are not yet propagated into matrix artifacts; only total prompt
+and completion tokens are authoritative there.
+
+Keep the dedicated worker untouched if an eligible continuation is still
+needed. When the run is finished or abandoned, first verify it is idle, then
+restore the tracked routine plist and restart the service. A worker restart
+changes the instance ID, so an unfinished certification must start in a new
+output directory afterward.
+
+```zsh
+printf 'Authorization: Bearer %s\n' "${API_KEY}" \
+  | curl -fsS http://127.0.0.1:18181/health -H @- \
+  | jq -e '.active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
+cd /Users/jungbogeon/starring
+DOMAIN="gui/$(id -u)"
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.codex-worker.plist"
+install -m 600 ops/macos/local.starring.codex-worker.plist "$INSTALLED"
+plutil -lint "$INSTALLED"
+launchctl bootout "$DOMAIN/local.starring.codex-worker"
+launchctl bootstrap "$DOMAIN" "$INSTALLED"
+launchctl kickstart -k "$DOMAIN/local.starring.codex-worker"
+unset API_KEY
+```
+
+The 2026-07-17 run completed 232 samples but failed acceptance at 203/232 rows
+and 295/298 planned model calls. It is recorded in
+`eval/design-harness/measurements.md` and does not establish a repeated Luna V4
+acceptance pass. A future pass requires a fresh output directory, clean source,
+new dedicated worker instance, and satisfaction of every authoritative check.
 
 ## Cut over from the local Gemma stack
 

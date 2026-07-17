@@ -1,4 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -24,6 +25,23 @@ const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_QUEUE = 8;
 const DEFAULT_TIMEOUT_MS = 55_000;
 const DEFAULT_MAX_BODY_BYTES = 2_000_000;
+const SOURCE_FILES = [
+  "codex-runner.mjs",
+  "metrics-log.mjs",
+  "protocol.mjs",
+  "worker.mjs",
+];
+
+export async function workerSourceSha256() {
+  const digest = createHash("sha256");
+  for (const name of SOURCE_FILES) {
+    const content = await readFile(new URL(name, import.meta.url));
+    digest.update(String(Buffer.byteLength(name)));
+    digest.update(":" + name + ":" + String(content.length) + ":");
+    digest.update(content);
+  }
+  return digest.digest("hex");
+}
 
 class Scheduler {
   constructor(concurrency, maxQueue) {
@@ -126,6 +144,45 @@ class Scheduler {
     }
     const waiters = this.idleWaiters.splice(0);
     waiters.forEach((resolvePromise) => resolvePromise());
+  }
+}
+
+class RequestCounters {
+  constructor() {
+    this.accepted = 0;
+    this.settled = 0;
+  }
+
+  submit(scheduler, task, signal) {
+    if (this.accepted === Number.MAX_SAFE_INTEGER) {
+      return Promise.reject(new WorkerError("request_counter_exhausted", 503));
+    }
+    this.accepted += 1;
+    let submitted;
+    try {
+      submitted = scheduler.submit(task, signal);
+    } catch (error) {
+      this.settled += 1;
+      throw error;
+    }
+    return Promise.resolve(submitted).finally(() => {
+      this.settled += 1;
+    });
+  }
+
+  snapshot(active, queued) {
+    if (!Number.isSafeInteger(this.accepted)
+      || !Number.isSafeInteger(this.settled)
+      || this.accepted < 0
+      || this.settled < 0
+      || this.settled > this.accepted
+      || this.accepted - this.settled !== active + queued) {
+      throw new WorkerError("invalid_request_counters", 500);
+    }
+    return {
+      accepted: this.accepted,
+      settled: this.settled,
+    };
   }
 }
 
@@ -380,14 +437,28 @@ export async function startWorker(options = {}) {
   if (verification.codex_cli_version !== CODEX_CLI_VERSION) {
     throw new WorkerError("invalid_codex_version", 503);
   }
+  const instanceId = options.instanceId ?? randomUUID();
+  if (typeof instanceId !== "string"
+    || instanceId.length === 0
+    || instanceId.length > 128
+    || instanceId !== instanceId.trim()) {
+    throw new WorkerError("invalid_instance_id", 500);
+  }
+  const sourceSha256 = options.workerSourceSha256 ?? await workerSourceSha256();
+  if (typeof sourceSha256 !== "string" || !/^[0-9a-f]{64}$/.test(sourceSha256)) {
+    throw new WorkerError("invalid_worker_source", 500);
+  }
   const identity = Object.freeze({
     provider: PROVIDER,
     model: MODEL,
     reasoning_effort: REASONING_EFFORT,
     auth_mode: AUTH_MODE,
     codex_cli_version: verification.codex_cli_version,
+    instance_id: instanceId,
+    worker_source_sha256: sourceSha256,
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
+  const counters = new RequestCounters();
   const logPath = options.metricsPath
     ?? process.env.STARRING_CODEX_WORKER_METRICS_LOG
     ?? join(homedir(), "Library", "Logs", "Starring", "codex-worker.jsonl");
@@ -402,7 +473,17 @@ export async function startWorker(options = {}) {
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
-      json(response, 200, healthEnvelope(identity, scheduler.active, scheduler.queue.length));
+      const counterSnapshot = counters.snapshot(scheduler.active, scheduler.queue.length);
+      json(response, 200, healthEnvelope(
+        identity,
+        scheduler.active,
+        scheduler.queue.length,
+        concurrency,
+        maxQueue,
+        timeoutMs,
+        counterSnapshot.accepted,
+        counterSnapshot.settled,
+      ));
       return;
     }
     if (request.method !== "POST" || request.url !== "/v1/frontier-completions") {
@@ -421,7 +502,7 @@ export async function startWorker(options = {}) {
     const disconnect = watchDisconnect(request, response);
     try {
       const result = await withTimeout(
-        (signal) => scheduler.submit(() => runner.complete({
+        (signal) => counters.submit(scheduler, () => runner.complete({
           requestId,
           model: MODEL,
           reasoningEffort: REASONING_EFFORT,

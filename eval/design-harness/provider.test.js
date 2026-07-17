@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -12,6 +12,7 @@ const {
   cargoExecutable,
   gatewayIdentity,
   hydratePrompt,
+  intentProcessTimeoutMs,
   preparePrompt,
 } = require('./provider');
 const fixtures = require('./fixtures.json');
@@ -135,6 +136,7 @@ test('intent provider accepts only strict schema three documents without fixture
   const prepared = preparePrompt(JSON.stringify(document), true);
 
   assert.equal(prepared.intent, true);
+  assert.equal(prepared.turnCount, 1);
   assert.deepEqual(JSON.parse(prepared.prompt), document);
   for (const forbidden of [
     { ...document, initial_draft: {} },
@@ -151,6 +153,12 @@ test('intent provider accepts only strict schema three documents without fixture
   );
   const duplicate = '{"schema_version":3,"schema_version":3,"mode":"intent_recipe","turns":[{"id":"a","input":"b"}]}';
   assert.equal(preparePrompt(duplicate, true).prompt, duplicate);
+});
+
+test('intent process timeout scales by turn with bounded teardown grace', () => {
+  assert.equal(intentProcessTimeoutMs(1), 65000);
+  assert.equal(intentProcessTimeoutMs(2), 125000);
+  assert.throws(() => intentProcessTimeoutMs(0), /positive turn count/);
 });
 
 test('intent binding DTO mirrors the strict Rust environment contract', () => {
@@ -260,6 +268,50 @@ test('intent provider pins Luna medium and passes worker credentials and provena
     },
   }, input);
   assert.match(wrongEffort.error, /reasoning effort must be exactly medium/);
+});
+
+test('intent provider continues run order from a validated process offset', () => {
+  const binary = executable('cat >/dev/null\nprintf \'{"run_order":%s}\\n\' "$STARRING_EVAL_RUN_ORDER"');
+  const script = [
+    "const Provider = require('./provider');",
+    "const input = JSON.stringify({ schema_version: 3, mode: 'intent_recipe', turns: [{ id: 'build', input: 'Build a private study room' }] });",
+    "const config = { intentOnly: true, allowHarnessOverrideForTest: true, model: 'gpt-5.6-luna', reasoningEffort: 'medium', bindings: { schema_version: 1, channel_bindings: [{ key: 'community_hub', id: '700' }] } };",
+    '(async () => {',
+    '  const provider = new Provider({ config });',
+    '  const first = await provider.callApi(input);',
+    '  const second = await provider.callApi(input);',
+    '  process.stdout.write(JSON.stringify([first.metadata.run_order, second.metadata.run_order]));',
+    '})().catch((error) => { process.stderr.write(error.stack); process.exit(1); });',
+  ].join('\n');
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: __dirname,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      STARRING_CODEX_WORKER_TOKEN: 'worker-test-only',
+      STARRING_CODEX_WORKER_URL: 'http://127.0.0.1:2/v1',
+      STARRING_EVAL_RUN_ID: 'continuation-test',
+      STARRING_EVAL_RUN_ORDER_OFFSET: '7',
+      STARRING_HARNESS_BIN: binary,
+    },
+  });
+
+  assert.deepEqual(JSON.parse(output), [8, 9]);
+});
+
+test('intent provider rejects invalid run order offsets during module initialization', () => {
+  for (const value of ['', '-1', '1.5', '01', ' 1', '9007199254740992']) {
+    const result = spawnSync(process.execPath, ['-e', "require('./provider')"], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        STARRING_EVAL_RUN_ORDER_OFFSET: value,
+      },
+    });
+    assert.notEqual(result.status, 0, value);
+    assert.match(result.stderr, /STARRING_EVAL_RUN_ORDER_OFFSET must be a nonnegative safe integer/);
+  }
 });
 
 test('intent provider requires the Codex worker endpoint and token', async () => {

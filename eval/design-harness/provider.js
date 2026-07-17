@@ -8,6 +8,7 @@ const INTENT_MODEL = 'gpt-5.6-luna';
 const INTENT_REASONING_EFFORT = 'medium';
 const INTENT_CONTEXT_TOKENS = 16384;
 const INTENT_TIMEOUT_MS = 60000;
+const INTENT_PROCESS_GRACE_MS = 5000;
 const INTENT_SESSION_CONFIG = Object.freeze({
   maxModelCalls: 12,
   maxToolCalls: 24,
@@ -16,7 +17,22 @@ const INTENT_SESSION_CONFIG = Object.freeze({
 });
 const UINT64_MAX = 18446744073709551615n;
 const intentRunId = process.env.STARRING_EVAL_RUN_ID || `intent-${randomUUID()}`;
-let intentRunOrder = 0;
+
+function parseIntentRunOrderOffset(value) {
+  if (value === undefined) {
+    return 0;
+  }
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error('STARRING_EVAL_RUN_ORDER_OFFSET must be a nonnegative safe integer');
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error('STARRING_EVAL_RUN_ORDER_OFFSET must be a nonnegative safe integer');
+  }
+  return parsed;
+}
+
+let intentRunOrder = parseIntentRunOrderOffset(process.env.STARRING_EVAL_RUN_ORDER_OFFSET);
 
 function hydrateFixtures(value) {
   if (Array.isArray(value)) {
@@ -108,14 +124,21 @@ function preparePrompt(prompt, intentOnly = false) {
   }
   const document = JSON.parse(trimmed);
   if (document?.schema_version === 3 || intentOnly) {
-    validateIntentDocument(document);
-    return { prompt: trimmed, intent: true };
+    const validated = validateIntentDocument(document);
+    return { prompt: trimmed, intent: true, turnCount: validated.turns.length };
   }
   return { prompt: JSON.stringify(hydrateFixtures(document)), intent: false };
 }
 
 function hydratePrompt(prompt) {
   return preparePrompt(prompt).prompt;
+}
+
+function intentProcessTimeoutMs(turnCount) {
+  if (!Number.isSafeInteger(turnCount) || turnCount < 1) {
+    throw new Error('intent process timeout requires a positive turn count');
+  }
+  return (turnCount * INTENT_TIMEOUT_MS) + INTENT_PROCESS_GRACE_MS;
 }
 
 function bindingDocument(value) {
@@ -289,6 +312,9 @@ class DesignHarnessProvider {
         }
         const bindings = bindingDocument(this.config.bindings);
         const source = sourceState(root);
+        if (intentRunOrder === Number.MAX_SAFE_INTEGER) {
+          throw new Error('intent evaluation run order exhausted the safe integer range');
+        }
         intentRunOrder += 1;
         env.STARRING_LLM_MODEL = INTENT_MODEL;
         env.STARRING_CODEX_REASONING_EFFORT = INTENT_REASONING_EFFORT;
@@ -329,7 +355,9 @@ class DesignHarnessProvider {
       const environmentTimeoutMs = Number(process.env.STARRING_EVAL_TIMEOUT_MS);
       const configuredTimeoutMs = this.config.timeoutMs
         || (Number.isSafeInteger(environmentTimeoutMs) && environmentTimeoutMs > 0 ? environmentTimeoutMs : 600000);
-      const timeoutMs = prepared.intent ? Math.min(configuredTimeoutMs, INTENT_TIMEOUT_MS) : configuredTimeoutMs;
+      const timeoutMs = prepared.intent
+        ? Math.min(configuredTimeoutMs, intentProcessTimeoutMs(prepared.turnCount))
+        : configuredTimeoutMs;
       const maxOutputBytes = this.config.maxOutputBytes || 4194304;
       const finish = (value) => {
         if (!settled) {
@@ -397,5 +425,6 @@ module.exports.cargoExecutable = cargoExecutable;
 module.exports.bindingDocument = bindingDocument;
 module.exports.gatewayIdentity = gatewayIdentity;
 module.exports.hydratePrompt = hydratePrompt;
+module.exports.intentProcessTimeoutMs = intentProcessTimeoutMs;
 module.exports.preparePrompt = preparePrompt;
 module.exports.validateIntentDocument = validateIntentDocument;

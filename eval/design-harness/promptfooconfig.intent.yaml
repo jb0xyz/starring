@@ -9,7 +9,7 @@ providers:
       intentOnly: true
       model: gpt-5.6-luna
       reasoningEffort: medium
-      timeoutMs: 60000
+      timeoutMs: 125000
       maxOutputBytes: 4194304
       bindings:
         schema_version: 1

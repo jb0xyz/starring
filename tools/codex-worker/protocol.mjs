@@ -170,7 +170,16 @@ export function validateRunnerResult(value, identity) {
   return value;
 }
 
-export function healthEnvelope(identity, active, queued) {
+export function healthEnvelope(
+  identity,
+  active,
+  queued,
+  concurrencyLimit,
+  queueCapacity,
+  requestTimeoutMs,
+  acceptedRequestsTotal,
+  settledRequestsTotal,
+) {
   return {
     schema_version: SCHEMA_VERSION,
     status: "ok",
@@ -179,8 +188,15 @@ export function healthEnvelope(identity, active, queued) {
     reasoning_effort: REASONING_EFFORT,
     auth_mode: AUTH_MODE,
     codex_cli_version: identity.codex_cli_version,
+    instance_id: identity.instance_id,
+    worker_source_sha256: identity.worker_source_sha256,
+    concurrency_limit: concurrencyLimit,
+    queue_capacity: queueCapacity,
+    request_timeout_ms: requestTimeoutMs,
     active_requests: active,
     queued_requests: queued,
+    accepted_requests_total: acceptedRequestsTotal,
+    settled_requests_total: settledRequestsTotal,
   };
 }
 

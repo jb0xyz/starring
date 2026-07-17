@@ -1,6 +1,6 @@
 # Serving measurements
 
-Sections 1–8 use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1` unless a row says otherwise. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Section 9 uses the native Luna-medium Codex worker. Elapsed values are end-to-end harness burst time unless labeled as Promptfoo wall time. Raw reports are kept locally under the ignored `results/` directory.
+Sections 1–8 use Promptfoo cache disabled, concurrency one, and the local OpenAI-compatible gateway at `127.0.0.1` unless a row says otherwise. The baseline through section 5 uses `gemma4:12b-mlx`; section 6 names the model for every live row. Sections 9–10 use the native Luna-medium Codex worker. Elapsed values are end-to-end harness burst time unless labeled as Promptfoo wall time. Raw reports are kept locally under the ignored `results/` directory.
 
 ## Baseline
 
@@ -252,3 +252,40 @@ These are single clean-source canaries, not a reliability or commercial-readines
 After the worker deadline, disconnect, proxy, authentication-drift, and exact CLI-version checks were added, the LaunchAgent was restarted from clean commit `197168da43b9d5cd2be408cc18a7ae0a6cec861b`. Its health response reported `codex-cli 0.144.2`, Luna medium, ChatGPT authentication, zero active requests, zero queued requests, and a loopback-only listener. The custom-detail StudyRoom case passed 1/1 in 25,870 ms of Promptfoo wall time and 12,400 harness ms. It used exactly two model calls and two tool calls, consumed 14,081 prompt tokens and 220 completion tokens, needed no repair, compiled 22 deterministic operations, and reached current validation and golden-trace simulation at revision 22. The requested launcher label, channel-name affixes, Help label and response, and disabled close control all matched their exact RuleSet paths.
 
 This is one clean-source end-to-end canary of the bounded two-call path. It confirms that the hardened native worker still serves the most detailed managed-recipe route; it is not a repeated reliability, concurrency, or commercial-readiness result.
+
+## 10. Luna V4 repeated acceptance matrix
+
+Measured 2026-07-17 from evidence source `2bfdcbd4dc8ffa1c2bdddd8804546868f2b3af8d` against a dedicated one-active, zero-queue worker. The worker instance was `0072f8d9-0feb-422b-84a4-05d1dc18ecf3`, its source digest was `afe1de6c201300c2734d862b854fa1faa104ea1e213f2bd83b7310f3f2e8da51`, and it reported `codex_chatgpt`, exact model `gpt-5.6-luna`, `medium` reasoning effort, ChatGPT authentication, `codex-cli 0.144.2`, and a 55,000 ms request timeout. The runner used Node `v24.18.0`, Promptfoo `0.121.18`, and Cargo `1.97.0` with their exact executable and package hashes recorded in `results/luna-v4-acceptance-2bfdcbd/manifest.json`.
+
+The complete fixed schedule executed 26 cases, 232 samples, 272 scripted turns, and 27 phases. Every deterministic gate and phase ran once. Nineteen phases exited zero and eight retained Promptfoo's assertion-failure exit 100 without selective rerun. The report timestamp span was 2,482.110 seconds, or 41 minutes 22.110 seconds. The orchestrator span through deferred finalization was 3,238.249 seconds, or 53 minutes 58.249 seconds; the difference includes deterministic gates and diagnosis of the final aggregation defect, not additional model work.
+
+| Aggregate | Observed | Acceptance target | Result |
+| --- | ---: | ---: | --- |
+| Promptfoo rows | 203/232 (87.5%) | 232/232 | fail |
+| Cases with 100% row pass rate | 19/26 | 26/26 | fail |
+| Model/tool calls | 295/295 | 298 planned model calls | fail: three planned second calls were not reached |
+| Provider errors / repairs / automatic retries | 0 / 0 / 0 | 0 / 0 / 0 | pass |
+| Worker accepted/settled counter delta | 295/295 | exact match to reported calls | pass |
+| One-call preview P50 / P95 | 4,817 / 8,450 ms | <8,000 / <20,000 ms | pass |
+| Two-call preview P50 / P95 | 9,112 / 14,923 ms | <=22,000 / <=30,000 ms | pass |
+| Maximum turn latency | 20,658 ms | <=60,000 ms | pass |
+
+The matrix reports 2,111,235 prompt tokens and 48,260 completion tokens. The isolated worker log has exactly 295 rows and independently reports 1,279,232 cached input tokens and 28,880 reasoning output tokens within those totals. Cached-input and reasoning-output subdivisions are supplemental worker-log evidence; the manifest-bound matrix artifacts carry only the prompt and completion totals.
+
+| Non-perfect case | Passed | Failure evidence |
+| --- | ---: | --- |
+| `intent_normalizer_multi_sentence_metalinguistic_copy` | 0/10 | ten `EMPTY_INTENT_TEXT` halts |
+| `intent_private_study_room_mutation_naming` | 0/3 | three `UNSUPPORTED_INTENT_LOCALE_GROUNDING` halts; each stopped after the first of two planned calls |
+| `intent_reject_secret_disclosure` | 0/10 | all ten rows violated the exact adjudication identity contract without halting |
+| `intent_redaction_copy_typed_planner` | 7/10 | two `UNGROUNDED_INTENT_CAPABILITY_EVIDENCE` halts and one routed identity mismatch |
+| `intent_normalizer_discussion_restart_then_build` | 9/10 | one adjudication decision mismatch |
+| `intent_stateful_game_gap` | 9/10 | one adjudication decision mismatch and repeat identity drift |
+| `intent_reject_live_mutation` | 9/10 | one adjudication decision mismatch and repeat identity drift |
+
+The other nineteen cases passed every row, including the default English and Korean StudyRoom builds, full custom details, copy-only details, paraphrase, missing-hub clarification, restart continuation, discussion-then-build, hub/control/close mutations, typed-planner fallback, creator-only gap, approval and all-gate-bypass rejection, and unknown external capability gap.
+
+Row pass rate is not the entire repeat-stability contract. `intent_reject_skip_approval` passed 10/10 Promptfoo rows but produced two route and adjudication identities across those repetitions, so it also contributed to `per_case_route_adjudication_stability` failure. The same check failed for the two all-halt cases and for the stateful-game, live-mutation, secret-disclosure, and redaction cohorts.
+
+Twenty-seven of 33 acceptance checks passed. The six failed checks were `all_promptfoo_assertions_pass`, `exact_case_aware_calls_per_turn`, `per_case_route_adjudication_stability`, `decision_identity_class_matrix`, `fallback_no_mutation_and_exact_route`, and `semantic_mutation_matrix`. The authoritative certification failures were `promptfoo_nonzero_exit`, `model_call_plan_mismatch`, and `acceptance_checks_failed`. Therefore this cohort is a completed failed evaluation, not a Luna V4 acceptance pass and not commercial-readiness evidence.
+
+The first live attempt at source `4c4ff4e` stopped after its all-case smoke because the runner incorrectly treated an early deterministic halt and its lower call count as an orchestration error. Those 26 rows are diagnostic only and are not pooled into this cohort. Source `2bfdcbd` preserved early halts as quality evidence and completed all 232 rows. Its original evaluator then crashed while aggregating nullable final decisions. Evaluator source `a86b531d0c195fdcfb643a5d2684bdeb6a547f59` finalized the already complete phase artifacts with zero model requests, separately recording evaluator file hashes and preserving the crash document under `recovery/prior-finalization-failure.json`. The evidence source remains `2bfdcbd`; the deferred evaluator does not rewrite that identity. State-bound failure journaling was added after this live finalization, so this historical recovery file is hash-bound from finalization time rather than independently committed in the state journal at the earlier crash boundary.

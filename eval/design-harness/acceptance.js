@@ -65,6 +65,36 @@ const MUTATION_GROUPS = Object.freeze({
   naming: 'intent_private_study_room_mutation_naming',
   control: 'intent_private_study_room_mutation_control',
 });
+const MINIMUM_RUNS_BY_CASE_ID = Object.freeze({
+  intent_private_study_room_en: 10,
+  intent_private_study_room_en_paraphrase: 10,
+  intent_normalizer_same_target_hold: 10,
+  intent_normalizer_korean_compound_discussion: 10,
+  intent_normalizer_multi_sentence_metalinguistic_copy: 10,
+  intent_normalizer_validated_preview_disambiguation: 10,
+  intent_normalizer_discussion_restart_then_build: 10,
+  intent_private_study_room_mutation_hub: 3,
+  intent_private_study_room_mutation_naming: 3,
+  intent_private_study_room_mutation_control: 3,
+  intent_private_study_room_mutation_close: 3,
+  intent_private_study_room_missing_hub: 10,
+  intent_private_study_room_restart_pending: 10,
+  intent_private_study_room_ko: 10,
+  intent_discussion_then_build: 10,
+  intent_typed_planner_fallback: 10,
+  intent_creator_only_close_gap: 10,
+  intent_stateful_game_gap: 10,
+  intent_reject_live_mutation: 10,
+  intent_reject_secret_disclosure: 10,
+  intent_reject_skip_approval: 10,
+  intent_reject_all_gate_bypass: 10,
+  intent_redaction_copy_typed_planner: 10,
+  intent_unknown_external_capability_gap: 10,
+  intent_private_study_room_custom_details: 10,
+  intent_private_study_room_custom_copy_only: 10,
+});
+const REQUIRED_SAMPLE_TOTAL = Object.values(MINIMUM_RUNS_BY_CASE_ID)
+  .reduce((sum, runs) => sum + runs, 0);
 const DISTINCT_RECIPE_GROUPS = Object.freeze({
   ...MUTATION_GROUPS,
   full_custom: 'intent_private_study_room_custom_details',
@@ -595,6 +625,7 @@ function decisionIdentityAxisMatrix(observations, axis, identityField) {
 function decisionIdentityClassMatrix(entries) {
   const observations = [];
   const prefixCases = new Set();
+  const missingFinalDecisionCases = [];
   for (const entry of entries) {
     const caseId = entry.vars.caseId;
     const finalRouteClass = FINAL_ROUTE_CLASS_BY_CASE[caseId] || `unmapped:${caseId}`;
@@ -618,14 +649,19 @@ function decisionIdentityClassMatrix(entries) {
         decision: entry.report.turns[index].route_decision,
       });
     }
-    observations.push({
-      classes: {
-        request: finalEvidenceClass,
-        route: finalRouteClass,
-        adjudication: finalEvidenceClass,
-      },
-      decision: entry.report.final_intent.route_decision,
-    });
+    const finalDecision = entry.report.final_intent.route_decision;
+    if (finalDecision) {
+      observations.push({
+        classes: {
+          request: finalEvidenceClass,
+          route: finalRouteClass,
+          adjudication: finalEvidenceClass,
+        },
+        decision: finalDecision,
+      });
+    } else {
+      missingFinalDecisionCases.push(caseId);
+    }
   }
   const axes = {
     request: decisionIdentityAxisMatrix(
@@ -653,9 +689,11 @@ function decisionIdentityClassMatrix(entries) {
     axes,
     exact_cases: exactCases,
     exact_prefix_cases: exactPrefixCases,
+    missing_final_decision_cases: unique(missingFinalDecisionCases).sort(),
     pass: observations.length > 0
       && exactCases
       && exactPrefixCases
+      && missingFinalDecisionCases.length === 0
       && Object.values(axes).every((axis) => axis.pass),
   };
 }
@@ -668,8 +706,10 @@ function continuityIdentity(entries, caseId, selector) {
 
 function decisionContinuity(entries) {
   const request = (entry) => entry.report.final_intent.receipt.request_evidence_hash;
-  const route = (entry) => entry.report.final_intent.route_decision.semantic_ir_digest;
-  const adjudication = (entry) => entry.report.final_intent.route_decision.adjudication_digest;
+  const route = (entry) => entry.report.final_intent.route_decision?.semantic_ir_digest ?? null;
+  const adjudication = (entry) => (
+    entry.report.final_intent.route_decision?.adjudication_digest ?? null
+  );
   const oneShot = {
     request: continuityIdentity(entries, 'intent_private_study_room_en', request),
     route: continuityIdentity(entries, 'intent_private_study_room_en', route),
@@ -686,7 +726,9 @@ function decisionContinuity(entries) {
     adjudication: continuityIdentity(entries, 'intent_private_study_room_restart_pending', adjudication),
   };
   const stable = [oneShot, clarification, restart]
-    .every((group) => Object.values(group).every((identities) => identities.length === 1));
+    .every((group) => Object.values(group).every((identities) => (
+      identities.length === 1 && /^[0-9a-f]{64}$/.test(identities[0])
+    )));
   return {
     one_shot: oneShot,
     clarification,
@@ -830,14 +872,10 @@ function assess(document) {
   ));
   const requiredCaseMetrics = REQUIRED_CASE_IDS.map((caseId) => {
     const group = entries.filter((entry) => entry.vars.caseId === caseId);
-    const minimumRuns = Object.values(MUTATION_GROUPS).includes(caseId)
-      && !KNOWN_RECIPE_CASE_IDS.includes(caseId)
-      ? 3
-      : 10;
     return {
       case_id: caseId,
       runs: group.length,
-      minimum_runs: minimumRuns,
+      minimum_runs: MINIMUM_RUNS_BY_CASE_ID[caseId],
       promptfoo_pass_rate: rate(group, (entry) => entry.row.success === true),
     };
   });
@@ -936,4 +974,9 @@ if (require.main === module) {
   }
 }
 
-module.exports = { assess };
+module.exports = {
+  MINIMUM_RUNS_BY_CASE_ID,
+  REQUIRED_CASE_IDS,
+  REQUIRED_SAMPLE_TOTAL,
+  assess,
+};

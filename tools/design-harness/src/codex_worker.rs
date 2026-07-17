@@ -15,6 +15,7 @@ use crate::config::{SERVING_AUTH_MODE, SERVING_MODEL, SERVING_PROVIDER, SERVING_
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
 const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.144.2";
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone)]
 pub struct CodexWorkerClient {
@@ -77,8 +78,15 @@ struct WorkerHealth {
     reasoning_effort: String,
     auth_mode: String,
     codex_cli_version: String,
+    instance_id: String,
+    worker_source_sha256: String,
+    concurrency_limit: usize,
+    queue_capacity: usize,
+    request_timeout_ms: u64,
     active_requests: usize,
     queued_requests: usize,
+    accepted_requests_total: u64,
+    settled_requests_total: u64,
 }
 
 struct MetricInput {
@@ -413,8 +421,22 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
         && health.model == SERVING_MODEL
         && health.reasoning_effort == SERVING_REASONING_EFFORT
         && health.auth_mode == SERVING_AUTH_MODE
-        && health.codex_cli_version == SERVING_CODEX_CLI_VERSION;
-    let _ = (health.active_requests, health.queued_requests);
+        && health.codex_cli_version == SERVING_CODEX_CLI_VERSION
+        && !health.instance_id.is_empty()
+        && health.instance_id.len() <= 128
+        && health.instance_id.trim() == health.instance_id
+        && health.worker_source_sha256.len() == 64
+        && health
+            .worker_source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && (1..=8).contains(&health.concurrency_limit)
+        && health.queue_capacity <= 128
+        && health.request_timeout_ms == 55_000
+        && health.accepted_requests_total <= MAX_SAFE_JSON_INTEGER
+        && health.settled_requests_total <= health.accepted_requests_total
+        && health.accepted_requests_total - health.settled_requests_total
+            == (health.active_requests + health.queued_requests) as u64;
     if valid {
         Ok(())
     } else {
@@ -431,7 +453,7 @@ mod tests {
 
     use super::{
         request_metric_input, validate_health, validate_response, CodexWorkerClient, WorkerHealth,
-        WorkerRequest, WorkerResponse,
+        WorkerRequest, WorkerResponse, MAX_SAFE_JSON_INTEGER, SERVING_CODEX_CLI_VERSION,
     };
 
     fn response() -> WorkerResponse {
@@ -494,12 +516,40 @@ mod tests {
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
             "codex_cli_version": "codex-cli 0.144.2",
+            "instance_id": "test-worker-instance",
+            "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "concurrency_limit": 2,
+            "queue_capacity": 8,
+            "request_timeout_ms": 55000,
             "active_requests": 0,
-            "queued_requests": 0
+            "queued_requests": 0,
+            "accepted_requests_total": 7,
+            "settled_requests_total": 7
         }))
         .unwrap();
         assert!(validate_health(&health).is_ok());
         health.codex_cli_version = "codex-cli 0.145.0".to_string();
+        assert!(validate_health(&health).is_err());
+        health.codex_cli_version = SERVING_CODEX_CLI_VERSION.to_string();
+        health.instance_id.clear();
+        assert!(validate_health(&health).is_err());
+        health.instance_id = "test-worker-instance".to_string();
+        health.worker_source_sha256 = "g".repeat(64);
+        assert!(validate_health(&health).is_err());
+        health.worker_source_sha256 = "a".repeat(64);
+        health.concurrency_limit = 0;
+        assert!(validate_health(&health).is_err());
+        health.concurrency_limit = 2;
+        health.request_timeout_ms = 54_999;
+        assert!(validate_health(&health).is_err());
+        health.request_timeout_ms = 55_000;
+        health.settled_requests_total = 8;
+        assert!(validate_health(&health).is_err());
+        health.settled_requests_total = 6;
+        assert!(validate_health(&health).is_err());
+        health.active_requests = 1;
+        assert!(validate_health(&health).is_ok());
+        health.accepted_requests_total = MAX_SAFE_JSON_INTEGER + 1;
         assert!(validate_health(&health).is_err());
     }
 
