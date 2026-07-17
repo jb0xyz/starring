@@ -739,8 +739,22 @@ test('a completed cohort can be finalized by a separately attested committed eva
     const failed = JSON.parse(await fs.promises.readFile(path.join(output, 'state.json'), 'utf8'));
     assert.equal(failed.status, 'failed');
     assert.ok(failed.phases.every((phase) => phase.status === 'completed'));
+    assert.equal(failed.failure_evidence.path, 'failures.json');
+    assert.equal(failed.failure_evidence.document.matrix_error.detail, 'aggregation defect');
 
     const finalizerCommit = 'b'.repeat(40);
+    const tampered = structuredClone(failed);
+    tampered.failure_evidence.document.matrix_error.detail = 'changed after failure';
+    await fs.promises.writeFile(path.join(output, 'state.json'), JSON.stringify(tampered));
+    const tamperedFinalizer = dependencies(async () => {
+      throw new Error('completed phases must not rerun');
+    }, 'worker-instance', root, requestCounter);
+    tamperedFinalizer.sourceState = () => ({ commit: finalizerCommit, dirty: false });
+    await assert.rejects(
+      runMatrix({ output, resume: true, dryRun: false }, tamperedFinalizer),
+      { code: 'deferred_finalization_failure_evidence_missing' },
+    );
+    await fs.promises.writeFile(path.join(output, 'state.json'), JSON.stringify(failed));
     const second = dependencies(async () => {
       throw new Error('completed phases must not rerun');
     }, 'worker-instance', root, requestCounter);
@@ -783,6 +797,71 @@ test('a completed cohort can be finalized by a separately attested committed eva
       runMatrix({ output, resume: true, dryRun: false }, second),
       { code: 'cohort_already_finalized' },
     );
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('deferred finalization resumes after interruption without losing bound failure evidence', async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'starring-matrix-recovery-'));
+  const output = path.join(root, 'run');
+  const requestCounter = createRequestCounter();
+  const spawnPhase = async (request) => {
+    await fs.promises.writeFile(request.output, JSON.stringify(phaseDocument(request.phase)));
+    return { code: 0, signal: null, stdout: '', stderr: '' };
+  };
+
+  try {
+    const first = dependencies(spawnPhase, 'worker-instance', root, requestCounter);
+    first.assess = () => {
+      throw new Error('bound aggregation defect');
+    };
+    first.beforeFailureArtifactWrite = async () => {
+      throw new Error('failure artifact interruption');
+    };
+    await assert.rejects(
+      runMatrix({ output, resume: false, dryRun: false }, first),
+      /failure artifact interruption/,
+    );
+    const failed = JSON.parse(await fs.promises.readFile(path.join(output, 'state.json'), 'utf8'));
+    const boundDigest = failed.failure_evidence.sha256;
+    assert.equal(fs.existsSync(path.join(output, 'failures.json')), false);
+    const finalizerCommit = 'b'.repeat(40);
+    const interrupted = dependencies(async () => {
+      throw new Error('completed phases must not rerun');
+    }, 'worker-instance', root, requestCounter);
+    interrupted.sourceState = () => ({ commit: finalizerCommit, dirty: false });
+    interrupted.beforeFinalStateWrite = async () => {
+      throw new Error('final state interruption');
+    };
+    await assert.rejects(
+      runMatrix({ output, resume: true, dryRun: false }, interrupted),
+      /final state interruption/,
+    );
+    const afterInterruption = JSON.parse(
+      await fs.promises.readFile(path.join(output, 'state.json'), 'utf8'),
+    );
+    assert.equal(afterInterruption.completed_at, null);
+    assert.equal(afterInterruption.failure_evidence.sha256, boundDigest);
+    const overwrittenFailure = JSON.parse(
+      await fs.promises.readFile(path.join(output, 'failures.json'), 'utf8'),
+    );
+    assert.equal(overwrittenFailure.matrix_error, undefined);
+
+    const resumed = dependencies(async () => {
+      throw new Error('completed phases must not rerun');
+    }, 'worker-instance', root, requestCounter);
+    resumed.sourceState = () => ({ commit: finalizerCommit, dirty: false });
+    const result = await runMatrix({ output, resume: true, dryRun: false }, resumed);
+    assert.equal(result.status, 'passed');
+    const recovery = JSON.parse(
+      await fs.promises.readFile(
+        path.join(output, 'recovery', 'prior-finalization-failure.json'),
+        'utf8',
+      ),
+    );
+    assert.equal(recovery.original_sha256, boundDigest);
+    assert.equal(recovery.document.matrix_error.detail, 'bound aggregation defect');
   } finally {
     await fs.promises.rm(root, { recursive: true, force: true });
   }

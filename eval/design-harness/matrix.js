@@ -86,6 +86,10 @@ function digest(value) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+function serializedJsonDigest(value) {
+  return digest(Buffer.from(`${JSON.stringify(value, null, 2)}\n`));
+}
+
 function exactArray(left, right) {
   return left.length === right.length && left.every((entry, index) => entry === right[index]);
 }
@@ -1127,7 +1131,22 @@ function initialState(plan, source, worker, tooling, now, runId) {
     artifacts: null,
     observed: null,
     finalizer: null,
+    failure_evidence: null,
   };
+}
+
+function validatedFailureEvidence(value) {
+  if (!value
+    || value.schema_version !== MATRIX_SCHEMA_VERSION
+    || value.path !== OUTPUT_FILES.failures
+    || !/^[0-9a-f]{64}$/.test(value.sha256)
+    || !value.document
+    || typeof value.document !== 'object'
+    || !value.document.matrix_error
+    || value.sha256 !== serializedJsonDigest(value.document)) {
+    throw new MatrixError('deferred_finalization_failure_evidence_missing');
+  }
+  return value;
 }
 
 function validateResumeState(state, plan, source, worker, tooling) {
@@ -1157,6 +1176,9 @@ function validateResumeState(state, plan, source, worker, tooling) {
   const finalizationOnly = state?.source_commit !== source.commit
     && allPhasesCompleted
     && allGatesPassed;
+  if (finalizationOnly) {
+    validatedFailureEvidence(state.failure_evidence);
+  }
   if (state?.schema_version !== MATRIX_SCHEMA_VERSION
     || state.profile !== MATRIX_PROFILE
     || (state.source_commit !== source.commit && !finalizationOnly)
@@ -1493,9 +1515,19 @@ async function writeFinalArtifacts(
   let recoveryFile = null;
   if (recovery) {
     const recoveryDirectory = path.join(output, 'recovery');
-    await fs.promises.mkdir(recoveryDirectory, { mode: 0o700 });
+    await fs.promises.mkdir(recoveryDirectory, { recursive: true, mode: 0o700 });
+    await fs.promises.chmod(recoveryDirectory, 0o700);
     recoveryFile = path.join(recoveryDirectory, 'prior-finalization-failure.json');
-    await atomicWriteJson(recoveryFile, recovery);
+    const recoveryExists = await fs.promises.stat(recoveryFile).then(() => true, () => false);
+    if (recoveryExists) {
+      const existing = await readJson(recoveryFile);
+      if (serializedJsonDigest(existing) !== serializedJsonDigest(recovery)) {
+        throw new MatrixError('deferred_finalization_recovery_changed');
+      }
+    } else {
+      await atomicWriteJson(recoveryFile, recovery);
+    }
+    await fs.promises.chmod(recoveryFile, 0o600);
     await assertSecretAbsent(recoveryFile, secret);
     effectiveFinalizer.recovery_input = {
       path: relativeArtifact(output, recoveryFile),
@@ -1591,6 +1623,8 @@ function defaultDependencies() {
     now: () => new Date(),
     runId: () => `luna-v4-${randomUUID()}`,
     finalizerIdentity,
+    beforeFinalStateWrite: async () => {},
+    beforeFailureArtifactWrite: async () => {},
     writeOutput: (value) => process.stdout.write(value),
   };
 }
@@ -1729,17 +1763,13 @@ async function runMatrix(options, overrides = {}) {
     };
     let recovery = null;
     if (finalizationOnly) {
-      const priorFailurePath = path.join(output, OUTPUT_FILES.failures);
-      await assertSecretAbsent(priorFailurePath, environment.STARRING_CODEX_WORKER_TOKEN);
+      const failureEvidence = validatedFailureEvidence(state.failure_evidence);
       recovery = {
         schema_version: MATRIX_SCHEMA_VERSION,
-        original_path: relativeArtifact(output, priorFailurePath),
-        original_sha256: await fileDigest(priorFailurePath),
-        document: await readJson(priorFailurePath),
+        original_path: failureEvidence.path,
+        original_sha256: failureEvidence.sha256,
+        document: failureEvidence.document,
       };
-      if (!recovery.document.matrix_error) {
-        throw new MatrixError('deferred_finalization_failure_evidence_missing');
-      }
     }
     const final = await writeFinalArtifacts(
       state,
@@ -1750,6 +1780,7 @@ async function runMatrix(options, overrides = {}) {
       finalizer,
       recovery,
     );
+    await dependencies.beforeFinalStateWrite({ state, final, output });
     await atomicWriteJson(statePath, state);
     dependencies.writeOutput(`${JSON.stringify({
       status: final.status,
@@ -1782,10 +1813,9 @@ async function runMatrix(options, overrides = {}) {
         failures = [];
       }
     }
-    const failurePath = path.join(output, OUTPUT_FILES.failures);
-    const failureExists = await fs.promises.stat(failurePath).then(() => true, () => false);
-    if (active || !failureExists) {
-      await atomicWriteJson(failurePath, {
+    if (!finalizationOnly && state.completed_at === null && state.artifacts === null) {
+      const failurePath = path.join(output, OUTPUT_FILES.failures);
+      const failureArtifact = {
         schema_version: MATRIX_SCHEMA_VERSION,
         matrix_error: {
           code: error.code || 'matrix_error',
@@ -1793,7 +1823,18 @@ async function runMatrix(options, overrides = {}) {
           phase_id: active?.id || null,
         },
         failures,
-      });
+      };
+      state.failure_evidence = {
+        schema_version: MATRIX_SCHEMA_VERSION,
+        path: OUTPUT_FILES.failures,
+        sha256: serializedJsonDigest(failureArtifact),
+        document: failureArtifact,
+      };
+      state.status = 'failed';
+      state.updated_at = timestamp(dependencies.now());
+      await atomicWriteJson(statePath, state);
+      await dependencies.beforeFailureArtifactWrite({ state, failureArtifact, output });
+      await atomicWriteJson(failurePath, failureArtifact);
     }
     if (state.status !== 'passed') {
       state.status = 'failed';
