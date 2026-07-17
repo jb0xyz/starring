@@ -1453,6 +1453,34 @@ test('equivalent hidden Core route projections cannot diverge', () => {
   assert.equal(customStatic.identities.length, 2);
 });
 
+test('unstable identity classes still expose cross-class collisions', () => {
+  const document = passingDocument();
+  const statefulIdentity = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_stateful_game_gap',
+  ).response.metadata.final_intent.route_decision.semantic_ir_digest;
+  const redaction = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_redaction_copy_typed_planner',
+  ).response.metadata;
+  for (const decision of [
+    ...redaction.turns.map((turn) => turn.route_decision).filter(Boolean),
+    redaction.final_intent.route_decision,
+  ]) {
+    decision.semantic_ir_digest = statefulIdentity;
+  }
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const collision = routeAxis.collisions.find(
+    (entry) => entry.identity === statefulIdentity,
+  );
+  assert.equal(assessment.pass, false);
+  assert.ok(collision);
+  assert.deepEqual(collision.class_ids, [
+    'custom_static_automation',
+    'intent_stateful_game_gap',
+  ]);
+});
+
 test('equivalent routes cannot collapse distinct request evidence', () => {
   const document = passingDocument();
   const typedPlanner = document.results.results.find(

@@ -602,13 +602,11 @@ function decisionIdentityAxisMatrix(observations, axis, identityField) {
   })).sort((left, right) => left.class_id.localeCompare(right.class_id));
   const identityClasses = new Map();
   for (const group of classes) {
-    if (group.identities.length !== 1) {
-      continue;
+    for (const identity of group.identities) {
+      const classIds = identityClasses.get(identity) || [];
+      classIds.push(group.class_id);
+      identityClasses.set(identity, classIds);
     }
-    const identity = group.identities[0];
-    const classIds = identityClasses.get(identity) || [];
-    classIds.push(group.class_id);
-    identityClasses.set(identity, classIds);
   }
   const collisions = [...identityClasses.entries()]
     .filter(([, classIds]) => classIds.length > 1)
