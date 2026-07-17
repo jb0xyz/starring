@@ -1106,9 +1106,15 @@ function balancedDiscussionDelimiters(value) {
       doubleClosings += 1;
     } else if (character === '‘') {
       singleOpenings += 1;
-    } else if (character === '’'
-      && !(isWordCharacter(characters[index - 1]) && isWordCharacter(characters[index + 1]))) {
-      singleClosings += 1;
+    } else if (character === '’') {
+      const intraWord = isWordCharacter(characters[index - 1])
+        && isWordCharacter(characters[index + 1]);
+      const pluralPossessive = singleOpenings === singleClosings
+        && /s/iu.test(characters[index - 1] ?? '')
+        && !isWordCharacter(characters[index + 1]);
+      if (!intraWord && !pluralPossessive) {
+        singleClosings += 1;
+      }
     }
   }
   if (doubleOpenings !== doubleClosings || singleOpenings !== singleClosings) {
@@ -1160,7 +1166,10 @@ function discussionResponseFailures(turn, context) {
   if (value.length > DISCUSSION_MAX_UTF16_UNITS) {
     failures.push(`${turn.id} discussion response is overly long`);
   }
-  if (discussionSentenceCount(value) > DISCUSSION_MAX_SENTENCES) {
+  const sentenceCount = discussionSentenceCount(value);
+  if (sentenceCount < 2) {
+    failures.push(`${turn.id} discussion response has fewer than two sentences`);
+  } else if (sentenceCount > DISCUSSION_MAX_SENTENCES) {
     failures.push(`${turn.id} discussion response has more than four sentences`);
   }
   const lines = value.split('\n');

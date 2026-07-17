@@ -794,7 +794,7 @@ test('normalizer assertion pins discussion holds and metalinguistic copies to no
   const routeDecision = decision('discussion');
   const document = routedDocument(
     routeDecision,
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     'normalizer-discussion',
   );
   for (const normalizerContract of [
@@ -854,7 +854,7 @@ test('normalizer assertion requires routed discussion replay across restart befo
     input: 'Discuss first',
     outcome: 'routed',
     completed: false,
-    message: 'We can compare the tradeoffs without changing the Draft.',
+    message: 'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     deterministic_operations: 0,
     intent_counters: counters({
       route_calls: 1,
@@ -1282,17 +1282,18 @@ test('discussion response quality accepts concise complete English and Korean pr
   });
   for (const message of [
     'Private rooms improve focus and privacy. They add discovery friction and moderation overhead. We can compare those tradeoffs before changing the Draft.',
-    'They’re a strong fit when privacy matters, though discovery becomes harder.',
-    'The status ‘They’re ready’ is concise and complete.',
+    'They’re a strong fit when privacy matters, though discovery becomes harder. We can compare that tradeoff before changing the Draft.',
+    'The status ‘They’re ready’ is concise and complete. We can now compare the tradeoffs.',
+    'Users’ privacy improves. Their discovery experience becomes harder.',
     '비공개 방은 몰입감과 안전성을 높입니다. 대신 방 탐색과 관리 비용이 늘어날 수 있습니다. Draft를 바꾸지 않고 이 균형을 먼저 비교해보겠습니다.',
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
   ]) {
     const document = routedDocument(routeDecision, message, 'discussion-quality');
     assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
   }
   const promotedJson = JSON.parse(routedDocument(
     routeDecision,
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     'discussion-quality',
   ));
   promotedJson.turns[0].model_call_metrics[0].finish_reason = 'stop';
@@ -1323,7 +1324,7 @@ test('discussion response quality separates reasoning usage from truncation sign
 
   const reasoningHeavy = JSON.parse(routedDocument(
     routeDecision,
-    'This concise comparison is complete.',
+    'This concise comparison is complete. It keeps the current design unchanged.',
     'discussion-quality',
   ));
   reasoningHeavy.turns[0].model_call_metrics[0].completion_tokens = 527;
@@ -1333,7 +1334,7 @@ test('discussion response quality separates reasoning usage from truncation sign
     true,
   );
   qualityFailure(
-    'This concise comparison is complete.',
+    'This concise comparison is complete. It keeps the current design unchanged.',
     /completion-limit finish reason/,
     (document) => {
       document.turns[0].model_call_metrics[0].finish_reason = 'length';
@@ -1342,6 +1343,7 @@ test('discussion response quality separates reasoning usage from truncation sign
   );
   qualityFailure(`${'A focused comparison remains useful. '.repeat(30)}`, /overly long/);
   qualityFailure(`${'😀'.repeat(300)}.`, /overly long/);
+  qualityFailure('Okay.', /fewer than two sentences/);
   qualityFailure('### Tradeoffs\nPrivacy improves, while discovery becomes harder.', /Markdown heading/);
   qualityFailure(
     'Choice | Benefit | Cost\n--- | --- | ---\nPrivate | Focus | Discovery friction',
