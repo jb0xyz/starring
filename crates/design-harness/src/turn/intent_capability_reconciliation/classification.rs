@@ -139,18 +139,39 @@ pub(super) fn custom_static_redaction_candidate_is_redundant(
 }
 
 fn custom_static_redaction_copy_owns(source: &SourceText<'_>, words: &[&str], value: &str) -> bool {
-    let static_message = source.contains_asserted_token("static")
-        && source.contains_asserted_token("panel")
-        && source.contains_asserted_token("message")
-        && ["say", "says", "show", "shows", "display", "displays"]
-            .iter()
-            .any(|marker| source.contains_asserted_token(marker));
     let redaction_copy = has_any(words, &["redacted", "redaction"])
         && (has_any(
             words,
             &["substitute", "substituted", "substitution", "placeholder"],
         ) || value.to_lowercase().contains("[redacted]"));
-    static_message && redaction_copy && closed_static_redaction_copy_words(words)
+    source_asserts_static_redaction_copy(source)
+        && redaction_copy
+        && closed_static_redaction_copy_words(words)
+}
+
+fn source_asserts_static_redaction_copy(source: &SourceText<'_>) -> bool {
+    source.clauses().iter().any(|clause| {
+        if clause.hypothetical {
+            return false;
+        }
+        let words = clause
+            .tokens
+            .iter()
+            .map(|token| token.lower.as_str())
+            .collect::<Vec<_>>();
+        has_any(&words, &["static"])
+            && has_any(&words, &["panel"])
+            && has_any(&words, &["message"])
+            && has_any(
+                &words,
+                &["say", "says", "show", "shows", "display", "displays"],
+            )
+            && has_any(&words, &["redacted", "redaction"])
+            && has_any(
+                &words,
+                &["substitute", "substituted", "substitution", "placeholder"],
+            )
+    })
 }
 
 fn closed_static_redaction_copy_words(words: &[&str]) -> bool {

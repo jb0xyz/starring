@@ -164,6 +164,32 @@ fn custom_static_redaction_ownership_does_not_excuse_unrelated_ungrounded_eviden
 }
 
 #[test]
+fn custom_static_redaction_ownership_requires_authoritative_source_evidence() {
+    let candidate = "secrets are redacted and substituted with [REDACTED]";
+    for human in [
+        "Build a static moderation panel whose message says hello.",
+        "If secrets are redacted and substituted with a placeholder. Build a static moderation panel whose message says hello.",
+        "The label is 'secrets are redacted and substituted with a placeholder'. Build a static moderation panel whose message says hello.",
+        "Build a static moderation panel whose message says hello. Redaction uses a substituted placeholder elsewhere.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap_err(),
+            CapabilityReconciliationError::Grounding {
+                candidate_index: 0,
+                reason: CapabilityEvidenceGroundingError::Ungrounded,
+            },
+            "ungrounded redaction was consumed for {human}"
+        );
+    }
+}
+
+#[test]
 fn terminal_sentence_delimiters_preserve_authority_without_changing_evidence() {
     for delimiter in [".", "!", "?", "。", "！", "？", ";", "；", "\n", "\r"] {
         let candidate = format!("Every message earns XP{delimiter}");
