@@ -2312,6 +2312,7 @@ fn human_grounding_promotes_direct_validation_result_sequences() {
     for human in [
         "Build a feedback automation, validate it, then show me the result.",
         "Build the automation, please validate the design and show me the results.",
+        "Build the automation and validate it. Show me the result.",
     ] {
         let mut value = valid_core();
         value["automation_kind"] = json!("custom_automation");

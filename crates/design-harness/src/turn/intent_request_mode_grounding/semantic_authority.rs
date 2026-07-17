@@ -30,13 +30,13 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
     let mut copied_block = false;
     let mut active_semantic_units = Vec::new();
     let mut closed_axes = ClosedAxesAccumulator::default();
+    let mut pending_preview_validation = false;
     for sentence in &grounding.sentences {
         let mut question_build_scope = false;
         let mut non_authoritative_scope = false;
         let mut conditional_scope = false;
         let mut runtime_negation_scope = false;
         let mut ui_copy_scope = false;
-        let mut pending_preview_validation = false;
         for (index, unit) in sentence.iter().enumerate() {
             if copied_block {
                 pending_preview_validation = false;
@@ -139,7 +139,10 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             }
             let paired_preview = directive_authoritative
                 && pending_preview_validation
-                && unit.link == UnquotedGroundingLink::Additive
+                && matches!(
+                    unit.link,
+                    UnquotedGroundingLink::Additive | UnquotedGroundingLink::Detached
+                )
                 && closed_preview_result_step(&unit.text);
             pending_preview_validation = false;
             if directive_authoritative {

@@ -213,6 +213,7 @@ fn validated_preview_requires_explicit_unquoted_language() {
     for value in [
         "Build a feedback automation, validate it, then show me the result.",
         "Build the automation, please validate the design and show me the results.",
+        "Build the automation and validate it. Show me the result.",
     ] {
         assert_eq!(
             grounded_preview_preference(value),
@@ -231,6 +232,7 @@ fn validated_preview_requires_explicit_unquoted_language() {
         "Build a feedback automation, then show me the result.",
         "Build a feedback automation, validate it or show me the result.",
         "Build a feedback automation, validate it, archive an audit record, then show me the result.",
+        "Build a feedback automation and validate it. Archive an audit record. Show me the result.",
         "Imagine we validate it, then show me the result.",
     ] {
         assert_eq!(
