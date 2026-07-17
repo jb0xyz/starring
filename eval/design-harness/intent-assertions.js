@@ -74,7 +74,6 @@ const BOUNDARY_LABELS = {
   direct_live_mutation: ['Direct live mutation', '직접 라이브 변경'],
   secret_disclosure: ['Secret disclosure', '비밀정보 노출'],
 };
-const DISCUSSION_COMPLETION_TOKEN_CAP = 512;
 const DISCUSSION_MAX_UTF16_UNITS = 480;
 const DISCUSSION_MAX_SENTENCES = 4;
 const DISCUSSION_MAX_LIST_ITEMS = 4;
@@ -1157,9 +1156,6 @@ function discussionResponseFailures(turn, context) {
     failures.push(`${turn.id} discussion response has a completion-limit finish reason`);
   } else if (!acceptableFinishReasons.has(metricFinishReason)) {
     failures.push(`${turn.id} discussion response lacks an acceptable final finish reason`);
-  }
-  if (finalMetric?.completion_tokens >= DISCUSSION_COMPLETION_TOKEN_CAP) {
-    failures.push(`${turn.id} discussion response reached the completion-token cap`);
   }
   if (value.length > DISCUSSION_MAX_UTF16_UNITS) {
     failures.push(`${turn.id} discussion response is overly long`);

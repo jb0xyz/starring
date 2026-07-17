@@ -1303,7 +1303,7 @@ test('discussion response quality accepts concise complete English and Korean pr
   );
 });
 
-test('discussion response quality rejects completion limits and structurally poor endings', () => {
+test('discussion response quality separates reasoning usage from truncation signals', () => {
   const routeDecision = decision('discussion');
   const expected = context({
     expectedOutcomes: 'routed',
@@ -1321,13 +1321,16 @@ test('discussion response quality rejects completion limits and structurally poo
     assert.match(actual.reason, reason);
   };
 
-  qualityFailure(
+  const reasoningHeavy = JSON.parse(routedDocument(
+    routeDecision,
     'This concise comparison is complete.',
-    /completion-token cap/,
-    (document) => {
-      document.turns[0].model_call_metrics[0].completion_tokens = 512;
-      document.model_call_metrics[0].completion_tokens = 512;
-    },
+    'discussion-quality',
+  ));
+  reasoningHeavy.turns[0].model_call_metrics[0].completion_tokens = 527;
+  reasoningHeavy.model_call_metrics[0].completion_tokens = 527;
+  assert.equal(
+    checks.intentAdjudicationDecision(JSON.stringify(reasoningHeavy), expected).pass,
+    true,
   );
   qualityFailure(
     'This concise comparison is complete.',
