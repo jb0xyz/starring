@@ -9,7 +9,7 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '8606675893c1eae8e1ecc3e053582da600b18237ed110c03b768a1a5adc927cf';
+const REGISTRY_DIGEST = '5783590262c2971922aa54d4262b37107489c8dbe88678fb1a60e27e39b8858c';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -229,8 +229,8 @@ function report(overrides = {}) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 15,
-      normalizer_revision: 10,
+      extractor_revision: 16,
+      normalizer_revision: 11,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
