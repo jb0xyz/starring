@@ -127,6 +127,45 @@ fn v4_boundary_only_model_kinds_share_route_identity() {
     }
 }
 
+#[test]
+fn v4_runtime_only_objective_head_does_not_rotate_decision_identity() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
+    let requirements = [
+        "an LLM decides rewards at event time",
+        "every message earns XP",
+        "levels unlock an economy",
+        "timers advance quests",
+    ];
+    let mut baseline = core_value();
+    baseline["automation_kind"] = json!("none");
+    baseline["other_unmapped_required_capabilities"] = json!(requirements);
+    let baseline = grounded_core_decision(&baseline, human);
+
+    let mut summarized = core_value();
+    summarized["automation_kind"] = json!("none");
+    summarized["other_unmapped_required_capabilities"] = json!([
+        "Build a persistent Discord game",
+        "an LLM decides rewards at event time",
+        "every message earns XP",
+        "levels unlock an economy",
+        "timers advance quests"
+    ]);
+    let summarized = grounded_core_decision(&summarized, human);
+
+    assert_eq!(baseline.kind(), IntentRouteDecisionKindV2::CapabilityGap);
+    assert_eq!(summarized.kind(), IntentRouteDecisionKindV2::CapabilityGap);
+    assert_eq!(baseline.unclassified_requirements(), requirements);
+    assert_eq!(summarized.unclassified_requirements(), requirements);
+    assert_eq!(
+        baseline.semantic_ir_digest(),
+        summarized.semantic_ir_digest()
+    );
+    assert_eq!(
+        baseline.adjudication_digest(),
+        summarized.adjudication_digest()
+    );
+}
+
 fn context() -> IntentResolutionContext {
     IntentResolutionContext::from_channel_bindings([ExistingChannelKey(
         "community_hub".to_string(),

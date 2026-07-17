@@ -6,7 +6,7 @@ mod syntax;
 use std::collections::BTreeSet;
 
 use self::classification::{
-    closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
+    closed_fields_or_preservation_own, closed_route_or_objective_restatement_owns,
     custom_automation_owns, custom_static_redaction_candidate_is_redundant,
     custom_static_redaction_request_is_closed, external_requirement_spans, has_external_marker,
     runtime_business_spans, source_has_supported_custom_automation_base,
@@ -133,7 +133,12 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                         });
                     }
                     if custom_automation_owns(&source, automation_kind, &value)
-                        || closed_route_selection_restatement_owns(&source, automation_kind, &value)
+                        || closed_route_or_objective_restatement_owns(
+                            &source,
+                            automation_kind,
+                            &value,
+                            runtime,
+                        )
                         || closed_fields_or_preservation_own(&source, &value, runtime)
                         || managed_context.is_some_and(|context| {
                             managed_recipe_restatement_owns(&source, context, &value)

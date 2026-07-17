@@ -1429,29 +1429,35 @@ fn human_grounding_canonicalizes_runtime_only_automation_kind() {
     let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
     let mut baseline = None;
     for kind in ["none", "custom_automation"] {
-        let mut value = valid_core();
-        value["automation_kind"] = json!(kind);
-        value["other_unmapped_required_capabilities"] = json!([
-            "an LLM decides rewards at event time",
-            "every message earns XP",
-            "levels unlock an economy",
-            "timers advance quests"
-        ]);
-        let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human)
-            .unwrap_or_else(|error| panic!("{kind}: {error:?}"));
-        parsed.apply_human_grounding(human, None).unwrap();
+        for include_objective_head in [false, true] {
+            let mut requirements = vec![
+                "an LLM decides rewards at event time",
+                "every message earns XP",
+                "levels unlock an economy",
+                "timers advance quests",
+            ];
+            if include_objective_head {
+                requirements.push("Build a persistent Discord game");
+            }
+            let mut value = valid_core();
+            value["automation_kind"] = json!(kind);
+            value["other_unmapped_required_capabilities"] = json!(requirements);
+            let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human)
+                .unwrap_or_else(|error| panic!("{kind}: {error:?}"));
+            parsed.apply_human_grounding(human, None).unwrap();
 
-        assert_eq!(
-            parsed.automation_kind(),
-            super::IntentAutomationKindV2::None
-        );
-        if let Some(baseline) = &baseline {
             assert_eq!(
-                &parsed, baseline,
-                "runtime-only identity drifted for {kind}"
+                parsed.automation_kind(),
+                super::IntentAutomationKindV2::None
             );
-        } else {
-            baseline = Some(parsed);
+            if let Some(baseline) = &baseline {
+                assert_eq!(
+                    &parsed, baseline,
+                    "runtime-only identity drifted for {kind} objective={include_objective_head}"
+                );
+            } else {
+                baseline = Some(parsed);
+            }
         }
     }
 }

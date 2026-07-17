@@ -831,6 +831,91 @@ fn closed_runtime_fields_recover_dependent_stateful_behaviors() {
 }
 
 #[test]
+fn runtime_only_objective_head_is_owned_for_both_model_kinds() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses";
+    for kind in [
+        IntentAutomationKindV2::None,
+        IntentAutomationKindV2::CustomAutomation,
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                kind,
+                &stateful_runtime(),
+                strings(&["Build a persistent Discord game"]),
+            )
+            .unwrap(),
+            strings(&[
+                "an LLM decides rewards at event time",
+                "every message earns XP",
+                "levels unlock an economy",
+                "timers advance quests",
+            ]),
+            "objective head remained for {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn runtime_only_objective_ownership_preserves_unknown_scope_and_requirements() {
+    let standalone = "Build a persistent Discord game";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            standalone,
+            IntentAutomationKindV2::None,
+            &stateful_runtime(),
+            strings(&[standalone]),
+        )
+        .unwrap(),
+        strings(&[standalone])
+    );
+
+    let stateful = "Build a persistent Discord game where every message earns XP";
+    for (kind, runtime) in [
+        (IntentAutomationKindV2::None, no_runtime()),
+        (
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            stateful_runtime(),
+        ),
+    ] {
+        let reconciled = reconcile_unmapped_capabilities(
+            stateful,
+            kind,
+            &runtime,
+            strings(&["Build a persistent Discord game"]),
+        )
+        .unwrap();
+        assert!(reconciled.contains(&"Build a persistent Discord game".to_string()));
+    }
+
+    let modified = "Build a persistent multiplayer Discord game where every message earns XP";
+    let reconciled = reconcile_unmapped_capabilities(
+        modified,
+        IntentAutomationKindV2::None,
+        &stateful_runtime(),
+        strings(&["Build a persistent multiplayer Discord game"]),
+    )
+    .unwrap();
+    assert!(reconciled.contains(&"Build a persistent multiplayer Discord game".to_string()));
+    assert!(reconciled.contains(&"every message earns XP".to_string()));
+
+    let independent = "Build a persistent Discord game where every message earns XP. Guild alliances span servers.";
+    let reconciled = reconcile_unmapped_capabilities(
+        independent,
+        IntentAutomationKindV2::None,
+        &stateful_runtime(),
+        strings(&[
+            "Build a persistent Discord game",
+            "Guild alliances span servers",
+        ]),
+    )
+    .unwrap();
+    assert!(!reconciled.contains(&"Build a persistent Discord game".to_string()));
+    assert!(reconciled.contains(&"Guild alliances span servers".to_string()));
+    assert!(reconciled.contains(&"every message earns XP".to_string()));
+}
+
+#[test]
 fn unclassified_build_kind_recovers_dependent_stateful_behaviors() {
     let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses";
     assert_eq!(

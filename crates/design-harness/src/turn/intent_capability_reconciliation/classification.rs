@@ -336,15 +336,34 @@ fn closed_static_redaction_request_word(word: &str) -> bool {
         )
 }
 
-pub(super) fn closed_route_selection_restatement_owns(
+pub(super) fn closed_route_or_objective_restatement_owns(
     source: &SourceText<'_>,
     automation_kind: IntentAutomationKindV2,
     value: &str,
+    runtime: &RuntimeRequirementsV2,
 ) -> bool {
-    automation_kind == IntentAutomationKindV2::CustomAutomation
+    let custom_route_selection = automation_kind == IntentAutomationKindV2::CustomAutomation
         && source
             .unique_complete_asserted_clause_tokens(value)
-            .is_some_and(|words| words == ["it", "is", "not", "a", "study-room", "feature"])
+            .is_some_and(|words| words == ["it", "is", "not", "a", "study-room", "feature"]);
+    custom_route_selection
+        || runtime_only_objective_restatement_owns(source, automation_kind, value, runtime)
+}
+
+fn runtime_only_objective_restatement_owns(
+    source: &SourceText<'_>,
+    automation_kind: IntentAutomationKindV2,
+    value: &str,
+    runtime: &RuntimeRequirementsV2,
+) -> bool {
+    matches!(
+        automation_kind,
+        IntentAutomationKindV2::CustomAutomation | IntentAutomationKindV2::None
+    ) && runtime.persistence == PersistenceRequirementV2::RestartPersistent
+        && source
+            .unique_asserted_where_head_tokens(value)
+            .is_some_and(|words| words == ["build", "a", "persistent", "discord", "game"])
+        && !runtime_business_spans(source, runtime).is_empty()
 }
 
 pub(super) fn closed_fields_or_preservation_own(
