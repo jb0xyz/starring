@@ -28,8 +28,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
     semantic_authority::grounded_request_controls(human)
 }
 
-#[cfg(test)]
-pub(super) fn grounded_request_mode(human: &str) -> Option<IntentRequestModeV2> {
+pub(crate) fn grounded_request_mode(human: &str) -> Option<IntentRequestModeV2> {
     grounded_request_controls(human).mode
 }
 

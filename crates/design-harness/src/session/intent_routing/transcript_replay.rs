@@ -89,7 +89,7 @@ pub(super) fn replay_core_semantics(
         || CoreReplayErrorV4::Snapshot(snapshot_error("routed Core state anchor is missing")),
     )?)
     .map_err(CoreReplayErrorV4::Snapshot)?;
-    validate_intent_state_anchor(&state).map_err(CoreReplayErrorV4::Snapshot)?;
+    validate_intent_state_anchor(&state, &human).map_err(CoreReplayErrorV4::Snapshot)?;
     let failure_revision = state.expected_revision;
     let mut core =
         parse_interpret_intent_core_for_serving(arguments, &human, state.expected_revision)

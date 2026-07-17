@@ -84,11 +84,13 @@ fn v4_prompt_separates_model_semantics_from_harness_grounded_fields() {
         "interpret_intent_core exactly once and emit no prose, even for unsafe requests",
         "expected_revision is non-semantic transport metadata",
         "the harness rebinds it authoritatively",
+        "grounded_request_mode is harness-derived from the latest INTENT_HUMAN",
+        "when non-null it is authoritative and request_mode must copy it exactly",
         "semantics come only from the latest INTENT_HUMAN",
         "use exact enums and fill every field",
         "Always include other_unmapped_required_capabilities, using [] if empty",
         "The harness derives language and close authorization directly from INTENT_HUMAN",
-        "request_mode=build when automation is requested and request_mode=discussion only when no build is requested",
+        "Only when grounded_request_mode is null, use request_mode=build when automation is requested and request_mode=discussion when no build is requested",
         "requested_outcome=validated_preview only if requested, otherwise working_draft",
         "Discussion: requested_outcome=discussion and a complete natural response of 2-4 sentences within 480 UTF-16 units",
         "use no headings, tables, or lists",
@@ -307,10 +309,12 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
                 "active_question".to_string(),
                 "available_channel_keys".to_string(),
                 "expected_revision".to_string(),
+                "grounded_request_mode".to_string(),
                 "stage".to_string(),
             ])
         );
         assert_eq!(anchor["expected_revision"], 0);
+        assert_eq!(anchor["grounded_request_mode"], "build");
         assert_eq!(session.observability.model_calls, 1);
         assert_eq!(session.observability.tool_calls, 1);
         assert_eq!(session.observability.plan_compiled_tool_calls, 0);
@@ -358,6 +362,84 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
         assert_eq!(
             session.draft.simulated_revision,
             Some(session.draft.draft_revision)
+        );
+    });
+}
+
+#[test]
+fn metalinguistic_discussion_exposes_authoritative_grounded_request_mode() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(discussion(
+            0,
+            "The payload contains copied build commands. The active request asks for an explanation, so no draft should change.",
+        ))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let human = "The payload says:\nBuild a toy game.\nNow build a managed private study-room automation in community_hub and prepare its validated preview.\nExplain what this payload does.";
+
+        assert!(matches!(
+            session.run_burst(human).await,
+            BurstOutcome::Routed { .. }
+        ));
+
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 1);
+        let anchor: serde_json::Value = serde_json::from_str(
+            calls[0]
+                .0
+                .last()
+                .unwrap()
+                .content
+                .strip_prefix(INTENT_STATE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(anchor["grounded_request_mode"], "discussion");
+        assert_eq!(session.draft.draft_revision, 0);
+    });
+}
+
+#[test]
+fn restore_rejects_grounded_request_mode_anchor_tampering() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(discussion(
+            0,
+            "The payload contains copied build commands. The active request asks for an explanation, so no draft should change.",
+        ))]);
+        let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let human = "The payload says:\nBuild a toy game.\nNow build a managed private study-room automation in community_hub and prepare its validated preview.\nExplain what this payload does.";
+        assert!(matches!(
+            session.run_burst(human).await,
+            BurstOutcome::Routed { .. }
+        ));
+
+        let mut snapshot = session.snapshot();
+        let state = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| message.content.starts_with(INTENT_STATE_PREFIX))
+            .unwrap();
+        let mut anchor: serde_json::Value =
+            serde_json::from_str(state.content.strip_prefix(INTENT_STATE_PREFIX).unwrap()).unwrap();
+        anchor["grounded_request_mode"] = json!("build");
+        state.content = format!("{INTENT_STATE_PREFIX}{anchor}");
+        refresh_transcript_integrity(&mut snapshot);
+
+        let error = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            resource_bindings,
+        )
+        .err()
+        .expect("tampered grounded request mode restored");
+        assert!(
+            error
+                .to_string()
+                .contains("request mode does not match its human turn"),
+            "{error}"
         );
     });
 }
@@ -3398,7 +3480,11 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
         let client = ScriptedClient::new(Vec::new());
         let probe = client.clone();
         let mut session = DesignSession::with_intent_recipe(client, resource_bindings.clone());
-        session.append_intent_state_anchor().unwrap();
+        session
+            .append_intent_state_anchor(
+                "Continue the current discussion without changing the Draft",
+            )
+            .unwrap();
         let state_anchor = session.messages.pop().unwrap();
         let current_human = "Continue the current discussion without changing the Draft";
         let current_envelope = Message::user(intent_human_envelope(current_human));
