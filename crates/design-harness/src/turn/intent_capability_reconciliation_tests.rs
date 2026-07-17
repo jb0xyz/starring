@@ -666,6 +666,47 @@ fn closed_runtime_fields_recover_dependent_stateful_behaviors() {
 }
 
 #[test]
+fn unclassified_build_kind_recovers_dependent_stateful_behaviors() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::None,
+            &stateful_runtime(),
+            Vec::new(),
+        )
+        .unwrap(),
+        strings(&[
+            "an LLM decides rewards at event time",
+            "every message earns XP",
+            "levels unlock an economy",
+            "timers advance quests",
+        ])
+    );
+}
+
+#[test]
+fn runtime_business_recovery_stays_closed_for_managed_recipes_and_inactive_axes() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time";
+    assert!(reconcile_unmapped_capabilities(
+        human,
+        IntentAutomationKindV2::ManagedPrivateStudyRoom,
+        &stateful_runtime(),
+        Vec::new(),
+    )
+    .unwrap()
+    .is_empty());
+    assert!(reconcile_unmapped_capabilities(
+        human,
+        IntentAutomationKindV2::None,
+        &no_runtime(),
+        Vec::new(),
+    )
+    .unwrap()
+    .is_empty());
+}
+
+#[test]
 fn inactive_runtime_axes_never_trigger_behavior_derivation() {
     let human = "Build a game where every message earns XP, timers advance quests, and an LLM decides rewards at event time. Preserve state across restarts";
     let runtime = RuntimeRequirementsV2 {

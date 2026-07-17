@@ -120,7 +120,10 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
             }
         }
     }
-    if automation_kind == IntentAutomationKindV2::CustomAutomation {
+    if matches!(
+        automation_kind,
+        IntentAutomationKindV2::CustomAutomation | IntentAutomationKindV2::None
+    ) {
         for span in runtime_business_spans(&source, runtime) {
             let Some(value) = source.value(span) else {
                 continue;
