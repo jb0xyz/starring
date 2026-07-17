@@ -134,13 +134,16 @@ capacity, timeout, and monotonic accepted and settled completion counters. The
 Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
-The final 2026-07-17 clean-source matrix at
-`60bcf398bbf10eb7c4fbe7c40f03ddd966455fba` passed all 232/232 Promptfoo rows
+The current 2026-07-17 clean-source matrix at
+`7f138b308644f954cd38ceee78768f3d6b7bf551` passed all 232/232 Promptfoo rows
 and executed the exact 298 model/tool calls with zero provider errors, repair
-attempts, or retries. Every route and adjudication identity class was stable.
-The certified catalog identity is extractor revision 16, normalizer revision
-12, and registry digest
-`5ab0dac8c5d445f01fad4bffaa91bf2eb8cfaa2b15c70ce6aa888b06be4253b7`.
+attempts, or retries. Every request, route, and adjudication identity class was
+stable. The certified catalog identity is extractor revision 16, normalizer
+revision 15, and registry digest
+`fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c`.
+The earlier normalizer-12 certificate remains immutable historical evidence;
+two interrupted normalizer-13 and normalizer-14 runs are diagnostic only and
+are not pooled into this result.
 This certifies the bounded single-worker authoring cohort, not commercial
 concurrency, soak behavior, high availability, or live Discord execution.
 
@@ -252,15 +255,14 @@ skips approval but keeps every technical safeguard.
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
   validations, and the ignored PostgreSQL integration suites for contention,
   CAS, lease, partial-unique, and reconnect behavior. At the final Luna V4
-  checkpoint, the focused `design-harness` library gate passed 740 tests, the
+  checkpoint, the focused `design-harness` library target passed 742 tests, the
   CLI gate passed 82 tests plus its dependency guard, and the JavaScript gate
   passed 106 tests. Relevant clippy `-D warnings` and formatting gates also
-  passed. An earlier full-workspace attempt encountered the macOS host startup
-  stall described under Known Limitations, so these results must not be
-  relabeled as a newly completed full-workspace gate. The exact resumable
-  repeated Luna matrix is implemented, statically verified, and passed live at
-  232/232 samples and 298/298 planned model calls. GitHub CI remains a separate
-  evidence boundary until the branch is published.
+  passed. The exact resumable repeated Luna matrix is implemented, statically
+  verified, and passed live at 232/232 samples and 298/298 planned model calls.
+  The clean evidence source also passed GitHub Actions CI run 31: the complete
+  workspace checks and PostgreSQL integration job were both green. CI remains
+  separate from the local live-model certificate.
 - **Live certification**: Layer 2 manual runbooks (real bot, guild, PostgreSQL)
   prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
   authoring cohort did not run a live Discord integration.
@@ -339,8 +341,6 @@ Stated as capabilities (durable across the phase numbering):
   effect.
 - Provisioning-state persistence, compensation, reconciliation, and replay
   idempotency for partial external failures.
-- Publication of the Luna V4 hardening branch, GitHub PR and CI evidence, and
-  merge to `main`.
 
 ## Known Limitations
 
@@ -400,7 +400,7 @@ Stated as capabilities (durable across the phase numbering):
   another 20 GiB before retaining additional large build or evaluation cohorts;
   this is an operational capacity target, not a certified production margin.
 
-## Next Phase: Publish V4, Then Prove Commercial Operation
+## Next Phase: Prove Commercial Operation
 
 The direction is no longer an automation-versus-game product fork. The near-term
 Harness Track comes first; a separate Stateful Runtime Track follows only after
@@ -408,27 +408,25 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Preserve the passing clean-source cohort and the earlier failed diagnostic
-   cohorts as immutable, separate evidence. Keep the raw worker loopback-only
-   and retain exact provider/model/effort/auth pinning.
-2. Push the branch, open the main-target PR, require all GitHub Actions checks,
-   and merge only after an independent diff and safety-boundary review.
-3. Measure queueing, concurrency, saturation, long-running soak recovery, and
+1. Preserve the passing clean-source cohort and the earlier failed or
+   interrupted diagnostic cohorts as immutable, separate evidence. Keep the raw
+   worker loopback-only and retain exact provider/model/effort/auth pinning.
+2. Measure queueing, concurrency, saturation, long-running soak recovery, and
    worker high availability on the Mac mini before setting a commercial SLO.
-4. Run the existing live Discord and PostgreSQL safety scenarios for the
+3. Run the existing live Discord and PostgreSQL safety scenarios for the
    integrated authoring-to-approval path; the passing authoring matrix itself
    did not exercise Discord.
-5. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
+4. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
    edit and recompile with explicit `keep`, `set`, and `reset_default`
    semantics.
-6. Complete the actual typed-planner handoff for supported custom static
+5. Complete the actual typed-planner handoff for supported custom static
    automation while preserving the same candidate gates and no-deploy boundary.
-7. Add an authenticated authoring API/UI, guild-binding authority, session
+6. Add an authenticated authoring API/UI, guild-binding authority, session
    ownership, and the existing approval/publication/activation integration.
-8. Add whole-plan deterministic preflight before the first side effect, then
+7. Add whole-plan deterministic preflight before the first side effect, then
    provisioning state, compensation, reconciliation, and replay idempotency for
    uncertain external effects.
-9. Release a bounded next private-room recipe, expand the recipe catalog, then
+8. Release a bounded next private-room recipe, expand the recipe catalog, then
    begin the separate `StatefulSpec` runtime arc for state, conditions, timers,
    sessions, and games.
 
