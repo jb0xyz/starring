@@ -629,13 +629,13 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 14, including the closed detail grammar,
+extractor revision moves from 4 to 15, including the closed detail grammar,
 path-only detail frontier, exact slot-literal verifier, supported-base
 classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay, and removal of the redundant
 model-authored runtime, language, and close-policy fields from the active frontier.
-The normalizer revision moves from 1 to 9, including exact capability-evidence
+The normalizer revision moves from 1 to 10, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only capability-array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
@@ -834,8 +834,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         14
-Recipe normalizer revision         9
+Recipe extractor revision         15
+Recipe normalizer revision        10
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -883,7 +883,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 13, normalizer revisions through 8, or
+branch-local extractor revisions through 14, normalizer revisions through 9, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -897,9 +897,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 14, and normalizer 9 is current;
-- a pre-release V4 prompt, extractor revision through 13, or normalizer revision
-  through 8 is rejected;
+- the exact V4 prompt with protocol 4, extractor 15, and normalizer 10 is current;
+- a pre-release V4 prompt, extractor revision through 14, or normalizer revision
+  through 9 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;

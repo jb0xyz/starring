@@ -296,9 +296,9 @@ not resent. Every eligible history turn is replayed once before context-fit
 trimming; failed or non-discussion results contribute no assistant prose.
 
 Snapshot schema 8 requires the exact V4 prompt, protocol 4, extractor revision
-14, normalizer revision 9, component identities, stage bindings, and a complete
+15, normalizer revision 10, component identities, stage bindings, and a complete
 transcript-integrity digest even for an Empty stage. V3 Intent snapshots and
-pre-release V4 extractor revisions through 13 or normalizer revisions through 8
+pre-release V4 extractor revisions through 14 or normalizer revisions through 9
 are rejected. V6 and V7 non-Intent snapshots may be promoted at the CLI edge;
 V6 or V7 snapshots containing Intent state are rejected.
 
@@ -320,8 +320,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         14
-Recipe normalizer revision         9
+Recipe extractor revision         15
+Recipe normalizer revision        10
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -337,7 +337,7 @@ OpenAI-compatible gateway           http://127.0.0.1:18080/v1
 The current recipe-registry digest pinned by the evaluator is:
 
 ```text
-23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d
+8606675893c1eae8e1ecc3e053582da600b18237ed110c03b768a1a5adc927cf
 ```
 
 The gateway-reported model tag is checked exactly. It is not a weights digest.
