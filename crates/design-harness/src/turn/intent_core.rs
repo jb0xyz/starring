@@ -176,7 +176,10 @@ struct InterpretIntentCoreWireV4 {
     #[serde(default)]
     #[schemars(skip)]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
-    #[schemars(length(max = 480))]
+    #[schemars(
+        length(max = 480),
+        description = "Discussion only: write 2 or 3 short complete sentences, preferably within 360 UTF-16 units, and finish with terminal punctuation; use an empty string for a build"
+    )]
     response: String,
 }
 
@@ -928,6 +931,20 @@ fn normalized_response(
         false,
         "intent.core.response",
     )?;
+    if normalized.ends_with("...")
+        || normalized.ends_with('…')
+        || matches!(
+            normalized.chars().next_back(),
+            Some(',' | ':' | ';' | '，' | '：' | '；' | '—' | '–' | '\\')
+        )
+    {
+        return Err(core_error(
+            "INCOMPLETE_INTENT_RESPONSE",
+            "intent.core.response",
+            "The discussion response has an obviously unfinished ending",
+            "Rewrite it as two or three short complete sentences within 360 UTF-16 units and finish with terminal punctuation",
+        ));
+    }
     Ok(normalized)
 }
 

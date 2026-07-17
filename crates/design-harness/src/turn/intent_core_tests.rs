@@ -2227,6 +2227,49 @@ fn core_parser_requires_a_bounded_discussion_response() {
             .code,
         "INTENT_TEXT_TOO_LONG"
     );
+
+    for ending in [",", ":", ";", "，", "：", "；", "—", "–", "\\", "...", "…"] {
+        value["response"] = json!(format!(
+            "Privacy improves. Discovery becomes harder. The main tradeoff is control versus convenience{ending}"
+        ));
+        assert_eq!(
+            parse_interpret_intent_core_compatibility(&value.to_string())
+                .unwrap_err()
+                .code,
+            "INCOMPLETE_INTENT_RESPONSE"
+        );
+    }
+
+    value["response"] = json!("Privacy improves. Discovery becomes harder.");
+    assert_eq!(
+        parse_interpret_intent_core_compatibility(&value.to_string())
+            .unwrap()
+            .response(),
+        "Privacy improves. Discovery becomes harder."
+    );
+
+    value["response"] = json!("An unfinished thought,");
+    assert_eq!(
+        parse_interpret_intent_core_compatibility(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INCOMPLETE_INTENT_RESPONSE"
+    );
+
+    value["response"] = json!(format!("Complete thought. {}", "x".repeat(470)));
+    assert_eq!(
+        parse_interpret_intent_core_compatibility(&value.to_string())
+            .unwrap_err()
+            .code,
+        "INTENT_TEXT_TOO_LONG"
+    );
+
+    let response_schema = &interpret_intent_core_frontier()[0].parameters["properties"]["response"];
+    assert_eq!(response_schema["maxLength"], 480);
+    assert!(response_schema["description"]
+        .as_str()
+        .unwrap()
+        .contains("2 or 3 short complete sentences"));
 }
 
 #[test]
