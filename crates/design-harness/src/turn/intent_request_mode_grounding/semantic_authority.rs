@@ -1,4 +1,6 @@
-use super::closed_axes::{closed_axis_semantic_authority, ClosedAxesAccumulator};
+use super::closed_axes::{
+    closed_axis_semantic_authority, ClosedAxesAccumulator, ClosedAxisObservation,
+};
 use super::directives::{request_directive, HoldDirective, RequestDirective};
 use super::lexical::strip_repeated_prefixes;
 use super::patterns::{
@@ -170,16 +172,16 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             let authoritative = authoritative && !non_authoritative_scope && active.is_some();
             let mut text = active.unwrap_or_else(|| unit.text.clone());
             if authoritative {
-                closed_axes.observe_with_source(
-                    &text,
-                    &unit.text,
-                    &unit.source_text,
-                    unit.link,
+                closed_axes.observe_with_source(ClosedAxisObservation {
+                    active_value: &text,
+                    source_value: &unit.text,
+                    literal_source_value: &unit.source_text,
+                    link: unit.link,
                     continuation,
                     continuation_source,
                     continuation_link,
-                    conditional_detail_consequent,
-                );
+                    operative_consequent: conditional_detail_consequent,
+                });
                 if unit.link == UnquotedGroundingLink::Detached
                     || starts_positive_runtime_scope(&text)
                 {

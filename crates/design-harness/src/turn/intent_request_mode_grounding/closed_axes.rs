@@ -55,6 +55,17 @@ pub(super) struct ClosedAxesAccumulator {
     previous_managed_detail_slot: Option<DetailSlot>,
 }
 
+pub(super) struct ClosedAxisObservation<'a> {
+    pub(super) active_value: &'a str,
+    pub(super) source_value: &'a str,
+    pub(super) literal_source_value: &'a str,
+    pub(super) link: UnquotedGroundingLink,
+    pub(super) continuation: Option<&'a str>,
+    pub(super) continuation_source: Option<&'a str>,
+    pub(super) continuation_link: Option<UnquotedGroundingLink>,
+    pub(super) operative_consequent: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PendingLocaleDefault {
     locale: IntentLocaleHintV2,
@@ -90,35 +101,35 @@ impl ClosedAxesAccumulator {
         continuation: Option<&str>,
         alternative_continuation: Option<&str>,
     ) {
-        self.observe_with_source(
-            raw_value,
-            raw_value,
-            raw_value,
+        self.observe_with_source(ClosedAxisObservation {
+            active_value: raw_value,
+            source_value: raw_value,
+            literal_source_value: raw_value,
             link,
             continuation,
-            continuation,
-            continuation.map(|_| {
+            continuation_source: continuation,
+            continuation_link: continuation.map(|_| {
                 if alternative_continuation.is_some() {
                     UnquotedGroundingLink::Alternative
                 } else {
                     UnquotedGroundingLink::Additive
                 }
             }),
-            false,
-        );
+            operative_consequent: false,
+        });
     }
 
-    pub(super) fn observe_with_source(
-        &mut self,
-        active_value: &str,
-        source_value: &str,
-        literal_source_value: &str,
-        link: UnquotedGroundingLink,
-        continuation: Option<&str>,
-        continuation_source: Option<&str>,
-        continuation_link: Option<UnquotedGroundingLink>,
-        operative_consequent: bool,
-    ) {
+    pub(super) fn observe_with_source(&mut self, observation: ClosedAxisObservation<'_>) {
+        let ClosedAxisObservation {
+            active_value,
+            source_value,
+            literal_source_value,
+            link,
+            continuation,
+            continuation_source,
+            continuation_link,
+            operative_consequent,
+        } = observation;
         let alternative_continuation =
             continuation.filter(|_| continuation_link == Some(UnquotedGroundingLink::Alternative));
         let copy_carrier_index = first_copy_carrier_index(source_value);
