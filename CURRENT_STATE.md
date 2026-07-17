@@ -134,6 +134,13 @@ capacity, timeout, and monotonic accepted and settled completion counters. The
 Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
+The 2026-07-17 matrix completed all 232 samples and failed acceptance at
+203/232 Promptfoo rows with 295/298 planned model calls. Its worker counters,
+retry isolation, deterministic gates, and latency gates passed. Seven cases
+were non-perfect; metalinguistic copied-command isolation, naming mutation, and
+secret-disclosure rejection were 0%, so no Luna V4 acceptance or commercial
+readiness is claimed. The routine worker has been restored to two active and
+eight queued requests after the dedicated run.
 
 The current V4 implementation and evidence internals are recorded in
 `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
@@ -242,12 +249,14 @@ skips approval but keeps every technical safeguard.
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
   validations, and the ignored PostgreSQL integration suites for contention,
   CAS, lease, partial-unique, and reconnect behavior. The V4 branch's focused
-  library run contains 648 passing tests. After the responsibility splits, the
+  library run contains 845 passing tests, and the current JavaScript evaluator
+  suite contains 103 passing tests. After the responsibility splits, the
   full local workspace, clippy, formatting, JavaScript and Promptfoo static,
   diff, dependency, comment, credential, and scope gates passed. The initial
   clean-source Luna cutover canaries passed 4/4. The exact resumable repeated
-  Luna matrix is implemented and statically verified; its live 232-sample run
-  and GitHub CI remain separate evidence boundaries.
+  Luna matrix is implemented, statically verified, and completed live. The
+  authoritative result is a failed 203/232 acceptance cohort with 295/298
+  planned model calls; GitHub CI remains a separate evidence boundary.
 - **Live certification**: manual runbooks (real bot, guild, PostgreSQL) prove the
   end-to-end lifecycle; they are never wired into CI.
 
@@ -296,7 +305,13 @@ Stated as capabilities (durable across the phase numbering):
   canaries passed 4/4 from a clean source. A durable 27-phase orchestrator now
   pins the exact 26-case, 232-sample, 272-turn, 298-call acceptance schedule,
   retry-free gates, worker/source/tooling boundaries, request-counter isolation,
-  and atomic evidence; its live cohort remains pending.
+  and atomic evidence. Its first complete live cohort ran every phase once,
+  passed 27/33 acceptance checks, and failed the remaining six. Deferred
+  finalization preserved the original evidence source and crash document while
+  separately attesting the fixed evaluator commit and executing zero additional
+  model requests. Future deferred recovery binds the initial failure document
+  and digest in the atomic state journal and resumes idempotently across a
+  partial final-artifact write.
 - CI guarding the cross-crate safety invariants.
 
 ## What Is Not Yet Built
@@ -312,6 +327,9 @@ Stated as capabilities (durable across the phase numbering):
   constraint).
 - Any non-Discord adapter.
 - Any product recipe beyond `starring.private_study_room@1`.
+- A passing repeated Luna V4 acceptance cohort. The completed 2026-07-17 run
+  failed seven case-level reliability paths despite passing every latency and
+  serving-isolation gate.
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
   and recompilation, typed multi-turn preference accumulation, and bounded
   Intent transcript compression.
@@ -379,17 +397,15 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Preserve the completed Luna cutover as the serving baseline: keep the raw
+1. Preserve the completed failed cohort and serving baseline: keep the raw
    worker loopback-only, retain exact provider/model/effort/auth pinning, and
-   rerun the full deterministic gates after every later code change.
-2. Run `npm run matrix:intent` for the V4 live evaluation in its fixed 27-phase
-   order against only
-   `gpt-5.6-luna` at `medium` with the declared 16,384-token policy:
-   clean-source smoke;
-   ten-repeat default, custom-full, and copy-only cohorts; three-repeat hub,
-   locale, close, copy, naming, and control mutations; then one-shot,
-   clarification, restart, discussion-build, and paraphrase equivalence. Record
-   failures and latency honestly without importing V3 or other-model samples.
+   keep the manifest-bound phase and recovery artifacts immutable.
+2. Fix the measured failure classes without weakening assertions: copied-command
+   intent grounding, naming-detail locale grounding, stable secret-rejection
+   adjudication, redaction fallback, and repeat-stable gap/rejection identity.
+   Use targeted repeated cohorts first, then run a fresh full 27-phase matrix
+   from one clean source and a new worker instance. Do not pool the failed cohort
+   or post-fix targeted samples into the new acceptance denominator.
 3. Push the branch, open the main-target PR, require all GitHub Actions checks,
    and merge only after an independent diff and safety-boundary review.
 4. Add typed multi-turn preference accumulation plus atomic recipe-owned-region

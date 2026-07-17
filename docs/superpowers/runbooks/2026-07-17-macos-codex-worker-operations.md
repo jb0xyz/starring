@@ -175,6 +175,21 @@ same. Completed phases are reused. Rerunning an unfinished or failed phase keeps
 its higher attempt count and makes the result non-certifying even if its model
 checks later pass.
 
+There is one narrow recovery exception. If both deterministic gates and all 27
+phases completed but an evaluator defect prevented final artifacts, a later
+clean committed evaluator may use `--resume` for deferred finalization only.
+The plan, tooling, original worker instance and source, and final request
+counters must still match. No gate, phase, or model request runs again. The
+manifest preserves the evidence source, separately attests the evaluator commit
+and file hashes, records zero finalization model requests, and binds a preserved
+copy of the prior failure document. That document is first embedded with its
+serialized digest in the atomic state journal, so a missing or overwritten root
+failure file cannot replace the original recovery input. Partial final artifact
+writes can resume from the journal and idempotent recovery copy. Finalization is
+one-shot; already finalized evidence cannot be overwritten. A deferred result
+is authoritative only after `state.json` records its completed finalizer and
+artifact set. This exception never applies to an incomplete phase sequence.
+
 For every phase the matrix records the worker's monotonic accepted and settled
 completion counters. It requires an idle worker at both boundaries and requires
 both counter deltas to equal the model calls reported by that phase. Any other
@@ -211,9 +226,11 @@ launchctl kickstart -k "$DOMAIN/local.starring.codex-worker"
 unset API_KEY
 ```
 
-No repeated Luna V4 acceptance pass is established by this procedure until the
-matrix has actually completed and its authoritative artifacts satisfy the
-conditions above.
+The 2026-07-17 run completed 232 samples but failed acceptance at 203/232 rows
+and 295/298 planned model calls. It is recorded in
+`eval/design-harness/measurements.md` and does not establish a repeated Luna V4
+acceptance pass. A future pass requires a fresh output directory, clean source,
+new dedicated worker instance, and satisfaction of every authoritative check.
 
 ## Cut over from the local Gemma stack
 
