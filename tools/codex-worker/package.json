@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "check": "node --check protocol.mjs && node --check metrics-log.mjs && node --check codex-runner.mjs && node --check scheduler.mjs && node --check worker.mjs && node --check scheduler.test.mjs && node --check worker.test.mjs",
+    "check": "node --check protocol.mjs && node --check metrics-log.mjs && node --check codex-runner.mjs && node --check request-timeline.mjs && node --check scheduler.mjs && node --check worker.mjs && node --check request-timeline.test.mjs && node --check scheduler.test.mjs && node --check worker.test.mjs",
     "start": "node worker.mjs",
-    "test": "node --test scheduler.test.mjs worker.test.mjs"
+    "test": "node --test request-timeline.test.mjs scheduler.test.mjs worker.test.mjs"
   },
   "engines": {
     "node": ">=22"

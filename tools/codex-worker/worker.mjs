@@ -18,6 +18,7 @@ import {
   validateCompletionRequest,
   validateRunnerResult,
 } from "./protocol.mjs";
+import { RequestTimeline } from "./request-timeline.mjs";
 import { RequestCounters, Scheduler, abortReason } from "./scheduler.mjs";
 
 const HOST = "127.0.0.1";
@@ -30,6 +31,7 @@ const SOURCE_FILES = [
   "codex-runner.mjs",
   "metrics-log.mjs",
   "protocol.mjs",
+  "request-timeline.mjs",
   "scheduler.mjs",
   "worker.mjs",
 ];
@@ -212,18 +214,55 @@ async function resolveToken(options) {
 
 function metricRecord(input) {
   return {
+    metric_schema_version: 2,
     timestamp: new Date().toISOString(),
     request_id: input.requestId,
+    instance_id: input.identity.instance_id,
+    worker_source_sha256: input.identity.worker_source_sha256,
     provider: PROVIDER,
     model: MODEL,
     reasoning_effort: REASONING_EFFORT,
+    concurrency_limit: input.concurrency,
+    queue_capacity: input.maxQueue,
+    request_timeout_ms: input.timeoutMs,
     frontier_name: input.frontierName,
     outcome: input.outcome,
     status_code: input.status,
     duration_ms: input.durationMs,
+    ...input.timeline,
     usage: input.usage ?? null,
     error_code: input.errorCode ?? null,
   };
+}
+
+function scheduleCompletion(input) {
+  input.timeline.admit(input.scheduler.active, input.scheduler.queue.length);
+  let submitted;
+  try {
+    submitted = input.counters.submit(input.scheduler, async () => {
+      input.timeline.runnerStarted();
+      try {
+        const result = await input.runner.complete({
+          requestId: input.requestId,
+          model: MODEL,
+          reasoningEffort: REASONING_EFFORT,
+          messages: input.body.messages,
+          frontier: input.body.frontier,
+          signal: input.signal,
+        });
+        input.timeline.runnerSettled("resolved");
+        return result;
+      } catch (error) {
+        input.timeline.runnerSettled("rejected");
+        throw error;
+      }
+    }, input.signal);
+  } catch (error) {
+    input.timeline.submissionObserved(input.scheduler.active, input.scheduler.queue.length);
+    throw error;
+  }
+  input.timeline.submissionObserved(input.scheduler.active, input.scheduler.queue.length);
+  return submitted;
 }
 
 async function listen(server, port) {
@@ -352,22 +391,26 @@ export async function startWorker(options = {}) {
     }
     const requestId = randomUUID();
     const started = Date.now();
+    const timeline = new RequestTimeline({ clock: options.timelineClock });
     const disconnect = watchDisconnect(request, response);
     try {
       const result = await withTimeout(
-        (signal) => counters.submit(scheduler, () => runner.complete({
+        (signal) => scheduleCompletion({
+          body,
+          counters,
           requestId,
-          model: MODEL,
-          reasoningEffort: REASONING_EFFORT,
-          messages: body.messages,
-          frontier: body.frontier,
+          runner,
+          scheduler,
           signal,
-        }), signal),
+          timeline,
+        }),
         timeoutMs,
         disconnect.signal,
       );
+      timeline.resultValidationStarted();
       validateRunnerResult(result, identity);
       const durationMs = Date.now() - started;
+      const timing = timeline.finish("completed");
       if (!disconnect.signal.aborted) {
         json(
           response,
@@ -376,25 +419,36 @@ export async function startWorker(options = {}) {
         );
       }
       await metrics.record(metricRecord({
+        concurrency,
         requestId,
+        identity,
         frontierName: body.frontier.name,
+        maxQueue,
         outcome: "succeeded",
         status: 200,
         durationMs,
+        timeline: timing,
+        timeoutMs,
         usage: result.usage,
       }));
     } catch (error) {
       const durationMs = Date.now() - started;
       const failure = errorDetails(error);
+      const timing = timeline.finish(timeline.failureStage());
       if (!disconnect.signal.aborted) {
         json(response, failure.status, { error: { code: failure.code } });
       }
       await metrics.record(metricRecord({
+        concurrency,
         requestId,
+        identity,
         frontierName: body.frontier.name,
+        maxQueue,
         outcome: "failed",
         status: failure.status,
         durationMs,
+        timeline: timing,
+        timeoutMs,
         errorCode: failure.code,
       }));
     } finally {
