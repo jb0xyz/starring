@@ -34,8 +34,10 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         let mut conditional_scope = false;
         let mut runtime_negation_scope = false;
         let mut ui_copy_scope = false;
+        let mut pending_preview_validation = false;
         for (index, unit) in sentence.iter().enumerate() {
             if copied_block {
+                pending_preview_validation = false;
                 closed_axes.break_ephemeral_scope();
                 non_authoritative_scope = false;
                 conditional_scope = false;
@@ -52,6 +54,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 continue;
             }
             if metalinguistic_carrier(&unit.text) {
+                pending_preview_validation = false;
                 closed_axes.break_ephemeral_scope();
                 copied_block = true;
                 non_authoritative_scope = false;
@@ -67,6 +70,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                         .and_then(|previous| sentence.get(previous))
                         .is_some_and(|previous| conditional_detail_antecedent(&previous.text));
             if ui_copy_scope {
+                pending_preview_validation = false;
                 closed_axes
                     .observe_copy_scope_continuation(&unit.text, conditional_detail_consequent);
                 closed_axes.break_ephemeral_scope();
@@ -131,10 +135,19 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 mode = Some(IntentRequestModeV2::Build);
                 active_build_targets.clear();
             }
+            let paired_preview = directive_authoritative
+                && pending_preview_validation
+                && unit.link == UnquotedGroundingLink::Additive
+                && closed_preview_result_step(&unit.text);
+            pending_preview_validation = false;
             if directive_authoritative {
+                if paired_preview {
+                    preview = Some(true);
+                }
                 if let Some(preference) = preview_directive(&unit.text) {
                     preview = Some(preference);
                 }
+                pending_preview_validation = closed_preview_validation_step(&unit.text);
             }
             let unit_non_authoritative = non_authoritative_semantic_unit(&unit.text);
             if scope_break {
@@ -205,6 +218,23 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         active_semantic_units: Some(active_semantic_units),
         closed_axes: closed_axes.finish(),
     }
+}
+
+fn closed_preview_validation_step(unit: &str) -> bool {
+    matches!(
+        strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS),
+        "validate it" | "validate the automation" | "validate the design" | "validate the draft"
+    )
+}
+
+fn closed_preview_result_step(unit: &str) -> bool {
+    matches!(
+        strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS),
+        "show me the result"
+            | "show me the results"
+            | "show me the validated result"
+            | "show me the validated results"
+    )
 }
 
 fn preview_directive(unit: &str) -> Option<bool> {

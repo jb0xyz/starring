@@ -211,6 +211,16 @@ fn validated_preview_requires_explicit_unquoted_language() {
         Some(false)
     );
     for value in [
+        "Build a feedback automation, validate it, then show me the result.",
+        "Build the automation, please validate the design and show me the results.",
+    ] {
+        assert_eq!(
+            grounded_preview_preference(value),
+            Some(true),
+            "preview sequence was not grounded for {value}"
+        );
+    }
+    for value in [
         "Build an automation that detects validated preview failures.",
         "Build an automation that detects systems without preview support.",
         "Use validated preview as the button label.",
@@ -218,6 +228,10 @@ fn validated_preview_requires_explicit_unquoted_language() {
         "검증된 미리보기 버튼 라벨을 사용해줘.",
         "미리보기 없이라는 문구를 표시해줘.",
         "미리보기 없이 작동하는 시스템을 감지하는 자동화를 만들어줘.",
+        "Build a feedback automation, then show me the result.",
+        "Build a feedback automation, validate it or show me the result.",
+        "Build a feedback automation, validate it, archive an audit record, then show me the result.",
+        "Imagine we validate it, then show me the result.",
     ] {
         assert_eq!(
             grounded_preview_preference(value),

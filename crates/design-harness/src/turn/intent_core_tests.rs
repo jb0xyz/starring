@@ -2234,7 +2234,6 @@ fn human_grounding_never_preserves_discussion_for_an_explicit_build() {
 #[test]
 fn human_grounding_defaults_builds_without_an_explicit_preview_to_working_draft() {
     for human in [
-        "Build a feedback automation, validate it, then show me the result.",
         "Build an automation that detects systems without preview support.",
         "미리보기 없이 작동하는 시스템을 감지하는 자동화를 만들어줘.",
     ] {
@@ -2247,6 +2246,25 @@ fn human_grounding_defaults_builds_without_an_explicit_preview_to_working_draft(
             parsed.requested_outcome(),
             crate::intent::IntentRequestedOutcome::WorkingDraft,
             "model outcome survived without an explicit preview request for {human}"
+        );
+    }
+}
+
+#[test]
+fn human_grounding_promotes_direct_validation_result_sequences() {
+    for human in [
+        "Build a feedback automation, validate it, then show me the result.",
+        "Build the automation, please validate the design and show me the results.",
+    ] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!("custom_automation");
+        value["requested_outcome"] = json!("working_draft");
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::ValidatedPreview,
+            "direct validation result sequence was not promoted for {human}"
         );
     }
 }
