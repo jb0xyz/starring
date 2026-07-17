@@ -2554,6 +2554,36 @@ fn mixed_boundary_and_capability_evidence_fails_safe() {
 }
 
 #[test]
+fn mixed_boundary_kinds_own_only_exhaustively_covered_candidates() {
+    let human = "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately.";
+    let candidate = human.trim_end_matches('.');
+    assert_eq!(
+        ground_safety_boundary_requests(human),
+        vec![
+            IntentBoundaryRequestV2::DirectLiveMutation,
+            IntentBoundaryRequestV2::SecretDisclosure,
+        ]
+    );
+    assert!(safety_boundary_owns_capability_evidence(human, candidate));
+    assert!(safety_boundary_owns_capability_evidence(
+        human,
+        "put the secret value into a public Discord panel, and deploy it immediately"
+    ));
+
+    for independent in [
+        "Persist state, read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately.",
+        "Read the server's API key from its environment, put the secret value into a public Discord panel, archive an audit record, and deploy it immediately.",
+        "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately, then write an immutable audit record.",
+        "Read the server's API key from its environment, put the secret value into a public Discord panel, or deploy it immediately.",
+    ] {
+        assert!(!safety_boundary_owns_capability_evidence(
+            independent,
+            independent.trim_end_matches('.')
+        ));
+    }
+}
+
+#[test]
 fn ambiguous_exact_candidate_fails_safe() {
     let human = "Deploy live Discord now. Deploy live Discord now.";
     assert!(!safety_boundary_owns_capability_evidence(

@@ -365,41 +365,71 @@ pub(in super::super) fn coordinated_groups_cover_candidate(
     candidate: TextSpan,
     visible: &[char],
 ) -> bool {
-    [BoundaryKind::Gate, BoundaryKind::Live, BoundaryKind::Secret]
-        .into_iter()
-        .any(|kind| {
-            let matching = groups
-                .iter()
-                .filter(|group| {
-                    group.kind == kind
-                        && group
-                            .positive_role_spans
-                            .iter()
-                            .any(|span| candidate.start < span.end && candidate.end > span.start)
-                })
-                .collect::<Vec<_>>();
-            if matching.len() < 2 {
-                return false;
-            }
-            let mut coverage_spans = matching
-                .iter()
-                .flat_map(|group| group.coverage_spans.iter().copied())
-                .collect::<Vec<_>>();
-            coverage_spans.extend(marker_occurrence_spans(visible, candidate, &["but"], false));
-            let positive_role_spans = matching
-                .iter()
-                .flat_map(|group| group.positive_role_spans.iter().copied())
-                .collect();
-            group_covers_candidate(
-                &BoundaryEvidenceGroup {
-                    kind,
-                    coverage_spans: merged_spans(coverage_spans),
-                    positive_role_spans,
-                },
-                candidate,
-                visible,
-            )
+    for kind in [BoundaryKind::Gate, BoundaryKind::Live, BoundaryKind::Secret] {
+        let matching = intersecting_groups(groups, candidate, Some(kind));
+        if matching.len() >= 2
+            && joined_groups_cover_candidate(&matching, candidate, visible, kind, &["but"])
+        {
+            return true;
+        }
+    }
+    let matching = intersecting_groups(groups, candidate, None);
+    let Some(first) = matching.first() else {
+        return false;
+    };
+    matching.len() >= 2
+        && matching.iter().any(|group| group.kind != first.kind)
+        && joined_groups_cover_candidate(
+            &matching,
+            candidate,
+            visible,
+            first.kind,
+            &["and", "but", "then"],
+        )
+}
+
+fn intersecting_groups(
+    groups: &[BoundaryEvidenceGroup],
+    candidate: TextSpan,
+    kind: Option<BoundaryKind>,
+) -> Vec<&BoundaryEvidenceGroup> {
+    groups
+        .iter()
+        .filter(|group| {
+            kind.is_none_or(|kind| group.kind == kind)
+                && group
+                    .positive_role_spans
+                    .iter()
+                    .any(|span| candidate.start < span.end && candidate.end > span.start)
         })
+        .collect()
+}
+
+fn joined_groups_cover_candidate(
+    groups: &[&BoundaryEvidenceGroup],
+    candidate: TextSpan,
+    visible: &[char],
+    kind: BoundaryKind,
+    joiners: &[&str],
+) -> bool {
+    let mut coverage_spans = groups
+        .iter()
+        .flat_map(|group| group.coverage_spans.iter().copied())
+        .collect::<Vec<_>>();
+    coverage_spans.extend(marker_occurrence_spans(visible, candidate, joiners, false));
+    let positive_role_spans = groups
+        .iter()
+        .flat_map(|group| group.positive_role_spans.iter().copied())
+        .collect();
+    group_covers_candidate(
+        &BoundaryEvidenceGroup {
+            kind,
+            coverage_spans: merged_spans(coverage_spans),
+            positive_role_spans,
+        },
+        candidate,
+        visible,
+    )
 }
 
 fn evidence_group_for_interval(
