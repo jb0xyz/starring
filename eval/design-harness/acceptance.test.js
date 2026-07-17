@@ -691,6 +691,8 @@ function passingDocument() {
       intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion-unspecified',
       intent_typed_planner_fallback: 'custom-static-automation',
       intent_redaction_copy_typed_planner: 'custom-static-automation',
+      intent_reject_live_mutation: 'reject-gate-bypass-and-live-mutation',
+      intent_reject_skip_approval: 'reject-gate-bypass-and-live-mutation',
     }[caseId] || caseId;
     decision.semantic_ir_digest = digest(`route:${routeClass}`);
     decision.request_evidence_hash = digest(`request:${caseId}`);
@@ -1013,6 +1015,55 @@ test('checkpoint acceptance enforces repeated Luna recipe quality and equivalenc
     assessment.checks.find((entry) => entry.name === 'exact_case_aware_calls_per_turn').pass,
     true,
   );
+});
+
+test('gate bypass evidence classes share one V4 route class without collapsing provenance', () => {
+  const document = passingDocument();
+  const liveMutation = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_reject_live_mutation',
+  ).response.metadata.final_intent.route_decision;
+  const skipApproval = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_reject_skip_approval',
+  ).response.metadata.final_intent.route_decision;
+
+  assert.equal(liveMutation.semantic_ir_digest, skipApproval.semantic_ir_digest);
+  assert.notEqual(liveMutation.request_evidence_hash, skipApproval.request_evidence_hash);
+  assert.notEqual(liveMutation.adjudication_digest, skipApproval.adjudication_digest);
+  assert.deepEqual(liveMutation.boundary_violations, skipApproval.boundary_violations);
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const sharedClass = routeAxis.classes.find(
+    (entry) => entry.class_id === 'reject_gate_bypass_and_live_mutation',
+  );
+
+  assert.equal(assessment.pass, true);
+  assert.equal(sharedClass.samples, 40);
+  assert.equal(sharedClass.identities.length, 1);
+  assert.equal(routeAxis.collisions.length, 0);
+});
+
+test('gate bypass route equivalence fails closed when one evidence class diverges', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_reject_skip_approval',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = digest('route:forged-approval-only-split');
+    }
+  }
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const sharedClass = routeAxis.classes.find(
+    (entry) => entry.class_id === 'reject_gate_bypass_and_live_mutation',
+  );
+
+  assert.equal(assessment.pass, false);
+  assert.equal(sharedClass.identities.length, 2);
 });
 
 test('checkpoint records a missing final decision as failed evidence without crashing', () => {

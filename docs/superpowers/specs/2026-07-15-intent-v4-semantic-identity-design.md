@@ -169,6 +169,11 @@ target. Consequently, two paraphrased human requests may have the same route
 semantic digest but different audited adjudication digests. This is intentional:
 semantic equivalence and evidence provenance are different questions.
 
+Approval-only bypass plus direct live mutation and all-gate bypass plus direct
+live mutation share one V4 route semantic class because the closed boundary
+vocabulary aggregates validation, preview, and approval bypass. Their request
+evidence and audited adjudication identities remain distinct.
+
 ### Compiler input identity
 
 Compiler input identity covers the normalized validated intent including
