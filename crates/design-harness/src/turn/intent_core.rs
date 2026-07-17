@@ -23,7 +23,8 @@ use super::intent_interpretation::{
     TimerRequirementV2,
 };
 use super::intent_request_mode_grounding::{
-    grounded_request_controls, ClosedAxisGroundingError, GroundedClosedAxes, GroundedSemanticUnit,
+    grounded_request_controls, safety_boundary_request_mode, ClosedAxisGroundingError,
+    GroundedClosedAxes, GroundedSemanticUnit,
 };
 use super::intent_runtime_grounding::{
     ground_runtime_requirements, RuntimeGroundingAmbiguity, RuntimeGroundingError,
@@ -444,6 +445,9 @@ fn parse_grounded_intent_core(
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
     validate_intent_human_grounding_size(human_message)?;
     let grounded = grounded_request_controls(human_message);
+    let grounded_mode = grounded
+        .mode
+        .or_else(|| safety_boundary_request_mode(human_message));
     if grounded
         .active_semantic_units
         .as_ref()
@@ -461,7 +465,7 @@ fn parse_grounded_intent_core(
     let mut input = match parse_core_wire(arguments) {
         Ok(input) => input,
         Err(error)
-            if grounded.mode == Some(IntentRequestModeV2::Discussion)
+            if grounded_mode == Some(IntentRequestModeV2::Discussion)
                 && missing_discussion_capabilities(&error) =>
         {
             parse_core_wire(&supply_empty_discussion_capabilities(arguments)?)?
@@ -471,7 +475,7 @@ fn parse_grounded_intent_core(
     if let Some(expected_revision) = expected_revision {
         input.expected_revision = expected_revision;
     }
-    apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
+    apply_grounded_request_mode(&mut input, grounded_mode, grounded.preview);
     apply_grounded_closed_axes(&mut input, grounded.closed_axes)?;
     apply_grounded_runtime_requirements(&mut input, grounded.active_semantic_units.as_deref())?;
     normalize_core(input)
@@ -612,11 +616,7 @@ fn apply_grounded_request_mode(
             input.request_mode = IntentRequestModeV2::Build;
             input.requested_outcome = match grounded_preview {
                 Some(true) => IntentRequestedOutcome::ValidatedPreview,
-                Some(false) => IntentRequestedOutcome::WorkingDraft,
-                None if input.requested_outcome == IntentRequestedOutcome::Discussion => {
-                    IntentRequestedOutcome::WorkingDraft
-                }
-                None => input.requested_outcome,
+                Some(false) | None => IntentRequestedOutcome::WorkingDraft,
             };
             input.response.clear();
         }

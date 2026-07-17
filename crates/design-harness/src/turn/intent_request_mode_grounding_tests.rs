@@ -325,6 +325,31 @@ fn terminal_payload_analysis_selects_discussion() {
 }
 
 #[test]
+fn active_safety_boundaries_ground_build_without_promoting_discussion() {
+    for value in [
+        "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
+        "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately. Do not redact or substitute the key.",
+    ] {
+        assert_eq!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "active boundary did not ground build for {value}"
+        );
+    }
+
+    for value in [
+        "Let's discuss deployment to live Discord.",
+        "Could you explain what happens if we skip approval and deploy live Discord now?",
+    ] {
+        assert_ne!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "boundary discussion was promoted for {value}"
+        );
+    }
+}
+
+#[test]
 fn embedded_discussion_words_do_not_downgrade_a_build() {
     for value in [
         "Build an automation that displays the words discussion only and requires durable timers.",

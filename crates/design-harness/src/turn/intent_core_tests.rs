@@ -2232,7 +2232,7 @@ fn human_grounding_never_preserves_discussion_for_an_explicit_build() {
 }
 
 #[test]
-fn human_grounding_preserves_a_model_preview_on_unclassified_preview_language() {
+fn human_grounding_defaults_builds_without_an_explicit_preview_to_working_draft() {
     for human in [
         "Build a feedback automation, validate it, then show me the result.",
         "Build an automation that detects systems without preview support.",
@@ -2245,8 +2245,25 @@ fn human_grounding_preserves_a_model_preview_on_unclassified_preview_language() 
 
         assert_eq!(
             parsed.requested_outcome(),
-            crate::intent::IntentRequestedOutcome::ValidatedPreview,
-            "domain preview language changed the model outcome for {human}"
+            crate::intent::IntentRequestedOutcome::WorkingDraft,
+            "model outcome survived without an explicit preview request for {human}"
+        );
+    }
+}
+
+#[test]
+fn human_grounding_defaults_gate_bypass_builds_without_an_outcome_request() {
+    let human = "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.";
+    for model_outcome in ["working_draft", "validated_preview"] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!("none");
+        value["requested_outcome"] = json!(model_outcome);
+        let parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+
+        assert_eq!(
+            parsed.requested_outcome(),
+            crate::intent::IntentRequestedOutcome::WorkingDraft,
+            "model outcome survived for {model_outcome}"
         );
     }
 }
