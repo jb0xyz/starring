@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 
 use self::classification::classify_sentence_units;
 use self::evidence::{
-    coordinated_groups_cover_candidate, cross_sentence_role_bridge, evidence_groups,
-    unique_visible_bounded_span, BoundaryEvidenceGroup, CanonicalWhitespaceMap,
+    coordinated_groups_cover_candidate, cross_sentence_role_bridge, dependent_secret_control_group,
+    evidence_groups, unique_visible_bounded_span, BoundaryEvidenceGroup, CanonicalWhitespaceMap,
 };
 use self::syntax::{
     mask_quoted_text, normalized_text, sentence_spans, sentence_units, TextSpan, UnitLink,
@@ -42,6 +42,7 @@ impl SafetyBoundaryAnalysis {
         let mut groups = Vec::new();
         let mut copied_block = false;
         let mut previous_tail = None;
+        let mut previous_sentence_had_secret = false;
         for (span, question) in sentence_spans(&visible) {
             let mut units = classify_sentence_units(&visible, span, question);
             for unit in &mut units {
@@ -57,14 +58,23 @@ impl SafetyBoundaryAnalysis {
                     copied_block = true;
                 }
             }
+            let mut sentence_groups = Vec::new();
             if let (Some(previous), Some(first)) = (previous_tail.as_ref(), units.first()) {
                 if cross_sentence_role_bridge(previous, first) {
                     let mut current = first.clone();
                     current.link = UnitLink::Sequential;
-                    groups.extend(evidence_groups(&[previous.clone(), current], &visible));
+                    sentence_groups.extend(evidence_groups(&[previous.clone(), current], &visible));
                 }
             }
-            groups.extend(evidence_groups(&units, &visible));
+            sentence_groups.extend(evidence_groups(&units, &visible));
+            let sentence_has_secret = sentence_groups
+                .iter()
+                .any(|group| group.request() == IntentBoundaryRequestV2::SecretDisclosure);
+            if previous_sentence_had_secret {
+                sentence_groups.extend(dependent_secret_control_group(&units, &visible));
+            }
+            previous_sentence_had_secret = sentence_has_secret;
+            groups.extend(sentence_groups);
             previous_tail = units.last().cloned();
         }
         let requests = groups

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use super::super::super::intent_interpretation::IntentBoundaryRequestV2;
 use super::super::classification::{
     boundary_action_is_effectively_preserved, closed_gate_control_weakening,
+    closed_secret_acquisition_component, closed_secret_unprotection_continuation,
     inherited_action_negation, live_resource_antecedent, live_resource_pronoun_continuation,
     starts_with_secret_target_object, BoundaryKind, LiveResourceAntecedent, UnitFacts,
     SECRET_ACTIONS,
@@ -151,6 +152,9 @@ pub(in super::super) fn evidence_groups(
                 if distributed_secret_seed(units, &facts, &raw_facts, index) {
                     intervals.insert((expanded_starts[index], expanded_ends[index + 1]));
                 }
+                if secret_acquisition_to_disclosure(units, &facts, index) {
+                    intervals.insert((index, expanded_ends[index + 1]));
+                }
             }
         }
         for (start, end) in intervals {
@@ -160,6 +164,30 @@ pub(in super::super) fn evidence_groups(
         }
     }
     groups
+}
+
+pub(in super::super) fn dependent_secret_control_group(
+    units: &[BoundaryUnit],
+    visible: &[char],
+) -> Option<BoundaryEvidenceGroup> {
+    let first = units.first()?;
+    let last = units.last()?;
+    if units.iter().any(|unit| unit.hypothetical) {
+        return None;
+    }
+    let span = TextSpan {
+        start: first.span.start,
+        end: last.span.end,
+    };
+    let text = visible[span.start..span.end]
+        .iter()
+        .collect::<String>()
+        .to_lowercase();
+    closed_secret_unprotection_continuation(&text).then_some(BoundaryEvidenceGroup {
+        kind: BoundaryKind::Secret,
+        coverage_spans: vec![span],
+        positive_role_spans: vec![span],
+    })
 }
 
 pub(in super::super) fn cross_sentence_role_bridge(
@@ -244,6 +272,25 @@ fn distributed_secret_seed(
     action_to_target || target_to_action || metadata_to_value
 }
 
+fn secret_acquisition_to_disclosure(
+    units: &[BoundaryUnit],
+    facts: &[UnitFacts],
+    index: usize,
+) -> bool {
+    let Some(left) = units.get(index) else {
+        return false;
+    };
+    let Some(right) = units.get(index.saturating_add(1)) else {
+        return false;
+    };
+    !left.hypothetical
+        && !right.hypothetical
+        && matches!(right.link, UnitLink::Additive | UnitLink::Sequential)
+        && closed_secret_acquisition_component(&left.text)
+        && facts[index.saturating_add(1)].is_seed(BoundaryKind::Secret)
+        && starts_with_secret_coreferential_disclosure(&right.text)
+}
+
 fn starts_with_secret_value_content(value: &str) -> bool {
     let value_references = [
         "actual value",
@@ -296,7 +343,9 @@ fn starts_with_secret_coreferential_disclosure(value: &str) -> bool {
         "it",
         "them",
         "its value",
+        "secret value",
         "their value",
+        "the secret value",
         "the value",
         "that value",
     ]
@@ -376,6 +425,9 @@ fn evidence_group_for_interval(
         }
         member_coverage_spans.extend(boundary_coverage_spans(visible, units[index].span, kind));
         if kind == BoundaryKind::Gate && closed_gate_control_weakening(&units[index].text) {
+            member_coverage_spans.push(units[index].span);
+        }
+        if kind == BoundaryKind::Secret && closed_secret_acquisition_component(&units[index].text) {
             member_coverage_spans.push(units[index].span);
         }
         positive_role_spans.extend(positive_role_spans_for_unit(visible, &units[index], kind));

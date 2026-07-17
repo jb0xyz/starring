@@ -38,6 +38,100 @@ pub(super) fn has_unnegated_unprotected_secret(value: &str) -> bool {
     })
 }
 
+pub(in crate::turn::intent_boundary_grounding) fn closed_secret_acquisition_component(
+    value: &str,
+) -> bool {
+    let Some((target_start, target_end)) =
+        maximal_secret_target_occurrences(value).into_iter().next()
+    else {
+        return false;
+    };
+    let prefix = value[..target_start].split_whitespace().collect::<Vec<_>>();
+    let Some((action, qualifiers)) = prefix.split_first() else {
+        return false;
+    };
+    if !["access", "fetch", "get", "load", "read", "retrieve"].contains(action)
+        || !qualifiers.iter().all(|word| {
+            matches!(
+                *word,
+                "a" | "actual"
+                    | "an"
+                    | "application"
+                    | "application's"
+                    | "its"
+                    | "process"
+                    | "process's"
+                    | "raw"
+                    | "runtime"
+                    | "runtime's"
+                    | "server"
+                    | "server's"
+                    | "service"
+                    | "service's"
+                    | "the"
+            )
+        })
+    {
+        return false;
+    }
+    matches!(
+        value[target_end..].trim(),
+        "" | "from configuration"
+            | "from environment"
+            | "from environment variables"
+            | "from its configuration"
+            | "from its environment"
+            | "from its environment variables"
+            | "from keychain"
+            | "from process environment"
+            | "from server environment"
+            | "from the configuration"
+            | "from the environment"
+            | "from the environment variables"
+            | "from the keychain"
+            | "from the process environment"
+            | "from the server environment"
+    )
+}
+
+pub(in crate::turn::intent_boundary_grounding) fn closed_secret_unprotection_continuation(
+    value: &str,
+) -> bool {
+    let Some(remainder) = ["do not ", "don't ", "dont ", "never "]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+    else {
+        return false;
+    };
+    let Some(action_text) = [
+        " it",
+        " them",
+        " the api key",
+        " the api token",
+        " the credential",
+        " the credentials",
+        " the key",
+        " the password",
+        " the secret",
+        " the secret value",
+        " the token",
+        " the value",
+    ]
+    .iter()
+    .find_map(|object| remainder.strip_suffix(object)) else {
+        return false;
+    };
+    let mut has_action = false;
+    action_text.split_whitespace().all(|word| {
+        if matches!(word, "mask" | "redact" | "replace" | "substitute") {
+            has_action = true;
+            true
+        } else {
+            matches!(word, "and" | "either" | "or")
+        }
+    }) && has_action
+}
+
 pub(super) fn source_ordered_bounded_marker_occurrences(
     value: &str,
     markers: &[&str],
