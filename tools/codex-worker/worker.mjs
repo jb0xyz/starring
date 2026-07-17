@@ -364,7 +364,8 @@ export async function startWorker(options = {}) {
     throw new WorkerError("metrics_unavailable", 503);
   }
 
-  const server = createServer(async (request, response) => {
+  const handlers = new Set();
+  const handleRequest = async (request, response) => {
     if (!authorized(request, token)) {
       json(response, 401, { error: { code: "unauthorized" } });
       return;
@@ -468,6 +469,11 @@ export async function startWorker(options = {}) {
     } finally {
       disconnect.cleanup();
     }
+  };
+  const server = createServer((request, response) => {
+    const handling = handleRequest(request, response);
+    handlers.add(handling);
+    handling.finally(() => handlers.delete(handling)).catch(() => {});
   });
   server.requestTimeout = DEFAULT_TIMEOUT_MS + 5_000;
   server.headersTimeout = 10_000;
@@ -484,10 +490,12 @@ export async function startWorker(options = {}) {
       return closePromise;
     }
     scheduler.stop();
-    closePromise = Promise.all([
-      new Promise((resolvePromise) => server.close(() => resolvePromise())),
-      scheduler.idle(),
-    ]).then(() => metrics.flush());
+    closePromise = (async () => {
+      await new Promise((resolvePromise) => server.close(() => resolvePromise()));
+      await Promise.allSettled([...handlers]);
+      await scheduler.idle();
+      await metrics.flush();
+    })();
     return closePromise;
   };
   return {

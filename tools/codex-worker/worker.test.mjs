@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -780,6 +789,35 @@ test("active client disconnect aborts the runner and leaves the worker responsiv
   }
 });
 
+test("graceful close waits for a disconnected handler terminal metric", async () => {
+  const started = deferred();
+  const fixture = await createFixture({
+    concurrency: 1,
+    runner: fakeRunner({
+      complete: async ({ signal }) => new Promise((resolvePromise, rejectPromise) => {
+        const aborted = () => rejectPromise(new Error("aborted"));
+        signal.addEventListener("abort", aborted, { once: true });
+        started.resolve();
+      }),
+    }),
+  });
+  try {
+    const controller = new AbortController();
+    const active = completionFetch(fixture.base, controller.signal);
+    await started.promise;
+    controller.abort();
+    const closing = fixture.worker.close();
+    await assert.rejects(active);
+    await closing;
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].error_code, "client_disconnected");
+    assert.equal(records[0].terminal_stage, "runner");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("timeout and runner failure map to bounded transport errors", async () => {
   const timed = await createFixture({
     timeoutMs: 25,
@@ -999,6 +1037,42 @@ test("startup fails closed when the metrics destination is unavailable", async (
       port: 0,
       runner: fakeRunner(),
       metricsPath: join(blocker, "worker.jsonl"),
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("metrics startup rejects unsafe existing directories without changing permissions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-mode-test-"));
+  const shared = join(directory, "shared");
+  await mkdir(shared, { mode: 0o755 });
+  await chmod(shared, 0o755);
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath: join(shared, "worker.jsonl"),
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  assert.equal((await stat(shared)).mode & 0o777, 0o755);
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("metrics startup rejects a symbolic-link destination", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-link-test-"));
+  const target = join(directory, "target.jsonl");
+  const metricsPath = join(directory, "metrics.jsonl");
+  await writeFile(target, "", { mode: 0o600 });
+  await symlink(target, metricsPath);
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath,
     }),
     (error) => error.code === "metrics_unavailable" && error.status === 503,
   );
