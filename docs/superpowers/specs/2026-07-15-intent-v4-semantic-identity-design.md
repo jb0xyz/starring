@@ -40,10 +40,11 @@ without adding information. A future recipe that supports multiple distinct
 operations must model the operation as a closed typed field rather than a free
 string.
 
-The model remains `gemma4:12b-mlx`. Default supported requests still use one
-model call and one tool call. Explicit recipe-detail requests still use two
-model calls and two tool calls. V4 adds no model retry, repair, router call, or
-event-time model dependency.
+The active authoring provider is `codex_chatgpt`, pinned to `gpt-5.6-luna` with
+`medium` reasoning effort through the private loopback worker. Default supported
+requests still use one model call and one tool call. Explicit recipe-detail
+requests still use two model calls and two tool calls. V4 adds no model retry,
+repair, router call, or event-time model dependency.
 
 ## Problem in V3
 
@@ -64,8 +65,8 @@ Core objective
 
 Three identical custom-detail requests produced one RuleSet and one compiled
 plan but two compiler-input and semantic-intent hashes. The V3 evaluator hid
-part of this risk by instructing Gemma to copy an exact objective in five known
-recipe cases.
+part of this risk by instructing the model to copy an exact objective in five
+known recipe cases.
 
 V3 also has no separate digest for the actual human request. Its
 `input_intent_hash` is a serialization of normalized intent, including revision,
@@ -168,6 +169,11 @@ evidence head, manifest identity, blockers, violations, and selected route
 target. Consequently, two paraphrased human requests may have the same route
 semantic digest but different audited adjudication digests. This is intentional:
 semantic equivalence and evidence provenance are different questions.
+
+Approval-only bypass plus direct live mutation and all-gate bypass plus direct
+live mutation share one V4 route semantic class because the closed boundary
+vocabulary aggregates validation, preview, and approval bypass. Their request
+evidence and audited adjudication identities remain distinct.
 
 ### Compiler input identity
 
@@ -629,13 +635,13 @@ compiled_operations
 
 The compiler manifest moves to V2 and adds `identity_revision = 2`. The recipe
 compiler revision remains 1 because requirement expansion is unchanged. The
-extractor revision moves from 4 to 14, including the closed detail grammar,
+extractor revision moves from 4 to 15, including the closed detail grammar,
 path-only detail frontier, exact slot-literal verifier, supported-base
 classification, runtime-versus-behavior evidence contract, and
 harness-authoritative binding of the non-semantic expected-revision transport
 field before normalization and transcript replay, and removal of the redundant
 model-authored runtime, language, and close-policy fields from the active frontier.
-The normalizer revision moves from 1 to 9, including exact capability-evidence
+The normalizer revision moves from 1 to 10, including exact capability-evidence
 canonicalization, typed safety-boundary evidence ownership, explicit request-mode
 grounding, discussion-only capability-array recovery, bounded presentation, static-base
 ownership reconciliation, dependent runtime-behavior recovery, and complete
@@ -834,8 +840,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         14
-Recipe normalizer revision         9
+Recipe extractor revision         15
+Recipe normalizer revision        10
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -883,7 +889,7 @@ objective cannot be converted into V4 semantics without silently changing the
 meaning of persisted receipts.
 
 Protocol 4 had not shipped on `main` before this branch. Snapshots produced by
-branch-local extractor revisions through 13, normalizer revisions through 8, or
+branch-local extractor revisions through 15, normalizer revisions through 10, or
 an earlier V4 prompt are pre-release evaluation artifacts, not a supported
 durable format. The root Intent snapshot requires the extractor and normalizer
 revisions and the `transcript_integrity_digest`, including for an Empty stage.
@@ -897,9 +903,9 @@ path.
 
 Compatibility rules are:
 
-- the exact V4 prompt with protocol 4, extractor 14, and normalizer 9 is current;
-- a pre-release V4 prompt, extractor revision through 13, or normalizer revision
-  through 8 is rejected;
+- the exact V4 prompt with protocol 4, extractor 16, and normalizer 11 is current;
+- a pre-release V4 prompt, extractor revision through 15, or normalizer revision
+  through 10 is rejected;
 - every V4 root, including `Empty`, requires a well-formed
   `transcript_integrity_digest` matching the complete unprojected transcript;
 - an exact V1, V2, or V3 prompt/protocol pair is explicitly unsupported;
@@ -951,7 +957,7 @@ replay, then runs every deeper defense-in-depth check only for matching bytes.
 
 ## Deterministic verification matrix
 
-The Rust suite must prove each relationship independently of Gemma.
+The Rust suite must prove each relationship independently of model output.
 
 | Change | Request evidence | Compiler input | Semantic intent | Plan | RuleSet |
 |---|---|---|---|---|---|
@@ -1171,7 +1177,7 @@ typed decisions, not duplicated raw user text.
 7. `feat(intent): harden V4 restore and snapshot compatibility`
 8. `test(eval): enforce V4 identity relationships`
 9. `perf(eval): expose request and token measurements`
-10. `docs(eval): record clean Gemma V4 evidence`
+10. `docs(eval): record clean V4 evidence`
 
 Every implementation commit must pass focused tests and remain reviewable. The
 final branch must pass workspace tests, clippy with warnings denied, formatting,

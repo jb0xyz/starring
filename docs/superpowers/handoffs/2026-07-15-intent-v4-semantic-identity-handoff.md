@@ -1,3 +1,8 @@
+> Historical checkpoint: current Luna V4 acceptance evidence and continuation
+> live in
+> `docs/superpowers/handoffs/2026-07-17-luna-v4-acceptance-hardening-handoff.md`.
+> Preserve the body below as the pre-certification Intent V4 record.
+
 # Intent V4 Semantic Identity Handoff
 
 > Serving update, 2026-07-17: the Gemma-only evaluation and continuation
@@ -296,9 +301,9 @@ not resent. Every eligible history turn is replayed once before context-fit
 trimming; failed or non-discussion results contribute no assistant prose.
 
 Snapshot schema 8 requires the exact V4 prompt, protocol 4, extractor revision
-14, normalizer revision 9, component identities, stage bindings, and a complete
+16, normalizer revision 11, component identities, stage bindings, and a complete
 transcript-integrity digest even for an Empty stage. V3 Intent snapshots and
-pre-release V4 extractor revisions through 13 or normalizer revisions through 8
+pre-release V4 extractor revisions through 15 or normalizer revisions through 10
 are rejected. V6 and V7 non-Intent snapshots may be promoted at the CLI edge;
 V6 or V7 snapshots containing Intent state are rejected.
 
@@ -320,8 +325,8 @@ Intent adjudicator                 3
 Intent workspace schema            2
 Intent identity revision           2
 Session snapshot                   8
-Recipe extractor revision         14
-Recipe normalizer revision         9
+Recipe extractor revision         16
+Recipe normalizer revision        11
 Recipe compiler revision           1
 Recipe simulator revision          1
 Recipe version                     1
@@ -337,7 +342,7 @@ OpenAI-compatible gateway           http://127.0.0.1:18080/v1
 The current recipe-registry digest pinned by the evaluator is:
 
 ```text
-23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d
+5783590262c2971922aa54d4262b37107489c8dbe88678fb1a60e27e39b8858c
 ```
 
 The gateway-reported model tag is checked exactly. It is not a weights digest.

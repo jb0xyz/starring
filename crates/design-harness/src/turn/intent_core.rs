@@ -8,9 +8,12 @@ use crate::errors::{translate_tool_arguments_error, StructuredError};
 use crate::intent::{ExistingChannelKey, IntentRequestedOutcome};
 use crate::tools::ToolDefinition;
 
-use super::intent_boundary_grounding::analyze_safety_boundaries;
+use super::intent_boundary_grounding::{
+    analyze_safety_boundaries, SafetyBoundaryAnalysis, UnquotedGroundingLink,
+};
 use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
+    asserted_safety_control_restatements, custom_automation_is_runtime_only,
     reconcile_unmapped_capabilities_with_context, CapabilityReconciliationError,
     ManagedRecipeCoreContext,
 };
@@ -173,7 +176,10 @@ struct InterpretIntentCoreWireV4 {
     #[serde(default)]
     #[schemars(skip)]
     custom_detail_facets: Vec<CustomDetailFacetWireV3>,
-    #[schemars(length(max = 480))]
+    #[schemars(
+        length(max = 480),
+        description = "Discussion only: write 2 or 3 short complete sentences, preferably within 360 UTF-16 units, and finish with terminal punctuation; use an empty string for a build"
+    )]
     response: String,
 }
 
@@ -272,6 +278,15 @@ impl IntentCoreInterpretationV4 {
         } else {
             PrivateStudyRoomDetailTicketV4::empty()
         };
+        if self.automation_kind == IntentAutomationKindV2::CustomAutomation
+            && custom_automation_is_runtime_only(
+                &canonical_human,
+                &self.runtime_requirements,
+                &unclassified_requirements,
+            )
+        {
+            self.automation_kind = IntentAutomationKindV2::None;
+        }
         let boundary_analysis = analyze_safety_boundaries(human_message);
         unclassified_requirements
             .retain(|requirement| !boundary_analysis.owns_capability_evidence(requirement));
@@ -444,6 +459,15 @@ fn parse_grounded_intent_core(
 ) -> Result<IntentCoreInterpretationV4, StructuredError> {
     validate_intent_human_grounding_size(human_message)?;
     let grounded = grounded_request_controls(human_message);
+    let boundary_analysis = analyze_safety_boundaries(human_message);
+    let grounded_mode = grounded.mode.or_else(|| {
+        (!boundary_analysis.requests().is_empty()).then_some(IntentRequestModeV2::Build)
+    });
+    let boundary_only = boundary_only_request(
+        &boundary_analysis,
+        human_message,
+        grounded.active_semantic_units.as_deref(),
+    );
     if grounded
         .active_semantic_units
         .as_ref()
@@ -461,7 +485,7 @@ fn parse_grounded_intent_core(
     let mut input = match parse_core_wire(arguments) {
         Ok(input) => input,
         Err(error)
-            if grounded.mode == Some(IntentRequestModeV2::Discussion)
+            if grounded_mode == Some(IntentRequestModeV2::Discussion)
                 && missing_discussion_capabilities(&error) =>
         {
             parse_core_wire(&supply_empty_discussion_capabilities(arguments)?)?
@@ -471,7 +495,7 @@ fn parse_grounded_intent_core(
     if let Some(expected_revision) = expected_revision {
         input.expected_revision = expected_revision;
     }
-    apply_grounded_request_mode(&mut input, grounded.mode, grounded.preview);
+    apply_grounded_request_mode(&mut input, grounded_mode, grounded.preview, boundary_only);
     apply_grounded_closed_axes(&mut input, grounded.closed_axes)?;
     apply_grounded_runtime_requirements(&mut input, grounded.active_semantic_units.as_deref())?;
     normalize_core(input)
@@ -596,6 +620,7 @@ fn apply_grounded_request_mode(
     input: &mut InterpretIntentCoreWireV4,
     grounded_mode: Option<IntentRequestModeV2>,
     grounded_preview: Option<bool>,
+    boundary_only: bool,
 ) {
     match grounded_mode {
         Some(IntentRequestModeV2::Discussion) => {
@@ -610,18 +635,84 @@ fn apply_grounded_request_mode(
         }
         Some(IntentRequestModeV2::Build) => {
             input.request_mode = IntentRequestModeV2::Build;
+            if boundary_only {
+                input.automation_kind = IntentAutomationKindV2::None;
+                input.hub_channel = RequiredNullableChannelV3(None);
+                input.other_unmapped_required_capabilities.clear();
+                input.custom_detail_facets.clear();
+            }
             input.requested_outcome = match grounded_preview {
                 Some(true) => IntentRequestedOutcome::ValidatedPreview,
-                Some(false) => IntentRequestedOutcome::WorkingDraft,
-                None if input.requested_outcome == IntentRequestedOutcome::Discussion => {
-                    IntentRequestedOutcome::WorkingDraft
-                }
-                None => input.requested_outcome,
+                Some(false) | None => IntentRequestedOutcome::WorkingDraft,
             };
             input.response.clear();
         }
         None => {}
     }
+}
+
+fn boundary_only_request(
+    analysis: &SafetyBoundaryAnalysis,
+    human_message: &str,
+    active_semantic_units: Option<&[GroundedSemanticUnit]>,
+) -> bool {
+    if analysis.requests().is_empty() {
+        return false;
+    }
+    let Some(active_semantic_units) = active_semantic_units else {
+        return false;
+    };
+    let mut has_authoritative = false;
+    let mut unowned: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for unit in active_semantic_units
+        .iter()
+        .filter(|unit| unit.authoritative)
+    {
+        has_authoritative = true;
+        if analysis.owns_capability_evidence(&unit.text) {
+            if let Some(current) = current.take() {
+                unowned.push(current);
+            }
+            continue;
+        }
+        if unit.link == UnquotedGroundingLink::Additive {
+            if let Some(current) = current.as_mut() {
+                current.push_str(" and ");
+                current.push_str(&unit.text);
+                continue;
+            }
+        }
+        if let Some(current) = current.replace(unit.text.clone()) {
+            unowned.push(current);
+        }
+    }
+    if let Some(current) = current {
+        unowned.push(current);
+    }
+    if !has_authoritative {
+        return false;
+    }
+    unowned.is_empty()
+        || unowned.iter().all(|value| {
+            asserted_safety_control_restatements(human_message, &[value.as_str()])
+                || closed_rejected_design_alternative(human_message, value)
+        })
+}
+
+fn closed_rejected_design_alternative(human_message: &str, value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_lowercase();
+    let frame = match value.as_str() {
+        "of producing a design" | "of producing the design" => format!("instead {value}"),
+        "producing a design" | "producing the design" => format!("instead of {value}"),
+        _ => return false,
+    };
+    canonical_human_message(human_message)
+        .to_lowercase()
+        .contains(&frame)
 }
 
 fn apply_grounded_runtime_requirements(
@@ -840,7 +931,50 @@ fn normalized_response(
         false,
         "intent.core.response",
     )?;
+    if !has_complete_discussion_terminal(&normalized) {
+        return Err(core_error(
+            "INCOMPLETE_INTENT_RESPONSE",
+            "intent.core.response",
+            "The discussion response does not end with complete terminal punctuation",
+            "Rewrite it as two or three short complete sentences within 360 UTF-16 units and finish with terminal punctuation",
+        ));
+    }
     Ok(normalized)
+}
+
+fn has_complete_discussion_terminal(value: &str) -> bool {
+    let mut end = value.len();
+    while let Some(character) = value[..end].chars().next_back() {
+        if matches!(
+            character,
+            '"' | '\''
+                | ')'
+                | ']'
+                | '}'
+                | '”'
+                | '’'
+                | '」'
+                | '』'
+                | '】'
+                | '）'
+                | '］'
+                | '｝'
+                | '*'
+                | '_'
+                | '`'
+        ) {
+            end -= character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let terminal = &value[..end];
+    !terminal.ends_with("...")
+        && !terminal.ends_with('…')
+        && matches!(
+            terminal.chars().next_back(),
+            Some('.' | '!' | '?' | '。' | '！' | '？')
+        )
 }
 
 fn normalize_runtime_requirements(values: Vec<RuntimeRequirementV3>) -> RuntimeRequirementsV2 {

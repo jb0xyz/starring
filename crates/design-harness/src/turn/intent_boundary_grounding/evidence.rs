@@ -14,8 +14,8 @@ mod grouping;
 
 pub(super) use canonical::{unique_visible_bounded_span, CanonicalWhitespaceMap};
 pub(super) use grouping::{
-    coordinated_groups_cover_candidate, cross_sentence_role_bridge, evidence_groups,
-    BoundaryEvidenceGroup,
+    coordinated_groups_cover_candidate, cross_sentence_role_bridge, dependent_secret_control_group,
+    evidence_groups, BoundaryEvidenceGroup,
 };
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use super::super::super::intent_interpretation::IntentBoundaryRequestV2;
 use super::super::classification::{
     boundary_action_is_effectively_preserved, closed_gate_control_weakening,
+    closed_secret_acquisition_component, closed_secret_unprotection_continuation,
     inherited_action_negation, live_resource_antecedent, live_resource_pronoun_continuation,
     starts_with_secret_target_object, BoundaryKind, LiveResourceAntecedent, UnitFacts,
     SECRET_ACTIONS,
@@ -151,6 +152,9 @@ pub(in super::super) fn evidence_groups(
                 if distributed_secret_seed(units, &facts, &raw_facts, index) {
                     intervals.insert((expanded_starts[index], expanded_ends[index + 1]));
                 }
+                if secret_acquisition_to_disclosure(units, &facts, index) {
+                    intervals.insert((index, expanded_ends[index + 1]));
+                }
             }
         }
         for (start, end) in intervals {
@@ -160,6 +164,30 @@ pub(in super::super) fn evidence_groups(
         }
     }
     groups
+}
+
+pub(in super::super) fn dependent_secret_control_group(
+    units: &[BoundaryUnit],
+    visible: &[char],
+) -> Option<BoundaryEvidenceGroup> {
+    let first = units.first()?;
+    let last = units.last()?;
+    if units.iter().any(|unit| unit.hypothetical) {
+        return None;
+    }
+    let span = TextSpan {
+        start: first.span.start,
+        end: last.span.end,
+    };
+    let text = visible[span.start..span.end]
+        .iter()
+        .collect::<String>()
+        .to_lowercase();
+    closed_secret_unprotection_continuation(&text).then_some(BoundaryEvidenceGroup {
+        kind: BoundaryKind::Secret,
+        coverage_spans: vec![span],
+        positive_role_spans: vec![span],
+    })
 }
 
 pub(in super::super) fn cross_sentence_role_bridge(
@@ -244,6 +272,25 @@ fn distributed_secret_seed(
     action_to_target || target_to_action || metadata_to_value
 }
 
+fn secret_acquisition_to_disclosure(
+    units: &[BoundaryUnit],
+    facts: &[UnitFacts],
+    index: usize,
+) -> bool {
+    let Some(left) = units.get(index) else {
+        return false;
+    };
+    let Some(right) = units.get(index.saturating_add(1)) else {
+        return false;
+    };
+    !left.hypothetical
+        && !right.hypothetical
+        && matches!(right.link, UnitLink::Additive | UnitLink::Sequential)
+        && closed_secret_acquisition_component(&left.text)
+        && facts[index.saturating_add(1)].is_seed(BoundaryKind::Secret)
+        && starts_with_secret_coreferential_disclosure(&right.text)
+}
+
 fn starts_with_secret_value_content(value: &str) -> bool {
     let value_references = [
         "actual value",
@@ -296,7 +343,9 @@ fn starts_with_secret_coreferential_disclosure(value: &str) -> bool {
         "it",
         "them",
         "its value",
+        "secret value",
         "their value",
+        "the secret value",
         "the value",
         "that value",
     ]
@@ -316,41 +365,71 @@ pub(in super::super) fn coordinated_groups_cover_candidate(
     candidate: TextSpan,
     visible: &[char],
 ) -> bool {
-    [BoundaryKind::Gate, BoundaryKind::Live, BoundaryKind::Secret]
-        .into_iter()
-        .any(|kind| {
-            let matching = groups
-                .iter()
-                .filter(|group| {
-                    group.kind == kind
-                        && group
-                            .positive_role_spans
-                            .iter()
-                            .any(|span| candidate.start < span.end && candidate.end > span.start)
-                })
-                .collect::<Vec<_>>();
-            if matching.len() < 2 {
-                return false;
-            }
-            let mut coverage_spans = matching
-                .iter()
-                .flat_map(|group| group.coverage_spans.iter().copied())
-                .collect::<Vec<_>>();
-            coverage_spans.extend(marker_occurrence_spans(visible, candidate, &["but"], false));
-            let positive_role_spans = matching
-                .iter()
-                .flat_map(|group| group.positive_role_spans.iter().copied())
-                .collect();
-            group_covers_candidate(
-                &BoundaryEvidenceGroup {
-                    kind,
-                    coverage_spans: merged_spans(coverage_spans),
-                    positive_role_spans,
-                },
-                candidate,
-                visible,
-            )
+    for kind in [BoundaryKind::Gate, BoundaryKind::Live, BoundaryKind::Secret] {
+        let matching = intersecting_groups(groups, candidate, Some(kind));
+        if matching.len() >= 2
+            && joined_groups_cover_candidate(&matching, candidate, visible, kind, &["but"])
+        {
+            return true;
+        }
+    }
+    let matching = intersecting_groups(groups, candidate, None);
+    let Some(first) = matching.first() else {
+        return false;
+    };
+    matching.len() >= 2
+        && matching.iter().any(|group| group.kind != first.kind)
+        && joined_groups_cover_candidate(
+            &matching,
+            candidate,
+            visible,
+            first.kind,
+            &["and", "but", "then"],
+        )
+}
+
+fn intersecting_groups(
+    groups: &[BoundaryEvidenceGroup],
+    candidate: TextSpan,
+    kind: Option<BoundaryKind>,
+) -> Vec<&BoundaryEvidenceGroup> {
+    groups
+        .iter()
+        .filter(|group| {
+            kind.is_none_or(|kind| group.kind == kind)
+                && group
+                    .positive_role_spans
+                    .iter()
+                    .any(|span| candidate.start < span.end && candidate.end > span.start)
         })
+        .collect()
+}
+
+fn joined_groups_cover_candidate(
+    groups: &[&BoundaryEvidenceGroup],
+    candidate: TextSpan,
+    visible: &[char],
+    kind: BoundaryKind,
+    joiners: &[&str],
+) -> bool {
+    let mut coverage_spans = groups
+        .iter()
+        .flat_map(|group| group.coverage_spans.iter().copied())
+        .collect::<Vec<_>>();
+    coverage_spans.extend(marker_occurrence_spans(visible, candidate, joiners, false));
+    let positive_role_spans = groups
+        .iter()
+        .flat_map(|group| group.positive_role_spans.iter().copied())
+        .collect();
+    group_covers_candidate(
+        &BoundaryEvidenceGroup {
+            kind,
+            coverage_spans: merged_spans(coverage_spans),
+            positive_role_spans,
+        },
+        candidate,
+        visible,
+    )
 }
 
 fn evidence_group_for_interval(
@@ -376,6 +455,9 @@ fn evidence_group_for_interval(
         }
         member_coverage_spans.extend(boundary_coverage_spans(visible, units[index].span, kind));
         if kind == BoundaryKind::Gate && closed_gate_control_weakening(&units[index].text) {
+            member_coverage_spans.push(units[index].span);
+        }
+        if kind == BoundaryKind::Secret && closed_secret_acquisition_component(&units[index].text) {
             member_coverage_spans.push(units[index].span);
         }
         positive_role_spans.extend(positive_role_spans_for_unit(visible, &units[index], kind));

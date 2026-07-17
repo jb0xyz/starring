@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use crate::llm::{Message, MessageRole};
 use crate::strict_json::{parse_json_with_unique_object_keys, StrictJsonError};
 use crate::turn::{
-    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS, INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
+    grounded_request_mode, IntentRequestModeV2, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    INTERPRET_INTENT_CORE, RESOLVE_INTENT_DECISION,
 };
 use serde::Deserialize;
 
@@ -17,6 +18,7 @@ use super::state::{
 pub(super) struct RestoredIntentStateAnchorV1 {
     stage: String,
     pub(super) expected_revision: u64,
+    grounded_request_mode: Option<IntentRequestModeV2>,
     pub(super) available_channel_keys: Vec<String>,
     active_question: Option<String>,
     active_options: Vec<String>,
@@ -75,6 +77,7 @@ pub(super) fn validate_v4_transcript(
         let human_message_index = u64::try_from(index)
             .map_err(|_| snapshot_error("intent transcript message index overflowed"))?;
         validate_human_envelope(&messages[index])?;
+        let human = restored_human_text(&messages[index])?;
         index = index.saturating_add(1);
         let state_message = messages.get(index).ok_or_else(|| {
             snapshot_error("intent human message is missing its following INTENT_STATE anchor")
@@ -89,7 +92,7 @@ pub(super) fn validate_v4_transcript(
                 ));
             }
         };
-        validate_intent_state_anchor(&state)?;
+        validate_intent_state_anchor(&state, &human)?;
         index = index.saturating_add(1);
         let mut turn = IntentTranscriptTurnV4 {
             human_message_index,
@@ -251,6 +254,7 @@ pub(super) fn parse_intent_state_anchor(
 
 pub(super) fn validate_intent_state_anchor(
     state: &RestoredIntentStateAnchorV1,
+    human_message: &str,
 ) -> Result<(), SessionSnapshotError> {
     let mut available = BTreeSet::new();
     if state
@@ -286,6 +290,11 @@ pub(super) fn validate_intent_state_anchor(
         _ => false,
     };
     let _ = state.expected_revision;
+    if state.grounded_request_mode != grounded_request_mode(human_message) {
+        return Err(snapshot_error(
+            "intent transcript state anchor request mode does not match its human turn",
+        ));
+    }
     if shape_valid {
         Ok(())
     } else {

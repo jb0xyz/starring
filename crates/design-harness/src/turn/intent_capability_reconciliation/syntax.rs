@@ -221,6 +221,42 @@ impl<'a> SourceText<'a> {
         )
     }
 
+    pub(super) fn unique_asserted_where_head_tokens(&self, value: &str) -> Option<Vec<String>> {
+        if value.is_empty() {
+            return None;
+        }
+        let value = trim_terminal_semantic_delimiters(value);
+        let mut matching = self.clauses.iter().filter_map(|clause| {
+            if clause.hypothetical {
+                return None;
+            }
+            let where_index = clause
+                .tokens
+                .iter()
+                .position(|token| token.lower == "where")?;
+            let head = clause.tokens.get(..where_index)?;
+            let first = head.first()?;
+            let last = head.last()?;
+            let span = Span {
+                start: first.span.start,
+                end: last.span.end,
+            };
+            if self.overlaps_quote(span)
+                || !self
+                    .value(span)
+                    .is_some_and(|head| head.eq_ignore_ascii_case(value))
+            {
+                return None;
+            }
+            Some(head)
+        });
+        let head = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(head.iter().map(|token| token.lower.clone()).collect())
+    }
+
     pub(super) fn unique_complete_asserted_sentence_tokens(
         &self,
         value: &str,
@@ -625,6 +661,43 @@ mod tests {
                 "preview".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn asserted_where_head_identity_is_exact_unique_and_unquoted() {
+        let source = SourceText::analyze(
+            "Build a persistent Discord game where every message earns XP, and timers advance quests.",
+        )
+        .unwrap();
+        assert_eq!(
+            source.unique_asserted_where_head_tokens("build a persistent discord game"),
+            Some(vec![
+                "build".to_string(),
+                "a".to_string(),
+                "persistent".to_string(),
+                "discord".to_string(),
+                "game".to_string(),
+            ])
+        );
+        assert!(source
+            .unique_asserted_where_head_tokens("Build a persistent Discord")
+            .is_none());
+
+        let quoted = SourceText::analyze(
+            "Post 'Build a persistent Discord game where every message earns XP'.",
+        )
+        .unwrap();
+        assert!(quoted
+            .unique_asserted_where_head_tokens("Build a persistent Discord game")
+            .is_none());
+
+        let duplicate = SourceText::analyze(
+            "Build a persistent Discord game where every message earns XP. Build a persistent Discord game where timers advance quests.",
+        )
+        .unwrap();
+        assert!(duplicate
+            .unique_asserted_where_head_tokens("Build a persistent Discord game")
+            .is_none());
     }
 
     #[test]

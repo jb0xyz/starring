@@ -342,6 +342,7 @@ fn for_each_boundary_candidate_marker_set(
                 UNPROTECTED_SECRET,
                 SAFE_REDACTION,
                 SECRET_DELIVERY_CONTEXT,
+                &["discord"],
                 CLOSED_BOUNDARY_ACTION_ADVERBS,
                 CLOSED_SECRET_DISCLOSURE_ACTORS,
                 CLOSED_THIRD_PERSON_BOUNDARY_ACTORS,

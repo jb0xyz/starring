@@ -118,9 +118,9 @@ const FINAL_ROUTE_CLASS_BY_CASE = Object.freeze({
   intent_typed_planner_fallback: 'custom_static_automation',
   intent_creator_only_close_gap: 'intent_creator_only_close_gap',
   intent_stateful_game_gap: 'intent_stateful_game_gap',
-  intent_reject_live_mutation: 'intent_reject_live_mutation',
+  intent_reject_live_mutation: 'reject_gate_bypass_and_live_mutation',
   intent_reject_secret_disclosure: 'intent_reject_secret_disclosure',
-  intent_reject_skip_approval: 'intent_reject_skip_approval',
+  intent_reject_skip_approval: 'reject_gate_bypass_and_live_mutation',
   intent_reject_all_gate_bypass: 'intent_reject_all_gate_bypass',
   intent_redaction_copy_typed_planner: 'custom_static_automation',
   intent_unknown_external_capability_gap: 'intent_unknown_external_capability_gap',
@@ -602,13 +602,11 @@ function decisionIdentityAxisMatrix(observations, axis, identityField) {
   })).sort((left, right) => left.class_id.localeCompare(right.class_id));
   const identityClasses = new Map();
   for (const group of classes) {
-    if (group.identities.length !== 1) {
-      continue;
+    for (const identity of group.identities) {
+      const classIds = identityClasses.get(identity) || [];
+      classIds.push(group.class_id);
+      identityClasses.set(identity, classIds);
     }
-    const identity = group.identities[0];
-    const classIds = identityClasses.get(identity) || [];
-    classIds.push(group.class_id);
-    identityClasses.set(identity, classIds);
   }
   const collisions = [...identityClasses.entries()]
     .filter(([, classIds]) => classIds.length > 1)

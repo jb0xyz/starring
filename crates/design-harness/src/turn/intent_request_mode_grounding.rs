@@ -1,4 +1,6 @@
-use super::intent_boundary_grounding::{unquoted_grounding_text, UnquotedGroundingLink};
+use super::intent_boundary_grounding::{
+    analyze_safety_boundaries, unquoted_grounding_text, UnquotedGroundingLink,
+};
 use super::intent_interpretation::IntentRequestModeV2;
 
 mod closed_axes;
@@ -28,9 +30,14 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
     semantic_authority::grounded_request_controls(human)
 }
 
-#[cfg(test)]
-pub(super) fn grounded_request_mode(human: &str) -> Option<IntentRequestModeV2> {
-    grounded_request_controls(human).mode
+pub(crate) fn grounded_request_mode(human: &str) -> Option<IntentRequestModeV2> {
+    grounded_request_controls(human)
+        .mode
+        .or_else(|| safety_boundary_request_mode(human))
+}
+
+pub(super) fn safety_boundary_request_mode(human: &str) -> Option<IntentRequestModeV2> {
+    (!analyze_safety_boundaries(human).requests().is_empty()).then_some(IntentRequestModeV2::Build)
 }
 
 #[cfg(test)]

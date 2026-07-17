@@ -13,7 +13,7 @@ const {
 const { candidateIdentityHashes } = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d';
+const REGISTRY_DIGEST = 'fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -383,8 +383,8 @@ function report(order, compilerInputHash, turns = [buildTurn()]) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 14,
-      normalizer_revision: 9,
+      extractor_revision: 16,
+      normalizer_revision: 15,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -691,6 +691,8 @@ function passingDocument() {
       intent_normalizer_multi_sentence_metalinguistic_copy: 'discussion-unspecified',
       intent_typed_planner_fallback: 'custom-static-automation',
       intent_redaction_copy_typed_planner: 'custom-static-automation',
+      intent_reject_live_mutation: 'reject-gate-bypass-and-live-mutation',
+      intent_reject_skip_approval: 'reject-gate-bypass-and-live-mutation',
     }[caseId] || caseId;
     decision.semantic_ir_digest = digest(`route:${routeClass}`);
     decision.request_evidence_hash = digest(`request:${caseId}`);
@@ -1015,6 +1017,55 @@ test('checkpoint acceptance enforces repeated Luna recipe quality and equivalenc
   );
 });
 
+test('gate bypass evidence classes share one V4 route class without collapsing provenance', () => {
+  const document = passingDocument();
+  const liveMutation = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_reject_live_mutation',
+  ).response.metadata.final_intent.route_decision;
+  const skipApproval = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_reject_skip_approval',
+  ).response.metadata.final_intent.route_decision;
+
+  assert.equal(liveMutation.semantic_ir_digest, skipApproval.semantic_ir_digest);
+  assert.notEqual(liveMutation.request_evidence_hash, skipApproval.request_evidence_hash);
+  assert.notEqual(liveMutation.adjudication_digest, skipApproval.adjudication_digest);
+  assert.deepEqual(liveMutation.boundary_violations, skipApproval.boundary_violations);
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const sharedClass = routeAxis.classes.find(
+    (entry) => entry.class_id === 'reject_gate_bypass_and_live_mutation',
+  );
+
+  assert.equal(assessment.pass, true);
+  assert.equal(sharedClass.samples, 40);
+  assert.equal(sharedClass.identities.length, 1);
+  assert.equal(routeAxis.collisions.length, 0);
+});
+
+test('gate bypass route equivalence fails closed when one evidence class diverges', () => {
+  const document = passingDocument();
+  for (const entry of document.results.results.filter(
+    (rowEntry) => rowEntry.vars.caseId === 'intent_reject_skip_approval',
+  )) {
+    for (const decision of [
+      ...entry.response.metadata.turns.map((turn) => turn.route_decision).filter(Boolean),
+      entry.response.metadata.final_intent.route_decision,
+    ]) {
+      decision.semantic_ir_digest = digest('route:forged-approval-only-split');
+    }
+  }
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const sharedClass = routeAxis.classes.find(
+    (entry) => entry.class_id === 'reject_gate_bypass_and_live_mutation',
+  );
+
+  assert.equal(assessment.pass, false);
+  assert.equal(sharedClass.identities.length, 2);
+});
+
 test('checkpoint records a missing final decision as failed evidence without crashing', () => {
   const document = passingDocument();
   const failed = document.results.results.find((entry) => (
@@ -1094,7 +1145,7 @@ test('checkpoint boundary canonicalizes session configuration key order', () => 
 
 test('checkpoint rejects stale extractor, normalizer, and forged registry identities', () => {
   const oldExtractor = passingDocument();
-  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 13;
+  oldExtractor.results.results[0].response.metadata.catalog_identity.extractor_revision = 14;
   const oldExtractorAssessment = assess(oldExtractor);
   assert.equal(oldExtractorAssessment.pass, false);
   assert.equal(
@@ -1103,7 +1154,7 @@ test('checkpoint rejects stale extractor, normalizer, and forged registry identi
   );
 
   const oldNormalizer = passingDocument();
-  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 8;
+  oldNormalizer.results.results[0].response.metadata.catalog_identity.normalizer_revision = 9;
   const oldNormalizerAssessment = assess(oldNormalizer);
   assert.equal(oldNormalizerAssessment.pass, false);
   assert.equal(
@@ -1451,6 +1502,34 @@ test('equivalent hidden Core route projections cannot diverge', () => {
     (entry) => entry.class_id === 'custom_static_automation',
   );
   assert.equal(customStatic.identities.length, 2);
+});
+
+test('unstable identity classes still expose cross-class collisions', () => {
+  const document = passingDocument();
+  const statefulIdentity = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_stateful_game_gap',
+  ).response.metadata.final_intent.route_decision.semantic_ir_digest;
+  const redaction = document.results.results.find(
+    (entry) => entry.vars.caseId === 'intent_redaction_copy_typed_planner',
+  ).response.metadata;
+  for (const decision of [
+    ...redaction.turns.map((turn) => turn.route_decision).filter(Boolean),
+    redaction.final_intent.route_decision,
+  ]) {
+    decision.semantic_ir_digest = statefulIdentity;
+  }
+
+  const assessment = assess(document);
+  const routeAxis = assessment.decision_identity_classes.axes.route;
+  const collision = routeAxis.collisions.find(
+    (entry) => entry.identity === statefulIdentity,
+  );
+  assert.equal(assessment.pass, false);
+  assert.ok(collision);
+  assert.deepEqual(collision.class_ids, [
+    'custom_static_automation',
+    'intent_stateful_game_gap',
+  ]);
 });
 
 test('equivalent routes cannot collapse distinct request evidence', () => {

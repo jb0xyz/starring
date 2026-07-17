@@ -50,6 +50,187 @@ fn custom_modal_and_private_submission_response_are_owned() {
 }
 
 #[test]
+fn custom_static_redaction_copy_is_owned() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Produce the working design now, but do not deploy it or expose any actual secret.";
+    for candidate in [
+        "secrets are redacted and substituted with [REDACTED]",
+        "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]",
+        "static panel message with secret redaction and a [REDACTED] placeholder",
+        "static moderation panel message redacts secrets and substitutes [REDACTED]",
+        "secret values are masked and replaced with a [REDACTED] placeholder",
+        "redact secret values by substituting them with [REDACTED]",
+        "static panel redaction using a [REDACTED] replacement",
+    ] {
+        assert!(
+            reconcile_unmapped_capabilities(
+                human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap_or_else(|error| panic!("static copy failed for {candidate}: {error:?}"))
+            .is_empty(),
+            "static copy remained for {candidate}"
+        );
+    }
+}
+
+#[test]
+fn closed_static_redaction_request_ignores_model_only_capabilities() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Produce the working design now, but do not deploy it or expose any actual secret.";
+    for candidate in [
+        "automatic transcript archiving",
+        "external consensus lease",
+        "publish unredacted secrets",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap_or_else(|error| panic!("closed request failed for {candidate}: {error:?}")),
+            Vec::<String>::new()
+        );
+    }
+}
+
+#[test]
+fn closed_static_redaction_request_preserves_grounded_independent_requirements() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Replace any message.";
+    let independent = "Replace any message";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&[independent]),
+        )
+        .unwrap(),
+        strings(&[independent])
+    );
+}
+
+#[test]
+fn custom_static_redaction_ownership_preserves_unsupported_requirements() {
+    let safe = "secrets are redacted and substituted with [REDACTED]";
+    for unsupported in [
+        "the panel archives every transcript",
+        "a worker must acquire an external consensus lease before posting",
+        "every message earns XP",
+        "a webhook receives the unredacted secret",
+    ] {
+        let human = format!(
+            "Build a static moderation panel whose message says {safe}. Additionally, {unsupported}."
+        );
+        let reconciled = reconcile_unmapped_capabilities(
+            &human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&[safe, unsupported]),
+        )
+        .unwrap_or_else(|error| {
+            panic!("unsupported requirement failed for {unsupported}: {error:?}")
+        });
+        assert!(
+            !reconciled.is_empty(),
+            "unsupported requirement was consumed for {unsupported}"
+        );
+        assert!(
+            reconciled.iter().all(|value| value != safe),
+            "safe static copy remained for {unsupported}: {reconciled:?}"
+        );
+    }
+}
+
+#[test]
+fn custom_static_redaction_ownership_rejects_mixed_or_wrong_route_candidates() {
+    let mixed = "secrets are redacted and substituted with [REDACTED] and the panel archives every transcript";
+    let human = format!("Build a static moderation panel whose message says {mixed}.");
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            &human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&[mixed]),
+        )
+        .unwrap(),
+        strings(&[mixed])
+    );
+
+    let upload = "secrets are redacted and substituted with [REDACTED] and uploaded to storage";
+    let human = format!("Build a static moderation panel whose message says {upload}.");
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            &human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&[upload]),
+        )
+        .unwrap(),
+        strings(&[upload])
+    );
+
+    let safe = "secrets are redacted and substituted with [REDACTED]";
+    let human = format!("Build a static moderation panel whose message says {safe}.");
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            &human,
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            &no_runtime(),
+            strings(&[safe]),
+        )
+        .unwrap(),
+        strings(&[safe])
+    );
+}
+
+#[test]
+fn custom_static_redaction_ownership_does_not_excuse_unrelated_ungrounded_evidence() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Archive every transcript.";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::CustomAutomation,
+            &no_runtime(),
+            strings(&["automatic transcript archiving"]),
+        )
+        .unwrap_err(),
+        CapabilityReconciliationError::Grounding {
+            candidate_index: 0,
+            reason: CapabilityEvidenceGroundingError::Ungrounded,
+        }
+    );
+}
+
+#[test]
+fn custom_static_redaction_ownership_requires_authoritative_source_evidence() {
+    let candidate = "secrets are redacted and substituted with [REDACTED]";
+    for human in [
+        "Build a static moderation panel whose message says hello.",
+        "If secrets are redacted and substituted with a placeholder. Build a static moderation panel whose message says hello.",
+        "The label is 'secrets are redacted and substituted with a placeholder'. Build a static moderation panel whose message says hello.",
+        "Build a static moderation panel whose message says hello. Redaction uses a substituted placeholder elsewhere.",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap_err(),
+            CapabilityReconciliationError::Grounding {
+                candidate_index: 0,
+                reason: CapabilityEvidenceGroundingError::Ungrounded,
+            },
+            "ungrounded redaction was consumed for {human}"
+        );
+    }
+}
+
+#[test]
 fn terminal_sentence_delimiters_preserve_authority_without_changing_evidence() {
     for delimiter in [".", "!", "?", "。", "！", "？", ";", "；", "\n", "\r"] {
         let candidate = format!("Every message earns XP{delimiter}");
@@ -663,6 +844,132 @@ fn closed_runtime_fields_recover_dependent_stateful_behaviors() {
             "timers advance quests",
         ])
     );
+}
+
+#[test]
+fn runtime_only_objective_head_is_owned_for_both_model_kinds() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses";
+    for kind in [
+        IntentAutomationKindV2::None,
+        IntentAutomationKindV2::CustomAutomation,
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                kind,
+                &stateful_runtime(),
+                strings(&["Build a persistent Discord game"]),
+            )
+            .unwrap(),
+            strings(&[
+                "an LLM decides rewards at event time",
+                "every message earns XP",
+                "levels unlock an economy",
+                "timers advance quests",
+            ]),
+            "objective head remained for {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn runtime_only_objective_ownership_preserves_unknown_scope_and_requirements() {
+    let standalone = "Build a persistent Discord game";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            standalone,
+            IntentAutomationKindV2::None,
+            &stateful_runtime(),
+            strings(&[standalone]),
+        )
+        .unwrap(),
+        strings(&[standalone])
+    );
+
+    let stateful = "Build a persistent Discord game where every message earns XP";
+    for (kind, runtime) in [
+        (IntentAutomationKindV2::None, no_runtime()),
+        (
+            IntentAutomationKindV2::ManagedPrivateStudyRoom,
+            stateful_runtime(),
+        ),
+    ] {
+        let reconciled = reconcile_unmapped_capabilities(
+            stateful,
+            kind,
+            &runtime,
+            strings(&["Build a persistent Discord game"]),
+        )
+        .unwrap();
+        assert!(reconciled.contains(&"Build a persistent Discord game".to_string()));
+    }
+
+    let modified = "Build a persistent multiplayer Discord game where every message earns XP";
+    let reconciled = reconcile_unmapped_capabilities(
+        modified,
+        IntentAutomationKindV2::None,
+        &stateful_runtime(),
+        strings(&["Build a persistent multiplayer Discord game"]),
+    )
+    .unwrap();
+    assert!(reconciled.contains(&"Build a persistent multiplayer Discord game".to_string()));
+    assert!(reconciled.contains(&"every message earns XP".to_string()));
+
+    let independent = "Build a persistent Discord game where every message earns XP. Guild alliances span servers.";
+    let reconciled = reconcile_unmapped_capabilities(
+        independent,
+        IntentAutomationKindV2::None,
+        &stateful_runtime(),
+        strings(&[
+            "Build a persistent Discord game",
+            "Guild alliances span servers",
+        ]),
+    )
+    .unwrap();
+    assert!(!reconciled.contains(&"Build a persistent Discord game".to_string()));
+    assert!(reconciled.contains(&"Guild alliances span servers".to_string()));
+    assert!(reconciled.contains(&"every message earns XP".to_string()));
+}
+
+#[test]
+fn unclassified_build_kind_recovers_dependent_stateful_behaviors() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses";
+    assert_eq!(
+        reconcile_unmapped_capabilities(
+            human,
+            IntentAutomationKindV2::None,
+            &stateful_runtime(),
+            Vec::new(),
+        )
+        .unwrap(),
+        strings(&[
+            "an LLM decides rewards at event time",
+            "every message earns XP",
+            "levels unlock an economy",
+            "timers advance quests",
+        ])
+    );
+}
+
+#[test]
+fn runtime_business_recovery_stays_closed_for_managed_recipes_and_inactive_axes() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time";
+    assert!(reconcile_unmapped_capabilities(
+        human,
+        IntentAutomationKindV2::ManagedPrivateStudyRoom,
+        &stateful_runtime(),
+        Vec::new(),
+    )
+    .unwrap()
+    .is_empty());
+    assert!(reconcile_unmapped_capabilities(
+        human,
+        IntentAutomationKindV2::None,
+        &no_runtime(),
+        Vec::new(),
+    )
+    .unwrap()
+    .is_empty());
 }
 
 #[test]

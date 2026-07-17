@@ -54,6 +54,7 @@ pub(super) use live_scope::{
     live_resource_antecedent, live_resource_pronoun_continuation, LiveResourceAntecedent,
 };
 pub(super) use secret_disclosure::{
+    closed_secret_acquisition_component, closed_secret_unprotection_continuation,
     secret_target_is_locally_safe, starts_with_secret_target_object,
 };
 pub(super) use unit_scope::{

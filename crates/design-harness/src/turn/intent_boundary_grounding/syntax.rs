@@ -61,6 +61,7 @@ pub(super) enum UnitLink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BoundaryUnit {
     pub(super) span: TextSpan,
+    pub(super) source_span: TextSpan,
     pub(super) link: UnitLink,
     pub(super) text: String,
     pub(super) hypothetical: bool,
@@ -156,6 +157,7 @@ fn push_boundary_unit(
     );
     units.push(BoundaryUnit {
         span,
+        source_span: TextSpan { start, end },
         link,
         text,
         hypothetical: false,

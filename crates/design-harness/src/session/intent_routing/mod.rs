@@ -7,8 +7,9 @@ use serde_json::json;
 use crate::errors::{StructuredError, ToolResult};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
-    private_study_room_details_frontier_for_fields, validate_intent_human_grounding_size,
-    IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    grounded_request_mode, private_study_room_details_frontier_for_fields,
+    validate_intent_human_grounding_size, IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4,
+    IntentRequestModeV2, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
@@ -69,6 +70,7 @@ pub use state::{
 struct IntentStateAnchorV1 {
     stage: &'static str,
     expected_revision: u64,
+    grounded_request_mode: Option<IntentRequestModeV2>,
     available_channel_keys: Vec<String>,
     active_question: Option<String>,
     active_options: Vec<String>,
@@ -224,7 +226,7 @@ impl<C> DesignSession<C> {
             })
     }
 
-    fn append_intent_state_anchor(&mut self) -> Result<(), StructuredError> {
+    fn append_intent_state_anchor(&mut self, human_message: &str) -> Result<(), StructuredError> {
         let runtime = self.intent_recipe.as_ref().ok_or_else(|| {
             intent_error(
                 "INTENT_SESSION_DISABLED",
@@ -253,6 +255,7 @@ impl<C> DesignSession<C> {
         let anchor = IntentStateAnchorV1 {
             stage,
             expected_revision: runtime.expected_revision(self.draft.draft_revision),
+            grounded_request_mode: grounded_request_mode(human_message),
             available_channel_keys,
             active_question,
             active_options,
@@ -729,7 +732,7 @@ impl<C: LlmClient> DesignSession<C> {
         if let Err(error) = revision_check {
             return self.fail_intent(error);
         }
-        if let Err(error) = self.append_intent_state_anchor() {
+        if let Err(error) = self.append_intent_state_anchor(human_message) {
             return self.fail_intent(error);
         }
         let frontier = match self.intent_frontier() {

@@ -9,8 +9,8 @@ use crate::intent::{
     PreparedIntentWorkspaceV2,
 };
 use crate::turn::{
-    parse_interpret_intent_core_compatibility, parse_interpret_intent_turn,
-    parse_private_study_room_details, IntentRecipeDetailFacetV3,
+    parse_interpret_intent_core_compatibility, parse_interpret_intent_core_for_human,
+    parse_interpret_intent_turn, parse_private_study_room_details, IntentRecipeDetailFacetV3,
 };
 
 use super::adjudicate::{
@@ -85,6 +85,85 @@ fn core_decision(value: &Value) -> IntentRouteDecisionV2 {
         IntentCoreAdjudicationV4::TypedPlanner(permit) => permit.decision().clone(),
         IntentCoreAdjudicationV4::Terminal(permit) => permit.decision().clone(),
     }
+}
+
+fn grounded_core_decision(value: &Value, human: &str) -> IntentRouteDecisionV2 {
+    let mut core = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+    core.apply_human_grounding(human, None).unwrap();
+    match adjudicate_intent_core_v4(core, REQUEST_EVIDENCE_HASH).unwrap() {
+        IntentCoreAdjudicationV4::PrivateStudyRoom(selection) => selection.decision().clone(),
+        IntentCoreAdjudicationV4::TypedPlanner(permit) => permit.decision().clone(),
+        IntentCoreAdjudicationV4::Terminal(permit) => permit.decision().clone(),
+    }
+}
+
+#[test]
+fn v4_boundary_only_model_kinds_share_route_identity() {
+    let human = "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately.";
+    let candidate = human.trim_end_matches('.');
+    let mut baseline: Option<IntentRouteDecisionV2> = None;
+    for (kind, outcome) in [
+        ("none", "working_draft"),
+        ("custom_automation", "validated_preview"),
+        ("managed_private_study_room", "working_draft"),
+    ] {
+        let mut value = core_value();
+        value["automation_kind"] = json!(kind);
+        value["requested_outcome"] = json!(outcome);
+        value["hub_channel"] = json!("invented_hub");
+        value["other_unmapped_required_capabilities"] = json!([candidate]);
+        value["custom_detail_facets"] = json!(["custom_naming"]);
+        let decision = grounded_core_decision(&value, human);
+        assert_eq!(decision.kind(), IntentRouteDecisionKindV2::Reject);
+        if let Some(baseline) = &baseline {
+            assert_eq!(decision.semantic_ir_digest(), baseline.semantic_ir_digest());
+            assert_eq!(
+                decision.adjudication_digest(),
+                baseline.adjudication_digest()
+            );
+        } else {
+            baseline = Some(decision);
+        }
+    }
+}
+
+#[test]
+fn v4_runtime_only_objective_head_does_not_rotate_decision_identity() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
+    let requirements = [
+        "an LLM decides rewards at event time",
+        "every message earns XP",
+        "levels unlock an economy",
+        "timers advance quests",
+    ];
+    let mut baseline = core_value();
+    baseline["automation_kind"] = json!("none");
+    baseline["other_unmapped_required_capabilities"] = json!(requirements);
+    let baseline = grounded_core_decision(&baseline, human);
+
+    let mut summarized = core_value();
+    summarized["automation_kind"] = json!("none");
+    summarized["other_unmapped_required_capabilities"] = json!([
+        "Build a persistent Discord game",
+        "an LLM decides rewards at event time",
+        "every message earns XP",
+        "levels unlock an economy",
+        "timers advance quests"
+    ]);
+    let summarized = grounded_core_decision(&summarized, human);
+
+    assert_eq!(baseline.kind(), IntentRouteDecisionKindV2::CapabilityGap);
+    assert_eq!(summarized.kind(), IntentRouteDecisionKindV2::CapabilityGap);
+    assert_eq!(baseline.unclassified_requirements(), requirements);
+    assert_eq!(summarized.unclassified_requirements(), requirements);
+    assert_eq!(
+        baseline.semantic_ir_digest(),
+        summarized.semantic_ir_digest()
+    );
+    assert_eq!(
+        baseline.adjudication_digest(),
+        summarized.adjudication_digest()
+    );
 }
 
 fn context() -> IntentResolutionContext {

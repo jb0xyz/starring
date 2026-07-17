@@ -1,4 +1,7 @@
-use crate::turn::intent_detail_syntax::grounded_detail_assignment_scope_with_slot;
+use crate::turn::intent_detail_grammar::{DetailSlot, GroundedDetailAssignment};
+use crate::turn::intent_detail_syntax::{
+    grounded_detail_assignment_scope_with_slot, grounded_static_detail_continuation,
+};
 use crate::turn::intent_interpretation::{CloseAuthorizationV2, IntentLocaleHintV2};
 use crate::turn::intent_metalinguistic_scope::first_copy_carrier_index;
 
@@ -49,6 +52,18 @@ pub(super) struct ClosedAxesAccumulator {
     pending_correction: bool,
     pending_korean_locale_default: Option<PendingLocaleDefault>,
     detector_scope: bool,
+    previous_managed_detail_slot: Option<DetailSlot>,
+}
+
+pub(super) struct ClosedAxisObservation<'a> {
+    pub(super) active_value: &'a str,
+    pub(super) source_value: &'a str,
+    pub(super) literal_source_value: &'a str,
+    pub(super) link: UnquotedGroundingLink,
+    pub(super) continuation: Option<&'a str>,
+    pub(super) continuation_source: Option<&'a str>,
+    pub(super) continuation_link: Option<UnquotedGroundingLink>,
+    pub(super) operative_consequent: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +87,7 @@ impl Default for ClosedAxesAccumulator {
             pending_correction: false,
             pending_korean_locale_default: None,
             detector_scope: false,
+            previous_managed_detail_slot: None,
         }
     }
 }
@@ -85,31 +101,35 @@ impl ClosedAxesAccumulator {
         continuation: Option<&str>,
         alternative_continuation: Option<&str>,
     ) {
-        self.observe_with_source(
-            raw_value,
-            raw_value,
+        self.observe_with_source(ClosedAxisObservation {
+            active_value: raw_value,
+            source_value: raw_value,
+            literal_source_value: raw_value,
             link,
             continuation,
-            continuation.map(|_| {
+            continuation_source: continuation,
+            continuation_link: continuation.map(|_| {
                 if alternative_continuation.is_some() {
                     UnquotedGroundingLink::Alternative
                 } else {
                     UnquotedGroundingLink::Additive
                 }
             }),
-            false,
-        );
+            operative_consequent: false,
+        });
     }
 
-    pub(super) fn observe_with_source(
-        &mut self,
-        active_value: &str,
-        source_value: &str,
-        link: UnquotedGroundingLink,
-        continuation: Option<&str>,
-        continuation_link: Option<UnquotedGroundingLink>,
-        operative_consequent: bool,
-    ) {
+    pub(super) fn observe_with_source(&mut self, observation: ClosedAxisObservation<'_>) {
+        let ClosedAxisObservation {
+            active_value,
+            source_value,
+            literal_source_value,
+            link,
+            continuation,
+            continuation_source,
+            continuation_link,
+            operative_consequent,
+        } = observation;
         let alternative_continuation =
             continuation.filter(|_| continuation_link == Some(UnquotedGroundingLink::Alternative));
         let copy_carrier_index = first_copy_carrier_index(source_value);
@@ -130,11 +150,13 @@ impl ClosedAxesAccumulator {
             self.pending_correction = false;
             self.pending_korean_locale_default = None;
             self.detector_scope = self.detector_scope || opens_closed_axis_detector_scope(value);
+            self.previous_managed_detail_slot = None;
             return;
         }
         if opens_closed_axis_detector_scope(value) {
             self.break_ephemeral_scope();
             self.detector_scope = true;
+            self.previous_managed_detail_slot = None;
             return;
         }
         let words = words(value);
@@ -243,7 +265,18 @@ impl ClosedAxesAccumulator {
         }
         let exhaustive_locale_scope = alternative_continuation
             .is_some_and(|continuation| exhaustive_locale_scope(value, continuation));
-        let managed_detail_assignment = grounded_detail_assignment_scope_with_slot(source_value);
+        let managed_detail_assignment = grounded_detail_assignment_scope_with_slot(source_value)
+            .or_else(|| {
+                (link == UnquotedGroundingLink::Additive)
+                    .then_some(self.previous_managed_detail_slot)
+                    .flatten()
+                    .filter(|slot| grounded_static_detail_continuation(literal_source_value, *slot))
+                    .map(|slot| (GroundedDetailAssignment::Static, slot))
+            });
+        self.previous_managed_detail_slot =
+            managed_detail_assignment.and_then(|(assignment, slot)| {
+                (assignment == GroundedDetailAssignment::Static).then_some(slot)
+            });
         let copy_carrier_locale = locale_branch
             .or(self.previous_locale_branch)
             .or((self.locale != IntentLocaleHintV2::Unspecified).then_some(self.locale));
@@ -251,7 +284,7 @@ impl ClosedAxesAccumulator {
             && (unsupported_locale_modifier(value, directive_words, locale_branch)
                 || unsupported_managed_detail_locale_grounding(
                     managed_detail_assignment,
-                    continuation,
+                    continuation_source.or(continuation),
                     continuation_link,
                     copy_carrier_locale,
                     operative_consequent,
@@ -478,11 +511,13 @@ impl ClosedAxesAccumulator {
         self.pending_correction = false;
         self.pending_korean_locale_default = None;
         self.detector_scope = false;
+        self.previous_managed_detail_slot = None;
     }
 
     pub(super) fn end_semantic_sentence(&mut self) {
         self.detector_scope = false;
         self.previous_locale_alternative = false;
+        self.previous_managed_detail_slot = None;
     }
 
     fn observe_locale(
@@ -675,6 +710,31 @@ mod tests {
                 controls.closed_axes.locale,
                 Ok(IntentLocaleHintV2::En),
                 "static detail assignment was rejected for {human}"
+            );
+        }
+    }
+
+    #[test]
+    fn locale_scope_preserves_literal_affix_continuations() {
+        let controls = super::super::grounded_request_controls(
+            "Build a managed private study-room automation. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room', and the member-role name has prefix 'team-' and suffix '-members'.",
+        );
+
+        assert_eq!(controls.closed_axes.locale, Ok(IntentLocaleHintV2::En));
+    }
+
+    #[test]
+    fn locale_scope_rejects_ungrounded_affix_continuations() {
+        for human in [
+            "Build a managed private study-room automation. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix.",
+            "Build a managed private study-room automation. Use English defaults except for generated names: the channel name has prefix 'focus-' or suffix '-room'.",
+            "Build a managed private study-room automation. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room' when archived.",
+        ] {
+            let controls = super::super::grounded_request_controls(human);
+            assert_eq!(
+                controls.closed_axes.locale,
+                Err(ClosedAxisGroundingError::UnsupportedLocale),
+                "ungrounded affix continuation was accepted for {human}"
             );
         }
     }

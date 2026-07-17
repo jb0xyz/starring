@@ -6,10 +6,12 @@ use std::collections::BTreeSet;
 
 use self::classification::classify_sentence_units;
 use self::evidence::{
-    coordinated_groups_cover_candidate, cross_sentence_role_bridge, evidence_groups,
-    unique_visible_bounded_span, BoundaryEvidenceGroup, CanonicalWhitespaceMap,
+    coordinated_groups_cover_candidate, cross_sentence_role_bridge, dependent_secret_control_group,
+    evidence_groups, unique_visible_bounded_span, BoundaryEvidenceGroup, CanonicalWhitespaceMap,
 };
-use self::syntax::{mask_quoted_text, sentence_spans, sentence_units, UnitLink};
+use self::syntax::{
+    mask_quoted_text, normalized_text, sentence_spans, sentence_units, TextSpan, UnitLink,
+};
 use super::intent_interpretation::IntentBoundaryRequestV2;
 use super::intent_metalinguistic_scope::{
     ends_metalinguistic_copy, metalinguistic_carrier, QuotedLiteralScope,
@@ -40,6 +42,7 @@ impl SafetyBoundaryAnalysis {
         let mut groups = Vec::new();
         let mut copied_block = false;
         let mut previous_tail = None;
+        let mut previous_sentence_had_secret = false;
         for (span, question) in sentence_spans(&visible) {
             let mut units = classify_sentence_units(&visible, span, question);
             for unit in &mut units {
@@ -55,14 +58,23 @@ impl SafetyBoundaryAnalysis {
                     copied_block = true;
                 }
             }
+            let mut sentence_groups = Vec::new();
             if let (Some(previous), Some(first)) = (previous_tail.as_ref(), units.first()) {
                 if cross_sentence_role_bridge(previous, first) {
                     let mut current = first.clone();
                     current.link = UnitLink::Sequential;
-                    groups.extend(evidence_groups(&[previous.clone(), current], &visible));
+                    sentence_groups.extend(evidence_groups(&[previous.clone(), current], &visible));
                 }
             }
-            groups.extend(evidence_groups(&units, &visible));
+            sentence_groups.extend(evidence_groups(&units, &visible));
+            let sentence_has_secret = sentence_groups
+                .iter()
+                .any(|group| group.request() == IntentBoundaryRequestV2::SecretDisclosure);
+            if previous_sentence_had_secret {
+                sentence_groups.extend(dependent_secret_control_group(&units, &visible));
+            }
+            previous_sentence_had_secret = sentence_has_secret;
+            groups.extend(sentence_groups);
             previous_tail = units.last().cloned();
         }
         let requests = groups
@@ -197,6 +209,7 @@ pub(super) enum UnquotedGroundingLink {
 
 pub(super) struct UnquotedGroundingUnit {
     pub(super) text: String,
+    pub(super) source_text: String,
     pub(super) question: bool,
     pub(super) link: UnquotedGroundingLink,
     pub(super) operative_authority: Option<bool>,
@@ -207,6 +220,7 @@ pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGro
     if mask.unmatched {
         return None;
     }
+    let source = human_message.chars().collect::<Vec<_>>();
     let sentences = sentence_spans(&mask.visible)
         .into_iter()
         .map(|(span, question)| {
@@ -217,12 +231,19 @@ pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGro
                     if let Some(previous) = grounding_units.last_mut() {
                         previous.text.push_str(" nor ");
                         previous.text.push_str(&unit.text);
+                        previous.source_text.push_str(" nor ");
+                        previous.source_text.push_str(&grounding_source_text(
+                            &source,
+                            &mask.visible,
+                            unit.source_span,
+                        ));
                         continue;
                     }
                 }
                 let operative_authority = operative_split.map(|split| unit.span.start >= split);
                 grounding_units.push(UnquotedGroundingUnit {
                     text: unit.text,
+                    source_text: grounding_source_text(&source, &mask.visible, unit.source_span),
                     question,
                     link: match unit.link {
                         UnitLink::Additive | UnitLink::Sequential => {
@@ -243,6 +264,23 @@ pub(super) fn unquoted_grounding_text(human_message: &str) -> Option<UnquotedGro
         })
         .collect();
     Some(UnquotedGroundingText { sentences })
+}
+
+fn grounding_source_text(source: &[char], visible: &[char], span: TextSpan) -> String {
+    let mut end = span.end;
+    while end < source.len()
+        && visible
+            .get(end)
+            .is_some_and(|character| character.is_whitespace())
+    {
+        end = end.saturating_add(1);
+    }
+    normalized_text(
+        &source[span.start..end]
+            .iter()
+            .collect::<String>()
+            .to_lowercase(),
+    )
 }
 
 #[cfg(test)]

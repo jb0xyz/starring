@@ -6,10 +6,12 @@ mod syntax;
 use std::collections::BTreeSet;
 
 use self::classification::{
-    closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
-    custom_automation_owns, external_requirement_spans, has_external_marker,
-    runtime_business_spans,
+    closed_fields_or_preservation_own, closed_route_or_objective_restatement_owns,
+    custom_automation_owns, custom_static_redaction_candidate_is_redundant,
+    custom_static_redaction_request_is_closed, external_requirement_spans, has_external_marker,
+    runtime_business_spans, source_has_supported_custom_automation_base,
 };
+use self::control_restatement::enforced_safety_control_restatement;
 use self::managed_recipe::managed_recipe_restatement_owns;
 pub(super) use self::managed_recipe::ManagedRecipeCoreContext;
 use self::syntax::{SourceSyntaxError, SourceText};
@@ -20,6 +22,18 @@ use super::intent_interpretation::{IntentAutomationKindV2, RuntimeRequirementsV2
 
 const MAX_CAPABILITIES: usize = 8;
 const MAX_CAPABILITY_UTF16: usize = 160;
+
+pub(super) fn asserted_safety_control_restatements(
+    canonical_human: &str,
+    candidates: &[&str],
+) -> bool {
+    let Ok(source) = SourceText::analyze(canonical_human) else {
+        return false;
+    };
+    candidates
+        .iter()
+        .all(|candidate| enforced_safety_control_restatement(&source, candidate))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CapabilityReconciliationError {
@@ -40,6 +54,24 @@ pub(super) enum CapabilityReconciliationError {
         count: usize,
     },
     UnbalancedQuote,
+}
+
+pub(super) fn custom_automation_is_runtime_only(
+    canonical_human: &str,
+    runtime: &RuntimeRequirementsV2,
+    requirements: &[String],
+) -> bool {
+    let Ok(source) = SourceText::analyze(canonical_human) else {
+        return false;
+    };
+    if source_has_supported_custom_automation_base(&source) {
+        return false;
+    }
+    let recovered = runtime_business_spans(&source, runtime)
+        .into_iter()
+        .filter_map(|span| source.value(span).map(str::to_string))
+        .collect::<BTreeSet<_>>();
+    !recovered.is_empty() && recovered == requirements.iter().cloned().collect::<BTreeSet<String>>()
 }
 
 #[cfg(test)]
@@ -68,11 +100,15 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
     let source = SourceText::analyze(canonical_human).map_err(|error| match error {
         SourceSyntaxError::UnbalancedQuote => CapabilityReconciliationError::UnbalancedQuote,
     })?;
+    let closed_static_redaction_request =
+        custom_static_redaction_request_is_closed(&source, automation_kind);
     let mut reconciled = BTreeSet::new();
     let mut external_candidate = None;
     let mut external_grounding_failure = None;
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {
         let candidate_mentions_external = has_external_marker(&candidate);
+        let redundant_static_redaction =
+            custom_static_redaction_candidate_is_redundant(&source, automation_kind, &candidate);
         match ground_unmapped_capability_evidence(
             canonical_human,
             vec![candidate],
@@ -94,7 +130,12 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                         });
                     }
                     if custom_automation_owns(&source, automation_kind, &value)
-                        || closed_route_selection_restatement_owns(&source, automation_kind, &value)
+                        || closed_route_or_objective_restatement_owns(
+                            &source,
+                            automation_kind,
+                            &value,
+                            runtime,
+                        )
                         || closed_fields_or_preservation_own(&source, &value, runtime)
                         || managed_context.is_some_and(|context| {
                             managed_recipe_restatement_owns(&source, context, &value)
@@ -105,6 +146,8 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
                     insert_checked(&mut reconciled, value)?;
                 }
             }
+            Err(CapabilityEvidenceGroundingError::Ungrounded)
+                if redundant_static_redaction || closed_static_redaction_request => {}
             Err(reason)
                 if candidate_mentions_external
                     && reason == CapabilityEvidenceGroundingError::Ungrounded =>
@@ -120,7 +163,10 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
             }
         }
     }
-    if automation_kind == IntentAutomationKindV2::CustomAutomation {
+    if matches!(
+        automation_kind,
+        IntentAutomationKindV2::CustomAutomation | IntentAutomationKindV2::None
+    ) {
         for span in runtime_business_spans(&source, runtime) {
             let Some(value) = source.value(span) else {
                 continue;

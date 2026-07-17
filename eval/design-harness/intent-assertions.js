@@ -74,7 +74,6 @@ const BOUNDARY_LABELS = {
   direct_live_mutation: ['Direct live mutation', '직접 라이브 변경'],
   secret_disclosure: ['Secret disclosure', '비밀정보 노출'],
 };
-const DISCUSSION_COMPLETION_TOKEN_CAP = 512;
 const DISCUSSION_MAX_UTF16_UNITS = 480;
 const DISCUSSION_MAX_SENTENCES = 4;
 const DISCUSSION_MAX_LIST_ITEMS = 4;
@@ -1092,10 +1091,34 @@ function balancedDiscussionDelimiters(value) {
   if (stack.length !== 0) {
     return false;
   }
-  for (const [opening, closing] of [['“', '”'], ['‘', '’']]) {
-    if (value.split(opening).length !== value.split(closing).length) {
-      return false;
+  const characters = [...value];
+  let doubleOpenings = 0;
+  let doubleClosings = 0;
+  let singleOpenings = 0;
+  let singleClosings = 0;
+  const isWordCharacter = (character) => (
+    typeof character === 'string' && /[\p{L}\p{M}\p{N}]/u.test(character)
+  );
+  for (const [index, character] of characters.entries()) {
+    if (character === '“') {
+      doubleOpenings += 1;
+    } else if (character === '”') {
+      doubleClosings += 1;
+    } else if (character === '‘') {
+      singleOpenings += 1;
+    } else if (character === '’') {
+      const intraWord = isWordCharacter(characters[index - 1])
+        && isWordCharacter(characters[index + 1]);
+      const pluralPossessive = singleOpenings === singleClosings
+        && /s/iu.test(characters[index - 1] ?? '')
+        && !isWordCharacter(characters[index + 1]);
+      if (!intraWord && !pluralPossessive) {
+        singleClosings += 1;
+      }
     }
+  }
+  if (doubleOpenings !== doubleClosings || singleOpenings !== singleClosings) {
+    return false;
   }
   const unescapedDoubleQuotes = [...value].filter((character, index, characters) => (
     character === '"' && characters[index - 1] !== '\\'
@@ -1116,6 +1139,20 @@ function discussionSentenceCount(value) {
     .map((entry) => entry.segment.trim())
     .filter(Boolean)
     .length;
+}
+
+function completeDiscussionTerminal(value) {
+  const closers = new Set([
+    '"', "'", ')', ']', '}', '”', '’', '」', '』', '】', '）', '］', '｝', '*', '_', '`',
+  ]);
+  const characters = [...value];
+  while (closers.has(characters.at(-1))) {
+    characters.pop();
+  }
+  const terminal = characters.join('');
+  return !terminal.endsWith('...')
+    && !terminal.endsWith('…')
+    && /[.!?。！？]$/u.test(terminal);
 }
 
 function discussionResponseFailures(turn, context) {
@@ -1140,13 +1177,13 @@ function discussionResponseFailures(turn, context) {
   } else if (!acceptableFinishReasons.has(metricFinishReason)) {
     failures.push(`${turn.id} discussion response lacks an acceptable final finish reason`);
   }
-  if (finalMetric?.completion_tokens >= DISCUSSION_COMPLETION_TOKEN_CAP) {
-    failures.push(`${turn.id} discussion response reached the completion-token cap`);
-  }
   if (value.length > DISCUSSION_MAX_UTF16_UNITS) {
     failures.push(`${turn.id} discussion response is overly long`);
   }
-  if (discussionSentenceCount(value) > DISCUSSION_MAX_SENTENCES) {
+  const sentenceCount = discussionSentenceCount(value);
+  if (sentenceCount < 2) {
+    failures.push(`${turn.id} discussion response has fewer than two sentences`);
+  } else if (sentenceCount > DISCUSSION_MAX_SENTENCES) {
     failures.push(`${turn.id} discussion response has more than four sentences`);
   }
   const lines = value.split('\n');
@@ -1164,7 +1201,7 @@ function discussionResponseFailures(turn, context) {
   if (listItems > DISCUSSION_MAX_LIST_ITEMS) {
     failures.push(`${turn.id} discussion response contains a long list`);
   }
-  if (/(?:\.{3,}|…|[,:;，：；—–\\])\s*$/u.test(value)) {
+  if (!completeDiscussionTerminal(value)) {
     failures.push(`${turn.id} discussion response has an obviously unfinished ending`);
   }
   if (!balancedDiscussionDelimiters(value)) {

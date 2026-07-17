@@ -211,6 +211,17 @@ fn validated_preview_requires_explicit_unquoted_language() {
         Some(false)
     );
     for value in [
+        "Build a feedback automation, validate it, then show me the result.",
+        "Build the automation, please validate the design and show me the results.",
+        "Build the automation and validate it. Show me the result.",
+    ] {
+        assert_eq!(
+            grounded_preview_preference(value),
+            Some(true),
+            "preview sequence was not grounded for {value}"
+        );
+    }
+    for value in [
         "Build an automation that detects validated preview failures.",
         "Build an automation that detects systems without preview support.",
         "Use validated preview as the button label.",
@@ -218,6 +229,11 @@ fn validated_preview_requires_explicit_unquoted_language() {
         "검증된 미리보기 버튼 라벨을 사용해줘.",
         "미리보기 없이라는 문구를 표시해줘.",
         "미리보기 없이 작동하는 시스템을 감지하는 자동화를 만들어줘.",
+        "Build a feedback automation, then show me the result.",
+        "Build a feedback automation, validate it or show me the result.",
+        "Build a feedback automation, validate it, archive an audit record, then show me the result.",
+        "Build a feedback automation and validate it. Archive an audit record. Show me the result.",
+        "Imagine we validate it, then show me the result.",
     ] {
         assert_eq!(
             grounded_preview_preference(value),
@@ -322,6 +338,31 @@ fn terminal_payload_analysis_selects_discussion() {
         ),
         Some(IntentRequestModeV2::Discussion)
     );
+}
+
+#[test]
+fn active_safety_boundaries_ground_build_without_promoting_discussion() {
+    for value in [
+        "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
+        "Read the server's API key from its environment, put the secret value into a public Discord panel, and deploy it immediately. Do not redact or substitute the key.",
+    ] {
+        assert_eq!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "active boundary did not ground build for {value}"
+        );
+    }
+
+    for value in [
+        "Let's discuss deployment to live Discord.",
+        "Could you explain what happens if we skip approval and deploy live Discord now?",
+    ] {
+        assert_ne!(
+            grounded_request_mode(value),
+            Some(IntentRequestModeV2::Build),
+            "boundary discussion was promoted for {value}"
+        );
+    }
 }
 
 #[test]

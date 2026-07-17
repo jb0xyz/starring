@@ -1,4 +1,6 @@
-use super::closed_axes::{closed_axis_semantic_authority, ClosedAxesAccumulator};
+use super::closed_axes::{
+    closed_axis_semantic_authority, ClosedAxesAccumulator, ClosedAxisObservation,
+};
 use super::directives::{request_directive, HoldDirective, RequestDirective};
 use super::lexical::strip_repeated_prefixes;
 use super::patterns::{
@@ -28,6 +30,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
     let mut copied_block = false;
     let mut active_semantic_units = Vec::new();
     let mut closed_axes = ClosedAxesAccumulator::default();
+    let mut pending_preview_validation = false;
     for sentence in &grounding.sentences {
         let mut question_build_scope = false;
         let mut non_authoritative_scope = false;
@@ -36,6 +39,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         let mut ui_copy_scope = false;
         for (index, unit) in sentence.iter().enumerate() {
             if copied_block {
+                pending_preview_validation = false;
                 closed_axes.break_ephemeral_scope();
                 non_authoritative_scope = false;
                 conditional_scope = false;
@@ -52,6 +56,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 continue;
             }
             if metalinguistic_carrier(&unit.text) {
+                pending_preview_validation = false;
                 closed_axes.break_ephemeral_scope();
                 copied_block = true;
                 non_authoritative_scope = false;
@@ -67,6 +72,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                         .and_then(|previous| sentence.get(previous))
                         .is_some_and(|previous| conditional_detail_antecedent(&previous.text));
             if ui_copy_scope {
+                pending_preview_validation = false;
                 closed_axes
                     .observe_copy_scope_continuation(&unit.text, conditional_detail_consequent);
                 closed_axes.break_ephemeral_scope();
@@ -80,6 +86,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             }
             let continuation_unit = sentence.get(index.saturating_add(1));
             let continuation = continuation_unit.map(|unit| unit.text.as_str());
+            let continuation_source = continuation_unit.map(|unit| unit.source_text.as_str());
             let continuation_link = continuation_unit.map(|unit| unit.link);
             if unit.link == UnquotedGroundingLink::Detached {
                 non_authoritative_scope = false;
@@ -130,10 +137,22 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 mode = Some(IntentRequestModeV2::Build);
                 active_build_targets.clear();
             }
+            let paired_preview = directive_authoritative
+                && pending_preview_validation
+                && matches!(
+                    unit.link,
+                    UnquotedGroundingLink::Additive | UnquotedGroundingLink::Detached
+                )
+                && closed_preview_result_step(&unit.text);
+            pending_preview_validation = false;
             if directive_authoritative {
+                if paired_preview {
+                    preview = Some(true);
+                }
                 if let Some(preference) = preview_directive(&unit.text) {
                     preview = Some(preference);
                 }
+                pending_preview_validation = closed_preview_validation_step(&unit.text);
             }
             let unit_non_authoritative = non_authoritative_semantic_unit(&unit.text);
             if scope_break {
@@ -156,14 +175,16 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             let authoritative = authoritative && !non_authoritative_scope && active.is_some();
             let mut text = active.unwrap_or_else(|| unit.text.clone());
             if authoritative {
-                closed_axes.observe_with_source(
-                    &text,
-                    &unit.text,
-                    unit.link,
+                closed_axes.observe_with_source(ClosedAxisObservation {
+                    active_value: &text,
+                    source_value: &unit.text,
+                    literal_source_value: &unit.source_text,
+                    link: unit.link,
                     continuation,
+                    continuation_source,
                     continuation_link,
-                    conditional_detail_consequent,
-                );
+                    operative_consequent: conditional_detail_consequent,
+                });
                 if unit.link == UnquotedGroundingLink::Detached
                     || starts_positive_runtime_scope(&text)
                 {
@@ -202,6 +223,23 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
         active_semantic_units: Some(active_semantic_units),
         closed_axes: closed_axes.finish(),
     }
+}
+
+fn closed_preview_validation_step(unit: &str) -> bool {
+    matches!(
+        strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS),
+        "validate it" | "validate the automation" | "validate the design" | "validate the draft"
+    )
+}
+
+fn closed_preview_result_step(unit: &str) -> bool {
+    matches!(
+        strip_repeated_prefixes(unit, ENGLISH_REQUEST_WRAPPERS),
+        "show me the result"
+            | "show me the results"
+            | "show me the validated result"
+            | "show me the validated results"
+    )
 }
 
 fn preview_directive(unit: &str) -> Option<bool> {

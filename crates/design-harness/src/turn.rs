@@ -87,6 +87,7 @@ pub(crate) use intent_recipe_details::{
     parse_private_study_room_details_for_active_serving_with_parameters,
     private_study_room_details_frontier_for_fields,
 };
+pub(crate) use intent_request_mode_grounding::grounded_request_mode;
 pub(crate) use plan::{normalize_turn_plan, validate_final_planned_action_order};
 pub(crate) use plan_input::{
     assign_repeat_targets as assign_turn_plan_repeat_targets,

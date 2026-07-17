@@ -9,7 +9,7 @@ const { pathToFileURL } = require('node:url');
 const checks = require('./intent-assertions');
 
 const MANIFEST_DIGEST = '68de3f4d9355c99b213ba7546f41a772cd21e59ac4f750cc5ff33d99a0cc5d53';
-const REGISTRY_DIGEST = '23940d98ff8cc2955368f63feb9d432dbe2b715d6279934252aa96090883265d';
+const REGISTRY_DIGEST = 'fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c';
 const RUNTIME_EVIDENCE = {
   durable_timer: ['intent.core.runtime_requirements.timers', 'durable'],
   event_time_llm_decision: ['intent.core.runtime_requirements.event_time_llm', 'true'],
@@ -229,8 +229,8 @@ function report(overrides = {}) {
     catalog_identity: {
       recipe_id: 'starring.private_study_room',
       recipe_version: 1,
-      extractor_revision: 14,
-      normalizer_revision: 9,
+      extractor_revision: 16,
+      normalizer_revision: 15,
       compiler_revision: 1,
       simulator_revision: 1,
       registry_digest: REGISTRY_DIGEST,
@@ -794,7 +794,7 @@ test('normalizer assertion pins discussion holds and metalinguistic copies to no
   const routeDecision = decision('discussion');
   const document = routedDocument(
     routeDecision,
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     'normalizer-discussion',
   );
   for (const normalizerContract of [
@@ -854,7 +854,7 @@ test('normalizer assertion requires routed discussion replay across restart befo
     input: 'Discuss first',
     outcome: 'routed',
     completed: false,
-    message: 'We can compare the tradeoffs without changing the Draft.',
+    message: 'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     deterministic_operations: 0,
     intent_counters: counters({
       route_calls: 1,
@@ -1183,11 +1183,11 @@ test('V4 report contract rejects version, evidence, and candidate identity drift
   assert.match(checks.intentReceipt(JSON.stringify(adjudicator), context()).reason, /contract identity/);
 
   const oldExtractor = JSON.parse(report());
-  oldExtractor.catalog_identity.extractor_revision = 13;
+  oldExtractor.catalog_identity.extractor_revision = 14;
   assert.match(checks.intentReceipt(JSON.stringify(oldExtractor), context()).reason, /catalog identity/);
 
   const oldNormalizer = JSON.parse(report());
-  oldNormalizer.catalog_identity.normalizer_revision = 8;
+  oldNormalizer.catalog_identity.normalizer_revision = 9;
   assert.match(checks.intentReceipt(JSON.stringify(oldNormalizer), context()).reason, /catalog identity/);
 
   const forgedRegistry = JSON.parse(report());
@@ -1282,15 +1282,18 @@ test('discussion response quality accepts concise complete English and Korean pr
   });
   for (const message of [
     'Private rooms improve focus and privacy. They add discovery friction and moderation overhead. We can compare those tradeoffs before changing the Draft.',
+    'They’re a strong fit when privacy matters, though discovery becomes harder. We can compare that tradeoff before changing the Draft.',
+    'The status ‘They’re ready’ is concise and complete. We can now compare the tradeoffs.',
+    'Users’ privacy improves. Their discovery experience becomes harder.',
     '비공개 방은 몰입감과 안전성을 높입니다. 대신 방 탐색과 관리 비용이 늘어날 수 있습니다. Draft를 바꾸지 않고 이 균형을 먼저 비교해보겠습니다.',
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
   ]) {
     const document = routedDocument(routeDecision, message, 'discussion-quality');
     assert.equal(checks.intentAdjudicationDecision(document, expected).pass, true);
   }
   const promotedJson = JSON.parse(routedDocument(
     routeDecision,
-    'We can compare the tradeoffs without changing the Draft.',
+    'We can compare the tradeoffs without changing the Draft. That keeps the current design unchanged.',
     'discussion-quality',
   ));
   promotedJson.turns[0].model_call_metrics[0].finish_reason = 'stop';
@@ -1301,7 +1304,7 @@ test('discussion response quality accepts concise complete English and Korean pr
   );
 });
 
-test('discussion response quality rejects completion limits and structurally poor endings', () => {
+test('discussion response quality separates reasoning usage from truncation signals', () => {
   const routeDecision = decision('discussion');
   const expected = context({
     expectedOutcomes: 'routed',
@@ -1319,16 +1322,19 @@ test('discussion response quality rejects completion limits and structurally poo
     assert.match(actual.reason, reason);
   };
 
-  qualityFailure(
-    'This concise comparison is complete.',
-    /completion-token cap/,
-    (document) => {
-      document.turns[0].model_call_metrics[0].completion_tokens = 512;
-      document.model_call_metrics[0].completion_tokens = 512;
-    },
+  const reasoningHeavy = JSON.parse(routedDocument(
+    routeDecision,
+    'This concise comparison is complete. It keeps the current design unchanged.',
+    'discussion-quality',
+  ));
+  reasoningHeavy.turns[0].model_call_metrics[0].completion_tokens = 527;
+  reasoningHeavy.model_call_metrics[0].completion_tokens = 527;
+  assert.equal(
+    checks.intentAdjudicationDecision(JSON.stringify(reasoningHeavy), expected).pass,
+    true,
   );
   qualityFailure(
-    'This concise comparison is complete.',
+    'This concise comparison is complete. It keeps the current design unchanged.',
     /completion-limit finish reason/,
     (document) => {
       document.turns[0].model_call_metrics[0].finish_reason = 'length';
@@ -1337,6 +1343,7 @@ test('discussion response quality rejects completion limits and structurally poo
   );
   qualityFailure(`${'A focused comparison remains useful. '.repeat(30)}`, /overly long/);
   qualityFailure(`${'😀'.repeat(300)}.`, /overly long/);
+  qualityFailure('Okay.', /fewer than two sentences/);
   qualityFailure('### Tradeoffs\nPrivacy improves, while discovery becomes harder.', /Markdown heading/);
   qualityFailure(
     'Choice | Benefit | Cost\n--- | --- | ---\nPrivate | Focus | Discovery friction',
@@ -1347,7 +1354,11 @@ test('discussion response quality rejects completion limits and structurally poo
     /long list/,
   );
   qualityFailure('Privacy improves, but the next tradeoff is…', /unfinished ending/);
+  qualityFailure('Privacy improves. The key tradeoff is', /unfinished ending/);
+  qualityFailure('Privacy improves. The key tradeoff is,”', /unfinished ending/);
   qualityFailure('Privacy improves (with stricter access.', /unbalanced delimiters/);
+  qualityFailure('The status says ‘They’re ready.', /unbalanced delimiters/);
+  qualityFailure('The status says They’re ready’ for this change.', /unbalanced delimiters/);
   qualityFailure(
     'Focus improves. Privacy improves. Discovery becomes harder. Moderation costs rise. The balance depends on the community.',
     /more than four sentences/,
