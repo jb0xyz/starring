@@ -40,10 +40,11 @@ without adding information. A future recipe that supports multiple distinct
 operations must model the operation as a closed typed field rather than a free
 string.
 
-The model remains `gemma4:12b-mlx`. Default supported requests still use one
-model call and one tool call. Explicit recipe-detail requests still use two
-model calls and two tool calls. V4 adds no model retry, repair, router call, or
-event-time model dependency.
+The active authoring provider is `codex_chatgpt`, pinned to `gpt-5.6-luna` with
+`medium` reasoning effort through the private loopback worker. Default supported
+requests still use one model call and one tool call. Explicit recipe-detail
+requests still use two model calls and two tool calls. V4 adds no model retry,
+repair, router call, or event-time model dependency.
 
 ## Problem in V3
 
@@ -64,8 +65,8 @@ Core objective
 
 Three identical custom-detail requests produced one RuleSet and one compiled
 plan but two compiler-input and semantic-intent hashes. The V3 evaluator hid
-part of this risk by instructing Gemma to copy an exact objective in five known
-recipe cases.
+part of this risk by instructing the model to copy an exact objective in five
+known recipe cases.
 
 V3 also has no separate digest for the actual human request. Its
 `input_intent_hash` is a serialization of normalized intent, including revision,
@@ -956,7 +957,7 @@ replay, then runs every deeper defense-in-depth check only for matching bytes.
 
 ## Deterministic verification matrix
 
-The Rust suite must prove each relationship independently of Gemma.
+The Rust suite must prove each relationship independently of model output.
 
 | Change | Request evidence | Compiler input | Semantic intent | Plan | RuleSet |
 |---|---|---|---|---|---|
@@ -1176,7 +1177,7 @@ typed decisions, not duplicated raw user text.
 7. `feat(intent): harden V4 restore and snapshot compatibility`
 8. `test(eval): enforce V4 identity relationships`
 9. `perf(eval): expose request and token measurements`
-10. `docs(eval): record clean Gemma V4 evidence`
+10. `docs(eval): record clean V4 evidence`
 
 Every implementation commit must pass focused tests and remain reviewable. The
 final branch must pass workspace tests, clippy with warnings denied, formatting,
