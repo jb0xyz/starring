@@ -1354,6 +1354,8 @@ test('discussion response quality separates reasoning usage from truncation sign
     /long list/,
   );
   qualityFailure('Privacy improves, but the next tradeoff is…', /unfinished ending/);
+  qualityFailure('Privacy improves. The key tradeoff is', /unfinished ending/);
+  qualityFailure('Privacy improves. The key tradeoff is,”', /unfinished ending/);
   qualityFailure('Privacy improves (with stricter access.', /unbalanced delimiters/);
   qualityFailure('The status says ‘They’re ready.', /unbalanced delimiters/);
   qualityFailure('The status says They’re ready’ for this change.', /unbalanced delimiters/);

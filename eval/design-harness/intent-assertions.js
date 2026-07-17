@@ -1141,6 +1141,20 @@ function discussionSentenceCount(value) {
     .length;
 }
 
+function completeDiscussionTerminal(value) {
+  const closers = new Set([
+    '"', "'", ')', ']', '}', '”', '’', '」', '』', '】', '）', '］', '｝', '*', '_', '`',
+  ]);
+  const characters = [...value];
+  while (closers.has(characters.at(-1))) {
+    characters.pop();
+  }
+  const terminal = characters.join('');
+  return !terminal.endsWith('...')
+    && !terminal.endsWith('…')
+    && /[.!?。！？]$/u.test(terminal);
+}
+
 function discussionResponseFailures(turn, context) {
   const failures = [];
   if (typeof turn.message !== 'string' || turn.message.trim().length === 0) {
@@ -1187,7 +1201,7 @@ function discussionResponseFailures(turn, context) {
   if (listItems > DISCUSSION_MAX_LIST_ITEMS) {
     failures.push(`${turn.id} discussion response contains a long list`);
   }
-  if (/(?:\.{3,}|…|[,:;，：；—–\\])\s*$/u.test(value)) {
+  if (!completeDiscussionTerminal(value)) {
     failures.push(`${turn.id} discussion response has an obviously unfinished ending`);
   }
   if (!balancedDiscussionDelimiters(value)) {
