@@ -56,6 +56,10 @@ fn custom_static_redaction_copy_is_owned() {
         "secrets are redacted and substituted with [REDACTED]",
         "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]",
         "static panel message with secret redaction and a [REDACTED] placeholder",
+        "static moderation panel message redacts secrets and substitutes [REDACTED]",
+        "secret values are masked and replaced with a [REDACTED] placeholder",
+        "redact secret values by substituting them with [REDACTED]",
+        "static panel redaction using a [REDACTED] replacement",
     ] {
         assert!(
             reconcile_unmapped_capabilities(
@@ -67,6 +71,27 @@ fn custom_static_redaction_copy_is_owned() {
             .unwrap_or_else(|error| panic!("static copy failed for {candidate}: {error:?}"))
             .is_empty(),
             "static copy remained for {candidate}"
+        );
+    }
+}
+
+#[test]
+fn closed_static_redaction_request_ignores_model_only_capabilities() {
+    let human = "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Produce the working design now, but do not deploy it or expose any actual secret.";
+    for candidate in [
+        "automatic transcript archiving",
+        "external consensus lease",
+        "publish unredacted secrets",
+    ] {
+        assert_eq!(
+            reconcile_unmapped_capabilities(
+                human,
+                IntentAutomationKindV2::CustomAutomation,
+                &no_runtime(),
+                strings(&[candidate]),
+            )
+            .unwrap_or_else(|error| panic!("closed request failed for {candidate}: {error:?}")),
+            Vec::<String>::new()
         );
     }
 }

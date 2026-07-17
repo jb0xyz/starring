@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use self::classification::{
     closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
     custom_automation_owns, custom_static_redaction_candidate_is_redundant,
-    external_requirement_spans, has_external_marker, runtime_business_spans,
+    custom_static_redaction_request_is_closed, external_requirement_spans, has_external_marker,
+    runtime_business_spans,
 };
 use self::control_restatement::enforced_safety_control_restatement;
 use self::managed_recipe::managed_recipe_restatement_owns;
@@ -81,6 +82,11 @@ pub(super) fn reconcile_unmapped_capabilities_with_context(
     let source = SourceText::analyze(canonical_human).map_err(|error| match error {
         SourceSyntaxError::UnbalancedQuote => CapabilityReconciliationError::UnbalancedQuote,
     })?;
+    let candidates = if custom_static_redaction_request_is_closed(&source, automation_kind) {
+        Vec::new()
+    } else {
+        candidates
+    };
     let mut reconciled = BTreeSet::new();
     let mut external_candidate = None;
     let mut external_grounding_failure = None;

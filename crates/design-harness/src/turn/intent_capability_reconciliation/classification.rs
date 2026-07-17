@@ -138,12 +138,52 @@ pub(super) fn custom_static_redaction_candidate_is_redundant(
     custom_static_redaction_copy_owns(source, &words, candidate)
 }
 
+pub(super) fn custom_static_redaction_request_is_closed(
+    source: &SourceText<'_>,
+    automation_kind: IntentAutomationKindV2,
+) -> bool {
+    automation_kind == IntentAutomationKindV2::CustomAutomation
+        && source_asserts_static_redaction_copy(source)
+        && source.clauses().iter().all(|clause| {
+            clause.hypothetical
+                || source.overlaps_quote(clause.span)
+                || clause
+                    .tokens
+                    .iter()
+                    .all(|token| closed_static_redaction_request_word(&token.lower))
+        })
+}
+
 fn custom_static_redaction_copy_owns(source: &SourceText<'_>, words: &[&str], value: &str) -> bool {
-    let redaction_copy = has_any(words, &["redacted", "redaction"])
-        && (has_any(
-            words,
-            &["substitute", "substituted", "substitution", "placeholder"],
-        ) || value.to_lowercase().contains("[redacted]"));
+    let redaction_copy = has_any(
+        words,
+        &[
+            "mask",
+            "masked",
+            "masking",
+            "masks",
+            "redact",
+            "redacted",
+            "redacting",
+            "redaction",
+            "redacts",
+        ],
+    ) && (has_any(
+        words,
+        &[
+            "placeholder",
+            "replace",
+            "replaced",
+            "replacement",
+            "replaces",
+            "replacing",
+            "substitute",
+            "substituted",
+            "substitutes",
+            "substituting",
+            "substitution",
+        ],
+    ) || value.to_lowercase().contains("[redacted]"));
     source_asserts_static_redaction_copy(source)
         && redaction_copy
         && closed_static_redaction_copy_words(words)
@@ -181,22 +221,33 @@ fn closed_static_redaction_copy_words(words: &[&str]) -> bool {
             "a" | "actual"
                 | "and"
                 | "are"
+                | "by"
                 | "build"
                 | "copy"
                 | "design"
                 | "display"
                 | "displays"
+                | "for"
                 | "is"
+                | "mask"
+                | "masked"
+                | "masking"
+                | "masks"
                 | "message"
                 | "moderation"
+                | "of"
                 | "panel"
                 | "placeholder"
                 | "redact"
                 | "redacted"
+                | "redacting"
                 | "redaction"
+                | "redacts"
                 | "replace"
                 | "replaced"
                 | "replacement"
+                | "replaces"
+                | "replacing"
                 | "say"
                 | "says"
                 | "secret"
@@ -206,14 +257,36 @@ fn closed_static_redaction_copy_words(words: &[&str]) -> bool {
                 | "static"
                 | "substitute"
                 | "substituted"
+                | "substitutes"
+                | "substituting"
                 | "substitution"
                 | "the"
+                | "them"
+                | "using"
                 | "value"
                 | "values"
                 | "with"
                 | "whose"
         )
     })
+}
+
+fn closed_static_redaction_request_word(word: &str) -> bool {
+    closed_static_redaction_copy_words(&[word])
+        || matches!(
+            word,
+            "any"
+                | "but"
+                | "deploy"
+                | "do"
+                | "expose"
+                | "it"
+                | "not"
+                | "now"
+                | "or"
+                | "produce"
+                | "working"
+        )
 }
 
 pub(super) fn closed_route_selection_restatement_owns(

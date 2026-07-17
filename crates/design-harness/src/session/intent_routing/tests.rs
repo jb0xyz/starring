@@ -2585,6 +2585,39 @@ fn human_boundary_grounding_discards_legacy_model_false_positives() {
 }
 
 #[test]
+fn closed_static_redaction_request_discards_model_only_capabilities() {
+    block_on(async {
+        let mut value = private_room_value(0, None);
+        value["automation_kind"] = json!("custom_automation");
+        value["requested_outcome"] = json!("working_draft");
+        value["other_unmapped_required_capabilities"] = json!(["automatic transcript archiving"]);
+        let client = ScriptedClient::new(vec![Ok(interpretation_call("interpret", value))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+        let root = session.draft.clone();
+
+        let BurstOutcome::Routed { fallback, decision } = session
+            .run_burst(
+                "Build a static moderation panel whose message says secrets are redacted and substituted with [REDACTED]. Produce the working design now, but do not deploy it or expose any actual secret.",
+            )
+            .await
+        else {
+            panic!("expected safe typed-planner route")
+        };
+        assert_eq!(fallback.kind(), IntentFallbackKind::TypedPlanner);
+        assert_eq!(decision.kind(), IntentRouteDecisionKindV2::TypedPlanner);
+        assert!(decision.blockers().is_empty());
+        assert!(decision.boundary_violations().is_empty());
+        assert!(decision.unclassified_requirements().is_empty());
+        assert_eq!(session.draft, root);
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
+    });
+}
+
+#[test]
 fn discussion_alone_surfaces_model_prose_and_never_creates_build_findings() {
     block_on(async {
         let prose = "Let us compare durable game designs before choosing one.";
