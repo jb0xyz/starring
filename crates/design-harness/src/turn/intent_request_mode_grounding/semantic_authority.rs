@@ -80,6 +80,7 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
             }
             let continuation_unit = sentence.get(index.saturating_add(1));
             let continuation = continuation_unit.map(|unit| unit.text.as_str());
+            let continuation_source = continuation_unit.map(|unit| unit.source_text.as_str());
             let continuation_link = continuation_unit.map(|unit| unit.link);
             if unit.link == UnquotedGroundingLink::Detached {
                 non_authoritative_scope = false;
@@ -159,8 +160,10 @@ pub(super) fn grounded_request_controls(human: &str) -> GroundedRequestControls 
                 closed_axes.observe_with_source(
                     &text,
                     &unit.text,
+                    &unit.source_text,
                     unit.link,
                     continuation,
+                    continuation_source,
                     continuation_link,
                     conditional_detail_consequent,
                 );

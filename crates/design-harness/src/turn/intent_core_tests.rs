@@ -1726,6 +1726,25 @@ fn human_grounding_reclassifies_evaluation_detail_wrappers() {
 }
 
 #[test]
+fn serving_grounding_accepts_naming_overrides_after_locale_defaults() {
+    let human = "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except for generated names: the channel name has prefix 'focus-' and suffix '-room', and the member-role name has prefix 'team-' and suffix '-members'. Leave all copy and controls at their defaults, keep closing disabled, and do not ask a follow-up question.";
+    let mut parsed =
+        parse_interpret_intent_core_for_serving(&valid_core().to_string(), human, 0).unwrap();
+    parsed
+        .apply_human_grounding(
+            human,
+            Some(&ExistingChannelKey("community_hub".to_string())),
+        )
+        .unwrap();
+
+    assert_eq!(parsed.locale(), IntentLocaleHintV2::En);
+    assert_eq!(
+        parsed.recipe_detail_facets(),
+        &[IntentRecipeDetailFacetV3::Naming]
+    );
+}
+
+#[test]
 fn serving_closed_axes_accept_control_detail_locale_exception() {
     for human in [
         "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English defaults except that the room Help button label is exactly 'Guide' and its ephemeral response is exactly 'Read the guide'. Keep default copy and naming, leave closing disabled, and do not ask a follow-up question.",
