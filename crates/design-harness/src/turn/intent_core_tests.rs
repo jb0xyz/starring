@@ -2301,6 +2301,14 @@ fn human_grounding_normalizes_boundary_only_model_kinds() {
             "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
             "Skip only user approval",
         ),
+        (
+            "Skip only user approval, keep validation and preview, then connect to Discord now and deploy the live changes immediately.",
+            "then connect to Discord now and deploy the live changes immediately.",
+        ),
+        (
+            "Skip validation, preview, approval, and deployment safeguards. Connect to Discord now and immediately create channels and roles in the live server instead of producing a design.",
+            "Connect to Discord now and immediately create channels and roles in the live server instead of producing a design.",
+        ),
     ];
     for (human, candidate) in cases {
         let mut baseline = None;
@@ -2364,6 +2372,38 @@ fn human_grounding_preserves_independent_supported_bases_with_boundaries() {
             "supported base was erased for {human}"
         );
     }
+}
+
+#[test]
+fn human_grounding_preserves_requirements_after_a_rejected_design_alternative() {
+    let human = "Connect to Discord now and immediately create channels and roles in the live server instead of producing a design, and archive every transcript.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!(["archive every transcript"]);
+    let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert_eq!(
+        parsed.automation_kind(),
+        super::IntentAutomationKindV2::CustomAutomation
+    );
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["archive every transcript"]
+    );
+    assert!(!parsed.boundary_requests().is_empty());
+
+    let human = "Connect to Discord now and immediately create channels and roles in the live server. Producing a design.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!(["Producing a design."]);
+    let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+    parsed.apply_human_grounding(human, None).unwrap();
+    assert_eq!(
+        parsed.automation_kind(),
+        super::IntentAutomationKindV2::CustomAutomation
+    );
+    assert_eq!(parsed.unclassified_requirements(), &["Producing a design."]);
 }
 
 #[test]

@@ -15,6 +15,8 @@ pub(in super::super) const GATE_TARGETS: &[&str] = &[
     "safety gates",
     "safety check",
     "safety checks",
+    "deployment safeguard",
+    "deployment safeguards",
     "safeguard",
     "safeguards",
     "검증",

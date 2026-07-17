@@ -625,6 +625,7 @@ fn apply_grounded_request_mode(
             if boundary_only {
                 input.automation_kind = IntentAutomationKindV2::None;
                 input.hub_channel = RequiredNullableChannelV3(None);
+                input.other_unmapped_required_capabilities.clear();
                 input.custom_detail_facets.clear();
             }
             input.requested_outcome = match grounded_preview {
@@ -679,8 +680,26 @@ fn boundary_only_request(
     if !has_authoritative {
         return false;
     }
-    let unowned = unowned.iter().map(String::as_str).collect::<Vec<_>>();
-    unowned.is_empty() || asserted_safety_control_restatements(human_message, &unowned)
+    unowned.is_empty()
+        || unowned.iter().all(|value| {
+            asserted_safety_control_restatements(human_message, &[value.as_str()])
+                || closed_rejected_design_alternative(human_message, value)
+        })
+}
+
+fn closed_rejected_design_alternative(human_message: &str, value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_lowercase();
+    let frame = match value.as_str() {
+        "of producing a design" | "of producing the design" => format!("instead {value}"),
+        "producing a design" | "producing the design" => format!("instead of {value}"),
+        _ => return false,
+    };
+    canonical_human_message(human_message)
+        .to_lowercase()
+        .contains(&frame)
 }
 
 fn apply_grounded_runtime_requirements(
