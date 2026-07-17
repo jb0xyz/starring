@@ -124,6 +124,53 @@ pub(super) fn custom_automation_owns(
         || custom_static_redaction_copy_owns(source, &words, value)
 }
 
+pub(super) fn source_has_supported_custom_automation_base(source: &SourceText<'_>) -> bool {
+    source_asserts_static_redaction_copy(source)
+        || source.clauses().iter().any(|clause| {
+            if clause.hypothetical || source.overlaps_quote(clause.span) {
+                return false;
+            }
+            let words = token_words(&clause.tokens);
+            let creates_resource = has_any(&words, &["create", "creates", "make", "makes"])
+                && has_any(&words, &["channel", "channels", "role", "roles"]);
+            let opens_modal = has_any(&words, &["button", "buttons", "control", "controls"])
+                && has_any(&words, &["modal", "modals", "dialog", "dialogs"]);
+            let sets_permissions = has_any(&words, &["permission", "permissions"])
+                && has_any(
+                    &words,
+                    &[
+                        "configure",
+                        "configures",
+                        "set",
+                        "sets",
+                        "update",
+                        "updates",
+                    ],
+                );
+            let grants_role = has_any(&words, &["role", "roles"])
+                && has_any(&words, &["assign", "assigns", "grant", "grants"]);
+            let posts_content = has_any(&words, &["message", "messages", "panel", "panels"])
+                && has_any(
+                    &words,
+                    &["post", "posts", "publish", "publishes", "send", "sends"],
+                );
+            let returns_ephemeral = has_any(&words, &["ephemeral", "private", "privately"])
+                && has_any(
+                    &words,
+                    &[
+                        "reply", "replies", "respond", "responds", "return", "returns", "send",
+                        "sends",
+                    ],
+                );
+            creates_resource
+                || opens_modal
+                || sets_permissions
+                || grants_role
+                || posts_content
+                || returns_ephemeral
+        })
+}
+
 pub(super) fn custom_static_redaction_candidate_is_redundant(
     source: &SourceText<'_>,
     automation_kind: IntentAutomationKindV2,

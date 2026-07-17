@@ -9,7 +9,7 @@ use self::classification::{
     closed_fields_or_preservation_own, closed_route_selection_restatement_owns,
     custom_automation_owns, custom_static_redaction_candidate_is_redundant,
     custom_static_redaction_request_is_closed, external_requirement_spans, has_external_marker,
-    runtime_business_spans,
+    runtime_business_spans, source_has_supported_custom_automation_base,
 };
 use self::control_restatement::enforced_safety_control_restatement;
 use self::managed_recipe::managed_recipe_restatement_owns;
@@ -54,6 +54,24 @@ pub(super) enum CapabilityReconciliationError {
         count: usize,
     },
     UnbalancedQuote,
+}
+
+pub(super) fn custom_automation_is_runtime_only(
+    canonical_human: &str,
+    runtime: &RuntimeRequirementsV2,
+    requirements: &[String],
+) -> bool {
+    let Ok(source) = SourceText::analyze(canonical_human) else {
+        return false;
+    };
+    if source_has_supported_custom_automation_base(&source) {
+        return false;
+    }
+    let recovered = runtime_business_spans(&source, runtime)
+        .into_iter()
+        .filter_map(|span| source.value(span).map(str::to_string))
+        .collect::<BTreeSet<_>>();
+    !recovered.is_empty() && recovered == requirements.iter().cloned().collect::<BTreeSet<String>>()
 }
 
 #[cfg(test)]

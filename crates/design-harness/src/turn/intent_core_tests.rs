@@ -1425,6 +1425,57 @@ fn human_grounding_canonicalizes_live_stateful_evidence() {
 }
 
 #[test]
+fn human_grounding_canonicalizes_runtime_only_automation_kind() {
+    let human = "Build a persistent Discord game where every message earns XP, levels unlock an economy, timers advance quests, and an LLM decides rewards at event time. Quest timers must be durable, and the economy ledger must be persistent. Preserve state across restarts and do not reduce the request to static responses.";
+    let mut baseline = None;
+    for kind in ["none", "custom_automation"] {
+        let mut value = valid_core();
+        value["automation_kind"] = json!(kind);
+        value["other_unmapped_required_capabilities"] = json!([
+            "an LLM decides rewards at event time",
+            "every message earns XP",
+            "levels unlock an economy",
+            "timers advance quests"
+        ]);
+        let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human)
+            .unwrap_or_else(|error| panic!("{kind}: {error:?}"));
+        parsed.apply_human_grounding(human, None).unwrap();
+
+        assert_eq!(
+            parsed.automation_kind(),
+            super::IntentAutomationKindV2::None
+        );
+        if let Some(baseline) = &baseline {
+            assert_eq!(
+                &parsed, baseline,
+                "runtime-only identity drifted for {kind}"
+            );
+        } else {
+            baseline = Some(parsed);
+        }
+    }
+}
+
+#[test]
+fn human_grounding_preserves_a_supported_custom_base_with_runtime_gaps() {
+    let human = "Build a feedback automation where a button opens a modal, and every message earns XP. The economy ledger must be persistent.";
+    let mut value = valid_core();
+    value["automation_kind"] = json!("custom_automation");
+    value["other_unmapped_required_capabilities"] = json!(["every message earns XP"]);
+    let mut parsed = parse_interpret_intent_core_for_human(&value.to_string(), human).unwrap();
+    parsed.apply_human_grounding(human, None).unwrap();
+
+    assert_eq!(
+        parsed.automation_kind(),
+        super::IntentAutomationKindV2::CustomAutomation
+    );
+    assert_eq!(
+        parsed.unclassified_requirements(),
+        &["every message earns XP"]
+    );
+}
+
+#[test]
 fn human_grounding_removes_static_custom_behavior_owned_by_the_base() {
     let human = "Design a feedback automation where a button opens a paragraph modal and submitting it sends a private thank-you response.";
     let mut value = valid_core();

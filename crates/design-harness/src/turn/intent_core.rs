@@ -13,8 +13,9 @@ use super::intent_boundary_grounding::{
 };
 use super::intent_capability_grounding::CapabilityEvidenceGroundingError;
 use super::intent_capability_reconciliation::{
-    asserted_safety_control_restatements, reconcile_unmapped_capabilities_with_context,
-    CapabilityReconciliationError, ManagedRecipeCoreContext,
+    asserted_safety_control_restatements, custom_automation_is_runtime_only,
+    reconcile_unmapped_capabilities_with_context, CapabilityReconciliationError,
+    ManagedRecipeCoreContext,
 };
 use super::intent_detail_requirement::{
     analyze_private_study_room_details, PrivateStudyRoomDetailTicketV4,
@@ -274,6 +275,15 @@ impl IntentCoreInterpretationV4 {
         } else {
             PrivateStudyRoomDetailTicketV4::empty()
         };
+        if self.automation_kind == IntentAutomationKindV2::CustomAutomation
+            && custom_automation_is_runtime_only(
+                &canonical_human,
+                &self.runtime_requirements,
+                &unclassified_requirements,
+            )
+        {
+            self.automation_kind = IntentAutomationKindV2::None;
+        }
         let boundary_analysis = analyze_safety_boundaries(human_message);
         unclassified_requirements
             .retain(|requirement| !boundary_analysis.owns_capability_evidence(requirement));
