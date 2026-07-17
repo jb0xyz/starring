@@ -121,6 +121,8 @@ eval/codex-worker-slo/
   summarize.mjs                 deterministic aggregation
   acceptance.mjs                diagnostic and certification gates
   artifact-store.mjs            atomic private evidence files
+  metrics-reader.mjs            bounded private worker-metric ingestion
+  program.mjs                   clean-source orchestration and evidence sealing
 ```
 
 The worker behavior is first moved without semantic change. Timeline telemetry
@@ -161,6 +163,13 @@ source mismatch, profile mismatch, non-idle boundary, counter discontinuity,
 automatic retry, missing metric, or unbalanced final counter. Interrupted runs
 remain diagnostic and cannot be resumed into a different worker instance.
 
+Before any live call, the evaluator reserves an empty private run directory and
+holds its directory identity through evidence sealing. The evaluator binds the
+clean Git snapshot to the digest of the exact worker source files, requires the
+running worker to expose that digest, and repeats the clean source snapshot
+before sealing. Toolchain metadata lives in hash-covered raw evidence and the
+manifest is derived from it.
+
 ## Profiles and budgets
 
 ### Development profile
@@ -173,10 +182,12 @@ process failures but makes zero Luna calls.
 The first live budget is at most 15 Luna calls:
 
 1. readiness and one warmup probe
-2. five serial representative probes
+2. four serial representative probes
 3. four two-request waves, eight requests total
-4. one cancellation and one post-cancellation recovery request only if the
-   earlier total remains within the 15-call cap
+4. one cancellation and one post-cancellation recovery request if every
+   earlier phase passes
+
+The exact maximum is `1 + 4 + 8 + 1 + 1 = 15` live calls.
 
 The runner stops before the next wave on the first error. The input budget is
 130,000 tokens and the output budget is 5,000 tokens. Exceeding either budget
@@ -202,6 +213,11 @@ Certification requires all of the following in one versioned plan:
 
 A 24-hour run is required before an availability claim. The program does not
 infer annual availability from a shorter local test.
+
+Commercial certification is intentionally disabled until the product adapter,
+failure scenarios, source provenance, and resource sampler are bound to trusted
+first-party connectors. Caller-supplied objects may support diagnostics but can
+never produce a commercial certificate.
 
 ## Initial canary gates
 
@@ -236,6 +252,11 @@ The worker FIFO is not a tenant-fair production queue. Per-tenant in-flight
 limits, session cancellation propagation, and fair scheduling belong at the
 future authenticated backend boundary. The worker queue is only a bounded local
 transport buffer.
+
+The live cancellation probe uses an authenticated correlation identifier and
+waits for that exact request to report active admission before disconnecting.
+Aggregate counter movement or a queued request never counts as proof of active
+cancellation.
 
 ## Implementation and verification order
 

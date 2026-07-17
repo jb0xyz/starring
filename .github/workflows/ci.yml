@@ -42,6 +42,8 @@ jobs:
         run: npm --prefix tools/codex-worker run check
       - name: Test Codex worker
         run: npm --prefix tools/codex-worker test
+      - name: Check Codex worker SLO evaluations
+        run: npm --prefix eval/codex-worker-slo run check
       - name: Install design harness evaluation dependencies
         run: npm --prefix eval/design-harness ci
       - name: Check design harness evaluations
