@@ -2216,7 +2216,7 @@ fn core_parser_requires_a_bounded_discussion_response() {
         "EMPTY_INTENT_TEXT"
     );
 
-    value["response"] = json!("😀".repeat(240));
+    value["response"] = json!(format!("{}.)", "😀".repeat(239)));
     let parsed = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap();
     assert_eq!(parsed.response().encode_utf16().count(), 480);
 
@@ -2228,25 +2228,41 @@ fn core_parser_requires_a_bounded_discussion_response() {
         "INTENT_TEXT_TOO_LONG"
     );
 
-    for ending in [",", ":", ";", "，", "：", "；", "—", "–", "\\", "...", "…"] {
+    for ending in [
+        "", ",", ":", ";", "，", "：", "；", "—", "–", "\\", "...", "…", ",”", "...”",
+    ] {
         value["response"] = json!(format!(
             "Privacy improves. Discovery becomes harder. The main tradeoff is control versus convenience{ending}"
         ));
+        let error = parse_interpret_intent_core_compatibility(&value.to_string()).unwrap_err();
+        assert_eq!(error.code, "INCOMPLETE_INTENT_RESPONSE");
+        assert_eq!(error.location, "intent.core.response");
         assert_eq!(
-            parse_interpret_intent_core_compatibility(&value.to_string())
-                .unwrap_err()
-                .code,
-            "INCOMPLETE_INTENT_RESPONSE"
+            error.message,
+            "The discussion response does not end with complete terminal punctuation"
+        );
+        assert_eq!(
+            error.hint,
+            "Rewrite it as two or three short complete sentences within 360 UTF-16 units and finish with terminal punctuation"
         );
     }
 
-    value["response"] = json!("Privacy improves. Discovery becomes harder.");
-    assert_eq!(
-        parse_interpret_intent_core_compatibility(&value.to_string())
-            .unwrap()
-            .response(),
-        "Privacy improves. Discovery becomes harder."
-    );
+    for response in [
+        "Privacy improves. Discovery becomes harder.",
+        "Privacy improves. Discovery becomes harder!",
+        "Privacy improves. Discovery becomes harder?",
+        "Privacy improves. “Discovery becomes harder.”",
+        "Privacy improves. **Discovery becomes harder.**",
+        "プライバシーが向上します。参加には追加の手順が必要です。",
+    ] {
+        value["response"] = json!(response);
+        assert_eq!(
+            parse_interpret_intent_core_compatibility(&value.to_string())
+                .unwrap()
+                .response(),
+            response
+        );
+    }
 
     value["response"] = json!("An unfinished thought,");
     assert_eq!(

@@ -931,21 +931,50 @@ fn normalized_response(
         false,
         "intent.core.response",
     )?;
-    if normalized.ends_with("...")
-        || normalized.ends_with('…')
-        || matches!(
-            normalized.chars().next_back(),
-            Some(',' | ':' | ';' | '，' | '：' | '；' | '—' | '–' | '\\')
-        )
-    {
+    if !has_complete_discussion_terminal(&normalized) {
         return Err(core_error(
             "INCOMPLETE_INTENT_RESPONSE",
             "intent.core.response",
-            "The discussion response has an obviously unfinished ending",
+            "The discussion response does not end with complete terminal punctuation",
             "Rewrite it as two or three short complete sentences within 360 UTF-16 units and finish with terminal punctuation",
         ));
     }
     Ok(normalized)
+}
+
+fn has_complete_discussion_terminal(value: &str) -> bool {
+    let mut end = value.len();
+    while let Some(character) = value[..end].chars().next_back() {
+        if matches!(
+            character,
+            '"' | '\''
+                | ')'
+                | ']'
+                | '}'
+                | '”'
+                | '’'
+                | '」'
+                | '』'
+                | '】'
+                | '）'
+                | '］'
+                | '｝'
+                | '*'
+                | '_'
+                | '`'
+        ) {
+            end -= character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let terminal = &value[..end];
+    !terminal.ends_with("...")
+        && !terminal.ends_with('…')
+        && matches!(
+            terminal.chars().next_back(),
+            Some('.' | '!' | '?' | '。' | '！' | '？')
+        )
 }
 
 fn normalize_runtime_requirements(values: Vec<RuntimeRequirementV3>) -> RuntimeRequirementsV2 {

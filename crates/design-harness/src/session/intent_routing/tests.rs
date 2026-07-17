@@ -2943,7 +2943,7 @@ fn restore_binds_every_historical_transcript_surface() {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
             ScriptedClient::new(vec![
-                Ok(discussion(0, "Original comparison")),
+                Ok(discussion(0, "Original comparison.")),
                 Ok(private_room(0, Some("community_hub"))),
             ]),
             resource_bindings.clone(),
@@ -3470,7 +3470,7 @@ fn intent_turns_never_produce_a_self_unrestorable_snapshot() {
         let resource_bindings = bindings("community_hub", "700");
         let oversized_text = "x".repeat(MAX_INTENT_RESTORED_TRANSCRIPT_CHARS);
         let client = ScriptedClient::new(vec![
-            Ok(discussion(0, "Initial durable discussion")),
+            Ok(discussion(0, "Initial durable discussion.")),
             Ok(LlmResponse::Text(oversized_text)),
         ]);
         let probe = client.clone();
@@ -4410,7 +4410,7 @@ fn restore_rejects_forged_terminal_response_in_preview_ready_history() {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
             ScriptedClient::new(vec![
-                Ok(discussion(0, "Original comparison")),
+                Ok(discussion(0, "Original comparison.")),
                 Ok(private_room(0, Some("community_hub"))),
             ]),
             resource_bindings.clone(),
@@ -4435,7 +4435,7 @@ fn restore_rejects_forged_terminal_response_in_preview_ready_history() {
             .find(|call| call.id == "interpret")
             .unwrap();
         let mut arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
-        arguments["response"] = json!("Forged comparison");
+        arguments["response"] = json!("Forged comparison.");
         call.arguments = arguments.to_string();
         refresh_transcript_integrity(&mut snapshot);
 
@@ -4459,7 +4459,7 @@ fn restore_rejects_forged_terminal_fallback_kind() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison."))]),
             resource_bindings.clone(),
         );
         assert!(matches!(
@@ -4507,7 +4507,7 @@ fn restore_rejects_a_routed_result_downgraded_to_failure() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison."))]),
             resource_bindings.clone(),
         );
         assert!(matches!(
@@ -4553,7 +4553,7 @@ fn restore_rejects_a_routed_result_replaced_with_failure_shape() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison."))]),
             resource_bindings.clone(),
         );
         assert!(matches!(
@@ -4736,7 +4736,7 @@ fn restore_rejects_routed_arguments_and_result_downgraded_together() {
     block_on(async {
         let resource_bindings = bindings("community_hub", "700");
         let mut session = DesignSession::with_intent_recipe(
-            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison"))]),
+            ScriptedClient::new(vec![Ok(discussion(0, "Original comparison."))]),
             resource_bindings.clone(),
         );
         assert!(matches!(
@@ -4797,7 +4797,7 @@ fn serving_projection_excludes_rejected_discussion_presentation() {
             .remove("other_unmapped_required_capabilities");
         let client = ScriptedClient::new(vec![
             Ok(interpretation_call("rejected", rejected)),
-            Ok(discussion(0, "Accepted presentation")),
+            Ok(discussion(0, "Accepted presentation.")),
         ]);
         let probe = client.clone();
         let mut session =
@@ -4825,6 +4825,63 @@ fn serving_projection_excludes_rejected_discussion_presentation() {
 }
 
 #[test]
+fn incomplete_discussion_halts_without_mutation_and_restores_exactly() {
+    block_on(async {
+        let resource_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(discussion(
+            0,
+            "Privacy improves. The key tradeoff is",
+        ))]);
+        let mut session =
+            DesignSession::with_intent_recipe(client, resource_bindings.clone());
+        let root_draft = session.draft.clone();
+        let root_stage = session.snapshot().intent_recipe.unwrap().stage;
+
+        let BurstOutcome::Halted(report) = session
+            .run_burst("Compare private-room tradeoffs without changing the Draft.")
+            .await
+        else {
+            panic!("expected incomplete discussion halt")
+        };
+        assert_eq!(report.code, "INCOMPLETE_INTENT_RESPONSE");
+        assert_eq!(
+            report.message,
+            "The discussion response does not end with complete terminal punctuation"
+        );
+        let error = report.last_error.as_ref().unwrap();
+        assert_eq!(error.code, "INCOMPLETE_INTENT_RESPONSE");
+        assert_eq!(error.location, "intent.core.response");
+        assert_eq!(
+            error.message,
+            "The discussion response does not end with complete terminal punctuation"
+        );
+        assert_eq!(
+            error.hint,
+            "Rewrite it as two or three short complete sentences within 360 UTF-16 units and finish with terminal punctuation"
+        );
+        assert_eq!(session.draft, root_draft);
+        assert_eq!(session.snapshot().intent_recipe.unwrap().stage, root_stage);
+        assert_eq!(session.observability.model_calls, 1);
+        assert_eq!(session.observability.tool_calls, 1);
+        assert_eq!(session.observability.intent_extraction_failures, 1);
+        assert_eq!(session.observability.intent_compile_attempts, 0);
+        assert_eq!(session.observability.intent_commits, 0);
+
+        let snapshot = session.snapshot();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            resource_bindings,
+        )
+        .expect("exact incomplete discussion failure should restore");
+        assert_eq!(restored.draft, root_draft);
+        assert_eq!(restored.snapshot().messages, snapshot.messages);
+        assert_eq!(restored.snapshot().intent_recipe.unwrap().stage, root_stage);
+    });
+}
+
+#[test]
 fn serving_projection_replays_grounded_concise_discussion() {
     block_on(async {
         let response = format!("{}final.", "word ".repeat(60));
@@ -4842,7 +4899,7 @@ fn serving_projection_replays_grounded_concise_discussion() {
             .remove("other_unmapped_required_capabilities");
         let client = ScriptedClient::new(vec![
             Ok(interpretation_call("recovered", recovered)),
-            Ok(discussion(0, "Next comparison")),
+            Ok(discussion(0, "Next comparison.")),
         ]);
         let probe = client.clone();
         let mut session =
@@ -4879,7 +4936,7 @@ fn serving_projection_replays_grounded_concise_discussion() {
 fn serving_projection_keeps_recent_conversation_without_growing_with_the_snapshot() {
     block_on(async {
         let responses = (0..6)
-            .map(|index| Ok(discussion(0, &format!("Comparison {index}"))))
+            .map(|index| Ok(discussion(0, &format!("Comparison {index}."))))
             .collect();
         let client = ScriptedClient::new(responses);
         let mut session =
