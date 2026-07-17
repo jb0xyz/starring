@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   DISABLED_CODEX_FEATURES,
@@ -171,6 +171,20 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   }
 }
 
+async function waitForMetricsHealth(fixture, predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const response = await responseJson(fixture.base, "/metrics-health");
+    if (response.status === 200 && predicate(response.body)) {
+      return response.body;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("metrics_health_timeout");
+    }
+    await delay(5);
+  }
+}
+
 function deferred() {
   let resolvePromise;
   const promise = new Promise((resolveValue) => {
@@ -227,6 +241,9 @@ test("health is authenticated, exact, and loopback only", async () => {
     const missing = await responseJson(fixture.base, "/health", { token: null });
     assert.equal(missing.status, 401);
     assert.deepEqual(missing.body, { error: { code: "unauthorized" } });
+    const missingMetrics = await responseJson(fixture.base, "/metrics-health", { token: null });
+    assert.equal(missingMetrics.status, 401);
+    assert.deepEqual(missingMetrics.body, { error: { code: "unauthorized" } });
 
     const health = await responseJson(fixture.base, "/health");
     assert.equal(health.status, 200);
@@ -265,6 +282,20 @@ test("health is authenticated, exact, and loopback only", async () => {
       queued_requests: 0,
       accepted_requests_total: 0,
       settled_requests_total: 0,
+    });
+    const metricsHealth = await responseJson(fixture.base, "/metrics-health");
+    assert.equal(metricsHealth.status, 200);
+    assert.deepEqual(metricsHealth.body, {
+      schema_version: 1,
+      instance_id: "test-worker-instance",
+      worker_source_sha256: "a".repeat(64),
+      status: "ok",
+      writable_verified: true,
+      records_attempted: 0,
+      records_written: 0,
+      pending_records: 0,
+      write_failures_total: 0,
+      last_error_code: null,
     });
   } finally {
     await fixture.cleanup();
@@ -435,6 +466,15 @@ test("successful completion returns the exact native envelope", async () => {
     assert.equal(records[0].terminal_stage, "completed");
     assert.equal(records[0].duration_ms, result.body.duration_ms);
     assert.deepEqual(records[0].usage, result.body.usage);
+    const metricsHealth = await waitForMetricsHealth(
+      fixture,
+      (body) => body.records_written === 1 && body.pending_records === 0,
+    );
+    assert.equal(metricsHealth.status, "ok");
+    assert.equal(metricsHealth.records_attempted, 1);
+    assert.equal(metricsHealth.write_failures_total, 0);
+    assert.equal((await stat(dirname(fixture.metricsPath))).mode & 0o777, 0o700);
+    assert.equal((await stat(fixture.metricsPath)).mode & 0o777, 0o600);
   } finally {
     await fixture.cleanup();
   }
@@ -915,6 +955,54 @@ test("metrics rotate as bounded JSONL files", async () => {
   assert.equal(JSON.parse(current).outcome, "succeeded");
   assert.equal(JSON.parse(rotated).outcome, "succeeded");
   await rm(fixture.directory, { recursive: true, force: true });
+});
+
+test("runtime metrics write failure is observable without changing completion output", async () => {
+  const fixture = await createFixture();
+  try {
+    const metricsDirectory = dirname(fixture.metricsPath);
+    await rm(metricsDirectory, { recursive: true, force: true });
+    await writeFile(metricsDirectory, "blocked", { mode: 0o600 });
+    const result = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    assert.equal(result.status, 200);
+    const metricsHealth = await waitForMetricsHealth(
+      fixture,
+      (body) => body.write_failures_total === 1 && body.pending_records === 0,
+    );
+    assert.deepEqual(metricsHealth, {
+      schema_version: 1,
+      instance_id: "test-worker-instance",
+      worker_source_sha256: "a".repeat(64),
+      status: "degraded",
+      writable_verified: true,
+      records_attempted: 1,
+      records_written: 0,
+      pending_records: 0,
+      write_failures_total: 1,
+      last_error_code: "metrics_write_failed",
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("startup fails closed when the metrics destination is unavailable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-metrics-test-"));
+  const blocker = join(directory, "blocker");
+  await writeFile(blocker, "blocked", { mode: 0o600 });
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath: join(blocker, "worker.jsonl"),
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("startup requires verified ChatGPT login identity", async () => {

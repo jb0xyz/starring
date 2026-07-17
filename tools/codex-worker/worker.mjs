@@ -358,6 +358,11 @@ export async function startWorker(options = {}) {
     maxBytes: options.metricsMaxBytes,
     backups: options.metricsBackups,
   });
+  try {
+    await metrics.verifyWritable();
+  } catch {
+    throw new WorkerError("metrics_unavailable", 503);
+  }
 
   const server = createServer(async (request, response) => {
     if (!authorized(request, token)) {
@@ -376,6 +381,15 @@ export async function startWorker(options = {}) {
         counterSnapshot.accepted,
         counterSnapshot.settled,
       ));
+      return;
+    }
+    if (request.method === "GET" && request.url === "/metrics-health") {
+      json(response, 200, {
+        schema_version: 1,
+        instance_id: identity.instance_id,
+        worker_source_sha256: identity.worker_source_sha256,
+        ...metrics.snapshot(),
+      });
       return;
     }
     if (request.method !== "POST" || request.url !== "/v1/frontier-completions") {
