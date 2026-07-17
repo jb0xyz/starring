@@ -1092,10 +1092,28 @@ function balancedDiscussionDelimiters(value) {
   if (stack.length !== 0) {
     return false;
   }
-  for (const [opening, closing] of [['“', '”'], ['‘', '’']]) {
-    if (value.split(opening).length !== value.split(closing).length) {
-      return false;
+  const characters = [...value];
+  let doubleOpenings = 0;
+  let doubleClosings = 0;
+  let singleOpenings = 0;
+  let singleClosings = 0;
+  const isWordCharacter = (character) => (
+    typeof character === 'string' && /[\p{L}\p{M}\p{N}]/u.test(character)
+  );
+  for (const [index, character] of characters.entries()) {
+    if (character === '“') {
+      doubleOpenings += 1;
+    } else if (character === '”') {
+      doubleClosings += 1;
+    } else if (character === '‘') {
+      singleOpenings += 1;
+    } else if (character === '’'
+      && !(isWordCharacter(characters[index - 1]) && isWordCharacter(characters[index + 1]))) {
+      singleClosings += 1;
     }
+  }
+  if (doubleOpenings !== doubleClosings || singleOpenings !== singleClosings) {
+    return false;
   }
   const unescapedDoubleQuotes = [...value].filter((character, index, characters) => (
     character === '"' && characters[index - 1] !== '\\'

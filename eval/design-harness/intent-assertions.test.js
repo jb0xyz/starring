@@ -1282,6 +1282,8 @@ test('discussion response quality accepts concise complete English and Korean pr
   });
   for (const message of [
     'Private rooms improve focus and privacy. They add discovery friction and moderation overhead. We can compare those tradeoffs before changing the Draft.',
+    'They’re a strong fit when privacy matters, though discovery becomes harder.',
+    'The status ‘They’re ready’ is concise and complete.',
     '비공개 방은 몰입감과 안전성을 높입니다. 대신 방 탐색과 관리 비용이 늘어날 수 있습니다. Draft를 바꾸지 않고 이 균형을 먼저 비교해보겠습니다.',
     'We can compare the tradeoffs without changing the Draft.',
   ]) {
@@ -1348,6 +1350,8 @@ test('discussion response quality rejects completion limits and structurally poo
   );
   qualityFailure('Privacy improves, but the next tradeoff is…', /unfinished ending/);
   qualityFailure('Privacy improves (with stricter access.', /unbalanced delimiters/);
+  qualityFailure('The status says ‘They’re ready.', /unbalanced delimiters/);
+  qualityFailure('The status says They’re ready’ for this change.', /unbalanced delimiters/);
   qualityFailure(
     'Focus improves. Privacy improves. Discovery becomes harder. Moderation costs rise. The balance depends on the community.',
     /more than four sentences/,
