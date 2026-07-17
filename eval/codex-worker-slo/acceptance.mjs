@@ -659,6 +659,13 @@ export function assessRun(planInput, raw, summary) {
   if (plan.id === "commercial_candidate") {
     nonClaims.push("certification_connectors_not_bound");
   }
+  if (raw.evidence_completeness !== undefined
+    && raw.evidence_completeness !== "complete") {
+    nonClaims.push("execution_evidence_incomplete");
+  }
+  if (raw.live_call_count_known !== true) {
+    nonClaims.push("live_call_and_usage_observation_incomplete");
+  }
   return {
     schema_version: 1,
     run_id: raw.run_id,

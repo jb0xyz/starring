@@ -13,7 +13,7 @@ import {
 } from "./artifact-store.mjs";
 import { runPlan } from "./load-runner.mjs";
 import { createFileMetricsReader } from "./metrics-reader.mjs";
-import { getPlan } from "./plans.mjs";
+import { getPlan, planDigest, planLiveCallCount } from "./plans.mjs";
 import { createResourceSampler } from "./resource-sampler.mjs";
 import { summarizeRun } from "./summarize.mjs";
 import { workerSourceSha256 } from "../../tools/codex-worker/worker.mjs";
@@ -22,16 +22,111 @@ const execFile = promisify(execFileCallback);
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 export class SloProgramError extends Error {
-  constructor(code) {
+  constructor(code, context = {}) {
     super(code);
     this.name = "SloProgramError";
     this.code = code;
+    this.run_id = context.runId ?? null;
+    this.directory = context.directory ?? null;
   }
 }
 
 function runId() {
   return `slo-${new Date().toISOString().toLowerCase().replace(/[^a-z0-9]+/g, "-")}`
     .replace(/-+$/, "");
+}
+
+function safeFailureCode(error, fallback = "slo_program_failed") {
+  return typeof error?.code === "string" && /^[a-z][a-z0-9_]{0,127}$/.test(error.code)
+    ? error.code
+    : fallback;
+}
+
+function zeroUsage() {
+  return {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+  };
+}
+
+function exceptionFallbackRaw(plan, source, selectedRunId, prerequisiteRunId, error) {
+  const timestamp = new Date().toISOString();
+  return {
+    schema_version: 1,
+    run_id: selectedRunId,
+    plan: structuredClone(plan),
+    plan_digest: planDigest(plan),
+    source: structuredClone(source),
+    source_end: { error_code: "source_revalidation_not_completed" },
+    execution_mode: plan.execution_mode,
+    started_at: timestamp,
+    completed_at: timestamp,
+    duration_ms: 0,
+    interrupted: true,
+    stop_reason: "slo_execution_failed",
+    automatic_retries: 0,
+    planned_live_calls: planLiveCallCount(plan),
+    observed_live_calls: 0,
+    live_call_count_known: false,
+    usage: zeroUsage(),
+    worker_boundary: null,
+    counters: {
+      start_accepted: null,
+      start_settled: null,
+      end_accepted: null,
+      end_settled: null,
+    },
+    health_samples: [],
+    metrics_health_samples: [],
+    resource_samples: [],
+    resource_errors: [],
+    resource_duration_ms: 0,
+    worker_metrics: [],
+    scenarios: [],
+    waves: [],
+    observations: [],
+    prerequisite_run_id: prerequisiteRunId,
+    evidence_completeness: "execution_exception_fallback",
+    execution_error_code: safeFailureCode(error),
+  };
+}
+
+function postprocessFallbackRaw(raw, error) {
+  const fallback = structuredClone(raw);
+  fallback.interrupted = true;
+  fallback.stop_reason = "slo_postprocess_failed";
+  fallback.evidence_completeness = "postprocess_fallback";
+  fallback.postprocess_error_code = safeFailureCode(error);
+  return fallback;
+}
+
+async function sealEvidence(input) {
+  const summary = input.summarizer(input.raw);
+  const acceptance = input.assessor(input.plan, input.raw, summary);
+  const written = await writeEvidenceRun({
+    reservation: input.reservation,
+    raw: input.raw,
+    summary,
+    acceptance,
+    toolchain: input.toolchain,
+  });
+  const verified = await verifyEvidenceRun(written.directory);
+  return {
+    directory: written.directory,
+    raw: verified.raw,
+    summary: verified.summary,
+    acceptance: verified.acceptance,
+    manifest: verified.manifest,
+  };
+}
+
+async function releaseReservationQuietly(reservation) {
+  try {
+    await releaseEvidenceRunReservation(reservation);
+  } catch {
+  }
 }
 
 export async function detectGitSource(options = {}) {
@@ -110,6 +205,12 @@ export async function executeSloProgram(options) {
   if (plan.execution_mode === "live" && options.source !== undefined) {
     throw new SloProgramError("live_source_override_forbidden");
   }
+  if (plan.execution_mode === "live"
+    && (options.runPlanExecutor !== undefined
+      || options.summarizeExecutor !== undefined
+      || options.assessExecutor !== undefined)) {
+    throw new SloProgramError("live_executor_override_forbidden");
+  }
   const source = options.source ?? await detectGitSource({
     repository: options.repository,
     execFile: options.execFile,
@@ -149,9 +250,12 @@ export async function executeSloProgram(options) {
     rootDirectory: outputRoot,
     runId: selectedRunId,
   });
+  const planExecutor = options.runPlanExecutor ?? runPlan;
+  const summarizer = options.summarizeExecutor ?? summarizeRun;
+  const assessor = options.assessExecutor ?? assessRun;
   let raw;
   try {
-    raw = await runPlan({
+    raw = await planExecutor({
       plan,
       source,
       runId: selectedRunId,
@@ -170,10 +274,26 @@ export async function executeSloProgram(options) {
       clock: options.clock,
     });
   } catch (error) {
-    await releaseEvidenceRunReservation(reservation);
-    throw error;
+    raw = exceptionFallbackRaw(plan, source, selectedRunId, prerequisiteRunId, error);
+    try {
+      return await sealEvidence({
+        reservation,
+        raw,
+        plan,
+        toolchain,
+        summarizer,
+        assessor,
+      });
+    } catch {
+      await releaseReservationQuietly(reservation);
+      throw new SloProgramError("evidence_sealing_failed", {
+        runId: selectedRunId,
+        directory: reservation.directory,
+      });
+    }
   }
   raw.prerequisite_run_id = prerequisiteRunId;
+  raw.evidence_completeness = "complete";
   if (plan.execution_mode === "live") {
     try {
       const sourceEnd = await detectGitSource({
@@ -193,23 +313,33 @@ export async function executeSloProgram(options) {
       raw.stop_reason ??= "source_continuity_lost";
     }
   }
-  const summary = summarizeRun(raw);
-  const acceptance = assessRun(plan, raw, summary);
-  const written = await writeEvidenceRun({
-    reservation,
-    raw,
-    summary,
-    acceptance,
-    toolchain,
-  });
-  const verified = await verifyEvidenceRun(written.directory);
-  return {
-    directory: written.directory,
-    raw: verified.raw,
-    summary: verified.summary,
-    acceptance: verified.acceptance,
-    manifest: verified.manifest,
-  };
+  try {
+    return await sealEvidence({
+      reservation,
+      raw,
+      plan,
+      toolchain,
+      summarizer,
+      assessor,
+    });
+  } catch (error) {
+    try {
+      return await sealEvidence({
+        reservation,
+        raw: postprocessFallbackRaw(raw, error),
+        plan,
+        toolchain,
+        summarizer,
+        assessor,
+      });
+    } catch {
+      await releaseReservationQuietly(reservation);
+      throw new SloProgramError("evidence_sealing_failed", {
+        runId: selectedRunId,
+        directory: reservation.directory,
+      });
+    }
+  }
 }
 
 function integerEnvironment(value, name) {
@@ -241,6 +371,9 @@ async function runMain() {
     stop_reason: result.raw.stop_reason,
     directory: result.directory,
     claims: result.acceptance.claims,
+    non_claims: result.acceptance.non_claims,
+    evidence_completeness: result.raw.evidence_completeness,
+    live_call_count_known: result.raw.live_call_count_known,
     usage: result.summary.usage,
     latency: result.summary.latency,
   })}\n`);
@@ -253,7 +386,12 @@ const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).hr
 if (invokedPath === import.meta.url) {
   runMain().catch((error) => {
     const code = typeof error?.code === "string" ? error.code : "slo_program_failed";
-    process.stderr.write(`${JSON.stringify({ event: "slo_program_failed", code })}\n`);
+    process.stderr.write(`${JSON.stringify({
+      event: "slo_program_failed",
+      code,
+      run_id: error?.run_id ?? null,
+      directory: error?.directory ?? null,
+    })}\n`);
     process.exitCode = 1;
   });
 }

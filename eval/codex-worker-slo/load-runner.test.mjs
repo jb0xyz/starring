@@ -71,6 +71,8 @@ function liveFixture(configuration = {}) {
   let cancellationAbortedBeforeAdmission = false;
   let hungRequestAborted = false;
   let unrelatedActive = false;
+  let metricsHealthReads = 0;
+  let metricsHealthAborted = false;
   const metrics = [];
   const health = () => ({
     schema_version: 1,
@@ -90,6 +92,20 @@ function liveFixture(configuration = {}) {
     const target = String(url);
     if (target.endsWith("/metrics-health")) {
       assert.equal(options.headers.authorization, `Bearer ${TOKEN}`);
+      metricsHealthReads += 1;
+      if (configuration.hangMetricsHealthAfterInitial && metricsHealthReads > 1) {
+        return new Promise((resolvePromise, rejectPromise) => {
+          const abort = () => {
+            metricsHealthAborted = true;
+            rejectPromise(new DOMException("aborted", "AbortError"));
+          };
+          if (options.signal.aborted) {
+            abort();
+          } else {
+            options.signal.addEventListener("abort", abort, { once: true });
+          }
+        });
+      }
       return new Response(JSON.stringify({
         schema_version: 1,
         instance_id: "test-live-instance",
@@ -232,6 +248,8 @@ function liveFixture(configuration = {}) {
       cancellationAdmissionReads,
       cancellationAbortedBeforeAdmission,
       hungRequestAborted,
+      metricsHealthAborted,
+      metricsHealthReads,
       unrelatedActive,
     }),
   };
@@ -630,6 +648,60 @@ test("stale worker source stops before any live completion", async () => {
   assert.equal(raw.stop_reason, "worker_source_mismatch");
   assert.equal(raw.observations.length, 0);
   assert.equal(fixture.counters().completions, 0);
+});
+
+test("metrics health I/O is bounded by the metrics phase deadline", async () => {
+  const fixture = liveFixture({ hangMetricsHealthAfterInitial: true });
+  const started = performance.now();
+  const raw = await runPlan({
+    plan: getPlan("live_canary"),
+    source: SOURCE,
+    runId: "canary-metrics-health-timeout",
+    baseUrl: "http://127.0.0.1:18181",
+    token: TOKEN,
+    fetchFn: fixture.fetchFn,
+    metricsReader: async () => fixture.metrics,
+    healthPollMs: 1,
+    metricsHealthTimeoutMs: 20,
+    wallClock: () => "2026-07-17T00:00:00.000Z",
+  });
+  assert.equal(raw.interrupted, true);
+  assert.equal(raw.stop_reason, "metrics_unavailable");
+  assert.equal(fixture.state().metricsHealthReads, 2);
+  assert.equal(fixture.state().metricsHealthAborted, true);
+  assert.ok(performance.now() - started < 1_000);
+});
+
+test("metrics reader I/O is bounded and receives the metrics phase abort", async () => {
+  const fixture = liveFixture();
+  let readerAborted = false;
+  const started = performance.now();
+  const raw = await runPlan({
+    plan: getPlan("live_canary"),
+    source: SOURCE,
+    runId: "canary-metrics-reader-timeout",
+    baseUrl: "http://127.0.0.1:18181",
+    token: TOKEN,
+    fetchFn: fixture.fetchFn,
+    metricsReader: async ({ signal }) => new Promise((resolvePromise, rejectPromise) => {
+      const abort = () => {
+        readerAborted = true;
+        rejectPromise(signal.reason);
+      };
+      if (signal.aborted) {
+        abort();
+      } else {
+        signal.addEventListener("abort", abort, { once: true });
+      }
+    }),
+    healthPollMs: 1,
+    metricsHealthTimeoutMs: 20,
+    wallClock: () => "2026-07-17T00:00:00.000Z",
+  });
+  assert.equal(raw.interrupted, true);
+  assert.equal(raw.stop_reason, "metrics_unavailable");
+  assert.equal(readerAborted, true);
+  assert.ok(performance.now() - started < 1_000);
 });
 
 test("real worker and runner correlate active cancellation through its terminal metric", async () => {

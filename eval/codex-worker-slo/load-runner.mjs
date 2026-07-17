@@ -1124,87 +1124,101 @@ export async function runPlan(options) {
   }
 
   if (plan.execution_mode === "live") {
-    const metricsStart = metricsHealthSamples[0] ?? null;
-    const expectedDelta = Number.isSafeInteger(healthSamples.at(-1)?.accepted_requests_total)
-      && Number.isSafeInteger(healthSamples[0]?.accepted_requests_total)
-      ? healthSamples.at(-1).accepted_requests_total - healthSamples[0].accepted_requests_total
-      : null;
-    let metricsSettled = false;
-    const metricsDeadline = clock.now() + metricsHealthTimeoutMs;
-    let metricsSampleCount = 0;
-    while (metricsStart !== null && expectedDelta !== null && clock.now() <= metricsDeadline) {
-      try {
-        const current = await sampleMetricsHealth(metricsSampleCount === 0 ? "final" : "correlation");
-        metricsSampleCount += 1;
-        const attemptedDelta = current.records_attempted - metricsStart.records_attempted;
-        const writtenDelta = current.records_written - metricsStart.records_written;
-        if (current.status !== "ok"
-          || !current.writable_verified
-          || current.write_failures_total !== 0
-          || current.last_error_code !== null
-          || attemptedDelta > expectedDelta
-          || writtenDelta > expectedDelta) {
-          stop ??= "metrics_unavailable";
+    const metricsPhase = linkedAbortController(runSignal);
+    const metricsSignal = metricsPhase.controller.signal;
+    const metricsTimer = setTimeout(
+      () => metricsPhase.controller.abort(new SloRunError("metrics_unavailable")),
+      metricsHealthTimeoutMs,
+    );
+    try {
+      const metricsStart = metricsHealthSamples[0] ?? null;
+      const expectedDelta = Number.isSafeInteger(healthSamples.at(-1)?.accepted_requests_total)
+        && Number.isSafeInteger(healthSamples[0]?.accepted_requests_total)
+        ? healthSamples.at(-1).accepted_requests_total - healthSamples[0].accepted_requests_total
+        : null;
+      let metricsSettled = false;
+      const metricsDeadline = clock.now() + metricsHealthTimeoutMs;
+      let metricsSampleCount = 0;
+      while (metricsStart !== null && expectedDelta !== null && clock.now() <= metricsDeadline) {
+        try {
+          const current = await sampleMetricsHealth(
+            metricsSampleCount === 0 ? "final" : "correlation",
+            metricsSignal,
+          );
+          metricsSampleCount += 1;
+          const attemptedDelta = current.records_attempted - metricsStart.records_attempted;
+          const writtenDelta = current.records_written - metricsStart.records_written;
+          if (current.status !== "ok"
+            || !current.writable_verified
+            || current.write_failures_total !== 0
+            || current.last_error_code !== null
+            || attemptedDelta > expectedDelta
+            || writtenDelta > expectedDelta) {
+            stop ??= "metrics_unavailable";
+            break;
+          }
+          if (current.pending_records === 0
+            && attemptedDelta === expectedDelta
+            && writtenDelta === expectedDelta) {
+            metricsSettled = true;
+            break;
+          }
+        } catch {
+          stop ??= safeErrorCode(metricsSignal.reason?.code, "metrics_unavailable");
           break;
         }
-        if (current.pending_records === 0
-          && attemptedDelta === expectedDelta
-          && writtenDelta === expectedDelta) {
-          metricsSettled = true;
+        try {
+          await runWithSignal(metricsSignal, () => clock.sleep(healthPollMs));
+        } catch {
+          stop ??= safeErrorCode(metricsSignal.reason?.code, "metrics_unavailable");
           break;
         }
-      } catch {
+      }
+      if (!metricsSettled) {
         stop ??= "metrics_unavailable";
-        break;
       }
-      try {
-        await runWithSignal(runSignal, () => clock.sleep(healthPollMs));
-      } catch {
-        stop ??= "duration_budget_exceeded";
-        break;
-      }
-    }
-    if (!metricsSettled) {
-      stop ??= "metrics_unavailable";
-    }
-    if (typeof options.metricsReader !== "function") {
-      stop ??= "metrics_unavailable";
-    } else {
-      try {
-        const records = await runWithSignal(runSignal, () => options.metricsReader({
-          request_ids: observations
-            .flatMap((observation) => observation.request_ids)
-            .filter((requestId) => typeof requestId === "string"),
-          worker_boundary: boundary ? {
-            instance_id: boundary.instance_id,
-            worker_source_sha256: boundary.worker_source_sha256,
-          } : null,
-          start_counters: {
-            accepted: healthSamples[0]?.accepted_requests_total ?? null,
-            settled: healthSamples[0]?.settled_requests_total ?? null,
-          },
-          end_counters: {
-            accepted: healthSamples.at(-1)?.accepted_requests_total ?? null,
-            settled: healthSamples.at(-1)?.settled_requests_total ?? null,
-          },
-          metrics_health_start: metricsHealthSamples[0] ? {
-            records_attempted: metricsHealthSamples[0].records_attempted,
-            records_written: metricsHealthSamples[0].records_written,
-          } : null,
-          metrics_health_end: metricsHealthSamples.at(-1) ? {
-            records_attempted: metricsHealthSamples.at(-1).records_attempted,
-            records_written: metricsHealthSamples.at(-1).records_written,
-          } : null,
-          expected_records: expectedDelta,
-          signal: runSignal,
-        }));
-        if (!Array.isArray(records)) {
-          throw new SloRunError("invalid_worker_metrics");
+      if (typeof options.metricsReader !== "function") {
+        stop ??= "metrics_unavailable";
+      } else {
+        try {
+          const records = await runWithSignal(metricsSignal, () => options.metricsReader({
+            request_ids: observations
+              .flatMap((observation) => observation.request_ids)
+              .filter((requestId) => typeof requestId === "string"),
+            worker_boundary: boundary ? {
+              instance_id: boundary.instance_id,
+              worker_source_sha256: boundary.worker_source_sha256,
+            } : null,
+            start_counters: {
+              accepted: healthSamples[0]?.accepted_requests_total ?? null,
+              settled: healthSamples[0]?.settled_requests_total ?? null,
+            },
+            end_counters: {
+              accepted: healthSamples.at(-1)?.accepted_requests_total ?? null,
+              settled: healthSamples.at(-1)?.settled_requests_total ?? null,
+            },
+            metrics_health_start: metricsHealthSamples[0] ? {
+              records_attempted: metricsHealthSamples[0].records_attempted,
+              records_written: metricsHealthSamples[0].records_written,
+            } : null,
+            metrics_health_end: metricsHealthSamples.at(-1) ? {
+              records_attempted: metricsHealthSamples.at(-1).records_attempted,
+              records_written: metricsHealthSamples.at(-1).records_written,
+            } : null,
+            expected_records: expectedDelta,
+            signal: metricsSignal,
+          }));
+          if (!Array.isArray(records)) {
+            throw new SloRunError("invalid_worker_metrics");
+          }
+          workerMetrics = records.map(sanitizeWorkerMetric);
+        } catch {
+          stop ??= safeErrorCode(metricsSignal.reason?.code, "metrics_unavailable");
         }
-        workerMetrics = records.map(sanitizeWorkerMetric);
-      } catch {
-        stop ??= "metrics_unavailable";
       }
+    } finally {
+      clearTimeout(metricsTimer);
+      metricsPhase.unlink();
     }
   }
   const cancellation = observations.find((row) => row.expected_outcome === "cancelled");

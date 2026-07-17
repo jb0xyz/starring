@@ -170,6 +170,19 @@ running worker to expose that digest, and repeats the clean source snapshot
 before sealing. Toolchain metadata lives in hash-covered raw evidence and the
 manifest is derived from it.
 
+The final metrics-health correlation and metrics-file read share a separate
+real-time deadline linked to the run deadline. A stalled metrics endpoint or
+reader therefore fails the diagnostic within the declared metrics phase instead
+of consuming the rest of the plan budget.
+
+An execution or post-processing exception is sealed as interrupted,
+explicitly incomplete evidence whenever the reserved directory remains usable.
+When execution state cannot be recovered, zero-filled usage counters are paired
+with `live_call_count_known=false` and cannot support a zero-usage claim;
+acceptance records corresponding non-claims. If evidence sealing itself fails,
+the command reports the reserved run identifier and directory so the operator
+can locate the failed run without printing secrets.
+
 ## Profiles and budgets
 
 ### Development profile
