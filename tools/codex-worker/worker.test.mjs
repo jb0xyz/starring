@@ -120,7 +120,7 @@ function sortedKeys(value) {
 }
 
 async function responseJson(base, path, options = {}) {
-  const headers = {};
+  const headers = { ...options.headers };
   if (options.token !== null) {
     headers.authorization = `Bearer ${options.token ?? TOKEN}`;
   }
@@ -222,13 +222,17 @@ async function metricRecords(fixture) {
   throw new Error("metrics_not_written");
 }
 
-function completionFetch(base, signal) {
+function completionFetch(base, signal, observationId = null) {
+  const headers = {
+    authorization: `Bearer ${TOKEN}`,
+    "content-type": "application/json",
+  };
+  if (observationId !== null) {
+    headers["x-starring-observation-id"] = observationId;
+  }
   return fetch(`${base}/v1/frontier-completions`, {
     method: "POST",
-    headers: {
-      authorization: `Bearer ${TOKEN}`,
-      "content-type": "application/json",
-    },
+    headers,
     body: JSON.stringify(completionRequest()),
     signal,
   });
@@ -253,6 +257,13 @@ test("health is authenticated, exact, and loopback only", async () => {
     const missingMetrics = await responseJson(fixture.base, "/metrics-health", { token: null });
     assert.equal(missingMetrics.status, 401);
     assert.deepEqual(missingMetrics.body, { error: { code: "unauthorized" } });
+    const missingAdmission = await responseJson(
+      fixture.base,
+      "/request-admission?observation_id=11111111-1111-4111-8111-111111111111",
+      { token: null },
+    );
+    assert.equal(missingAdmission.status, 401);
+    assert.deepEqual(missingAdmission.body, { error: { code: "unauthorized" } });
 
     const health = await responseJson(fixture.base, "/health");
     assert.equal(health.status, 200);
@@ -307,6 +318,108 @@ test("health is authenticated, exact, and loopback only", async () => {
       last_error_code: null,
     });
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("request-correlated admission is exact, bounded, and collision safe", async () => {
+  const gate = deferred();
+  const firstId = "11111111-1111-4111-8111-111111111111";
+  const secondId = "22222222-2222-4222-8222-222222222222";
+  const unknownId = "33333333-3333-4333-8333-333333333333";
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 1,
+    runner: fakeRunner({
+      complete: async () => {
+        await gate.promise;
+        return runnerResult();
+      },
+    }),
+  });
+  try {
+    const first = completionFetch(fixture.base, undefined, firstId);
+    await waitFor(() => fixture.worker.stats().active === 1);
+    const active = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${firstId}`,
+    );
+    assert.equal(active.status, 200);
+    assert.deepEqual(sortedKeys(active.body), [
+      "observation_id",
+      "request_id",
+      "schema_version",
+      "status",
+    ]);
+    assert.equal(active.body.schema_version, 1);
+    assert.equal(active.body.observation_id, firstId);
+    assert.equal(active.body.status, "active");
+    assert.match(
+      active.body.request_id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+
+    const second = completionFetch(fixture.base, undefined, secondId);
+    await waitFor(() => fixture.worker.stats().queued === 1);
+    const queued = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${secondId}`,
+    );
+    assert.equal(queued.status, 200);
+    assert.equal(queued.body.observation_id, secondId);
+    assert.equal(queued.body.status, "queued");
+    assert.notEqual(queued.body.request_id, active.body.request_id);
+
+    const unknown = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${unknownId}`,
+    );
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(unknown.body, { error: { code: "admission_not_found" } });
+    const malformed = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${unknownId}&observation_id=${firstId}`,
+    );
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(malformed.body, { error: { code: "invalid_admission_query" } });
+    const invalidHeader = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": "unsafe/value" },
+      body: completionRequest(),
+    });
+    assert.equal(invalidHeader.status, 400);
+    assert.deepEqual(invalidHeader.body, { error: { code: "invalid_observation_id" } });
+    const collision = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": firstId },
+      body: completionRequest(),
+    });
+    assert.equal(collision.status, 409);
+    assert.deepEqual(collision.body, { error: { code: "observation_id_collision" } });
+
+    gate.resolve();
+    assert.deepEqual(
+      (await Promise.all([first, second])).map((response) => response.status),
+      [200, 200],
+    );
+    const released = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${firstId}`,
+    );
+    assert.equal(released.status, 404);
+    assert.deepEqual(released.body, { error: { code: "admission_not_found" } });
+    const recentReuse = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": firstId },
+      body: completionRequest(),
+    });
+    assert.equal(recentReuse.status, 409);
+    assert.deepEqual(recentReuse.body, { error: { code: "observation_id_collision" } });
+    const health = await responseJson(fixture.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 2);
+    assert.equal(health.body.settled_requests_total, 2);
+  } finally {
+    gate.resolve();
     await fixture.cleanup();
   }
 });

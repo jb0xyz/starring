@@ -4,6 +4,11 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  AdmissionRegistry,
+  requestObservationId,
+  validateObservationId,
+} from "./admission-registry.mjs";
 import { createCodexRunner, readKeychainToken } from "./codex-runner.mjs";
 import { MetricsLog } from "./metrics-log.mjs";
 import {
@@ -28,6 +33,7 @@ const DEFAULT_QUEUE = 8;
 const DEFAULT_TIMEOUT_MS = 55_000;
 const DEFAULT_MAX_BODY_BYTES = 2_000_000;
 const SOURCE_FILES = [
+  "admission-registry.mjs",
   "codex-runner.mjs",
   "metrics-log.mjs",
   "protocol.mjs",
@@ -91,6 +97,24 @@ function authorized(request, token) {
   const presentedBytes = Buffer.from(presented);
   return expectedBytes.length === presentedBytes.length
     && timingSafeEqual(expectedBytes, presentedBytes);
+}
+
+function admissionQueryObservationId(request) {
+  let url;
+  try {
+    url = new URL(request.url, "http://127.0.0.1");
+  } catch {
+    return null;
+  }
+  if (url.pathname !== "/request-admission") {
+    return null;
+  }
+  const values = url.searchParams.getAll("observation_id");
+  if (values.length !== 1
+    || [...url.searchParams.keys()].some((key) => key !== "observation_id")) {
+    throw new WorkerError("invalid_admission_query", 400);
+  }
+  return validateObservationId(values[0]);
 }
 
 async function readJsonBody(request, maxBytes) {
@@ -236,10 +260,13 @@ function metricRecord(input) {
 }
 
 function scheduleCompletion(input) {
-  input.timeline.admit(input.scheduler.active, input.scheduler.queue.length);
+  const activeBefore = input.scheduler.active;
+  const queuedBefore = input.scheduler.queue.length;
+  input.timeline.admit(activeBefore, queuedBefore);
   let submitted;
   try {
     submitted = input.counters.submit(input.scheduler, async () => {
+      input.admissions.activate(input.observationId);
       input.timeline.runnerStarted();
       try {
         const result = await input.runner.complete({
@@ -261,8 +288,17 @@ function scheduleCompletion(input) {
     input.timeline.submissionObserved(input.scheduler.active, input.scheduler.queue.length);
     throw error;
   }
-  input.timeline.submissionObserved(input.scheduler.active, input.scheduler.queue.length);
-  return submitted;
+  const activeAfter = input.scheduler.active;
+  const queuedAfter = input.scheduler.queue.length;
+  input.timeline.submissionObserved(activeAfter, queuedAfter);
+  if (activeAfter > activeBefore) {
+    input.admissions.admit(input.observationId, "active");
+  } else if (queuedAfter > queuedBefore) {
+    input.admissions.admit(input.observationId, "queued");
+  }
+  return Promise.resolve(submitted).finally(() => {
+    input.admissions.release(input.observationId);
+  });
 }
 
 async function listen(server, port) {
@@ -351,6 +387,7 @@ export async function startWorker(options = {}) {
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
   const counters = new RequestCounters();
+  const admissions = new AdmissionRegistry({ ttlMs: timeoutMs + 5_000 });
   const logPath = options.metricsPath
     ?? process.env.STARRING_CODEX_WORKER_METRICS_LOG
     ?? join(homedir(), "Library", "Logs", "Starring", "codex-worker.jsonl");
@@ -368,6 +405,22 @@ export async function startWorker(options = {}) {
   const handleRequest = async (request, response) => {
     if (!authorized(request, token)) {
       json(response, 401, { error: { code: "unauthorized" } });
+      return;
+    }
+    let admissionObservationId;
+    try {
+      admissionObservationId = admissionQueryObservationId(request);
+    } catch (error) {
+      errorResponse(response, error);
+      return;
+    }
+    if (request.method === "GET" && admissionObservationId !== null) {
+      const admission = admissions.lookup(admissionObservationId);
+      if (admission === null) {
+        errorResponse(response, new WorkerError("admission_not_found", 404));
+      } else {
+        json(response, 200, admission);
+      }
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
@@ -398,19 +451,30 @@ export async function startWorker(options = {}) {
       return;
     }
     let body;
+    let observationId;
     try {
       body = validateCompletionRequest(await readJsonBody(request, maxBodyBytes));
+      observationId = requestObservationId(request);
     } catch (error) {
       errorResponse(response, error);
       return;
     }
     const requestId = randomUUID();
+    try {
+      if (observationId !== null) {
+        admissions.reserve(observationId, requestId);
+      }
+    } catch (error) {
+      errorResponse(response, error);
+      return;
+    }
     const started = Date.now();
     const timeline = new RequestTimeline({ clock: options.timelineClock });
     const disconnect = watchDisconnect(request, response);
     try {
       const result = await withTimeout(
         (signal) => scheduleCompletion({
+          admissions,
           body,
           counters,
           requestId,
@@ -418,6 +482,7 @@ export async function startWorker(options = {}) {
           scheduler,
           signal,
           timeline,
+          observationId,
         }),
         timeoutMs,
         disconnect.signal,
@@ -467,6 +532,7 @@ export async function startWorker(options = {}) {
         errorCode: failure.code,
       }));
     } finally {
+      admissions.release(observationId);
       disconnect.cleanup();
     }
   };
