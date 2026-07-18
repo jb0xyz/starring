@@ -2093,6 +2093,9 @@ dependencies = [
  "desired-state",
  "diff-engine",
  "discord-model",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

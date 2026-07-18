@@ -35,8 +35,9 @@ use adaptive::simulation_profile_for_current_human_turn;
 use context::compact_text;
 use intent_routing::IntentRecipeRuntime;
 pub use intent_routing::{
-    IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV2,
-    IntentRecipeStatusV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2, PinnedIntentRecipeV2,
+    AuthoringContractV1, IntentDecisionSourceV2, IntentFallbackKind, IntentFallbackV1,
+    IntentRecipeReceiptV2, IntentRecipeStatusV2, IntentRouteDecisionKindV2, IntentRouteDecisionV2,
+    PinnedIntentRecipeV2, PreviewReadyArtifactError, PreviewReadyArtifactV1,
     INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3, INTENT_ADJUDICATOR_VERSION_V4,
     INTENT_RECIPE_PROTOCOL_VERSION_V2, INTENT_RECIPE_PROTOCOL_VERSION_V3,
     INTENT_RECIPE_PROTOCOL_VERSION_V4,

@@ -14,14 +14,17 @@ pub use errors::{
     ToolSuccess,
 };
 pub use gates::{simulate_draft, validate_draft};
+pub use intent::IntentRequestedOutcome;
 pub use llm::{LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall};
+pub use resource_resolution::ResourceBindingFingerprint;
 pub use resource_resolution::ResourceBindingMap;
 pub use session::{
-    BurstOutcome, DesignSession, HaltReport, IntentDecisionSourceV2, IntentFallbackKind,
-    IntentFallbackV1, IntentRecipeReceiptV2, IntentRecipeStatusV2, IntentRouteDecisionKindV2,
-    IntentRouteDecisionV2, LimitKind, Observability, PinnedIntentRecipeV2, RepairKind, RepairState,
-    RepairTicket, SessionConfig, SessionSnapshot, SessionSnapshotError, TurnPhase, TurnState,
-    DEFAULT_SYSTEM_PROMPT, INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
+    AuthoringContractV1, BurstOutcome, DesignSession, HaltReport, IntentDecisionSourceV2,
+    IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV2, IntentRecipeStatusV2,
+    IntentRouteDecisionKindV2, IntentRouteDecisionV2, LimitKind, Observability,
+    PinnedIntentRecipeV2, PreviewReadyArtifactError, PreviewReadyArtifactV1, RepairKind,
+    RepairState, RepairTicket, SessionConfig, SessionSnapshot, SessionSnapshotError, TurnPhase,
+    TurnState, DEFAULT_SYSTEM_PROMPT, INTENT_ADJUDICATOR_VERSION_V2, INTENT_ADJUDICATOR_VERSION_V3,
     INTENT_ADJUDICATOR_VERSION_V4, INTENT_RECIPE_PROTOCOL_VERSION_V2,
     INTENT_RECIPE_PROTOCOL_VERSION_V3, INTENT_RECIPE_PROTOCOL_VERSION_V4, SESSION_SNAPSHOT_VERSION,
 };

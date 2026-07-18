@@ -1,15 +1,22 @@
 use std::collections::BTreeSet;
+use std::fmt::{Debug, Formatter};
 
-use resource_resolution::ResourceBindingMap;
+use automation_state::InteractionRuleSet;
+use resource_resolution::{
+    resource_binding_fingerprint_v2, ResourceBindingFingerprint, ResourceBindingMap,
+};
 use serde::Serialize;
 use serde_json::json;
+use thiserror::Error;
 
 use crate::errors::{StructuredError, ToolResult};
+use crate::intent::{recipe_descriptor_v1, IntentRequestedOutcome, RecipeKindV1};
 use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
 use crate::turn::{
     grounded_request_mode, private_study_room_details_frontier_for_fields,
-    validate_intent_human_grounding_size, IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4,
-    IntentRequestModeV2, EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
+    render_preview_with_bindings, validate_intent_human_grounding_size, DraftPreview,
+    IntentRecipeDetailFacetV3, IntentRecipeDetailFieldV4, IntentRequestModeV2,
+    EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
 
 use super::{DesignSession, LimitKind, SessionConfig, SessionSnapshot, SessionSnapshotError};
@@ -64,6 +71,95 @@ pub(super) use state::{
 pub use state::{
     IntentFallbackKind, IntentFallbackV1, IntentRecipeReceiptV2, IntentRecipeStatusV2,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringContractV1 {
+    pub artifact_version: u16,
+    pub intent_protocol_version: u16,
+    pub identity_revision: u16,
+    pub extractor_revision: u32,
+    pub normalizer_revision: u32,
+    pub compiler_revision: u32,
+    pub simulator_revision: u32,
+    pub recipe_id: String,
+    pub recipe_version: u32,
+    pub recipe_descriptor_digest: String,
+    pub recipe_registry_digest: String,
+    pub requested_outcome: IntentRequestedOutcome,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct PreviewReadyArtifactV1 {
+    contract: AuthoringContractV1,
+    receipt: IntentRecipeReceiptV2,
+    ruleset: InteractionRuleSet,
+    preview: DraftPreview,
+    context_fingerprint: ResourceBindingFingerprint,
+    external_channel_bindings: Vec<String>,
+    stage_binding_digest: String,
+}
+
+impl PreviewReadyArtifactV1 {
+    pub fn contract(&self) -> &AuthoringContractV1 {
+        &self.contract
+    }
+
+    pub fn receipt(&self) -> &IntentRecipeReceiptV2 {
+        &self.receipt
+    }
+
+    pub fn ruleset(&self) -> &InteractionRuleSet {
+        &self.ruleset
+    }
+
+    pub fn preview(&self) -> &DraftPreview {
+        &self.preview
+    }
+
+    pub fn context_fingerprint(&self) -> &ResourceBindingFingerprint {
+        &self.context_fingerprint
+    }
+
+    pub fn external_channel_bindings(&self) -> &[String] {
+        &self.external_channel_bindings
+    }
+
+    pub fn stage_binding_digest(&self) -> &str {
+        &self.stage_binding_digest
+    }
+}
+
+impl Debug for PreviewReadyArtifactV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewReadyArtifactV1")
+            .field("contract", &self.contract)
+            .field("receipt", &self.receipt)
+            .field("context_fingerprint", &self.context_fingerprint)
+            .field("external_channel_bindings", &self.external_channel_bindings)
+            .field("stage_binding_digest", &self.stage_binding_digest)
+            .field("ruleset", &"<redacted>")
+            .field("preview", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum PreviewReadyArtifactError {
+    #[error("intent recipe mode is not enabled")]
+    IntentRecipeDisabled,
+    #[error("intent recipe session is not preview-ready: {status}")]
+    NotPreviewReady { status: &'static str },
+    #[error(transparent)]
+    InvalidSession(#[from] SessionSnapshotError),
+    #[error("preview rendering failed at {location}: {message}")]
+    PreviewRendering {
+        code: String,
+        location: String,
+        message: String,
+    },
+}
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +239,71 @@ impl<C> DesignSession<C> {
         session.tools.clear();
         session.intent_recipe = Some(runtime);
         Ok(session)
+    }
+
+    pub fn export_preview_ready_artifact(
+        &self,
+    ) -> Result<PreviewReadyArtifactV1, PreviewReadyArtifactError> {
+        let runtime = self
+            .intent_recipe
+            .as_ref()
+            .ok_or(PreviewReadyArtifactError::IntentRecipeDisabled)?;
+        let snapshot = self.snapshot();
+        validate_intent_durable_transcript_bound(&snapshot)?;
+        super::validate_snapshot_with_intent_bindings(&snapshot, &runtime.bindings)?;
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            workspace,
+            external_channel_bindings,
+            recipe_evidence,
+            decision_binding_digest,
+            ..
+        } = &runtime.snapshot.stage
+        else {
+            let status = match runtime.snapshot.stage {
+                IntentRecipeStageSnapshotV2::Empty => "empty",
+                IntentRecipeStageSnapshotV2::AwaitingDecision { .. } => "awaiting_decision",
+                IntentRecipeStageSnapshotV2::PreviewReady { .. } => unreachable!(),
+            };
+            return Err(PreviewReadyArtifactError::NotPreviewReady { status });
+        };
+        let Some(IntentRecipeStatusV2::PreviewReady { receipt, .. }) = self.intent_recipe_status()
+        else {
+            return Err(PreviewReadyArtifactError::NotPreviewReady {
+                status: "inconsistent",
+            });
+        };
+        let preview =
+            render_preview_with_bindings(&self.draft, &runtime.bindings).map_err(|error| {
+                PreviewReadyArtifactError::PreviewRendering {
+                    code: error.code,
+                    location: error.location,
+                    message: error.message,
+                }
+            })?;
+        let descriptor = recipe_descriptor_v1(RecipeKindV1::PrivateStudyRoomV1);
+        let contract = AuthoringContractV1 {
+            artifact_version: 1,
+            intent_protocol_version: runtime.snapshot.protocol_version,
+            identity_revision: receipt.identity_revision,
+            extractor_revision: runtime.snapshot.extractor_revision,
+            normalizer_revision: runtime.snapshot.normalizer_revision,
+            compiler_revision: descriptor.compiler_revision,
+            simulator_revision: descriptor.simulator_revision,
+            recipe_id: recipe_evidence.recipe_id().to_string(),
+            recipe_version: recipe_evidence.recipe_version(),
+            recipe_descriptor_digest: recipe_evidence.selected_descriptor_digest().to_string(),
+            recipe_registry_digest: recipe_evidence.registry_digest().to_string(),
+            requested_outcome: workspace.requested_outcome,
+        };
+        Ok(PreviewReadyArtifactV1 {
+            contract,
+            receipt,
+            ruleset: self.draft.ruleset.clone(),
+            preview,
+            context_fingerprint: resource_binding_fingerprint_v2(&runtime.bindings),
+            external_channel_bindings: external_channel_bindings.clone(),
+            stage_binding_digest: decision_binding_digest.clone(),
+        })
     }
 
     pub fn intent_recipe_enabled(&self) -> bool {

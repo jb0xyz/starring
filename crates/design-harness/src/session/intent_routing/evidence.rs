@@ -73,6 +73,22 @@ impl IntentRecipeEvidenceV4 {
         &self.source_human_turn_digest
     }
 
+    pub(super) fn recipe_id(&self) -> &str {
+        &self.recipe_id
+    }
+
+    pub(super) fn recipe_version(&self) -> u32 {
+        self.recipe_version
+    }
+
+    pub(super) fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+
+    pub(super) fn selected_descriptor_digest(&self) -> &str {
+        &self.selected_descriptor_digest
+    }
+
     pub(super) fn validate(&self) -> Result<(), StructuredError> {
         let canonical_facets = canonical_facets(&self.detail_facets)?;
         let registry_digest = recipe_registry_digest_v1()?;

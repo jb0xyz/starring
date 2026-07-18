@@ -367,6 +367,184 @@ fn one_shot_uses_one_model_call_one_frontier_and_no_plan_tool_budget() {
 }
 
 #[test]
+fn preview_ready_artifact_is_verified_owned_and_bound_to_the_live_session() {
+    block_on(async {
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let probe = client.clone();
+        let mut session =
+            DesignSession::with_intent_recipe(client, bindings("community_hub", "700"));
+
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private study rooms in community_hub and prepare a validated preview",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let snapshot_before = session.snapshot();
+        let calls_before = probe.calls();
+        let artifact = session.export_preview_ready_artifact().unwrap();
+        assert_eq!(session.snapshot(), snapshot_before);
+        assert_eq!(probe.calls(), calls_before);
+        assert_eq!(artifact.receipt(), &receipt(&session));
+        assert_eq!(artifact.ruleset(), &session.draft().ruleset);
+        assert_eq!(artifact.preview().revision, session.draft().draft_revision);
+        assert!(artifact.preview().draft.unresolved_references.is_empty());
+        assert_eq!(
+            artifact.preview().ruleset,
+            serde_json::to_value(artifact.ruleset()).unwrap()
+        );
+        assert_eq!(
+            artifact.external_channel_bindings(),
+            &["community_hub".to_string()]
+        );
+        assert_eq!(artifact.context_fingerprint().as_str().len(), 64);
+        assert_eq!(artifact.stage_binding_digest().len(), 64);
+        let contract = artifact.contract();
+        assert_eq!(contract.artifact_version, 1);
+        assert_eq!(contract.intent_protocol_version, 4);
+        assert_eq!(contract.identity_revision, 2);
+        assert_eq!(contract.extractor_revision, 16);
+        assert_eq!(contract.normalizer_revision, 15);
+        assert_eq!(contract.compiler_revision, 1);
+        assert_eq!(contract.simulator_revision, 1);
+        assert_eq!(contract.recipe_id, "starring.private_study_room");
+        assert_eq!(contract.recipe_version, 1);
+        assert_eq!(
+            contract.requested_outcome,
+            IntentRequestedOutcome::ValidatedPreview
+        );
+        for digest in [
+            artifact.context_fingerprint().as_str(),
+            artifact.stage_binding_digest(),
+            artifact.receipt().candidate_ruleset_hash.as_str(),
+            artifact.receipt().candidate_draft_hash.as_str(),
+            contract.recipe_descriptor_digest.as_str(),
+            contract.recipe_registry_digest.as_str(),
+        ] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)));
+        }
+        let debug = format!("{artifact:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&artifact.ruleset().panels[0].content));
+
+        let exported_ruleset = artifact.ruleset().clone();
+        session.draft_mut().ruleset.panels[0].content = "tampered".to_string();
+        assert_eq!(artifact.ruleset(), &exported_ruleset);
+        assert!(matches!(
+            session.export_preview_ready_artifact(),
+            Err(PreviewReadyArtifactError::InvalidSession(_))
+        ));
+    });
+}
+
+#[test]
+fn preview_ready_artifact_survives_exact_snapshot_restore() {
+    block_on(async {
+        let authoritative_bindings = bindings("community_hub", "700");
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            authoritative_bindings.clone(),
+        );
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Create private study rooms in community_hub and prepare a validated preview",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let expected = session.export_preview_ready_artifact().unwrap();
+        let snapshot = session.snapshot();
+
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot.clone(),
+            authoritative_bindings,
+        )
+        .unwrap();
+        assert_eq!(restored.export_preview_ready_artifact().unwrap(), expected);
+
+        assert!(DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            bindings("community_hub", "701"),
+        )
+        .is_err());
+    });
+}
+
+#[test]
+fn preview_ready_artifact_enforces_the_durable_transcript_bound() {
+    block_on(async {
+        let mut session = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]),
+            bindings("community_hub", "700"),
+        );
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        session.messages.push(Message::user(
+            "x".repeat(MAX_INTENT_RESTORED_TRANSCRIPT_CHARS.saturating_add(1)),
+        ));
+        assert!(matches!(
+            session.export_preview_ready_artifact(),
+            Err(PreviewReadyArtifactError::InvalidSession(_))
+        ));
+    });
+}
+
+#[test]
+fn preview_ready_artifact_rejects_non_intent_empty_and_awaiting_sessions() {
+    block_on(async {
+        let plain = DesignSession::new(ScriptedClient::new(Vec::new()));
+        assert_eq!(
+            plain.export_preview_ready_artifact().unwrap_err(),
+            PreviewReadyArtifactError::IntentRecipeDisabled
+        );
+
+        let empty = DesignSession::with_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            bindings("community_hub", "700"),
+        );
+        assert_eq!(
+            empty.export_preview_ready_artifact().unwrap_err(),
+            PreviewReadyArtifactError::NotPreviewReady { status: "empty" }
+        );
+
+        let mut available = bindings("community_hub", "700");
+        available
+            .channel_bindings
+            .extend(bindings("other_hub", "701").channel_bindings);
+        let mut awaiting = DesignSession::with_intent_recipe(
+            ScriptedClient::new(vec![Ok(private_room(0, None))]),
+            available,
+        );
+        assert!(matches!(
+            awaiting.run_burst("Create private study rooms").await,
+            BurstOutcome::NeedsInput { .. }
+        ));
+        assert_eq!(
+            awaiting.export_preview_ready_artifact().unwrap_err(),
+            PreviewReadyArtifactError::NotPreviewReady {
+                status: "awaiting_decision"
+            }
+        );
+    });
+}
+
+#[test]
 fn metalinguistic_discussion_exposes_authoritative_grounded_request_mode() {
     block_on(async {
         let client = ScriptedClient::new(vec![Ok(discussion(
