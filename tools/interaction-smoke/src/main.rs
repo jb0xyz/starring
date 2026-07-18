@@ -727,6 +727,9 @@ fn report_apply_outcome(subject: &str, outcome: ApplyOutcome) {
         ApplyOutcome::AlreadyApplied => {
             eprintln!("activation {subject}: request was already applied");
         }
+        ApplyOutcome::Superseded { reason } => {
+            eprintln!("activation {subject}: request was superseded: {reason:?}");
+        }
         ApplyOutcome::InProgress {
             blocking_request_id,
             lease_until,
