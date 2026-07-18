@@ -1,23 +1,26 @@
 use automation_ruleset::{content_hash, RuleSetStoreError, CURRENT_RULESET_SCHEMA_VERSION};
 use automation_ruleset_activation::{
-    ActivationRequestId, ActivationRequestState, ActivationTarget,
+    approval_policy_digest_v1, product_approval_context_digest_v1, ActivationApprovalContextV1,
+    ActivationDigest, ActivationLinkStateV1, ActivationPromotionId, ActivationRequest,
+    ActivationRequestId, ActivationRequestState, ActivationTarget, ApprovalPolicyBindingV1,
+    CreateProductActivationRequest, LinkProductActivation, ProductApprovalContextV1,
 };
 use chrono::Duration;
 use design_harness::{IntentRequestedOutcome, PreviewReadyArtifactV1};
 
 use crate::digest::{
-    activation_request_hash_v1, idempotency_scope_digest_v1, promotion_request_digest_v1,
-    DigestError,
+    activation_request_hash_v1, approval_payload_digest_v1, idempotency_scope_digest_v1,
+    promotion_request_digest_v1, DigestError,
 };
 use crate::id::{AuthoringHash, PromotionIdError};
 use crate::{
     AuthenticatedPromotionContext, AuthoringEvidenceV1, AuthoringPreviewSummaryV1,
     AuthoringPreviewV1, CreatePromotionOutcomeV1, EnsurePendingActivationV1, IdempotencyKey,
-    NewPromotionV1, PendingActivationLinkV1, PendingActivationPort, PendingActivationPortError,
-    PendingActivationReceiptV1, PromotionClock, PromotionId, PromotionIntentV1, PromotionRecordV1,
-    PromotionStageV1, PromotionStore, PromotionStoreError, PublicationDispositionV1,
-    PublicationPortOutcomeV1, PublicationRecordV1, PublishAuthoringRuleSetV1,
-    RuleSetPublicationPort,
+    LinkPendingActivationV1, NewPromotionV1, PendingActivationLinkV1, PendingActivationPort,
+    PendingActivationPortError, PendingActivationReceiptV1, PromotionClock, PromotionId,
+    PromotionIntentV1, PromotionRecordV1, PromotionStageV1, PromotionStore, PromotionStoreError,
+    PublicationDispositionV1, PublicationPortOutcomeV1, PublicationRecordV1,
+    PublishAuthoringRuleSetV1, ResolveProductApprovalContextV1, RuleSetPublicationPort,
 };
 
 pub struct StartPromotionV1 {
@@ -73,7 +76,8 @@ where
         &self,
         promotion_id: &PromotionId,
     ) -> Result<ResumePromotionOutcomeV1, PromotionError> {
-        for _ in 0..4 {
+        let mut advanced = false;
+        for _ in 0..8 {
             let record = self
                 .store
                 .get(promotion_id)
@@ -90,7 +94,11 @@ where
                         .mark_published(&record.id, record.revision, publication, self.clock.now())
                         .await
                     {
-                        Ok(_) | Err(PromotionStoreError::RevisionConflict { .. }) => continue,
+                        Ok(_) => {
+                            advanced = true;
+                            continue;
+                        }
+                        Err(PromotionStoreError::RevisionConflict { .. }) => continue,
                         Err(error) => return Err(PromotionError::Store(error)),
                     }
                 }
@@ -117,6 +125,10 @@ where
                     };
                     match transition {
                         Ok(record) => {
+                            advanced = true;
+                            if matches!(record.stage, PromotionStageV1::ActivationPending { .. }) {
+                                continue;
+                            }
                             return Ok(match &record.stage {
                                 PromotionStageV1::Expired { .. } => {
                                     ResumePromotionOutcomeV1::TerminalExpired(record)
@@ -128,8 +140,31 @@ where
                         Err(error) => return Err(PromotionError::Store(error)),
                     }
                 }
-                PromotionStageV1::ActivationPending { .. } => {
-                    return Ok(ResumePromotionOutcomeV1::AlreadyActivationPending(record));
+                PromotionStageV1::ActivationPending {
+                    publication,
+                    activation,
+                } => {
+                    let linked = self.link_pending(&record, publication, activation).await?;
+                    if linked.state == ActivationRequestState::Expired {
+                        let expired = expired_link(activation, &linked);
+                        let updated_at = self.clock.now().max(expired.expires_at);
+                        match self
+                            .store
+                            .mark_expired(&record.id, record.revision, expired, updated_at)
+                            .await
+                        {
+                            Ok(record) => {
+                                return Ok(ResumePromotionOutcomeV1::TerminalExpired(record));
+                            }
+                            Err(PromotionStoreError::RevisionConflict { .. }) => continue,
+                            Err(error) => return Err(PromotionError::Store(error)),
+                        }
+                    }
+                    return Ok(if advanced {
+                        ResumePromotionOutcomeV1::Advanced(record)
+                    } else {
+                        ResumePromotionOutcomeV1::AlreadyActivationPending(record)
+                    });
                 }
                 PromotionStageV1::Expired { .. } => {
                     return Ok(ResumePromotionOutcomeV1::TerminalExpired(record));
@@ -197,20 +232,74 @@ where
             version: publication.version,
             content_hash: publication.content_hash,
         };
-        let ttl_seconds = i64::try_from(authority.policy.ttl_seconds.get())
-            .map_err(|_| PromotionError::InvalidPolicy)?;
-        let ttl = Duration::try_seconds(ttl_seconds).ok_or(PromotionError::InvalidPolicy)?;
+        let resolved = self
+            .activation
+            .resolve_product_approval_context(ResolveProductApprovalContextV1 {
+                tenant_id: authority.tenant_id.clone(),
+                installation_id: authority.installation_id.clone(),
+                target: target.clone(),
+                binding_revision: authority.binding_revision,
+                context_fingerprint: record.intent.evidence.context_fingerprint.clone(),
+                required_channel_bindings: record.intent.evidence.external_channel_bindings.clone(),
+            })
+            .await?;
+        let policy_revision = std::num::NonZeroU64::new(authority.policy.revision.get())
+            .ok_or(PromotionError::InvalidPolicy)?;
+        let policy = ApprovalPolicyBindingV1 {
+            revision: policy_revision,
+            required_approvals: authority.policy.required_approvals,
+            ttl_seconds: authority.policy.ttl_seconds,
+            digest: approval_policy_digest_v1(
+                policy_revision,
+                authority.policy.required_approvals,
+                authority.policy.ttl_seconds,
+            ),
+        };
+        let mut approval_context = ProductApprovalContextV1 {
+            promotion_id: ActivationPromotionId::parse(record.id.as_str())
+                .map_err(|_| PromotionError::ActivationIdentity)?,
+            promotion_request_digest: ActivationDigest::parse(record.request_digest.as_str())
+                .map_err(|_| PromotionError::ActivationIdentity)?,
+            approval_payload_digest: ActivationDigest::parse(&"0".repeat(64))
+                .map_err(|_| PromotionError::ActivationIdentity)?,
+            approval_context_digest: ActivationDigest::parse(&"0".repeat(64))
+                .map_err(|_| PromotionError::ActivationIdentity)?,
+            binding: resolved.binding,
+            baseline: resolved.baseline,
+            policy,
+        };
+        let payload = crate::model::product_approval_payload_from_parts(
+            &record.id,
+            &record.request_digest,
+            &record.intent,
+            publication,
+            &approval_context,
+        );
+        approval_context.approval_payload_digest = approval_payload_digest_v1(&payload)?;
+        approval_context.approval_context_digest = product_approval_context_digest_v1(
+            &request_id,
+            &target,
+            authority.requester,
+            &approval_context,
+        );
         let receipt = self
             .activation
             .ensure_pending_activation(EnsurePendingActivationV1 {
-                id: request_id.clone(),
-                target,
-                requester: authority.requester,
-                required_approvals: authority.policy.required_approvals,
-                ttl,
+                create: CreateProductActivationRequest {
+                    id: request_id.clone(),
+                    target,
+                    requester: authority.requester,
+                    context: approval_context.clone(),
+                },
             })
             .await?;
-        let state = validate_activation_receipt(record, publication, &request_id, &receipt, ttl)?;
+        let state = validate_activation_receipt(
+            record,
+            publication,
+            &request_id,
+            &approval_context,
+            &receipt,
+        )?;
         let link = PendingActivationLinkV1 {
             request_id: receipt.request.id,
             target: receipt.request.target,
@@ -220,13 +309,45 @@ where
             created_at: receipt.request.created_at,
             expires_at: receipt.request.expires_at,
             disposition: receipt.disposition,
-            request_state_at_link: state,
+            request_state_at_link: if state == ActivationRequestState::Expired {
+                ActivationRequestState::Expired
+            } else {
+                ActivationRequestState::Pending
+            },
+            approval_context,
         };
         Ok(match state {
             ActivationRequestState::Pending => PendingRequestOutcomeV1::Pending(link),
             ActivationRequestState::Expired => PendingRequestOutcomeV1::Expired(link),
             _ => return Err(PromotionError::PendingActivationMismatch),
         })
+    }
+
+    async fn link_pending(
+        &self,
+        record: &PromotionRecordV1,
+        publication: &PublicationRecordV1,
+        activation: &PendingActivationLinkV1,
+    ) -> Result<ActivationRequest, PromotionError> {
+        let linked = self
+            .activation
+            .link_pending_activation(LinkPendingActivationV1 {
+                request_id: activation.request_id.clone(),
+                link: LinkProductActivation {
+                    promotion_id: activation.approval_context.promotion_id.clone(),
+                    promotion_request_digest: activation
+                        .approval_context
+                        .promotion_request_digest
+                        .clone(),
+                    approval_context_digest: activation
+                        .approval_context
+                        .approval_context_digest
+                        .clone(),
+                },
+            })
+            .await?;
+        validate_linked_activation(record, publication, activation, &linked)?;
+        Ok(linked)
     }
 }
 
@@ -340,11 +461,14 @@ fn validate_activation_receipt(
     record: &PromotionRecordV1,
     publication: &PublicationRecordV1,
     expected_request_id: &ActivationRequestId,
+    expected_context: &ProductApprovalContextV1,
     receipt: &PendingActivationReceiptV1,
-    ttl: Duration,
 ) -> Result<ActivationRequestState, PromotionError> {
     let request = &receipt.request;
     let authority = &record.intent.authority;
+    let ttl_seconds = i64::try_from(authority.policy.ttl_seconds.get())
+        .map_err(|_| PromotionError::InvalidPolicy)?;
+    let ttl = Duration::try_seconds(ttl_seconds).ok_or(PromotionError::InvalidPolicy)?;
     let expected_expiry = request
         .created_at
         .checked_add_signed(ttl)
@@ -356,28 +480,104 @@ fn validate_activation_receipt(
         || request.target.content_hash != publication.content_hash
         || request.requester != authority.requester
         || request.required_approvals != authority.policy.required_approvals.get()
-        || !matches!(
-            request.state,
-            ActivationRequestState::Pending | ActivationRequestState::Expired
-        )
-        || !request.approvals.is_empty()
-        || request.rejection.is_some()
-        || request.apply_attempt_id.is_some()
-        || request.apply_attempt_no != 0
-        || request.apply_lease_until.is_some()
-        || request.last_apply_error.is_some()
-        || request.completion.is_some()
         || request.created_at < record.created_at
         || request.expires_at != expected_expiry
+        || request.approval_context
+            != (ActivationApprovalContextV1::ProductAuthoring {
+                context: Box::new(expected_context.clone()),
+            })
+        || request.observed_active != expected_context.baseline.as_observed()
     {
         return Err(PromotionError::PendingActivationMismatch);
     }
-    if request.state == ActivationRequestState::Expired
-        && receipt.disposition != crate::PendingActivationDispositionV1::Reused
-    {
+    match receipt.disposition {
+        crate::PendingActivationDispositionV1::Created => {
+            if request.state != ActivationRequestState::Pending
+                || request.link_state != ActivationLinkStateV1::Unlinked
+                || !request.approvals.is_empty()
+                || request.rejection.is_some()
+                || request.apply_attempt_id.is_some()
+                || request.apply_attempt_no != 0
+                || request.apply_lease_until.is_some()
+                || request.last_apply_error.is_some()
+                || request.completion.is_some()
+                || request.termination.is_some()
+            {
+                return Err(PromotionError::PendingActivationMismatch);
+            }
+        }
+        crate::PendingActivationDispositionV1::Reused => {
+            if request.state == ActivationRequestState::Expired {
+                return Ok(ActivationRequestState::Expired);
+            }
+            if request.link_state == ActivationLinkStateV1::Unlinked
+                && (request.state != ActivationRequestState::Pending
+                    || !request.approvals.is_empty()
+                    || request.rejection.is_some()
+                    || request.apply_attempt_id.is_some()
+                    || request.completion.is_some()
+                    || request.termination.is_some())
+            {
+                return Err(PromotionError::PendingActivationMismatch);
+            }
+        }
+    }
+    Ok(ActivationRequestState::Pending)
+}
+
+fn validate_linked_activation(
+    record: &PromotionRecordV1,
+    publication: &PublicationRecordV1,
+    activation: &PendingActivationLinkV1,
+    request: &ActivationRequest,
+) -> Result<(), PromotionError> {
+    let expected_expiry = request
+        .created_at
+        .checked_add_signed(
+            Duration::try_seconds(
+                i64::try_from(record.intent.authority.policy.ttl_seconds.get())
+                    .map_err(|_| PromotionError::InvalidPolicy)?,
+            )
+            .ok_or(PromotionError::InvalidPolicy)?,
+        )
+        .ok_or(PromotionError::InvalidPolicy)?;
+    let exact = request.id == activation.request_id
+        && request.target == activation.target
+        && request.target.version == publication.version
+        && request.target.content_hash == publication.content_hash
+        && request.requester == activation.requester
+        && request.required_approvals == activation.required_approvals.get()
+        && request.observed_active == activation.observed_active
+        && request.created_at == activation.created_at
+        && request.expires_at == activation.expires_at
+        && request.expires_at == expected_expiry
+        && request.approval_context
+            == (ActivationApprovalContextV1::ProductAuthoring {
+                context: Box::new(activation.approval_context.clone()),
+            });
+    let linked = matches!(request.link_state, ActivationLinkStateV1::Linked { .. });
+    if !exact || (!linked && request.state != ActivationRequestState::Expired) {
         return Err(PromotionError::PendingActivationMismatch);
     }
-    Ok(request.state)
+    Ok(())
+}
+
+fn expired_link(
+    activation: &PendingActivationLinkV1,
+    request: &ActivationRequest,
+) -> PendingActivationLinkV1 {
+    PendingActivationLinkV1 {
+        request_id: request.id.clone(),
+        target: request.target.clone(),
+        requester: request.requester,
+        required_approvals: activation.required_approvals,
+        observed_active: request.observed_active.clone(),
+        created_at: request.created_at,
+        expires_at: request.expires_at,
+        disposition: crate::PendingActivationDispositionV1::Reused,
+        request_state_at_link: ActivationRequestState::Expired,
+        approval_context: activation.approval_context.clone(),
+    }
 }
 
 enum PendingRequestOutcomeV1 {

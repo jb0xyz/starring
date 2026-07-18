@@ -3,14 +3,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetSchemaVersion, RuleSetVersionId};
+use automation_ruleset_activation::ActivationDigest;
 
 use crate::id::{AuthoringHash, IdempotencyScopeDigest, PromotionRequestDigest};
-use crate::model::{AuthenticatedPromotionContext, PromotionIntentV1, PublicationRecordV1};
+use crate::model::{
+    AuthenticatedPromotionContext, ProductApprovalPayloadV1, PromotionIntentV1, PublicationRecordV1,
+};
 use crate::{IdempotencyKey, PromotionId};
 
 const IDEMPOTENCY_SCOPE_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.scope.v1\0";
 const PROMOTION_REQUEST_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.request.v1\0";
 const ACTIVATION_REQUEST_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.activation_request.v1\0";
+const APPROVAL_PAYLOAD_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.approval_payload.v1\0";
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +72,15 @@ pub(crate) fn activation_request_hash_v1(
     .and_then(|value| AuthoringHash::parse(&value).map_err(DigestError::Identity))
 }
 
+pub fn approval_payload_digest_v1(
+    payload: &ProductApprovalPayloadV1,
+) -> Result<ActivationDigest, DigestError> {
+    canonical_digest(APPROVAL_PAYLOAD_DOMAIN_V1, payload).and_then(|value| {
+        ActivationDigest::parse(&value)
+            .map_err(|error| DigestError::ActivationIdentity(error.to_string()))
+    })
+}
+
 fn canonical_digest(domain: &[u8], value: &impl Serialize) -> Result<String, DigestError> {
     let value =
         serde_json::to_value(value).map_err(|error| DigestError::Serialize(error.to_string()))?;
@@ -109,9 +122,11 @@ fn to_lower_hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum DigestError {
+pub enum DigestError {
     #[error("promotion digest serialization failed: {0}")]
     Serialize(String),
     #[error("promotion digest identity is invalid: {0}")]
     Identity(crate::PromotionIdError),
+    #[error("activation digest identity is invalid: {0}")]
+    ActivationIdentity(String),
 }

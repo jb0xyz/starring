@@ -4,29 +4,33 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use authoring_promotion::{
-    ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId,
-    BindingRevision, CreatePromotionOutcomeV1, EnsurePendingActivationV1, IdempotencyKey,
-    InMemoryPromotionStore, ManualPromotionClock, PendingActivationDispositionV1,
-    PendingActivationPort, PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision,
-    PrincipalId, PromotionError, PromotionId, PromotionRecordV1, PromotionRecordValidationError,
+    approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
+    AuthoringSessionId, AutomationInstallationId, BindingRevision, CreatePromotionOutcomeV1,
+    EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore, LinkPendingActivationV1,
+    ManualPromotionClock, PendingActivationDispositionV1, PendingActivationPort,
+    PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision, PrincipalId,
+    PromotionError, PromotionId, PromotionRecordV1, PromotionRecordValidationError,
     PromotionService, PromotionStageV1, PromotionStore, PromotionStoreError,
     PublicationDispositionV1, PublicationPortOutcomeV1, PublicationRecordV1,
-    PublishAuthoringRuleSetV1, PublishedAuthoringRuleSetV1, ResumePromotionOutcomeV1,
-    RuleSetPublicationPort, SessionGeneration, StartPromotionV1, TenantId,
+    PublishAuthoringRuleSetV1, PublishedAuthoringRuleSetV1, ResolveProductApprovalContextV1,
+    ResolvedProductApprovalContextV1, ResumePromotionOutcomeV1, RuleSetPublicationPort,
+    SessionGeneration, StartPromotionV1, TenantId,
 };
 use automation_ruleset::{
     InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError,
 };
 use automation_ruleset_activation::{
-    ActivationRequest, ActivationRequestId, CreateActivationRequest,
+    ActivationApprovalContextV1, ActivationLinkStateV1, ActivationRequest, ActivationRequestId,
+    ApprovalBindingContextV1, ExpectedActiveBaselineV1,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, PreviewReadyArtifactV1,
     ResourceBindingMap, ToolCall, ToolDefinition,
 };
-use discord_model::{GuildId, UserId};
+use discord_model::{ChannelId, GuildId, UserId};
 use futures::executor::block_on;
+use resource_resolution::{approval_binding_fingerprint_v1, ResolvedApprovalBinding};
 use serde_json::json;
 
 #[derive(Clone)]
@@ -186,12 +190,15 @@ impl RuleSetPublicationPort for PublicationSpy {
 
 struct PendingSpy {
     calls: AtomicUsize,
+    link_calls: AtomicUsize,
     fail_once: AtomicBool,
+    fail_link_once: AtomicBool,
+    indeterminate_after_link_once: AtomicBool,
     indeterminate_after_create_once: AtomicBool,
     corrupt: AtomicBool,
     expire_existing: AtomicBool,
     barrier: Option<Arc<Barrier>>,
-    now: DateTime<Utc>,
+    now: Mutex<DateTime<Utc>>,
     requests: Mutex<BTreeMap<ActivationRequestId, ActivationRequest>>,
 }
 
@@ -199,18 +206,49 @@ impl PendingSpy {
     fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            link_calls: AtomicUsize::new(0),
             fail_once: AtomicBool::new(false),
+            fail_link_once: AtomicBool::new(false),
+            indeterminate_after_link_once: AtomicBool::new(false),
             indeterminate_after_create_once: AtomicBool::new(false),
             corrupt: AtomicBool::new(false),
             expire_existing: AtomicBool::new(false),
             barrier: None,
-            now: fixed_now(),
+            now: Mutex::new(fixed_now()),
             requests: Mutex::new(BTreeMap::new()),
         }
     }
 }
 
 impl PendingActivationPort for PendingSpy {
+    async fn resolve_product_approval_context(
+        &self,
+        input: ResolveProductApprovalContextV1,
+    ) -> Result<ResolvedProductApprovalContextV1, PendingActivationPortError> {
+        let revision = NonZeroU64::new(input.binding_revision.get()).unwrap();
+        let required_bindings = input
+            .required_channel_bindings
+            .into_iter()
+            .map(|key| ResolvedApprovalBinding::Channel {
+                key: serde_json::from_value(json!(key)).unwrap(),
+                id: ChannelId(700),
+            })
+            .collect::<Vec<_>>();
+        Ok(ResolvedProductApprovalContextV1 {
+            binding: ApprovalBindingContextV1 {
+                revision,
+                fingerprint: approval_binding_fingerprint_v1(
+                    input.target.guild_id,
+                    revision,
+                    &required_bindings,
+                )
+                .unwrap(),
+                required_bindings,
+            },
+            baseline: ExpectedActiveBaselineV1::Absent,
+        })
+    }
+
     async fn ensure_pending_activation(
         &self,
         input: EnsurePendingActivationV1,
@@ -223,14 +261,22 @@ impl PendingActivationPort for PendingSpy {
             return Err(PendingActivationPortError::Backend("injected".to_string()));
         }
         let mut requests = self.requests.lock().unwrap();
-        if let Some(existing) = requests.get_mut(&input.id) {
+        if let Some(existing) = requests.get_mut(&input.create.id) {
             if self.expire_existing.load(Ordering::SeqCst) {
                 existing.expire_if_due(existing.expires_at);
             }
-            let exact = existing.target == input.target
-                && existing.requester == input.requester
-                && existing.required_approvals == input.required_approvals.get()
-                && existing.expires_at - existing.created_at == input.ttl;
+            let exact = existing.target == input.create.target
+                && existing.requester == input.create.requester
+                && existing.required_approvals
+                    == input.create.context.policy.required_approvals.get()
+                && existing.expires_at - existing.created_at
+                    == chrono::Duration::seconds(
+                        i64::try_from(input.create.context.policy.ttl_seconds.get()).unwrap(),
+                    )
+                && existing.approval_context
+                    == (ActivationApprovalContextV1::ProductAuthoring {
+                        context: Box::new(input.create.context.clone()),
+                    });
             if !exact {
                 return Err(PendingActivationPortError::Conflict(
                     "request identity mismatch".to_string(),
@@ -241,18 +287,8 @@ impl PendingActivationPort for PendingSpy {
                 disposition: PendingActivationDispositionV1::Reused,
             });
         }
-        let mut request = ActivationRequest::create(
-            CreateActivationRequest {
-                id: input.id,
-                target: input.target,
-                requester: input.requester,
-                required_approvals: input.required_approvals.get(),
-                ttl: input.ttl,
-                observed_active: None,
-            },
-            self.now,
-        )
-        .unwrap();
+        let mut request =
+            ActivationRequest::create_product(input.create, *self.now.lock().unwrap()).unwrap();
         if self.corrupt.load(Ordering::SeqCst) {
             request.requester = UserId(request.requester.0 + 1);
         }
@@ -269,6 +305,43 @@ impl PendingActivationPort for PendingSpy {
             request,
             disposition: PendingActivationDispositionV1::Created,
         })
+    }
+
+    async fn link_pending_activation(
+        &self,
+        input: LinkPendingActivationV1,
+    ) -> Result<ActivationRequest, PendingActivationPortError> {
+        self.link_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_link_once.swap(false, Ordering::SeqCst) {
+            return Err(PendingActivationPortError::Backend(
+                "injected before link".to_string(),
+            ));
+        }
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests.get_mut(&input.request_id).ok_or_else(|| {
+            PendingActivationPortError::Indeterminate("request disappeared".to_string())
+        })?;
+        let result = request.link_product_at(
+            &input.link.promotion_id,
+            &input.link.promotion_request_digest,
+            &input.link.approval_context_digest,
+            *self.now.lock().unwrap(),
+        );
+        if result.is_ok()
+            && self
+                .indeterminate_after_link_once
+                .swap(false, Ordering::SeqCst)
+        {
+            return Err(PendingActivationPortError::Indeterminate(
+                "injected after link".to_string(),
+            ));
+        }
+        match result {
+            Ok(_) | Err(automation_ruleset_activation::LinkDecisionError::Expired) => {
+                Ok(request.clone())
+            }
+            Err(error) => Err(PendingActivationPortError::Conflict(error.to_string())),
+        }
     }
 }
 
@@ -335,6 +408,37 @@ fn exact_candidate_reaches_pending_without_changing_the_active_pointer() {
         assert_eq!(published.disposition, PublicationDispositionV1::Created);
         assert_eq!(published.registry_created_by, UserId(100));
         assert_eq!(linked.requester, UserId(100));
+        let activation_request = activation
+            .requests
+            .lock()
+            .unwrap()
+            .get(&linked.request_id)
+            .cloned()
+            .unwrap();
+        assert!(matches!(
+            activation_request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ));
+        assert!(matches!(
+            activation_request.link_state,
+            ActivationLinkStateV1::Linked { .. }
+        ));
+        let approval_payload = record.product_approval_payload().unwrap();
+        let approval_payload_digest = approval_payload_digest_v1(&approval_payload).unwrap();
+        assert_eq!(
+            approval_payload_digest,
+            linked.approval_context.approval_payload_digest
+        );
+        assert_eq!(
+            approval_payload_digest.as_str(),
+            "759d0f7a037eab7c077c63054f8f83b5f2a7853d32e415895395540e5c6bcd6f"
+        );
+        let mut changed_payload = approval_payload.clone();
+        changed_payload.preview.summary.actions += 1;
+        assert_ne!(
+            approval_payload_digest_v1(&changed_payload).unwrap(),
+            approval_payload_digest
+        );
         assert_eq!(
             record.intent.idempotency_scope_digest.as_str(),
             "554d460bd901e90fa6fc6be49c267bfea2408c8af7fd892fd124721b03f66849"
@@ -757,6 +861,9 @@ fn concurrent_resumes_converge_on_one_version_one_request_and_one_record() {
             ResumePromotionOutcomeV1::AlreadyActivationPending(_)
         ) | (
             ResumePromotionOutcomeV1::AlreadyActivationPending(_),
+            ResumePromotionOutcomeV1::Advanced(_)
+        ) | (
+            ResumePromotionOutcomeV1::Advanced(_),
             ResumePromotionOutcomeV1::Advanced(_)
         )
     ));
@@ -1238,6 +1345,130 @@ fn crash_after_pending_request_creation_resumes_by_linking_the_exact_request() {
         assert_eq!(link.disposition, PendingActivationDispositionV1::Reused);
         assert_eq!(publication.calls.load(Ordering::SeqCst), 1);
         assert_eq!(activation.calls.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn crash_after_promotion_journal_repairs_the_exact_unlinked_request() {
+    block_on(async {
+        for indeterminate_after_link in [false, true] {
+            let promotions = InMemoryPromotionStore::default();
+            let publication = PublicationSpy::default();
+            let activation = PendingSpy::new();
+            if indeterminate_after_link {
+                activation
+                    .indeterminate_after_link_once
+                    .store(true, Ordering::SeqCst);
+            } else {
+                activation.fail_link_once.store(true, Ordering::SeqCst);
+            }
+            let service = PromotionService::new(
+                &promotions,
+                &publication,
+                &activation,
+                ManualPromotionClock::new(fixed_now()),
+            );
+            let key = if indeterminate_after_link {
+                "journal-link-indeterminate"
+            } else {
+                "journal-link-crash"
+            };
+            let CreatePromotionOutcomeV1::Created(prepared) = service
+                .start(start_input(key, "studyrooms", true).await)
+                .await
+                .unwrap()
+            else {
+                panic!("expected created")
+            };
+            assert!(matches!(
+                service.resume_to_activation_pending(&prepared.id).await,
+                Err(PromotionError::PendingActivation(
+                    PendingActivationPortError::Backend(_)
+                        | PendingActivationPortError::Indeterminate(_)
+                ))
+            ));
+            let journaled = promotions.get(&prepared.id).await.unwrap().unwrap();
+            let PromotionStageV1::ActivationPending {
+                activation: link, ..
+            } = &journaled.stage
+            else {
+                panic!("expected journaled activation")
+            };
+            let request = activation
+                .requests
+                .lock()
+                .unwrap()
+                .get(&link.request_id)
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                matches!(request.link_state, ActivationLinkStateV1::Linked { .. }),
+                indeterminate_after_link
+            );
+            assert!(matches!(
+                service
+                    .resume_to_activation_pending(&prepared.id)
+                    .await
+                    .unwrap(),
+                ResumePromotionOutcomeV1::AlreadyActivationPending(existing)
+                    if existing == journaled
+            ));
+            let repaired = activation
+                .requests
+                .lock()
+                .unwrap()
+                .get(&link.request_id)
+                .cloned()
+                .unwrap();
+            assert!(matches!(
+                repaired.link_state,
+                ActivationLinkStateV1::Linked { .. }
+            ));
+            assert_eq!(activation.requests.lock().unwrap().len(), 1);
+            assert_eq!(activation.link_calls.load(Ordering::SeqCst), 2);
+        }
+    });
+}
+
+#[test]
+fn unlinked_request_expiring_after_journal_becomes_revision_four_terminal() {
+    block_on(async {
+        let promotions = InMemoryPromotionStore::default();
+        let publication = PublicationSpy::default();
+        let activation = PendingSpy::new();
+        activation.fail_link_once.store(true, Ordering::SeqCst);
+        let promotion_clock = ManualPromotionClock::new(fixed_now());
+        let service = PromotionService::new(
+            &promotions,
+            &publication,
+            &activation,
+            promotion_clock.clone(),
+        );
+        let CreatePromotionOutcomeV1::Created(prepared) = service
+            .start(start_input("journal-expiry", "studyrooms", true).await)
+            .await
+            .unwrap()
+        else {
+            panic!("expected created")
+        };
+        assert!(service
+            .resume_to_activation_pending(&prepared.id)
+            .await
+            .is_err());
+        let journaled = promotions.get(&prepared.id).await.unwrap().unwrap();
+        assert_eq!(journaled.revision.get(), 3);
+        *activation.now.lock().unwrap() = fixed_now() + chrono::Duration::seconds(3600);
+        promotion_clock.advance(chrono::Duration::seconds(3600));
+        let ResumePromotionOutcomeV1::TerminalExpired(expired) = service
+            .resume_to_activation_pending(&prepared.id)
+            .await
+            .unwrap()
+        else {
+            panic!("expected terminal expiry")
+        };
+        assert_eq!(expired.revision.get(), 4);
+        assert!(matches!(expired.stage, PromotionStageV1::Expired { .. }));
+        expired.validate().unwrap();
     });
 }
 

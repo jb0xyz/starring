@@ -1,16 +1,19 @@
 use std::fmt::{Debug, Formatter};
-use std::num::NonZeroU32;
 
 use automation_ruleset::{
     PublishOutcome, PublishRuleSetRequest, RuleSetContentHash, RuleSetKey, RuleSetSchemaVersion,
     RuleSetStore, RuleSetStoreError, RuleSetVersionId,
 };
 use automation_ruleset_activation::{ActivationRequest, ActivationRequestId, ActivationTarget};
+use automation_ruleset_activation::{
+    ApprovalBindingContextV1, CreateProductActivationRequest, ExpectedActiveBaselineV1,
+    LinkProductActivation,
+};
 use automation_state::InteractionRuleSet;
-use chrono::Duration;
 use discord_model::{GuildId, UserId};
+use resource_resolution::ResourceBindingFingerprint;
 
-use crate::PendingActivationDispositionV1;
+use crate::{AutomationInstallationId, BindingRevision, PendingActivationDispositionV1, TenantId};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PublishAuthoringRuleSetV1 {
@@ -121,12 +124,30 @@ impl From<automation_ruleset::RuleSetVersion> for PublishedAuthoringRuleSetV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnsurePendingActivationV1 {
-    pub id: ActivationRequestId,
+pub struct ResolveProductApprovalContextV1 {
+    pub tenant_id: TenantId,
+    pub installation_id: AutomationInstallationId,
     pub target: ActivationTarget,
-    pub requester: UserId,
-    pub required_approvals: NonZeroU32,
-    pub ttl: Duration,
+    pub binding_revision: BindingRevision,
+    pub context_fingerprint: ResourceBindingFingerprint,
+    pub required_channel_bindings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedProductApprovalContextV1 {
+    pub binding: ApprovalBindingContextV1,
+    pub baseline: ExpectedActiveBaselineV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnsurePendingActivationV1 {
+    pub create: CreateProductActivationRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkPendingActivationV1 {
+    pub request_id: ActivationRequestId,
+    pub link: LinkProductActivation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,8 +168,18 @@ pub enum PendingActivationPortError {
 
 #[allow(async_fn_in_trait)]
 pub trait PendingActivationPort {
+    async fn resolve_product_approval_context(
+        &self,
+        request: ResolveProductApprovalContextV1,
+    ) -> Result<ResolvedProductApprovalContextV1, PendingActivationPortError>;
+
     async fn ensure_pending_activation(
         &self,
         request: EnsurePendingActivationV1,
     ) -> Result<PendingActivationReceiptV1, PendingActivationPortError>;
+
+    async fn link_pending_activation(
+        &self,
+        request: LinkPendingActivationV1,
+    ) -> Result<ActivationRequest, PendingActivationPortError>;
 }

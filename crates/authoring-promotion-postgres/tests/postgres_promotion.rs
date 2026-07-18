@@ -6,24 +6,33 @@ use std::sync::{Arc, Mutex};
 use authoring_promotion::{
     ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId,
     BindingRevision, CreatePromotionOutcomeV1, EnsurePendingActivationV1, IdempotencyKey,
-    ManualPromotionClock, PendingActivationDispositionV1, PendingActivationPort,
-    PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision, PrincipalId,
-    PromotionError, PromotionRecordV1, PromotionService, PromotionStageV1, PromotionStore,
-    PromotionStoreError, PublicationDispositionV1, PublicationPortOutcomeV1,
-    PublishAuthoringRuleSetV1, ResumePromotionOutcomeV1, RuleSetPublicationPort, SessionGeneration,
-    StartPromotionV1, TenantId,
+    LinkPendingActivationV1, ManualPromotionClock, PendingActivationDispositionV1,
+    PendingActivationPort, PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision,
+    PrincipalId, ProductActivationBridge, ProductApprovalEnvironmentError,
+    ProductApprovalEnvironmentProvider, ProductApprovalEnvironmentV1, PromotionError,
+    PromotionRecordV1, PromotionService, PromotionStageV1, PromotionStore, PromotionStoreError,
+    PublicationDispositionV1, PublicationPortOutcomeV1, PublishAuthoringRuleSetV1,
+    ResolveProductApprovalContextV1, ResolvedProductApprovalContextV1, ResumePromotionOutcomeV1,
+    RuleSetPublicationPort, SessionGeneration, StartPromotionV1, TenantId, UtcPromotionClock,
 };
 use authoring_promotion_postgres::{PostgresPromotionStore, MIGRATOR};
 use automation_ruleset::{InMemoryRuleSetStore, RuleSetStore, RuleSetStoreError};
 use automation_ruleset_activation::{
-    ActivationRequest, ActivationRequestId, CreateActivationRequest,
+    ActivationApprovalContextV1, ActivationEnvironment, ActivationEnvironmentError,
+    ActivationEnvironmentProvider, ActivationRequest, ActivationRequestId, ActivationRequestState,
+    ActivationRequestStore, ActivationService, ApplyAttemptId, ApplyOutcome,
+    ApprovalBindingContextV1, ExpectedActiveBaselineV1,
 };
+use automation_ruleset_activation_postgres::PostgresActivationRequestStore;
+use automation_ruleset_postgres::PostgresRuleSetStore;
+use automation_ruleset_readiness::GuildCapabilities;
 use chrono::{DateTime, TimeZone, Utc};
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, PreviewReadyArtifactV1,
     ResourceBindingMap, ToolCall, ToolDefinition,
 };
-use discord_model::{GuildId, UserId};
+use discord_model::{ChannelId, GuildId, Permissions, UserId};
+use resource_resolution::{approval_binding_fingerprint_v1, ResolvedApprovalBinding};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -72,11 +81,7 @@ impl LlmClient for ScriptedClient {
 }
 
 async fn artifact() -> PreviewReadyArtifactV1 {
-    let mut bindings = ResourceBindingMap::default();
-    bindings.channel_bindings.insert(
-        serde_json::from_value(json!("community_hub")).unwrap(),
-        "700".parse().unwrap(),
-    );
+    let bindings = product_bindings();
     let mut session =
         DesignSession::with_intent_recipe(ScriptedClient::validated_preview(), bindings);
     assert!(matches!(
@@ -88,6 +93,15 @@ async fn artifact() -> PreviewReadyArtifactV1 {
         BurstOutcome::Ready { .. }
     ));
     session.export_preview_ready_artifact().unwrap()
+}
+
+fn product_bindings() -> ResourceBindingMap {
+    let mut bindings = ResourceBindingMap::default();
+    bindings.channel_bindings.insert(
+        serde_json::from_value(json!("community_hub")).unwrap(),
+        "700".parse().unwrap(),
+    );
+    bindings
 }
 
 fn fixed_now() -> DateTime<Utc> {
@@ -136,10 +150,24 @@ impl RuleSetPublicationPort for UnusedPorts {
 }
 
 impl PendingActivationPort for UnusedPorts {
+    async fn resolve_product_approval_context(
+        &self,
+        _request: ResolveProductApprovalContextV1,
+    ) -> Result<ResolvedProductApprovalContextV1, PendingActivationPortError> {
+        panic!("activation must not be called")
+    }
+
     async fn ensure_pending_activation(
         &self,
         _request: EnsurePendingActivationV1,
     ) -> Result<PendingActivationReceiptV1, PendingActivationPortError> {
+        panic!("activation must not be called")
+    }
+
+    async fn link_pending_activation(
+        &self,
+        _request: LinkPendingActivationV1,
+    ) -> Result<ActivationRequest, PendingActivationPortError> {
         panic!("activation must not be called")
     }
 }
@@ -159,6 +187,34 @@ impl PendingPort {
 }
 
 impl PendingActivationPort for PendingPort {
+    async fn resolve_product_approval_context(
+        &self,
+        input: ResolveProductApprovalContextV1,
+    ) -> Result<ResolvedProductApprovalContextV1, PendingActivationPortError> {
+        let revision = NonZeroU64::new(input.binding_revision.get()).unwrap();
+        let required_bindings = input
+            .required_channel_bindings
+            .into_iter()
+            .map(|key| ResolvedApprovalBinding::Channel {
+                key: serde_json::from_value(json!(key)).unwrap(),
+                id: ChannelId(700),
+            })
+            .collect::<Vec<_>>();
+        Ok(ResolvedProductApprovalContextV1 {
+            binding: ApprovalBindingContextV1 {
+                revision,
+                fingerprint: approval_binding_fingerprint_v1(
+                    input.target.guild_id,
+                    revision,
+                    &required_bindings,
+                )
+                .unwrap(),
+                required_bindings,
+            },
+            baseline: ExpectedActiveBaselineV1::Absent,
+        })
+    }
+
     async fn ensure_pending_activation(
         &self,
         input: EnsurePendingActivationV1,
@@ -167,11 +223,15 @@ impl PendingActivationPort for PendingPort {
             return Err(PendingActivationPortError::Backend("injected".to_string()));
         }
         let mut requests = self.requests.lock().unwrap();
-        if let Some(existing) = requests.get(&input.id) {
-            let exact = existing.target == input.target
-                && existing.requester == input.requester
-                && existing.required_approvals == input.required_approvals.get()
-                && existing.expires_at - existing.created_at == input.ttl;
+        if let Some(existing) = requests.get(&input.create.id) {
+            let exact = existing.target == input.create.target
+                && existing.requester == input.create.requester
+                && existing.required_approvals
+                    == input.create.context.policy.required_approvals.get()
+                && existing.approval_context
+                    == (ActivationApprovalContextV1::ProductAuthoring {
+                        context: Box::new(input.create.context.clone()),
+                    });
             if !exact {
                 return Err(PendingActivationPortError::Conflict(
                     "request mismatch".to_string(),
@@ -182,22 +242,68 @@ impl PendingActivationPort for PendingPort {
                 disposition: PendingActivationDispositionV1::Reused,
             });
         }
-        let request = ActivationRequest::create(
-            CreateActivationRequest {
-                id: input.id,
-                target: input.target,
-                requester: input.requester,
-                required_approvals: input.required_approvals.get(),
-                ttl: input.ttl,
-                observed_active: None,
-            },
-            fixed_now(),
-        )
-        .unwrap();
+        let request = ActivationRequest::create_product(input.create, fixed_now()).unwrap();
         requests.insert(request.id.clone(), request.clone());
         Ok(PendingActivationReceiptV1 {
             request,
             disposition: PendingActivationDispositionV1::Created,
+        })
+    }
+
+    async fn link_pending_activation(
+        &self,
+        input: LinkPendingActivationV1,
+    ) -> Result<ActivationRequest, PendingActivationPortError> {
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests.get_mut(&input.request_id).ok_or_else(|| {
+            PendingActivationPortError::Indeterminate("request disappeared".to_string())
+        })?;
+        match request.link_product_at(
+            &input.link.promotion_id,
+            &input.link.promotion_request_digest,
+            &input.link.approval_context_digest,
+            fixed_now(),
+        ) {
+            Ok(_) | Err(automation_ruleset_activation::LinkDecisionError::Expired) => {
+                Ok(request.clone())
+            }
+            Err(error) => Err(PendingActivationPortError::Conflict(error.to_string())),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReadyProductEnvironment {
+    revision: NonZeroU64,
+    bindings: ResourceBindingMap,
+}
+
+impl ProductApprovalEnvironmentProvider for ReadyProductEnvironment {
+    async fn load_fresh(
+        &self,
+        request: &ResolveProductApprovalContextV1,
+    ) -> Result<ProductApprovalEnvironmentV1, ProductApprovalEnvironmentError> {
+        assert_eq!(request.tenant_id.as_str(), "postgres-end-to-end");
+        assert_eq!(request.installation_id.as_str(), "postgres-installation");
+        Ok(ProductApprovalEnvironmentV1 {
+            binding_revision: self.revision,
+            bindings: self.bindings.clone(),
+        })
+    }
+}
+
+impl ActivationEnvironmentProvider for ReadyProductEnvironment {
+    async fn load_fresh(
+        &self,
+        _target: &automation_ruleset_activation::ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        Ok(ActivationEnvironment {
+            binding_revision: Some(self.revision),
+            bindings: self.bindings.clone(),
+            guild_capabilities: GuildCapabilities {
+                base_permissions: Permissions::ADMINISTRATOR,
+            },
+            role_permissions: BTreeMap::new(),
         })
     }
 }
@@ -228,6 +334,27 @@ async fn cleanup(pool: &PgPool, tenant: &str) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+async fn cleanup_product(pool: &PgPool, tenant: &str, guild_id: GuildId) {
+    cleanup(pool, tenant).await;
+    let guild_id = guild_id.to_string();
+    sqlx::query("DELETE FROM activation_requests WHERE guild_id = $1")
+        .bind(&guild_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    for table in [
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+        "automation_ruleset_heads",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
+            .bind(&guild_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn create_prepared(
@@ -450,6 +577,93 @@ async fn crash_resume_reuses_publication_and_survives_reconnect() {
         final_record
     );
     cleanup(&second_pool, tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
+    let tenant = "postgres-end-to-end";
+    let guild_id = context(tenant).guild_id;
+    let sealed = artifact().await;
+    let pool = pool().await;
+    cleanup_product(&pool, tenant, guild_id).await;
+    let promotions = PostgresPromotionStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let environment = ReadyProductEnvironment {
+        revision: NonZeroU64::new(1).unwrap(),
+        bindings: product_bindings(),
+    };
+    let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests);
+    let promotion_service =
+        PromotionService::new(&promotions, &rulesets, &bridge, UtcPromotionClock);
+    let CreatePromotionOutcomeV1::Created(prepared) = promotion_service
+        .start(input("end-to-end-key", tenant, &sealed))
+        .await
+        .unwrap()
+    else {
+        panic!("expected prepared promotion")
+    };
+    let ResumePromotionOutcomeV1::Advanced(journaled) = promotion_service
+        .resume_to_activation_pending(&prepared.id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected linked product activation")
+    };
+    let PromotionStageV1::ActivationPending {
+        publication,
+        activation,
+    } = &journaled.stage
+    else {
+        panic!("expected activation pending")
+    };
+    let pending = requests.get(&activation.request_id).await.unwrap().unwrap();
+    assert_eq!(pending.state, ActivationRequestState::Pending);
+    assert!(matches!(
+        pending.link_state,
+        automation_ruleset_activation::ActivationLinkStateV1::Linked { .. }
+    ));
+    assert!(matches!(
+        pending.approval_context,
+        ActivationApprovalContextV1::ProductAuthoring { .. }
+    ));
+    let approved = requests
+        .approve_bound(
+            &activation.request_id,
+            UserId(200),
+            &activation.approval_context.approval_payload_digest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.state, ActivationRequestState::Approved);
+    let activation_service = ActivationService::new(&requests, &rulesets, &environment);
+    let outcome = activation_service
+        .apply(
+            &activation.request_id,
+            ApplyAttemptId::parse("authoring_end_to_end_apply").unwrap(),
+            UserId(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, ApplyOutcome::Activated);
+    let active = rulesets
+        .active(guild_id, &journaled.intent.authority.ruleset_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.version, publication.version);
+    assert_eq!(active.content_hash, publication.content_hash);
+    assert_eq!(
+        requests
+            .get(&activation.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ActivationRequestState::Applied
+    );
+    cleanup_product(&pool, tenant, guild_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -9,6 +9,7 @@ automation-ruleset-activation = { path = "../automation-ruleset-activation" }
 automation-state = { path = "../automation-state" }
 chrono = { version = "0.4", features = ["serde"] }
 design-harness = { path = "../design-harness" }
+desired-state = { path = "../desired-state" }
 discord-model = { path = "../discord-model" }
 resource-resolution = { path = "../resource-resolution" }
 serde = { workspace = true }

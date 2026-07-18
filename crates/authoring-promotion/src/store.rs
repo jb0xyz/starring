@@ -176,8 +176,23 @@ impl PromotionRecordV1 {
         updated_at: DateTime<Utc>,
     ) -> Result<Self, PromotionStoreError> {
         self.ensure_transition(expected_revision, updated_at)?;
-        let PromotionStageV1::Published { publication } = &self.stage else {
-            return Err(PromotionStoreError::InvalidTransition);
+        let publication = match &self.stage {
+            PromotionStageV1::Published { publication } => publication,
+            PromotionStageV1::ActivationPending {
+                publication,
+                activation: current,
+            } if current.request_id == activation.request_id
+                && current.target == activation.target
+                && current.requester == activation.requester
+                && current.required_approvals == activation.required_approvals
+                && current.observed_active == activation.observed_active
+                && current.created_at == activation.created_at
+                && current.expires_at == activation.expires_at
+                && current.approval_context == activation.approval_context =>
+            {
+                publication
+            }
+            _ => return Err(PromotionStoreError::InvalidTransition),
         };
         self.with_next_stage(
             PromotionStageV1::Expired {

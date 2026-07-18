@@ -4,7 +4,11 @@ use std::num::{NonZeroU32, NonZeroU64};
 use automation_ruleset::{
     content_hash, RuleSetContentHash, RuleSetKey, RuleSetSchemaVersion, RuleSetVersionId,
 };
-use automation_ruleset_activation::{ActivationRequestId, ActivationTarget, ObservedActive};
+use automation_ruleset_activation::{
+    product_approval_context_digest_v1, ActivationDigest, ActivationPromotionId,
+    ActivationRequestId, ActivationTarget, ApprovalBindingContextV1, ApprovalPolicyBindingV1,
+    ExpectedActiveBaselineV1, ObservedActive, ProductApprovalContextV1,
+};
 use automation_state::InteractionRuleSet;
 use chrono::{DateTime, Utc};
 use design_harness::IntentRequestedOutcome;
@@ -12,7 +16,9 @@ use discord_model::{GuildId, UserId};
 use resource_resolution::ResourceBindingFingerprint;
 use serde::{Deserialize, Serialize};
 
-use crate::digest::{activation_request_hash_v1, promotion_request_digest_v1};
+use crate::digest::{
+    activation_request_hash_v1, approval_payload_digest_v1, promotion_request_digest_v1,
+};
 use crate::id::{
     AuthoringHash, AuthoringSessionId, AutomationInstallationId, BindingRevision,
     IdempotencyScopeDigest, PolicyRevision, PrincipalId, PromotionId, PromotionRequestDigest,
@@ -92,6 +98,43 @@ pub struct AuthoringPreviewSummaryV1 {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProductApprovalPayloadV1 {
+    pub format_version: u16,
+    pub promotion_id: PromotionId,
+    pub promotion_request_digest: PromotionRequestDigest,
+    pub authority: AuthenticatedPromotionContext,
+    pub evidence: AuthoringEvidenceV1,
+    pub definition: InteractionRuleSet,
+    pub preview: AuthoringPreviewV1,
+    pub publication: PublicationRecordV1,
+    pub target: ActivationTarget,
+    pub binding: ApprovalBindingContextV1,
+    pub baseline: ExpectedActiveBaselineV1,
+    pub policy: ApprovalPolicyBindingV1,
+}
+
+impl Debug for ProductApprovalPayloadV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductApprovalPayloadV1")
+            .field("format_version", &self.format_version)
+            .field("promotion_id", &self.promotion_id)
+            .field("promotion_request_digest", &self.promotion_request_digest)
+            .field("authority", &self.authority)
+            .field("evidence", &self.evidence)
+            .field("definition", &"<redacted>")
+            .field("preview", &self.preview)
+            .field("publication", &self.publication)
+            .field("target", &self.target)
+            .field("binding", &self.binding)
+            .field("baseline", &self.baseline)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromotionIntentV1 {
     pub idempotency_scope_digest: IdempotencyScopeDigest,
     pub authority: AuthenticatedPromotionContext,
@@ -156,6 +199,7 @@ pub struct PendingActivationLinkV1 {
     pub expires_at: DateTime<Utc>,
     pub disposition: PendingActivationDispositionV1,
     pub request_state_at_link: automation_ruleset_activation::ActivationRequestState,
+    pub approval_context: ProductApprovalContextV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +268,24 @@ impl Debug for PromotionRecordV1 {
 }
 
 impl PromotionRecordV1 {
+    pub fn product_approval_payload(&self) -> Option<ProductApprovalPayloadV1> {
+        match &self.stage {
+            PromotionStageV1::ActivationPending {
+                publication,
+                activation,
+            }
+            | PromotionStageV1::Expired {
+                publication,
+                activation,
+            } => Some(product_approval_payload(
+                self,
+                publication,
+                &activation.approval_context,
+            )),
+            PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PromotionRecordValidationError> {
         if self.id.as_str() != self.intent.idempotency_scope_digest.as_str() {
             return Err(PromotionRecordValidationError::Identity);
@@ -307,7 +369,7 @@ impl PromotionRecordV1 {
                 if self.updated_at < activation.expires_at {
                     return Err(PromotionRecordValidationError::Timestamp);
                 }
-                if self.revision.get() != 3 {
+                if !matches!(self.revision.get(), 3 | 4) {
                     return Err(PromotionRecordValidationError::Revision);
                 }
             }
@@ -429,7 +491,101 @@ fn validate_activation(
     if expected_expiry != activation.expires_at {
         return Err(PromotionRecordValidationError::Activation);
     }
+    let context = &activation.approval_context;
+    let promotion_identity = ActivationPromotionId::parse(promotion_id.as_str()).ok();
+    let request_identity = ActivationDigest::parse(promotion_request_digest.as_str()).ok();
+    let payload = product_approval_payload_from_parts(
+        promotion_id,
+        promotion_request_digest,
+        intent,
+        publication,
+        context,
+    );
+    let payload_digest = approval_payload_digest_v1(&payload).ok();
+    if promotion_identity.as_ref() != Some(&context.promotion_id)
+        || request_identity.as_ref() != Some(&context.promotion_request_digest)
+        || payload_digest.as_ref() != Some(&context.approval_payload_digest)
+        || context.binding.revision.get() != authority.binding_revision.get()
+        || context.policy.revision.get() != authority.policy.revision.get()
+        || context.policy.required_approvals != authority.policy.required_approvals
+        || context.policy.ttl_seconds != authority.policy.ttl_seconds
+        || !context.policy.validate()
+        || !context.binding.validate(authority.guild_id)
+        || context.baseline.as_observed() != activation.observed_active
+        || product_approval_context_digest_v1(
+            &activation.request_id,
+            &activation.target,
+            activation.requester,
+            context,
+        ) != context.approval_context_digest
+        || !context_bindings_match_evidence(context, &intent.evidence)
+    {
+        return Err(PromotionRecordValidationError::Activation);
+    }
     Ok(())
+}
+
+fn product_approval_payload(
+    record: &PromotionRecordV1,
+    publication: &PublicationRecordV1,
+    context: &ProductApprovalContextV1,
+) -> ProductApprovalPayloadV1 {
+    product_approval_payload_from_parts(
+        &record.id,
+        &record.request_digest,
+        &record.intent,
+        publication,
+        context,
+    )
+}
+
+pub(crate) fn product_approval_payload_from_parts(
+    promotion_id: &PromotionId,
+    promotion_request_digest: &PromotionRequestDigest,
+    intent: &PromotionIntentV1,
+    publication: &PublicationRecordV1,
+    context: &ProductApprovalContextV1,
+) -> ProductApprovalPayloadV1 {
+    ProductApprovalPayloadV1 {
+        format_version: 1,
+        promotion_id: promotion_id.clone(),
+        promotion_request_digest: promotion_request_digest.clone(),
+        authority: intent.authority.clone(),
+        evidence: intent.evidence.clone(),
+        definition: intent.definition.clone(),
+        preview: intent.preview.clone(),
+        publication: publication.clone(),
+        target: ActivationTarget {
+            guild_id: intent.authority.guild_id,
+            ruleset_key: intent.authority.ruleset_key.clone(),
+            version: publication.version,
+            content_hash: publication.content_hash,
+        },
+        binding: context.binding.clone(),
+        baseline: context.baseline.clone(),
+        policy: context.policy.clone(),
+    }
+}
+
+fn context_bindings_match_evidence(
+    context: &ProductApprovalContextV1,
+    evidence: &AuthoringEvidenceV1,
+) -> bool {
+    if context.binding.required_bindings.len() != evidence.external_channel_bindings.len() {
+        return false;
+    }
+    context
+        .binding
+        .required_bindings
+        .iter()
+        .zip(&evidence.external_channel_bindings)
+        .all(|(binding, expected_key)| {
+            matches!(
+                binding,
+                resource_resolution::ResolvedApprovalBinding::Channel { key, .. }
+                    if key.0 == *expected_key
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
