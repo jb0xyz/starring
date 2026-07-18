@@ -120,12 +120,9 @@ struct InMemoryPromotionState {
     records: BTreeMap<PromotionId, PromotionRecordV1>,
 }
 
-impl PromotionStore for InMemoryPromotionStore {
-    async fn create_prepared(
-        &self,
-        promotion: NewPromotionV1,
-    ) -> Result<CreatePromotionOutcomeV1, PromotionStoreError> {
-        let record = PromotionRecordV1 {
+impl PromotionRecordV1 {
+    pub fn prepared(promotion: NewPromotionV1) -> Result<Self, PromotionStoreError> {
+        let record = Self {
             id: promotion.id,
             revision: PromotionRevision::FIRST,
             request_digest: promotion.request_digest,
@@ -137,6 +134,107 @@ impl PromotionStore for InMemoryPromotionStore {
         record
             .validate()
             .map_err(PromotionStoreError::InvalidRecord)?;
+        Ok(record)
+    }
+
+    pub fn transition_to_published(
+        &self,
+        expected_revision: PromotionRevision,
+        publication: PublicationRecordV1,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, PromotionStoreError> {
+        self.ensure_transition(expected_revision, updated_at)?;
+        if self.stage != PromotionStageV1::Prepared {
+            return Err(PromotionStoreError::InvalidTransition);
+        }
+        self.with_next_stage(PromotionStageV1::Published { publication }, updated_at)
+    }
+
+    pub fn transition_to_activation_pending(
+        &self,
+        expected_revision: PromotionRevision,
+        activation: PendingActivationLinkV1,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, PromotionStoreError> {
+        self.ensure_transition(expected_revision, updated_at)?;
+        let PromotionStageV1::Published { publication } = &self.stage else {
+            return Err(PromotionStoreError::InvalidTransition);
+        };
+        self.with_next_stage(
+            PromotionStageV1::ActivationPending {
+                publication: publication.clone(),
+                activation,
+            },
+            updated_at,
+        )
+    }
+
+    pub fn transition_to_expired(
+        &self,
+        expected_revision: PromotionRevision,
+        activation: PendingActivationLinkV1,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, PromotionStoreError> {
+        self.ensure_transition(expected_revision, updated_at)?;
+        let PromotionStageV1::Published { publication } = &self.stage else {
+            return Err(PromotionStoreError::InvalidTransition);
+        };
+        self.with_next_stage(
+            PromotionStageV1::Expired {
+                publication: publication.clone(),
+                activation,
+            },
+            updated_at,
+        )
+    }
+
+    fn ensure_transition(
+        &self,
+        expected_revision: PromotionRevision,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), PromotionStoreError> {
+        self.validate()
+            .map_err(PromotionStoreError::InvalidRecord)?;
+        if self.revision != expected_revision {
+            return Err(PromotionStoreError::RevisionConflict {
+                current: self.revision,
+            });
+        }
+        if updated_at < self.updated_at {
+            return Err(PromotionStoreError::InvalidRecord(
+                PromotionRecordValidationError::Timestamp,
+            ));
+        }
+        Ok(())
+    }
+
+    fn with_next_stage(
+        &self,
+        stage: PromotionStageV1,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, PromotionStoreError> {
+        let revision = self
+            .revision
+            .next()
+            .map_err(|_| PromotionStoreError::RevisionOverflow)?;
+        let next = Self {
+            stage,
+            revision,
+            updated_at,
+            ..self.clone()
+        };
+        next.validate()
+            .map_err(PromotionStoreError::InvalidRecord)?;
+        Ok(next)
+    }
+}
+
+impl PromotionStore for InMemoryPromotionStore {
+    async fn create_prepared(
+        &self,
+        promotion: NewPromotionV1,
+    ) -> Result<CreatePromotionOutcomeV1, PromotionStoreError> {
+        let record = PromotionRecordV1::prepared(promotion)?;
         let mut state = self.state.lock().unwrap();
         if let Some(existing) = state.records.get(&record.id) {
             existing
@@ -184,34 +282,7 @@ impl PromotionStore for InMemoryPromotionStore {
             .get(promotion_id)
             .cloned()
             .ok_or(PromotionStoreError::NotFound)?;
-        current
-            .validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
-        if current.revision != expected_revision {
-            return Err(PromotionStoreError::RevisionConflict {
-                current: current.revision,
-            });
-        }
-        if current.stage != PromotionStageV1::Prepared {
-            return Err(PromotionStoreError::InvalidTransition);
-        }
-        if updated_at < current.updated_at {
-            return Err(PromotionStoreError::InvalidRecord(
-                PromotionRecordValidationError::Timestamp,
-            ));
-        }
-        let revision = current
-            .revision
-            .next()
-            .map_err(|_| PromotionStoreError::RevisionOverflow)?;
-        let next = PromotionRecordV1 {
-            stage: PromotionStageV1::Published { publication },
-            revision,
-            updated_at,
-            ..current
-        };
-        next.validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
+        let next = current.transition_to_published(expected_revision, publication, updated_at)?;
         state.records.insert(next.id.clone(), next.clone());
         Ok(next)
     }
@@ -229,37 +300,8 @@ impl PromotionStore for InMemoryPromotionStore {
             .get(promotion_id)
             .cloned()
             .ok_or(PromotionStoreError::NotFound)?;
-        current
-            .validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
-        if current.revision != expected_revision {
-            return Err(PromotionStoreError::RevisionConflict {
-                current: current.revision,
-            });
-        }
-        let PromotionStageV1::Published { publication } = &current.stage else {
-            return Err(PromotionStoreError::InvalidTransition);
-        };
-        if updated_at < current.updated_at {
-            return Err(PromotionStoreError::InvalidRecord(
-                PromotionRecordValidationError::Timestamp,
-            ));
-        }
-        let revision = current
-            .revision
-            .next()
-            .map_err(|_| PromotionStoreError::RevisionOverflow)?;
-        let next = PromotionRecordV1 {
-            stage: PromotionStageV1::ActivationPending {
-                publication: publication.clone(),
-                activation,
-            },
-            revision,
-            updated_at,
-            ..current
-        };
-        next.validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
+        let next =
+            current.transition_to_activation_pending(expected_revision, activation, updated_at)?;
         state.records.insert(next.id.clone(), next.clone());
         Ok(next)
     }
@@ -277,37 +319,7 @@ impl PromotionStore for InMemoryPromotionStore {
             .get(promotion_id)
             .cloned()
             .ok_or(PromotionStoreError::NotFound)?;
-        current
-            .validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
-        if current.revision != expected_revision {
-            return Err(PromotionStoreError::RevisionConflict {
-                current: current.revision,
-            });
-        }
-        let PromotionStageV1::Published { publication } = &current.stage else {
-            return Err(PromotionStoreError::InvalidTransition);
-        };
-        if updated_at < current.updated_at {
-            return Err(PromotionStoreError::InvalidRecord(
-                PromotionRecordValidationError::Timestamp,
-            ));
-        }
-        let revision = current
-            .revision
-            .next()
-            .map_err(|_| PromotionStoreError::RevisionOverflow)?;
-        let next = PromotionRecordV1 {
-            stage: PromotionStageV1::Expired {
-                publication: publication.clone(),
-                activation,
-            },
-            revision,
-            updated_at,
-            ..current
-        };
-        next.validate()
-            .map_err(PromotionStoreError::InvalidRecord)?;
+        let next = current.transition_to_expired(expected_revision, activation, updated_at)?;
         state.records.insert(next.id.clone(), next.clone());
         Ok(next)
     }

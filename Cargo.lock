@@ -115,6 +115,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "authoring-promotion-postgres"
+version = "0.1.0"
+dependencies = [
+ "authoring-promotion",
+ "automation-ruleset",
+ "automation-ruleset-activation",
+ "chrono",
+ "design-harness",
+ "discord-model",
+ "futures",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
