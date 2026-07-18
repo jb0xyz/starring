@@ -40,6 +40,7 @@ use discord_model::{ChannelId, GuildId, Permissions, UserId};
 use resource_resolution::{approval_binding_fingerprint_v1, ResolvedApprovalBinding};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Json;
 use sqlx::PgPool;
 
 #[derive(Clone)]
@@ -333,6 +334,13 @@ async fn pool() -> PgPool {
     pool
 }
 
+fn is_check_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("23514")
+    )
+}
+
 async fn cleanup(pool: &PgPool, tenant: &str) {
     sqlx::query("DELETE FROM authoring_promotions WHERE tenant_id = $1")
         .bind(tenant)
@@ -443,13 +451,24 @@ async fn database_rejects_direct_product_link_without_promotion_journal() {
     let created = requests
         .create_product(CreateProductActivationRequest {
             id: request_id.clone(),
-            target,
+            target: target.clone(),
             requester: UserId(100),
             context: approval_context.clone(),
         })
         .await
         .unwrap();
     assert_eq!(created.link_state, ActivationLinkStateV1::Unlinked);
+    let authority_rewrite = sqlx::query(
+        "UPDATE activation_requests SET authority_kind = 'legacy_manual', \
+         link_state_name = 'not_required', approval_context = '{\"authority\":\"legacy_manual\"}', \
+         link_state = '{\"state\":\"not_required\"}', promotion_id = NULL, \
+         promotion_request_digest = NULL, approval_payload_digest = NULL, \
+         approval_context_digest = NULL, linked_at = NULL WHERE id = $1",
+    )
+    .bind(request_id.as_str())
+    .execute(&pool)
+    .await;
+    assert!(is_check_violation(&authority_rewrite.unwrap_err()));
     let error = requests
         .link_product(
             &request_id,
@@ -469,6 +488,52 @@ async fn database_rejects_direct_product_link_without_promotion_journal() {
         requests.get(&request_id).await.unwrap().unwrap().link_state,
         ActivationLinkStateV1::Unlinked
     );
+
+    let raw_request_id = ActivationRequestId::parse("direct_linked_insert").unwrap();
+    let mut raw_context = approval_context;
+    raw_context.promotion_id = ActivationPromotionId::parse(&"a".repeat(64)).unwrap();
+    raw_context.promotion_request_digest = ActivationDigest::parse(&"b".repeat(64)).unwrap();
+    raw_context.approval_payload_digest = ActivationDigest::parse(&"c".repeat(64)).unwrap();
+    raw_context.approval_context_digest =
+        product_approval_context_digest_v1(&raw_request_id, &target, UserId(100), &raw_context);
+    let raw_created_at = Utc::now();
+    let raw_linked_at = raw_created_at + chrono::Duration::milliseconds(1);
+    let raw_expires_at = raw_created_at + chrono::Duration::seconds(3600);
+    let raw_link_state = ActivationLinkStateV1::Linked {
+        linked_at: raw_linked_at,
+    };
+    let raw_approval_context = ActivationApprovalContextV1::ProductAuthoring {
+        context: Box::new(raw_context.clone()),
+    };
+    let raw_insert = sqlx::query(
+        "INSERT INTO activation_requests \
+         (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \
+          required_approvals, state, created_at, expires_at, authority_kind, link_state_name, \
+          approval_context, link_state, promotion_id, promotion_request_digest, \
+          approval_payload_digest, approval_context_digest, linked_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, 'product_authoring', \
+          'linked', $10, $11, $12, $13, $14, $15, $16)",
+    )
+    .bind(raw_request_id.as_str())
+    .bind(guild_id.to_string())
+    .bind(target.ruleset_key.as_str())
+    .bind(i64::from(target.version.get()))
+    .bind(target.content_hash.to_hex())
+    .bind(UserId(100).to_string())
+    .bind(i32::try_from(required_approvals.get()).unwrap())
+    .bind(raw_created_at)
+    .bind(raw_expires_at)
+    .bind(Json(raw_approval_context))
+    .bind(Json(raw_link_state))
+    .bind(raw_context.promotion_id.as_str())
+    .bind(raw_context.promotion_request_digest.as_str())
+    .bind(raw_context.approval_payload_digest.as_str())
+    .bind(raw_context.approval_context_digest.as_str())
+    .bind(raw_linked_at)
+    .execute(&pool)
+    .await;
+    assert!(is_check_violation(&raw_insert.unwrap_err()));
+    assert!(requests.get(&raw_request_id).await.unwrap().is_none());
     cleanup_product(&pool, tenant, guild_id).await;
 }
 
@@ -723,6 +788,17 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
         pending.approval_context,
         ActivationApprovalContextV1::ProductAuthoring { .. }
     ));
+    let changed_request_digest = "a".repeat(64);
+    let identity_rewrite = sqlx::query(
+        "UPDATE activation_requests SET promotion_request_digest = $2, \
+         approval_context = jsonb_set(approval_context, \
+         '{context,promotion_request_digest}', to_jsonb($2::TEXT)) WHERE id = $1",
+    )
+    .bind(activation.request_id.as_str())
+    .bind(changed_request_digest)
+    .execute(&pool)
+    .await;
+    assert!(is_check_violation(&identity_rewrite.unwrap_err()));
     let approved = requests
         .approve_bound(
             &activation.request_id,

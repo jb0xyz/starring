@@ -176,6 +176,14 @@ async fn journal_product_link(
     target: &RuleSetVersion,
     context: &ProductApprovalContextV1,
 ) {
+    let (created_at, expires_at) =
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT created_at, expires_at FROM activation_requests WHERE id = $1",
+        )
+        .bind(id.as_str())
+        .fetch_one(pool)
+        .await
+        .unwrap();
     let activation_target = ActivationTarget {
         guild_id: target.guild_id,
         ruleset_key: target.ruleset_key.clone(),
@@ -199,6 +207,8 @@ async fn journal_product_link(
                 "target": activation_target,
                 "requester": UserId(10),
                 "required_approvals": context.policy.required_approvals,
+                "created_at": created_at,
+                "expires_at": expires_at,
                 "request_state_at_journal": "pending",
                 "approval_context": context
             }

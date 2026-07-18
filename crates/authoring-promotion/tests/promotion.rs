@@ -492,6 +492,24 @@ fn exact_candidate_reaches_pending_without_changing_the_active_pointer() {
         restored.validate().unwrap();
         assert_eq!(restored, record);
 
+        let mut legacy_state_name = serde_json::to_value(&record).unwrap();
+        let activation = legacy_state_name["stage"]["activation"]
+            .as_object_mut()
+            .unwrap();
+        let state = activation.remove("request_state_at_journal").unwrap();
+        activation.insert("request_state_at_link".to_string(), state);
+        let legacy_restored =
+            serde_json::from_value::<PromotionRecordV1>(legacy_state_name).unwrap();
+        legacy_restored.validate().unwrap();
+        assert_eq!(legacy_restored, record);
+        let canonical = serde_json::to_value(&legacy_restored).unwrap();
+        assert!(canonical["stage"]["activation"]
+            .get("request_state_at_journal")
+            .is_some());
+        assert!(canonical["stage"]["activation"]
+            .get("request_state_at_link")
+            .is_none());
+
         let mut changed_evidence = serde_json::to_value(&record).unwrap();
         changed_evidence["intent"]["evidence"]["candidate_ruleset_hash"] = json!("00".repeat(32));
         let changed_evidence =

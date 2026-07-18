@@ -198,6 +198,7 @@ pub struct PendingActivationLinkV1 {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub disposition: PendingActivationDispositionV1,
+    #[serde(alias = "request_state_at_link")]
     pub request_state_at_journal: automation_ruleset_activation::ActivationRequestState,
     pub approval_context: ProductApprovalContextV1,
 }
