@@ -1,0 +1,15 @@
+[package]
+name = "authoring-application"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+authoring-promotion = { path = "../authoring-promotion" }
+automation-ruleset = { path = "../automation-ruleset" }
+design-harness = { path = "../design-harness" }
+discord-model = { path = "../discord-model" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+serde_json = { workspace = true }

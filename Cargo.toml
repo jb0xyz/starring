@@ -20,6 +20,7 @@ members = [
     "crates/design-harness",
     "crates/authoring-promotion",
     "crates/authoring-promotion-postgres",
+    "crates/authoring-application",
     "crates/automation-runtime",
     "crates/automation-instance",
     "crates/automation-instance-postgres",
