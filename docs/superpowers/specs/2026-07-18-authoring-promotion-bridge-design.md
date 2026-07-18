@@ -2,7 +2,7 @@
 
 Date: 2026-07-18
 
-Status: implementation in progress
+Status: core bridge implemented; production edge and runtime convergence pending
 
 Branch: `feat/authoring-promotion-bridge`
 
@@ -12,12 +12,12 @@ Connect a validated conversational Intent candidate to the existing durable
 RuleSet lifecycle without giving the model publication, approval, activation,
 Discord, or production-database authority.
 
-The product flow is:
+The target product flow is:
 
 ```text
 authenticated authoring session
   -> verified PreviewReady artifact
-  -> immutable publication journal
+  -> monotonic promotion journal with immutable identity and publication payload
   -> immutable RuleSet version
   -> approval payload
   -> pending activation request
@@ -104,7 +104,7 @@ must be explicitly upgraded through a new validated-preview authoring turn.
 A new pure `authoring-promotion` crate owns the workflow domain and orchestration
 traits. A paired `authoring-promotion-postgres` crate owns durable storage.
 
-The authenticated edge supplies:
+The planned authenticated edge will supply:
 
 - tenant and session ownership
 - authoritative guild
@@ -115,27 +115,31 @@ The authenticated edge supplies:
 
 The model and request body do not supply those values.
 
-The application edge loads the exported artifact through the same durable
-authoring session and generation that produced it. It verifies session owner,
-generation, binding revision, and binding fingerprint before constructing the
-non-Serde server-resolved promotion command. A client-submitted authority
-context or an arbitrary artifact/context pairing is never accepted.
+The implemented application contract passes the same expected generation to an
+owned-artifact port and a server-authority port in sequence. Those ports are
+responsible for owner and generation validation. The product activation bridge
+later resolves and validates the fresh binding revision and fingerprint before
+constructing the activation context. The intended production route never accepts
+a client-submitted authority context or an arbitrary artifact/context pairing;
+its durable adapters must provide one atomic authorized-session snapshot or an
+equivalent generation-bound guarantee.
 
-The workflow journal is created before publication and advances monotonically:
+The implemented workflow journal is created before publication and advances
+monotonically:
 
 ```text
 Prepared
   -> Published
   -> ActivationPending
-  -> ActivationAppliedRuntimePending
-  -> Live
 
-Prepared | Published
-  -> Cancelled
-
-ActivationPending
-  -> Rejected | Withdrawn | Expired | Superseded
+Published | ActivationPending
+  -> Expired
 ```
+
+Approval, rejection, withdrawal, supersession, apply completion, runtime
+pending, and `Live` convergence remain authoritative on the activation side or
+future workflow stages. They must be synchronized without weakening the
+existing activation CAS before the product reports a complete lifecycle.
 
 If an exact activation request is created but the journal CAS is interrupted
 until that request expires, recovery records `Published -> Expired` with the
@@ -145,7 +149,8 @@ later activation synchronization boundary owns ordinary
 
 Each transition uses a revision CAS. Retry resumes from the durable state.
 
-The immutable record binds:
+The monotonic record has immutable identity and publication payload fields and
+binds:
 
 - promotion ID and idempotency digest
 - tenant, owner, session ID, session generation, and candidate revision
@@ -170,16 +175,24 @@ request. A crash after publication is safe because retry reuses identical
 registry content. Activation-request failure leaves an inactive published
 artifact and a resumable `Published` workflow.
 
-The pure workflow port has no production adapter to the legacy activation
-service. That adapter remains fail-closed until Boundary 3 adds the full
-approval context and an activation-side link gate. A product-authored request
-is created `Unlinked`; approval and apply reject it until a CAS records the
-exact promotion identity on the activation request and the promotion journal
-records the same request. Recovery may complete either side of that handshake.
-This prevents a crash between request creation and journal linkage from leaving
-an independently approvable orphan. A same-database transaction or durable
-outbox/inbox may implement the handshake, but request-ID convention alone is
-not an authorization gate.
+`ProductActivationBridge` now adapts the pure workflow to the existing RuleSet
+registry and activation request store. A product-authored request is created
+`Unlinked`; approval and apply reject it until the promotion journal reaches the
+exact `ActivationPending` record. The bridge re-reads and validates that record
+immediately before linking. PostgreSQL independently enforces the same request,
+target, requester, policy, payload, and approval-context identities in a trigger
+for every insertion or transition into the linked product state. Product
+authority and link identities become immutable after insertion, closing
+unauthorized direct linked-insert bypasses, authority relabeling, and
+linked-context rewrites. Request-ID
+convention alone is not an authorization gate. Recovery safely completes a
+journaled but unlinked request, while a request without the journal remains
+unapprovable.
+
+The durable activation observation field is canonically
+`request_state_at_journal`. A compatibility migration rewrites the earlier
+branch-local `request_state_at_link` spelling, and deserialization retains an
+alias so an interrupted rollout can still recover old records.
 
 ## Idempotency
 
@@ -195,8 +208,10 @@ from the promotion identity. An exact retry loads and compares the complete
 immutable request. A different candidate, actor, target, binding, baseline, or
 policy under the same idempotency key is a hard conflict.
 
-Rejected, expired, cancelled, or superseded workflows require a new explicit
-idempotency key. Apply and resume always use fresh attempt IDs.
+After activation rejection, withdrawal, expiry, or supersession, a new promotion
+attempt requires a new explicit idempotency key. Apply and resume always use
+fresh attempt IDs. Rejection, withdrawal, and supersession are currently
+activation-authority terminal states rather than promotion journal stages.
 
 ## Boundary 3: approval context and activation preconditions
 
@@ -258,19 +273,22 @@ client-submitted RuleSet bytes. It includes:
 - authoring candidate identity
 - published version and content hash
 - resolved external resources
-- fresh readiness findings
 - active baseline and intended replacement
-- approval policy and expiry
+- approval policy and relative expiry
 
 Its canonical digest is persisted in both the promotion workflow and activation
-request. Apply requires them to match.
+request, and journal linking requires those values to agree. Apply subsequently
+verifies the immutable activation context and approved digest; it does not
+re-read the promotion journal.
 
-Fresh readiness is shown before approval for usability and repeated during apply
-for safety.
+Fresh readiness is repeated during apply for safety. Persisting a pre-approval
+readiness summary and displaying the absolute activation-request expiry remain
+production-surface work; neither is currently part of the canonical payload.
 
-## Boundary 4: runtime convergence
+## Planned Boundary 4: runtime convergence
 
-Pointer activation yields `ActivationAppliedRuntimePending`. The first
+This boundary is not implemented in the current checkpoint. The planned design
+has pointer activation yield `ActivationAppliedRuntimePending`. Its first
 convergence implementation uses a controlled restart and does not hot-swap. It:
 
 1. Stops accepting and dispatching top-level interactions.
@@ -285,8 +303,8 @@ convergence implementation uses a controlled restart and does not hot-swap. It:
 7. Records the panel reconciliation result and runtime attestation.
 8. Marks the promotion `Live`.
 
-A convergence failure never reports deployment success. The active pointer may
-already have changed, so the state remains
+Under the planned contract, a convergence failure never reports deployment
+success. The active pointer may already have changed, so the state remains
 `ActivationAppliedRuntimePending` and retry targets the same immutable artifact.
 
 Hot swap is introduced only after top-level custom IDs or a dual-version route
@@ -296,11 +314,22 @@ never expose a new panel to an old unversioned top-level dispatcher.
 
 ## Product API authority
 
-The future API derives requester, approver, applied-by actor, guild membership,
-and guild authorization from an authenticated principal. IDs in request bodies
-are never trusted.
+The pure `authoring-application` contract derives promotion requester, guild,
+installation, RuleSet key, binding revision, and policy from a verified
+principal plus server-owned session and authority ports. Its client command
+contains only an idempotency key, session ID, and expected generation. The
+future HTTP API must supply the real authentication adapter and derive approver
+and applied-by actors, guild membership, and guild authorization without
+trusting IDs in request bodies.
 
-The API exposes separate actions:
+`VerifiedPrincipalV1` is an in-process trust assertion, not cryptographic
+authentication, and the raw workflow service remains a public core API. The
+production composition must expose only the authenticated application route,
+must keep direct workflow submission unreachable from transport handlers, and
+must resolve the owned artifact and authority from one durable generation or an
+equivalent atomic snapshot.
+
+The planned API exposes separate actions:
 
 ```text
 POST promotion
@@ -311,7 +340,7 @@ POST apply
 GET runtime convergence status
 ```
 
-No endpoint combines promotion, approval, and apply.
+No planned endpoint combines promotion, approval, and apply.
 
 ## Failure matrix
 
@@ -322,13 +351,14 @@ No endpoint combines promotion, approval, and apply.
 | Publish rejected | Prepared | none | after correction |
 | Crash after publish | Prepared or Published | none | reuse artifact |
 | Activation request failure | Published | none | resume |
-| Approval rejected, withdrawn, or expired | terminal | none | new promotion key |
+| Approval rejected or withdrawn | activation terminal; promotion sync pending | none | new promotion key |
+| Approval expired | activation terminal; promotion records expiry when observed | none | new promotion key |
 | Binding drift | Superseded | none | new preview |
 | Active baseline drift | Superseded | none | new preview |
 | Readiness failure | Approved | none | after environment fix |
 | Lease loss before mutation | Applying or safe error | none | recover/resume |
 | Indeterminate activation | Applying | unknown | recover only |
-| Runtime convergence failure | ActivationAppliedRuntimePending | applied | same target |
+| Planned runtime convergence failure | ActivationAppliedRuntimePending | applied | same target |
 
 ## Verification
 
@@ -344,12 +374,13 @@ The deterministic suite covers:
 - self-approval rejection and distinct approval requirement
 - binding and baseline supersession before pointer mutation
 - readiness failure preserving the prior active pointer
-- activation followed by exact hydration and panel reconciliation acknowledgement
+- guarded activation through the exact product-bound request
 - no publish, approve, apply, Discord, or database tool visible to the model
 
 PostgreSQL tests run serially and cover reconnect, concurrent identical
-publication, crash-resume state transitions, approval/apply CAS, supersession,
-and runtime-pending recovery.
+publication, crash-resume state transitions, exact journal-link enforcement,
+product-bound approval, guarded apply, and active-pointer mutation. Runtime
+convergence remains outside this checkpoint.
 
 CI retains workspace tests, clippy, formatting, Promptfoo static checks, and the
 existing PostgreSQL job. Live Luna and disposable Discord checks remain
@@ -361,7 +392,7 @@ separate evidence and never run in ordinary CI.
 2. Pure publication workflow and in-memory tests.
 3. PostgreSQL workflow journal and retry tests.
 4. Activation approval context, binding and baseline preconditions.
-5. Authenticated application edge.
+5. Pure authentication-ready application boundary.
 6. Runtime convergence controller and integration tests.
 7. Live disposable-guild evidence and current-state handoff.
 
