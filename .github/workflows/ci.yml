@@ -94,3 +94,5 @@ jobs:
         run: cargo test -p automation-ruleset-dispatch -- --ignored --test-threads=1
       - name: Test RuleSet readiness activation
         run: cargo test -p automation-ruleset-readiness -- --ignored --test-threads=1
+      - name: Test runtime convergence PostgreSQL store
+        run: cargo test -p automation-runtime-convergence-postgres -- --ignored --test-threads=1
