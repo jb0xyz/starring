@@ -105,6 +105,7 @@ where
                 PromotionStageV1::Published { publication } => {
                     let request = self.request_pending(&record, publication).await?;
                     let transition = match request {
+                        PendingRequestOutcomeV1::RefreshJournal => continue,
                         PendingRequestOutcomeV1::Pending(activation) => {
                             let updated_at = self.clock.now().max(activation.created_at);
                             self.store
@@ -293,13 +294,16 @@ where
                 },
             })
             .await?;
-        let state = validate_activation_receipt(
+        let observation = validate_activation_receipt(
             record,
             publication,
             &request_id,
             &approval_context,
             &receipt,
         )?;
+        if observation == ActivationReceiptObservationV1::RefreshJournal {
+            return Ok(PendingRequestOutcomeV1::RefreshJournal);
+        }
         let link = PendingActivationLinkV1 {
             request_id: receipt.request.id,
             target: receipt.request.target,
@@ -309,17 +313,19 @@ where
             created_at: receipt.request.created_at,
             expires_at: receipt.request.expires_at,
             disposition: receipt.disposition,
-            request_state_at_link: if state == ActivationRequestState::Expired {
+            request_state_at_journal: if observation == ActivationReceiptObservationV1::Expired {
                 ActivationRequestState::Expired
             } else {
                 ActivationRequestState::Pending
             },
             approval_context,
         };
-        Ok(match state {
-            ActivationRequestState::Pending => PendingRequestOutcomeV1::Pending(link),
-            ActivationRequestState::Expired => PendingRequestOutcomeV1::Expired(link),
-            _ => return Err(PromotionError::PendingActivationMismatch),
+        Ok(match observation {
+            ActivationReceiptObservationV1::Pending => PendingRequestOutcomeV1::Pending(link),
+            ActivationReceiptObservationV1::Expired => PendingRequestOutcomeV1::Expired(link),
+            ActivationReceiptObservationV1::RefreshJournal => {
+                PendingRequestOutcomeV1::RefreshJournal
+            }
         })
     }
 
@@ -463,7 +469,7 @@ fn validate_activation_receipt(
     expected_request_id: &ActivationRequestId,
     expected_context: &ProductApprovalContextV1,
     receipt: &PendingActivationReceiptV1,
-) -> Result<ActivationRequestState, PromotionError> {
+) -> Result<ActivationReceiptObservationV1, PromotionError> {
     let request = &receipt.request;
     let authority = &record.intent.authority;
     let ttl_seconds = i64::try_from(authority.policy.ttl_seconds.get())
@@ -508,21 +514,26 @@ fn validate_activation_receipt(
         }
         crate::PendingActivationDispositionV1::Reused => {
             if request.state == ActivationRequestState::Expired {
-                return Ok(ActivationRequestState::Expired);
+                return Ok(ActivationReceiptObservationV1::Expired);
             }
-            if request.link_state == ActivationLinkStateV1::Unlinked
-                && (request.state != ActivationRequestState::Pending
-                    || !request.approvals.is_empty()
-                    || request.rejection.is_some()
-                    || request.apply_attempt_id.is_some()
-                    || request.completion.is_some()
-                    || request.termination.is_some())
+            if request.link_state != ActivationLinkStateV1::Unlinked {
+                return Ok(ActivationReceiptObservationV1::RefreshJournal);
+            }
+            if request.state != ActivationRequestState::Pending
+                || !request.approvals.is_empty()
+                || request.rejection.is_some()
+                || request.apply_attempt_id.is_some()
+                || request.apply_attempt_no != 0
+                || request.apply_lease_until.is_some()
+                || request.last_apply_error.is_some()
+                || request.completion.is_some()
+                || request.termination.is_some()
             {
                 return Err(PromotionError::PendingActivationMismatch);
             }
         }
     }
-    Ok(ActivationRequestState::Pending)
+    Ok(ActivationReceiptObservationV1::Pending)
 }
 
 fn validate_linked_activation(
@@ -575,14 +586,22 @@ fn expired_link(
         created_at: request.created_at,
         expires_at: request.expires_at,
         disposition: crate::PendingActivationDispositionV1::Reused,
-        request_state_at_link: ActivationRequestState::Expired,
+        request_state_at_journal: ActivationRequestState::Expired,
         approval_context: activation.approval_context.clone(),
     }
 }
 
 enum PendingRequestOutcomeV1 {
+    RefreshJournal,
     Pending(PendingActivationLinkV1),
     Expired(PendingActivationLinkV1),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationReceiptObservationV1 {
+    Pending,
+    Expired,
+    RefreshJournal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

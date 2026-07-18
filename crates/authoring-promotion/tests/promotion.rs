@@ -21,7 +21,7 @@ use automation_ruleset::{
 };
 use automation_ruleset_activation::{
     ActivationApprovalContextV1, ActivationLinkStateV1, ActivationRequest, ActivationRequestId,
-    ApprovalBindingContextV1, ExpectedActiveBaselineV1,
+    ApprovalBindingContextV1, ExpectedActiveBaselineV1, LinkProductActivation,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use design_harness::{
@@ -1345,6 +1345,70 @@ fn crash_after_pending_request_creation_resumes_by_linking_the_exact_request() {
         assert_eq!(link.disposition, PendingActivationDispositionV1::Reused);
         assert_eq!(publication.calls.load(Ordering::SeqCst), 1);
         assert_eq!(activation.calls.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn linked_request_without_activation_pending_journal_is_not_laundered() {
+    block_on(async {
+        let promotions = FailOnceTransitionStore::activation();
+        let publication = PublicationSpy::default();
+        let activation = PendingSpy::new();
+        let service = PromotionService::new(
+            &promotions,
+            &publication,
+            &activation,
+            ManualPromotionClock::new(fixed_now()),
+        );
+        let CreatePromotionOutcomeV1::Created(prepared) = service
+            .start(start_input("out-of-order-link", "studyrooms", true).await)
+            .await
+            .unwrap()
+        else {
+            panic!("expected created")
+        };
+        assert!(matches!(
+            service.resume_to_activation_pending(&prepared.id).await,
+            Err(PromotionError::Store(PromotionStoreError::Backend(_)))
+        ));
+        assert!(matches!(
+            promotions.get(&prepared.id).await.unwrap().unwrap().stage,
+            PromotionStageV1::Published { .. }
+        ));
+        {
+            let mut requests = activation.requests.lock().unwrap();
+            let request = requests.values_mut().next().unwrap();
+            let ActivationApprovalContextV1::ProductAuthoring { context } =
+                &request.approval_context
+            else {
+                panic!("expected product context")
+            };
+            let link = LinkProductActivation {
+                promotion_id: context.promotion_id.clone(),
+                promotion_request_digest: context.promotion_request_digest.clone(),
+                approval_context_digest: context.approval_context_digest.clone(),
+            };
+            request
+                .link_product_at(
+                    &link.promotion_id,
+                    &link.promotion_request_digest,
+                    &link.approval_context_digest,
+                    fixed_now(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            service
+                .resume_to_activation_pending(&prepared.id)
+                .await
+                .unwrap_err(),
+            PromotionError::ConcurrentTransitionLimit
+        );
+        assert!(matches!(
+            promotions.get(&prepared.id).await.unwrap().unwrap().stage,
+            PromotionStageV1::Published { .. }
+        ));
+        assert_eq!(activation.link_calls.load(Ordering::SeqCst), 0);
     });
 }
 

@@ -1,10 +1,11 @@
 use std::num::{NonZeroU32, NonZeroU64};
 
 use authoring_promotion::{
-    AutomationInstallationId, BindingRevision, EnsurePendingActivationV1, LinkPendingActivationV1,
-    PendingActivationDispositionV1, PendingActivationPort, PendingActivationPortError,
-    ProductActivationBridge, ProductApprovalEnvironmentError, ProductApprovalEnvironmentProvider,
-    ProductApprovalEnvironmentV1, ResolveProductApprovalContextV1, TenantId,
+    AutomationInstallationId, BindingRevision, EnsurePendingActivationV1, InMemoryPromotionStore,
+    LinkPendingActivationV1, PendingActivationDispositionV1, PendingActivationPort,
+    PendingActivationPortError, ProductActivationBridge, ProductApprovalEnvironmentError,
+    ProductApprovalEnvironmentProvider, ProductApprovalEnvironmentV1,
+    ResolveProductApprovalContextV1, TenantId,
 };
 use automation_ruleset::{
     InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetKey, RuleSetStore,
@@ -120,7 +121,7 @@ fn resolution_request(
 }
 
 #[test]
-fn product_bridge_resolves_creates_links_and_requires_bound_approval() {
+fn product_bridge_rejects_link_without_activation_pending_journal() {
     block_on(async {
         let rulesets = InMemoryRuleSetStore::default();
         let target = target(&rulesets).await;
@@ -135,7 +136,8 @@ fn product_bridge_resolves_creates_links_and_requires_bound_approval() {
                 .unwrap(),
         );
         let requests = InMemoryActivationRequestStore::with_clock(clock);
-        let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests);
+        let promotions = InMemoryPromotionStore::default();
+        let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests, &promotions);
         let resolved = bridge
             .resolve_product_approval_context(resolution_request(&target, &bindings))
             .await
@@ -196,31 +198,24 @@ fn product_bridge_resolves_creates_links_and_requires_bound_approval() {
             promotion_request_digest: context.promotion_request_digest.clone(),
             approval_context_digest: context.approval_context_digest.clone(),
         };
-        let linked = bridge
-            .link_pending_activation(LinkPendingActivationV1 {
-                request_id: request_id.clone(),
-                link: link.clone(),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            linked.link_state,
-            ActivationLinkStateV1::Linked { .. }
-        ));
-        bridge
+        let error = bridge
             .link_pending_activation(LinkPendingActivationV1 {
                 request_id: request_id.clone(),
                 link,
             })
             .await
-            .unwrap();
-        let approved = requests
-            .approve_bound(&request_id, UserId(200), &context.approval_payload_digest)
-            .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, PendingActivationPortError::Conflict(_)));
         assert_eq!(
-            approved.state,
-            automation_ruleset_activation::ActivationRequestState::Approved
+            requests.get(&request_id).await.unwrap().unwrap().link_state,
+            ActivationLinkStateV1::Unlinked
+        );
+        assert_eq!(
+            requests
+                .approve_bound(&request_id, UserId(200), &context.approval_payload_digest)
+                .await
+                .unwrap_err(),
+            ApproveError::Unlinked
         );
         assert!(rulesets
             .active(GUILD, &target.ruleset_key)
@@ -247,7 +242,9 @@ fn product_bridge_fails_closed_on_binding_authority_drift() {
             },
         ] {
             let requests = InMemoryActivationRequestStore::default();
-            let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests);
+            let promotions = InMemoryPromotionStore::default();
+            let bridge =
+                ProductActivationBridge::new(&rulesets, &environment, &requests, &promotions);
             assert!(matches!(
                 bridge
                     .resolve_product_approval_context(resolution_request(&target, &sealed_bindings))

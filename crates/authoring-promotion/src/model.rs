@@ -198,7 +198,7 @@ pub struct PendingActivationLinkV1 {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub disposition: PendingActivationDispositionV1,
-    pub request_state_at_link: automation_ruleset_activation::ActivationRequestState,
+    pub request_state_at_journal: automation_ruleset_activation::ActivationRequestState,
     pub approval_context: ProductApprovalContextV1,
 }
 
@@ -335,7 +335,7 @@ impl PromotionRecordV1 {
                     publication,
                     activation,
                 )?;
-                if activation.request_state_at_link
+                if activation.request_state_at_journal
                     != automation_ruleset_activation::ActivationRequestState::Pending
                 {
                     return Err(PromotionRecordValidationError::Activation);
@@ -361,7 +361,7 @@ impl PromotionRecordV1 {
                 if activation.disposition != PendingActivationDispositionV1::Reused {
                     return Err(PromotionRecordValidationError::Activation);
                 }
-                if activation.request_state_at_link
+                if activation.request_state_at_journal
                     != automation_ruleset_activation::ActivationRequestState::Expired
                 {
                     return Err(PromotionRecordValidationError::Activation);

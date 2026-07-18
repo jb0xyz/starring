@@ -25,6 +25,7 @@ use automation_state::InteractionRuleSet;
 use chrono::Duration;
 use discord_model::{GuildId, Permissions, UserId};
 use resource_resolution::{approval_binding_fingerprint_v1, ResourceBindingMap};
+use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Notify;
@@ -51,6 +52,15 @@ async fn pool() -> PgPool {
 
 async fn cleanup(pool: &PgPool, guild_id: GuildId) {
     let guild = guild_id.to_string();
+    sqlx::query(
+        "DELETE FROM authoring_promotions WHERE id IN \
+         (SELECT promotion_id FROM activation_requests WHERE guild_id = $1 \
+          AND promotion_id IS NOT NULL)",
+    )
+    .bind(&guild)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query("DELETE FROM activation_requests WHERE guild_id = $1")
         .bind(&guild)
         .execute(pool)
@@ -158,6 +168,54 @@ fn product_link(context: &ProductApprovalContextV1) -> LinkProductActivation {
         promotion_request_digest: context.promotion_request_digest.clone(),
         approval_context_digest: context.approval_context_digest.clone(),
     }
+}
+
+async fn journal_product_link(
+    pool: &PgPool,
+    id: &ActivationRequestId,
+    target: &RuleSetVersion,
+    context: &ProductApprovalContextV1,
+) {
+    let activation_target = ActivationTarget {
+        guild_id: target.guild_id,
+        ruleset_key: target.ruleset_key.clone(),
+        version: target.version,
+        content_hash: target.content_hash,
+    };
+    let record = json!({
+        "id": context.promotion_id.as_str(),
+        "revision": 3,
+        "request_digest": context.promotion_request_digest.as_str(),
+        "intent": {
+            "authority": {
+                "tenant_id": "activation-postgres-tests",
+                "principal_id": "activation-postgres-tests"
+            }
+        },
+        "stage": {
+            "state": "activation_pending",
+            "activation": {
+                "request_id": id,
+                "target": activation_target,
+                "requester": UserId(10),
+                "required_approvals": context.policy.required_approvals,
+                "request_state_at_journal": "pending",
+                "approval_context": context
+            }
+        }
+    });
+    sqlx::query(
+        "INSERT INTO authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, record) \
+         VALUES ($1, 1, 3, 'activation_pending', $2, $3, $3, $4)",
+    )
+    .bind(context.promotion_id.as_str())
+    .bind(context.promotion_request_digest.as_str())
+    .bind("activation-postgres-tests")
+    .bind(record)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 struct CountingRuleSetStore {
@@ -350,6 +408,7 @@ async fn create_approved(
 }
 
 async fn create_approved_product(
+    pool: &PgPool,
     store: &PostgresActivationRequestStore,
     id_value: &str,
     target: &RuleSetVersion,
@@ -361,6 +420,7 @@ async fn create_approved_product(
         .create_product(product_input(id.clone(), target, context.clone()))
         .await
         .unwrap();
+    journal_product_link(pool, &id, target, &context).await;
     store
         .link_product(&id, product_link(&context))
         .await
@@ -922,6 +982,7 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
             requests.link_product(&id, wrong).await.unwrap_err(),
             LinkProductError::Conflict
         );
+        journal_product_link(&first_pool, &id, &target, &context).await;
         let linked = requests
             .link_product(&id, product_link(&context))
             .await
@@ -987,6 +1048,7 @@ async fn concurrent_product_link_and_approval_serialize_without_unbound_approval
         .create_product(product_input(id.clone(), &target, context.clone()))
         .await
         .unwrap();
+    journal_product_link(&pool, &id, &target, &context).await;
 
     let (link, approval) = tokio::join!(
         requests.link_product(&id, product_link(&context)),
@@ -1028,6 +1090,7 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
         .create_product(product_input(first_id.clone(), &target, context.clone()))
         .await
         .unwrap();
+    journal_product_link(&pool, &first_id, &target, &context).await;
     requests
         .link_product(&first_id, product_link(&context))
         .await
@@ -1091,10 +1154,22 @@ async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baselin
     let rulesets = CountingRuleSetStore::new(pool.clone());
     let first_target = publish(&rulesets, guild, 1).await;
     let second_target = publish(&rulesets, guild, 2).await;
-    let (first_id, _) =
-        create_approved_product(&requests, "guarded_product_first", &first_target, '4').await;
-    let (second_id, _) =
-        create_approved_product(&requests, "guarded_product_second", &second_target, '5').await;
+    let (first_id, _) = create_approved_product(
+        &pool,
+        &requests,
+        "guarded_product_first",
+        &first_target,
+        '4',
+    )
+    .await;
+    let (second_id, _) = create_approved_product(
+        &pool,
+        &requests,
+        "guarded_product_second",
+        &second_target,
+        '5',
+    )
+    .await;
     let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
 
     assert_eq!(

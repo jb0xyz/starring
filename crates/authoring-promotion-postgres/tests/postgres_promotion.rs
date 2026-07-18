@@ -16,12 +16,17 @@ use authoring_promotion::{
     RuleSetPublicationPort, SessionGeneration, StartPromotionV1, TenantId, UtcPromotionClock,
 };
 use authoring_promotion_postgres::{PostgresPromotionStore, MIGRATOR};
-use automation_ruleset::{InMemoryRuleSetStore, RuleSetStore, RuleSetStoreError};
+use automation_ruleset::{
+    InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError,
+};
 use automation_ruleset_activation::{
-    ActivationApprovalContextV1, ActivationEnvironment, ActivationEnvironmentError,
-    ActivationEnvironmentProvider, ActivationRequest, ActivationRequestId, ActivationRequestState,
-    ActivationRequestStore, ActivationService, ApplyAttemptId, ApplyOutcome,
-    ApprovalBindingContextV1, ExpectedActiveBaselineV1,
+    approval_policy_digest_v1, product_approval_context_digest_v1, ActivationApprovalContextV1,
+    ActivationDigest, ActivationEnvironment, ActivationEnvironmentError,
+    ActivationEnvironmentProvider, ActivationLinkStateV1, ActivationPromotionId, ActivationRequest,
+    ActivationRequestId, ActivationRequestState, ActivationRequestStore, ActivationService,
+    ActivationStoreError, ActivationTarget, ApplyAttemptId, ApplyOutcome, ApprovalBindingContextV1,
+    ApprovalPolicyBindingV1, CreateProductActivationRequest, ExpectedActiveBaselineV1,
+    LinkProductActivation, LinkProductError, ProductApprovalContextV1,
 };
 use automation_ruleset_activation_postgres::PostgresActivationRequestStore;
 use automation_ruleset_postgres::PostgresRuleSetStore;
@@ -379,6 +384,96 @@ async fn create_prepared(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn database_rejects_direct_product_link_without_promotion_journal() {
+    let tenant = "postgres-direct-link-gate";
+    let guild_id = GuildId(9_200_002);
+    let promotion_id = ActivationPromotionId::parse(&"f".repeat(64)).unwrap();
+    let pool = pool().await;
+    cleanup_product(&pool, tenant, guild_id).await;
+    sqlx::query("DELETE FROM authoring_promotions WHERE id = $1")
+        .bind(promotion_id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let published = rulesets
+        .publish(PublishRuleSetRequest {
+            guild_id,
+            ruleset_key: "direct-link-gate".parse().unwrap(),
+            definition: artifact().await.ruleset().clone(),
+            created_by: UserId(100),
+        })
+        .await
+        .unwrap();
+    let published = match published {
+        PublishOutcome::Created(published) | PublishOutcome::Reused(published) => published,
+    };
+    let target = ActivationTarget {
+        guild_id,
+        ruleset_key: published.ruleset_key,
+        version: published.version,
+        content_hash: published.content_hash,
+    };
+    let request_id = ActivationRequestId::parse("direct_product_without_journal").unwrap();
+    let binding_revision = NonZeroU64::new(1).unwrap();
+    let policy_revision = NonZeroU64::new(1).unwrap();
+    let required_approvals = NonZeroU32::new(1).unwrap();
+    let ttl_seconds = NonZeroU64::new(3600).unwrap();
+    let mut approval_context = ProductApprovalContextV1 {
+        promotion_id,
+        promotion_request_digest: ActivationDigest::parse(&"d".repeat(64)).unwrap(),
+        approval_payload_digest: ActivationDigest::parse(&"e".repeat(64)).unwrap(),
+        approval_context_digest: ActivationDigest::parse(&"0".repeat(64)).unwrap(),
+        binding: ApprovalBindingContextV1 {
+            revision: binding_revision,
+            required_bindings: Vec::new(),
+            fingerprint: approval_binding_fingerprint_v1(guild_id, binding_revision, &[]).unwrap(),
+        },
+        baseline: ExpectedActiveBaselineV1::Absent,
+        policy: ApprovalPolicyBindingV1 {
+            revision: policy_revision,
+            required_approvals,
+            ttl_seconds,
+            digest: approval_policy_digest_v1(policy_revision, required_approvals, ttl_seconds),
+        },
+    };
+    approval_context.approval_context_digest =
+        product_approval_context_digest_v1(&request_id, &target, UserId(100), &approval_context);
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let created = requests
+        .create_product(CreateProductActivationRequest {
+            id: request_id.clone(),
+            target,
+            requester: UserId(100),
+            context: approval_context.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.link_state, ActivationLinkStateV1::Unlinked);
+    let error = requests
+        .link_product(
+            &request_id,
+            LinkProductActivation {
+                promotion_id: approval_context.promotion_id.clone(),
+                promotion_request_digest: approval_context.promotion_request_digest.clone(),
+                approval_context_digest: approval_context.approval_context_digest.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LinkProductError::Store(ActivationStoreError::Backend(_))
+    ));
+    assert_eq!(
+        requests.get(&request_id).await.unwrap().unwrap().link_state,
+        ActivationLinkStateV1::Unlinked
+    );
+    cleanup_product(&pool, tenant, guild_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn create_reconnect_exact_replay_and_conflict_are_durable() {
     let tenant = "postgres-reconnect";
     let sealed = artifact().await;
@@ -594,7 +689,7 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
         revision: NonZeroU64::new(1).unwrap(),
         bindings: product_bindings(),
     };
-    let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests);
+    let bridge = ProductActivationBridge::new(&rulesets, &environment, &requests, &promotions);
     let promotion_service =
         PromotionService::new(&promotions, &rulesets, &bridge, UtcPromotionClock);
     let CreatePromotionOutcomeV1::Created(prepared) = promotion_service

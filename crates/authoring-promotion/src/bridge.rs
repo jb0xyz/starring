@@ -13,8 +13,9 @@ use resource_resolution::{
 
 use crate::{
     EnsurePendingActivationV1, LinkPendingActivationV1, PendingActivationDispositionV1,
-    PendingActivationPort, PendingActivationPortError, PendingActivationReceiptV1,
-    ResolveProductApprovalContextV1, ResolvedProductApprovalContextV1,
+    PendingActivationPort, PendingActivationPortError, PendingActivationReceiptV1, PromotionId,
+    PromotionStageV1, PromotionStore, PromotionStoreError, ResolveProductApprovalContextV1,
+    ResolvedProductApprovalContextV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,27 +38,30 @@ pub trait ProductApprovalEnvironmentProvider {
     ) -> Result<ProductApprovalEnvironmentV1, ProductApprovalEnvironmentError>;
 }
 
-pub struct ProductActivationBridge<'a, R, E, A> {
+pub struct ProductActivationBridge<'a, R, E, A, S> {
     rulesets: &'a R,
     environment: &'a E,
     requests: &'a A,
+    promotions: &'a S,
 }
 
-impl<'a, R, E, A> ProductActivationBridge<'a, R, E, A> {
-    pub fn new(rulesets: &'a R, environment: &'a E, requests: &'a A) -> Self {
+impl<'a, R, E, A, S> ProductActivationBridge<'a, R, E, A, S> {
+    pub fn new(rulesets: &'a R, environment: &'a E, requests: &'a A, promotions: &'a S) -> Self {
         Self {
             rulesets,
             environment,
             requests,
+            promotions,
         }
     }
 }
 
-impl<R, E, A> PendingActivationPort for ProductActivationBridge<'_, R, E, A>
+impl<R, E, A, S> PendingActivationPort for ProductActivationBridge<'_, R, E, A, S>
 where
     R: RuleSetStore,
     E: ProductApprovalEnvironmentProvider,
     A: ActivationRequestStore,
+    S: PromotionStore,
 {
     async fn resolve_product_approval_context(
         &self,
@@ -174,7 +178,7 @@ where
                     disposition: PendingActivationDispositionV1::Reused,
                 })
             }
-            Err(error) => Err(activation_error(error)),
+            Err(error) => Err(activation_mutation_error(error)),
         }
     }
 
@@ -182,6 +186,7 @@ where
         &self,
         request: LinkPendingActivationV1,
     ) -> Result<ActivationRequest, PendingActivationPortError> {
+        self.verify_activation_pending_journal(&request).await?;
         match self
             .requests
             .link_product(&request.request_id, request.link)
@@ -207,8 +212,45 @@ where
             Err(LinkProductError::NotPending) => {
                 Err(conflict("product activation request is not pending"))
             }
-            Err(LinkProductError::Store(error)) => Err(activation_error(error)),
+            Err(LinkProductError::Store(error)) => Err(activation_mutation_error(error)),
         }
+    }
+}
+
+impl<R, E, A, S> ProductActivationBridge<'_, R, E, A, S>
+where
+    S: PromotionStore,
+{
+    async fn verify_activation_pending_journal(
+        &self,
+        request: &LinkPendingActivationV1,
+    ) -> Result<(), PendingActivationPortError> {
+        let promotion_id = PromotionId::parse(request.link.promotion_id.as_str())
+            .map_err(|_| conflict("product activation promotion identity is invalid"))?;
+        let record = self
+            .promotions
+            .get(&promotion_id)
+            .await
+            .map_err(promotion_error)?
+            .ok_or_else(|| conflict("activation-pending promotion journal is missing"))?;
+        record
+            .validate()
+            .map_err(|_| conflict("activation-pending promotion journal is invalid"))?;
+        let PromotionStageV1::ActivationPending { activation, .. } = &record.stage else {
+            return Err(conflict("promotion journal is not activation-pending"));
+        };
+        if activation.request_id != request.request_id
+            || activation.approval_context.promotion_id != request.link.promotion_id
+            || activation.approval_context.promotion_request_digest
+                != request.link.promotion_request_digest
+            || activation.approval_context.approval_context_digest
+                != request.link.approval_context_digest
+        {
+            return Err(conflict(
+                "activation link does not match the promotion journal",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -250,5 +292,34 @@ fn activation_error(error: ActivationStoreError) -> PendingActivationPortError {
             PendingActivationPortError::Indeterminate("duplicate request race".to_string())
         }
         error => conflict(&error.to_string()),
+    }
+}
+
+fn activation_mutation_error(error: ActivationStoreError) -> PendingActivationPortError {
+    match error {
+        ActivationStoreError::Backend(message) => {
+            PendingActivationPortError::Indeterminate(message)
+        }
+        error => activation_error(error),
+    }
+}
+
+fn promotion_error(error: PromotionStoreError) -> PendingActivationPortError {
+    match error {
+        PromotionStoreError::Backend(message) => PendingActivationPortError::Backend(message),
+        error => conflict(&format!("promotion journal authority failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_backend_failure_is_indeterminate() {
+        assert_eq!(
+            activation_mutation_error(ActivationStoreError::Backend("lost ack".to_string())),
+            PendingActivationPortError::Indeterminate("lost ack".to_string())
+        );
     }
 }
