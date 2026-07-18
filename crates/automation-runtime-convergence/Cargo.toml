@@ -1,0 +1,15 @@
+[package]
+name = "automation-runtime-convergence"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+automation-ruleset = { path = "../automation-ruleset" }
+chrono = { version = "0.4", features = ["serde"] }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"

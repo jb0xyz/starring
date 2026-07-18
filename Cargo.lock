@@ -346,6 +346,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-convergence"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "automation-state"
 version = "0.1.0"
 dependencies = [
