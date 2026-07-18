@@ -20,9 +20,12 @@ use automation_ruleset_activation::{
 use automation_ruleset_readiness::GuildCapabilities;
 use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
 use chrono::{Duration, TimeZone, Utc};
-use discord_model::{GuildId, Permissions, UserId};
+use desired_state::ResourceKey;
+use discord_model::{GuildId, Permissions, RoleId, UserId};
 use futures::executor::block_on;
-use resource_resolution::{approval_binding_fingerprint_v1, ResourceBindingMap};
+use resource_resolution::{
+    approval_binding_fingerprint_v1, ResolvedApprovalBinding, ResourceBindingMap,
+};
 
 const GUILD: GuildId = GuildId(7);
 
@@ -150,6 +153,7 @@ enum ProviderMode {
     Ready,
     ProductReady,
     ProductBindingRevisionDrift,
+    ProductBindingFingerprintDrift,
     MissingCapability,
     Fail,
 }
@@ -196,6 +200,20 @@ impl ActivationEnvironmentProvider for SpyProvider {
                 },
                 role_permissions: BTreeMap::new(),
             }),
+            ProviderMode::ProductBindingFingerprintDrift => {
+                let mut bindings = ResourceBindingMap::default();
+                bindings
+                    .role_bindings
+                    .insert(ResourceKey("member".to_string()), RoleId(202));
+                Ok(ActivationEnvironment {
+                    binding_revision: NonZeroU64::new(3),
+                    bindings,
+                    guild_capabilities: GuildCapabilities {
+                        base_permissions: Permissions::ADMINISTRATOR,
+                    },
+                    role_permissions: BTreeMap::new(),
+                })
+            }
             ProviderMode::MissingCapability => Ok(ActivationEnvironment {
                 binding_revision: None,
                 bindings: ResourceBindingMap::default(),
@@ -310,6 +328,31 @@ fn product_context(
     context
 }
 
+fn product_context_with_required_bindings(
+    id: &ActivationRequestId,
+    target: &RuleSetVersion,
+    baseline: ExpectedActiveBaselineV1,
+    required_bindings: Vec<ResolvedApprovalBinding>,
+) -> ProductApprovalContextV1 {
+    let mut context = product_context(id, target, baseline);
+    context.binding.fingerprint =
+        approval_binding_fingerprint_v1(GUILD, context.binding.revision, &required_bindings)
+            .unwrap();
+    context.binding.required_bindings = required_bindings;
+    context.approval_context_digest = product_approval_context_digest_v1(
+        id,
+        &ActivationTarget {
+            guild_id: target.guild_id,
+            ruleset_key: target.ruleset_key.clone(),
+            version: target.version,
+            content_hash: target.content_hash,
+        },
+        UserId(10),
+        &context,
+    );
+    context
+}
+
 fn create_approved_product(
     fixture: &Fixture,
     id_value: &str,
@@ -318,6 +361,15 @@ fn create_approved_product(
 ) -> (ActivationRequestId, ProductApprovalContextV1) {
     let id = ActivationRequestId::parse(id_value).unwrap();
     let context = product_context(&id, target, baseline);
+    create_approved_product_with_context(fixture, id, target, context)
+}
+
+fn create_approved_product_with_context(
+    fixture: &Fixture,
+    id: ActivationRequestId,
+    target: &RuleSetVersion,
+    context: ProductApprovalContextV1,
+) -> (ActivationRequestId, ProductApprovalContextV1) {
     block_on(
         fixture
             .requests
@@ -660,6 +712,99 @@ fn product_activation_is_superseded_when_approved_binding_revision_drifted() {
     assert!(block_on(fixture.rulesets.active(GUILD, &key()))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn product_exact_active_target_is_superseded_when_binding_revision_drifted() {
+    let fixture = Fixture::new(ProviderMode::ProductBindingRevisionDrift);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_active_revision_drift",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+    block_on(
+        fixture
+            .rulesets
+            .inner
+            .activate(GUILD, &key(), target.version),
+    )
+    .unwrap();
+
+    let outcome = block_on(fixture.service().apply(
+        &id,
+        attempt("product_active_revision"),
+        UserId(10),
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::BindingDrift {
+                expected_revision,
+                observed_revision,
+                ..
+            }
+        } if expected_revision.get() == 3 && observed_revision.get() == 4
+    ));
+    assert_eq!(fixture.provider.calls(), 1);
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Superseded
+    );
+}
+
+#[test]
+fn product_exact_active_target_is_superseded_when_binding_fingerprint_drifted() {
+    let fixture = Fixture::new(ProviderMode::ProductBindingFingerprintDrift);
+    let target = fixture.rulesets.publish(false);
+    let id = ActivationRequestId::parse("product_active_fingerprint_drift").unwrap();
+    let context = product_context_with_required_bindings(
+        &id,
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+        vec![ResolvedApprovalBinding::Role {
+            key: ResourceKey("member".to_string()),
+            id: RoleId(101),
+        }],
+    );
+    let (id, _) = create_approved_product_with_context(&fixture, id, &target, context);
+    block_on(
+        fixture
+            .rulesets
+            .inner
+            .activate(GUILD, &key(), target.version),
+    )
+    .unwrap();
+
+    let outcome = block_on(fixture.service().apply(
+        &id,
+        attempt("product_active_fingerprint"),
+        UserId(10),
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::BindingDrift {
+                expected_revision,
+                observed_revision,
+                expected_fingerprint,
+                observed_fingerprint: Some(observed_fingerprint),
+            }
+        } if expected_revision == observed_revision
+            && expected_fingerprint != observed_fingerprint
+    ));
+    assert_eq!(fixture.provider.calls(), 1);
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Superseded
+    );
 }
 
 #[test]

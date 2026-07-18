@@ -564,22 +564,12 @@ where
                 return Err(error);
             }
         };
-        if active.as_ref().is_some_and(|active| {
+        let target_is_active = active.as_ref().is_some_and(|active| {
             active.version == request.target.version
                 && active.content_hash == request.target.content_hash
-        }) {
-            self.complete(
-                request_id,
-                attempt_id,
-                applied_by,
-                CompletionKind::AlreadyActive,
-                None,
-            )
-            .await?;
-            return Ok(ApplyOutcome::AlreadyActive);
-        }
+        });
         let observed_baseline = baseline_from_active(active.as_ref());
-        if observed_baseline != context.baseline {
+        if !target_is_active && observed_baseline != context.baseline {
             return self
                 .supersede(
                     request_id,
@@ -624,6 +614,24 @@ where
                 return Err(error);
             }
         };
+        let notices = Some(
+            runtime
+                .notices
+                .into_iter()
+                .map(|notice| format!("{notice:?}"))
+                .collect(),
+        );
+        if target_is_active {
+            self.complete(
+                request_id,
+                attempt_id,
+                applied_by,
+                CompletionKind::AlreadyActive,
+                notices,
+            )
+            .await?;
+            return Ok(ApplyOutcome::AlreadyActive);
+        }
         if !self
             .requests
             .renew_lease(request_id, attempt_id, APPLY_LEASE_SECONDS)
@@ -643,13 +651,6 @@ where
                 expected_active: expected_ruleset_baseline(&context.baseline),
             })
             .await;
-        let notices = Some(
-            runtime
-                .notices
-                .into_iter()
-                .map(|notice| format!("{notice:?}"))
-                .collect(),
-        );
         match guarded {
             Ok(GuardedActivationOutcome::Activated(_)) => {
                 self.complete(
