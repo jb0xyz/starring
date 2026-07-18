@@ -121,6 +121,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "authoring-application-discord"
+version = "0.1.0"
+dependencies = [
+ "authoring-application",
+ "authoring-promotion",
+ "chrono",
+ "discord-model",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "twilight-http",
+ "twilight-model",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "authoring-promotion"
 version = "0.1.0"
 dependencies = [

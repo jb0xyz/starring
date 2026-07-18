@@ -18,6 +18,9 @@ fn adapter_excludes_database_http_edge_and_model_dependencies() {
         "llm",
         "automation-ruleset-activation",
         "authoring-promotion-postgres",
+        "tracing",
+        "log",
+        "sentry",
     ] {
         assert!(
             !regular.contains(forbidden),
@@ -32,6 +35,8 @@ fn source_files_contain_no_comments() {
         ("src/adapter.rs", include_str!("../src/adapter.rs")),
         ("src/evidence.rs", include_str!("../src/evidence.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
+        ("src/oauth.rs", include_str!("../src/oauth.rs")),
+        ("src/oauth_tests.rs", include_str!("../src/oauth_tests.rs")),
         ("src/snapshot.rs", include_str!("../src/snapshot.rs")),
         ("src/twilight.rs", include_str!("../src/twilight.rs")),
         ("tests/authority.rs", include_str!("authority.rs")),

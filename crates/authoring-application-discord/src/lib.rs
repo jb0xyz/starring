@@ -1,5 +1,6 @@
 mod adapter;
 mod evidence;
+mod oauth;
 mod snapshot;
 mod twilight;
 
@@ -9,6 +10,11 @@ pub use adapter::{
 };
 pub use evidence::{
     DiscordApplicationIdError, DiscordApplicationIdV1, FreshDiscordAuthorityEvidenceV1,
+};
+pub use oauth::{
+    DiscordAuthorizationCodeV1, DiscordIdentifyOAuthPort, DiscordOAuthClient,
+    DiscordOAuthClientSecretV1, DiscordOAuthConfigError, DiscordOAuthConfigV1, DiscordOAuthError,
+    DiscordOAuthSecretError, DiscordOAuthStateV1, VerifiedDiscordIdentityV1,
 };
 pub use snapshot::{
     DiscordAuthorityClientError, DiscordGuildAuthorityClient, DiscordGuildAuthoritySnapshotV1,
