@@ -16,10 +16,14 @@ use futures_util::FutureExt;
 use serde::Serialize;
 use url::form_urlencoded;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::HttpState;
 use crate::config::valid_return_path;
-use crate::{CsrfSecret, FacadeError, OAuthCode, ProductControlFacade, SessionCredential};
+use crate::{
+    CsrfSecret, DiscordAuthorizationRequest, FacadeError, IdempotencyKey, OAuthCode, OAuthState,
+    ProductControlFacade, SessionCredential,
+};
 
 pub(super) const SESSION_COOKIE: &str = "__Host-starring_session";
 pub(super) const OAUTH_COOKIE: &str = "__Host-starring_oauth";
@@ -277,17 +281,11 @@ pub(super) fn parse_json<T>(
 pub(super) fn idempotency_key(
     headers: &HeaderMap,
     request_id: &RequestId,
-) -> Result<String, Response> {
+) -> Result<IdempotencyKey, Response> {
     let value = single_header(headers, IDEMPOTENCY_HEADER)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 128
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
-                })
-        });
-    value.map(str::to_string).ok_or_else(|| {
+        .and_then(|value| IdempotencyKey::parse(value).ok());
+    value.ok_or_else(|| {
         problem(
             StatusCode::BAD_REQUEST,
             "invalid_idempotency_key",
@@ -319,7 +317,10 @@ pub(super) enum CookieReadError {
     Invalid,
 }
 
-pub(super) fn cookie_secret(headers: &HeaderMap, name: &str) -> Result<String, CookieReadError> {
+pub(super) fn cookie_secret(
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<Zeroizing<String>, CookieReadError> {
     let value = single_header(headers, COOKIE).ok_or(CookieReadError::Missing)?;
     let value = value.to_str().map_err(|_| CookieReadError::Invalid)?;
     if value.len() > 4_096 {
@@ -335,7 +336,7 @@ pub(super) fn cookie_secret(headers: &HeaderMap, name: &str) -> Result<String, C
             if found.is_some() {
                 return Err(CookieReadError::Duplicate);
             }
-            found = Some(value.to_string());
+            found = Some(Zeroizing::new(value.to_string()));
         }
     }
     found.ok_or(CookieReadError::Missing)
@@ -368,10 +369,13 @@ pub(super) fn parse_callback_query(
     let mut code = None;
     let mut state = None;
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        let value = Zeroizing::new(value.into_owned());
         match key.as_ref() {
-            "code" if code.is_none() => code = Some(OAuthCode::parse(&value).map_err(|_| ())?),
+            "code" if code.is_none() => {
+                code = Some(OAuthCode::parse(value.as_str()).map_err(|_| ())?)
+            }
             "state" if state.is_none() => {
-                state = Some(crate::OAuthState::parse(&value).map_err(|_| ())?)
+                state = Some(crate::OAuthState::parse(value.as_str()).map_err(|_| ())?)
             }
             _ => return Err(()),
         }
@@ -379,67 +383,67 @@ pub(super) fn parse_callback_query(
     Ok((code.ok_or(())?, state.ok_or(())?))
 }
 
-pub(super) fn valid_oauth_authorization(
-    url: &url::Url,
-    expected_state: &crate::OAuthState,
+pub(super) fn discord_authorization_location(
+    request: &DiscordAuthorizationRequest,
+    state: &OAuthState,
     expected_callback: &str,
-) -> bool {
-    if url.scheme() != "https"
-        || url.host_str() != Some("discord.com")
-        || url.port().is_some()
-        || url.username() != ""
-        || url.password().is_some()
-        || url.path() != "/oauth2/authorize"
-        || url.fragment().is_some()
+) -> Option<Zeroizing<String>> {
+    if !request
+        .client_id
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed > 0 && parsed.to_string() == request.client_id)
+        || request.callback_url != expected_callback
     {
-        return false;
+        return None;
     }
-    let mut client_id = None;
-    let mut redirect_uri = None;
-    let mut response_type = None;
-    let mut scope = None;
-    let mut state = None;
-    for (key, value) in url.query_pairs() {
-        let destination = match key.as_ref() {
-            "client_id" => &mut client_id,
-            "redirect_uri" => &mut redirect_uri,
-            "response_type" => &mut response_type,
-            "scope" => &mut scope,
-            "state" => &mut state,
-            _ => return false,
-        };
-        if destination.replace(value.into_owned()).is_some() {
-            return false;
-        }
+    let mut location = Zeroizing::new(String::with_capacity(
+        128 + request.client_id.len() + request.callback_url.len() + state.expose_secret().len(),
+    ));
+    location.push_str("https://discord.com/oauth2/authorize?client_id=");
+    push_form_value(&mut location, &request.client_id);
+    location.push_str("&redirect_uri=");
+    push_form_value(&mut location, &request.callback_url);
+    location.push_str("&response_type=code&scope=identify&state=");
+    push_form_value(&mut location, state.expose_secret());
+    Some(location)
+}
+
+fn push_form_value(destination: &mut String, value: &str) {
+    for fragment in form_urlencoded::byte_serialize(value.as_bytes()) {
+        destination.push_str(fragment);
     }
-    client_id.is_some_and(|value| {
-        value
-            .parse::<u64>()
-            .is_ok_and(|parsed| parsed > 0 && parsed.to_string() == value)
-    }) && redirect_uri.as_deref() == Some(expected_callback)
-        && response_type.as_deref() == Some("code")
-        && scope.as_deref() == Some("identify")
-        && state.as_deref() == Some(expected_state.expose_secret())
 }
 
-pub(super) fn secure_http_only_cookie(name: &str, value: &str, max_age_seconds: u32) -> String {
-    format!("{name}={value}; Path=/; Max-Age={max_age_seconds}; Secure; HttpOnly; SameSite=Lax")
+pub(super) fn secure_http_only_cookie(
+    name: &str,
+    value: &str,
+    max_age_seconds: u32,
+) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{name}={value}; Path=/; Max-Age={max_age_seconds}; Secure; HttpOnly; SameSite=Lax"
+    ))
 }
 
-pub(super) fn secure_csrf_cookie(value: &str, max_age_seconds: u32) -> String {
-    format!("{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Strict")
+pub(super) fn secure_csrf_cookie(value: &str, max_age_seconds: u32) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Strict"
+    ))
 }
 
-pub(super) fn clear_cookie(name: &str) -> String {
-    format!("{name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
+pub(super) fn clear_cookie(name: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
+    ))
 }
 
-pub(super) fn clear_csrf_cookie() -> String {
-    format!("{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict")
+pub(super) fn clear_csrf_cookie() -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict"
+    ))
 }
 
-pub(super) fn append_cookie(response: &mut Response, cookie: String) {
-    if let Ok(mut value) = HeaderValue::from_str(&cookie) {
+pub(super) fn append_cookie(response: &mut Response, cookie: Zeroizing<String>) {
+    if let Ok(mut value) = HeaderValue::from_str(cookie.as_str()) {
         value.set_sensitive(true);
         response.headers_mut().append(SET_COOKIE, value);
     }

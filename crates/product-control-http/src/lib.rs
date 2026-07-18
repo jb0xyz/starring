@@ -12,8 +12,12 @@ pub use dto::{
 };
 pub use error::{FacadeError, FacadeErrorCode};
 pub use facade::{
-    ApplyCommand, DecisionCommand, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand,
-    OAuthStartResult, ProductControlFacade, PromoteCommand, RejectCommand,
+    ApplyCommand, DecisionCommand, DiscordAuthorizationRequest, OAuthCallbackCommand,
+    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade, PromoteCommand,
+    RejectCommand,
 };
 pub use router::product_control_router;
-pub use secret::{CsrfSecret, OAuthCode, OAuthState, SecretParseError, SessionCredential};
+pub use secret::{
+    CsrfSecret, IdempotencyKey, IdempotencyKeyParseError, OAuthCode, OAuthState, SecretParseError,
+    SessionCredential,
+};

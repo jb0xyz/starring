@@ -1,7 +1,5 @@
 use std::fmt::{Debug, Formatter};
 
-use url::Url;
-
 use crate::{
     ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView, DeploymentView,
     FacadeError, OAuthCode, OAuthState, ProductState, PromotionView, SessionCredential,
@@ -31,19 +29,24 @@ pub struct OAuthStartCommand {
     pub return_to: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct OAuthStartResult {
-    pub authorization_url: Url,
+    pub authorization_request: DiscordAuthorizationRequest,
     pub authorization_state: OAuthState,
     pub browser_nonce: OAuthState,
     pub max_age_seconds: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct DiscordAuthorizationRequest {
+    pub client_id: String,
+    pub callback_url: String,
 }
 
 impl Debug for OAuthStartResult {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OAuthStartResult")
-            .field("authorization_url", &"<redacted>")
+            .field("authorization_request", &self.authorization_request)
             .field("authorization_state", &self.authorization_state)
             .field("browser_nonce", &self.browser_nonce)
             .field("max_age_seconds", &self.max_age_seconds)
@@ -51,14 +54,14 @@ impl Debug for OAuthStartResult {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct OAuthCallbackCommand {
     pub code: OAuthCode,
     pub state: OAuthState,
     pub browser_nonce: OAuthState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct OAuthCallbackResult {
     pub session: SessionCredential,
     pub csrf: CsrfSecret,
@@ -66,12 +69,11 @@ pub struct OAuthCallbackResult {
     pub max_age_seconds: u32,
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct PromoteCommand {
     pub installation_id: String,
     pub session_id: String,
     pub expected_generation: u64,
-    pub idempotency_key: String,
+    pub idempotency_key: crate::IdempotencyKey,
 }
 
 impl Debug for PromoteCommand {
@@ -86,13 +88,12 @@ impl Debug for PromoteCommand {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct DecisionCommand {
     pub installation_id: String,
     pub promotion_id: String,
     pub expected_payload_digest: String,
     pub expected_revision: u64,
-    pub idempotency_key: String,
+    pub idempotency_key: crate::IdempotencyKey,
 }
 
 impl Debug for DecisionCommand {
@@ -108,7 +109,6 @@ impl Debug for DecisionCommand {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct RejectCommand {
     pub decision: DecisionCommand,
     pub reason: String,
@@ -124,7 +124,7 @@ impl Debug for RejectCommand {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ApplyCommand {
     pub decision: DecisionCommand,
 }
@@ -134,7 +134,6 @@ impl PromoteCommand {
         valid_resource_id(&self.installation_id)
             && valid_resource_id(&self.session_id)
             && self.expected_generation > 0
-            && valid_resource_id(&self.idempotency_key)
     }
 }
 
@@ -144,7 +143,6 @@ impl DecisionCommand {
             && valid_digest(&self.promotion_id)
             && valid_digest(&self.expected_payload_digest)
             && self.expected_revision > 0
-            && valid_resource_id(&self.idempotency_key)
     }
 }
 

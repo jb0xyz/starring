@@ -2065,11 +2065,13 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tower",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

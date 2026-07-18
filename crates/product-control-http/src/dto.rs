@@ -2,6 +2,7 @@ use std::fmt::{Debug, Formatter};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +34,7 @@ impl From<authoring_application::ProductStatusV1> for ProductState {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Serialize)]
 pub struct CurrentPrincipalView {
     pub principal_id: String,
     pub display_name: String,
@@ -54,6 +55,12 @@ impl Debug for CurrentPrincipalView {
             .field("display_name", &self.display_name)
             .field("csrf_token", &"<redacted>")
             .finish()
+    }
+}
+
+impl Drop for CurrentPrincipalView {
+    fn drop(&mut self) {
+        self.csrf_token.zeroize();
     }
 }
 

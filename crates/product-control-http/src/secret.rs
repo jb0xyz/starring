@@ -1,7 +1,11 @@
 use std::fmt::{Debug, Formatter};
 
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
+
 const SECRET_BYTES: usize = 43;
 const OAUTH_CODE_MAX_BYTES: usize = 1_024;
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SecretParseError {
@@ -11,7 +15,11 @@ pub enum SecretParseError {
     InvalidOAuthCode,
 }
 
-fn parse_base64url_secret(value: &str) -> Result<String, SecretParseError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("idempotency key is invalid")]
+pub struct IdempotencyKeyParseError;
+
+fn parse_base64url_secret(value: &str) -> Result<Zeroizing<String>, SecretParseError> {
     if value.len() == SECRET_BYTES
         && value
             .bytes()
@@ -37,7 +45,7 @@ fn parse_base64url_secret(value: &str) -> Result<String, SecretParseError> {
             )
         })
     {
-        Ok(value.to_string())
+        Ok(Zeroizing::new(value.to_string()))
     } else {
         Err(SecretParseError::InvalidEncoding)
     }
@@ -45,8 +53,7 @@ fn parse_base64url_secret(value: &str) -> Result<String, SecretParseError> {
 
 macro_rules! define_secret {
     ($name:ident) => {
-        #[derive(Clone, PartialEq, Eq)]
-        pub struct $name(String);
+        pub struct $name(Zeroizing<String>);
 
         impl $name {
             pub fn parse(value: &str) -> Result<Self, SecretParseError> {
@@ -54,9 +61,17 @@ macro_rules! define_secret {
             }
 
             pub fn expose_secret(&self) -> &str {
-                &self.0
+                self.0.as_str()
             }
         }
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                constant_time_secret_eq(self.expose_secret(), other.expose_secret())
+            }
+        }
+
+        impl Eq for $name {}
 
         impl Debug for $name {
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -70,8 +85,7 @@ define_secret!(SessionCredential);
 define_secret!(CsrfSecret);
 define_secret!(OAuthState);
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct OAuthCode(String);
+pub struct OAuthCode(Zeroizing<String>);
 
 impl OAuthCode {
     pub fn parse(value: &str) -> Result<Self, SecretParseError> {
@@ -81,11 +95,11 @@ impl OAuthCode {
         {
             return Err(SecretParseError::InvalidOAuthCode);
         }
-        Ok(Self(value.to_string()))
+        Ok(Self(Zeroizing::new(value.to_string())))
     }
 
     pub fn expose_secret(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -93,4 +107,42 @@ impl Debug for OAuthCode {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("OAuthCode(<redacted>)")
     }
+}
+
+pub struct IdempotencyKey(Zeroizing<String>);
+
+impl IdempotencyKey {
+    pub fn parse(value: &str) -> Result<Self, IdempotencyKeyParseError> {
+        if value.is_empty()
+            || value.len() > IDEMPOTENCY_KEY_MAX_BYTES
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(IdempotencyKeyParseError);
+        }
+        Ok(Self(Zeroizing::new(value.to_string())))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl PartialEq for IdempotencyKey {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_secret_eq(self.expose_secret(), other.expose_secret())
+    }
+}
+
+impl Eq for IdempotencyKey {}
+
+impl Debug for IdempotencyKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IdempotencyKey(<redacted>)")
+    }
+}
+
+pub(crate) fn constant_time_secret_eq(left: &str, right: &str) -> bool {
+    left.len() == right.len() && left.as_bytes().ct_eq(right.as_bytes()).into()
 }

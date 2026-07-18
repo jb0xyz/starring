@@ -10,13 +10,13 @@ use http_body_util::BodyExt;
 use product_control_http::{
     product_control_router, ApplyCommand, ApplyView, ApprovalPreviewView, CsrfSecret,
     CurrentPrincipal, CurrentPrincipalView, DecisionCommand, DecisionView, DeploymentState,
-    DeploymentView, FacadeError, FacadeErrorCode, HttpBoundaryConfig, OAuthCallbackCommand,
-    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade, ProductState,
-    PromoteCommand, PromotionView, RejectCommand, SafeApprovalSummary, SessionCredential,
+    DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode, HttpBoundaryConfig,
+    IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
+    ProductControlFacade, ProductState, PromoteCommand, PromotionView, RejectCommand,
+    SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
-use url::Url;
 
 const HOST: &str = "starring.example";
 const ORIGIN: &str = "https://starring.example";
@@ -35,6 +35,7 @@ struct FakeFacade {
     panic_ready: AtomicUsize,
     disallowed_return: AtomicUsize,
     invalid_client_id: AtomicUsize,
+    invalid_callback_url: AtomicUsize,
     identical_session_csrf: AtomicUsize,
     block_promote: AtomicUsize,
     promote_entered: Notify,
@@ -89,10 +90,14 @@ impl ProductControlFacade for FakeFacade {
             "0"
         };
         Ok(OAuthStartResult {
-            authorization_url: Url::parse(&format!(
-                "https://discord.com/oauth2/authorize?client_id={client_id}&redirect_uri=https%3A%2F%2Fstarring.example%2Foauth%2Fdiscord%2Fcallback&response_type=code&scope=identify&state={STATE}"
-            ))
-            .unwrap(),
+            authorization_request: DiscordAuthorizationRequest {
+                client_id: client_id.to_string(),
+                callback_url: if self.invalid_callback_url.load(Ordering::SeqCst) == 0 {
+                    "https://starring.example/oauth/discord/callback".to_string()
+                } else {
+                    "https://attacker.example/oauth/discord/callback".to_string()
+                },
+            },
             authorization_state: product_control_http::OAuthState::parse(STATE).unwrap(),
             browser_nonce: product_control_http::OAuthState::parse(NONCE).unwrap(),
             max_age_seconds: 600,
@@ -591,6 +596,43 @@ async fn duplicate_security_inputs_are_rejected() {
     .unwrap();
     let response = app(facade).oneshot(duplicate_query).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let cleared_nonce = response.headers().get_all("set-cookie");
+    let cleared_nonce = cleared_nonce.iter().collect::<Vec<_>>();
+    assert_eq!(cleared_nonce.len(), 1);
+    assert!(cleared_nonce[0].is_sensitive());
+    assert!(cleared_nonce[0]
+        .to_str()
+        .unwrap()
+        .starts_with("__Host-starring_oauth=;"));
+}
+
+#[tokio::test]
+async fn oauth_callback_clears_nonce_after_missing_or_malformed_nonce() {
+    for cookie in [None, Some("__Host-starring_oauth=invalid")] {
+        let mut request = request_builder(
+            "GET",
+            &format!("/oauth/discord/callback?code=one-time-code&state={STATE}"),
+        );
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        let response = app(Arc::new(FakeFacade::default()))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let cleared_nonce = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(cleared_nonce.len(), 1);
+        assert!(cleared_nonce[0].is_sensitive());
+        assert!(cleared_nonce[0]
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-starring_oauth=;"));
+    }
 }
 
 #[tokio::test]
@@ -625,10 +667,13 @@ async fn oauth_start_sets_a_host_only_secure_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FOUND);
-    assert!(response.headers()["location"]
-        .to_str()
-        .unwrap()
-        .starts_with("https://discord.com/oauth2/authorize?"));
+    assert!(response.headers()["location"].is_sensitive());
+    assert_eq!(
+        response.headers()["location"].to_str().unwrap(),
+        format!(
+            "https://discord.com/oauth2/authorize?client_id=123456789012345678&redirect_uri=https%3A%2F%2Fstarring.example%2Foauth%2Fdiscord%2Fcallback&response_type=code&scope=identify&state={STATE}"
+        )
+    );
     let cookie = response.headers()["set-cookie"].to_str().unwrap();
     assert!(cookie.starts_with("__Host-starring_oauth="));
     assert!(cookie.contains("Secure"));
@@ -641,6 +686,21 @@ async fn oauth_start_sets_a_host_only_secure_cookie() {
 async fn oauth_authorization_rejects_a_non_snowflake_client_identity() {
     let facade = Arc::new(FakeFacade::default());
     facade.invalid_client_id.store(1, Ordering::SeqCst);
+    let response = app(facade)
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn oauth_authorization_rejects_a_callback_not_owned_by_the_http_edge() {
+    let facade = Arc::new(FakeFacade::default());
+    facade.invalid_callback_url.store(1, Ordering::SeqCst);
     let response = app(facade)
         .oneshot(
             request_builder("GET", "/oauth/discord/start")
@@ -887,7 +947,7 @@ fn secret_bearing_debug_views_are_redacted() {
         installation_id: "install-1".to_string(),
         session_id: "session-1".to_string(),
         expected_generation: 1,
-        idempotency_key: "raw-idempotency-key".to_string(),
+        idempotency_key: IdempotencyKey::parse("raw-idempotency-key").unwrap(),
     };
     assert!(!format!("{current:?}").contains(CSRF));
     assert!(!format!("{command:?}").contains("raw-idempotency-key"));

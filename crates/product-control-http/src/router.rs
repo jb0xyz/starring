@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
 use crate::facade::{is_live_exact_replay, validate_scoped_path};
 use crate::{
@@ -145,17 +146,23 @@ where
         .await
     {
         Ok(output) => {
-            if !valid_oauth_authorization(
-                &output.authorization_url,
-                &output.authorization_state,
-                state.config.oauth_callback_url(),
-            ) || output.max_age_seconds == 0
+            if output.max_age_seconds == 0
                 || output.max_age_seconds > 600
                 || output.authorization_state == output.browser_nonce
             {
                 return map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id);
             }
-            let location = match HeaderValue::from_str(output.authorization_url.as_str()) {
+            let location = match discord_authorization_location(
+                &output.authorization_request,
+                &output.authorization_state,
+                state.config.oauth_callback_url(),
+            ) {
+                Some(value) => value,
+                None => {
+                    return map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id)
+                }
+            };
+            let location = match HeaderValue::from_str(location.as_str()) {
                 Ok(mut value) => {
                     value.set_sensitive(true);
                     value
@@ -189,15 +196,17 @@ async fn oauth_callback<F>(
 where
     F: ProductControlFacade,
 {
-    let (code, oauth_state) = match parse_callback_query(query.as_deref()) {
+    let query = query.map(Zeroizing::new);
+    let (code, oauth_state) = match parse_callback_query(query.as_ref().map(|value| value.as_str()))
+    {
         Ok(value) => value,
-        Err(()) => return malformed_query(&request_id),
+        Err(()) => return malformed_oauth_callback(&request_id),
     };
     let nonce = match cookie_secret(&headers, OAUTH_COOKIE)
         .and_then(|value| crate::OAuthState::parse(&value).map_err(|_| CookieReadError::Invalid))
     {
         Ok(value) => value,
-        Err(_) => return malformed_query(&request_id),
+        Err(_) => return malformed_oauth_callback(&request_id),
     };
     let command = OAuthCallbackCommand {
         code,
@@ -209,7 +218,10 @@ where
             if output.max_age_seconds == 0
                 || output.max_age_seconds > 43_200
                 || !state.config.allows_return_path(&output.return_to)
-                || output.session.expose_secret() == output.csrf.expose_secret()
+                || crate::secret::constant_time_secret_eq(
+                    output.session.expose_secret(),
+                    output.csrf.expose_secret(),
+                )
             {
                 let _ = state
                     .facade
@@ -259,6 +271,12 @@ where
             response
         }
     }
+}
+
+fn malformed_oauth_callback(request_id: &RequestId) -> Response {
+    let mut response = malformed_query(request_id);
+    append_cookie(&mut response, clear_cookie(OAUTH_COOKIE));
+    response
 }
 
 async fn current_principal<F>(
