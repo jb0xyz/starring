@@ -140,6 +140,7 @@ fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
     assert!(!source.contains("pub trait OwnedSessionArtifactPort"));
     assert!(!source.contains("pub trait PromotionAuthorityPort"));
     assert!(source.contains("pub trait AuthenticationPort"));
+    assert!(source.contains("pub trait MutationAuthenticationPort"));
     assert!(source.contains("pub trait AuthorizedPromotionSnapshotPort"));
     assert!(source.contains("load_atomic_authorized_snapshot"));
     let identity = include_str!("../src/identity.rs");
@@ -163,6 +164,21 @@ fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
     assert!(authentication_claims.contains("session_fingerprint"));
     assert!(identity.contains("AuthenticatedSessionFingerprintV1(<redacted>)"));
     assert!(identity.contains("AuthenticationClaimsV1(<redacted>)"));
+    let application = include_str!("../src/application.rs");
+    assert!(application.contains("authenticate_mutation(credential, csrf)"));
+    for mutation in ["promote_owned_session", "approve", "reject", "apply"] {
+        let method = application
+            .split(&format!("fn {mutation}"))
+            .nth(1)
+            .unwrap()
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            method.contains("csrf"),
+            "mutation {mutation} omitted CSRF proof"
+        );
+    }
 }
 
 #[test]

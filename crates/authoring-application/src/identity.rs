@@ -97,6 +97,8 @@ pub enum AuthenticationBackendFailureV1 {
 pub enum AuthenticationError {
     #[error("authentication credential is invalid")]
     InvalidCredential,
+    #[error("authentication CSRF proof is invalid")]
+    InvalidCsrf,
     #[error("authentication credential has expired")]
     Expired,
     #[error("authentication credential was revoked")]
@@ -112,5 +114,16 @@ pub trait AuthenticationPort {
     async fn authenticate(
         &self,
         credential: &Self::Credential,
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait MutationAuthenticationPort: AuthenticationPort {
+    type CsrfProof: ?Sized;
+
+    async fn authenticate_mutation(
+        &self,
+        credential: &Self::Credential,
+        csrf: &Self::CsrfProof,
     ) -> Result<AuthenticationClaimsV1, AuthenticationError>;
 }

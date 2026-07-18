@@ -8,11 +8,11 @@ use crate::{
     AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1,
     AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionSnapshotPort,
     AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusProjectionV1,
-    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1, ProductApplicationError,
-    ProductApprovalPreviewV1, ProductDecisionPhaseV1, ProductDecisionPort,
-    ProductDecisionProjectionV1, ProductMutationReceiptV1, ProductStatusQueryV1, ProductStatusV1,
-    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
-    RuntimeDeploymentQueryV1,
+    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
+    MutationAuthenticationPort, ProductApplicationError, ProductApprovalPreviewV1,
+    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
+    ProductMutationReceiptV1, ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1,
+    PromotionSubmissionPort, RejectProductPromotionV1, RuntimeDeploymentQueryV1,
 };
 use crate::{ApproveProductPromotionV1, AuthoringApplicationError};
 
@@ -41,7 +41,7 @@ impl<'a, A, G, S, P> AuthoringApplication<'a, A, G, S, P> {
 
 impl<A, G, S, P> AuthoringApplication<'_, A, G, S, P>
 where
-    A: AuthenticationPort,
+    A: MutationAuthenticationPort,
     G: FreshGuildAuthorityPort,
     S: AuthorizedPromotionSnapshotPort<G::Evidence>,
     P: PromotionSubmissionPort,
@@ -49,10 +49,14 @@ where
     pub async fn promote_owned_session(
         &self,
         credential: &A::Credential,
+        csrf: &A::CsrfProof,
         installation: &InstallationSelectorV1,
         command: PromoteOwnedSessionV1,
     ) -> Result<P::Output, AuthoringApplicationError> {
-        let claims = self.authentication.authenticate(credential).await?;
+        let claims = self
+            .authentication
+            .authenticate_mutation(credential, csrf)
+            .await?;
         let actor = AuthenticatedActorV1::from_authentication_claims(claims);
         let authorized = self
             .guild_authority
@@ -126,6 +130,32 @@ where
         Ok((actor, authorized))
     }
 
+    async fn authenticate_mutation_and_authorize(
+        &self,
+        credential: &A::Credential,
+        csrf: &A::CsrfProof,
+        installation: &InstallationSelectorV1,
+        capability: CapabilityV1,
+    ) -> Result<
+        (AuthenticatedActorV1, AuthorizedInstallationV1<G::Evidence>),
+        ProductApplicationError,
+    >
+    where
+        A: MutationAuthenticationPort,
+    {
+        let claims = self
+            .authentication
+            .authenticate_mutation(credential, csrf)
+            .await?;
+        let actor = AuthenticatedActorV1::from_authentication_claims(claims);
+        let authorized = self
+            .guild_authority
+            .authorize_installation(&actor, installation, capability)
+            .await?;
+        validate_authorized_scope(installation, authorized.scope())?;
+        Ok((actor, authorized))
+    }
+
     pub async fn get_approval_preview(
         &self,
         credential: &A::Credential,
@@ -174,12 +204,21 @@ where
     pub async fn approve(
         &self,
         credential: &A::Credential,
+        csrf: &A::CsrfProof,
         installation: &InstallationSelectorV1,
         command: ApproveProductPromotionV1,
-    ) -> Result<ProductMutationReceiptV1, ProductApplicationError> {
+    ) -> Result<ProductMutationReceiptV1, ProductApplicationError>
+    where
+        A: MutationAuthenticationPort,
+    {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
-            .authenticate_and_authorize(credential, installation, CapabilityV1::Approve)
+            .authenticate_mutation_and_authorize(
+                credential,
+                csrf,
+                installation,
+                CapabilityV1::Approve,
+            )
             .await?;
         let receipt = self
             .decisions
@@ -197,12 +236,21 @@ where
     pub async fn reject(
         &self,
         credential: &A::Credential,
+        csrf: &A::CsrfProof,
         installation: &InstallationSelectorV1,
         command: RejectProductPromotionV1,
-    ) -> Result<ProductMutationReceiptV1, ProductApplicationError> {
+    ) -> Result<ProductMutationReceiptV1, ProductApplicationError>
+    where
+        A: MutationAuthenticationPort,
+    {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
-            .authenticate_and_authorize(credential, installation, CapabilityV1::Reject)
+            .authenticate_mutation_and_authorize(
+                credential,
+                csrf,
+                installation,
+                CapabilityV1::Reject,
+            )
             .await?;
         let receipt = self
             .decisions
@@ -220,12 +268,21 @@ where
     pub async fn apply(
         &self,
         credential: &A::Credential,
+        csrf: &A::CsrfProof,
         installation: &InstallationSelectorV1,
         command: ApplyProductPromotionV1,
-    ) -> Result<ProductStatusV1, ProductApplicationError> {
+    ) -> Result<ProductStatusV1, ProductApplicationError>
+    where
+        A: MutationAuthenticationPort,
+    {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
-            .authenticate_and_authorize(credential, installation, CapabilityV1::Apply)
+            .authenticate_mutation_and_authorize(
+                credential,
+                csrf,
+                installation,
+                CapabilityV1::Apply,
+            )
             .await?;
         let receipt = self
             .decisions

@@ -5,19 +5,20 @@ use std::sync::{Arc, Mutex};
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
-    AuthenticationError, AuthenticationPort, AuthoringApplication, AuthorizedApplyProductV1,
-    AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1,
-    AuthorizedInstallationScopeV1, AuthorizedInstallationV1, AuthorizedProductStatusV1,
-    AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
+    AuthenticationError, AuthenticationPort, AuthoringApplication, AuthoringApplicationError,
+    AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1,
+    AuthorizedDeploymentStatusV1, AuthorizedInstallationScopeV1, AuthorizedInstallationV1,
+    AuthorizedProductStatusV1, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
     AuthorizedPromotionSnapshotV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
     DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
     ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
-    InstallationSelectorV1, ProductApplicationError, ProductApprovalPreviewV1,
-    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
-    ProductDecisionPort, ProductDecisionProjectionV1, ProductIdempotencyKeyV1,
-    ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
-    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError,
-    RejectionReasonV1, ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
+    InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError,
+    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
+    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
+    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1,
+    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
+    RejectionReasonError, RejectionReasonV1, ResolvedPromotionAuthorityV1,
+    RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -111,6 +112,29 @@ impl AuthenticationPort for Authentication {
     ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
         self.events.lock().unwrap().push("authenticate");
         assert_eq!(credential, "opaque-session-token");
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        Ok(AuthenticationClaimsV1::from_authentication(
+            PrincipalId::parse("principal-1").unwrap(),
+            AuthenticatedSessionFingerprintV1::from_sha256_digest([7_u8; 32]),
+        ))
+    }
+}
+
+impl MutationAuthenticationPort for Authentication {
+    type CsrfProof = str;
+
+    async fn authenticate_mutation(
+        &self,
+        credential: &Self::Credential,
+        csrf: &Self::CsrfProof,
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
+        self.events.lock().unwrap().push("authenticate_mutation");
+        assert_eq!(credential, "opaque-session-token");
+        if csrf != "csrf-proof" {
+            return Err(AuthenticationError::InvalidCsrf);
+        }
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -254,12 +278,22 @@ fn promotion_orders_authentication_fresh_authority_atomic_snapshot_and_submissio
             input: Mutex::new(None),
         };
         AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
-            .promote_owned_session("opaque-session-token", &installation(), promote_command())
+            .promote_owned_session(
+                "opaque-session-token",
+                "csrf-proof",
+                &installation(),
+                promote_command(),
+            )
             .await
             .unwrap();
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["authenticate", "authorize", "atomic_snapshot", "submit"]
+            vec![
+                "authenticate_mutation",
+                "authorize",
+                "atomic_snapshot",
+                "submit"
+            ]
         );
         let captured = promotions.input.lock().unwrap().take().unwrap();
         assert_eq!(captured.context.tenant_id.as_str(), "tenant-1");
@@ -277,12 +311,12 @@ fn authentication_and_authority_failures_stop_every_downstream_port() {
             (
                 Some(AuthenticationError::Revoked),
                 None,
-                vec!["authenticate"],
+                vec!["authenticate_mutation"],
             ),
             (
                 None,
                 Some(FreshGuildAuthorityError::Forbidden),
-                vec!["authenticate", "authorize"],
+                vec!["authenticate_mutation", "authorize"],
             ),
         ] {
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -308,12 +342,55 @@ fn authentication_and_authority_failures_stop_every_downstream_port() {
                 &snapshots,
                 &promotions
             )
-            .promote_owned_session("opaque-session-token", &installation(), promote_command(),)
+            .promote_owned_session(
+                "opaque-session-token",
+                "csrf-proof",
+                &installation(),
+                promote_command(),
+            )
             .await
             .is_err());
             assert_eq!(*events.lock().unwrap(), expected);
             assert!(promotions.input.lock().unwrap().is_none());
         }
+    });
+}
+
+#[test]
+fn invalid_csrf_stops_before_authority_and_snapshot_access() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events: events.clone(),
+            input: Mutex::new(None),
+        };
+        let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+            .promote_owned_session(
+                "opaque-session-token",
+                "wrong-csrf",
+                &installation(),
+                promote_command(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AuthoringApplicationError::Authentication(AuthenticationError::InvalidCsrf)
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["authenticate_mutation"]);
+        assert!(promotions.input.lock().unwrap().is_none());
     });
 }
 
@@ -485,6 +562,7 @@ fn approval_is_payload_bound_and_uses_only_server_derived_actor_authority() {
         let receipt = application
             .approve(
                 "opaque-session-token",
+                "csrf-proof",
                 &installation(),
                 ApproveProductPromotionV1 {
                     promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
@@ -499,7 +577,11 @@ fn approval_is_payload_bound_and_uses_only_server_derived_actor_authority() {
         assert!(!receipt.exact_replay());
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["authenticate", "authorize", "approve_payload_bound"]
+            vec![
+                "authenticate_mutation",
+                "authorize",
+                "approve_payload_bound"
+            ]
         );
     });
 }
@@ -527,6 +609,7 @@ fn reject_reason_is_bounded_and_digest_bound_port_is_used() {
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
             .reject(
                 "opaque-session-token",
+                "csrf-proof",
                 &installation(),
                 RejectProductPromotionV1 {
                     promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
@@ -541,7 +624,7 @@ fn reject_reason_is_bounded_and_digest_bound_port_is_used() {
             .unwrap();
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["authenticate", "authorize", "reject_payload_bound"]
+            vec!["authenticate_mutation", "authorize", "reject_payload_bound"]
         );
     });
 }
@@ -602,6 +685,7 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
             ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
                 .apply(
                     "opaque-session-token",
+                    "csrf-proof",
                     &installation(),
                     ApplyProductPromotionV1 {
                         promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
@@ -617,7 +701,7 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
         assert_eq!(
             *events.lock().unwrap(),
             vec![
-                "authenticate",
+                "authenticate_mutation",
                 "authorize",
                 "apply_idempotent",
                 "deployment_status"

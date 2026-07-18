@@ -22,7 +22,7 @@ pub use control::{
 };
 pub use identity::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,
-    AuthenticationClaimsV1, AuthenticationError, AuthenticationPort,
+    AuthenticationClaimsV1, AuthenticationError, AuthenticationPort, MutationAuthenticationPort,
 };
 pub use promotion::{
     AuthoringApplicationError, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
