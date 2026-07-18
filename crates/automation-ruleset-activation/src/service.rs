@@ -23,6 +23,7 @@ use crate::model::{
 use crate::store::{
     ActivationRequestStore, ActivationStoreError, ApproveError, ClaimOutcome, RejectError,
 };
+use crate::{ActivationApprovalContextV1, ActivationLinkStateV1};
 
 const APPLY_LEASE_SECONDS: i64 = 60;
 const APPLY_DEADLINE: StdDuration = StdDuration::from_secs(45);
@@ -179,6 +180,8 @@ pub enum ApplyOutcome {
 pub enum ApplyError {
     #[error("activation request is not approved")]
     NotApproved,
+    #[error("product activation request is not linked")]
+    Unlinked,
     #[error("activation request is expired")]
     Expired,
     #[error("activation lease is lost")]
@@ -306,6 +309,13 @@ where
         applied_by: UserId,
     ) -> Result<ApplyOutcome, ApplyError> {
         let request = self.load_request(request_id).await?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) && !matches!(&request.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return Err(ApplyError::Unlinked);
+        }
         match request.state {
             ActivationRequestState::Applied => return Ok(ApplyOutcome::AlreadyApplied),
             ActivationRequestState::Expired => return Err(ApplyError::Expired),
@@ -329,6 +339,13 @@ where
         applied_by: UserId,
     ) -> Result<ApplyOutcome, ApplyError> {
         let request = self.load_request(request_id).await?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) && !matches!(&request.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return Err(ApplyError::Unlinked);
+        }
         match request.state {
             ActivationRequestState::Applied => return Ok(ApplyOutcome::AlreadyApplied),
             ActivationRequestState::Expired => return Err(ApplyError::Expired),
@@ -398,6 +415,7 @@ where
             }
             ClaimOutcome::AlreadyApplied => return Ok(ApplyOutcome::AlreadyApplied),
             ClaimOutcome::NotApproved => return Err(ApplyError::NotApproved),
+            ClaimOutcome::Unlinked => return Err(ApplyError::Unlinked),
             ClaimOutcome::Expired => return Err(ApplyError::Expired),
         };
 

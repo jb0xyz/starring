@@ -1,7 +1,10 @@
 use automation_ruleset_activation::{
-    ActivationRequest, ActivationRequestId, ActivationRequestStore, ActivationStoreError,
-    ApplyAttemptId, ApplyErrorRecord, ApprovalDecisionError, ApproveError, ClaimDecision,
-    ClaimOutcome, CompletionKind, CreateActivationRequest, RejectError, RejectionDecisionError,
+    ActivationApprovalContextV1, ActivationDigest, ActivationLinkStateV1, ActivationRequest,
+    ActivationRequestId, ActivationRequestStore, ActivationStoreError, ApplyAttemptId,
+    ApplyErrorRecord, ApprovalDecisionError, ApproveError, ClaimDecision, ClaimOutcome,
+    CompletionKind, CreateActivationRequest, CreateProductActivationRequest, LinkDecision,
+    LinkDecisionError, LinkProductActivation, LinkProductError, RejectError,
+    RejectionDecisionError,
 };
 use chrono::{DateTime, Utc};
 use discord_model::{GuildId, UserId};
@@ -10,8 +13,8 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, Row};
 
 use crate::row::{
-    backend, completion_kind_str, decode_request, state_str, ActivationRequestRow, ApprovalRow,
-    REQUEST_COLUMNS,
+    authority_kind, backend, completion_kind_str, decode_request, link_state_name, state_str,
+    ActivationRequestRow, ApprovalRow, REQUEST_COLUMNS,
 };
 
 const APPLYING_CONSTRAINT: &str = "activation_requests_one_applying_per_ruleset";
@@ -43,7 +46,7 @@ async fn fetch_request(
         return Ok(None);
     };
     let approvals = sqlx::query_as::<_, ApprovalRow>(
-        "SELECT approver_id, approved_at FROM activation_request_approvals \
+        "SELECT approver_id, approved_at, approval_payload_digest FROM activation_request_approvals \
          WHERE request_id = $1 ORDER BY approver_id",
     )
     .bind(request_id.as_str())
@@ -56,7 +59,7 @@ async fn fetch_request(
 async fn database_now(
     connection: &mut PgConnection,
 ) -> Result<DateTime<Utc>, ActivationStoreError> {
-    sqlx::query_scalar("SELECT NOW()")
+    sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(connection)
         .await
         .map_err(backend)
@@ -71,11 +74,14 @@ async fn database_lease(
             "lease duration must be positive".to_string(),
         ));
     }
-    sqlx::query_as("SELECT NOW(), NOW() + ($1 * INTERVAL '1 second')")
-        .bind(lease_seconds)
-        .fetch_one(connection)
-        .await
-        .map_err(backend)
+    sqlx::query_as(
+        "SELECT captured_at, captured_at + ($1 * INTERVAL '1 second') \
+         FROM (SELECT clock_timestamp() AS captured_at) AS clock",
+    )
+    .bind(lease_seconds)
+    .fetch_one(connection)
+    .await
+    .map_err(backend)
 }
 
 fn is_constraint(error: &sqlx::Error, name: &str) -> bool {
@@ -96,6 +102,7 @@ fn decision_outcome(decision: ClaimDecision, request: ActivationRequest) -> Clai
         },
         ClaimDecision::AlreadyApplied => ClaimOutcome::AlreadyApplied,
         ClaimDecision::NotApproved => ClaimOutcome::NotApproved,
+        ClaimDecision::Unlinked => ClaimOutcome::Unlinked,
         ClaimDecision::Expired => ClaimOutcome::Expired,
     }
 }
@@ -153,8 +160,9 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             "INSERT INTO activation_requests (id, guild_id, ruleset_key, target_version, \
              target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
              observed_active_version, observed_active_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW(), \
-             NOW() + ($8 * INTERVAL '1 millisecond'), $9, $10)",
+             SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', captured_at, \
+             captured_at + ($8 * INTERVAL '1 millisecond'), $9, $10 \
+             FROM (SELECT clock_timestamp() AS captured_at) AS clock",
         )
         .bind(input.id.as_str())
         .bind(input.target.guild_id.to_string())
@@ -184,6 +192,156 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         Ok(request)
     }
 
+    async fn create_product(
+        &self,
+        input: CreateProductActivationRequest,
+    ) -> Result<ActivationRequest, ActivationStoreError> {
+        let validated =
+            ActivationRequest::create_product(input.clone(), DateTime::<Utc>::UNIX_EPOCH)
+                .map_err(ActivationStoreError::InvalidRequest)?;
+        let ttl_millis = i64::try_from(input.context.policy.ttl_seconds.get())
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(1000))
+            .ok_or_else(|| {
+                ActivationStoreError::InvalidRequest("request ttl overflow".to_string())
+            })?;
+        let observed_version = validated
+            .observed_active
+            .as_ref()
+            .map(|observed| i64::from(observed.version.get()));
+        let observed_hash = validated
+            .observed_active
+            .as_ref()
+            .map(|observed| observed.content_hash.to_hex());
+        let approval_context = ActivationApprovalContextV1::ProductAuthoring {
+            context: Box::new(input.context.clone()),
+        };
+        let link_state = ActivationLinkStateV1::Unlinked;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let result = sqlx::query(
+            "INSERT INTO activation_requests (id, guild_id, ruleset_key, target_version, \
+             target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
+             observed_active_version, observed_active_hash, authority_kind, link_state_name, \
+             approval_context, link_state, promotion_id, promotion_request_digest, \
+             approval_payload_digest, approval_context_digest) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, 'pending', captured_at, \
+             captured_at + ($8 * INTERVAL '1 millisecond'), $9, $10, $11, $12, $13, $14, \
+             $15, $16, $17, $18 \
+             FROM (SELECT clock_timestamp() AS captured_at) AS clock",
+        )
+        .bind(input.id.as_str())
+        .bind(input.target.guild_id.to_string())
+        .bind(input.target.ruleset_key.as_str())
+        .bind(i64::from(input.target.version.get()))
+        .bind(input.target.content_hash.to_hex())
+        .bind(input.requester.to_string())
+        .bind(
+            i32::try_from(input.context.policy.required_approvals.get()).map_err(|_| {
+                ActivationStoreError::InvalidRequest("required approvals overflow".to_string())
+            })?,
+        )
+        .bind(ttl_millis)
+        .bind(observed_version)
+        .bind(observed_hash)
+        .bind(authority_kind(&approval_context))
+        .bind(link_state_name(&link_state))
+        .bind(Json(&approval_context))
+        .bind(Json(&link_state))
+        .bind(input.context.promotion_id.as_str())
+        .bind(input.context.promotion_request_digest.as_str())
+        .bind(input.context.approval_payload_digest.as_str())
+        .bind(input.context.approval_context_digest.as_str())
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = result {
+            tx.rollback().await.map_err(backend)?;
+            if is_constraint(&error, "activation_requests_pkey") {
+                return Err(ActivationStoreError::DuplicateRequest);
+            }
+            return Err(backend(error));
+        }
+        let request = fetch_request(&mut tx, &input.id, false)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(request)
+    }
+
+    async fn link_product(
+        &self,
+        request_id: &ActivationRequestId,
+        link: LinkProductActivation,
+    ) -> Result<ActivationRequest, LinkProductError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut request = fetch_request(&mut tx, request_id, true)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        let now = database_now(&mut tx).await?;
+        let decision = match request.link_product_at(
+            &link.promotion_id,
+            &link.promotion_request_digest,
+            &link.approval_context_digest,
+            now,
+        ) {
+            Ok(decision) => decision,
+            Err(LinkDecisionError::Expired) => {
+                sqlx::query("UPDATE activation_requests SET state = 'expired' WHERE id = $1")
+                    .bind(request_id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
+                return Err(LinkProductError::Expired);
+            }
+            Err(error) => {
+                tx.rollback().await.map_err(backend)?;
+                return Err(error.into());
+            }
+        };
+        if decision == LinkDecision::ExactReplay {
+            if request.state == automation_ruleset_activation::ActivationRequestState::Expired {
+                sqlx::query(
+                    "UPDATE activation_requests SET state = 'expired' \
+                     WHERE id = $1 AND state IN ('pending','approved')",
+                )
+                .bind(request_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            }
+            tx.commit().await.map_err(backend)?;
+            return Ok(request);
+        }
+        let ActivationLinkStateV1::Linked { linked_at } = &request.link_state else {
+            tx.rollback().await.map_err(backend)?;
+            return Err(LinkProductError::Store(ActivationStoreError::Backend(
+                "linked request omitted link timestamp".to_string(),
+            )));
+        };
+        let result = sqlx::query(
+            "UPDATE activation_requests SET link_state_name = 'linked', link_state = $2, \
+             linked_at = $3 WHERE id = $1 AND state = 'pending' \
+             AND link_state_name = 'unlinked' AND expires_at > $3",
+        )
+        .bind(request_id.as_str())
+        .bind(Json(&request.link_state))
+        .bind(*linked_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await.map_err(backend)?;
+            return Err(LinkProductError::Store(ActivationStoreError::Backend(
+                "product activation link CAS failed".to_string(),
+            )));
+        }
+        let linked = fetch_request(&mut tx, request_id, false)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(linked)
+    }
+
     async fn get(
         &self,
         request_id: &ActivationRequestId,
@@ -197,7 +355,7 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
-        let request = fetch_request(&mut tx, request_id, false).await?;
+        let request = fetch_request(&mut tx, request_id, true).await?;
         tx.commit().await.map_err(backend)?;
         Ok(request)
     }
@@ -231,12 +389,70 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             .find(|approval| approval.approver == approver)
             .ok_or_else(|| backend("approval decision omitted approver"))?;
         let insert = sqlx::query(
-            "INSERT INTO activation_request_approvals (request_id, approver_id, approved_at) \
-             VALUES ($1, $2, $3)",
+            "INSERT INTO activation_request_approvals \
+             (request_id, approver_id, approved_at, approval_payload_digest) \
+             VALUES ($1, $2, $3, NULL)",
         )
         .bind(request_id.as_str())
         .bind(approver.to_string())
         .bind(approval.approved_at)
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = insert {
+            tx.rollback().await.map_err(backend)?;
+            if is_constraint(&error, "activation_request_approvals_pkey") {
+                return Err(ApproveError::DuplicateApproval);
+            }
+            return Err(ApproveError::Store(backend(error)));
+        }
+        sqlx::query("UPDATE activation_requests SET state = $2 WHERE id = $1")
+            .bind(request_id.as_str())
+            .bind(state_str(request.state))
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(request)
+    }
+
+    async fn approve_bound(
+        &self,
+        request_id: &ActivationRequestId,
+        approver: UserId,
+        approval_payload_digest: &ActivationDigest,
+    ) -> Result<ActivationRequest, ApproveError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut request = fetch_request(&mut tx, request_id, true)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        let now = database_now(&mut tx).await?;
+        if let Err(error) = request.approve_bound_at(approver, approval_payload_digest, now) {
+            if error == ApprovalDecisionError::Expired {
+                sqlx::query("UPDATE activation_requests SET state = 'expired' WHERE id = $1")
+                    .bind(request_id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
+            } else {
+                tx.rollback().await.map_err(backend)?;
+            }
+            return Err(error.into());
+        }
+        let approval = request
+            .approvals
+            .iter()
+            .find(|approval| approval.approver == approver)
+            .ok_or_else(|| backend("approval decision omitted approver"))?;
+        let insert = sqlx::query(
+            "INSERT INTO activation_request_approvals \
+             (request_id, approver_id, approved_at, approval_payload_digest) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(request_id.as_str())
+        .bind(approver.to_string())
+        .bind(approval.approved_at)
+        .bind(approval_payload_digest.as_str())
         .execute(&mut *tx)
         .await;
         if let Err(error) = insert {
@@ -329,12 +545,13 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let update = sqlx::query(
             "UPDATE activation_requests SET state = 'applying', apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
-             apply_lease_until = NOW() + ($3 * INTERVAL '1 second') \
-             WHERE id = $1 AND state = 'approved' AND expires_at > NOW()",
+             apply_lease_until = $3 \
+             WHERE id = $1 AND state = 'approved' AND expires_at > $4",
         )
         .bind(request_id.as_str())
         .bind(attempt_id.as_str())
-        .bind(lease_seconds)
+        .bind(lease_until)
+        .bind(now)
         .execute(&mut *tx)
         .await;
         match update {
@@ -381,12 +598,13 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let result = sqlx::query(
             "UPDATE activation_requests SET apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
-             apply_lease_until = NOW() + ($3 * INTERVAL '1 second') \
-             WHERE id = $1 AND state = 'applying' AND apply_lease_until <= NOW()",
+             apply_lease_until = $3 \
+             WHERE id = $1 AND state = 'applying' AND apply_lease_until <= $4",
         )
         .bind(request_id.as_str())
         .bind(attempt_id.as_str())
-        .bind(lease_seconds)
+        .bind(lease_until)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
@@ -504,7 +722,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             let id = ActivationRequestId::parse(&row.id)
                 .map_err(|error| backend(format!("invalid persisted id: {error}")))?;
             let approvals = sqlx::query_as::<_, ApprovalRow>(
-                "SELECT approver_id, approved_at FROM activation_request_approvals \
+                "SELECT approver_id, approved_at, approval_payload_digest \
+                 FROM activation_request_approvals \
                  WHERE request_id = $1 ORDER BY approver_id",
             )
             .bind(id.as_str())
