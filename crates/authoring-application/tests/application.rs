@@ -4,20 +4,20 @@ use std::sync::{Arc, Mutex};
 
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
-    AuthenticatedActorV1, AuthenticatedIdentityV1, AuthenticationError, AuthenticationPort,
-    AuthoringApplication, AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1,
-    AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1, AuthorizedInstallationScopeV1,
-    AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionSnapshotError,
-    AuthorizedPromotionSnapshotPort, AuthorizedPromotionSnapshotV1, AuthorizedRejectProductV1,
-    CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
-    ExactDeploymentSelectorV1, ExactLiveProjectionV1, FreshGuildAuthorityError,
-    FreshGuildAuthorityPort, InstallationSelectorV1, ProductApplicationError,
-    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1,
-    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
-    RejectionReasonError, RejectionReasonV1, ResolvedPromotionAuthorityV1,
-    RuntimeDeploymentQueryV1,
+    AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
+    AuthenticationError, AuthenticationPort, AuthoringApplication, AuthorizedApplyProductV1,
+    AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1,
+    AuthorizedInstallationScopeV1, AuthorizedInstallationV1, AuthorizedProductStatusV1,
+    AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
+    AuthorizedPromotionSnapshotV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
+    DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
+    ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
+    InstallationSelectorV1, ProductApplicationError, ProductApprovalPreviewV1,
+    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
+    ProductDecisionPort, ProductDecisionProjectionV1, ProductIdempotencyKeyV1,
+    ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
+    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError,
+    RejectionReasonV1, ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -108,14 +108,15 @@ impl AuthenticationPort for Authentication {
     async fn authenticate(
         &self,
         credential: &Self::Credential,
-    ) -> Result<AuthenticatedIdentityV1, AuthenticationError> {
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
         self.events.lock().unwrap().push("authenticate");
         assert_eq!(credential, "opaque-session-token");
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        Ok(AuthenticatedIdentityV1::from_authentication(
+        Ok(AuthenticationClaimsV1::from_authentication(
             PrincipalId::parse("principal-1").unwrap(),
+            AuthenticatedSessionFingerprintV1::from_sha256_digest([7_u8; 32]),
         ))
     }
 }
@@ -136,6 +137,7 @@ impl FreshGuildAuthorityPort for GuildAuthority {
     ) -> Result<AuthorizedInstallationV1<Self::Evidence>, FreshGuildAuthorityError> {
         self.events.lock().unwrap().push("authorize");
         assert_eq!(actor.principal_id().as_str(), "principal-1");
+        assert_eq!(actor.session_fingerprint().as_bytes(), &[7_u8; 32]);
         assert_eq!(installation.installation_id().as_str(), "installation-2");
         assert!(matches!(
             capability,

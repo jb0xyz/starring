@@ -52,8 +52,8 @@ where
         installation: &InstallationSelectorV1,
         command: PromoteOwnedSessionV1,
     ) -> Result<P::Output, AuthoringApplicationError> {
-        let identity = self.authentication.authenticate(credential).await?;
-        let actor = AuthenticatedActorV1::from_identity(identity);
+        let claims = self.authentication.authenticate(credential).await?;
+        let actor = AuthenticatedActorV1::from_authentication_claims(claims);
         let authorized = self
             .guild_authority
             .authorize_installation(&actor, installation, CapabilityV1::Promote)
@@ -116,8 +116,8 @@ where
         (AuthenticatedActorV1, AuthorizedInstallationV1<G::Evidence>),
         ProductApplicationError,
     > {
-        let identity = self.authentication.authenticate(credential).await?;
-        let actor = AuthenticatedActorV1::from_identity(identity);
+        let claims = self.authentication.authenticate(credential).await?;
+        let actor = AuthenticatedActorV1::from_authentication_claims(claims);
         let authorized = self
             .guild_authority
             .authorize_installation(&actor, installation, capability)

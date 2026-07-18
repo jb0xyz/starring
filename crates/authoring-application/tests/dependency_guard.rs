@@ -135,21 +135,34 @@ fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
 fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
     let source = source();
     assert!(!source.contains("from_trusted_edge"));
-    assert!(!source.contains("pub fn from_identity"));
+    assert!(!source.contains("pub fn from_authenticated_session"));
+    assert!(!source.contains("pub fn from_authentication_claims"));
     assert!(!source.contains("pub trait OwnedSessionArtifactPort"));
     assert!(!source.contains("pub trait PromotionAuthorityPort"));
     assert!(source.contains("pub trait AuthenticationPort"));
     assert!(source.contains("pub trait AuthorizedPromotionSnapshotPort"));
     assert!(source.contains("load_atomic_authorized_snapshot"));
     let identity = include_str!("../src/identity.rs");
-    let authenticated_identity = identity
-        .split("pub struct AuthenticatedIdentityV1")
+    let authenticated_session = identity
+        .split("struct AuthenticatedSessionV1")
         .nth(1)
         .unwrap()
         .split('}')
         .next()
         .unwrap();
-    assert!(!authenticated_identity.contains("tenant"));
+    assert!(!identity.contains("pub struct AuthenticatedSessionV1"));
+    assert!(!authenticated_session.contains("tenant"));
+    let authentication_claims = identity
+        .split("pub struct AuthenticationClaimsV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!authentication_claims.contains("tenant"));
+    assert!(authentication_claims.contains("session_fingerprint"));
+    assert!(identity.contains("AuthenticatedSessionFingerprintV1(<redacted>)"));
+    assert!(identity.contains("AuthenticationClaimsV1(<redacted>)"));
 }
 
 #[test]

@@ -4,15 +4,16 @@ use std::time::Duration;
 
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
-    AuthenticatedActorV1, AuthenticatedIdentityV1, AuthenticationError, AuthenticationPort,
-    AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1,
-    AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1, AuthorizedRejectProductV1,
-    CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
-    FreshGuildAuthorityError, InstallationSelectorV1, ProductApplicationError,
-    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1,
-    ProductStatusV1, PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1,
+    AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
+    AuthenticationError, AuthenticationPort, AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1,
+    AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1,
+    AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError,
+    DeploymentStatusProjectionV1, FreshGuildAuthorityError, InstallationSelectorV1,
+    ProductApplicationError, ProductApprovalPreviewV1, ProductControlApplication,
+    ProductControlPortError, ProductDecisionPhaseV1, ProductDecisionPort,
+    ProductDecisionProjectionV1, ProductIdempotencyKeyV1, ProductMutationReceiptV1,
+    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
+    RejectProductPromotionV1, RejectionReasonV1,
 };
 use authoring_application_discord::{
     AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -41,12 +42,13 @@ impl AuthenticationPort for Authentication {
     async fn authenticate(
         &self,
         credential: &str,
-    ) -> Result<AuthenticatedIdentityV1, AuthenticationError> {
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
         if credential != "valid-credential" {
             return Err(AuthenticationError::InvalidCredential);
         }
-        Ok(AuthenticatedIdentityV1::from_authentication(
+        Ok(AuthenticationClaimsV1::from_authentication(
             PrincipalId::parse("principal-1").unwrap(),
+            AuthenticatedSessionFingerprintV1::from_sha256_digest([9_u8; 32]),
         ))
     }
 }
@@ -64,6 +66,7 @@ impl InstallationAuthoritySource for Source {
         installation: &InstallationSelectorV1,
     ) -> Result<InstallationAuthorityRecordV1, DiscordAuthoritySourceError> {
         assert_eq!(actor.principal_id().as_str(), "principal-1");
+        assert_eq!(actor.session_fingerprint().as_bytes(), &[9_u8; 32]);
         assert_eq!(installation.installation_id().as_str(), "install-1");
         self.calls.lock().map(|mut calls| *calls += 1).unwrap();
         self.result.clone()

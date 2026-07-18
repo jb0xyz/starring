@@ -21,7 +21,8 @@ pub use control::{
     RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
 };
 pub use identity::{
-    AuthenticatedActorV1, AuthenticatedIdentityV1, AuthenticationError, AuthenticationPort,
+    AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,
+    AuthenticationClaimsV1, AuthenticationError, AuthenticationPort,
 };
 pub use promotion::{
     AuthoringApplicationError, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
