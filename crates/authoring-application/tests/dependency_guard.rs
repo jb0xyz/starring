@@ -53,8 +53,10 @@ fn regular_dependencies_stay_pure() {
     let forbidden = [
         "sqlx",
         "rusqlite",
+        "axum",
         "ai-gateway",
         "automation-runtime",
+        "automation-ruleset-activation",
         "automation-ruleset-readiness",
         "approval-manager",
         "policy-engine",
@@ -104,7 +106,7 @@ ai-gateway = "1"
 
 #[test]
 fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
-    let source = include_str!("../src/lib.rs");
+    let source = source();
     assert!(!source.contains("Deserialize"));
     let command = source
         .split("pub struct PromoteOwnedSessionV1")
@@ -131,7 +133,7 @@ fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
 
 #[test]
 fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
-    let source = include_str!("../src/lib.rs");
+    let source = source();
     assert!(!source.contains("from_trusted_edge"));
     assert!(!source.contains("pub fn from_identity"));
     assert!(!source.contains("pub trait OwnedSessionArtifactPort"));
@@ -139,4 +141,73 @@ fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
     assert!(source.contains("pub trait AuthenticationPort"));
     assert!(source.contains("pub trait AuthorizedPromotionSnapshotPort"));
     assert!(source.contains("load_atomic_authorized_snapshot"));
+    let identity = include_str!("../src/identity.rs");
+    let authenticated_identity = identity
+        .split("pub struct AuthenticatedIdentityV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!authenticated_identity.contains("tenant"));
+}
+
+#[test]
+fn product_commands_never_accept_trusted_authority_or_apply_attempt_fields() {
+    let source = source();
+    for command_name in [
+        "ApproveProductPromotionV1",
+        "RejectProductPromotionV1",
+        "ApplyProductPromotionV1",
+    ] {
+        let command = source
+            .split(&format!("pub struct {command_name}"))
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        for forbidden in [
+            "actor",
+            "guild_id",
+            "requester",
+            "policy",
+            "target",
+            "attempt_id",
+        ] {
+            assert!(
+                !command.contains(forbidden),
+                "client command {command_name} leaked {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decision_port_has_only_bound_decisions_and_adapter_derived_apply_identity() {
+    let source = include_str!("../src/control.rs");
+    let product_port = source
+        .split("pub trait ProductDecisionPort")
+        .nth(1)
+        .unwrap();
+    assert!(product_port.contains("approve_payload_bound"));
+    assert!(product_port.contains("reject_payload_bound"));
+    assert!(product_port.contains("apply_idempotent"));
+    assert!(!product_port.contains("ApplyAttemptId"));
+    assert!(!product_port.contains("async fn approve("));
+    assert!(!product_port.contains("async fn reject("));
+    assert!(!product_port.contains("async fn apply("));
+}
+
+fn source() -> String {
+    [
+        include_str!("../src/lib.rs"),
+        include_str!("../src/application.rs"),
+        include_str!("../src/authority.rs"),
+        include_str!("../src/control.rs"),
+        include_str!("../src/identity.rs"),
+        include_str!("../src/promotion.rs"),
+        include_str!("../src/status.rs"),
+    ]
+    .join("\n")
 }
