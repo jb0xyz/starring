@@ -22,7 +22,7 @@ use resource_resolution::{
     approval_binding_fingerprint_v1, project_required_bindings, ResourceBindingMap,
 };
 
-use crate::id::{ActivationRequestId, ApplyAttemptId};
+use crate::id::{ActivationDigest, ActivationRequestId, ApplyAttemptId};
 use crate::model::{
     ActivationRequest, ActivationRequestState, ActivationTarget, ActivationTerminationV1,
     ApplyErrorRecord, ApplyFailureKind, CompletionKind, CreateActivationRequest, ObservedActive,
@@ -309,6 +309,17 @@ where
         approver: UserId,
     ) -> Result<ActivationRequest, ApproveError> {
         self.requests.approve(request_id, approver).await
+    }
+
+    pub async fn approve_bound(
+        &self,
+        request_id: &ActivationRequestId,
+        approver: UserId,
+        approval_payload_digest: &ActivationDigest,
+    ) -> Result<ActivationRequest, ApproveError> {
+        self.requests
+            .approve_bound(request_id, approver, approval_payload_digest)
+            .await
     }
 
     pub async fn reject(

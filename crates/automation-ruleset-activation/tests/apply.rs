@@ -397,11 +397,61 @@ fn create_approved_product_with_context(
     .unwrap();
     block_on(
         fixture
-            .requests
+            .service()
             .approve_bound(&id, UserId(20), &context.approval_payload_digest),
     )
     .unwrap();
     (id, context)
+}
+
+#[test]
+fn product_approval_service_requires_the_exact_payload_digest() {
+    let fixture = Fixture::new(ProviderMode::ProductReady);
+    let target = fixture.rulesets.publish(false);
+    let id = ActivationRequestId::parse("bound_service").unwrap();
+    let context = product_context(&id, &target, ExpectedActiveBaselineV1::Absent);
+    block_on(
+        fixture
+            .requests
+            .create_product(CreateProductActivationRequest {
+                id: id.clone(),
+                target: ActivationTarget {
+                    guild_id: target.guild_id,
+                    ruleset_key: target.ruleset_key.clone(),
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                requester: UserId(10),
+                context: context.clone(),
+            }),
+    )
+    .unwrap();
+    block_on(fixture.requests.link_product(
+        &id,
+        LinkProductActivation {
+            promotion_id: context.promotion_id.clone(),
+            promotion_request_digest: context.promotion_request_digest.clone(),
+            approval_context_digest: context.approval_context_digest.clone(),
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(
+        block_on(
+            fixture
+                .service()
+                .approve_bound(&id, UserId(20), &digest('f'))
+        )
+        .unwrap_err(),
+        automation_ruleset_activation::ApproveError::PayloadMismatch
+    );
+    let approved = block_on(fixture.service().approve_bound(
+        &id,
+        UserId(20),
+        &context.approval_payload_digest,
+    ))
+    .unwrap();
+    assert_eq!(approved.state, ActivationRequestState::Approved);
 }
 
 #[test]
