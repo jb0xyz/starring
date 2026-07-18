@@ -1,0 +1,18 @@
+[package]
+name = "authoring-application-discord"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+authoring-application = { path = "../authoring-application" }
+authoring-promotion = { path = "../authoring-promotion" }
+discord-model = { path = "../discord-model" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["time"] }
+twilight-http = "0.17"
+twilight-model = "0.17"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }

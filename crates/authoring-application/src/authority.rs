@@ -1,3 +1,6 @@
+use std::num::NonZeroU64;
+use std::time::SystemTime;
+
 use authoring_promotion::{AutomationInstallationId, TenantId};
 use discord_model::{GuildId, UserId};
 
@@ -121,4 +124,20 @@ pub trait FreshGuildAuthorityPort {
         installation: &InstallationSelectorV1,
         capability: CapabilityV1,
     ) -> Result<AuthorizedInstallationV1<Self::Evidence>, FreshGuildAuthorityError>;
+}
+
+pub trait FreshGuildAuthorityEvidence {
+    fn tenant_id(&self) -> &TenantId;
+    fn installation_id(&self) -> &AutomationInstallationId;
+    fn discord_application_id(&self) -> NonZeroU64;
+    fn guild_id(&self) -> GuildId;
+    fn acting_user_id(&self) -> UserId;
+    fn capability(&self) -> CapabilityV1;
+    fn guild_owner(&self) -> bool;
+    fn effective_permissions_bits(&self) -> u64;
+    fn installation_authority_revision(&self) -> NonZeroU64;
+    fn installation_authority_digest(&self) -> &str;
+    fn observation_digest(&self) -> &str;
+    fn observed_at(&self) -> SystemTime;
+    fn expires_at(&self) -> SystemTime;
 }

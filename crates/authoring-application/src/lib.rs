@@ -8,7 +8,8 @@ mod status;
 pub use application::{AuthoringApplication, ProductControlApplication};
 pub use authority::{
     AuthorizedInstallationScopeV1, AuthorizedInstallationV1, CapabilityV1,
-    FreshGuildAuthorityError, FreshGuildAuthorityPort, InstallationSelectorV1,
+    FreshGuildAuthorityError, FreshGuildAuthorityEvidence, FreshGuildAuthorityPort,
+    InstallationSelectorV1,
 };
 pub use control::{
     ApplyProductPromotionV1, ApprovalPayloadDigestError, ApprovalPayloadDigestV1,
