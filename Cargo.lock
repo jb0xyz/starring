@@ -141,6 +141,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "authoring-application-postgres"
+version = "0.1.0"
+dependencies = [
+ "authoring-application",
+ "authoring-application-discord",
+ "authoring-promotion",
+ "automation-ruleset",
+ "base64",
+ "chrono",
+ "design-harness",
+ "desired-state",
+ "discord-model",
+ "futures",
+ "getrandom 0.4.3",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror 1.0.69",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "authoring-promotion"
 version = "0.1.0"
 dependencies = [

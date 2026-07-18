@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 authoring-application = { path = "../authoring-application" }
+authoring-application-discord = { path = "../authoring-application-discord" }
 authoring-promotion = { path = "../authoring-promotion" }
 automation-ruleset = { path = "../automation-ruleset" }
 base64 = "0.22"
@@ -12,12 +13,15 @@ chrono = { version = "0.4", features = ["serde"] }
 design-harness = { path = "../design-harness" }
 desired-state = { path = "../desired-state" }
 discord-model = { path = "../discord-model" }
+getrandom = "0.4"
 resource-resolution = { path = "../resource-resolution" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive", "macros", "migrate"] }
+subtle = "2"
 thiserror = { workspace = true }
+url = "2"
 zeroize = "1"
 
 [dev-dependencies]

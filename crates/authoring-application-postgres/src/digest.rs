@@ -18,6 +18,11 @@ pub enum OpaqueSessionCredentialError {
 pub struct ProductSessionDigestV1([u8; 32]);
 
 impl ProductSessionDigestV1 {
+    #[cfg(test)]
+    pub(crate) fn from_digest_bytes(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

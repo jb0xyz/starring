@@ -1,12 +1,16 @@
 mod authentication;
 mod bindings;
+mod database;
 mod digest;
 mod envelope;
+mod product_identity;
+mod secret;
 mod snapshot;
 
 pub use authentication::{
     AuthenticationConfigError, PostgresAuthentication, PostgresAuthenticationConfig,
 };
+pub use database::ProductDatabaseFailureV1;
 pub use digest::{
     digest_opaque_session_credential_v1, OpaqueSessionCredentialError, ProductSessionDigestV1,
 };
@@ -14,6 +18,16 @@ pub use envelope::{
     build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
     SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1, SnapshotAuthenticatedDataV1,
     SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+};
+pub use product_identity::{
+    ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,
+    OAuthFlowIssueV1, PostgresProductIdentityConfig, PostgresProductIdentityStore,
+    ProductIdentityConfigError, ProductIdentityError, ProductIdentityLifetimesV1,
+    ProductLogoutDispositionV1, ProductSessionRevocationReasonV1,
+};
+pub use secret::{
+    OperatingSystemSecretGenerator, ProductSecretGenerator, ProductSecretGeneratorError,
+    ProductSecretV1,
 };
 pub use snapshot::{
     AuthorizedSnapshotConfigError, PostgresAuthorizedPromotionSnapshots,

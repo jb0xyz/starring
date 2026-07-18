@@ -22,12 +22,14 @@ use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingFinger
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::types::Json;
+use subtle::ConstantTimeEq;
 
 use crate::bindings::decode_resource_bindings;
 use crate::envelope::{
     build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
     SnapshotAuthenticatedDataInputV1, SnapshotEnvelopeCipher,
 };
+use crate::ProductDatabaseFailureV1;
 
 const DEFAULT_STATEMENT_TIMEOUT_MILLIS: u64 = 2_000;
 const DEFAULT_FRESH_AUTHORITY_MILLIS: u64 = 5_000;
@@ -140,6 +142,7 @@ struct AtomicSnapshotRow {
     owner_principal_id: String,
     owner_discord_user_id: String,
     owner_disabled: bool,
+    actor_session_digest: Vec<u8>,
     current_generation: i64,
     session_lifecycle_state: String,
     tenant_lifecycle_state: String,
@@ -203,21 +206,17 @@ where
         session_id: &AuthoringSessionId,
         expected_generation: SessionGeneration,
     ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| session_backend(error.to_string()))?;
+        let mut transaction = self.pool.begin().await.map_err(session_database_backend)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| session_backend(error.to_string()))?;
-        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .map_err(session_database_backend)?;
+        sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
             .bind(self.config.statement_timeout())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| session_backend(error.to_string()))?;
-        let row = fetch_atomic_snapshot(&mut transaction, session_id)
+            .map_err(session_database_backend)?;
+        let row = fetch_atomic_snapshot(&mut transaction, session_id, actor, scope)
             .await?
             .ok_or(OwnedSessionLoadError::NotFound)?;
         let copied = validate_and_copy_row(
@@ -232,7 +231,7 @@ where
         transaction
             .commit()
             .await
-            .map_err(|error| session_backend(error.to_string()))?;
+            .map_err(session_database_backend)?;
         let artifact = materialize_snapshot(&self.cipher, &copied, self.config).await?;
         Ok(AuthorizedPromotionSnapshotV1::from_atomic_authorization(
             artifact,
@@ -244,12 +243,15 @@ where
 async fn fetch_atomic_snapshot(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: &AuthoringSessionId,
+    actor: &AuthenticatedActorV1,
+    scope: &AuthorizedInstallationScopeV1,
 ) -> Result<Option<AtomicSnapshotRow>, AuthorizedPromotionSnapshotError> {
     sqlx::query_as::<_, AtomicSnapshotRow>(
         "SELECT authoring_session.tenant_id AS session_tenant_id, \
          authoring_session.installation_id AS session_installation_id, \
          authoring_session.owner_principal_id, principal.discord_user_id AS owner_discord_user_id, \
          principal.disabled AS owner_disabled, \
+         actor_session.session_digest AS actor_session_digest, \
          authoring_session.current_generation, \
          authoring_session.lifecycle_state AS session_lifecycle_state, \
          tenant.lifecycle_state AS tenant_lifecycle_state, \
@@ -272,29 +274,41 @@ async fn fetch_atomic_snapshot(
          authority.policy_revision, authority.required_approvals, \
          authority.activation_ttl_seconds, authority.authority_payload_digest, \
          CURRENT_TIMESTAMP AS database_now \
-         FROM authoring_sessions AS authoring_session \
-         INNER JOIN product_principals AS principal \
+         FROM public.authoring_sessions AS authoring_session \
+         INNER JOIN public.product_principals AS principal \
          ON principal.principal_id = authoring_session.owner_principal_id \
-         INNER JOIN product_tenants AS tenant \
+         INNER JOIN public.product_auth_sessions AS actor_session \
+         ON actor_session.principal_id = authoring_session.owner_principal_id \
+         AND actor_session.session_digest = $2 \
+         AND actor_session.oauth_state_digest IS NOT NULL \
+         AND actor_session.revoked_at IS NULL \
+         AND CURRENT_TIMESTAMP < actor_session.idle_expires_at \
+         AND CURRENT_TIMESTAMP < actor_session.absolute_expires_at \
+         INNER JOIN public.product_tenants AS tenant \
          ON tenant.tenant_id = authoring_session.tenant_id \
-         INNER JOIN automation_installations AS installation \
+         INNER JOIN public.automation_installations AS installation \
          ON installation.tenant_id = authoring_session.tenant_id \
          AND installation.installation_id = authoring_session.installation_id \
-         INNER JOIN authoring_session_generations AS generation \
+         INNER JOIN public.authoring_session_generations AS generation \
          ON generation.tenant_id = authoring_session.tenant_id \
          AND generation.installation_id = authoring_session.installation_id \
          AND generation.session_id = authoring_session.session_id \
          AND generation.generation = authoring_session.current_generation \
-         INNER JOIN automation_installation_authority_versions AS authority \
+         INNER JOIN public.automation_installation_authority_versions AS authority \
          ON authority.tenant_id = generation.tenant_id \
          AND authority.installation_id = generation.installation_id \
          AND authority.revision = generation.installation_authority_revision \
-         WHERE authoring_session.session_id = $1",
+         WHERE authoring_session.session_id = $1 \
+         AND authoring_session.tenant_id = $3 \
+         AND authoring_session.installation_id = $4",
     )
     .bind(session_id.as_str())
+    .bind(actor.session_fingerprint().as_bytes().as_slice())
+    .bind(scope.tenant_id().as_str())
+    .bind(scope.installation_id().as_str())
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|error| session_backend(error.to_string()).into())
+    .map_err(|error| session_database_backend(error).into())
 }
 
 fn validate_and_copy_row<E: FreshGuildAuthorityEvidence>(
@@ -307,6 +321,18 @@ fn validate_and_copy_row<E: FreshGuildAuthorityEvidence>(
     config: PostgresAuthorizedPromotionSnapshotsConfig,
 ) -> Result<CopiedAuthorizedSnapshot, AuthorizedPromotionSnapshotError> {
     if row.owner_principal_id != actor.principal_id().as_str() {
+        return Err(OwnedSessionLoadError::NotOwned.into());
+    }
+    let persisted_session_digest: [u8; 32] = row
+        .actor_session_digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| session_backend("persisted actor session digest is invalid"))?;
+    if persisted_session_digest
+        .ct_eq(actor.session_fingerprint().as_bytes())
+        .unwrap_u8()
+        != 1
+    {
         return Err(OwnedSessionLoadError::NotOwned.into());
     }
     if row.owner_disabled {
@@ -608,6 +634,10 @@ fn session_backend(error: impl std::fmt::Display) -> OwnedSessionLoadError {
     OwnedSessionLoadError::Backend(error.to_string())
 }
 
+fn session_database_backend(error: sqlx::Error) -> OwnedSessionLoadError {
+    session_backend(ProductDatabaseFailureV1::classify(&error))
+}
+
 fn authority_backend(error: impl std::fmt::Display) -> PromotionAuthorityError {
     PromotionAuthorityError::Backend(error.to_string())
 }
@@ -688,6 +718,7 @@ mod tests {
             owner_principal_id: "principal-1".to_string(),
             owner_discord_user_id: "100".to_string(),
             owner_disabled: false,
+            actor_session_digest: vec![5_u8; 32],
             current_generation: 1,
             session_lifecycle_state: "active".to_string(),
             tenant_lifecycle_state: "active".to_string(),

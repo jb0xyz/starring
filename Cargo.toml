@@ -22,6 +22,7 @@ members = [
     "crates/authoring-promotion-postgres",
     "crates/authoring-application",
     "crates/authoring-application-discord",
+    "crates/authoring-application-postgres",
     "crates/product-control-http",
     "crates/automation-runtime",
     "crates/automation-runtime-convergence",

@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
-    AuthenticatedActorV1, AuthenticatedIdentityV1, AuthenticationPort, AuthoringApplication,
-    AuthorizedInstallationScopeV1, AuthorizedInstallationV1, CapabilityV1,
-    FreshGuildAuthorityError, FreshGuildAuthorityEvidence, FreshGuildAuthorityPort,
-    InstallationSelectorV1, PromoteOwnedSessionV1, PromotionSubmissionPort,
+    AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
+    AuthenticationPort, AuthoringApplication, AuthorizedInstallationScopeV1,
+    AuthorizedInstallationV1, CapabilityV1, FreshGuildAuthorityError, FreshGuildAuthorityEvidence,
+    FreshGuildAuthorityPort, InstallationSelectorV1, MutationAuthenticationPort,
+    PromoteOwnedSessionV1, PromotionSubmissionPort,
 };
 use authoring_application_postgres::{
     build_snapshot_authenticated_data_v1, digest_opaque_session_credential_v1,
@@ -30,7 +31,7 @@ use discord_model::{ChannelId, GuildId, UserId};
 use resource_resolution::resource_binding_fingerprint_v2;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::types::Json;
 use zeroize::Zeroizing;
 
@@ -217,24 +218,79 @@ impl PromotionSubmissionPort for PromotionCapture {
     }
 }
 
+fn assert_test_database_name(database_name: &str) {
+    assert!(
+        database_name.starts_with("starring_")
+            && database_name.split('_').any(|segment| segment == "test")
+            && database_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "refusing to use a database outside the strict Starring test namespace"
+    );
+}
+
 fn database_url() -> String {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
         .expect("STARRING_TEST_DATABASE_URL required for ignored PostgreSQL tests");
-    assert!(
-        url.contains("test"),
-        "refusing to run against a database whose name does not contain test"
-    );
+    let options = url
+        .parse::<PgConnectOptions>()
+        .unwrap_or_else(|_| panic!("STARRING_TEST_DATABASE_URL must be a PostgreSQL URL"));
+    let database_name = options
+        .get_database()
+        .unwrap_or_else(|| panic!("STARRING_TEST_DATABASE_URL must name a database"));
+    assert_test_database_name(database_name);
     url
 }
 
 async fn pool() -> PgPool {
+    let url = database_url();
+    let expected_database = url
+        .parse::<PgConnectOptions>()
+        .unwrap()
+        .get_database()
+        .unwrap()
+        .to_string();
     let pool = PgPoolOptions::new()
         .max_connections(8)
-        .connect(&database_url())
+        .connect(&url)
         .await
         .expect("connect");
+    let current_database = sqlx::query_scalar::<_, String>("SELECT pg_catalog.current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("read current test database");
+    assert_test_database_name(&current_database);
+    assert_eq!(current_database, expected_database);
     MIGRATOR.run(&pool).await.expect("migrate");
     pool
+}
+
+async fn shadow_search_path_pool(setup_pool: &PgPool) -> PgPool {
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS authoring_identity_shadow")
+        .execute(setup_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION authoring_identity_shadow.clock_timestamp() \
+         RETURNS TIMESTAMPTZ LANGUAGE SQL IMMUTABLE SET search_path = pg_catalog \
+         AS 'SELECT ''2000-01-01T00:00:00Z''::TIMESTAMPTZ'",
+    )
+    .execute(setup_pool)
+    .await
+    .unwrap();
+    PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                sqlx::query("SET search_path = authoring_identity_shadow, pg_catalog")
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url())
+        .await
+        .unwrap()
 }
 
 fn unique_suffix() -> String {
@@ -245,7 +301,7 @@ fn unique_suffix() -> String {
         .to_string()
 }
 
-fn credential(seed: &str) -> String {
+fn opaque_credential(seed: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(seed.as_bytes()))
 }
 
@@ -255,7 +311,7 @@ async fn insert_authentication_session(
     discord_user_id: UserId,
     credential: &str,
     last_seen_minutes_ago: i64,
-) {
+) -> String {
     sqlx::query(
         "INSERT INTO product_principals \
          (principal_id, discord_user_id, disabled, identity_revision, display_profile) \
@@ -267,23 +323,45 @@ async fn insert_authentication_session(
     .await
     .unwrap();
     let session_digest = digest_opaque_session_credential_v1(credential).unwrap();
-    let csrf_digest: [u8; 32] = Sha256::digest(format!("csrf:{principal_id}").as_bytes()).into();
+    let csrf = opaque_credential(&format!("csrf:{principal_id}"));
+    let csrf_digest = digest_opaque_session_credential_v1(&csrf).unwrap();
+    let oauth_state_digest: [u8; 32] =
+        Sha256::digest(format!("oauth-state:{principal_id}").as_bytes()).into();
+    let oauth_nonce_digest: [u8; 32] =
+        Sha256::digest(format!("oauth-nonce:{principal_id}").as_bytes()).into();
+    sqlx::query(
+        "INSERT INTO product_oauth_flows \
+         (state_digest, browser_nonce_digest, redirect_uri, return_path, created_at, expires_at, \
+          consumed_at, terminal_result_code) \
+         VALUES ($1, $2, 'https://starring.example/oauth/discord/callback', '/', \
+          CURRENT_TIMESTAMP - INTERVAL '7 minutes', CURRENT_TIMESTAMP + INTERVAL '3 minutes', \
+          CURRENT_TIMESTAMP - INTERVAL '6 minutes', 'callback_claimed')",
+    )
+    .bind(oauth_state_digest.as_slice())
+    .bind(oauth_nonce_digest.as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO product_auth_sessions \
-         (session_digest, principal_id, csrf_digest, authenticated_at, created_at, \
+         (session_digest, principal_id, csrf_digest, oauth_state_digest, \
+          authenticated_at, created_at, \
           last_seen_at, idle_expires_at, absolute_expires_at) \
-         VALUES ($1, $2, $3, CURRENT_TIMESTAMP - INTERVAL '20 minutes', \
-          CURRENT_TIMESTAMP - INTERVAL '20 minutes', \
-          CURRENT_TIMESTAMP - make_interval(mins => $4), \
-          CURRENT_TIMESTAMP + INTERVAL '20 minutes', CURRENT_TIMESTAMP + INTERVAL '12 hours')",
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP - make_interval(mins => $5), \
+          CURRENT_TIMESTAMP - make_interval(mins => $5), \
+          CURRENT_TIMESTAMP - make_interval(mins => $5), \
+          CURRENT_TIMESTAMP + INTERVAL '20 minutes', \
+          CURRENT_TIMESTAMP - make_interval(mins => $5) + INTERVAL '12 hours')",
     )
     .bind(session_digest.as_bytes().as_slice())
     .bind(principal_id)
-    .bind(csrf_digest.as_slice())
+    .bind(csrf_digest.as_bytes().as_slice())
+    .bind(oauth_state_digest.as_slice())
     .bind(i32::try_from(last_seen_minutes_ago).unwrap())
     .execute(pool)
     .await
     .unwrap();
+    csrf
 }
 
 async fn preview_ready_snapshot() -> (design_harness::SessionSnapshot, ResourceBindingMap) {
@@ -313,6 +391,7 @@ struct ProductFixture {
     guild_id: GuildId,
     user_id: UserId,
     credential: String,
+    csrf: String,
     binding_fingerprint: String,
     candidate_revision: u64,
 }
@@ -330,8 +409,9 @@ async fn insert_product_fixture(pool: &PgPool) -> ProductFixture {
     let user_id = UserId(1_000_000_000 + numeric_suffix);
     let guild_id = GuildId(2_000_000_000 + numeric_suffix);
     let application_id = (3_000_000_000 + numeric_suffix).to_string();
-    let credential = credential(&format!("snapshot:{suffix}"));
-    insert_authentication_session(pool, principal_id.as_str(), user_id, &credential, 0).await;
+    let credential = opaque_credential(&format!("snapshot:{suffix}"));
+    let csrf =
+        insert_authentication_session(pool, principal_id.as_str(), user_id, &credential, 0).await;
     let (snapshot, bindings) = preview_ready_snapshot().await;
     let plaintext = serde_json::to_vec(&snapshot).unwrap();
     let binding_fingerprint = resource_binding_fingerprint_v2(&bindings);
@@ -464,6 +544,7 @@ async fn insert_product_fixture(pool: &PgPool) -> ProductFixture {
         guild_id,
         user_id,
         credential,
+        csrf,
         binding_fingerprint: binding_fingerprint.into_string(),
         candidate_revision: receipt.candidate_revision,
     }
@@ -479,11 +560,21 @@ async fn postgres_authentication_uses_database_time_touches_and_revokes() {
         .parse::<u64>()
         .unwrap();
     let user_id = UserId(4_000_000_000 + numeric_suffix);
-    let credential = credential(&format!("authentication:{suffix}"));
-    insert_authentication_session(&pool, &principal_id, user_id, &credential, 10).await;
+    let credential = opaque_credential(&format!("authentication:{suffix}"));
+    let csrf = insert_authentication_session(&pool, &principal_id, user_id, &credential, 5).await;
     let authentication = PostgresAuthentication::new(pool.clone());
     let identity = authentication.authenticate(&credential).await.unwrap();
-    assert!(format!("{identity:?}").contains(&principal_id));
+    assert!(!format!("{identity:?}").contains(&principal_id));
+    assert!(authentication
+        .authenticate_mutation(&credential, &csrf)
+        .await
+        .is_ok());
+    assert!(matches!(
+        authentication
+            .authenticate_mutation(&credential, &opaque_credential("wrong-csrf"))
+            .await,
+        Err(authoring_application::AuthenticationError::InvalidCsrf)
+    ));
     let session_digest = digest_opaque_session_credential_v1(&credential).unwrap();
     let persisted_digest = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT session_digest FROM product_auth_sessions WHERE session_digest = $1",
@@ -523,7 +614,9 @@ async fn postgres_authentication_uses_database_time_touches_and_revokes() {
 async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generation() {
     let pool = pool().await;
     let fixture = insert_product_fixture(&pool).await;
-    let authentication = PostgresAuthentication::new(pool.clone());
+    let other_fixture = insert_product_fixture(&pool).await;
+    let shadow_pool = shadow_search_path_pool(&pool).await;
+    let authentication = PostgresAuthentication::new(shadow_pool.clone());
     let guild_authority = TestGuildAuthority {
         tenant_id: fixture.tenant_id.clone(),
         installation_id: fixture.installation_id.clone(),
@@ -531,13 +624,14 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         guild_id: fixture.guild_id,
         user_id: fixture.user_id,
     };
-    let snapshots = PostgresAuthorizedPromotionSnapshots::new(pool, PassthroughCipher);
+    let snapshots = PostgresAuthorizedPromotionSnapshots::new(shadow_pool, PassthroughCipher);
     let promotions = PromotionCapture;
     let application =
         AuthoringApplication::new(&authentication, &guild_authority, &snapshots, &promotions);
     let output = application
         .promote_owned_session(
             &fixture.credential,
+            &fixture.csrf,
             &InstallationSelectorV1::new(fixture.installation_id.clone()),
             PromoteOwnedSessionV1 {
                 idempotency_key: IdempotencyKey::parse("postgres-atomic-snapshot").unwrap(),
@@ -551,9 +645,75 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
     assert_eq!(output.1, fixture.candidate_revision);
     assert_eq!(output.2, fixture.binding_fingerprint);
     assert!(fixture.principal_id.as_str().starts_with("principal-"));
+    let known_cross_tenant_authority = TestGuildAuthority {
+        tenant_id: other_fixture.tenant_id,
+        installation_id: other_fixture.installation_id.clone(),
+        application_id: other_fixture.application_id,
+        guild_id: other_fixture.guild_id,
+        user_id: fixture.user_id,
+    };
+    let known_cross_tenant_application = AuthoringApplication::new(
+        &authentication,
+        &known_cross_tenant_authority,
+        &snapshots,
+        &promotions,
+    );
+    let known_cross_tenant = known_cross_tenant_application
+        .promote_owned_session(
+            &fixture.credential,
+            &fixture.csrf,
+            &InstallationSelectorV1::new(other_fixture.installation_id),
+            PromoteOwnedSessionV1 {
+                idempotency_key: IdempotencyKey::parse("postgres-known-cross-tenant").unwrap(),
+                session_id: fixture.session_id.clone(),
+                expected_generation: SessionGeneration::new(1).unwrap(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        known_cross_tenant,
+        Err(authoring_application::AuthoringApplicationError::Session(
+            authoring_application::OwnedSessionLoadError::NotFound
+        ))
+    ));
+    let random_suffix = unique_suffix();
+    let random_installation_id =
+        AutomationInstallationId::parse(&format!("random-installation-{random_suffix}")).unwrap();
+    let random_scope_authority = TestGuildAuthority {
+        tenant_id: TenantId::parse(&format!("random-tenant-{random_suffix}")).unwrap(),
+        installation_id: random_installation_id.clone(),
+        application_id: "9000000001".to_string(),
+        guild_id: GuildId(9_000_000_002),
+        user_id: fixture.user_id,
+    };
+    let random_scope_application = AuthoringApplication::new(
+        &authentication,
+        &random_scope_authority,
+        &snapshots,
+        &promotions,
+    );
+    let random_scope = random_scope_application
+        .promote_owned_session(
+            &fixture.credential,
+            &fixture.csrf,
+            &InstallationSelectorV1::new(random_installation_id),
+            PromoteOwnedSessionV1 {
+                idempotency_key: IdempotencyKey::parse("postgres-random-cross-tenant").unwrap(),
+                session_id: fixture.session_id.clone(),
+                expected_generation: SessionGeneration::new(1).unwrap(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        random_scope,
+        Err(authoring_application::AuthoringApplicationError::Session(
+            authoring_application::OwnedSessionLoadError::NotFound
+        ))
+    ));
     let stale = application
         .promote_owned_session(
             &fixture.credential,
+            &fixture.csrf,
             &InstallationSelectorV1::new(fixture.installation_id),
             PromoteOwnedSessionV1 {
                 idempotency_key: IdempotencyKey::parse("postgres-stale-snapshot").unwrap(),
@@ -571,9 +731,11 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
 }
 
 #[test]
-fn authenticated_identity_remains_issued_by_authentication_port() {
-    let identity = AuthenticatedIdentityV1::from_authentication(
+fn authenticated_session_context_is_non_authority_and_redacts_fingerprint() {
+    let session = AuthenticationClaimsV1::from_authentication(
         PrincipalId::parse("adapter-contract").unwrap(),
+        AuthenticatedSessionFingerprintV1::from_sha256_digest([5_u8; 32]),
     );
-    assert!(format!("{identity:?}").contains("adapter-contract"));
+    assert!(!format!("{session:?}").contains("adapter-contract"));
+    assert!(!format!("{session:?}").contains("050505"));
 }

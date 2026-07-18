@@ -90,6 +90,8 @@ jobs:
         run: cargo test -p automation-ruleset-activation-postgres -- --ignored --test-threads=1
       - name: Test authoring promotion PostgreSQL store
         run: cargo test -p authoring-promotion-postgres -- --ignored --test-threads=1
+      - name: Test authoring application PostgreSQL store
+        run: cargo test -p authoring-application-postgres -- --ignored --test-threads=1
       - name: Test pinned RuleSet dispatch
         run: cargo test -p automation-ruleset-dispatch -- --ignored --test-threads=1
       - name: Test RuleSet readiness activation
