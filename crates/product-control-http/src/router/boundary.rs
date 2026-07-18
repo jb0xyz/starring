@@ -15,14 +15,13 @@ use axum::Json;
 use futures_util::FutureExt;
 use serde::Serialize;
 use url::form_urlencoded;
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::HttpState;
 use crate::config::valid_return_path;
 use crate::{
     CsrfSecret, DiscordAuthorizationRequest, FacadeError, IdempotencyKey, OAuthCode, OAuthState,
-    ProductControlFacade, SessionCredential,
+    ProductControlFacade, ProductRequestId, SessionCredential,
 };
 
 pub(super) const SESSION_COOKIE: &str = "__Host-starring_session";
@@ -33,8 +32,7 @@ const IDEMPOTENCY_HEADER: HeaderName = HeaderName::from_static("idempotency-key"
 const ORIGIN_HEADER: HeaderName = HeaderName::from_static("origin");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
-#[derive(Clone)]
-pub(super) struct RequestId(String);
+pub(super) type RequestId = ProductRequestId;
 
 #[derive(Serialize)]
 struct ErrorEnvelope<'a> {
@@ -59,7 +57,7 @@ pub(super) async fn request_boundary(mut request: Request<Body>, next: Next) -> 
     let mut response = next.run(request).await;
     response.headers_mut().insert(
         REQUEST_ID_HEADER,
-        HeaderValue::from_str(&request_id.0)
+        HeaderValue::from_str(request_id.as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
     );
     response
@@ -208,7 +206,7 @@ where
         ));
     }
     let credential = session_credential(headers, request_id)?;
-    let csrf = match single_header(headers, CSRF_HEADER) {
+    let header_csrf = match single_header(headers, CSRF_HEADER) {
         Some(value) => match value
             .to_str()
             .ok()
@@ -219,7 +217,14 @@ where
         },
         None => return Err(csrf_forbidden(request_id)),
     };
-    Ok((credential, csrf))
+    let cookie_csrf = csrf_cookie(headers).map_err(|_| csrf_forbidden(request_id))?;
+    if !crate::secret::constant_time_secret_eq(
+        header_csrf.expose_secret(),
+        cookie_csrf.expose_secret(),
+    ) {
+        return Err(csrf_forbidden(request_id));
+    }
+    Ok((credential, header_csrf))
 }
 
 #[allow(clippy::result_large_err)]
@@ -462,21 +467,14 @@ fn mark_sensitive_request_headers(headers: &mut HeaderMap) {
 }
 
 fn request_id(headers: &HeaderMap) -> RequestId {
-    let accepted = single_header(headers, REQUEST_ID_HEADER)
+    single_header(headers, REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        })
-        .map(str::to_string);
-    accepted.map(RequestId).unwrap_or_else(new_request_id)
+        .and_then(|value| ProductRequestId::parse(value).ok())
+        .unwrap_or_else(new_request_id)
 }
 
 fn new_request_id() -> RequestId {
-    RequestId(Uuid::new_v4().simple().to_string())
+    ProductRequestId::generated()
 }
 
 fn csrf_forbidden(request_id: &RequestId) -> Response {
@@ -543,7 +541,7 @@ pub(super) fn problem(
         error: ErrorDetail {
             code,
             message,
-            request_id: &request_id.0,
+            request_id: request_id.as_str(),
             retryable,
         },
     };

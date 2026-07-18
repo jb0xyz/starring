@@ -49,6 +49,7 @@ fn transport_secrets_are_zeroizing_and_queries_are_not_traced() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let secrets = fs::read_to_string(root.join("src/secret.rs")).unwrap();
     let facade = fs::read_to_string(root.join("src/facade.rs")).unwrap();
+    let dto = fs::read_to_string(root.join("src/dto.rs")).unwrap();
     let router = fs::read_to_string(root.join("src/router.rs")).unwrap();
     let boundary = fs::read_to_string(root.join("src/router/boundary.rs")).unwrap();
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -66,7 +67,17 @@ fn transport_secrets_are_zeroizing_and_queries_are_not_traced() {
     assert!(facade.contains("pub struct DiscordAuthorizationRequest"));
     assert!(facade.contains("pub authorization_request: DiscordAuthorizationRequest"));
     assert!(facade.contains("pub idempotency_key: crate::IdempotencyKey"));
+    assert!(facade.contains("pub struct ProductRequestId(String)"));
+    assert_eq!(
+        facade.matches("pub request_id: ProductRequestId").count(),
+        2
+    );
     assert!(!facade.contains("pub idempotency_key: String"));
+    assert!(!dto.contains("csrf_token"));
+    assert!(!router.contains("current_principal(&credential, &csrf)"));
+    assert!(router.contains("current_principal(&credential)"));
+    assert!(boundary.contains("cookie_csrf = csrf_cookie(headers)"));
+    assert!(boundary.contains("constant_time_secret_eq("));
     assert!(boundary.contains(") -> Option<Zeroizing<String>>"));
     assert!(boundary.contains("let mut location = Zeroizing::new(String::with_capacity("));
     assert!(boundary.contains("https://discord.com/oauth2/authorize?client_id="));

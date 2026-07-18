@@ -2,7 +2,6 @@ use std::fmt::{Debug, Formatter};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,15 +33,8 @@ impl From<authoring_application::ProductStatusV1> for ProductState {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct CurrentPrincipalView {
-    pub principal_id: String,
-    pub display_name: String,
-    pub csrf_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CurrentPrincipal {
     pub principal_id: String,
     pub display_name: String,
 }
@@ -51,17 +43,16 @@ impl Debug for CurrentPrincipalView {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CurrentPrincipalView")
-            .field("principal_id", &self.principal_id)
-            .field("display_name", &self.display_name)
-            .field("csrf_token", &"<redacted>")
+            .field("principal_id", &"<redacted>")
+            .field("display_name", &"<redacted>")
             .finish()
     }
 }
 
-impl Drop for CurrentPrincipalView {
-    fn drop(&mut self) {
-        self.csrf_token.zeroize();
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentPrincipal {
+    pub principal_id: String,
+    pub display_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

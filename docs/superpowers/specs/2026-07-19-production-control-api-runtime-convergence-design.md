@@ -272,11 +272,13 @@ OAuth errors never echo Discord response bodies, codes, or tokens to the client.
   logs, errors, traces, or metrics labels.
 - Authentication rejects revoked, absolute-expired, or idle-expired sessions.
 - `last_seen_at` is updated at a bounded interval rather than on every request.
-- `GET /v1/me` returns a display-safe principal view and the raw CSRF secret for
-  in-memory client use. Responses use `Cache-Control: no-store`.
+- `GET /v1/me` returns only a display-safe principal view. The callback sets the
+  raw CSRF secret in a separate Secure, non-HttpOnly, SameSite=Strict host cookie;
+  the secret is never serialized into an identity response.
 - Every state-changing endpoint requires the session cookie, exact configured
-  `Origin`, and `X-CSRF-Token`. The server hashes and constant-time compares the
-  token against the session row.
+  `Origin`, exactly one CSRF cookie, and exactly one `X-CSRF-Token`. The edge
+  constant-time compares the cookie and header before the application hashes
+  the proof and constant-time compares it against the session row.
 - CORS is disabled for unknown origins. If a separate first-party web origin is
   configured, it is an exact allowlist with credentials and no wildcard.
 - `POST /v1/logout` atomically revokes the session, clears the cookie, and is an
@@ -1107,9 +1109,10 @@ checks remain green at every merge boundary.
   expired state or nonce.
 - OAuth tokens and codes are absent from logs, errors, database, and snapshots.
 - Revocation failure issues no product session.
-- Mutations reject missing cookie, invalid/expired session, missing CSRF, stale
-  CSRF, missing/wrong Origin, wildcard origin, oversized body, wrong content
-  type, duplicate critical header, and unknown JSON field.
+- Mutations reject missing cookie, invalid/expired session, missing or duplicate
+  CSRF cookie/header, cookie/header mismatch, stale backend CSRF proof,
+  missing/wrong Origin, wildcard origin, oversized body, wrong content type,
+  duplicate critical header, and unknown JSON field.
 - Cross-tenant known IDs and random IDs produce indistinguishable 404 responses.
 - Stable internal errors contain no SQL or Discord response details.
 - Exact idempotent replay returns the same semantic result; mismatched reuse is

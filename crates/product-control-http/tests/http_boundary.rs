@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,8 +12,8 @@ use product_control_http::{
     CurrentPrincipal, CurrentPrincipalView, DecisionCommand, DecisionView, DeploymentState,
     DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode, HttpBoundaryConfig,
     IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
-    ProductControlFacade, ProductState, PromoteCommand, PromotionView, RejectCommand,
-    SafeApprovalSummary, SessionCredential,
+    ProductControlFacade, ProductRequestId, ProductState, PromoteCommand, PromotionView,
+    RejectCommand, SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -22,6 +22,7 @@ const HOST: &str = "starring.example";
 const ORIGIN: &str = "https://starring.example";
 const SESSION: &str = "sssssssssssssssssssssssssssssssssssssssssss";
 const CSRF: &str = "ccccccccccccccccccccccccccccccccccccccccccc";
+const OTHER_CSRF: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxw";
 const NONCE: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnng";
 const STATE: &str = "ttttttttttttttttttttttttttttttttttttttttttg";
 const PROMOTION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -37,9 +38,11 @@ struct FakeFacade {
     invalid_client_id: AtomicUsize,
     invalid_callback_url: AtomicUsize,
     identical_session_csrf: AtomicUsize,
+    approval_response: AtomicUsize,
     block_promote: AtomicUsize,
     promote_entered: Notify,
     promote_release: Notify,
+    mutation_request_ids: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeFacade {
@@ -67,14 +70,21 @@ impl FakeFacade {
         }
     }
 
-    fn decision(&self) -> DecisionView {
+    fn decision(&self, state: ProductState) -> DecisionView {
         DecisionView {
             installation_id: "install-1".to_string(),
             promotion_id: PROMOTION.to_string(),
             revision: 4,
-            state: ProductState::Approved,
+            state,
             replayed: false,
         }
+    }
+
+    fn record_request_id(&self, mutation: &str, request_id: &ProductRequestId) {
+        self.mutation_request_ids
+            .lock()
+            .unwrap()
+            .push((mutation.to_string(), request_id.as_str().to_string()));
     }
 }
 
@@ -127,14 +137,13 @@ impl ProductControlFacade for FakeFacade {
 
     async fn current_principal(
         &self,
-        _credential: &SessionCredential,
-        csrf: &CsrfSecret,
+        credential: &SessionCredential,
     ) -> Result<CurrentPrincipal, FacadeError> {
         if self.fail_me.load(Ordering::SeqCst) > 0 {
             return Err(FacadeError::new(FacadeErrorCode::Internal));
         }
-        if csrf.expose_secret() != CSRF {
-            return Err(FacadeError::new(FacadeErrorCode::Forbidden));
+        if credential.expose_secret() != SESSION {
+            return Err(FacadeError::new(FacadeErrorCode::AuthenticationRequired));
         }
         Ok(CurrentPrincipal {
             principal_id: "principal-1".to_string(),
@@ -157,9 +166,10 @@ impl ProductControlFacade for FakeFacade {
         &self,
         credential: &SessionCredential,
         csrf: &CsrfSecret,
-        _command: PromoteCommand,
+        command: PromoteCommand,
     ) -> Result<PromotionView, FacadeError> {
         self.verify_mutation_inputs(credential, csrf)?;
+        self.record_request_id("promote", &command.request_id);
         self.promote_calls.fetch_add(1, Ordering::SeqCst);
         if self.block_promote.load(Ordering::SeqCst) != 0 {
             self.promote_entered.notify_one();
@@ -174,7 +184,7 @@ impl ProductControlFacade for FakeFacade {
         _installation_id: &str,
         _promotion_id: &str,
     ) -> Result<DecisionView, FacadeError> {
-        Ok(self.decision())
+        Ok(self.decision(ProductState::Approved))
     }
 
     async fn approval_preview(
@@ -209,29 +219,37 @@ impl ProductControlFacade for FakeFacade {
         &self,
         credential: &SessionCredential,
         csrf: &CsrfSecret,
-        _command: DecisionCommand,
+        command: DecisionCommand,
     ) -> Result<DecisionView, FacadeError> {
         self.verify_mutation_inputs(credential, csrf)?;
-        Ok(self.decision())
+        self.record_request_id("approve", &command.request_id);
+        let state = match self.approval_response.load(Ordering::SeqCst) {
+            0 => ProductState::Approved,
+            1 => ProductState::PendingApproval,
+            _ => ProductState::Rejected,
+        };
+        Ok(self.decision(state))
     }
 
     async fn reject(
         &self,
         credential: &SessionCredential,
         csrf: &CsrfSecret,
-        _command: RejectCommand,
+        command: RejectCommand,
     ) -> Result<DecisionView, FacadeError> {
         self.verify_mutation_inputs(credential, csrf)?;
-        Ok(self.decision())
+        self.record_request_id("reject", &command.decision.request_id);
+        Ok(self.decision(ProductState::Rejected))
     }
 
     async fn apply(
         &self,
         credential: &SessionCredential,
         csrf: &CsrfSecret,
-        _command: ApplyCommand,
+        command: ApplyCommand,
     ) -> Result<ApplyView, FacadeError> {
         self.verify_mutation_inputs(credential, csrf)?;
+        self.record_request_id("apply", &command.decision.request_id);
         Ok(ApplyView {
             installation_id: "install-1".to_string(),
             promotion_id: PROMOTION.to_string(),
@@ -318,11 +336,19 @@ fn return_path_configuration_rejects_ambiguous_entries() {
 }
 
 fn request_builder(method: &str, uri: &str) -> axum::http::request::Builder {
+    request_builder_with_id(method, uri, "test-request-1")
+}
+
+fn request_builder_with_id(
+    method: &str,
+    uri: &str,
+    request_id: &str,
+) -> axum::http::request::Builder {
     Request::builder()
         .method(method)
         .uri(uri)
         .header("host", HOST)
-        .header("x-request-id", "test-request-1")
+        .header("x-request-id", request_id)
 }
 
 fn promotion_request() -> axum::http::request::Builder {
@@ -332,7 +358,10 @@ fn promotion_request() -> axum::http::request::Builder {
     )
     .header("content-type", "application/json")
     .header("origin", ORIGIN)
-    .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
     .header("x-csrf-token", CSRF)
     .header("idempotency-key", "request-1")
 }
@@ -426,7 +455,10 @@ async fn mutation_requires_cookie_exact_origin_and_session_csrf() {
         "/v1/installations/install-1/authoring/sessions/session-1/promotions",
     )
     .header("content-type", "application/json")
-    .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
     .header("x-csrf-token", CSRF)
     .header("idempotency-key", "request-1")
     .body(Body::from(r#"{"expected_generation":1}"#))
@@ -437,34 +469,55 @@ async fn mutation_requires_cookie_exact_origin_and_session_csrf() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let missing_cookie = request_builder(
+    let missing_session = request_builder(
         "POST",
         "/v1/installations/install-1/authoring/sessions/session-1/promotions",
     )
     .header("content-type", "application/json")
     .header("origin", ORIGIN)
+    .header("cookie", format!("__Host-starring_csrf={CSRF}"))
     .header("x-csrf-token", CSRF)
     .header("idempotency-key", "request-1")
     .body(Body::from(r#"{"expected_generation":1}"#))
     .unwrap();
     let response = app(Arc::clone(&facade))
-        .oneshot(missing_cookie)
+        .oneshot(missing_session)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    let missing_csrf = request_builder(
+    let missing_csrf_header = request_builder(
+        "POST",
+        "/v1/installations/install-1/authoring/sessions/session-1/promotions",
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
+    .header("idempotency-key", "request-1")
+    .body(Body::from(r#"{"expected_generation":1}"#))
+    .unwrap();
+    let response = app(Arc::clone(&facade))
+        .oneshot(missing_csrf_header)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let missing_csrf_cookie = request_builder(
         "POST",
         "/v1/installations/install-1/authoring/sessions/session-1/promotions",
     )
     .header("content-type", "application/json")
     .header("origin", ORIGIN)
     .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .header("x-csrf-token", CSRF)
     .header("idempotency-key", "request-1")
     .body(Body::from(r#"{"expected_generation":1}"#))
     .unwrap();
     let response = app(Arc::clone(&facade))
-        .oneshot(missing_csrf)
+        .oneshot(missing_csrf_cookie)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -475,7 +528,10 @@ async fn mutation_requires_cookie_exact_origin_and_session_csrf() {
     )
     .header("content-type", "application/json")
     .header("origin", "https://attacker.example")
-    .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
     .header("x-csrf-token", CSRF)
     .header("idempotency-key", "request-1")
     .body(Body::from(r#"{"expected_generation":1}"#))
@@ -486,21 +542,45 @@ async fn mutation_requires_cookie_exact_origin_and_session_csrf() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let stale_csrf = request_builder(
+    let mismatched_csrf = request_builder(
         "POST",
         "/v1/installations/install-1/authoring/sessions/session-1/promotions",
     )
     .header("content-type", "application/json")
     .header("origin", ORIGIN)
-    .header("cookie", format!("__Host-starring_session={SESSION}"))
     .header(
-        "x-csrf-token",
-        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
     )
+    .header("x-csrf-token", OTHER_CSRF)
     .header("idempotency-key", "request-1")
     .body(Body::from(r#"{"expected_generation":1}"#))
     .unwrap();
-    let response = app(Arc::clone(&facade)).oneshot(stale_csrf).await.unwrap();
+    let response = app(Arc::clone(&facade))
+        .oneshot(mismatched_csrf)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(facade.verify_calls.load(Ordering::SeqCst), 0);
+
+    let stale_backend_csrf = request_builder(
+        "POST",
+        "/v1/installations/install-1/authoring/sessions/session-1/promotions",
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={OTHER_CSRF}"),
+    )
+    .header("x-csrf-token", OTHER_CSRF)
+    .header("idempotency-key", "request-1")
+    .body(Body::from(r#"{"expected_generation":1}"#))
+    .unwrap();
+    let response = app(Arc::clone(&facade))
+        .oneshot(stale_backend_csrf)
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let response = app(Arc::clone(&facade))
@@ -512,7 +592,7 @@ async fn mutation_requires_cookie_exact_origin_and_session_csrf() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(facade.verify_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(facade.verify_calls.load(Ordering::SeqCst), 2);
     assert_eq!(facade.promote_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -573,6 +653,28 @@ async fn duplicate_security_inputs_are_rejected() {
         .unwrap();
     let response = app(Arc::clone(&facade))
         .oneshot(duplicate_csrf)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let duplicate_csrf_cookie = request_builder(
+        "POST",
+        "/v1/installations/install-1/authoring/sessions/session-1/promotions",
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!(
+            "__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}; __Host-starring_csrf={CSRF}"
+        ),
+    )
+    .header("x-csrf-token", CSRF)
+    .header("idempotency-key", "request-1")
+    .body(Body::from(r#"{"expected_generation":1}"#))
+    .unwrap();
+    let response = app(Arc::clone(&facade))
+        .oneshot(duplicate_csrf_cookie)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -640,10 +742,7 @@ async fn internal_errors_are_stable_and_redacted() {
     let facade = Arc::new(FakeFacade::default());
     facade.fail_me.store(1, Ordering::SeqCst);
     let request = request_builder("GET", "/v1/me")
-        .header(
-            "cookie",
-            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
-        )
+        .header("cookie", format!("__Host-starring_session={SESSION}"))
         .body(Body::empty())
         .unwrap();
     let response = app(facade).oneshot(request).await.unwrap();
@@ -753,7 +852,10 @@ async fn product_decisions_require_revision_and_digest_cas() {
     let valid = request_builder("POST", &uri)
         .header("content-type", "application/json")
         .header("origin", ORIGIN)
-        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
         .header("x-csrf-token", CSRF)
         .header("idempotency-key", "approve-1")
         .body(Body::from(format!(
@@ -763,10 +865,50 @@ async fn product_decisions_require_revision_and_digest_cas() {
     let response = app(Arc::clone(&facade)).oneshot(valid).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    facade.approval_response.store(1, Ordering::SeqCst);
+    let pending = request_builder("POST", &uri)
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
+        .header("x-csrf-token", CSRF)
+        .header("idempotency-key", "approve-pending")
+        .body(Body::from(format!(
+            "{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3}}"
+        )))
+        .unwrap();
+    let response = app(Arc::clone(&facade)).oneshot(pending).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    facade.approval_response.store(2, Ordering::SeqCst);
+    let invalid_state = request_builder("POST", &uri)
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
+        .header("x-csrf-token", CSRF)
+        .header("idempotency-key", "approve-invalid-state")
+        .body(Body::from(format!(
+            "{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3}}"
+        )))
+        .unwrap();
+    let response = app(Arc::clone(&facade))
+        .oneshot(invalid_state)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
     let missing_revision = request_builder("POST", &uri)
         .header("content-type", "application/json")
         .header("origin", ORIGIN)
-        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
         .header("x-csrf-token", CSRF)
         .header("idempotency-key", "approve-2")
         .body(Body::from(format!(
@@ -782,7 +924,10 @@ async fn product_decisions_require_revision_and_digest_cas() {
     let zero_revision = request_builder("POST", &uri)
         .header("content-type", "application/json")
         .header("origin", ORIGIN)
-        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
         .header("x-csrf-token", CSRF)
         .header("idempotency-key", "approve-3")
         .body(Body::from(format!(
@@ -791,6 +936,99 @@ async fn product_decisions_require_revision_and_digest_cas() {
         .unwrap();
     let response = app(facade).oneshot(zero_revision).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn audited_mutations_receive_the_validated_transport_request_id() {
+    let facade = Arc::new(FakeFacade::default());
+    let cases = [
+        (
+            "promote",
+            "/v1/installations/install-1/authoring/sessions/session-1/promotions".to_string(),
+            "audit-promote",
+            "promote-key",
+            r#"{"expected_generation":1}"#.to_string(),
+            StatusCode::CREATED,
+        ),
+        (
+            "approve",
+            format!("/v1/installations/install-1/promotions/{PROMOTION}/approvals"),
+            "audit-approve",
+            "approve-key",
+            format!("{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3}}"),
+            StatusCode::OK,
+        ),
+        (
+            "reject",
+            format!("/v1/installations/install-1/promotions/{PROMOTION}/rejections"),
+            "audit-reject",
+            "reject-key",
+            format!("{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3,\"reason\":\"superseded\"}}"),
+            StatusCode::OK,
+        ),
+        (
+            "apply",
+            format!("/v1/installations/install-1/promotions/{PROMOTION}/apply"),
+            "audit-apply",
+            "apply-key",
+            format!("{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3}}"),
+            StatusCode::ACCEPTED,
+        ),
+    ];
+    for (_, uri, request_id, idempotency_key, body, expected_status) in &cases {
+        let request = request_builder_with_id("POST", uri, request_id)
+            .header("content-type", "application/json")
+            .header("origin", ORIGIN)
+            .header(
+                "cookie",
+                format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+            )
+            .header("x-csrf-token", CSRF)
+            .header("idempotency-key", *idempotency_key)
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let response = app(Arc::clone(&facade)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), *expected_status);
+        assert_eq!(response.headers()["x-request-id"], *request_id);
+    }
+    let observed = facade.mutation_request_ids.lock().unwrap();
+    assert_eq!(observed.len(), cases.len());
+    for ((expected_mutation, _, expected_request_id, _, _, _), (mutation, request_id)) in
+        cases.iter().zip(observed.iter())
+    {
+        assert_eq!(mutation, expected_mutation);
+        assert_eq!(request_id, expected_request_id);
+    }
+}
+
+#[tokio::test]
+async fn invalid_request_ids_are_replaced_before_reaching_a_mutation() {
+    let facade = Arc::new(FakeFacade::default());
+    let request = request_builder_with_id(
+        "POST",
+        "/v1/installations/install-1/authoring/sessions/session-1/promotions",
+        "invalid/request/id",
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
+    .header("x-csrf-token", CSRF)
+    .header("idempotency-key", "generated-request-id")
+    .body(Body::from(r#"{"expected_generation":1}"#))
+    .unwrap();
+    let response = app(Arc::clone(&facade)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response_request_id = response.headers()["x-request-id"].to_str().unwrap();
+    assert_ne!(response_request_id, "invalid/request/id");
+    assert!(ProductRequestId::parse(response_request_id).is_ok());
+    let observed = facade.mutation_request_ids.lock().unwrap();
+    assert_eq!(
+        observed.as_slice(),
+        &[("promote".to_string(), response_request_id.to_string())]
+    );
 }
 
 #[tokio::test]
@@ -853,37 +1091,38 @@ async fn oauth_callback_never_exposes_the_session_as_csrf() {
 }
 
 #[tokio::test]
-async fn principal_requires_the_session_bound_csrf_cookie() {
+async fn principal_requires_only_the_session_and_never_returns_csrf() {
     let facade = Arc::new(FakeFacade::default());
-    let missing_csrf = request_builder("GET", "/v1/me")
-        .header("cookie", format!("__Host-starring_session={SESSION}"))
+    let missing_session = request_builder("GET", "/v1/me")
+        .header("cookie", format!("__Host-starring_csrf={CSRF}"))
         .body(Body::empty())
         .unwrap();
     let response = app(Arc::clone(&facade))
-        .oneshot(missing_csrf)
+        .oneshot(missing_session)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let valid = request_builder("GET", "/v1/me")
-        .header(
-            "cookie",
-            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
-        )
+        .header("cookie", format!("__Host-starring_session={SESSION}"))
         .body(Body::empty())
         .unwrap();
     let response = app(facade).oneshot(valid).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(body.contains("principal-1"));
-    assert!(body.contains(CSRF));
+    assert!(!body.contains(CSRF));
+    assert!(!body.contains("csrf_token"));
 }
 
 #[tokio::test]
 async fn logout_clears_session_and_csrf_cookies() {
     let request = request_builder("POST", "/v1/logout")
         .header("origin", ORIGIN)
-        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
         .header("x-csrf-token", CSRF)
         .body(Body::empty())
         .unwrap();
@@ -937,19 +1176,23 @@ async fn panic_and_wrong_method_have_redacted_problem_responses() {
 }
 
 #[test]
-fn secret_bearing_debug_views_are_redacted() {
+fn command_debug_redacts_idempotency_and_preserves_request_correlation() {
     let current = CurrentPrincipalView {
         principal_id: "principal-1".to_string(),
         display_name: "Manager".to_string(),
-        csrf_token: CSRF.to_string(),
     };
     let command = PromoteCommand {
+        request_id: ProductRequestId::parse("audit-request-1").unwrap(),
         installation_id: "install-1".to_string(),
         session_id: "session-1".to_string(),
         expected_generation: 1,
         idempotency_key: IdempotencyKey::parse("raw-idempotency-key").unwrap(),
     };
-    assert!(!format!("{current:?}").contains(CSRF));
-    assert!(!format!("{command:?}").contains("raw-idempotency-key"));
+    let current_debug = format!("{current:?}");
+    assert!(!current_debug.contains("principal-1"));
+    assert!(!current_debug.contains("Manager"));
+    let command_debug = format!("{command:?}");
+    assert!(command_debug.contains("audit-request-1"));
+    assert!(!command_debug.contains("raw-idempotency-key"));
     assert!(SessionCredential::parse(&format!("{}B", "A".repeat(42))).is_err());
 }

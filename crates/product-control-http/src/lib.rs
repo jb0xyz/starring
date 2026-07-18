@@ -13,8 +13,8 @@ pub use dto::{
 pub use error::{FacadeError, FacadeErrorCode};
 pub use facade::{
     ApplyCommand, DecisionCommand, DiscordAuthorizationRequest, OAuthCallbackCommand,
-    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade, PromoteCommand,
-    RejectCommand,
+    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade,
+    ProductRequestId, ProductRequestIdParseError, PromoteCommand, RejectCommand,
 };
 pub use router::product_control_router;
 pub use secret::{

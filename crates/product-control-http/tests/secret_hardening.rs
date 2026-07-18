@@ -3,7 +3,8 @@ use std::fmt::Display;
 use product_control_http::{
     ApplyCommand, CsrfSecret, CurrentPrincipalView, DecisionCommand, DiscordAuthorizationRequest,
     IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthCode, OAuthStartCommand,
-    OAuthStartResult, OAuthState, PromoteCommand, RejectCommand, SessionCredential,
+    OAuthStartResult, OAuthState, ProductRequestId, PromoteCommand, RejectCommand,
+    SessionCredential,
 };
 
 const SESSION: &str = "sssssssssssssssssssssssssssssssssssssssssss";
@@ -52,7 +53,6 @@ fn public_transport_contract_intentionally_omits_clone_for_secret_bearing_types(
     assert_not_clone!(DecisionCommand);
     assert_not_clone!(RejectCommand);
     assert_not_clone!(ApplyCommand);
-    assert_not_clone!(CurrentPrincipalView);
 }
 
 #[test]
@@ -70,6 +70,33 @@ fn non_secret_oauth_start_command_remains_a_cloneable_value_contract() {
         return_to: Some("/app".to_string()),
     };
     assert_eq!(command.clone(), command);
+}
+
+#[test]
+fn request_ids_are_bounded_non_secret_correlation_values() {
+    for valid in ["a", "request-1", "Request_1"] {
+        let request_id = ProductRequestId::parse(valid).unwrap();
+        assert_eq!(request_id.as_str(), valid);
+        assert_eq!(request_id.clone(), request_id);
+        assert!(format!("{request_id:?}").contains(valid));
+    }
+    for invalid in ["", "contains space", "slash/value", "line\nbreak"] {
+        assert!(ProductRequestId::parse(invalid).is_err());
+    }
+    assert!(ProductRequestId::parse(&"a".repeat(64)).is_ok());
+    assert!(ProductRequestId::parse(&"a".repeat(65)).is_err());
+}
+
+#[test]
+fn current_principal_view_is_display_safe_and_cloneable() {
+    let view = CurrentPrincipalView {
+        principal_id: "principal-1".to_string(),
+        display_name: "Manager".to_string(),
+    };
+    assert_eq!(view.clone(), view);
+    let debug = format!("{view:?}");
+    assert!(!debug.contains("principal-1"));
+    assert!(!debug.contains("Manager"));
 }
 
 #[test]

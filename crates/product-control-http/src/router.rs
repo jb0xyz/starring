@@ -291,16 +291,11 @@ where
         Ok(value) => value,
         Err(response) => return response,
     };
-    let csrf = match csrf_cookie(&headers) {
-        Ok(value) => value,
-        Err(_) => return authentication_required(&request_id),
-    };
-    match state.facade.current_principal(&credential, &csrf).await {
+    match state.facade.current_principal(&credential).await {
         Ok(principal) => {
             let view = CurrentPrincipalView {
                 principal_id: principal.principal_id,
                 display_name: principal.display_name,
-                csrf_token: csrf.expose_secret().to_string(),
             };
             if valid_current_principal(&view) {
                 Json(view).into_response()
@@ -361,6 +356,7 @@ where
         Err(response) => return response,
     };
     let command = PromoteCommand {
+        request_id: request_id.clone(),
         installation_id,
         session_id,
         expected_generation: body.expected_generation,
@@ -511,6 +507,7 @@ where
     };
     let command = RejectCommand {
         decision: DecisionCommand {
+            request_id: request_id.clone(),
             installation_id,
             promotion_id,
             expected_payload_digest: body.expected_payload_digest,
@@ -658,6 +655,7 @@ where
     let body = parse_json(body, request_id)?;
     let idempotency_key = idempotency_key(headers, request_id)?;
     let command = DecisionCommand {
+        request_id: request_id.clone(),
         installation_id,
         promotion_id,
         expected_payload_digest: body.expected_payload_digest,

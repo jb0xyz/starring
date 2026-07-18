@@ -1,13 +1,46 @@
 use std::fmt::{Debug, Formatter};
 
+use uuid::Uuid;
+
 use crate::{
     ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView, DeploymentView,
     FacadeError, OAuthCode, OAuthState, ProductState, PromotionView, SessionCredential,
 };
 
 const RESOURCE_ID_MAX_BYTES: usize = 128;
+const REQUEST_ID_MAX_BYTES: usize = 64;
 const REASON_MAX_BYTES: usize = 4_000;
 const REASON_MAX_SCALARS: usize = 1_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductRequestId(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("product request ID is invalid")]
+pub struct ProductRequestIdParseError;
+
+impl ProductRequestId {
+    pub fn parse(value: &str) -> Result<Self, ProductRequestIdParseError> {
+        if !value.is_empty()
+            && value.len() <= REQUEST_ID_MAX_BYTES
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(ProductRequestIdParseError)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn generated() -> Self {
+        Self(Uuid::new_v4().simple().to_string())
+    }
+}
 
 pub(crate) fn valid_resource_id(value: &str) -> bool {
     !value.is_empty()
@@ -70,6 +103,7 @@ pub struct OAuthCallbackResult {
 }
 
 pub struct PromoteCommand {
+    pub request_id: ProductRequestId,
     pub installation_id: String,
     pub session_id: String,
     pub expected_generation: u64,
@@ -80,6 +114,7 @@ impl Debug for PromoteCommand {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PromoteCommand")
+            .field("request_id", &self.request_id)
             .field("installation_id", &self.installation_id)
             .field("session_id", &self.session_id)
             .field("expected_generation", &self.expected_generation)
@@ -89,6 +124,7 @@ impl Debug for PromoteCommand {
 }
 
 pub struct DecisionCommand {
+    pub request_id: ProductRequestId,
     pub installation_id: String,
     pub promotion_id: String,
     pub expected_payload_digest: String,
@@ -100,6 +136,7 @@ impl Debug for DecisionCommand {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DecisionCommand")
+            .field("request_id", &self.request_id)
             .field("installation_id", &self.installation_id)
             .field("promotion_id", &self.promotion_id)
             .field("expected_payload_digest", &self.expected_payload_digest)
@@ -177,7 +214,6 @@ pub trait ProductControlFacade: Send + Sync + 'static {
     async fn current_principal(
         &self,
         credential: &SessionCredential,
-        csrf: &CsrfSecret,
     ) -> Result<CurrentPrincipal, FacadeError>;
 
     async fn revoke_session(

@@ -1,12 +1,11 @@
 use crate::facade::{valid_digest, valid_resource_id};
 use crate::{
-    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipalView, DecisionView,
-    DeploymentState, DeploymentView, ProductState, PromotionView,
+    ApplyView, ApprovalPreviewView, CurrentPrincipalView, DecisionView, DeploymentState,
+    DeploymentView, ProductState, PromotionView,
 };
 
 pub(super) fn valid_current_principal(view: &CurrentPrincipalView) -> bool {
     valid_resource_id(&view.principal_id)
-        && CsrfSecret::parse(&view.csrf_token).is_ok()
         && !view.display_name.is_empty()
         && view.display_name.len() <= 1_024
         && view.display_name.chars().count() <= 256
@@ -36,7 +35,11 @@ pub(super) fn valid_approval_view(
     installation_id: &str,
     promotion_id: &str,
 ) -> bool {
-    valid_decision_view(view, installation_id, promotion_id) && view.state == ProductState::Approved
+    valid_decision_view(view, installation_id, promotion_id)
+        && matches!(
+            view.state,
+            ProductState::PendingApproval | ProductState::Approved
+        )
 }
 
 pub(super) fn valid_rejection_view(
