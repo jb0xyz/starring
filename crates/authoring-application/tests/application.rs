@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use authoring_application::{
-    AuthoringApplication, OwnedPreviewReadyArtifactV1, OwnedSessionArtifactPort,
-    OwnedSessionLoadError, PromoteOwnedSessionV1, PromotionAuthorityError, PromotionAuthorityPort,
-    PromotionSubmissionPort, ResolvedPromotionAuthorityV1, VerifiedPrincipalV1,
+    AuthenticatedActorV1, AuthenticatedIdentityV1, AuthenticationError, AuthenticationPort,
+    AuthoringApplication, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
+    AuthorizedPromotionSnapshotV1, OwnedSessionLoadError, PromoteOwnedSessionV1,
+    PromotionAuthorityError, PromotionSubmissionPort, ResolvedPromotionAuthorityV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -83,56 +84,62 @@ async fn artifact() -> PreviewReadyArtifactV1 {
     session.export_preview_ready_artifact().unwrap()
 }
 
-struct OwnedSession {
-    artifact: PreviewReadyArtifactV1,
+struct Authentication {
     calls: AtomicUsize,
 }
 
-impl OwnedSessionArtifactPort for OwnedSession {
-    async fn load_owned_preview_ready(
+impl AuthenticationPort for Authentication {
+    type Credential = str;
+
+    async fn authenticate(
         &self,
-        principal: &VerifiedPrincipalV1,
-        session_id: &AuthoringSessionId,
-        expected_generation: SessionGeneration,
-    ) -> Result<OwnedPreviewReadyArtifactV1, OwnedSessionLoadError> {
+        credential: &Self::Credential,
+    ) -> Result<AuthenticatedIdentityV1, AuthenticationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(principal.tenant_id().as_str(), "tenant-1");
-        assert_eq!(principal.principal_id().as_str(), "principal-1");
-        assert_eq!(session_id.as_str(), "session-1");
-        assert_eq!(expected_generation.get(), 7);
-        Ok(OwnedPreviewReadyArtifactV1::from_owned_session(
-            self.artifact.clone(),
+        assert_eq!(credential, "opaque-session-token");
+        Ok(AuthenticatedIdentityV1::from_authentication(
+            TenantId::parse("tenant-1").unwrap(),
+            PrincipalId::parse("principal-1").unwrap(),
         ))
     }
 }
 
-struct Authority {
+struct AuthorizedSnapshot {
+    artifact: PreviewReadyArtifactV1,
     calls: AtomicUsize,
 }
 
-impl PromotionAuthorityPort for Authority {
-    async fn resolve_promotion_authority(
+impl AuthorizedPromotionSnapshotPort for AuthorizedSnapshot {
+    async fn load_atomic_authorized_snapshot(
         &self,
-        principal: &VerifiedPrincipalV1,
+        actor: &AuthenticatedActorV1,
         session_id: &AuthoringSessionId,
         expected_generation: SessionGeneration,
-    ) -> Result<ResolvedPromotionAuthorityV1, PromotionAuthorityError> {
+    ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(principal.principal_id().as_str(), "principal-1");
+        assert_eq!(actor.tenant_id().as_str(), "tenant-1");
+        assert_eq!(actor.principal_id().as_str(), "principal-1");
         assert_eq!(session_id.as_str(), "session-1");
         assert_eq!(expected_generation.get(), 7);
-        Ok(ResolvedPromotionAuthorityV1 {
-            guild_id: GuildId(900),
-            installation_id: AutomationInstallationId::parse("installation-1").unwrap(),
-            ruleset_key: "studyrooms".parse().unwrap(),
-            requester: UserId(100),
-            binding_revision: BindingRevision::new(3).unwrap(),
-            policy: ApprovalPolicyV1 {
-                revision: PolicyRevision::new(5).unwrap(),
-                required_approvals: NonZeroU32::new(2).unwrap(),
-                ttl_seconds: NonZeroU64::new(3600).unwrap(),
-            },
-        })
+        Ok(AuthorizedPromotionSnapshotV1::from_atomic_authorization(
+            self.artifact.clone(),
+            authority(),
+        ))
+    }
+}
+
+fn authority() -> ResolvedPromotionAuthorityV1 {
+    ResolvedPromotionAuthorityV1 {
+        guild_id: GuildId(900),
+        installation_id: AutomationInstallationId::parse("installation-1").unwrap(),
+        ruleset_key: "studyrooms".parse().unwrap(),
+        requester: UserId(100),
+        binding_revision: BindingRevision::new(3).unwrap(),
+        policy: ApprovalPolicyV1 {
+            revision: PolicyRevision::new(5).unwrap(),
+            required_approvals: NonZeroU32::new(2).unwrap(),
+            ttl_seconds: NonZeroU64::new(3600).unwrap(),
+        },
     }
 }
 
@@ -153,13 +160,6 @@ impl PromotionSubmissionPort for PromotionCapture {
     }
 }
 
-fn principal() -> VerifiedPrincipalV1 {
-    VerifiedPrincipalV1::from_trusted_edge(
-        TenantId::parse("tenant-1").unwrap(),
-        PrincipalId::parse("principal-1").unwrap(),
-    )
-}
-
 fn command() -> PromoteOwnedSessionV1 {
     PromoteOwnedSessionV1 {
         idempotency_key: IdempotencyKey::parse("promotion-1").unwrap(),
@@ -169,19 +169,19 @@ fn command() -> PromoteOwnedSessionV1 {
 }
 
 #[test]
-fn trusted_identity_and_server_authority_build_the_only_promotion_context() {
+fn authenticated_identity_and_atomic_authority_build_the_only_promotion_context() {
     block_on(async {
-        let sessions = OwnedSession {
+        let authentication = Authentication {
+            calls: AtomicUsize::new(0),
+        };
+        let snapshots = AuthorizedSnapshot {
             artifact: artifact().await,
             calls: AtomicUsize::new(0),
         };
-        let authority = Authority {
-            calls: AtomicUsize::new(0),
-        };
         let promotions = PromotionCapture::default();
-        let application = AuthoringApplication::new(&sessions, &authority, &promotions);
+        let application = AuthoringApplication::new(&authentication, &snapshots, &promotions);
         application
-            .promote_owned_session(&principal(), command())
+            .promote_owned_session("opaque-session-token", command())
             .await
             .unwrap();
         let captured = promotions.input.lock().unwrap().take().unwrap();
@@ -197,111 +197,146 @@ fn trusted_identity_and_server_authority_build_the_only_promotion_context() {
         assert_eq!(captured.context.binding_revision.get(), 3);
         assert_eq!(captured.context.policy.revision.get(), 5);
         assert_eq!(captured.context.policy.required_approvals.get(), 2);
-        assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(authentication.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshots.calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+struct DeniedAuthentication;
+
+impl AuthenticationPort for DeniedAuthentication {
+    type Credential = str;
+
+    async fn authenticate(
+        &self,
+        _credential: &Self::Credential,
+    ) -> Result<AuthenticatedIdentityV1, AuthenticationError> {
+        Err(AuthenticationError::Revoked)
+    }
+}
+
+#[test]
+fn failed_authentication_stops_before_snapshot_and_promotion() {
+    block_on(async {
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            calls: AtomicUsize::new(0),
+        };
+        let promotions = PromotionCapture::default();
+        let application = AuthoringApplication::new(&DeniedAuthentication, &snapshots, &promotions);
+        assert!(matches!(
+            application
+                .promote_owned_session("revoked-session-token", command())
+                .await,
+            Err(
+                authoring_application::AuthoringApplicationError::Authentication(
+                    AuthenticationError::Revoked
+                )
+            )
+        ));
+        assert_eq!(snapshots.calls.load(Ordering::SeqCst), 0);
+        assert!(promotions.input.lock().unwrap().is_none());
     });
 }
 
 struct DeniedSession;
 
-impl OwnedSessionArtifactPort for DeniedSession {
-    async fn load_owned_preview_ready(
+impl AuthorizedPromotionSnapshotPort for DeniedSession {
+    async fn load_atomic_authorized_snapshot(
         &self,
-        _principal: &VerifiedPrincipalV1,
+        _actor: &AuthenticatedActorV1,
         _session_id: &AuthoringSessionId,
         _expected_generation: SessionGeneration,
-    ) -> Result<OwnedPreviewReadyArtifactV1, OwnedSessionLoadError> {
-        Err(OwnedSessionLoadError::NotOwned)
+    ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
+        Err(OwnedSessionLoadError::NotOwned.into())
     }
 }
 
 #[test]
-fn failed_session_ownership_stops_before_authority_and_promotion() {
+fn failed_session_ownership_stops_before_promotion() {
     block_on(async {
-        let authority = Authority {
+        let authentication = Authentication {
             calls: AtomicUsize::new(0),
         };
         let promotions = PromotionCapture::default();
-        let application = AuthoringApplication::new(&DeniedSession, &authority, &promotions);
+        let application = AuthoringApplication::new(&authentication, &DeniedSession, &promotions);
         assert!(matches!(
             application
-                .promote_owned_session(&principal(), command())
+                .promote_owned_session("opaque-session-token", command())
                 .await,
             Err(authoring_application::AuthoringApplicationError::Session(
                 OwnedSessionLoadError::NotOwned
             ))
         ));
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(authentication.calls.load(Ordering::SeqCst), 1);
         assert!(promotions.input.lock().unwrap().is_none());
     });
 }
 
 struct DeniedAuthority;
 
-impl PromotionAuthorityPort for DeniedAuthority {
-    async fn resolve_promotion_authority(
+impl AuthorizedPromotionSnapshotPort for DeniedAuthority {
+    async fn load_atomic_authorized_snapshot(
         &self,
-        _principal: &VerifiedPrincipalV1,
+        _actor: &AuthenticatedActorV1,
         _session_id: &AuthoringSessionId,
         _expected_generation: SessionGeneration,
-    ) -> Result<ResolvedPromotionAuthorityV1, PromotionAuthorityError> {
-        Err(PromotionAuthorityError::Forbidden)
+    ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
+        Err(PromotionAuthorityError::Forbidden.into())
     }
 }
 
 #[test]
 fn failed_server_authority_stops_before_promotion() {
     block_on(async {
-        let sessions = OwnedSession {
-            artifact: artifact().await,
+        let authentication = Authentication {
             calls: AtomicUsize::new(0),
         };
         let promotions = PromotionCapture::default();
-        let application = AuthoringApplication::new(&sessions, &DeniedAuthority, &promotions);
+        let application = AuthoringApplication::new(&authentication, &DeniedAuthority, &promotions);
         assert!(matches!(
             application
-                .promote_owned_session(&principal(), command())
+                .promote_owned_session("opaque-session-token", command())
                 .await,
             Err(authoring_application::AuthoringApplicationError::Authority(
                 PromotionAuthorityError::Forbidden
             ))
         ));
-        assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(authentication.calls.load(Ordering::SeqCst), 1);
         assert!(promotions.input.lock().unwrap().is_none());
     });
 }
 
 struct StaleAuthority;
 
-impl PromotionAuthorityPort for StaleAuthority {
-    async fn resolve_promotion_authority(
+impl AuthorizedPromotionSnapshotPort for StaleAuthority {
+    async fn load_atomic_authorized_snapshot(
         &self,
-        _principal: &VerifiedPrincipalV1,
+        _actor: &AuthenticatedActorV1,
         _session_id: &AuthoringSessionId,
         _expected_generation: SessionGeneration,
-    ) -> Result<ResolvedPromotionAuthorityV1, PromotionAuthorityError> {
-        Err(PromotionAuthorityError::GenerationMismatch)
+    ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
+        Err(PromotionAuthorityError::GenerationMismatch.into())
     }
 }
 
 #[test]
 fn authority_generation_mismatch_stops_before_promotion() {
     block_on(async {
-        let sessions = OwnedSession {
-            artifact: artifact().await,
+        let authentication = Authentication {
             calls: AtomicUsize::new(0),
         };
         let promotions = PromotionCapture::default();
-        let application = AuthoringApplication::new(&sessions, &StaleAuthority, &promotions);
+        let application = AuthoringApplication::new(&authentication, &StaleAuthority, &promotions);
         assert!(matches!(
             application
-                .promote_owned_session(&principal(), command())
+                .promote_owned_session("opaque-session-token", command())
                 .await,
             Err(authoring_application::AuthoringApplicationError::Authority(
                 PromotionAuthorityError::GenerationMismatch
             ))
         ));
-        assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(authentication.calls.load(Ordering::SeqCst), 1);
         assert!(promotions.input.lock().unwrap().is_none());
     });
 }
@@ -323,29 +358,29 @@ impl PromotionSubmissionPort for FailedPromotion {
 }
 
 #[test]
-fn promotion_failure_is_propagated_after_both_authorization_checks() {
+fn promotion_failure_is_propagated_after_one_atomic_authorization_check() {
     block_on(async {
-        let sessions = OwnedSession {
-            artifact: artifact().await,
+        let authentication = Authentication {
             calls: AtomicUsize::new(0),
         };
-        let authority = Authority {
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
             calls: AtomicUsize::new(0),
         };
         let promotions = FailedPromotion {
             calls: AtomicUsize::new(0),
         };
-        let application = AuthoringApplication::new(&sessions, &authority, &promotions);
+        let application = AuthoringApplication::new(&authentication, &snapshots, &promotions);
         assert!(matches!(
             application
-                .promote_owned_session(&principal(), command())
+                .promote_owned_session("opaque-session-token", command())
                 .await,
             Err(authoring_application::AuthoringApplicationError::Promotion(
                 PromotionError::ConcurrentTransitionLimit
             ))
         ));
-        assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(authentication.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshots.calls.load(Ordering::SeqCst), 1);
         assert_eq!(promotions.calls.load(Ordering::SeqCst), 1);
     });
 }

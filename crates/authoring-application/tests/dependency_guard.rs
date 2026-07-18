@@ -128,3 +128,15 @@ fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
         );
     }
 }
+
+#[test]
+fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
+    let source = include_str!("../src/lib.rs");
+    assert!(!source.contains("from_trusted_edge"));
+    assert!(!source.contains("pub fn from_identity"));
+    assert!(!source.contains("pub trait OwnedSessionArtifactPort"));
+    assert!(!source.contains("pub trait PromotionAuthorityPort"));
+    assert!(source.contains("pub trait AuthenticationPort"));
+    assert!(source.contains("pub trait AuthorizedPromotionSnapshotPort"));
+    assert!(source.contains("load_atomic_authorized_snapshot"));
+}

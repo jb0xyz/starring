@@ -8,26 +8,59 @@ use design_harness::PreviewReadyArtifactV1;
 use discord_model::{GuildId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedPrincipalV1 {
+pub struct AuthenticatedIdentityV1 {
     tenant_id: TenantId,
     principal_id: PrincipalId,
 }
 
-impl VerifiedPrincipalV1 {
-    pub fn from_trusted_edge(tenant_id: TenantId, principal_id: PrincipalId) -> Self {
+impl AuthenticatedIdentityV1 {
+    pub fn from_authentication(tenant_id: TenantId, principal_id: PrincipalId) -> Self {
         Self {
             tenant_id,
             principal_id,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedActorV1 {
+    identity: AuthenticatedIdentityV1,
+}
+
+impl AuthenticatedActorV1 {
+    fn from_identity(identity: AuthenticatedIdentityV1) -> Self {
+        Self { identity }
+    }
 
     pub fn tenant_id(&self) -> &TenantId {
-        &self.tenant_id
+        &self.identity.tenant_id
     }
 
     pub fn principal_id(&self) -> &PrincipalId {
-        &self.principal_id
+        &self.identity.principal_id
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthenticationError {
+    #[error("authentication credential is invalid")]
+    InvalidCredential,
+    #[error("authentication credential has expired")]
+    Expired,
+    #[error("authentication credential was revoked")]
+    Revoked,
+    #[error("authentication backend failed: {0}")]
+    Backend(String),
+}
+
+#[allow(async_fn_in_trait)]
+pub trait AuthenticationPort {
+    type Credential: ?Sized;
+
+    async fn authenticate(
+        &self,
+        credential: &Self::Credential,
+    ) -> Result<AuthenticatedIdentityV1, AuthenticationError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +73,28 @@ pub struct PromoteOwnedSessionV1 {
 #[derive(Clone)]
 pub struct OwnedPreviewReadyArtifactV1 {
     artifact: PreviewReadyArtifactV1,
+}
+
+#[derive(Clone)]
+pub struct AuthorizedPromotionSnapshotV1 {
+    artifact: OwnedPreviewReadyArtifactV1,
+    authority: ResolvedPromotionAuthorityV1,
+}
+
+impl AuthorizedPromotionSnapshotV1 {
+    pub fn from_atomic_authorization(
+        artifact: PreviewReadyArtifactV1,
+        authority: ResolvedPromotionAuthorityV1,
+    ) -> Self {
+        Self {
+            artifact: OwnedPreviewReadyArtifactV1::from_owned_session(artifact),
+            authority,
+        }
+    }
+
+    fn into_parts(self) -> (PreviewReadyArtifactV1, ResolvedPromotionAuthorityV1) {
+        (self.artifact.into_inner(), self.authority)
+    }
 }
 
 impl OwnedPreviewReadyArtifactV1 {
@@ -88,24 +143,22 @@ pub enum PromotionAuthorityError {
     Backend(String),
 }
 
-#[allow(async_fn_in_trait)]
-pub trait OwnedSessionArtifactPort {
-    async fn load_owned_preview_ready(
-        &self,
-        principal: &VerifiedPrincipalV1,
-        session_id: &AuthoringSessionId,
-        expected_generation: SessionGeneration,
-    ) -> Result<OwnedPreviewReadyArtifactV1, OwnedSessionLoadError>;
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthorizedPromotionSnapshotError {
+    #[error(transparent)]
+    Session(#[from] OwnedSessionLoadError),
+    #[error(transparent)]
+    Authority(#[from] PromotionAuthorityError),
 }
 
 #[allow(async_fn_in_trait)]
-pub trait PromotionAuthorityPort {
-    async fn resolve_promotion_authority(
+pub trait AuthorizedPromotionSnapshotPort {
+    async fn load_atomic_authorized_snapshot(
         &self,
-        principal: &VerifiedPrincipalV1,
+        actor: &AuthenticatedActorV1,
         session_id: &AuthoringSessionId,
         expected_generation: SessionGeneration,
-    ) -> Result<ResolvedPromotionAuthorityV1, PromotionAuthorityError>;
+    ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +217,8 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthoringApplicationError {
     #[error(transparent)]
+    Authentication(#[from] AuthenticationError),
+    #[error(transparent)]
     Session(#[from] OwnedSessionLoadError),
     #[error(transparent)]
     Authority(#[from] PromotionAuthorityError),
@@ -171,52 +226,60 @@ pub enum AuthoringApplicationError {
     Promotion(#[from] PromotionError),
 }
 
-pub struct AuthoringApplication<'a, S, R, P> {
-    sessions: &'a S,
-    authority: &'a R,
+impl From<AuthorizedPromotionSnapshotError> for AuthoringApplicationError {
+    fn from(value: AuthorizedPromotionSnapshotError) -> Self {
+        match value {
+            AuthorizedPromotionSnapshotError::Session(error) => Self::Session(error),
+            AuthorizedPromotionSnapshotError::Authority(error) => Self::Authority(error),
+        }
+    }
+}
+
+pub struct AuthoringApplication<'a, A, S, P> {
+    authentication: &'a A,
+    snapshots: &'a S,
     promotions: &'a P,
 }
 
-impl<'a, S, R, P> AuthoringApplication<'a, S, R, P> {
-    pub fn new(sessions: &'a S, authority: &'a R, promotions: &'a P) -> Self {
+impl<'a, A, S, P> AuthoringApplication<'a, A, S, P> {
+    pub fn new(authentication: &'a A, snapshots: &'a S, promotions: &'a P) -> Self {
         Self {
-            sessions,
-            authority,
+            authentication,
+            snapshots,
             promotions,
         }
     }
 }
 
-impl<S, R, P> AuthoringApplication<'_, S, R, P>
+impl<A, S, P> AuthoringApplication<'_, A, S, P>
 where
-    S: OwnedSessionArtifactPort,
-    R: PromotionAuthorityPort,
+    A: AuthenticationPort,
+    S: AuthorizedPromotionSnapshotPort,
     P: PromotionSubmissionPort,
 {
     pub async fn promote_owned_session(
         &self,
-        principal: &VerifiedPrincipalV1,
+        credential: &A::Credential,
         command: PromoteOwnedSessionV1,
     ) -> Result<P::Output, AuthoringApplicationError> {
-        let artifact = self
-            .sessions
-            .load_owned_preview_ready(principal, &command.session_id, command.expected_generation)
-            .await?;
-        let authority = self
-            .authority
-            .resolve_promotion_authority(
-                principal,
+        let identity = self.authentication.authenticate(credential).await?;
+        let actor = AuthenticatedActorV1::from_identity(identity);
+        let snapshot = self
+            .snapshots
+            .load_atomic_authorized_snapshot(
+                &actor,
                 &command.session_id,
                 command.expected_generation,
             )
             .await?;
+        let (artifact, authority) = snapshot.into_parts();
         self.promotions
             .submit_verified_promotion(StartPromotionV1 {
                 idempotency_key: command.idempotency_key,
                 context: AuthenticatedPromotionContext {
-                    tenant_id: principal.tenant_id.clone(),
-                    principal_id: principal.principal_id.clone(),
-                    session_owner_id: principal.principal_id.clone(),
+                    tenant_id: actor.tenant_id().clone(),
+                    principal_id: actor.principal_id().clone(),
+                    session_owner_id: actor.principal_id().clone(),
                     session_id: command.session_id,
                     session_generation: command.expected_generation,
                     guild_id: authority.guild_id,
@@ -226,7 +289,7 @@ where
                     binding_revision: authority.binding_revision,
                     policy: authority.policy,
                 },
-                artifact: artifact.into_inner(),
+                artifact,
             })
             .await
             .map_err(AuthoringApplicationError::Promotion)
