@@ -115,6 +115,12 @@ The authenticated edge supplies:
 
 The model and request body do not supply those values.
 
+The application edge loads the exported artifact through the same durable
+authoring session and generation that produced it. It verifies session owner,
+generation, binding revision, and binding fingerprint before constructing the
+non-Serde server-resolved promotion command. A client-submitted authority
+context or an arbitrary artifact/context pairing is never accepted.
+
 The workflow journal is created before publication and advances monotonically:
 
 ```text
@@ -130,6 +136,12 @@ Prepared | Published
 ActivationPending
   -> Rejected | Withdrawn | Expired | Superseded
 ```
+
+If an exact activation request is created but the journal CAS is interrupted
+until that request expires, recovery records `Published -> Expired` with the
+reused request identity and an update timestamp at or after its expiry. The
+later activation synchronization boundary owns ordinary
+`ActivationPending -> Expired` convergence.
 
 Each transition uses a revision CAS. Retry resumes from the durable state.
 
@@ -158,10 +170,25 @@ request. A crash after publication is safe because retry reuses identical
 registry content. Activation-request failure leaves an inactive published
 artifact and a resumable `Published` workflow.
 
+The pure workflow port has no production adapter to the legacy activation
+service. That adapter remains fail-closed until Boundary 3 adds the full
+approval context and an activation-side link gate. A product-authored request
+is created `Unlinked`; approval and apply reject it until a CAS records the
+exact promotion identity on the activation request and the promotion journal
+records the same request. Recovery may complete either side of that handshake.
+This prevents a crash between request creation and journal linkage from leaving
+an independently approvable orphan. A same-database transaction or durable
+outbox/inbox may implement the handshake, but request-ID convention alone is
+not an authorization gate.
+
 ## Idempotency
 
-The endpoint idempotency key is bound to tenant, principal, session generation,
-guild, installation, and server policy through a domain-separated digest.
+The endpoint idempotency scope digest binds the raw key to the tenant,
+authenticated principal, and versioned promotion endpoint domain. The separate
+exact request digest binds that scope to the session generation, candidate,
+guild, installation, RuleSet key, bindings, and server policy. Reusing the same
+raw key for any different request under that tenant and principal is therefore
+a hard conflict rather than a second workflow.
 
 The activation request ID is a full lowercase SHA-256 hexadecimal digest derived
 from the promotion identity. An exact retry loads and compares the complete

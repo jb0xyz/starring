@@ -1,0 +1,20 @@
+[package]
+name = "authoring-promotion"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-ruleset = { path = "../automation-ruleset" }
+automation-ruleset-activation = { path = "../automation-ruleset-activation" }
+automation-state = { path = "../automation-state" }
+chrono = { version = "0.4", features = ["serde"] }
+design-harness = { path = "../design-harness" }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
