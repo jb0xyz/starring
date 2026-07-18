@@ -1,14 +1,14 @@
 use automation_ruleset_activation::{
     ActivationApprovalContextV1, ActivationDigest, ActivationLinkStateV1, ActivationRequest,
     ActivationRequestId, ActivationRequestState, ActivationStoreError, ActivationTarget,
-    ApplyAttemptId, ApplyErrorRecord, Approval, Completion, CompletionKind, ObservedActive,
-    Rejection,
+    ActivationTerminationV1, ApplyAttemptId, ApplyErrorRecord, Approval, Completion,
+    CompletionKind, ObservedActive, Rejection,
 };
 use chrono::{DateTime, Utc};
 use discord_model::{GuildId, UserId};
 use sqlx::types::Json;
 
-pub(crate) const REQUEST_COLUMNS: &str = "id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, required_approvals, state, created_at, expires_at, apply_attempt_id, apply_attempt_no, apply_lease_until, last_apply_error, observed_active_version, observed_active_hash, applied_at, applied_by, completion_kind, activation_notices, rejected_at, rejected_by, rejection_reason, authority_kind, link_state_name, approval_context, link_state, promotion_id, promotion_request_digest, approval_payload_digest, approval_context_digest, linked_at";
+pub(crate) const REQUEST_COLUMNS: &str = "id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, required_approvals, state, created_at, expires_at, apply_attempt_id, apply_attempt_no, apply_lease_until, last_apply_error, observed_active_version, observed_active_hash, applied_at, applied_by, completion_kind, activation_notices, rejected_at, rejected_by, rejection_reason, authority_kind, link_state_name, approval_context, link_state, promotion_id, promotion_request_digest, approval_payload_digest, approval_context_digest, linked_at, termination";
 
 #[derive(Clone, sqlx::FromRow)]
 pub(crate) struct ActivationRequestRow {
@@ -44,6 +44,7 @@ pub(crate) struct ActivationRequestRow {
     pub approval_payload_digest: Option<String>,
     pub approval_context_digest: Option<String>,
     pub linked_at: Option<DateTime<Utc>>,
+    pub termination: Option<Json<ActivationTerminationV1>>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -194,6 +195,7 @@ pub(crate) fn decode_request(
         last_apply_error: row.last_apply_error.map(|error| error.0),
         observed_active,
         completion,
+        termination: row.termination.map(|termination| termination.0),
         created_at: row.created_at,
         expires_at: row.expires_at,
     };
@@ -284,6 +286,8 @@ fn parse_state(value: &str) -> Result<ActivationRequestState, ActivationStoreErr
         "applied" => Ok(ActivationRequestState::Applied),
         "rejected" => Ok(ActivationRequestState::Rejected),
         "expired" => Ok(ActivationRequestState::Expired),
+        "superseded" => Ok(ActivationRequestState::Superseded),
+        "withdrawn" => Ok(ActivationRequestState::Withdrawn),
         _ => Err(backend(format!("invalid persisted state: {value}"))),
     }
 }
@@ -366,6 +370,8 @@ pub(crate) fn state_str(state: ActivationRequestState) -> &'static str {
         ActivationRequestState::Applied => "applied",
         ActivationRequestState::Rejected => "rejected",
         ActivationRequestState::Expired => "expired",
+        ActivationRequestState::Superseded => "superseded",
+        ActivationRequestState::Withdrawn => "withdrawn",
     }
 }
 
@@ -432,6 +438,7 @@ mod tests {
             approval_payload_digest: None,
             approval_context_digest: None,
             linked_at: None,
+            termination: None,
         }
     }
 

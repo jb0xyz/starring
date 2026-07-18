@@ -4,7 +4,7 @@ use automation_ruleset_activation::{
     ApplyErrorRecord, ApprovalDecisionError, ApproveError, ClaimDecision, ClaimOutcome,
     CompletionKind, CreateActivationRequest, CreateProductActivationRequest, LinkDecision,
     LinkDecisionError, LinkProductActivation, LinkProductError, RejectError,
-    RejectionDecisionError,
+    RejectionDecisionError, SupersessionReasonV1, WithdrawDecisionError, WithdrawError,
 };
 use chrono::{DateTime, Utc};
 use discord_model::{GuildId, UserId};
@@ -82,6 +82,28 @@ async fn database_lease(
     .fetch_one(connection)
     .await
     .map_err(backend)
+}
+
+async fn bind_product_executor(
+    connection: &mut PgConnection,
+    request: &ActivationRequest,
+) -> Result<(), ActivationStoreError> {
+    let ActivationApprovalContextV1::ProductAuthoring { context } = &request.approval_context
+    else {
+        return Ok(());
+    };
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT set_config('starring.product_approval_context_digest', $1, TRUE)",
+    )
+    .bind(context.approval_context_digest.as_str())
+    .fetch_one(connection)
+    .await
+    .map_err(backend)?;
+    if bound == context.approval_context_digest.as_str() {
+        Ok(())
+    } else {
+        Err(backend("product activation executor binding mismatch"))
+    }
 }
 
 fn is_constraint(error: &sqlx::Error, name: &str) -> bool {
@@ -515,6 +537,52 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         Ok(request)
     }
 
+    async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut request = fetch_request(&mut tx, request_id, true)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        let now = database_now(&mut tx).await?;
+        if let Err(error) = request.withdraw_at(withdrawn_by, reason, now) {
+            if error == WithdrawDecisionError::Expired {
+                sqlx::query("UPDATE activation_requests SET state = 'expired' WHERE id = $1")
+                    .bind(request_id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
+            } else {
+                tx.rollback().await.map_err(backend)?;
+            }
+            return Err(error.into());
+        }
+        let termination = request
+            .termination
+            .as_ref()
+            .ok_or_else(|| backend("withdrawal omitted terminal evidence"))?;
+        let result = sqlx::query(
+            "UPDATE activation_requests SET state = 'withdrawn', termination = $2, \
+             last_apply_error = NULL \
+             WHERE id = $1 AND state IN ('pending','approved')",
+        )
+        .bind(request_id.as_str())
+        .bind(Json(termination))
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await.map_err(backend)?;
+            return Err(WithdrawError::Store(backend("withdrawal CAS failed")));
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(request)
+    }
+
     async fn claim_apply(
         &self,
         request_id: &ActivationRequestId,
@@ -542,6 +610,7 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             tx.commit().await.map_err(backend)?;
             return Ok(decision_outcome(decision, request));
         }
+        bind_product_executor(&mut tx, &request).await?;
         let update = sqlx::query(
             "UPDATE activation_requests SET state = 'applying', apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
@@ -595,6 +664,7 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             tx.commit().await.map_err(backend)?;
             return Ok(decision_outcome(decision, request));
         }
+        bind_product_executor(&mut tx, &request).await?;
         let result = sqlx::query(
             "UPDATE activation_requests SET apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
@@ -687,6 +757,51 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         .await
         .map_err(backend)?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn supersede_applying(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
+    ) -> Result<bool, ActivationStoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut request = fetch_request(&mut tx, request_id, true)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        let now = database_now(&mut tx).await?;
+        if !request.supersede_at(attempt_id, reason, now) {
+            tx.rollback().await.map_err(backend)?;
+            return Ok(false);
+        }
+        let termination = request
+            .termination
+            .as_ref()
+            .ok_or_else(|| backend("supersession omitted terminal evidence"))?;
+        let result = sqlx::query(
+            "UPDATE activation_requests SET state = 'superseded', apply_attempt_id = NULL, \
+             apply_lease_until = NULL, last_apply_error = NULL, termination = $3 \
+             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2",
+        )
+        .bind(request_id.as_str())
+        .bind(attempt_id.as_str())
+        .bind(Json(termination))
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await.map_err(backend)?;
+            return Ok(false);
+        }
+        let stored = fetch_request(&mut tx, request_id, false)
+            .await?
+            .ok_or(ActivationStoreError::NotFound)?;
+        if stored != request {
+            tx.rollback().await.map_err(backend)?;
+            return Err(backend("supersession persistence mismatch"));
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(true)
     }
 
     async fn mark_expired(

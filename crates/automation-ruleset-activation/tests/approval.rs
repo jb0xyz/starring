@@ -5,7 +5,7 @@ use automation_ruleset_activation::{
     ActivationTarget, ApplyAttemptId, ApprovalBindingContextV1, ApprovalPolicyBindingV1,
     ApproveError, ClaimOutcome, CreateActivationRequest, CreateProductActivationRequest,
     ExpectedActiveBaselineV1, InMemoryActivationRequestStore, LinkProductActivation,
-    LinkProductError, ManualActivationClock, ProductApprovalContextV1, RejectError,
+    LinkProductError, ManualActivationClock, ProductApprovalContextV1, RejectError, WithdrawError,
 };
 use chrono::{Duration, TimeZone, Utc};
 use discord_model::{GuildId, UserId};
@@ -333,4 +333,43 @@ fn product_approval_before_link_timestamp_fails_validation() {
     approved.approvals[0].approved_at = linked_at - Duration::seconds(1);
 
     assert!(approved.validate().is_err());
+}
+
+#[test]
+fn pending_and_approved_requests_can_be_withdrawn_but_applying_cannot() {
+    let store = InMemoryActivationRequestStore::with_clock(clock());
+    let pending = create(&store, "withdraw_pending", 10, 1);
+    let withdrawn = block_on(store.withdraw(&pending, UserId(10), "changed".to_string())).unwrap();
+    assert_eq!(withdrawn.state, ActivationRequestState::Withdrawn);
+    assert_eq!(
+        block_on(store.withdraw(&pending, UserId(10), "again".to_string())).unwrap_err(),
+        WithdrawError::InvalidState
+    );
+
+    let applying = create(&store, "withdraw_applying", 10, 1);
+    block_on(store.approve(&applying, UserId(20))).unwrap();
+    block_on(store.claim_apply(
+        &applying,
+        ApplyAttemptId::parse("withdraw_owner").unwrap(),
+        60,
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(store.withdraw(&applying, UserId(10), "too late".to_string())).unwrap_err(),
+        WithdrawError::InvalidState
+    );
+}
+
+#[test]
+fn product_withdrawal_requires_the_durable_promotion_link() {
+    let store = InMemoryActivationRequestStore::with_clock(clock());
+    let (id, context) = create_product(&store, "withdraw_product");
+    assert_eq!(
+        block_on(store.withdraw(&id, UserId(10), "cancel".to_string())).unwrap_err(),
+        WithdrawError::Unlinked
+    );
+    block_on(store.link_product(&id, link(&context))).unwrap();
+    let withdrawn = block_on(store.withdraw(&id, UserId(10), "cancel".to_string())).unwrap();
+    assert_eq!(withdrawn.state, ActivationRequestState::Withdrawn);
+    assert!(withdrawn.approvals.is_empty());
 }

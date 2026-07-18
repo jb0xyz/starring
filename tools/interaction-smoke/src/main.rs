@@ -705,6 +705,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
                 .await
                 .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
         Ok(ActivationEnvironment {
+            binding_revision: None,
             bindings,
             guild_capabilities,
             role_permissions,

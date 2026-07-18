@@ -14,10 +14,11 @@ pub use id::{
     ActivationRequestId, ApplyAttemptId,
 };
 pub use model::{
-    ActivationRequest, ActivationRequestState, ActivationTarget, ApplyErrorRecord,
-    ApplyFailureKind, Approval, ApprovalDecisionError, ClaimDecision, Completion, CompletionKind,
-    CreateActivationRequest, CreateProductActivationRequest, LinkDecision, LinkDecisionError,
-    ObservedActive, Rejection, RejectionDecisionError, TransitionError,
+    ActivationRequest, ActivationRequestState, ActivationTarget, ActivationTerminationV1,
+    ApplyErrorRecord, ApplyFailureKind, Approval, ApprovalDecisionError, ClaimDecision, Completion,
+    CompletionKind, CreateActivationRequest, CreateProductActivationRequest, LinkDecision,
+    LinkDecisionError, ObservedActive, Rejection, RejectionDecisionError, SupersessionReasonV1,
+    TransitionError, WithdrawDecisionError,
 };
 #[cfg(feature = "unsafe-dev-activation")]
 pub use service::unsafe_dev_activate;
@@ -29,5 +30,5 @@ pub use service::{
 pub use store::{
     ActivationClock, ActivationRequestStore, ActivationStoreError, ApproveError, ClaimOutcome,
     InMemoryActivationRequestStore, LinkProductActivation, LinkProductError, ManualActivationClock,
-    RejectError, UtcActivationClock,
+    RejectError, UtcActivationClock, WithdrawError,
 };

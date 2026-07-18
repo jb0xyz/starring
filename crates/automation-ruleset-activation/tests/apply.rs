@@ -1,24 +1,28 @@
 use std::collections::BTreeMap;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use automation_ruleset::{
-    InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetActivation,
-    RuleSetContentHash, RuleSetKey, RuleSetStore, RuleSetStoreError, RuleSetVersion,
-    RuleSetVersionId,
+    GuardedActivationOutcome, GuardedRuleSetActivation, InMemoryRuleSetStore, PublishOutcome,
+    PublishRuleSetRequest, RuleSetActivation, RuleSetContentHash, RuleSetKey, RuleSetStore,
+    RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
 };
 use automation_ruleset_activation::{
+    approval_policy_digest_v1, product_approval_context_digest_v1, ActivationDigest,
     ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
-    ActivationRequestId, ActivationRequestState, ActivationRequestStore, ActivationService,
-    ActivationTarget, ApplyAttemptId, ApplyError, ApplyOutcome, ClaimOutcome,
-    CreateActivationRequest, InMemoryActivationRequestStore, ManualActivationClock,
-    RecoveryDisposition, RequestActivation,
+    ActivationPromotionId, ActivationRequestId, ActivationRequestState, ActivationRequestStore,
+    ActivationService, ActivationTarget, ApplyAttemptId, ApplyError, ApplyOutcome,
+    ApprovalBindingContextV1, ApprovalPolicyBindingV1, ClaimOutcome, CreateActivationRequest,
+    CreateProductActivationRequest, ExpectedActiveBaselineV1, InMemoryActivationRequestStore,
+    LinkProductActivation, ManualActivationClock, ProductApprovalContextV1, RecoveryDisposition,
+    RequestActivation, SupersessionReasonV1,
 };
 use automation_ruleset_readiness::GuildCapabilities;
 use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
 use chrono::{Duration, TimeZone, Utc};
 use discord_model::{GuildId, Permissions, UserId};
 use futures::executor::block_on;
-use resource_resolution::ResourceBindingMap;
+use resource_resolution::{approval_binding_fingerprint_v1, ResourceBindingMap};
 
 const GUILD: GuildId = GuildId(7);
 
@@ -122,6 +126,17 @@ impl RuleSetStore for SpyRuleSetStore {
         self.inner.activate(guild_id, key, version).await
     }
 
+    async fn activate_guarded(
+        &self,
+        request: GuardedRuleSetActivation,
+    ) -> Result<GuardedActivationOutcome, RuleSetStoreError> {
+        self.activate_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_activate.load(Ordering::SeqCst) {
+            return Err(RuleSetStoreError::Backend("outcome unknown".to_string()));
+        }
+        self.inner.activate_guarded(request).await
+    }
+
     async fn active(
         &self,
         guild_id: GuildId,
@@ -133,6 +148,8 @@ impl RuleSetStore for SpyRuleSetStore {
 
 enum ProviderMode {
     Ready,
+    ProductReady,
+    ProductBindingRevisionDrift,
     MissingCapability,
     Fail,
 }
@@ -156,6 +173,23 @@ impl ActivationEnvironmentProvider for SpyProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.mode {
             ProviderMode::Ready => Ok(ActivationEnvironment {
+                binding_revision: None,
+                bindings: ResourceBindingMap::default(),
+                guild_capabilities: GuildCapabilities {
+                    base_permissions: Permissions::ADMINISTRATOR,
+                },
+                role_permissions: BTreeMap::new(),
+            }),
+            ProviderMode::ProductReady => Ok(ActivationEnvironment {
+                binding_revision: NonZeroU64::new(3),
+                bindings: ResourceBindingMap::default(),
+                guild_capabilities: GuildCapabilities {
+                    base_permissions: Permissions::ADMINISTRATOR,
+                },
+                role_permissions: BTreeMap::new(),
+            }),
+            ProviderMode::ProductBindingRevisionDrift => Ok(ActivationEnvironment {
+                binding_revision: NonZeroU64::new(4),
                 bindings: ResourceBindingMap::default(),
                 guild_capabilities: GuildCapabilities {
                     base_permissions: Permissions::ADMINISTRATOR,
@@ -163,6 +197,7 @@ impl ActivationEnvironmentProvider for SpyProvider {
                 role_permissions: BTreeMap::new(),
             }),
             ProviderMode::MissingCapability => Ok(ActivationEnvironment {
+                binding_revision: None,
                 bindings: ResourceBindingMap::default(),
                 guild_capabilities: GuildCapabilities {
                     base_permissions: Permissions::SEND_MESSAGES,
@@ -231,6 +266,90 @@ impl Fixture {
 
 fn attempt(value: &str) -> ApplyAttemptId {
     ApplyAttemptId::parse(value).unwrap()
+}
+
+fn digest(value: char) -> ActivationDigest {
+    ActivationDigest::parse(&value.to_string().repeat(64)).unwrap()
+}
+
+fn product_context(
+    id: &ActivationRequestId,
+    target: &RuleSetVersion,
+    baseline: ExpectedActiveBaselineV1,
+) -> ProductApprovalContextV1 {
+    let binding_revision = NonZeroU64::new(3).unwrap();
+    let policy_revision = NonZeroU64::new(7).unwrap();
+    let required_approvals = NonZeroU32::new(1).unwrap();
+    let ttl_seconds = NonZeroU64::new(1_800).unwrap();
+    let activation_target = ActivationTarget {
+        guild_id: target.guild_id,
+        ruleset_key: target.ruleset_key.clone(),
+        version: target.version,
+        content_hash: target.content_hash,
+    };
+    let mut context = ProductApprovalContextV1 {
+        promotion_id: ActivationPromotionId::parse(&"a".repeat(64)).unwrap(),
+        promotion_request_digest: digest('b'),
+        approval_payload_digest: digest('c'),
+        approval_context_digest: digest('d'),
+        binding: ApprovalBindingContextV1 {
+            revision: binding_revision,
+            required_bindings: Vec::new(),
+            fingerprint: approval_binding_fingerprint_v1(GUILD, binding_revision, &[]).unwrap(),
+        },
+        baseline,
+        policy: ApprovalPolicyBindingV1 {
+            revision: policy_revision,
+            required_approvals,
+            ttl_seconds,
+            digest: approval_policy_digest_v1(policy_revision, required_approvals, ttl_seconds),
+        },
+    };
+    context.approval_context_digest =
+        product_approval_context_digest_v1(id, &activation_target, UserId(10), &context);
+    context
+}
+
+fn create_approved_product(
+    fixture: &Fixture,
+    id_value: &str,
+    target: &RuleSetVersion,
+    baseline: ExpectedActiveBaselineV1,
+) -> (ActivationRequestId, ProductApprovalContextV1) {
+    let id = ActivationRequestId::parse(id_value).unwrap();
+    let context = product_context(&id, target, baseline);
+    block_on(
+        fixture
+            .requests
+            .create_product(CreateProductActivationRequest {
+                id: id.clone(),
+                target: ActivationTarget {
+                    guild_id: target.guild_id,
+                    ruleset_key: target.ruleset_key.clone(),
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                requester: UserId(10),
+                context: context.clone(),
+            }),
+    )
+    .unwrap();
+    block_on(fixture.requests.link_product(
+        &id,
+        LinkProductActivation {
+            promotion_id: context.promotion_id.clone(),
+            promotion_request_digest: context.promotion_request_digest.clone(),
+            approval_context_digest: context.approval_context_digest.clone(),
+        },
+    ))
+    .unwrap();
+    block_on(
+        fixture
+            .requests
+            .approve_bound(&id, UserId(20), &context.approval_payload_digest),
+    )
+    .unwrap();
+    (id, context)
 }
 
 #[test]
@@ -432,6 +551,204 @@ fn success_marks_applied_with_notices_and_requester_may_apply() {
     assert!(stored.completion.unwrap().notices.is_some());
 }
 
+#[test]
+fn product_activation_uses_guarded_pointer_cas() {
+    let fixture = Fixture::new(ProviderMode::ProductReady);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_success",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+
+    let outcome = block_on(
+        fixture
+            .service()
+            .apply(&id, attempt("product_attempt"), UserId(10)),
+    )
+    .unwrap();
+
+    assert_eq!(outcome, ApplyOutcome::Activated);
+    assert_eq!(fixture.rulesets.activate_calls(), 1);
+    assert_eq!(fixture.provider.calls(), 1);
+    assert_eq!(
+        block_on(fixture.rulesets.active(GUILD, &key()))
+            .unwrap()
+            .unwrap()
+            .version,
+        target.version
+    );
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Applied
+    );
+}
+
+#[test]
+fn product_activation_is_superseded_before_snapshot_when_baseline_drifted() {
+    let fixture = Fixture::new(ProviderMode::ProductReady);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_baseline_drift",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+    let competing = fixture.rulesets.publish(true);
+    block_on(
+        fixture
+            .rulesets
+            .inner
+            .activate(GUILD, &key(), competing.version),
+    )
+    .unwrap();
+
+    let outcome = block_on(
+        fixture
+            .service()
+            .apply(&id, attempt("product_drift"), UserId(10)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::ActiveBaselineDrift { .. }
+        }
+    ));
+    assert_eq!(fixture.provider.calls(), 0);
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+    assert_eq!(
+        block_on(fixture.rulesets.active(GUILD, &key()))
+            .unwrap()
+            .unwrap()
+            .version,
+        competing.version
+    );
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Superseded
+    );
+}
+
+#[test]
+fn product_activation_is_superseded_when_approved_binding_revision_drifted() {
+    let fixture = Fixture::new(ProviderMode::ProductBindingRevisionDrift);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_binding_drift",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+
+    let outcome = block_on(
+        fixture
+            .service()
+            .apply(&id, attempt("product_binding"), UserId(10)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::BindingDrift { .. }
+        }
+    ));
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+    assert!(block_on(fixture.rulesets.active(GUILD, &key()))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn product_activation_without_authoritative_binding_revision_fails_closed() {
+    let fixture = Fixture::new(ProviderMode::Ready);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_unversioned_binding",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+
+    assert!(matches!(
+        block_on(
+            fixture
+                .service()
+                .apply(&id, attempt("product_unversioned"), UserId(10))
+        ),
+        Err(ApplyError::Environment(_))
+    ));
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Approved
+    );
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+}
+
+struct BaselineDriftingProvider<'a> {
+    rulesets: &'a SpyRuleSetStore,
+    competing_version: RuleSetVersionId,
+}
+
+impl ActivationEnvironmentProvider for BaselineDriftingProvider<'_> {
+    async fn load_fresh(
+        &self,
+        _: &ActivationTarget,
+    ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        self.rulesets
+            .inner
+            .activate(GUILD, &key(), self.competing_version)
+            .await
+            .unwrap();
+        Ok(ActivationEnvironment {
+            binding_revision: NonZeroU64::new(3),
+            bindings: ResourceBindingMap::default(),
+            guild_capabilities: GuildCapabilities {
+                base_permissions: Permissions::ADMINISTRATOR,
+            },
+            role_permissions: BTreeMap::new(),
+        })
+    }
+}
+
+#[test]
+fn guarded_cas_catches_baseline_drift_during_fresh_environment_load() {
+    let fixture = Fixture::new(ProviderMode::ProductReady);
+    let target = fixture.rulesets.publish(false);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_midflight_drift",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+    let competing = fixture.rulesets.publish(true);
+    let provider = BaselineDriftingProvider {
+        rulesets: &fixture.rulesets,
+        competing_version: competing.version,
+    };
+    let service = ActivationService::new(&fixture.requests, &fixture.rulesets, &provider);
+
+    let outcome = block_on(service.apply(&id, attempt("midflight_drift"), UserId(10))).unwrap();
+
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::ActiveBaselineDrift { .. }
+        }
+    ));
+    assert_eq!(fixture.rulesets.activate_calls(), 1);
+    assert_eq!(
+        block_on(fixture.rulesets.active(GUILD, &key()))
+            .unwrap()
+            .unwrap()
+            .version,
+        competing.version
+    );
+}
+
 struct StealingProvider<'a> {
     requests: &'a InMemoryActivationRequestStore<ManualActivationClock>,
     clock: ManualActivationClock,
@@ -451,6 +768,7 @@ impl ActivationEnvironmentProvider for StealingProvider<'_> {
             .unwrap();
         assert!(matches!(outcome, ClaimOutcome::Claimed(_)));
         Ok(ActivationEnvironment {
+            binding_revision: None,
             bindings: ResourceBindingMap::default(),
             guild_capabilities: GuildCapabilities {
                 base_permissions: Permissions::ADMINISTRATOR,

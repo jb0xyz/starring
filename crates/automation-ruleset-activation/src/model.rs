@@ -1,6 +1,9 @@
+use std::num::NonZeroU64;
+
 use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use chrono::{DateTime, Duration, Utc};
 use discord_model::{GuildId, UserId};
+use resource_resolution::ApprovalBindingFingerprint;
 use serde::{Deserialize, Serialize};
 
 use crate::approval::{
@@ -85,6 +88,45 @@ pub enum ActivationRequestState {
     Applied,
     Rejected,
     Expired,
+    Superseded,
+    Withdrawn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SupersessionReasonV1 {
+    ActiveBaselineDrift {
+        expected: crate::ExpectedActiveBaselineV1,
+        observed: crate::ExpectedActiveBaselineV1,
+    },
+    BindingDrift {
+        expected_revision: NonZeroU64,
+        observed_revision: NonZeroU64,
+        expected_fingerprint: ApprovalBindingFingerprint,
+        observed_fingerprint: Option<ApprovalBindingFingerprint>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActivationTerminationV1 {
+    Superseded {
+        at: DateTime<Utc>,
+        reason: SupersessionReasonV1,
+    },
+    Withdrawn {
+        at: DateTime<Utc>,
+        by: UserId,
+        reason: String,
+    },
+}
+
+impl ActivationTerminationV1 {
+    fn at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Superseded { at, .. } | Self::Withdrawn { at, .. } => *at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +147,7 @@ pub struct ActivationRequest {
     pub last_apply_error: Option<ApplyErrorRecord>,
     pub observed_active: Option<ObservedActive>,
     pub completion: Option<Completion>,
+    pub termination: Option<ActivationTerminationV1>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -170,6 +213,16 @@ pub enum RejectionDecisionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawDecisionError {
+    #[error("product activation request is not linked")]
+    Unlinked,
+    #[error("activation request cannot be withdrawn from its current state")]
+    InvalidState,
+    #[error("activation request is expired")]
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TransitionError {
     #[error("apply attempt number overflow")]
     AttemptOverflow,
@@ -220,6 +273,7 @@ impl ActivationRequest {
             last_apply_error: None,
             observed_active: input.observed_active,
             completion: None,
+            termination: None,
             created_at: now,
             expires_at,
         };
@@ -267,6 +321,7 @@ impl ActivationRequest {
             apply_lease_until: None,
             last_apply_error: None,
             completion: None,
+            termination: None,
             created_at: now,
             expires_at,
         };
@@ -297,6 +352,10 @@ impl ActivationRequest {
             .completion
             .as_ref()
             .is_some_and(|completion| completion.applied_at < self.created_at)
+            || self
+                .termination
+                .as_ref()
+                .is_some_and(|termination| termination.at() < self.created_at)
         {
             return Err("activation decision timestamps are invalid".to_string());
         }
@@ -378,6 +437,7 @@ impl ActivationRequest {
                 if approval_count >= self.required_approvals
                     || self.rejection.is_some()
                     || self.completion.is_some()
+                    || self.termination.is_some()
                 {
                     return Err("pending activation state is invalid".to_string());
                 }
@@ -386,6 +446,7 @@ impl ActivationRequest {
                 if approval_count < self.required_approvals
                     || self.rejection.is_some()
                     || self.completion.is_some()
+                    || self.termination.is_some()
                 {
                     return Err("approved activation state is invalid".to_string());
                 }
@@ -394,6 +455,7 @@ impl ActivationRequest {
                 if approval_count < self.required_approvals
                     || self.rejection.is_some()
                     || self.completion.is_some()
+                    || self.termination.is_some()
                 {
                     return Err("applying activation state is invalid".to_string());
                 }
@@ -402,18 +464,53 @@ impl ActivationRequest {
                 if approval_count < self.required_approvals
                     || self.completion.is_none()
                     || self.rejection.is_some()
+                    || self.termination.is_some()
                 {
                     return Err("applied activation state is invalid".to_string());
                 }
             }
             ActivationRequestState::Rejected => {
-                if self.rejection.is_none() || self.completion.is_some() {
+                if self.rejection.is_none()
+                    || self.completion.is_some()
+                    || self.termination.is_some()
+                {
                     return Err("rejected activation state is invalid".to_string());
                 }
             }
             ActivationRequestState::Expired => {
-                if self.rejection.is_some() || self.completion.is_some() {
+                if self.rejection.is_some()
+                    || self.completion.is_some()
+                    || self.termination.is_some()
+                {
                     return Err("expired activation state is invalid".to_string());
+                }
+            }
+            ActivationRequestState::Superseded => {
+                if approval_count < self.required_approvals
+                    || self.rejection.is_some()
+                    || self.completion.is_some()
+                    || !matches!(
+                        self.termination,
+                        Some(ActivationTerminationV1::Superseded { .. })
+                    )
+                    || !matches!(
+                        self.approval_context,
+                        ActivationApprovalContextV1::ProductAuthoring { .. }
+                    )
+                    || !matches!(self.link_state, ActivationLinkStateV1::Linked { .. })
+                {
+                    return Err("superseded activation state is invalid".to_string());
+                }
+            }
+            ActivationRequestState::Withdrawn => {
+                if self.rejection.is_some()
+                    || self.completion.is_some()
+                    || !matches!(
+                        self.termination,
+                        Some(ActivationTerminationV1::Withdrawn { .. })
+                    )
+                {
+                    return Err("withdrawn activation state is invalid".to_string());
                 }
             }
         }
@@ -595,9 +692,10 @@ impl ActivationRequest {
             ActivationRequestState::Applying => Ok(self.in_progress(now)),
             ActivationRequestState::Applied => Ok(ClaimDecision::AlreadyApplied),
             ActivationRequestState::Expired => Ok(ClaimDecision::Expired),
-            ActivationRequestState::Pending | ActivationRequestState::Rejected => {
-                Ok(ClaimDecision::NotApproved)
-            }
+            ActivationRequestState::Pending
+            | ActivationRequestState::Rejected
+            | ActivationRequestState::Superseded
+            | ActivationRequestState::Withdrawn => Ok(ClaimDecision::NotApproved),
         }
     }
 
@@ -626,8 +724,66 @@ impl ActivationRequest {
             ActivationRequestState::Expired => Ok(ClaimDecision::Expired),
             ActivationRequestState::Pending
             | ActivationRequestState::Approved
-            | ActivationRequestState::Rejected => Ok(ClaimDecision::NotApproved),
+            | ActivationRequestState::Rejected
+            | ActivationRequestState::Superseded
+            | ActivationRequestState::Withdrawn => Ok(ClaimDecision::NotApproved),
         }
+    }
+
+    pub fn supersede_at(
+        &mut self,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.state != ActivationRequestState::Applying
+            || self.apply_attempt_id.as_ref() != Some(attempt_id)
+            || !matches!(
+                self.approval_context,
+                ActivationApprovalContextV1::ProductAuthoring { .. }
+            )
+            || !matches!(self.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return false;
+        }
+        self.state = ActivationRequestState::Superseded;
+        self.apply_attempt_id = None;
+        self.apply_lease_until = None;
+        self.last_apply_error = None;
+        self.termination = Some(ActivationTerminationV1::Superseded { at: now, reason });
+        true
+    }
+
+    pub fn withdraw_at(
+        &mut self,
+        by: UserId,
+        reason: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), WithdrawDecisionError> {
+        if self.expire_if_due(now) {
+            return Err(WithdrawDecisionError::Expired);
+        }
+        if matches!(
+            self.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) && !matches!(self.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return Err(WithdrawDecisionError::Unlinked);
+        }
+        if !matches!(
+            self.state,
+            ActivationRequestState::Pending | ActivationRequestState::Approved
+        ) {
+            return Err(WithdrawDecisionError::InvalidState);
+        }
+        self.state = ActivationRequestState::Withdrawn;
+        self.last_apply_error = None;
+        self.termination = Some(ActivationTerminationV1::Withdrawn {
+            at: now,
+            by,
+            reason,
+        });
+        Ok(())
     }
 
     pub fn renew_lease_at(

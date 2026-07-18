@@ -3,8 +3,9 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use automation_ruleset::{
-    PublishOutcome, PublishRuleSetRequest, RuleSetActivation, RuleSetKey, RuleSetStore,
-    RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
+    GuardedActivationOutcome, GuardedRuleSetActivation, PublishOutcome, PublishRuleSetRequest,
+    RuleSetActivation, RuleSetKey, RuleSetStore, RuleSetStoreError, RuleSetVersion,
+    RuleSetVersionId,
 };
 use automation_ruleset_activation::{
     approval_policy_digest_v1, product_approval_context_digest_v1, ActivationDigest,
@@ -15,6 +16,7 @@ use automation_ruleset_activation::{
     ApprovalBindingContextV1, ApprovalPolicyBindingV1, ApproveError, ClaimOutcome, CompletionKind,
     CreateActivationRequest, CreateProductActivationRequest, ExpectedActiveBaselineV1,
     LinkProductActivation, LinkProductError, ProductApprovalContextV1, RecoveryDisposition,
+    SupersessionReasonV1, WithdrawError,
 };
 use automation_ruleset_activation_postgres::{PostgresActivationRequestStore, MIGRATOR};
 use automation_ruleset_postgres::PostgresRuleSetStore;
@@ -211,6 +213,14 @@ impl RuleSetStore for CountingRuleSetStore {
         self.inner.activate(guild_id, ruleset_key, version).await
     }
 
+    async fn activate_guarded(
+        &self,
+        request: GuardedRuleSetActivation,
+    ) -> Result<GuardedActivationOutcome, RuleSetStoreError> {
+        self.activate_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.activate_guarded(request).await
+    }
+
     async fn active(
         &self,
         guild_id: GuildId,
@@ -224,6 +234,7 @@ struct ReadyProvider;
 
 fn ready_environment() -> ActivationEnvironment {
     ActivationEnvironment {
+        binding_revision: NonZeroU64::new(3),
         bindings: ResourceBindingMap::default(),
         guild_capabilities: GuildCapabilities {
             base_permissions: Permissions::ADMINISTRATOR,
@@ -336,6 +347,29 @@ async fn create_approved(
     let id = create_request(store, id, target, 1).await;
     approve(store, &id, 20).await;
     id
+}
+
+async fn create_approved_product(
+    store: &PostgresActivationRequestStore,
+    id_value: &str,
+    target: &RuleSetVersion,
+    promotion_value: char,
+) -> (ActivationRequestId, ProductApprovalContextV1) {
+    let id = request_id(id_value);
+    let context = product_context(&id, target, promotion_value);
+    store
+        .create_product(product_input(id.clone(), target, context.clone()))
+        .await
+        .unwrap();
+    store
+        .link_product(&id, product_link(&context))
+        .await
+        .unwrap();
+    store
+        .approve_bound(&id, UserId(20), &context.approval_payload_digest)
+        .await
+        .unwrap();
+    (id, context)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1008,6 +1042,23 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
     .execute(&pool)
     .await;
     assert!(unbound.is_err());
+    requests
+        .approve_bound(&first_id, UserId(20), &context.approval_payload_digest)
+        .await
+        .unwrap();
+    let unguarded_executor = sqlx::query(
+        "UPDATE activation_requests SET state = 'applying', apply_attempt_id = 'old_binary', \
+         apply_attempt_no = apply_attempt_no + 1, \
+         apply_lease_until = clock_timestamp() + INTERVAL '1 minute' WHERE id = $1",
+    )
+    .bind(first_id.as_str())
+    .execute(&pool)
+    .await;
+    assert!(unguarded_executor.is_err());
+    assert_eq!(
+        requests.get(&first_id).await.unwrap().unwrap().state,
+        ActivationRequestState::Approved
+    );
 
     let second_id = request_id("product_trigger_second");
     let mut duplicate_context = product_context(&second_id, &target, '3');
@@ -1027,5 +1078,106 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
         .create_product(product_input(second_id, &target, duplicate_context))
         .await
         .is_err());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baseline() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_018);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let first_target = publish(&rulesets, guild, 1).await;
+    let second_target = publish(&rulesets, guild, 2).await;
+    let (first_id, _) =
+        create_approved_product(&requests, "guarded_product_first", &first_target, '4').await;
+    let (second_id, _) =
+        create_approved_product(&requests, "guarded_product_second", &second_target, '5').await;
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    assert_eq!(
+        service
+            .apply(&first_id, attempt_id("guarded_product_a"), UserId(10))
+            .await
+            .unwrap(),
+        ApplyOutcome::Activated
+    );
+    let second = service
+        .apply(&second_id, attempt_id("guarded_product_b"), UserId(10))
+        .await
+        .unwrap();
+    assert!(matches!(
+        second,
+        ApplyOutcome::Superseded {
+            reason: SupersessionReasonV1::ActiveBaselineDrift { .. }
+        }
+    ));
+    assert_eq!(rulesets.activate_calls(), 1);
+    assert_eq!(
+        rulesets
+            .active(guild, &key())
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        first_target.version
+    );
+    let stored = requests.get(&second_id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActivationRequestState::Superseded);
+    assert_eq!(stored.approvals.len(), 1);
+    assert!(matches!(
+        service
+            .apply(&second_id, attempt_id("guarded_product_replay"), UserId(10))
+            .await
+            .unwrap(),
+        ApplyOutcome::Superseded { .. }
+    ));
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn withdrawal_is_terminal_durable_and_database_constrained() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_019);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = PostgresRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = create_request(&requests, "withdraw_durable", &target, 1).await;
+
+    let withdrawn = requests
+        .withdraw(&id, UserId(10), "changed".to_string())
+        .await
+        .unwrap();
+    assert_eq!(withdrawn.state, ActivationRequestState::Withdrawn);
+    assert_eq!(
+        requests
+            .withdraw(&id, UserId(10), "again".to_string())
+            .await
+            .unwrap_err(),
+        WithdrawError::InvalidState
+    );
+    assert_eq!(
+        requests
+            .claim_apply(&id, attempt_id("withdraw_claim"), 60)
+            .await
+            .unwrap(),
+        ClaimOutcome::NotApproved
+    );
+    assert_eq!(
+        requests.get(&id).await.unwrap().unwrap().state,
+        ActivationRequestState::Withdrawn
+    );
+
+    let invalid_terminal = sqlx::query(
+        "UPDATE activation_requests SET state = 'superseded', termination = NULL WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .execute(&pool)
+    .await;
+    assert!(invalid_terminal.is_err());
     cleanup(&pool, guild).await;
 }

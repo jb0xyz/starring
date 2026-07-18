@@ -9,6 +9,7 @@ use crate::model::{
     ActivationRequest, ActivationRequestState, ApplyErrorRecord, ApprovalDecisionError,
     ClaimDecision, Completion, CompletionKind, CreateActivationRequest,
     CreateProductActivationRequest, LinkDecisionError, RejectionDecisionError,
+    SupersessionReasonV1, WithdrawDecisionError,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -67,6 +68,28 @@ pub enum RejectError {
     Expired,
     #[error(transparent)]
     Store(#[from] ActivationStoreError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawError {
+    #[error("product activation request is not linked")]
+    Unlinked,
+    #[error("activation request cannot be withdrawn from its current state")]
+    InvalidState,
+    #[error("activation request is expired")]
+    Expired,
+    #[error(transparent)]
+    Store(#[from] ActivationStoreError),
+}
+
+impl From<WithdrawDecisionError> for WithdrawError {
+    fn from(error: WithdrawDecisionError) -> Self {
+        match error {
+            WithdrawDecisionError::Unlinked => Self::Unlinked,
+            WithdrawDecisionError::InvalidState => Self::InvalidState,
+            WithdrawDecisionError::Expired => Self::Expired,
+        }
+    }
 }
 
 impl From<RejectionDecisionError> for RejectError {
@@ -223,6 +246,12 @@ pub trait ActivationRequestStore {
         rejected_by: UserId,
         reason: String,
     ) -> Result<ActivationRequest, RejectError>;
+    async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError>;
     async fn claim_apply(
         &self,
         request_id: &ActivationRequestId,
@@ -254,6 +283,12 @@ pub trait ActivationRequestStore {
         request_id: &ActivationRequestId,
         attempt_id: &ApplyAttemptId,
         error: ApplyErrorRecord,
+    ) -> Result<bool, ActivationStoreError>;
+    async fn supersede_applying(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
     ) -> Result<bool, ActivationStoreError>;
     async fn mark_expired(
         &self,
@@ -412,6 +447,25 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         Ok(request.clone())
     }
 
+    async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError> {
+        let mut requests = self.requests.lock().unwrap();
+        let mut candidate = requests
+            .get(request_id)
+            .cloned()
+            .ok_or(ActivationStoreError::NotFound)?;
+        candidate.withdraw_at(withdrawn_by, reason, self.clock.now())?;
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate.clone());
+        Ok(candidate)
+    }
+
     async fn claim_apply(
         &self,
         request_id: &ActivationRequestId,
@@ -531,6 +585,26 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
             return Ok(false);
         };
         if !candidate.release_at(attempt_id, error) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
+    }
+
+    async fn supersede_applying(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
+    ) -> Result<bool, ActivationStoreError> {
+        let mut requests = self.requests.lock().unwrap();
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.supersede_at(attempt_id, reason, self.clock.now()) {
             return Ok(false);
         }
         candidate
