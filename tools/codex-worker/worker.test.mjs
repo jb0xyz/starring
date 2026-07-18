@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   DISABLED_CODEX_FEATURES,
@@ -111,7 +120,7 @@ function sortedKeys(value) {
 }
 
 async function responseJson(base, path, options = {}) {
-  const headers = {};
+  const headers = { ...options.headers };
   if (options.token !== null) {
     headers.authorization = `Bearer ${options.token ?? TOKEN}`;
   }
@@ -145,6 +154,7 @@ async function createFixture(options = {}) {
     metricsBackups: options.metricsBackups,
     instanceId: options.instanceId ?? "test-worker-instance",
     workerSourceSha256: options.workerSourceSha256 ?? "a".repeat(64),
+    timelineClock: options.timelineClock,
   });
   const protocol = "http:";
   const base = `${protocol}/${"/"}${worker.address.address}:${worker.address.port}`;
@@ -170,6 +180,20 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   }
 }
 
+async function waitForMetricsHealth(fixture, predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const response = await responseJson(fixture.base, "/metrics-health");
+    if (response.status === 200 && predicate(response.body)) {
+      return response.body;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("metrics_health_timeout");
+    }
+    await delay(5);
+  }
+}
+
 function deferred() {
   let resolvePromise;
   const promise = new Promise((resolveValue) => {
@@ -182,13 +206,33 @@ function delay(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-function completionFetch(base, signal) {
+async function metricRecords(fixture) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await fixture.worker.metrics.flush();
+    try {
+      const log = (await readFile(fixture.metricsPath, "utf8")).trim();
+      return log.length === 0 ? [] : log.split("\n").map((line) => JSON.parse(line));
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    await delay(5);
+  }
+  throw new Error("metrics_not_written");
+}
+
+function completionFetch(base, signal, observationId = null) {
+  const headers = {
+    authorization: `Bearer ${TOKEN}`,
+    "content-type": "application/json",
+  };
+  if (observationId !== null) {
+    headers["x-starring-observation-id"] = observationId;
+  }
   return fetch(`${base}/v1/frontier-completions`, {
     method: "POST",
-    headers: {
-      authorization: `Bearer ${TOKEN}`,
-      "content-type": "application/json",
-    },
+    headers,
     body: JSON.stringify(completionRequest()),
     signal,
   });
@@ -210,6 +254,16 @@ test("health is authenticated, exact, and loopback only", async () => {
     const missing = await responseJson(fixture.base, "/health", { token: null });
     assert.equal(missing.status, 401);
     assert.deepEqual(missing.body, { error: { code: "unauthorized" } });
+    const missingMetrics = await responseJson(fixture.base, "/metrics-health", { token: null });
+    assert.equal(missingMetrics.status, 401);
+    assert.deepEqual(missingMetrics.body, { error: { code: "unauthorized" } });
+    const missingAdmission = await responseJson(
+      fixture.base,
+      "/request-admission?observation_id=11111111-1111-4111-8111-111111111111",
+      { token: null },
+    );
+    assert.equal(missingAdmission.status, 401);
+    assert.deepEqual(missingAdmission.body, { error: { code: "unauthorized" } });
 
     const health = await responseJson(fixture.base, "/health");
     assert.equal(health.status, 200);
@@ -249,7 +303,123 @@ test("health is authenticated, exact, and loopback only", async () => {
       accepted_requests_total: 0,
       settled_requests_total: 0,
     });
+    const metricsHealth = await responseJson(fixture.base, "/metrics-health");
+    assert.equal(metricsHealth.status, 200);
+    assert.deepEqual(metricsHealth.body, {
+      schema_version: 1,
+      instance_id: "test-worker-instance",
+      worker_source_sha256: "a".repeat(64),
+      status: "ok",
+      writable_verified: true,
+      records_attempted: 0,
+      records_written: 0,
+      pending_records: 0,
+      write_failures_total: 0,
+      last_error_code: null,
+    });
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("request-correlated admission is exact, bounded, and collision safe", async () => {
+  const gate = deferred();
+  const firstId = "11111111-1111-4111-8111-111111111111";
+  const secondId = "22222222-2222-4222-8222-222222222222";
+  const unknownId = "33333333-3333-4333-8333-333333333333";
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 1,
+    runner: fakeRunner({
+      complete: async () => {
+        await gate.promise;
+        return runnerResult();
+      },
+    }),
+  });
+  try {
+    const first = completionFetch(fixture.base, undefined, firstId);
+    await waitFor(() => fixture.worker.stats().active === 1);
+    const active = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${firstId}`,
+    );
+    assert.equal(active.status, 200);
+    assert.deepEqual(sortedKeys(active.body), [
+      "observation_id",
+      "request_id",
+      "schema_version",
+      "status",
+    ]);
+    assert.equal(active.body.schema_version, 1);
+    assert.equal(active.body.observation_id, firstId);
+    assert.equal(active.body.status, "active");
+    assert.match(
+      active.body.request_id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+
+    const second = completionFetch(fixture.base, undefined, secondId);
+    await waitFor(() => fixture.worker.stats().queued === 1);
+    const queued = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${secondId}`,
+    );
+    assert.equal(queued.status, 200);
+    assert.equal(queued.body.observation_id, secondId);
+    assert.equal(queued.body.status, "queued");
+    assert.notEqual(queued.body.request_id, active.body.request_id);
+
+    const unknown = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${unknownId}`,
+    );
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(unknown.body, { error: { code: "admission_not_found" } });
+    const malformed = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${unknownId}&observation_id=${firstId}`,
+    );
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(malformed.body, { error: { code: "invalid_admission_query" } });
+    const invalidHeader = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": "unsafe/value" },
+      body: completionRequest(),
+    });
+    assert.equal(invalidHeader.status, 400);
+    assert.deepEqual(invalidHeader.body, { error: { code: "invalid_observation_id" } });
+    const collision = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": firstId },
+      body: completionRequest(),
+    });
+    assert.equal(collision.status, 409);
+    assert.deepEqual(collision.body, { error: { code: "observation_id_collision" } });
+
+    gate.resolve();
+    assert.deepEqual(
+      (await Promise.all([first, second])).map((response) => response.status),
+      [200, 200],
+    );
+    const released = await responseJson(
+      fixture.base,
+      `/request-admission?observation_id=${firstId}`,
+    );
+    assert.equal(released.status, 404);
+    assert.deepEqual(released.body, { error: { code: "admission_not_found" } });
+    const recentReuse = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      headers: { "x-starring-observation-id": firstId },
+      body: completionRequest(),
+    });
+    assert.equal(recentReuse.status, 409);
+    assert.deepEqual(recentReuse.body, { error: { code: "observation_id_collision" } });
+    const health = await responseJson(fixture.base, "/health");
+    assert.equal(health.body.accepted_requests_total, 2);
+    assert.equal(health.body.settled_requests_total, 2);
+  } finally {
+    gate.resolve();
     await fixture.cleanup();
   }
 });
@@ -305,7 +475,9 @@ test("request identity and sole frontier shape fail closed", async () => {
 
 test("successful completion returns the exact native envelope", async () => {
   const calls = [];
+  const ticks = [100, 105, 120, 122].map((value) => BigInt(value) * 1_000_000n);
   const fixture = await createFixture({
+    timelineClock: () => ticks.shift(),
     runner: fakeRunner({
       complete: async (input) => {
         calls.push(input);
@@ -362,6 +534,69 @@ test("successful completion returns the exact native envelope", async () => {
     assert.equal(health.body.settled_requests_total, 1);
     assert.equal(health.body.active_requests, 0);
     assert.equal(health.body.queued_requests, 0);
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.deepEqual(sortedKeys(records[0]), [
+      "active_at_admission",
+      "concurrency_limit",
+      "duration_ms",
+      "error_code",
+      "frontier_name",
+      "instance_id",
+      "metric_schema_version",
+      "model",
+      "outcome",
+      "post_runner_ms",
+      "provider",
+      "queue_capacity",
+      "queue_wait_ms",
+      "queued_at_admission",
+      "reasoning_effort",
+      "request_id",
+      "request_timeout_ms",
+      "result_validation_started",
+      "runner_duration_ms",
+      "runner_elapsed_at_terminal_ms",
+      "runner_outcome",
+      "runner_settled",
+      "runner_started",
+      "status_code",
+      "terminal_stage",
+      "timestamp",
+      "total_duration_ms",
+      "usage",
+      "worker_source_sha256",
+    ]);
+    assert.equal(records[0].metric_schema_version, 2);
+    assert.equal(records[0].request_id, result.body.request_id);
+    assert.equal(records[0].instance_id, "test-worker-instance");
+    assert.equal(records[0].worker_source_sha256, "a".repeat(64));
+    assert.equal(records[0].concurrency_limit, 2);
+    assert.equal(records[0].queue_capacity, 8);
+    assert.equal(records[0].request_timeout_ms, 55_000);
+    assert.equal(records[0].active_at_admission, 0);
+    assert.equal(records[0].queued_at_admission, 0);
+    assert.equal(records[0].queue_wait_ms, 5);
+    assert.equal(records[0].runner_duration_ms, 15);
+    assert.equal(records[0].runner_elapsed_at_terminal_ms, null);
+    assert.equal(records[0].post_runner_ms, 2);
+    assert.equal(records[0].total_duration_ms, 22);
+    assert.equal(records[0].runner_started, true);
+    assert.equal(records[0].runner_settled, true);
+    assert.equal(records[0].runner_outcome, "resolved");
+    assert.equal(records[0].result_validation_started, true);
+    assert.equal(records[0].terminal_stage, "completed");
+    assert.equal(records[0].duration_ms, result.body.duration_ms);
+    assert.deepEqual(records[0].usage, result.body.usage);
+    const metricsHealth = await waitForMetricsHealth(
+      fixture,
+      (body) => body.records_written === 1 && body.pending_records === 0,
+    );
+    assert.equal(metricsHealth.status, "ok");
+    assert.equal(metricsHealth.records_attempted, 1);
+    assert.equal(metricsHealth.write_failures_total, 0);
+    assert.equal((await stat(dirname(fixture.metricsPath))).mode & 0o777, 0o700);
+    assert.equal((await stat(fixture.metricsPath)).mode & 0o777, 0o600);
   } finally {
     await fixture.cleanup();
   }
@@ -380,6 +615,14 @@ test("runner identity mismatch is never relabeled as Luna", async () => {
     });
     assert.equal(result.status, 502);
     assert.deepEqual(result.body, { error: { code: "provider_identity_mismatch" } });
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].terminal_stage, "result_validation");
+    assert.equal(records[0].runner_started, true);
+    assert.equal(records[0].runner_settled, true);
+    assert.equal(records[0].runner_outcome, "resolved");
+    assert.equal(records[0].result_validation_started, true);
+    assert.equal(records[0].usage, null);
   } finally {
     await fixture.cleanup();
   }
@@ -431,6 +674,15 @@ test("bounded queue rejects overflow without retrying", async () => {
     assert.equal(overflow.status, 429);
     assert.deepEqual(overflow.body, { error: { code: "queue_full" } });
     assert.equal(calls, 2);
+    const overflowRecords = await metricRecords(fixture);
+    assert.equal(overflowRecords.length, 1);
+    assert.equal(overflowRecords[0].error_code, "queue_full");
+    assert.equal(overflowRecords[0].terminal_stage, "admission");
+    assert.equal(overflowRecords[0].active_at_admission, 2);
+    assert.equal(overflowRecords[0].queued_at_admission, 1);
+    assert.equal(overflowRecords[0].queue_wait_ms, 0);
+    assert.equal(overflowRecords[0].runner_started, false);
+    assert.equal(overflowRecords[0].runner_duration_ms, null);
     const rejectedHealth = await responseJson(fixture.base, "/health");
     assert.equal(rejectedHealth.body.accepted_requests_total, 4);
     assert.equal(rejectedHealth.body.settled_requests_total, 1);
@@ -481,6 +733,12 @@ test("queued deadline removes stale work without calling the runner", async () =
     assert.equal(expired.status, 504);
     assert.deepEqual(expired.body, { error: { code: "codex_timeout" } });
     assert.equal(calls, 1);
+    const expiredRecords = await metricRecords(fixture);
+    assert.equal(expiredRecords.length, 1);
+    assert.equal(expiredRecords[0].terminal_stage, "queue");
+    assert.equal(expiredRecords[0].runner_started, false);
+    assert.equal(expiredRecords[0].runner_duration_ms, null);
+    assert.equal(expiredRecords[0].queue_wait_ms, expiredRecords[0].total_duration_ms);
     assert.deepEqual(fixture.worker.stats(), { active: 1, queued: 0 });
     const staleHealth = await responseJson(fixture.base, "/health");
     assert.equal(staleHealth.body.accepted_requests_total, 2);
@@ -578,6 +836,13 @@ test("queued client disconnect removes work without calling the runner", async (
     await assert.rejects(queued);
     await waitFor(() => fixture.worker.stats().queued === 0);
     assert.equal(calls, 1);
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].status_code, 499);
+    assert.equal(records[0].error_code, "client_disconnected");
+    assert.equal(records[0].terminal_stage, "queue");
+    assert.equal(records[0].runner_started, false);
+    assert.equal(records[0].queue_wait_ms, records[0].total_duration_ms);
     const disconnectedHealth = await responseJson(fixture.base, "/health");
     assert.equal(disconnectedHealth.body.accepted_requests_total, 2);
     assert.equal(disconnectedHealth.body.settled_requests_total, 1);
@@ -619,12 +884,48 @@ test("active client disconnect aborts the runner and leaves the worker responsiv
     controller.abort();
     await assert.rejects(active);
     await waitFor(() => aborts === 1 && fixture.worker.stats().active === 0);
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].status_code, 499);
+    assert.equal(records[0].error_code, "client_disconnected");
+    assert.equal(records[0].terminal_stage, "runner");
+    assert.equal(records[0].runner_started, true);
+    assert.equal(records[0].runner_settled, true);
     const health = await responseJson(fixture.base, "/health");
     assert.equal(health.status, 200);
     assert.equal(health.body.active_requests, 0);
     assert.equal(health.body.queued_requests, 0);
     assert.equal(health.body.accepted_requests_total, 1);
     assert.equal(health.body.settled_requests_total, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("graceful close waits for a disconnected handler terminal metric", async () => {
+  const started = deferred();
+  const fixture = await createFixture({
+    concurrency: 1,
+    runner: fakeRunner({
+      complete: async ({ signal }) => new Promise((resolvePromise, rejectPromise) => {
+        const aborted = () => rejectPromise(new Error("aborted"));
+        signal.addEventListener("abort", aborted, { once: true });
+        started.resolve();
+      }),
+    }),
+  });
+  try {
+    const controller = new AbortController();
+    const active = completionFetch(fixture.base, controller.signal);
+    await started.promise;
+    controller.abort();
+    const closing = fixture.worker.close();
+    await assert.rejects(active);
+    await closing;
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].error_code, "client_disconnected");
+    assert.equal(records[0].terminal_stage, "runner");
   } finally {
     await fixture.cleanup();
   }
@@ -646,6 +947,12 @@ test("timeout and runner failure map to bounded transport errors", async () => {
     });
     assert.equal(timeout.status, 504);
     assert.deepEqual(timeout.body, { error: { code: "codex_timeout" } });
+    const timedRecords = await metricRecords(timed);
+    assert.equal(timedRecords.length, 1);
+    assert.equal(timedRecords[0].terminal_stage, "runner");
+    assert.equal(timedRecords[0].runner_started, true);
+    assert.equal(timedRecords[0].runner_settled, true);
+    assert.equal(timedRecords[0].runner_outcome, "rejected");
     const health = await responseJson(timed.base, "/health");
     assert.equal(health.body.accepted_requests_total, 1);
     assert.equal(health.body.settled_requests_total, 1);
@@ -669,6 +976,11 @@ test("timeout and runner failure map to bounded transport errors", async () => {
     });
     assert.equal(failure.status, 502);
     assert.deepEqual(failure.body, { error: { code: "runner_failure" } });
+    const failedRecords = await metricRecords(failed);
+    assert.equal(failedRecords.length, 1);
+    assert.equal(failedRecords[0].terminal_stage, "runner");
+    assert.equal(failedRecords[0].runner_outcome, "rejected");
+    assert.equal(failedRecords[0].usage, null);
     const health = await responseJson(failed.base, "/health");
     assert.equal(health.body.accepted_requests_total, 1);
     assert.equal(health.body.settled_requests_total, 1);
@@ -676,6 +988,53 @@ test("timeout and runner failure map to bounded transport errors", async () => {
     assert.equal(health.body.queued_requests, 0);
   } finally {
     await failed.cleanup();
+  }
+});
+
+test("timeout keeps an ignored-abort runner duration censored until counters settle", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const fixture = await createFixture({
+    concurrency: 1,
+    maxQueue: 0,
+    timeoutMs: 25,
+    runner: fakeRunner({
+      complete: async () => {
+        calls += 1;
+        await gate.promise;
+        return runnerResult();
+      },
+    }),
+  });
+  try {
+    const result = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    assert.equal(result.status, 504);
+    assert.deepEqual(result.body, { error: { code: "codex_timeout" } });
+    assert.equal(calls, 1);
+    const records = await metricRecords(fixture);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].terminal_stage, "runner");
+    assert.equal(records[0].runner_started, true);
+    assert.equal(records[0].runner_settled, false);
+    assert.equal(records[0].runner_outcome, null);
+    assert.equal(records[0].runner_duration_ms, null);
+    assert.ok(records[0].runner_elapsed_at_terminal_ms >= 2_500);
+    assert.equal(fixture.worker.stats().active, 1);
+    const activeHealth = await responseJson(fixture.base, "/health");
+    assert.equal(activeHealth.body.accepted_requests_total, 1);
+    assert.equal(activeHealth.body.settled_requests_total, 0);
+    gate.resolve();
+    await waitFor(() => fixture.worker.stats().active === 0);
+    const settledHealth = await responseJson(fixture.base, "/health");
+    assert.equal(settledHealth.body.accepted_requests_total, 1);
+    assert.equal(settledHealth.body.settled_requests_total, 1);
+    assert.equal((await metricRecords(fixture)).length, 1);
+  } finally {
+    gate.resolve();
+    await fixture.cleanup();
   }
 });
 
@@ -747,6 +1106,90 @@ test("metrics rotate as bounded JSONL files", async () => {
   assert.equal(JSON.parse(current).outcome, "succeeded");
   assert.equal(JSON.parse(rotated).outcome, "succeeded");
   await rm(fixture.directory, { recursive: true, force: true });
+});
+
+test("runtime metrics write failure is observable without changing completion output", async () => {
+  const fixture = await createFixture();
+  try {
+    const metricsDirectory = dirname(fixture.metricsPath);
+    await rm(metricsDirectory, { recursive: true, force: true });
+    await writeFile(metricsDirectory, "blocked", { mode: 0o600 });
+    const result = await responseJson(fixture.base, "/v1/frontier-completions", {
+      method: "POST",
+      body: completionRequest(),
+    });
+    assert.equal(result.status, 200);
+    const metricsHealth = await waitForMetricsHealth(
+      fixture,
+      (body) => body.write_failures_total === 1 && body.pending_records === 0,
+    );
+    assert.deepEqual(metricsHealth, {
+      schema_version: 1,
+      instance_id: "test-worker-instance",
+      worker_source_sha256: "a".repeat(64),
+      status: "degraded",
+      writable_verified: true,
+      records_attempted: 1,
+      records_written: 0,
+      pending_records: 0,
+      write_failures_total: 1,
+      last_error_code: "metrics_write_failed",
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("startup fails closed when the metrics destination is unavailable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-metrics-test-"));
+  const blocker = join(directory, "blocker");
+  await writeFile(blocker, "blocked", { mode: 0o600 });
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath: join(blocker, "worker.jsonl"),
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("metrics startup rejects unsafe existing directories without changing permissions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-mode-test-"));
+  const shared = join(directory, "shared");
+  await mkdir(shared, { mode: 0o755 });
+  await chmod(shared, 0o755);
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath: join(shared, "worker.jsonl"),
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  assert.equal((await stat(shared)).mode & 0o777, 0o755);
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("metrics startup rejects a symbolic-link destination", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "starring-codex-worker-link-test-"));
+  const target = join(directory, "target.jsonl");
+  const metricsPath = join(directory, "metrics.jsonl");
+  await writeFile(target, "", { mode: 0o600 });
+  await symlink(target, metricsPath);
+  await assert.rejects(
+    startWorker({
+      token: TOKEN,
+      port: 0,
+      runner: fakeRunner(),
+      metricsPath,
+    }),
+    (error) => error.code === "metrics_unavailable" && error.status === 503,
+  );
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("startup requires verified ChatGPT login identity", async () => {

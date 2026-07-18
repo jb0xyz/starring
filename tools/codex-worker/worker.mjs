@@ -4,6 +4,11 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  AdmissionRegistry,
+  requestObservationId,
+  validateObservationId,
+} from "./admission-registry.mjs";
 import { createCodexRunner, readKeychainToken } from "./codex-runner.mjs";
 import { MetricsLog } from "./metrics-log.mjs";
 import {
@@ -18,6 +23,8 @@ import {
   validateCompletionRequest,
   validateRunnerResult,
 } from "./protocol.mjs";
+import { RequestTimeline } from "./request-timeline.mjs";
+import { RequestCounters, Scheduler, abortReason } from "./scheduler.mjs";
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 18_181;
@@ -26,9 +33,12 @@ const DEFAULT_QUEUE = 8;
 const DEFAULT_TIMEOUT_MS = 55_000;
 const DEFAULT_MAX_BODY_BYTES = 2_000_000;
 const SOURCE_FILES = [
+  "admission-registry.mjs",
   "codex-runner.mjs",
   "metrics-log.mjs",
   "protocol.mjs",
+  "request-timeline.mjs",
+  "scheduler.mjs",
   "worker.mjs",
 ];
 
@@ -41,155 +51,6 @@ export async function workerSourceSha256() {
     digest.update(content);
   }
   return digest.digest("hex");
-}
-
-class Scheduler {
-  constructor(concurrency, maxQueue) {
-    this.concurrency = concurrency;
-    this.maxQueue = maxQueue;
-    this.active = 0;
-    this.queue = [];
-    this.accepting = true;
-    this.idleWaiters = [];
-  }
-
-  submit(task, signal) {
-    if (!this.accepting) {
-      return Promise.reject(new WorkerError("worker_shutting_down", 503));
-    }
-    if (signal?.aborted) {
-      return Promise.reject(abortReason(signal));
-    }
-    if (this.active < this.concurrency) {
-      return this.start(task, signal);
-    }
-    if (this.queue.length >= this.maxQueue) {
-      return Promise.reject(new WorkerError("queue_full", 429));
-    }
-    return new Promise((resolvePromise, rejectPromise) => {
-      const entry = {
-        task,
-        resolvePromise,
-        rejectPromise,
-        signal,
-        abort: null,
-      };
-      entry.abort = () => {
-        const index = this.queue.indexOf(entry);
-        if (index === -1) {
-          return;
-        }
-        this.queue.splice(index, 1);
-        this.detach(entry);
-        rejectPromise(abortReason(signal));
-        this.resolveIdle();
-      };
-      signal?.addEventListener("abort", entry.abort, { once: true });
-      this.queue.push(entry);
-    });
-  }
-
-  start(task, signal) {
-    this.active += 1;
-    return Promise.resolve()
-      .then(() => {
-        if (signal?.aborted) {
-          throw abortReason(signal);
-        }
-        return task();
-      })
-      .finally(() => this.release());
-  }
-
-  release() {
-    this.active -= 1;
-    let next = this.queue.shift();
-    while (next?.signal?.aborted) {
-      this.detach(next);
-      next.rejectPromise(abortReason(next.signal));
-      next = this.queue.shift();
-    }
-    if (next !== undefined) {
-      this.detach(next);
-      this.start(next.task, next.signal).then(next.resolvePromise, next.rejectPromise);
-      return;
-    }
-    this.resolveIdle();
-  }
-
-  stop() {
-    this.accepting = false;
-    const queued = this.queue.splice(0);
-    queued.forEach((entry) => {
-      this.detach(entry);
-      entry.rejectPromise(new WorkerError("worker_shutting_down", 503));
-    });
-    this.resolveIdle();
-  }
-
-  idle() {
-    if (this.active === 0 && this.queue.length === 0) {
-      return Promise.resolve();
-    }
-    return new Promise((resolvePromise) => this.idleWaiters.push(resolvePromise));
-  }
-
-  detach(entry) {
-    entry.signal?.removeEventListener("abort", entry.abort);
-  }
-
-  resolveIdle() {
-    if (this.active !== 0 || this.queue.length !== 0) {
-      return;
-    }
-    const waiters = this.idleWaiters.splice(0);
-    waiters.forEach((resolvePromise) => resolvePromise());
-  }
-}
-
-class RequestCounters {
-  constructor() {
-    this.accepted = 0;
-    this.settled = 0;
-  }
-
-  submit(scheduler, task, signal) {
-    if (this.accepted === Number.MAX_SAFE_INTEGER) {
-      return Promise.reject(new WorkerError("request_counter_exhausted", 503));
-    }
-    this.accepted += 1;
-    let submitted;
-    try {
-      submitted = scheduler.submit(task, signal);
-    } catch (error) {
-      this.settled += 1;
-      throw error;
-    }
-    return Promise.resolve(submitted).finally(() => {
-      this.settled += 1;
-    });
-  }
-
-  snapshot(active, queued) {
-    if (!Number.isSafeInteger(this.accepted)
-      || !Number.isSafeInteger(this.settled)
-      || this.accepted < 0
-      || this.settled < 0
-      || this.settled > this.accepted
-      || this.accepted - this.settled !== active + queued) {
-      throw new WorkerError("invalid_request_counters", 500);
-    }
-    return {
-      accepted: this.accepted,
-      settled: this.settled,
-    };
-  }
-}
-
-function abortReason(signal) {
-  return signal?.reason instanceof WorkerError
-    ? signal.reason
-    : new WorkerError("client_disconnected", 499);
 }
 
 function json(response, status, value) {
@@ -236,6 +97,24 @@ function authorized(request, token) {
   const presentedBytes = Buffer.from(presented);
   return expectedBytes.length === presentedBytes.length
     && timingSafeEqual(expectedBytes, presentedBytes);
+}
+
+function admissionQueryObservationId(request) {
+  let url;
+  try {
+    url = new URL(request.url, "http://127.0.0.1");
+  } catch {
+    return null;
+  }
+  if (url.pathname !== "/request-admission") {
+    return null;
+  }
+  const values = url.searchParams.getAll("observation_id");
+  if (values.length !== 1
+    || [...url.searchParams.keys()].some((key) => key !== "observation_id")) {
+    throw new WorkerError("invalid_admission_query", 400);
+  }
+  return validateObservationId(values[0]);
 }
 
 async function readJsonBody(request, maxBytes) {
@@ -359,18 +238,67 @@ async function resolveToken(options) {
 
 function metricRecord(input) {
   return {
+    metric_schema_version: 2,
     timestamp: new Date().toISOString(),
     request_id: input.requestId,
+    instance_id: input.identity.instance_id,
+    worker_source_sha256: input.identity.worker_source_sha256,
     provider: PROVIDER,
     model: MODEL,
     reasoning_effort: REASONING_EFFORT,
+    concurrency_limit: input.concurrency,
+    queue_capacity: input.maxQueue,
+    request_timeout_ms: input.timeoutMs,
     frontier_name: input.frontierName,
     outcome: input.outcome,
     status_code: input.status,
     duration_ms: input.durationMs,
+    ...input.timeline,
     usage: input.usage ?? null,
     error_code: input.errorCode ?? null,
   };
+}
+
+function scheduleCompletion(input) {
+  const activeBefore = input.scheduler.active;
+  const queuedBefore = input.scheduler.queue.length;
+  input.timeline.admit(activeBefore, queuedBefore);
+  let submitted;
+  try {
+    submitted = input.counters.submit(input.scheduler, async () => {
+      input.admissions.activate(input.observationId);
+      input.timeline.runnerStarted();
+      try {
+        const result = await input.runner.complete({
+          requestId: input.requestId,
+          model: MODEL,
+          reasoningEffort: REASONING_EFFORT,
+          messages: input.body.messages,
+          frontier: input.body.frontier,
+          signal: input.signal,
+        });
+        input.timeline.runnerSettled("resolved");
+        return result;
+      } catch (error) {
+        input.timeline.runnerSettled("rejected");
+        throw error;
+      }
+    }, input.signal);
+  } catch (error) {
+    input.timeline.submissionObserved(input.scheduler.active, input.scheduler.queue.length);
+    throw error;
+  }
+  const activeAfter = input.scheduler.active;
+  const queuedAfter = input.scheduler.queue.length;
+  input.timeline.submissionObserved(activeAfter, queuedAfter);
+  if (activeAfter > activeBefore) {
+    input.admissions.admit(input.observationId, "active");
+  } else if (queuedAfter > queuedBefore) {
+    input.admissions.admit(input.observationId, "queued");
+  }
+  return Promise.resolve(submitted).finally(() => {
+    input.admissions.release(input.observationId);
+  });
 }
 
 async function listen(server, port) {
@@ -459,6 +387,7 @@ export async function startWorker(options = {}) {
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
   const counters = new RequestCounters();
+  const admissions = new AdmissionRegistry({ ttlMs: timeoutMs + 5_000 });
   const logPath = options.metricsPath
     ?? process.env.STARRING_CODEX_WORKER_METRICS_LOG
     ?? join(homedir(), "Library", "Logs", "Starring", "codex-worker.jsonl");
@@ -466,10 +395,32 @@ export async function startWorker(options = {}) {
     maxBytes: options.metricsMaxBytes,
     backups: options.metricsBackups,
   });
+  try {
+    await metrics.verifyWritable();
+  } catch {
+    throw new WorkerError("metrics_unavailable", 503);
+  }
 
-  const server = createServer(async (request, response) => {
+  const handlers = new Set();
+  const handleRequest = async (request, response) => {
     if (!authorized(request, token)) {
       json(response, 401, { error: { code: "unauthorized" } });
+      return;
+    }
+    let admissionObservationId;
+    try {
+      admissionObservationId = admissionQueryObservationId(request);
+    } catch (error) {
+      errorResponse(response, error);
+      return;
+    }
+    if (request.method === "GET" && admissionObservationId !== null) {
+      const admission = admissions.lookup(admissionObservationId);
+      if (admission === null) {
+        errorResponse(response, new WorkerError("admission_not_found", 404));
+      } else {
+        json(response, 200, admission);
+      }
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
@@ -486,35 +437,60 @@ export async function startWorker(options = {}) {
       ));
       return;
     }
+    if (request.method === "GET" && request.url === "/metrics-health") {
+      json(response, 200, {
+        schema_version: 1,
+        instance_id: identity.instance_id,
+        worker_source_sha256: identity.worker_source_sha256,
+        ...metrics.snapshot(),
+      });
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/v1/frontier-completions") {
       json(response, 404, { error: { code: "not_found" } });
       return;
     }
     let body;
+    let observationId;
     try {
       body = validateCompletionRequest(await readJsonBody(request, maxBodyBytes));
+      observationId = requestObservationId(request);
     } catch (error) {
       errorResponse(response, error);
       return;
     }
     const requestId = randomUUID();
+    try {
+      if (observationId !== null) {
+        admissions.reserve(observationId, requestId);
+      }
+    } catch (error) {
+      errorResponse(response, error);
+      return;
+    }
     const started = Date.now();
+    const timeline = new RequestTimeline({ clock: options.timelineClock });
     const disconnect = watchDisconnect(request, response);
     try {
       const result = await withTimeout(
-        (signal) => counters.submit(scheduler, () => runner.complete({
+        (signal) => scheduleCompletion({
+          admissions,
+          body,
+          counters,
           requestId,
-          model: MODEL,
-          reasoningEffort: REASONING_EFFORT,
-          messages: body.messages,
-          frontier: body.frontier,
+          runner,
+          scheduler,
           signal,
-        }), signal),
+          timeline,
+          observationId,
+        }),
         timeoutMs,
         disconnect.signal,
       );
+      timeline.resultValidationStarted();
       validateRunnerResult(result, identity);
       const durationMs = Date.now() - started;
+      const timing = timeline.finish("completed");
       if (!disconnect.signal.aborted) {
         json(
           response,
@@ -523,30 +499,47 @@ export async function startWorker(options = {}) {
         );
       }
       await metrics.record(metricRecord({
+        concurrency,
         requestId,
+        identity,
         frontierName: body.frontier.name,
+        maxQueue,
         outcome: "succeeded",
         status: 200,
         durationMs,
+        timeline: timing,
+        timeoutMs,
         usage: result.usage,
       }));
     } catch (error) {
       const durationMs = Date.now() - started;
       const failure = errorDetails(error);
+      const timing = timeline.finish(timeline.failureStage());
       if (!disconnect.signal.aborted) {
         json(response, failure.status, { error: { code: failure.code } });
       }
       await metrics.record(metricRecord({
+        concurrency,
         requestId,
+        identity,
         frontierName: body.frontier.name,
+        maxQueue,
         outcome: "failed",
         status: failure.status,
         durationMs,
+        timeline: timing,
+        timeoutMs,
         errorCode: failure.code,
       }));
     } finally {
+      admissions.release(observationId);
       disconnect.cleanup();
     }
+  };
+  const server = createServer((request, response) => {
+    const handling = handleRequest(request, response);
+    handlers.add(handling);
+    handling.finally(() => handlers.delete(handling)).catch(() => {});
   });
   server.requestTimeout = DEFAULT_TIMEOUT_MS + 5_000;
   server.headersTimeout = 10_000;
@@ -563,10 +556,12 @@ export async function startWorker(options = {}) {
       return closePromise;
     }
     scheduler.stop();
-    closePromise = Promise.all([
-      new Promise((resolvePromise) => server.close(() => resolvePromise())),
-      scheduler.idle(),
-    ]).then(() => metrics.flush());
+    closePromise = (async () => {
+      await new Promise((resolvePromise) => server.close(() => resolvePromise()));
+      await Promise.allSettled([...handlers]);
+      await scheduler.idle();
+      await metrics.flush();
+    })();
     return closePromise;
   };
   return {

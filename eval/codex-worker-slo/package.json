@@ -1,0 +1,14 @@
+{
+  "name": "starring-codex-worker-slo-eval",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "check": "npm test && node --check acceptance.mjs && node --check acceptance.test.mjs && node --check artifact-store.mjs && node --check artifact-store.test.mjs && node --check load-runner.mjs && node --check load-runner.test.mjs && node --check metrics-reader.mjs && node --check metrics-reader.test.mjs && node --check plans.mjs && node --check plans.test.mjs && node --check program.mjs && node --check program.test.mjs && node --check resource-sampler.mjs && node --check resource-sampler.test.mjs && node --check summarize.mjs && node --check summarize.test.mjs && node --check workloads.mjs && node --check workloads.test.mjs",
+    "run": "node program.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
