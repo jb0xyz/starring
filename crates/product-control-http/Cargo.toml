@@ -1,0 +1,22 @@
+[package]
+name = "product-control-http"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+authoring-application = { path = "../authoring-application" }
+axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tower = { version = "0.5", features = ["util"] }
