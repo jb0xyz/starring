@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use automation_ruleset::{
-    PublishOutcome, PublishRuleSetRequest, RuleSetContentHash, RuleSetHashError, RuleSetHasher,
-    RuleSetKey, RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersionId,
+    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, PublishOutcome,
+    PublishRuleSetRequest, RuleSetContentHash, RuleSetHashError, RuleSetHasher, RuleSetKey,
+    RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
+    RuleSetVersionIdentity,
 };
 use automation_ruleset_postgres::{PostgresRuleSetStore, MIGRATOR};
 use automation_state::{
@@ -86,6 +88,10 @@ fn request(guild: GuildId, key: &RuleSetKey, def: InteractionRuleSet) -> Publish
 
 fn key() -> RuleSetKey {
     RuleSetKey::parse("studyroom").unwrap()
+}
+
+fn identity(version: &RuleSetVersion) -> RuleSetVersionIdentity {
+    RuleSetVersionIdentity::from(version)
 }
 
 async fn head_next(pool: &PgPool, guild: GuildId, key: &RuleSetKey) -> i64 {
@@ -365,4 +371,174 @@ async fn reconnect_durability() {
         RuleSetVersionId::FIRST
     );
     cleanup(&pool_b, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn guarded_activation_preserves_exact_baseline_and_target_hash() {
+    let pool = pool().await;
+    let guild = GuildId(9_000_008);
+    cleanup(&pool, guild).await;
+    let store = PostgresRuleSetStore::new(pool.clone());
+    let first = match store
+        .publish(request(guild, &key(), definition("guarded_a")))
+        .await
+        .unwrap()
+    {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let second = match store
+        .publish(request(guild, &key(), definition("guarded_b")))
+        .await
+        .unwrap()
+    {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let first_identity = identity(&first);
+    let second_identity = identity(&second);
+
+    assert!(matches!(
+        store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: first_identity.clone(),
+                expected_active: ExpectedActiveRuleSet::Absent,
+            })
+            .await
+            .unwrap(),
+        GuardedActivationOutcome::Activated(_)
+    ));
+    assert!(matches!(
+        store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: first_identity.clone(),
+                expected_active: ExpectedActiveRuleSet::Absent,
+            })
+            .await
+            .unwrap(),
+        GuardedActivationOutcome::AlreadyTarget(_)
+    ));
+    assert_eq!(
+        store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: second_identity.clone(),
+                expected_active: ExpectedActiveRuleSet::Absent,
+            })
+            .await
+            .unwrap(),
+        GuardedActivationOutcome::BaselineMismatch {
+            observed_active: Some(first_identity.clone())
+        }
+    );
+    assert!(matches!(
+        store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: second_identity,
+                expected_active: ExpectedActiveRuleSet::Exact {
+                    identity: first_identity
+                },
+            })
+            .await
+            .unwrap(),
+        GuardedActivationOutcome::Activated(_)
+    ));
+    assert_eq!(store.active(guild, &key()).await.unwrap().unwrap(), second);
+
+    let mismatch = store
+        .activate_guarded(GuardedRuleSetActivation {
+            guild_id: guild,
+            ruleset_key: key(),
+            target: RuleSetVersionIdentity {
+                version: first.version,
+                content_hash: RuleSetContentHash::parse_hex(&"ef".repeat(32)).unwrap(),
+            },
+            expected_active: ExpectedActiveRuleSet::Exact {
+                identity: identity(&second),
+            },
+        })
+        .await;
+    assert_eq!(mismatch.unwrap_err(), RuleSetStoreError::TargetHashMismatch);
+    assert_eq!(store.active(guild, &key()).await.unwrap().unwrap(), second);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn concurrent_absent_guarded_activations_have_one_winner() {
+    let pool = pool().await;
+    let guild = GuildId(9_000_009);
+    cleanup(&pool, guild).await;
+    let store = Arc::new(PostgresRuleSetStore::new(pool.clone()));
+    let first = match store
+        .publish(request(guild, &key(), definition("race_a")))
+        .await
+        .unwrap()
+    {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let second = match store
+        .publish(request(guild, &key(), definition("race_b")))
+        .await
+        .unwrap()
+    {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_store = store.clone();
+    let first_barrier = barrier.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: identity(&first),
+                expected_active: ExpectedActiveRuleSet::Absent,
+            })
+            .await
+    });
+    let second_store = store.clone();
+    let second_barrier = barrier.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        second_store
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: identity(&second),
+                expected_active: ExpectedActiveRuleSet::Absent,
+            })
+            .await
+    });
+    let outcomes = [
+        first_task.await.unwrap().unwrap(),
+        second_task.await.unwrap().unwrap(),
+    ];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, GuardedActivationOutcome::Activated(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, GuardedActivationOutcome::BaselineMismatch { .. }))
+            .count(),
+        1
+    );
+    cleanup(&pool, guild).await;
 }

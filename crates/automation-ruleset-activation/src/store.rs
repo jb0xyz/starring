@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use discord_model::{GuildId, UserId};
 
-use crate::id::{ActivationRequestId, ApplyAttemptId};
+use crate::id::{ActivationDigest, ActivationPromotionId, ActivationRequestId, ApplyAttemptId};
 use crate::model::{
     ActivationRequest, ActivationRequestState, ApplyErrorRecord, ApprovalDecisionError,
-    ClaimDecision, Completion, CompletionKind, CreateActivationRequest, RejectionDecisionError,
+    ClaimDecision, Completion, CompletionKind, CreateActivationRequest,
+    CreateProductActivationRequest, LinkDecisionError, RejectionDecisionError,
+    SupersessionReasonV1, WithdrawDecisionError,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -28,6 +30,12 @@ pub enum ApproveError {
     SelfApprovalForbidden,
     #[error("approval already exists")]
     DuplicateApproval,
+    #[error("product activation requires payload-bound approval")]
+    BoundApprovalRequired,
+    #[error("product activation request is not linked")]
+    Unlinked,
+    #[error("approval payload digest does not match")]
+    PayloadMismatch,
     #[error("activation request is not pending")]
     NotPending,
     #[error("activation request is expired")]
@@ -41,6 +49,9 @@ impl From<ApprovalDecisionError> for ApproveError {
         match error {
             ApprovalDecisionError::SelfApprovalForbidden => Self::SelfApprovalForbidden,
             ApprovalDecisionError::DuplicateApproval => Self::DuplicateApproval,
+            ApprovalDecisionError::BoundApprovalRequired => Self::BoundApprovalRequired,
+            ApprovalDecisionError::Unlinked => Self::Unlinked,
+            ApprovalDecisionError::PayloadMismatch => Self::PayloadMismatch,
             ApprovalDecisionError::NotPending => Self::NotPending,
             ApprovalDecisionError::Expired => Self::Expired,
         }
@@ -51,16 +62,41 @@ impl From<ApprovalDecisionError> for ApproveError {
 pub enum RejectError {
     #[error("activation request is not pending")]
     NotPending,
+    #[error("product activation request is not linked")]
+    Unlinked,
     #[error("activation request is expired")]
     Expired,
     #[error(transparent)]
     Store(#[from] ActivationStoreError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawError {
+    #[error("product activation request is not linked")]
+    Unlinked,
+    #[error("activation request cannot be withdrawn from its current state")]
+    InvalidState,
+    #[error("activation request is expired")]
+    Expired,
+    #[error(transparent)]
+    Store(#[from] ActivationStoreError),
+}
+
+impl From<WithdrawDecisionError> for WithdrawError {
+    fn from(error: WithdrawDecisionError) -> Self {
+        match error {
+            WithdrawDecisionError::Unlinked => Self::Unlinked,
+            WithdrawDecisionError::InvalidState => Self::InvalidState,
+            WithdrawDecisionError::Expired => Self::Expired,
+        }
+    }
+}
+
 impl From<RejectionDecisionError> for RejectError {
     fn from(error: RejectionDecisionError) -> Self {
         match error {
             RejectionDecisionError::NotPending => Self::NotPending,
+            RejectionDecisionError::Unlinked => Self::Unlinked,
             RejectionDecisionError::Expired => Self::Expired,
         }
     }
@@ -76,6 +112,7 @@ pub enum ClaimOutcome {
     },
     AlreadyApplied,
     NotApproved,
+    Unlinked,
     Expired,
 }
 
@@ -94,7 +131,40 @@ impl ClaimOutcome {
             },
             ClaimDecision::AlreadyApplied => Self::AlreadyApplied,
             ClaimDecision::NotApproved => Self::NotApproved,
+            ClaimDecision::Unlinked => Self::Unlinked,
             ClaimDecision::Expired => Self::Expired,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkProductActivation {
+    pub promotion_id: ActivationPromotionId,
+    pub promotion_request_digest: ActivationDigest,
+    pub approval_context_digest: ActivationDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LinkProductError {
+    #[error("activation request is not product-authored")]
+    NotProduct,
+    #[error("activation link identity conflicts with the product request")]
+    Conflict,
+    #[error("activation request is not pending")]
+    NotPending,
+    #[error("activation request is expired")]
+    Expired,
+    #[error(transparent)]
+    Store(#[from] ActivationStoreError),
+}
+
+impl From<LinkDecisionError> for LinkProductError {
+    fn from(error: LinkDecisionError) -> Self {
+        match error {
+            LinkDecisionError::NotProduct => Self::NotProduct,
+            LinkDecisionError::Conflict => Self::Conflict,
+            LinkDecisionError::NotPending => Self::NotPending,
+            LinkDecisionError::Expired => Self::Expired,
         }
     }
 }
@@ -146,6 +216,15 @@ pub trait ActivationRequestStore {
         &self,
         request: CreateActivationRequest,
     ) -> Result<ActivationRequest, ActivationStoreError>;
+    async fn create_product(
+        &self,
+        request: CreateProductActivationRequest,
+    ) -> Result<ActivationRequest, ActivationStoreError>;
+    async fn link_product(
+        &self,
+        request_id: &ActivationRequestId,
+        link: LinkProductActivation,
+    ) -> Result<ActivationRequest, LinkProductError>;
     async fn get(
         &self,
         request_id: &ActivationRequestId,
@@ -155,12 +234,24 @@ pub trait ActivationRequestStore {
         request_id: &ActivationRequestId,
         approver: UserId,
     ) -> Result<ActivationRequest, ApproveError>;
+    async fn approve_bound(
+        &self,
+        request_id: &ActivationRequestId,
+        approver: UserId,
+        approval_payload_digest: &ActivationDigest,
+    ) -> Result<ActivationRequest, ApproveError>;
     async fn reject(
         &self,
         request_id: &ActivationRequestId,
         rejected_by: UserId,
         reason: String,
     ) -> Result<ActivationRequest, RejectError>;
+    async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError>;
     async fn claim_apply(
         &self,
         request_id: &ActivationRequestId,
@@ -192,6 +283,12 @@ pub trait ActivationRequestStore {
         request_id: &ActivationRequestId,
         attempt_id: &ApplyAttemptId,
         error: ApplyErrorRecord,
+    ) -> Result<bool, ActivationStoreError>;
+    async fn supersede_applying(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
     ) -> Result<bool, ActivationStoreError>;
     async fn mark_expired(
         &self,
@@ -250,6 +347,41 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         Ok(request)
     }
 
+    async fn create_product(
+        &self,
+        input: CreateProductActivationRequest,
+    ) -> Result<ActivationRequest, ActivationStoreError> {
+        let mut requests = self.requests.lock().unwrap();
+        if requests.contains_key(&input.id) {
+            return Err(ActivationStoreError::DuplicateRequest);
+        }
+        let request = ActivationRequest::create_product(input, self.clock.now())
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(request.id.clone(), request.clone());
+        Ok(request)
+    }
+
+    async fn link_product(
+        &self,
+        request_id: &ActivationRequestId,
+        link: LinkProductActivation,
+    ) -> Result<ActivationRequest, LinkProductError> {
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests
+            .get_mut(request_id)
+            .ok_or(ActivationStoreError::NotFound)?;
+        request.link_product_at(
+            &link.promotion_id,
+            &link.promotion_request_digest,
+            &link.approval_context_digest,
+            self.clock.now(),
+        )?;
+        request
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        Ok(request.clone())
+    }
+
     async fn get(
         &self,
         request_id: &ActivationRequestId,
@@ -257,6 +389,9 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         let mut requests = self.requests.lock().unwrap();
         if let Some(request) = requests.get_mut(request_id) {
             request.expire_if_due(self.clock.now());
+            request
+                .validate()
+                .map_err(ActivationStoreError::InvalidRequest)?;
             return Ok(Some(request.clone()));
         }
         Ok(None)
@@ -272,6 +407,26 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
             .get_mut(request_id)
             .ok_or(ActivationStoreError::NotFound)?;
         request.approve_at(approver, self.clock.now())?;
+        request
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        Ok(request.clone())
+    }
+
+    async fn approve_bound(
+        &self,
+        request_id: &ActivationRequestId,
+        approver: UserId,
+        approval_payload_digest: &ActivationDigest,
+    ) -> Result<ActivationRequest, ApproveError> {
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests
+            .get_mut(request_id)
+            .ok_or(ActivationStoreError::NotFound)?;
+        request.approve_bound_at(approver, approval_payload_digest, self.clock.now())?;
+        request
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
         Ok(request.clone())
     }
 
@@ -286,7 +441,29 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
             .get_mut(request_id)
             .ok_or(ActivationStoreError::NotFound)?;
         request.reject_at(rejected_by, reason, self.clock.now())?;
+        request
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
         Ok(request.clone())
+    }
+
+    async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError> {
+        let mut requests = self.requests.lock().unwrap();
+        let mut candidate = requests
+            .get(request_id)
+            .cloned()
+            .ok_or(ActivationStoreError::NotFound)?;
+        candidate.withdraw_at(withdrawn_by, reason, self.clock.now())?;
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate.clone());
+        Ok(candidate)
     }
 
     async fn claim_apply(
@@ -320,6 +497,9 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
                 });
             }
         }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
         requests.insert(candidate.id.clone(), candidate.clone());
         Ok(ClaimOutcome::from_decision(decision, candidate))
     }
@@ -339,6 +519,9 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         let decision = request
             .claim_resume_at(attempt_id, now, lease_until)
             .map_err(|error| ActivationStoreError::InvalidRequest(error.to_string()))?;
+        request
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
         Ok(ClaimOutcome::from_decision(decision, request.clone()))
     }
 
@@ -350,9 +533,17 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
     ) -> Result<bool, ActivationStoreError> {
         let lease_until = self.lease_until(lease_seconds)?;
         let mut requests = self.requests.lock().unwrap();
-        Ok(requests
-            .get_mut(request_id)
-            .is_some_and(|request| request.renew_lease_at(attempt_id, lease_until)))
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.renew_lease_at(attempt_id, lease_until) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
     }
 
     async fn complete_applied(
@@ -370,9 +561,17 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
             notices,
         };
         let mut requests = self.requests.lock().unwrap();
-        Ok(requests
-            .get_mut(request_id)
-            .is_some_and(|request| request.complete_at(attempt_id, completion)))
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.complete_at(attempt_id, completion) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
     }
 
     async fn release_to_approved(
@@ -382,9 +581,37 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         error: ApplyErrorRecord,
     ) -> Result<bool, ActivationStoreError> {
         let mut requests = self.requests.lock().unwrap();
-        Ok(requests
-            .get_mut(request_id)
-            .is_some_and(|request| request.release_at(attempt_id, error)))
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.release_at(attempt_id, error) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
+    }
+
+    async fn supersede_applying(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
+    ) -> Result<bool, ActivationStoreError> {
+        let mut requests = self.requests.lock().unwrap();
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.supersede_at(attempt_id, reason, self.clock.now()) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
     }
 
     async fn mark_expired(
@@ -392,9 +619,17 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         request_id: &ActivationRequestId,
     ) -> Result<bool, ActivationStoreError> {
         let mut requests = self.requests.lock().unwrap();
-        Ok(requests
-            .get_mut(request_id)
-            .is_some_and(|request| request.expire_if_due(self.clock.now())))
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.expire_if_due(self.clock.now()) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
     }
 
     async fn list_applying(
@@ -402,14 +637,20 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
         guild_id: GuildId,
     ) -> Result<Vec<ActivationRequest>, ActivationStoreError> {
         let requests = self.requests.lock().unwrap();
-        Ok(requests
+        let applying = requests
             .values()
             .filter(|request| {
                 request.target.guild_id == guild_id
                     && request.state == ActivationRequestState::Applying
             })
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        for request in &applying {
+            request
+                .validate()
+                .map_err(ActivationStoreError::InvalidRequest)?;
+        }
+        Ok(applying)
     }
 
     async fn bookkeep_applied(
@@ -424,8 +665,16 @@ impl<C: ActivationClock> ActivationRequestStore for InMemoryActivationRequestSto
             notices: None,
         };
         let mut requests = self.requests.lock().unwrap();
-        Ok(requests
-            .get_mut(request_id)
-            .is_some_and(|request| request.bookkeep_at(completion)))
+        let Some(mut candidate) = requests.get(request_id).cloned() else {
+            return Ok(false);
+        };
+        if !candidate.bookkeep_at(completion) {
+            return Ok(false);
+        }
+        candidate
+            .validate()
+            .map_err(ActivationStoreError::InvalidRequest)?;
+        requests.insert(candidate.id.clone(), candidate);
+        Ok(true)
     }
 }

@@ -1,7 +1,8 @@
 use automation_ruleset::{
-    content_hash, InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetContentHash,
+    content_hash, ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation,
+    InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetContentHash,
     RuleSetHashError, RuleSetHasher, RuleSetKey, RuleSetSchemaVersion, RuleSetStore,
-    RuleSetStoreError, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
+    RuleSetStoreError, RuleSetVersionId, RuleSetVersionIdentity, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_state::{
     ActionSpec, ActionTarget, InstanceRef, InteractionRule, InteractionRuleSet, RoleRef,
@@ -123,6 +124,99 @@ fn activate_missing_then_activate_and_rollback() {
             .version,
         v1
     );
+}
+
+#[test]
+fn guarded_activation_is_idempotent_and_never_overwrites_a_drifted_baseline() {
+    let store = InMemoryRuleSetStore::default();
+    let first = match block_on(store.publish(req(7, "studyroom", ruleset("a")))).unwrap() {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let second = match block_on(store.publish(req(7, "studyroom", ruleset("b")))).unwrap() {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let first_identity = RuleSetVersionIdentity::from(&first);
+    let second_identity = RuleSetVersionIdentity::from(&second);
+    let activate_first = GuardedRuleSetActivation {
+        guild_id: GuildId(7),
+        ruleset_key: key("studyroom"),
+        target: first_identity.clone(),
+        expected_active: ExpectedActiveRuleSet::Absent,
+    };
+    assert!(matches!(
+        block_on(store.activate_guarded(activate_first.clone())).unwrap(),
+        GuardedActivationOutcome::Activated(_)
+    ));
+    assert!(matches!(
+        block_on(store.activate_guarded(activate_first)).unwrap(),
+        GuardedActivationOutcome::AlreadyTarget(_)
+    ));
+
+    let drifted = block_on(store.activate_guarded(GuardedRuleSetActivation {
+        guild_id: GuildId(7),
+        ruleset_key: key("studyroom"),
+        target: second_identity.clone(),
+        expected_active: ExpectedActiveRuleSet::Absent,
+    }))
+    .unwrap();
+    assert_eq!(
+        drifted,
+        GuardedActivationOutcome::BaselineMismatch {
+            observed_active: Some(first_identity.clone())
+        }
+    );
+    assert_eq!(
+        block_on(store.active(GuildId(7), &key("studyroom")))
+            .unwrap()
+            .unwrap()
+            .version,
+        first.version
+    );
+
+    assert!(matches!(
+        block_on(store.activate_guarded(GuardedRuleSetActivation {
+            guild_id: GuildId(7),
+            ruleset_key: key("studyroom"),
+            target: second_identity,
+            expected_active: ExpectedActiveRuleSet::Exact {
+                identity: first_identity
+            },
+        }))
+        .unwrap(),
+        GuardedActivationOutcome::Activated(_)
+    ));
+    assert_eq!(
+        block_on(store.active(GuildId(7), &key("studyroom")))
+            .unwrap()
+            .unwrap()
+            .version,
+        second.version
+    );
+}
+
+#[test]
+fn guarded_activation_binds_the_exact_target_hash() {
+    let store = InMemoryRuleSetStore::default();
+    let target = match block_on(store.publish(req(7, "studyroom", ruleset("a")))).unwrap() {
+        PublishOutcome::Created(version) => version,
+        PublishOutcome::Reused(_) => panic!("expected Created"),
+    };
+    let result = block_on(store.activate_guarded(GuardedRuleSetActivation {
+        guild_id: GuildId(7),
+        ruleset_key: key("studyroom"),
+        target: RuleSetVersionIdentity {
+            version: target.version,
+            content_hash: RuleSetContentHash::parse_hex(&"ff".repeat(32)).unwrap(),
+        },
+        expected_active: ExpectedActiveRuleSet::Absent,
+    }));
+
+    assert_eq!(result.unwrap_err(), RuleSetStoreError::TargetHashMismatch);
+    assert!(block_on(store.active(GuildId(7), &key("studyroom")))
+        .unwrap()
+        .is_none());
 }
 
 #[test]

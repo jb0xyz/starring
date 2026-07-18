@@ -1,13 +1,14 @@
 use automation_ruleset_activation::{
-    ActivationRequest, ActivationRequestId, ActivationRequestState, ActivationStoreError,
-    ActivationTarget, ApplyAttemptId, ApplyErrorRecord, Approval, Completion, CompletionKind,
-    ObservedActive, Rejection,
+    ActivationApprovalContextV1, ActivationDigest, ActivationLinkStateV1, ActivationRequest,
+    ActivationRequestId, ActivationRequestState, ActivationStoreError, ActivationTarget,
+    ActivationTerminationV1, ApplyAttemptId, ApplyErrorRecord, Approval, Completion,
+    CompletionKind, ObservedActive, Rejection,
 };
 use chrono::{DateTime, Utc};
 use discord_model::{GuildId, UserId};
 use sqlx::types::Json;
 
-pub(crate) const REQUEST_COLUMNS: &str = "id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, required_approvals, state, created_at, expires_at, apply_attempt_id, apply_attempt_no, apply_lease_until, last_apply_error, observed_active_version, observed_active_hash, applied_at, applied_by, completion_kind, activation_notices, rejected_at, rejected_by, rejection_reason";
+pub(crate) const REQUEST_COLUMNS: &str = "id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, required_approvals, state, created_at, expires_at, apply_attempt_id, apply_attempt_no, apply_lease_until, last_apply_error, observed_active_version, observed_active_hash, applied_at, applied_by, completion_kind, activation_notices, rejected_at, rejected_by, rejection_reason, authority_kind, link_state_name, approval_context, link_state, promotion_id, promotion_request_digest, approval_payload_digest, approval_context_digest, linked_at, termination";
 
 #[derive(Clone, sqlx::FromRow)]
 pub(crate) struct ActivationRequestRow {
@@ -34,12 +35,23 @@ pub(crate) struct ActivationRequestRow {
     pub rejected_at: Option<DateTime<Utc>>,
     pub rejected_by: Option<String>,
     pub rejection_reason: Option<String>,
+    pub authority_kind: String,
+    pub link_state_name: String,
+    pub approval_context: Json<ActivationApprovalContextV1>,
+    pub link_state: Json<ActivationLinkStateV1>,
+    pub promotion_id: Option<String>,
+    pub promotion_request_digest: Option<String>,
+    pub approval_payload_digest: Option<String>,
+    pub approval_context_digest: Option<String>,
+    pub linked_at: Option<DateTime<Utc>>,
+    pub termination: Option<Json<ActivationTerminationV1>>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
 pub(crate) struct ApprovalRow {
     pub approver_id: String,
     pub approved_at: DateTime<Utc>,
+    pub approval_payload_digest: Option<String>,
 }
 
 pub(crate) fn backend(error: impl std::fmt::Display) -> ActivationStoreError {
@@ -127,17 +139,42 @@ pub(crate) fn decode_request(
         row.rejected_by.as_deref(),
         row.rejection_reason,
     )?;
+    let approval_context = row.approval_context.0;
+    let link_state = row.link_state.0;
+    validate_context_shadows(
+        &approval_context,
+        &link_state,
+        ContextShadows {
+            authority_kind: &row.authority_kind,
+            link_state_name: &row.link_state_name,
+            promotion_id: row.promotion_id.as_deref(),
+            promotion_request_digest: row.promotion_request_digest.as_deref(),
+            approval_payload_digest: row.approval_payload_digest.as_deref(),
+            approval_context_digest: row.approval_context_digest.as_deref(),
+            linked_at: row.linked_at,
+        },
+    )?;
     let mut approvals = approvals
         .into_iter()
         .map(|approval| {
             Ok(Approval {
                 approver: parse_user(&approval.approver_id, "approver_id")?,
                 approved_at: approval.approved_at,
+                approval_payload_digest: approval
+                    .approval_payload_digest
+                    .as_deref()
+                    .map(ActivationDigest::parse)
+                    .transpose()
+                    .map_err(|error| {
+                        backend(format!(
+                            "invalid persisted approval payload digest: {error}"
+                        ))
+                    })?,
             })
         })
         .collect::<Result<Vec<_>, ActivationStoreError>>()?;
     approvals.sort_by_key(|approval| approval.approver);
-    Ok(ActivationRequest {
+    let request = ActivationRequest {
         id,
         target: ActivationTarget {
             guild_id,
@@ -147,6 +184,8 @@ pub(crate) fn decode_request(
         },
         requester,
         required_approvals,
+        approval_context,
+        link_state,
         approvals,
         state,
         rejection,
@@ -156,9 +195,81 @@ pub(crate) fn decode_request(
         last_apply_error: row.last_apply_error.map(|error| error.0),
         observed_active,
         completion,
+        termination: row.termination.map(|termination| termination.0),
         created_at: row.created_at,
         expires_at: row.expires_at,
-    })
+    };
+    request
+        .validate()
+        .map_err(|error| backend(format!("invalid persisted activation request: {error}")))?;
+    Ok(request)
+}
+
+struct ContextShadows<'a> {
+    authority_kind: &'a str,
+    link_state_name: &'a str,
+    promotion_id: Option<&'a str>,
+    promotion_request_digest: Option<&'a str>,
+    approval_payload_digest: Option<&'a str>,
+    approval_context_digest: Option<&'a str>,
+    linked_at: Option<DateTime<Utc>>,
+}
+
+fn validate_context_shadows(
+    approval_context: &ActivationApprovalContextV1,
+    link_state: &ActivationLinkStateV1,
+    shadows: ContextShadows<'_>,
+) -> Result<(), ActivationStoreError> {
+    match (approval_context, link_state) {
+        (ActivationApprovalContextV1::LegacyManual, ActivationLinkStateV1::NotRequired)
+            if shadows.authority_kind == "legacy_manual"
+                && shadows.link_state_name == "not_required"
+                && shadows.promotion_id.is_none()
+                && shadows.promotion_request_digest.is_none()
+                && shadows.approval_payload_digest.is_none()
+                && shadows.approval_context_digest.is_none()
+                && shadows.linked_at.is_none() =>
+        {
+            Ok(())
+        }
+        (
+            ActivationApprovalContextV1::ProductAuthoring { context },
+            ActivationLinkStateV1::Unlinked,
+        ) if shadows.authority_kind == "product_authoring"
+            && shadows.link_state_name == "unlinked"
+            && shadows.promotion_id == Some(context.promotion_id.as_str())
+            && shadows.promotion_request_digest
+                == Some(context.promotion_request_digest.as_str())
+            && shadows.approval_payload_digest
+                == Some(context.approval_payload_digest.as_str())
+            && shadows.approval_context_digest
+                == Some(context.approval_context_digest.as_str())
+            && shadows.linked_at.is_none() =>
+        {
+            Ok(())
+        }
+        (
+            ActivationApprovalContextV1::ProductAuthoring { context },
+            ActivationLinkStateV1::Linked {
+                linked_at: context_linked_at,
+            },
+        ) if shadows.authority_kind == "product_authoring"
+            && shadows.link_state_name == "linked"
+            && shadows.promotion_id == Some(context.promotion_id.as_str())
+            && shadows.promotion_request_digest
+                == Some(context.promotion_request_digest.as_str())
+            && shadows.approval_payload_digest
+                == Some(context.approval_payload_digest.as_str())
+            && shadows.approval_context_digest
+                == Some(context.approval_context_digest.as_str())
+            && shadows.linked_at == Some(*context_linked_at) =>
+        {
+            Ok(())
+        }
+        _ => Err(backend(
+            "persisted activation approval context projections do not match",
+        )),
+    }
 }
 
 fn parse_user(value: &str, field: &str) -> Result<UserId, ActivationStoreError> {
@@ -175,6 +286,8 @@ fn parse_state(value: &str) -> Result<ActivationRequestState, ActivationStoreErr
         "applied" => Ok(ActivationRequestState::Applied),
         "rejected" => Ok(ActivationRequestState::Rejected),
         "expired" => Ok(ActivationRequestState::Expired),
+        "superseded" => Ok(ActivationRequestState::Superseded),
+        "withdrawn" => Ok(ActivationRequestState::Withdrawn),
         _ => Err(backend(format!("invalid persisted state: {value}"))),
     }
 }
@@ -257,6 +370,23 @@ pub(crate) fn state_str(state: ActivationRequestState) -> &'static str {
         ActivationRequestState::Applied => "applied",
         ActivationRequestState::Rejected => "rejected",
         ActivationRequestState::Expired => "expired",
+        ActivationRequestState::Superseded => "superseded",
+        ActivationRequestState::Withdrawn => "withdrawn",
+    }
+}
+
+pub(crate) fn authority_kind(context: &ActivationApprovalContextV1) -> &'static str {
+    match context {
+        ActivationApprovalContextV1::LegacyManual => "legacy_manual",
+        ActivationApprovalContextV1::ProductAuthoring { .. } => "product_authoring",
+    }
+}
+
+pub(crate) fn link_state_name(state: &ActivationLinkStateV1) -> &'static str {
+    match state {
+        ActivationLinkStateV1::NotRequired => "not_required",
+        ActivationLinkStateV1::Unlinked => "unlinked",
+        ActivationLinkStateV1::Linked { .. } => "linked",
     }
 }
 
@@ -282,7 +412,7 @@ mod tests {
             target_version: 1,
             target_content_hash: "11".repeat(32),
             requester_id: "10".to_string(),
-            required_approvals: 1,
+            required_approvals: 2,
             state: "pending".to_string(),
             created_at,
             expires_at: created_at + Duration::minutes(30),
@@ -299,6 +429,16 @@ mod tests {
             rejected_at: None,
             rejected_by: None,
             rejection_reason: None,
+            authority_kind: "legacy_manual".to_string(),
+            link_state_name: "not_required".to_string(),
+            approval_context: Json(ActivationApprovalContextV1::LegacyManual),
+            link_state: Json(ActivationLinkStateV1::NotRequired),
+            promotion_id: None,
+            promotion_request_digest: None,
+            approval_payload_digest: None,
+            approval_context_digest: None,
+            linked_at: None,
+            termination: None,
         }
     }
 
@@ -309,6 +449,7 @@ mod tests {
             vec![ApprovalRow {
                 approver_id: "20".to_string(),
                 approved_at: Utc.with_ymd_and_hms(2026, 7, 12, 0, 1, 0).unwrap(),
+                approval_payload_digest: None,
             }],
         )
         .unwrap();

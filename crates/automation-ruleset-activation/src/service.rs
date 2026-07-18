@@ -1,27 +1,40 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::Duration as StdDuration;
 
-use automation_ruleset::{RuleSetKey, RuleSetStore, RuleSetStoreError, RuleSetVersionId};
+use automation_ruleset::{
+    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetKey,
+    RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId, RuleSetVersionIdentity,
+};
 use automation_ruleset_readiness::{
-    activate_if_ready, ActivationError, GuildCapabilities, ReadinessError,
+    activate_if_ready, check_readiness, ActivationError, GuildCapabilities, ReadinessError,
+    RuleSetReadinessInput,
 };
 use chrono::Duration;
 use desired_state::ResourceKey;
 use discord_model::{GuildId, Permissions, UserId};
-use resource_resolution::ResourceBindingMap;
+use resource_resolution::{
+    approval_binding_fingerprint_v1, project_required_bindings, ResourceBindingMap,
+};
 
 use crate::id::{ActivationRequestId, ApplyAttemptId};
 use crate::model::{
-    ActivationRequest, ActivationRequestState, ActivationTarget, ApplyErrorRecord,
-    ApplyFailureKind, CompletionKind, CreateActivationRequest, ObservedActive,
+    ActivationRequest, ActivationRequestState, ActivationTarget, ActivationTerminationV1,
+    ApplyErrorRecord, ApplyFailureKind, CompletionKind, CreateActivationRequest, ObservedActive,
+    SupersessionReasonV1,
 };
 use crate::store::{
     ActivationRequestStore, ActivationStoreError, ApproveError, ClaimOutcome, RejectError,
+    WithdrawError,
+};
+use crate::{
+    ActivationApprovalContextV1, ActivationLinkStateV1, ExpectedActiveBaselineV1,
+    ProductApprovalContextV1,
 };
 
 const APPLY_LEASE_SECONDS: i64 = 60;
@@ -120,6 +133,7 @@ fn with_deadline<F: Future>(future: F, duration: StdDuration) -> Deadline<F> {
 }
 
 pub struct ActivationEnvironment {
+    pub binding_revision: Option<NonZeroU64>,
     pub bindings: ResourceBindingMap,
     pub guild_capabilities: GuildCapabilities,
     pub role_permissions: BTreeMap<ResourceKey, Permissions>,
@@ -168,6 +182,9 @@ pub enum ApplyOutcome {
     AlreadyActive,
     RecoveredAlreadyActive,
     AlreadyApplied,
+    Superseded {
+        reason: SupersessionReasonV1,
+    },
     InProgress {
         blocking_request_id: ActivationRequestId,
         lease_until: chrono::DateTime<chrono::Utc>,
@@ -179,8 +196,12 @@ pub enum ApplyOutcome {
 pub enum ApplyError {
     #[error("activation request is not approved")]
     NotApproved,
+    #[error("product activation request is not linked")]
+    Unlinked,
     #[error("activation request is expired")]
     Expired,
+    #[error("activation request was withdrawn")]
+    Withdrawn,
     #[error("activation lease is lost")]
     LeaseLost,
     #[error("target ruleset version is missing")]
@@ -299,6 +320,17 @@ where
         self.requests.reject(request_id, rejected_by, reason).await
     }
 
+    pub async fn withdraw(
+        &self,
+        request_id: &ActivationRequestId,
+        withdrawn_by: UserId,
+        reason: String,
+    ) -> Result<ActivationRequest, WithdrawError> {
+        self.requests
+            .withdraw(request_id, withdrawn_by, reason)
+            .await
+    }
+
     pub async fn apply(
         &self,
         request_id: &ActivationRequestId,
@@ -306,9 +338,22 @@ where
         applied_by: UserId,
     ) -> Result<ApplyOutcome, ApplyError> {
         let request = self.load_request(request_id).await?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) && !matches!(&request.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return Err(ApplyError::Unlinked);
+        }
         match request.state {
             ActivationRequestState::Applied => return Ok(ApplyOutcome::AlreadyApplied),
             ActivationRequestState::Expired => return Err(ApplyError::Expired),
+            ActivationRequestState::Superseded => {
+                return Ok(ApplyOutcome::Superseded {
+                    reason: supersession_reason(&request)?,
+                })
+            }
+            ActivationRequestState::Withdrawn => return Err(ApplyError::Withdrawn),
             ActivationRequestState::Pending | ActivationRequestState::Rejected => {
                 return Err(ApplyError::NotApproved)
             }
@@ -329,9 +374,22 @@ where
         applied_by: UserId,
     ) -> Result<ApplyOutcome, ApplyError> {
         let request = self.load_request(request_id).await?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) && !matches!(&request.link_state, ActivationLinkStateV1::Linked { .. })
+        {
+            return Err(ApplyError::Unlinked);
+        }
         match request.state {
             ActivationRequestState::Applied => return Ok(ApplyOutcome::AlreadyApplied),
             ActivationRequestState::Expired => return Err(ApplyError::Expired),
+            ActivationRequestState::Superseded => {
+                return Ok(ApplyOutcome::Superseded {
+                    reason: supersession_reason(&request)?,
+                })
+            }
+            ActivationRequestState::Withdrawn => return Err(ApplyError::Withdrawn),
             ActivationRequestState::Applying => {}
             ActivationRequestState::Pending
             | ActivationRequestState::Approved
@@ -398,6 +456,7 @@ where
             }
             ClaimOutcome::AlreadyApplied => return Ok(ApplyOutcome::AlreadyApplied),
             ClaimOutcome::NotApproved => return Err(ApplyError::NotApproved),
+            ClaimOutcome::Unlinked => return Err(ApplyError::Unlinked),
             ClaimOutcome::Expired => return Err(ApplyError::Expired),
         };
 
@@ -421,6 +480,12 @@ where
         applied_by: UserId,
         request: ActivationRequest,
     ) -> Result<ApplyOutcome, ApplyError> {
+        if let ActivationApprovalContextV1::ProductAuthoring { context } = &request.approval_context
+        {
+            return self
+                .apply_product_claimed(request_id, attempt_id, applied_by, &request, context)
+                .await;
+        }
         let prepared = match prepare_activation(self.rulesets, self.provider, &request.target).await
         {
             Ok(prepared) => prepared,
@@ -469,6 +534,192 @@ where
                     }
                 }
             }
+        }
+    }
+
+    async fn apply_product_claimed(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        applied_by: UserId,
+        request: &ActivationRequest,
+        context: &ProductApprovalContextV1,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        let artifact = match load_exact_target(self.rulesets, &request.target).await {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                self.release_known(request_id, attempt_id, &error).await?;
+                return Err(error);
+            }
+        };
+        let active = match self
+            .rulesets
+            .active(request.target.guild_id, &request.target.ruleset_key)
+            .await
+        {
+            Ok(active) => active,
+            Err(error) => {
+                let error = ApplyError::RuleSet(error);
+                self.release_known(request_id, attempt_id, &error).await?;
+                return Err(error);
+            }
+        };
+        let target_is_active = active.as_ref().is_some_and(|active| {
+            active.version == request.target.version
+                && active.content_hash == request.target.content_hash
+        });
+        let observed_baseline = baseline_from_active(active.as_ref());
+        if !target_is_active && observed_baseline != context.baseline {
+            return self
+                .supersede(
+                    request_id,
+                    attempt_id,
+                    SupersessionReasonV1::ActiveBaselineDrift {
+                        expected: context.baseline.clone(),
+                        observed: observed_baseline,
+                    },
+                )
+                .await;
+        }
+        let environment = match self.provider.load_fresh(&request.target).await {
+            Ok(environment) => environment,
+            Err(error) => {
+                let error = ApplyError::Environment(error);
+                self.release_known(request_id, attempt_id, &error).await?;
+                return Err(error);
+            }
+        };
+        let binding_drift =
+            match product_binding_drift(request.target.guild_id, context, &environment) {
+                Ok(drift) => drift,
+                Err(error) => {
+                    let error = ApplyError::Environment(error);
+                    self.release_known(request_id, attempt_id, &error).await?;
+                    return Err(error);
+                }
+            };
+        if let Some(reason) = binding_drift {
+            return self.supersede(request_id, attempt_id, reason).await;
+        }
+        let runtime = match check_readiness(RuleSetReadinessInput {
+            artifact: &artifact,
+            bindings: &environment.bindings,
+            guild_capabilities: &environment.guild_capabilities,
+            role_permissions: &environment.role_permissions,
+        }) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let error = ApplyError::NotReady(Box::new(error));
+                self.release_known(request_id, attempt_id, &error).await?;
+                return Err(error);
+            }
+        };
+        let notices = Some(
+            runtime
+                .notices
+                .into_iter()
+                .map(|notice| format!("{notice:?}"))
+                .collect(),
+        );
+        if target_is_active {
+            self.complete(
+                request_id,
+                attempt_id,
+                applied_by,
+                CompletionKind::AlreadyActive,
+                notices,
+            )
+            .await?;
+            return Ok(ApplyOutcome::AlreadyActive);
+        }
+        if !self
+            .requests
+            .renew_lease(request_id, attempt_id, APPLY_LEASE_SECONDS)
+            .await?
+        {
+            return Err(ApplyError::LeaseLost);
+        }
+        let guarded = self
+            .rulesets
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: request.target.guild_id,
+                ruleset_key: request.target.ruleset_key.clone(),
+                target: RuleSetVersionIdentity {
+                    version: request.target.version,
+                    content_hash: request.target.content_hash,
+                },
+                expected_active: expected_ruleset_baseline(&context.baseline),
+            })
+            .await;
+        match guarded {
+            Ok(GuardedActivationOutcome::Activated(_)) => {
+                self.complete(
+                    request_id,
+                    attempt_id,
+                    applied_by,
+                    CompletionKind::Activated,
+                    notices,
+                )
+                .await?;
+                Ok(ApplyOutcome::Activated)
+            }
+            Ok(GuardedActivationOutcome::AlreadyTarget(_)) => {
+                self.complete(
+                    request_id,
+                    attempt_id,
+                    applied_by,
+                    CompletionKind::AlreadyActive,
+                    notices,
+                )
+                .await?;
+                Ok(ApplyOutcome::AlreadyActive)
+            }
+            Ok(GuardedActivationOutcome::BaselineMismatch { observed_active }) => {
+                self.supersede(
+                    request_id,
+                    attempt_id,
+                    SupersessionReasonV1::ActiveBaselineDrift {
+                        expected: context.baseline.clone(),
+                        observed: baseline_from_identity(observed_active.as_ref()),
+                    },
+                )
+                .await
+            }
+            Err(error @ RuleSetStoreError::Backend(_)) => {
+                Err(ApplyError::IndeterminateActivation(error))
+            }
+            Err(RuleSetStoreError::VersionNotFound) => {
+                let error = ApplyError::TargetMissing;
+                self.release_known(request_id, attempt_id, &error).await?;
+                Err(error)
+            }
+            Err(RuleSetStoreError::TargetHashMismatch) => {
+                let error = ApplyError::TargetCorrupt;
+                self.release_known(request_id, attempt_id, &error).await?;
+                Err(error)
+            }
+            Err(error) => {
+                let error = ApplyError::RuleSet(error);
+                self.release_known(request_id, attempt_id, &error).await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn supersede(
+        &self,
+        request_id: &ActivationRequestId,
+        attempt_id: &ApplyAttemptId,
+        reason: SupersessionReasonV1,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        if self
+            .requests
+            .supersede_applying(request_id, attempt_id, reason.clone())
+            .await?
+        {
+            Ok(ApplyOutcome::Superseded { reason })
+        } else {
+            Err(ApplyError::LeaseLost)
         }
     }
 
@@ -540,6 +791,102 @@ where
             .bookkeep_applied(&request.id, request.requester)
             .await
             .map_err(|error| format!("bookkeeping failed: {error}"))
+    }
+}
+
+fn supersession_reason(request: &ActivationRequest) -> Result<SupersessionReasonV1, ApplyError> {
+    match request.termination.as_ref() {
+        Some(ActivationTerminationV1::Superseded { reason, .. }) => Ok(reason.clone()),
+        _ => Err(ApplyError::Store(ActivationStoreError::InvalidRequest(
+            "superseded activation omitted terminal evidence".to_string(),
+        ))),
+    }
+}
+
+async fn load_exact_target<R>(
+    rulesets: &R,
+    target: &ActivationTarget,
+) -> Result<RuleSetVersion, ApplyError>
+where
+    R: RuleSetStore,
+{
+    let artifact = rulesets
+        .get_version(target.guild_id, &target.ruleset_key, target.version)
+        .await
+        .map_err(ApplyError::RuleSet)?
+        .ok_or(ApplyError::TargetMissing)?;
+    if artifact.guild_id != target.guild_id
+        || artifact.ruleset_key != target.ruleset_key
+        || artifact.version != target.version
+        || artifact.content_hash != target.content_hash
+    {
+        return Err(ApplyError::TargetCorrupt);
+    }
+    Ok(artifact)
+}
+
+fn baseline_from_active(active: Option<&RuleSetVersion>) -> ExpectedActiveBaselineV1 {
+    match active {
+        Some(active) => ExpectedActiveBaselineV1::Exact {
+            version: active.version,
+            content_hash: active.content_hash,
+        },
+        None => ExpectedActiveBaselineV1::Absent,
+    }
+}
+
+fn baseline_from_identity(active: Option<&RuleSetVersionIdentity>) -> ExpectedActiveBaselineV1 {
+    match active {
+        Some(active) => ExpectedActiveBaselineV1::Exact {
+            version: active.version,
+            content_hash: active.content_hash,
+        },
+        None => ExpectedActiveBaselineV1::Absent,
+    }
+}
+
+fn expected_ruleset_baseline(baseline: &ExpectedActiveBaselineV1) -> ExpectedActiveRuleSet {
+    match baseline {
+        ExpectedActiveBaselineV1::Absent => ExpectedActiveRuleSet::Absent,
+        ExpectedActiveBaselineV1::Exact {
+            version,
+            content_hash,
+        } => ExpectedActiveRuleSet::Exact {
+            identity: RuleSetVersionIdentity {
+                version: *version,
+                content_hash: *content_hash,
+            },
+        },
+    }
+}
+
+fn product_binding_drift(
+    guild_id: GuildId,
+    context: &ProductApprovalContextV1,
+    environment: &ActivationEnvironment,
+) -> Result<Option<SupersessionReasonV1>, ActivationEnvironmentError> {
+    let observed_revision = environment.binding_revision.ok_or_else(|| {
+        ActivationEnvironmentError::Load(
+            "authoritative binding revision is unavailable for product activation".to_string(),
+        )
+    })?;
+    let observed_bindings =
+        project_required_bindings(&context.binding.required_bindings, &environment.bindings).ok();
+    let observed_fingerprint = observed_bindings.as_ref().and_then(|bindings| {
+        approval_binding_fingerprint_v1(guild_id, observed_revision, bindings).ok()
+    });
+    if observed_revision == context.binding.revision
+        && observed_bindings.as_ref() == Some(&context.binding.required_bindings)
+        && observed_fingerprint.as_ref() == Some(&context.binding.fingerprint)
+    {
+        Ok(None)
+    } else {
+        Ok(Some(SupersessionReasonV1::BindingDrift {
+            expected_revision: context.binding.revision,
+            observed_revision,
+            expected_fingerprint: context.binding.fingerprint.clone(),
+            observed_fingerprint,
+        }))
     }
 }
 

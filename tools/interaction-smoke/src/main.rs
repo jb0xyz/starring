@@ -705,6 +705,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
                 .await
                 .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
         Ok(ActivationEnvironment {
+            binding_revision: None,
             bindings,
             guild_capabilities,
             role_permissions,
@@ -725,6 +726,9 @@ fn report_apply_outcome(subject: &str, outcome: ApplyOutcome) {
         }
         ApplyOutcome::AlreadyApplied => {
             eprintln!("activation {subject}: request was already applied");
+        }
+        ApplyOutcome::Superseded { reason } => {
+            eprintln!("activation {subject}: request was superseded: {reason:?}");
         }
         ApplyOutcome::InProgress {
             blocking_request_id,

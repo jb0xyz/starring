@@ -25,3 +25,43 @@ pub struct RuleSetActivation {
     pub ruleset_key: RuleSetKey,
     pub active_version: RuleSetVersionId,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSetVersionIdentity {
+    pub version: RuleSetVersionId,
+    pub content_hash: RuleSetContentHash,
+}
+
+impl From<&RuleSetVersion> for RuleSetVersionIdentity {
+    fn from(version: &RuleSetVersion) -> Self {
+        Self {
+            version: version.version,
+            content_hash: version.content_hash,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExpectedActiveRuleSet {
+    Absent,
+    Exact { identity: RuleSetVersionIdentity },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardedRuleSetActivation {
+    pub guild_id: GuildId,
+    pub ruleset_key: RuleSetKey,
+    pub target: RuleSetVersionIdentity,
+    pub expected_active: ExpectedActiveRuleSet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuardedActivationOutcome {
+    Activated(RuleSetActivation),
+    AlreadyTarget(RuleSetActivation),
+    BaselineMismatch {
+        observed_active: Option<RuleSetVersionIdentity>,
+    },
+}

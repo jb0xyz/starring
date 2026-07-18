@@ -97,6 +97,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "authoring-application"
+version = "0.1.0"
+dependencies = [
+ "authoring-promotion",
+ "automation-ruleset",
+ "design-harness",
+ "discord-model",
+ "futures",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "authoring-promotion"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-ruleset-activation",
+ "automation-state",
+ "chrono",
+ "design-harness",
+ "desired-state",
+ "discord-model",
+ "futures",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "authoring-promotion-postgres"
+version = "0.1.0"
+dependencies = [
+ "authoring-promotion",
+ "automation-ruleset",
+ "automation-ruleset-activation",
+ "automation-ruleset-activation-postgres",
+ "automation-ruleset-postgres",
+ "automation-ruleset-readiness",
+ "chrono",
+ "design-harness",
+ "discord-model",
+ "futures",
+ "resource-resolution",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,6 +254,7 @@ dependencies = [
  "resource-resolution",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
@@ -2093,6 +2146,9 @@ dependencies = [
  "desired-state",
  "diff-engine",
  "discord-model",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

@@ -12,7 +12,7 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **30 crates and 6
+Discord with a natural-language frontend." A Rust workspace of **33 crates and 5
 tools**, PostgreSQL-backed at its durable runtime boundaries, organized into
 three layers. The defining safety principle is constant across all layers:
 
@@ -22,8 +22,10 @@ three layers. The defining safety principle is constant across all layers:
 
 Layer 1 and Layer 2 production runtime boundaries are PostgreSQL-or-die and
 fail-closed: they do not start, and do not mutate Discord, on an unsafe or
-unverifiable state. Layer 3 keeps local authoring state in SQLite and cannot
-touch Discord or the production database.
+unverifiable state. The model-facing Layer 3 harness keeps local authoring state
+in SQLite and cannot touch Discord or the production database. A separate
+server-side promotion boundary bridges sealed authoring artifacts into the
+PostgreSQL-backed Layer 2 lifecycle without exposing that authority to the model.
 
 ## Architecture at a Glance
 
@@ -41,9 +43,10 @@ Layer 3 — Conversational Intent Authoring (design-time only)
 ```
 
 Layer 2 remains the live-proven engine arc. The current development checkpoint
-adds Layer 3 above it without changing publication, approval, activation, or
-event-time execution. All layers share the Discord domain model and the
-resource-binding layer.
+connects a sealed Layer 3 design to Layer 2 publication and product-bound
+activation without exposing those capabilities to the model. Event-time
+execution remains deterministic. All layers share the Discord domain model and
+the resource-binding layer.
 
 ## Layer 1: DesiredState Control Plane
 
@@ -112,12 +115,37 @@ independently grounded slot-specific exact literal in that current turn before
 compilation. Duplicate keys, cross-slot substitutions, stale-turn literals, and
 path or value drift fail closed without repair or Draft mutation.
 
-The layer currently exists as the pure `design-harness` crate and the
-SQLite/loopback-worker `design-harness-cli` edge. It is a CLI and evaluation
+The authoring surface currently exists as the pure `design-harness` crate and
+the SQLite/loopback-worker `design-harness-cli` edge. It is a CLI and evaluation
 checkpoint, not a production API or UI. The only implemented product recipe is
 the private study room recipe. Typed-planner fallback is classified but not yet
-handed off to an actual typed-planner session. No Layer 3 authoring path
-publishes or activates a design.
+handed off to an actual typed-planner session.
+
+The intended `authoring-application` route loads an owned, revalidated
+`PreviewReadyArtifactV1` through trusted session ports and passes it to the pure
+`authoring-promotion` workflow. That workflow publishes its exact
+`InteractionRuleSet` as an inactive immutable version, creates a
+`ProductAuthoring` activation request, and durably binds that request to the
+exact promotion journal. The lower-level workflow remains a public core API and
+depends on production composition to keep direct transport access unreachable.
+The
+`authoring-promotion-postgres` adapter persists the monotonic workflow. A
+database trigger rejects a product activation link unless the exact
+`ActivationPending` promotion row, request, target, requester, policy, payload,
+and approval-context identities agree. Approval and apply continue through the
+existing activation authority; publication and promotion never change the
+active pointer.
+
+The pure `authoring-application` boundary accepts only an idempotency key,
+session ID, and expected generation from the client-facing command. It receives
+an in-process trusted-principal assertion and delegates owner and generation
+checks to owned-session and server-authority ports. The latter resolves guild,
+installation, RuleSet key, requester, binding revision, and policy. The boundary
+then starts the promotion, attempts advancement, and returns the resulting state,
+which may also be terminal expiry. Durable session, authority, HTTP
+authentication, approval, rejection, and apply adapters are not yet attached,
+so this is an authentication-ready internal contract rather than a production
+endpoint.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -158,7 +186,7 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-30 crates, 6 tools. The recurring pattern is **pure core + edge adapter**: pure
+33 crates, 5 Rust tools. The recurring pattern is **pure core + edge adapter**: pure
 crates hold the domain and logic and are forbidden `sqlx`/`twilight`
 dependencies (guarded by `dependency_guard` tests); a paired `*-postgres`
 adapter (or the `automation-runtime` Twilight edge) provides persistence and
@@ -173,6 +201,9 @@ Discord I/O.
   (interpret/run/validate), `automation-runtime` (Twilight edge).
 - **Layer 3 authoring**: `design-harness` (pure Draft, conversation, Intent IR,
   Recipe Compiler, candidate gates, and exact simulation).
+- **Layer 3 to Layer 2 promotion**: `authoring-application` (pure trusted-edge
+  application contract), `authoring-promotion` (workflow and product activation
+  bridge), and `authoring-promotion-postgres` (durable journal).
 - **Layer 2 durable ruleset**: `automation-ruleset` (registry core),
   `automation-ruleset-postgres`, `automation-ruleset-readiness` (hydration +
   activation gate), `automation-ruleset-dispatch` (pinned dispatch),
@@ -180,13 +211,15 @@ Discord I/O.
   authority).
 - **Layer 2 durable instances**: `automation-instance` + `-postgres`,
   `automation-instance-teardown`, `automation-panel-installation` + `-postgres`.
-- **Tools**: `interaction-smoke` (Layer 2 live runner + activation CLI),
+- **Rust tools**: `interaction-smoke` (Layer 2 live runner + activation CLI),
   `executor-smoke`, `starring-demo`, `ai-eval`, `design-harness`
-  (Luna-medium/SQLite CLI and evaluation edge), and `codex-worker` (private
-  loopback ChatGPT-login Codex execution boundary).
+  (Luna-medium/SQLite CLI and evaluation edge). `codex-worker` is a separate
+  private loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is six migrations under `/migrations` (instances, rulesets,
-instance-version pin, panel installations, deleting-status, activation-requests).
+Persistence is fourteen migrations under `/migrations`, including the original
+instance and RuleSet stores, product-bound activation context and terminal
+states, the authoring promotion journal, guarded activation, and the exact
+promotion-journal link gate.
 
 ## Durable RuleSet Lifecycle
 
@@ -229,12 +262,21 @@ converge through per-request and per-`(guild, key)` CAS. A development-only
 `unsafe-dev-activate` escape (compile-feature-gated, absent from normal builds)
 skips approval but keeps every technical safeguard.
 
+Product-authored requests begin `Unlinked`. Both the pure bridge and a
+PostgreSQL trigger require an exact `ActivationPending` promotion journal before
+the request becomes approvable. Approval binds the exact promotion payload,
+resource projection, policy, and observed active baseline. Apply reloads the
+fresh environment and rechecks binding revision, fingerprint, baseline, and
+readiness even when the requested target is already active.
+
 ## Core Safety Invariants
 
 - Layer 1 and Layer 2 production runtime boundaries are PostgreSQL-or-die and
   fail-closed: no start and no Discord mutation on an unsafe or unverifiable
-  state. Layer 3 authoring persistence is local SQLite and has no Discord or
-  production-database mutation authority.
+  state. The model-facing Layer 3 harness remains local and pure. The intended
+  production composition exposes publication and approval-request creation only
+  through the separate server-authorized promotion boundary, and neither
+  operation activates a RuleSet.
 - AI at design/authoring time only; runtime is deterministic; event-time LLM is
   forbidden (`no_ai_gateway` per crate).
 - Pure crates carry no `sqlx`/`twilight` regular dependency (`dependency_guard`).
@@ -249,7 +291,7 @@ skips approval but keeps every technical safeguard.
 - **CI** (`.github/workflows/ci.yml`, GitHub Actions, push + PR): a DB-less job
   (fmt, build, `cargo test --workspace`, clippy `-D warnings`, unsafe-dev feature
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
-  job (six adapter packages' ignored integration tests, serial). No live Discord
+  job (five adapter packages' ignored integration tests, serial). No live Discord
   or LLM in CI.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
@@ -283,6 +325,12 @@ Stated as capabilities (durable across the phase numbering):
 - Live-proven durable RuleSet rollback.
 - Approval-bound, un-bypassable activation authority (two-person, leased,
   fresh-readiness-at-apply).
+- PreviewReady-to-approval promotion core: exact inactive publication,
+  idempotent durable journal, product-bound approval payload, two-layer journal
+  link gate, and guarded active-pointer mutation through the existing authority.
+- Pure authentication-ready authoring application contract that derives
+  promotion authority from trusted-edge principal and server-owned session
+  ports.
 - Pure conversational Intent IR and deterministic Recipe Compiler for the first
   private-study-room recipe.
 - Intent protocol V4 semantic identity: ordered human request evidence; closed
@@ -325,8 +373,16 @@ Stated as capabilities (durable across the phase numbering):
 
 - A production user-facing authoring API or UI. The current harness is a CLI and
   evaluation checkpoint.
+- Durable owned-session and guild-installation authority adapters for
+  `authoring-application`; its pure ports are implemented but not wired to an
+  authenticated HTTP edge.
 - An authenticated production approval surface (the CLI's manual actor input is
   workflow validation only, not identity assurance).
+- Promotion status convergence after approval, rejection, expiry, apply, and
+  runtime hydration. The activation request is authoritative today; promotion
+  stages stop at `ActivationPending` or `Expired`.
+- Runtime activation acknowledgement and controlled reload/hot-swap. A guarded
+  active-pointer change is not yet a `Live` product acknowledgement.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
 - A periodic teardown-retry worker (teardown resumes on boot, not on a schedule).
@@ -346,11 +402,21 @@ Stated as capabilities (durable across the phase numbering):
 
 - Manual CLI `--actor` input provides no production identity assurance; the real
   approval boundary completes when an authenticated surface attaches.
+- `authoring-application` is an internal trust-boundary contract, not an
+  authenticator. `VerifiedPrincipalV1::from_trusted_edge` must be called only
+  after transport authentication, and production composition must not expose
+  `PromotionService::start` directly.
+  `OwnedPreviewReadyArtifactV1::from_owned_session` is likewise a public
+  in-process trust constructor, not ownership proof by itself. The owned-artifact
+  and authority adapters must enforce the same durable generation in one
+  transaction or equivalent snapshot before this boundary is
+  production-authenticated.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
-- `last_apply_error` keeps only the latest attempt (no history table);
-  `observed_active` is recorded but does not gate apply.
+- `last_apply_error` keeps only the latest attempt (no history table). Legacy and
+  manual `observed_active` remains informational; product-authoring requests bind
+  an exact expected baseline and fail as `Superseded` when it drifts.
 - Discord and DB are not jointly atomic; the guarantees are "no durable
   incomplete state" and idempotent convergence, not distributed transactions.
 - Layer 1's live end-to-end maturity is not certified here.

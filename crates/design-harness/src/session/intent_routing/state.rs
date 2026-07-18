@@ -1,12 +1,11 @@
 use crate::draft::Draft;
 use crate::errors::StructuredError;
-use crate::intent::identity::domain_separated_length_framed_digest;
 use crate::intent::{
     recipe_descriptor_v1, ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV2,
     MissingDecision, RecipeKindV1,
 };
 use crate::llm::Message;
-use resource_resolution::ResourceBindingMap;
+use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 use serde::{Deserialize, Serialize};
 
 use super::super::SessionSnapshotError;
@@ -358,19 +357,7 @@ pub(super) fn validate_intent_recipe_component_identity(
 }
 
 pub(super) fn context_fingerprint(bindings: &ResourceBindingMap) -> String {
-    let mut fields = Vec::<Vec<u8>>::new();
-    for (key, id) in &bindings.channel_bindings {
-        fields.push(b"channel".to_vec());
-        fields.push(key.0.as_bytes().to_vec());
-        fields.push(id.to_string().into_bytes());
-    }
-    for (key, id) in &bindings.role_bindings {
-        fields.push(b"role".to_vec());
-        fields.push(key.0.as_bytes().to_vec());
-        fields.push(id.to_string().into_bytes());
-    }
-    let references = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    domain_separated_length_framed_digest(b"starring.intent.resource_context.v2\0", &references)
+    resource_binding_fingerprint_v2(bindings).into_string()
 }
 
 pub(super) fn intent_error(

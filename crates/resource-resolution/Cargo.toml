@@ -9,3 +9,8 @@ discord-model = { path = "../discord-model" }
 desired-state = { path = "../desired-state" }
 desired-compiler = { path = "../desired-compiler" }
 diff-engine = { path = "../diff-engine" }
+serde = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = { workspace = true }

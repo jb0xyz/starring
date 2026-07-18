@@ -9,7 +9,7 @@ automation-ruleset-activation = { path = "../automation-ruleset-activation" }
 chrono = { version = "0.4", features = ["serde"] }
 discord-model = { path = "../discord-model" }
 serde_json = { workspace = true }
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive", "migrate"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive", "macros", "migrate"] }
 
 [dev-dependencies]
 automation-ruleset-postgres = { path = "../automation-ruleset-postgres" }

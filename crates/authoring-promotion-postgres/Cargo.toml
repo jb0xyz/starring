@@ -1,0 +1,22 @@
+[package]
+name = "authoring-promotion-postgres"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+authoring-promotion = { path = "../authoring-promotion" }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = { workspace = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive", "macros", "migrate"] }
+
+[dev-dependencies]
+automation-ruleset = { path = "../automation-ruleset" }
+automation-ruleset-activation = { path = "../automation-ruleset-activation" }
+automation-ruleset-activation-postgres = { path = "../automation-ruleset-activation-postgres" }
+automation-ruleset-postgres = { path = "../automation-ruleset-postgres" }
+automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+design-harness = { path = "../design-harness" }
+discord-model = { path = "../discord-model" }
+futures = "0.3"
+resource-resolution = { path = "../resource-resolution" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
