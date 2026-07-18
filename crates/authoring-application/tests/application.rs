@@ -12,13 +12,14 @@ use authoring_application::{
     AuthorizedPromotionSnapshotV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
     DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
     ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
-    InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError,
-    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRevisionV1, ProductStatusQueryV1,
-    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
-    RejectionReasonError, RejectionReasonV1, ResolvedPromotionAuthorityV1,
-    RuntimeDeploymentQueryV1,
+    InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
+    ProductApprovalPort, ProductApprovalPreviewV1, ProductControlApplication,
+    ProductControlPortError, ProductDecisionPhaseV1, ProductDecisionPort,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductIdempotencyKeyV1,
+    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdError, ProductRequestIdV1,
+    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1,
+    PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
+    ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -398,6 +399,42 @@ fn promotion_id() -> PromotionId {
     PromotionId::parse(&"a".repeat(64)).unwrap()
 }
 
+fn product_request_id() -> ProductRequestIdV1 {
+    ProductRequestIdV1::parse("req_01JZ7QW9YB2G8M4K6T3P5R1C0D").unwrap()
+}
+
+fn approve_command() -> ApproveProductPromotionV1 {
+    ApproveProductPromotionV1 {
+        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap(),
+        expected_revision: ProductRevisionV1::new(3).unwrap(),
+        idempotency_key: ProductIdempotencyKeyV1::parse("approve-key").unwrap(),
+    }
+}
+
+#[test]
+fn product_request_id_is_bounded_validated_and_redacted() {
+    assert_eq!(
+        ProductRequestIdV1::parse("").unwrap_err(),
+        ProductRequestIdError::Empty
+    );
+    assert_eq!(
+        ProductRequestIdV1::parse(&"a".repeat(129)).unwrap_err(),
+        ProductRequestIdError::TooLong
+    );
+    for invalid in ["request id", "요청", "request/id", "request\n"] {
+        assert_eq!(
+            ProductRequestIdV1::parse(invalid).unwrap_err(),
+            ProductRequestIdError::InvalidCharacter
+        );
+    }
+    let request_id = product_request_id();
+    assert_eq!(request_id.as_str(), "req_01JZ7QW9YB2G8M4K6T3P5R1C0D");
+    let debug = format!("{request_id:?}");
+    assert_eq!(debug, "ProductRequestIdV1(<redacted>)");
+    assert!(!debug.contains(request_id.as_str()));
+}
+
 fn exact_deployment() -> ExactDeploymentSelectorV1 {
     ExactDeploymentSelectorV1::from_server_projection(
         AutomationInstallationId::parse("installation-2").unwrap(),
@@ -424,7 +461,7 @@ struct Decisions {
     phase: Mutex<ProductDecisionPhaseV1>,
 }
 
-impl ProductDecisionPort<Evidence> for Decisions {
+impl ProductDecisionQueryPort<Evidence> for Decisions {
     async fn load_approval_preview(
         &self,
         _request: AuthorizedApprovalPreviewV1<'_, Evidence>,
@@ -443,14 +480,23 @@ impl ProductDecisionPort<Evidence> for Decisions {
         assert_eq!(request.promotion().promotion_id(), &promotion_id());
         Ok(decision_projection(self.phase.lock().unwrap().clone()))
     }
+}
 
+impl ProductApprovalPort<Evidence> for Decisions {
     async fn approve_payload_bound(
         &self,
         request: AuthorizedApproveProductV1<'_, Evidence>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
         self.events.lock().unwrap().push("approve_payload_bound");
+        assert_eq!(request.request_id(), &product_request_id());
         assert_eq!(request.actor().principal_id().as_str(), "principal-1");
+        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
         assert_eq!(request.scope().acting_user_id(), UserId(200));
+        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
+        assert_eq!(
+            format!("{:?}", request.context()),
+            "ProductMutationContextV1(<redacted>)"
+        );
         assert_eq!(
             request.command().expected_payload_digest.as_str(),
             "c".repeat(64)
@@ -458,17 +504,22 @@ impl ProductDecisionPort<Evidence> for Decisions {
         assert_eq!(request.command().expected_revision.get(), 3);
         assert_eq!(request.command().idempotency_key.as_str(), "approve-key");
         Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(ProductDecisionPhaseV1::Approved),
+            decision_projection(self.phase.lock().unwrap().clone()),
             false,
         ))
     }
+}
 
+impl ProductRejectionPort<Evidence> for Decisions {
     async fn reject_payload_bound(
         &self,
         request: AuthorizedRejectProductV1<'_, Evidence>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
         self.events.lock().unwrap().push("reject_payload_bound");
+        assert_eq!(request.request_id(), &product_request_id());
+        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
         assert_eq!(request.scope().acting_user_id(), UserId(200));
+        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
         assert_eq!(request.command().reason.as_str(), "unsafe requested scope");
         assert_eq!(request.command().idempotency_key.as_str(), "reject-key");
         Ok(ProductMutationReceiptV1::from_server_projection(
@@ -476,14 +527,19 @@ impl ProductDecisionPort<Evidence> for Decisions {
             false,
         ))
     }
+}
 
+impl ProductApplyPort<Evidence> for Decisions {
     async fn apply_idempotent(
         &self,
         request: AuthorizedApplyProductV1<'_, Evidence>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
         self.events.lock().unwrap().push("apply_idempotent");
+        assert_eq!(request.request_id(), &product_request_id());
         assert_eq!(request.actor().principal_id().as_str(), "principal-1");
+        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
         assert_eq!(request.scope().acting_user_id(), UserId(200));
+        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
         assert_eq!(
             request.command().expected_payload_digest.as_str(),
             "c".repeat(64)
@@ -498,6 +554,8 @@ impl ProductDecisionPort<Evidence> for Decisions {
         ))
     }
 }
+
+fn assert_compatibility_decision_port<T: ProductDecisionPort<Evidence>>() {}
 
 struct Deployments {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -551,38 +609,64 @@ fn product_fixture(
 }
 
 #[test]
-fn approval_is_payload_bound_and_uses_only_server_derived_actor_authority() {
+fn approval_supports_pending_quorum_and_approved_outcomes() {
     block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
+        assert_compatibility_decision_port::<Decisions>();
+        for phase in [
             ProductDecisionPhaseV1::PendingApproval,
+            ProductDecisionPhaseV1::Approved,
+        ] {
+            let (events, authentication, authority, decisions, deployments) =
+                product_fixture(phase.clone(), DeploymentStatusProjectionV1::NotRequested);
+            let application = ProductControlApplication::new(
+                &authentication,
+                &authority,
+                &decisions,
+                &deployments,
+            );
+            let receipt = application
+                .approve(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    approve_command(),
+                )
+                .await
+                .unwrap();
+            assert!(!receipt.exact_replay());
+            assert_eq!(receipt.projection().phase(), &phase);
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![
+                    "authenticate_mutation",
+                    "authorize",
+                    "approve_payload_bound"
+                ]
+            );
+        }
+    });
+}
+
+#[test]
+fn approval_rejects_non_approval_success_projection() {
+    block_on(async {
+        let (_, authentication, authority, decisions, deployments) = product_fixture(
+            ProductDecisionPhaseV1::Rejected,
             DeploymentStatusProjectionV1::NotRequested,
         );
-        let application =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
-        let receipt = application
-            .approve(
-                "opaque-session-token",
-                "csrf-proof",
-                &installation(),
-                ApproveProductPromotionV1 {
-                    promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                    expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
-                        .unwrap(),
-                    expected_revision: ProductRevisionV1::new(3).unwrap(),
-                    idempotency_key: ProductIdempotencyKeyV1::parse("approve-key").unwrap(),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(!receipt.exact_replay());
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![
-                "authenticate_mutation",
-                "authorize",
-                "approve_payload_bound"
-            ]
-        );
+        let error =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
+                .approve(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    approve_command(),
+                )
+                .await
+                .unwrap_err();
+        assert_eq!(error, ProductApplicationError::InvalidProjection);
     });
 }
 
@@ -610,6 +694,7 @@ fn reject_reason_is_bounded_and_digest_bound_port_is_used() {
             .reject(
                 "opaque-session-token",
                 "csrf-proof",
+                &product_request_id(),
                 &installation(),
                 RejectProductPromotionV1 {
                     promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
@@ -686,6 +771,7 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
                 .apply(
                     "opaque-session-token",
                     "csrf-proof",
+                    &product_request_id(),
                     &installation(),
                     ApplyProductPromotionV1 {
                         promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),

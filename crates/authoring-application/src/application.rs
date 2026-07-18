@@ -9,10 +9,11 @@ use crate::{
     AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionSnapshotPort,
     AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusProjectionV1,
     DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
-    MutationAuthenticationPort, ProductApplicationError, ProductApprovalPreviewV1,
-    ProductDecisionPhaseV1, ProductDecisionPort, ProductDecisionProjectionV1,
-    ProductMutationReceiptV1, ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1,
-    PromotionSubmissionPort, RejectProductPromotionV1, RuntimeDeploymentQueryV1,
+    MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApprovalPort,
+    ProductApprovalPreviewV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort, ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1,
+    ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionPort,
+    RejectProductPromotionV1, RuntimeDeploymentQueryV1,
 };
 use crate::{ApproveProductPromotionV1, AuthoringApplicationError};
 
@@ -108,8 +109,6 @@ impl<A, G, D, R> ProductControlApplication<'_, A, G, D, R>
 where
     A: AuthenticationPort,
     G: FreshGuildAuthorityPort,
-    D: ProductDecisionPort<G::Evidence>,
-    R: DeploymentStatusPort<G::Evidence>,
 {
     async fn authenticate_and_authorize(
         &self,
@@ -161,7 +160,10 @@ where
         credential: &A::Credential,
         installation: &InstallationSelectorV1,
         query: ProductStatusQueryV1,
-    ) -> Result<ProductApprovalPreviewV1, ProductApplicationError> {
+    ) -> Result<ProductApprovalPreviewV1, ProductApplicationError>
+    where
+        D: ProductDecisionQueryPort<G::Evidence>,
+    {
         let (actor, authorized) = self
             .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
             .await?;
@@ -183,7 +185,11 @@ where
         credential: &A::Credential,
         installation: &InstallationSelectorV1,
         query: ProductStatusQueryV1,
-    ) -> Result<ProductStatusV1, ProductApplicationError> {
+    ) -> Result<ProductStatusV1, ProductApplicationError>
+    where
+        D: ProductDecisionQueryPort<G::Evidence>,
+        R: DeploymentStatusPort<G::Evidence>,
+    {
         let (actor, authorized) = self
             .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
             .await?;
@@ -205,11 +211,13 @@ where
         &self,
         credential: &A::Credential,
         csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
         installation: &InstallationSelectorV1,
         command: ApproveProductPromotionV1,
     ) -> Result<ProductMutationReceiptV1, ProductApplicationError>
     where
         A: MutationAuthenticationPort,
+        D: ProductApprovalPort<G::Evidence>,
     {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
@@ -223,6 +231,7 @@ where
         let receipt = self
             .decisions
             .approve_payload_bound(AuthorizedApproveProductV1::new(
+                request_id,
                 &actor,
                 authorized.scope(),
                 authorized.evidence(),
@@ -230,6 +239,7 @@ where
             ))
             .await?;
         validate_decision_projection(authorized.scope(), &promotion, receipt.projection())?;
+        validate_approval_phase(receipt.projection().phase())?;
         Ok(receipt)
     }
 
@@ -237,11 +247,13 @@ where
         &self,
         credential: &A::Credential,
         csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
         installation: &InstallationSelectorV1,
         command: RejectProductPromotionV1,
     ) -> Result<ProductMutationReceiptV1, ProductApplicationError>
     where
         A: MutationAuthenticationPort,
+        D: ProductRejectionPort<G::Evidence>,
     {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
@@ -255,6 +267,7 @@ where
         let receipt = self
             .decisions
             .reject_payload_bound(AuthorizedRejectProductV1::new(
+                request_id,
                 &actor,
                 authorized.scope(),
                 authorized.evidence(),
@@ -269,11 +282,14 @@ where
         &self,
         credential: &A::Credential,
         csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
         installation: &InstallationSelectorV1,
         command: ApplyProductPromotionV1,
     ) -> Result<ProductStatusV1, ProductApplicationError>
     where
         A: MutationAuthenticationPort,
+        D: ProductApplyPort<G::Evidence>,
+        R: DeploymentStatusPort<G::Evidence>,
     {
         let promotion = command.promotion.clone();
         let (actor, authorized) = self
@@ -287,6 +303,7 @@ where
         let receipt = self
             .decisions
             .apply_idempotent(AuthorizedApplyProductV1::new(
+                request_id,
                 &actor,
                 authorized.scope(),
                 authorized.evidence(),
@@ -303,7 +320,11 @@ where
         credential: &A::Credential,
         installation: &InstallationSelectorV1,
         query: RuntimeDeploymentQueryV1,
-    ) -> Result<DeploymentStatusV1, ProductApplicationError> {
+    ) -> Result<DeploymentStatusV1, ProductApplicationError>
+    where
+        D: ProductDecisionQueryPort<G::Evidence>,
+        R: DeploymentStatusPort<G::Evidence>,
+    {
         let (actor, authorized) = self
             .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
             .await?;
@@ -338,7 +359,10 @@ where
         actor: &AuthenticatedActorV1,
         authorized: &AuthorizedInstallationV1<G::Evidence>,
         projection: &ProductDecisionProjectionV1,
-    ) -> Result<ProductStatusV1, ProductApplicationError> {
+    ) -> Result<ProductStatusV1, ProductApplicationError>
+    where
+        R: DeploymentStatusPort<G::Evidence>,
+    {
         if let Some(status) = map_non_applied_status(projection.phase()) {
             return Ok(status);
         }
@@ -360,6 +384,17 @@ where
         } else {
             ProductStatusV1::RuntimePending
         })
+    }
+}
+
+fn validate_approval_phase(phase: &ProductDecisionPhaseV1) -> Result<(), ProductApplicationError> {
+    if matches!(
+        phase,
+        ProductDecisionPhaseV1::PendingApproval | ProductDecisionPhaseV1::Approved
+    ) {
+        Ok(())
+    } else {
+        Err(ProductApplicationError::InvalidProjection)
     }
 }
 

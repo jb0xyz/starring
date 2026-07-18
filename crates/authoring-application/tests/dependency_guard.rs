@@ -215,17 +215,65 @@ fn product_commands_never_accept_trusted_authority_or_apply_attempt_fields() {
 #[test]
 fn decision_port_has_only_bound_decisions_and_adapter_derived_apply_identity() {
     let source = include_str!("../src/control.rs");
-    let product_port = source
+    for (trait_name, methods) in [
+        (
+            "ProductDecisionQueryPort",
+            &["load_approval_preview", "load_product_status"][..],
+        ),
+        ("ProductApprovalPort", &["approve_payload_bound"][..]),
+        ("ProductRejectionPort", &["reject_payload_bound"][..]),
+        ("ProductApplyPort", &["apply_idempotent"][..]),
+    ] {
+        let port = source
+            .split(&format!("pub trait {trait_name}"))
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        for method in methods {
+            assert!(port.contains(method), "{trait_name} omitted {method}");
+        }
+    }
+    let marker = source
         .split("pub trait ProductDecisionPort")
         .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
         .unwrap();
-    assert!(product_port.contains("approve_payload_bound"));
-    assert!(product_port.contains("reject_payload_bound"));
-    assert!(product_port.contains("apply_idempotent"));
-    assert!(!product_port.contains("ApplyAttemptId"));
-    assert!(!product_port.contains("async fn approve("));
-    assert!(!product_port.contains("async fn reject("));
-    assert!(!product_port.contains("async fn apply("));
+    for capability in [
+        "ProductDecisionQueryPort",
+        "ProductApprovalPort",
+        "ProductRejectionPort",
+        "ProductApplyPort",
+    ] {
+        assert!(marker.contains(capability));
+    }
+    assert!(!marker.contains("async fn"));
+    assert!(!source.contains("ApplyAttemptId"));
+    assert!(!source.contains("async fn approve("));
+    assert!(!source.contains("async fn reject("));
+    assert!(!source.contains("async fn apply("));
+}
+
+#[test]
+fn product_mutation_context_is_crate_issued_bound_and_redacted() {
+    let control = include_str!("../src/control.rs");
+    let context = control
+        .split("pub struct ProductMutationContextV1")
+        .nth(1)
+        .unwrap()
+        .split("pub struct AuthorizedApprovalPreviewV1")
+        .next()
+        .unwrap();
+    for bound_value in ["request_id", "actor", "scope", "evidence"] {
+        assert!(context.contains(bound_value));
+    }
+    assert!(context.contains("pub(crate) fn new"));
+    assert!(!context.contains("pub fn new"));
+    assert!(context.contains("ProductMutationContextV1(<redacted>)"));
+    assert!(control.contains("ProductRequestIdV1(<redacted>)"));
 }
 
 fn source() -> String {

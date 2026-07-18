@@ -9,11 +9,11 @@ use authoring_application::{
     AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1,
     AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError,
     DeploymentStatusProjectionV1, FreshGuildAuthorityError, InstallationSelectorV1,
-    ProductApplicationError, ProductApprovalPreviewV1, ProductControlApplication,
-    ProductControlPortError, ProductDecisionPhaseV1, ProductDecisionPort,
-    ProductDecisionProjectionV1, ProductIdempotencyKeyV1, ProductMutationReceiptV1,
-    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
-    RejectProductPromotionV1, RejectionReasonV1,
+    ProductApplicationError, ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1,
+    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductIdempotencyKeyV1,
+    ProductMutationReceiptV1, ProductRejectionPort, ProductRevisionV1, ProductStatusQueryV1,
+    ProductStatusV1, PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1,
 };
 use authoring_application_discord::{
     AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -99,7 +99,7 @@ impl DiscordGuildAuthorityClient for Client {
 
 struct Decisions;
 
-impl ProductDecisionPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
+impl ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
     async fn load_approval_preview(
         &self,
         _request: AuthorizedApprovalPreviewV1<'_, FreshDiscordAuthorityEvidenceV1>,
@@ -124,21 +124,27 @@ impl ProductDecisionPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
             ProductDecisionPhaseV1::PendingApproval,
         ))
     }
+}
 
+impl ProductApprovalPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
     async fn approve_payload_bound(
         &self,
         _request: AuthorizedApproveProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
         unreachable!()
     }
+}
 
+impl ProductRejectionPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
     async fn reject_payload_bound(
         &self,
         _request: AuthorizedRejectProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
         unreachable!()
     }
+}
 
+impl ProductApplyPort<FreshDiscordAuthorityEvidenceV1> for Decisions {
     async fn apply_idempotent(
         &self,
         _request: AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,

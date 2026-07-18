@@ -5,13 +5,55 @@ use authoring_promotion::{AutomationInstallationId, ProductApprovalPayloadV1, Pr
 use discord_model::GuildId;
 
 use crate::{
-    AuthenticatedActorV1, AuthorizedInstallationScopeV1, ProductDecisionPhaseV1,
-    ProductDecisionProjectionV1,
+    AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthorizedInstallationScopeV1,
+    ProductDecisionPhaseV1, ProductDecisionProjectionV1,
 };
 
 const REJECTION_REASON_MAX_SCALARS: usize = 1_000;
 const REJECTION_REASON_MAX_BYTES: usize = 4_000;
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+const REQUEST_ID_MAX_BYTES: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProductRequestIdError {
+    #[error("product request ID must not be empty")]
+    Empty,
+    #[error("product request ID exceeds {REQUEST_ID_MAX_BYTES} bytes")]
+    TooLong,
+    #[error("product request ID contains invalid characters")]
+    InvalidCharacter,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProductRequestIdV1(String);
+
+impl ProductRequestIdV1 {
+    pub fn parse(value: &str) -> Result<Self, ProductRequestIdError> {
+        if value.is_empty() {
+            return Err(ProductRequestIdError::Empty);
+        }
+        if value.len() > REQUEST_ID_MAX_BYTES {
+            return Err(ProductRequestIdError::TooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+        {
+            return Err(ProductRequestIdError::InvalidCharacter);
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Debug for ProductRequestIdV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProductRequestIdV1(<redacted>)")
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromotionSelectorV1 {
@@ -310,6 +352,55 @@ pub enum ProductControlPortError {
     Backend(String),
 }
 
+pub struct ProductMutationContextV1<'a, E> {
+    request_id: &'a ProductRequestIdV1,
+    actor: &'a AuthenticatedActorV1,
+    scope: &'a AuthorizedInstallationScopeV1,
+    evidence: &'a E,
+}
+
+impl<'a, E> ProductMutationContextV1<'a, E> {
+    pub(crate) fn new(
+        request_id: &'a ProductRequestIdV1,
+        actor: &'a AuthenticatedActorV1,
+        scope: &'a AuthorizedInstallationScopeV1,
+        evidence: &'a E,
+    ) -> Self {
+        Self {
+            request_id,
+            actor,
+            scope,
+            evidence,
+        }
+    }
+
+    pub fn request_id(&self) -> &ProductRequestIdV1 {
+        self.request_id
+    }
+
+    pub fn actor(&self) -> &AuthenticatedActorV1 {
+        self.actor
+    }
+
+    pub fn session_fingerprint(&self) -> &AuthenticatedSessionFingerprintV1 {
+        self.actor.session_fingerprint()
+    }
+
+    pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
+        self.scope
+    }
+
+    pub fn evidence(&self) -> &E {
+        self.evidence
+    }
+}
+
+impl<E> Debug for ProductMutationContextV1<'_, E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProductMutationContextV1(<redacted>)")
+    }
+}
+
 pub struct AuthorizedApprovalPreviewV1<'a, E> {
     actor: &'a AuthenticatedActorV1,
     scope: &'a AuthorizedInstallationScopeV1,
@@ -389,37 +480,46 @@ impl<'a, E> AuthorizedProductStatusV1<'a, E> {
 }
 
 pub struct AuthorizedApproveProductV1<'a, E> {
-    actor: &'a AuthenticatedActorV1,
-    scope: &'a AuthorizedInstallationScopeV1,
-    evidence: &'a E,
+    context: ProductMutationContextV1<'a, E>,
     command: ApproveProductPromotionV1,
 }
 
 impl<'a, E> AuthorizedApproveProductV1<'a, E> {
     pub(crate) fn new(
+        request_id: &'a ProductRequestIdV1,
         actor: &'a AuthenticatedActorV1,
         scope: &'a AuthorizedInstallationScopeV1,
         evidence: &'a E,
         command: ApproveProductPromotionV1,
     ) -> Self {
         Self {
-            actor,
-            scope,
-            evidence,
+            context: ProductMutationContextV1::new(request_id, actor, scope, evidence),
             command,
         }
     }
 
+    pub fn context(&self) -> &ProductMutationContextV1<'a, E> {
+        &self.context
+    }
+
+    pub fn request_id(&self) -> &ProductRequestIdV1 {
+        self.context.request_id()
+    }
+
     pub fn actor(&self) -> &AuthenticatedActorV1 {
-        self.actor
+        self.context.actor()
+    }
+
+    pub fn session_fingerprint(&self) -> &AuthenticatedSessionFingerprintV1 {
+        self.context.session_fingerprint()
     }
 
     pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
-        self.scope
+        self.context.scope()
     }
 
     pub fn evidence(&self) -> &E {
-        self.evidence
+        self.context.evidence()
     }
 
     pub fn command(&self) -> &ApproveProductPromotionV1 {
@@ -428,37 +528,46 @@ impl<'a, E> AuthorizedApproveProductV1<'a, E> {
 }
 
 pub struct AuthorizedRejectProductV1<'a, E> {
-    actor: &'a AuthenticatedActorV1,
-    scope: &'a AuthorizedInstallationScopeV1,
-    evidence: &'a E,
+    context: ProductMutationContextV1<'a, E>,
     command: RejectProductPromotionV1,
 }
 
 impl<'a, E> AuthorizedRejectProductV1<'a, E> {
     pub(crate) fn new(
+        request_id: &'a ProductRequestIdV1,
         actor: &'a AuthenticatedActorV1,
         scope: &'a AuthorizedInstallationScopeV1,
         evidence: &'a E,
         command: RejectProductPromotionV1,
     ) -> Self {
         Self {
-            actor,
-            scope,
-            evidence,
+            context: ProductMutationContextV1::new(request_id, actor, scope, evidence),
             command,
         }
     }
 
+    pub fn context(&self) -> &ProductMutationContextV1<'a, E> {
+        &self.context
+    }
+
+    pub fn request_id(&self) -> &ProductRequestIdV1 {
+        self.context.request_id()
+    }
+
     pub fn actor(&self) -> &AuthenticatedActorV1 {
-        self.actor
+        self.context.actor()
+    }
+
+    pub fn session_fingerprint(&self) -> &AuthenticatedSessionFingerprintV1 {
+        self.context.session_fingerprint()
     }
 
     pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
-        self.scope
+        self.context.scope()
     }
 
     pub fn evidence(&self) -> &E {
-        self.evidence
+        self.context.evidence()
     }
 
     pub fn command(&self) -> &RejectProductPromotionV1 {
@@ -467,37 +576,46 @@ impl<'a, E> AuthorizedRejectProductV1<'a, E> {
 }
 
 pub struct AuthorizedApplyProductV1<'a, E> {
-    actor: &'a AuthenticatedActorV1,
-    scope: &'a AuthorizedInstallationScopeV1,
-    evidence: &'a E,
+    context: ProductMutationContextV1<'a, E>,
     command: ApplyProductPromotionV1,
 }
 
 impl<'a, E> AuthorizedApplyProductV1<'a, E> {
     pub(crate) fn new(
+        request_id: &'a ProductRequestIdV1,
         actor: &'a AuthenticatedActorV1,
         scope: &'a AuthorizedInstallationScopeV1,
         evidence: &'a E,
         command: ApplyProductPromotionV1,
     ) -> Self {
         Self {
-            actor,
-            scope,
-            evidence,
+            context: ProductMutationContextV1::new(request_id, actor, scope, evidence),
             command,
         }
     }
 
+    pub fn context(&self) -> &ProductMutationContextV1<'a, E> {
+        &self.context
+    }
+
+    pub fn request_id(&self) -> &ProductRequestIdV1 {
+        self.context.request_id()
+    }
+
     pub fn actor(&self) -> &AuthenticatedActorV1 {
-        self.actor
+        self.context.actor()
+    }
+
+    pub fn session_fingerprint(&self) -> &AuthenticatedSessionFingerprintV1 {
+        self.context.session_fingerprint()
     }
 
     pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
-        self.scope
+        self.context.scope()
     }
 
     pub fn evidence(&self) -> &E {
-        self.evidence
+        self.context.evidence()
     }
 
     pub fn command(&self) -> &ApplyProductPromotionV1 {
@@ -506,7 +624,7 @@ impl<'a, E> AuthorizedApplyProductV1<'a, E> {
 }
 
 #[allow(async_fn_in_trait)]
-pub trait ProductDecisionPort<E> {
+pub trait ProductDecisionQueryPort<E> {
     async fn load_approval_preview(
         &self,
         request: AuthorizedApprovalPreviewV1<'_, E>,
@@ -516,19 +634,41 @@ pub trait ProductDecisionPort<E> {
         &self,
         request: AuthorizedProductStatusV1<'_, E>,
     ) -> Result<ProductDecisionProjectionV1, ProductControlPortError>;
+}
 
+#[allow(async_fn_in_trait)]
+pub trait ProductApprovalPort<E> {
     async fn approve_payload_bound(
         &self,
         request: AuthorizedApproveProductV1<'_, E>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError>;
+}
 
+#[allow(async_fn_in_trait)]
+pub trait ProductRejectionPort<E> {
     async fn reject_payload_bound(
         &self,
         request: AuthorizedRejectProductV1<'_, E>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError>;
+}
 
+#[allow(async_fn_in_trait)]
+pub trait ProductApplyPort<E> {
     async fn apply_idempotent(
         &self,
         request: AuthorizedApplyProductV1<'_, E>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError>;
+}
+
+pub trait ProductDecisionPort<E>:
+    ProductDecisionQueryPort<E> + ProductApprovalPort<E> + ProductRejectionPort<E> + ProductApplyPort<E>
+{
+}
+
+impl<T, E> ProductDecisionPort<E> for T where
+    T: ProductDecisionQueryPort<E>
+        + ProductApprovalPort<E>
+        + ProductRejectionPort<E>
+        + ProductApplyPort<E>
+{
 }
