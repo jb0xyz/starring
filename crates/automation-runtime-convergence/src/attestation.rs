@@ -89,3 +89,19 @@ pub struct LiveAttestationV1 {
     pub gateway_ready: GatewayReadyAttestationV1,
     pub certified_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveLossKindV1 {
+    ServingLeaseExpired,
+    ServingDisconnected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveRecoveryAttestationV1 {
+    pub prior_live: LiveAttestationV1,
+    pub kind: LiveLossKindV1,
+    pub evidence_at: DateTime<Utc>,
+    pub recovered_at: DateTime<Utc>,
+}

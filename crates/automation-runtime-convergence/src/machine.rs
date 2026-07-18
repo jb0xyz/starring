@@ -7,11 +7,11 @@ mod validation;
 use crate::{
     ActivationAttestationV1, CommandGuardV1, ControllerLeaseV1, DeploymentId, DeploymentRevision,
     DrainAttestationV1, GatewayReadyAttestationV1, LeaseRequestV1, LiveAttestationV1,
-    PanelCertificateV1, PreflightAttestationV1, RuntimeDeploymentError,
-    RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1,
-    RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1, RuntimeFailureDispositionV1,
-    RuntimeFailureV1, RuntimeGeneration, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
-    SupersedingDeploymentV1,
+    LiveRecoveryAttestationV1, PanelCertificateV1, PreflightAttestationV1, RecoverLiveRequestV1,
+    RuntimeDeploymentError, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1,
+    RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1,
+    RuntimeFailureDispositionV1, RuntimeFailureV1, RuntimeGeneration, RuntimePendingConditionV1,
+    RuntimeProcessIdentityV1, SupersedingDeploymentV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +45,7 @@ pub struct RuntimeDeployment {
     panel_certificate: Option<PanelCertificateV1>,
     gateway_ready: Option<GatewayReadyAttestationV1>,
     live: Option<LiveAttestationV1>,
+    last_live_recovery: Option<LiveRecoveryAttestationV1>,
     last_runtime_failure: Option<RuntimeFailureDispositionV1>,
 }
 
@@ -80,6 +81,7 @@ impl RuntimeDeployment {
             panel_certificate: None,
             gateway_ready: None,
             live: None,
+            last_live_recovery: None,
             last_runtime_failure: None,
         })
     }
@@ -101,6 +103,7 @@ impl RuntimeDeployment {
             panel_certificate: snapshot.panel_certificate,
             gateway_ready: snapshot.gateway_ready,
             live: snapshot.live,
+            last_live_recovery: snapshot.last_live_recovery,
             last_runtime_failure: snapshot.last_runtime_failure,
         };
         deployment.validate_snapshot()?;
@@ -124,6 +127,7 @@ impl RuntimeDeployment {
             panel_certificate: self.panel_certificate.clone(),
             gateway_ready: self.gateway_ready.clone(),
             live: self.live.clone(),
+            last_live_recovery: self.last_live_recovery.clone(),
             last_runtime_failure: self.last_runtime_failure.clone(),
         }
     }
@@ -158,6 +162,10 @@ impl RuntimeDeployment {
 
     pub fn live_attestation(&self) -> Option<&LiveAttestationV1> {
         self.live.as_ref()
+    }
+
+    pub fn last_live_recovery(&self) -> Option<&LiveRecoveryAttestationV1> {
+        self.last_live_recovery.as_ref()
     }
 
     pub fn acquire_lease(
@@ -323,9 +331,8 @@ impl RuntimeDeployment {
         Self::validate_failure(&failure)?;
         if retry_not_before < failure.recorded_at
             || self
-                .activation
-                .as_ref()
-                .is_none_or(|activation| failure.recorded_at < activation.activated_at)
+                .runtime_evidence_floor()
+                .is_none_or(|floor| failure.recorded_at < floor)
         {
             return Err(RuntimeDeploymentError::InvalidFailure);
         }
@@ -358,9 +365,8 @@ impl RuntimeDeployment {
         self.require_runtime_failure_phase("record_blocked_failure")?;
         Self::validate_failure(&failure)?;
         if self
-            .activation
-            .as_ref()
-            .is_none_or(|activation| failure.recorded_at < activation.activated_at)
+            .runtime_evidence_floor()
+            .is_none_or(|floor| failure.recorded_at < floor)
         {
             return Err(RuntimeDeploymentError::InvalidFailure);
         }
@@ -475,6 +481,53 @@ impl RuntimeDeployment {
         self.live = Some(live);
         self.controller_lease = None;
         self.phase = RuntimeDeploymentPhaseV1::Live;
+        self.bump_revision()
+    }
+
+    pub fn recover_live(
+        &mut self,
+        request: RecoverLiveRequestV1,
+    ) -> Result<TransitionOutcomeV1, RuntimeDeploymentError> {
+        if self.last_live_recovery.as_ref().is_some_and(|recovery| {
+            recovery.prior_live.runtime_generation == request.expected_runtime_generation
+                && recovery.prior_live.process_instance_id == request.expected_process_instance_id
+                && recovery.kind == request.kind
+                && recovery.evidence_at == request.evidence_at
+                && recovery.recovered_at == request.recovered_at
+        }) && !matches!(self.phase, RuntimeDeploymentPhaseV1::Live)
+        {
+            return Ok(self.replayed());
+        }
+        self.require_revision(request.expected_revision)?;
+        self.require_phase(RuntimeDeploymentPhaseKindV1::Live, "recover_live")?;
+        if request.expected_runtime_generation != self.runtime_generation {
+            return Err(RuntimeDeploymentError::RuntimeGenerationConflict {
+                expected: self.runtime_generation,
+                actual: request.expected_runtime_generation,
+            });
+        }
+        let prior_live = self
+            .live
+            .clone()
+            .ok_or(RuntimeDeploymentError::InvalidSnapshot)?;
+        if prior_live.process_instance_id != request.expected_process_instance_id {
+            return Err(RuntimeDeploymentError::ProcessInstanceMismatch);
+        }
+        if request.evidence_at < prior_live.certified_at
+            || request.recovered_at < request.evidence_at
+        {
+            return Err(RuntimeDeploymentError::AttestationTimeRegression);
+        }
+        self.last_live_recovery = Some(LiveRecoveryAttestationV1 {
+            prior_live,
+            kind: request.kind,
+            evidence_at: request.evidence_at,
+            recovered_at: request.recovered_at,
+        });
+        self.clear_unaccepted_runtime_evidence();
+        self.phase = RuntimeDeploymentPhaseV1::RuntimePending {
+            condition: RuntimePendingConditionV1::Ready,
+        };
         self.bump_revision()
     }
 
@@ -631,6 +684,20 @@ impl RuntimeDeployment {
         self.panel_certificate = None;
         self.gateway_ready = None;
         self.live = None;
+    }
+
+    fn runtime_evidence_floor(&self) -> Option<DateTime<Utc>> {
+        let activated_at = self
+            .activation
+            .as_ref()
+            .map(|activation| activation.activated_at)?;
+        Some(
+            self.last_live_recovery
+                .as_ref()
+                .map_or(activated_at, |recovery| {
+                    activated_at.max(recovery.recovered_at)
+                }),
+        )
     }
 
     fn has_reached(&self, expected: RuntimeDeploymentPhaseKindV1) -> bool {

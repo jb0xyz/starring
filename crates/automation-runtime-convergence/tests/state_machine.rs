@@ -4,13 +4,13 @@ use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
     CommandGuardV1, ControllerId, DeploymentId, DrainAttestationV1, FencingToken,
-    GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1,
+    GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1, LiveLossKindV1,
     PanelCertificateId, PanelCertificateV1, PanelIneligibilityV1, PreflightAttestationV1,
-    ProcessInstanceId, PromotionId, RuntimeDeployment, RuntimeDeploymentError,
-    RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1,
-    RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1, RuntimeFailureV1,
-    RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId,
-    TransitionOutcomeV1,
+    ProcessInstanceId, PromotionId, RecoverLiveRequestV1, RuntimeDeployment,
+    RuntimeDeploymentError, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1,
+    RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
+    RuntimeFailureV1, RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1,
+    TenantId, TransitionOutcomeV1,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use discord_model::GuildId;
@@ -511,6 +511,225 @@ fn live_certification_replay_is_idempotent_after_lease_release() {
         )
         .unwrap();
     assert_eq!(replay, TransitionOutcomeV1::Replayed { revision });
+}
+
+#[test]
+fn lost_live_evidence_returns_to_pending_and_roundtrips() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_ready();
+    fixture
+        .deployment
+        .certify_live(&fixture.guard(50), fixture.ready(), at(51))
+        .unwrap();
+    let expected_revision = fixture.deployment.revision();
+    let request = RecoverLiveRequestV1 {
+        expected_revision,
+        expected_runtime_generation: RuntimeGeneration::new(2).unwrap(),
+        expected_process_instance_id: ProcessInstanceId::parse("process-new").unwrap(),
+        kind: LiveLossKindV1::ServingLeaseExpired,
+        evidence_at: at(60),
+        recovered_at: at(61),
+    };
+    let outcome = fixture.deployment.recover_live(request.clone()).unwrap();
+    assert!(matches!(outcome, TransitionOutcomeV1::Applied { .. }));
+    assert_eq!(
+        fixture.deployment.phase().kind(),
+        RuntimeDeploymentPhaseKindV1::RuntimePending
+    );
+    let snapshot = fixture.deployment.snapshot();
+    assert!(snapshot.activation.is_some());
+    assert!(snapshot.panel_certificate.is_none());
+    assert!(snapshot.gateway_ready.is_none());
+    assert!(snapshot.live.is_none());
+    let recovery = fixture.deployment.last_live_recovery().unwrap();
+    assert_eq!(
+        recovery.prior_live.process_instance_id.as_str(),
+        "process-new"
+    );
+    assert_eq!(recovery.kind, LiveLossKindV1::ServingLeaseExpired);
+    let revision = fixture.deployment.revision();
+    assert_eq!(
+        fixture.deployment.recover_live(request).unwrap(),
+        TransitionOutcomeV1::Replayed { revision }
+    );
+    assert_eq!(
+        RuntimeDeployment::restore(fixture.deployment.snapshot()).unwrap(),
+        fixture.deployment
+    );
+}
+
+#[test]
+fn live_recovery_requires_exact_identity_and_monotonic_database_evidence() {
+    let cases = [
+        (
+            RuntimeGeneration::new(1).unwrap(),
+            ProcessInstanceId::parse("process-new").unwrap(),
+            at(60),
+            at(61),
+            RuntimeDeploymentError::RuntimeGenerationConflict {
+                expected: RuntimeGeneration::new(2).unwrap(),
+                actual: RuntimeGeneration::new(1).unwrap(),
+            },
+        ),
+        (
+            RuntimeGeneration::new(2).unwrap(),
+            ProcessInstanceId::parse("process-other").unwrap(),
+            at(60),
+            at(61),
+            RuntimeDeploymentError::ProcessInstanceMismatch,
+        ),
+        (
+            RuntimeGeneration::new(2).unwrap(),
+            ProcessInstanceId::parse("process-new").unwrap(),
+            at(50),
+            at(61),
+            RuntimeDeploymentError::AttestationTimeRegression,
+        ),
+        (
+            RuntimeGeneration::new(2).unwrap(),
+            ProcessInstanceId::parse("process-new").unwrap(),
+            at(62),
+            at(61),
+            RuntimeDeploymentError::AttestationTimeRegression,
+        ),
+    ];
+    for (generation, process, evidence_at, recovered_at, expected) in cases {
+        let mut fixture = Fixture::new();
+        fixture.advance_to_awaiting_ready();
+        fixture
+            .deployment
+            .certify_live(&fixture.guard(50), fixture.ready(), at(51))
+            .unwrap();
+        let error = fixture
+            .deployment
+            .recover_live(RecoverLiveRequestV1 {
+                expected_revision: fixture.deployment.revision(),
+                expected_runtime_generation: generation,
+                expected_process_instance_id: process,
+                kind: LiveLossKindV1::ServingDisconnected,
+                evidence_at,
+                recovered_at,
+            })
+            .unwrap_err();
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn recovery_fences_the_old_process_and_accepts_only_fresh_runtime_evidence() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_ready();
+    fixture
+        .deployment
+        .certify_live(&fixture.guard(50), fixture.ready(), at(51))
+        .unwrap();
+    fixture
+        .deployment
+        .recover_live(RecoverLiveRequestV1 {
+            expected_revision: fixture.deployment.revision(),
+            expected_runtime_generation: RuntimeGeneration::new(2).unwrap(),
+            expected_process_instance_id: ProcessInstanceId::parse("process-new").unwrap(),
+            kind: LiveLossKindV1::ServingDisconnected,
+            evidence_at: at(60),
+            recovered_at: at(61),
+        })
+        .unwrap();
+    let revision = fixture.deployment.revision();
+    assert_eq!(
+        fixture
+            .deployment
+            .acquire_lease(LeaseRequestV1 {
+                expected_revision: revision,
+                controller_id: ControllerId::parse("controller-recovery").unwrap(),
+                fencing_token: FencingToken::new(10).unwrap(),
+                now: at(62),
+                expires_at: at(120),
+            })
+            .unwrap_err(),
+        RuntimeDeploymentError::FencingTokenNotMonotonic
+    );
+    fixture.controller = ControllerId::parse("controller-recovery").unwrap();
+    fixture.token = FencingToken::new(11).unwrap();
+    fixture
+        .deployment
+        .acquire_lease(LeaseRequestV1 {
+            expected_revision: revision,
+            controller_id: fixture.controller.clone(),
+            fencing_token: fixture.token,
+            now: at(62),
+            expires_at: at(120),
+        })
+        .unwrap();
+    fixture
+        .deployment
+        .begin_panel_reconciliation(&fixture.guard(63))
+        .unwrap();
+    let mut stale_panel = fixture.panel();
+    stale_panel.reconciled_at = at(64);
+    assert_eq!(
+        fixture
+            .deployment
+            .accept_panel_certificate(&fixture.guard(64), stale_panel)
+            .unwrap_err(),
+        RuntimeDeploymentError::ProcessInstanceMismatch
+    );
+    let mut recovered_panel = fixture.panel();
+    recovered_panel.certificate_id = PanelCertificateId::parse("panels-recovered").unwrap();
+    recovered_panel.process_instance_id = ProcessInstanceId::parse("process-recovered").unwrap();
+    recovered_panel.reconciled_at = at(64);
+    fixture
+        .deployment
+        .accept_panel_certificate(&fixture.guard(64), recovered_panel)
+        .unwrap();
+    let mut recovered_ready = fixture.ready();
+    recovered_ready.process_instance_id = ProcessInstanceId::parse("process-recovered").unwrap();
+    recovered_ready.ready_at = at(65);
+    fixture
+        .deployment
+        .certify_live(&fixture.guard(65), recovered_ready, at(66))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .deployment
+            .live_attestation()
+            .unwrap()
+            .process_instance_id
+            .as_str(),
+        "process-recovered"
+    );
+}
+
+#[test]
+fn corrupted_historical_live_recovery_is_rejected() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_ready();
+    fixture
+        .deployment
+        .certify_live(&fixture.guard(50), fixture.ready(), at(51))
+        .unwrap();
+    fixture
+        .deployment
+        .recover_live(RecoverLiveRequestV1 {
+            expected_revision: fixture.deployment.revision(),
+            expected_runtime_generation: RuntimeGeneration::new(2).unwrap(),
+            expected_process_instance_id: ProcessInstanceId::parse("process-new").unwrap(),
+            kind: LiveLossKindV1::ServingLeaseExpired,
+            evidence_at: at(60),
+            recovered_at: at(61),
+        })
+        .unwrap();
+    let mut snapshot = fixture.deployment.snapshot();
+    snapshot
+        .last_live_recovery
+        .as_mut()
+        .unwrap()
+        .prior_live
+        .panel_certificate
+        .failed_count = 1;
+    assert_eq!(
+        RuntimeDeployment::restore(snapshot).unwrap_err(),
+        RuntimeDeploymentError::InvalidSnapshot
+    );
 }
 
 #[test]

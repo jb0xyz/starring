@@ -7,8 +7,8 @@ mod state;
 
 pub use attestation::{
     ActivationAttestationV1, ActivationOutcomeKindV1, DrainAttestationV1,
-    GatewayReadyAttestationV1, GatewayReadyKindV1, LiveAttestationV1, PanelCertificateV1,
-    PreflightAttestationV1,
+    GatewayReadyAttestationV1, GatewayReadyKindV1, LiveAttestationV1, LiveLossKindV1,
+    LiveRecoveryAttestationV1, PanelCertificateV1, PreflightAttestationV1,
 };
 pub use error::{PanelIneligibilityV1, RuntimeDeploymentError};
 pub use id::{
@@ -22,7 +22,8 @@ pub use identity::{
 };
 pub use machine::{RuntimeDeployment, TransitionOutcomeV1};
 pub use state::{
-    CommandGuardV1, ControllerLeaseV1, LeaseRequestV1, RuntimeDeploymentPhaseKindV1,
-    RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1, RuntimeFailureDispositionV1,
-    RuntimeFailureKindV1, RuntimeFailureV1, RuntimePendingConditionV1, SupersedingDeploymentV1,
+    CommandGuardV1, ControllerLeaseV1, LeaseRequestV1, RecoverLiveRequestV1,
+    RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
+    RuntimeFailureDispositionV1, RuntimeFailureKindV1, RuntimeFailureV1, RuntimePendingConditionV1,
+    SupersedingDeploymentV1,
 };

@@ -70,6 +70,14 @@ impl RuntimeDeployment {
         if certificate.reconciled_at < activation.activated_at {
             return Err(RuntimeDeploymentError::AttestationTimeRegression);
         }
+        if let Some(recovery) = &self.last_live_recovery {
+            if certificate.reconciled_at < recovery.recovered_at {
+                return Err(RuntimeDeploymentError::AttestationTimeRegression);
+            }
+            if certificate.process_instance_id == recovery.prior_live.process_instance_id {
+                return Err(RuntimeDeploymentError::ProcessInstanceMismatch);
+            }
+        }
         Self::validate_panel_eligibility(certificate)
     }
 
@@ -223,9 +231,8 @@ impl RuntimeDeployment {
             if Self::validate_failure(failure).is_err()
                 || failure.recorded_at < self.requested_at
                 || self
-                    .activation
-                    .as_ref()
-                    .is_some_and(|activation| failure.recorded_at < activation.activated_at)
+                    .runtime_evidence_floor()
+                    .is_some_and(|floor| failure.recorded_at < floor)
                 || retry_not_before.is_some_and(|retry_at| retry_at < failure.recorded_at)
             {
                 return Err(RuntimeDeploymentError::InvalidSnapshot);
@@ -272,6 +279,40 @@ impl RuntimeDeployment {
                 || self.gateway_ready.as_ref() != Some(&live.gateway_ready)
                 || live.process_instance_id != live.gateway_ready.process_instance_id
                 || live.certified_at < live.gateway_ready.ready_at
+            {
+                return Err(RuntimeDeploymentError::InvalidSnapshot);
+            }
+        }
+        if let Some(recovery) = &self.last_live_recovery {
+            let prior = &recovery.prior_live;
+            let recovery_phase_valid = matches!(
+                self.phase,
+                RuntimeDeploymentPhaseV1::RuntimePending { .. }
+                    | RuntimeDeploymentPhaseV1::ReconcilingPanels
+                    | RuntimeDeploymentPhaseV1::AwaitingGatewayReady
+                    | RuntimeDeploymentPhaseV1::Live
+                    | RuntimeDeploymentPhaseV1::Superseded { .. }
+            );
+            if !recovery_phase_valid
+                || prior.target != self.target
+                || prior.runtime_generation != self.runtime_generation
+                || self.activation.as_ref() != Some(&prior.activation)
+                || prior.panel_certificate.target != self.target
+                || prior.panel_certificate.runtime_generation != self.runtime_generation
+                || prior.gateway_ready.target != self.target
+                || prior.gateway_ready.runtime_generation != self.runtime_generation
+                || prior.process_instance_id != prior.panel_certificate.process_instance_id
+                || prior.process_instance_id != prior.gateway_ready.process_instance_id
+                || prior.panel_certificate.reconciled_at < prior.activation.activated_at
+                || prior.gateway_ready.ready_at < prior.panel_certificate.reconciled_at
+                || prior.certified_at < prior.gateway_ready.ready_at
+                || Self::validate_panel_eligibility(&prior.panel_certificate).is_err()
+                || recovery.evidence_at < recovery.prior_live.certified_at
+                || recovery.recovered_at < recovery.evidence_at
+                || self
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.certified_at < recovery.recovered_at)
             {
                 return Err(RuntimeDeploymentError::InvalidSnapshot);
             }

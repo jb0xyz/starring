@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivationAttestationV1, ControllerId, DeploymentRevision, DrainAttestationV1, FencingToken,
-    GatewayReadyAttestationV1, LiveAttestationV1, PanelCertificateV1, PreflightAttestationV1,
-    RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeGeneration,
-    RuntimeProcessIdentityV1,
+    GatewayReadyAttestationV1, LiveAttestationV1, LiveLossKindV1, LiveRecoveryAttestationV1,
+    PanelCertificateV1, PreflightAttestationV1, RuntimeDeploymentIdentityV1,
+    RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeGeneration, RuntimeProcessIdentityV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +171,16 @@ pub struct CommandGuardV1 {
     pub now: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverLiveRequestV1 {
+    pub expected_revision: DeploymentRevision,
+    pub expected_runtime_generation: RuntimeGeneration,
+    pub expected_process_instance_id: crate::ProcessInstanceId,
+    pub kind: LiveLossKindV1,
+    pub evidence_at: DateTime<Utc>,
+    pub recovered_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupersedingDeploymentV1 {
@@ -197,5 +207,6 @@ pub struct RuntimeDeploymentSnapshotV1 {
     pub panel_certificate: Option<PanelCertificateV1>,
     pub gateway_ready: Option<GatewayReadyAttestationV1>,
     pub live: Option<LiveAttestationV1>,
+    pub last_live_recovery: Option<LiveRecoveryAttestationV1>,
     pub last_runtime_failure: Option<RuntimeFailureDispositionV1>,
 }
