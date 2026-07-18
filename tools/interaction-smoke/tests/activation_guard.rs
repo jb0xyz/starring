@@ -1,7 +1,9 @@
 const SOURCE: &str = include_str!("../src/main.rs");
 
 fn has_direct_activation_bypass(source: &str) -> bool {
-    source.contains("activate_if_ready(") || source.contains(".activate(")
+    source.contains("activate_if_ready(")
+        || source.contains(".activate(")
+        || source.contains(".activate_guarded(")
 }
 
 #[test]
@@ -18,6 +20,9 @@ fn activation_bypass_guard_detects_direct_calls() {
     ));
     assert!(has_direct_activation_bypass(
         "ruleset_store.activate(guild, key, version)"
+    ));
+    assert!(has_direct_activation_bypass(
+        "ruleset_store.activate_guarded(request)"
     ));
 }
 

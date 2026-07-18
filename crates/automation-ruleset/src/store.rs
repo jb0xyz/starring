@@ -8,7 +8,10 @@ use discord_model::{GuildId, UserId};
 
 use crate::hash::{RuleSetHasher, Sha256RuleSetHasher};
 use crate::key::RuleSetKey;
-use crate::model::{RuleSetActivation, RuleSetVersion};
+use crate::model::{
+    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetActivation,
+    RuleSetVersion, RuleSetVersionIdentity,
+};
 use crate::version::RuleSetVersionId;
 use crate::version::CURRENT_RULESET_SCHEMA_VERSION;
 
@@ -32,6 +35,8 @@ pub enum RuleSetStoreError {
     VersionNotFound,
     VersionOverflow,
     HashCollision,
+    TargetHashMismatch,
+    GuardedActivationUnsupported,
     Canonicalization(String),
     Backend(String),
 }
@@ -62,6 +67,13 @@ pub trait RuleSetStore {
         key: &RuleSetKey,
         version: RuleSetVersionId,
     ) -> Result<RuleSetActivation, RuleSetStoreError>;
+
+    async fn activate_guarded(
+        &self,
+        _request: GuardedRuleSetActivation,
+    ) -> Result<GuardedActivationOutcome, RuleSetStoreError> {
+        Err(RuleSetStoreError::GuardedActivationUnsupported)
+    }
 
     async fn active(
         &self,
@@ -182,6 +194,44 @@ impl<H: RuleSetHasher> RuleSetStore for InMemoryRuleSetStore<H> {
             ruleset_key: key.clone(),
             active_version: version,
         })
+    }
+
+    async fn activate_guarded(
+        &self,
+        request: GuardedRuleSetActivation,
+    ) -> Result<GuardedActivationOutcome, RuleSetStoreError> {
+        let mut guilds = self.inner.lock().unwrap();
+        let entry = guilds
+            .get_mut(&(request.guild_id, request.ruleset_key.clone()))
+            .ok_or(RuleSetStoreError::VersionNotFound)?;
+        let target = entry
+            .versions
+            .get(&request.target.version)
+            .ok_or(RuleSetStoreError::VersionNotFound)?;
+        if target.content_hash != request.target.content_hash {
+            return Err(RuleSetStoreError::TargetHashMismatch);
+        }
+        let observed_active = entry
+            .active
+            .and_then(|version| entry.versions.get(&version))
+            .map(RuleSetVersionIdentity::from);
+        let activation = RuleSetActivation {
+            guild_id: request.guild_id,
+            ruleset_key: request.ruleset_key,
+            active_version: request.target.version,
+        };
+        if observed_active.as_ref() == Some(&request.target) {
+            return Ok(GuardedActivationOutcome::AlreadyTarget(activation));
+        }
+        let baseline_matches = match &request.expected_active {
+            ExpectedActiveRuleSet::Absent => observed_active.is_none(),
+            ExpectedActiveRuleSet::Exact { identity } => observed_active.as_ref() == Some(identity),
+        };
+        if !baseline_matches {
+            return Ok(GuardedActivationOutcome::BaselineMismatch { observed_active });
+        }
+        entry.active = Some(request.target.version);
+        Ok(GuardedActivationOutcome::Activated(activation))
     }
 
     async fn active(

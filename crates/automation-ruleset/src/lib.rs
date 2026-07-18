@@ -8,7 +8,10 @@ pub use hash::{
     content_hash, RuleSetContentHash, RuleSetHashError, RuleSetHasher, Sha256RuleSetHasher,
 };
 pub use key::{RuleSetKey, RuleSetKeyError};
-pub use model::{RuleSetActivation, RuleSetVersion};
+pub use model::{
+    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetActivation,
+    RuleSetVersion, RuleSetVersionIdentity,
+};
 pub use store::{
     InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError,
 };
