@@ -261,7 +261,7 @@ impl Debug for VerifiedDiscordIdentityV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VerifiedDiscordIdentityV1")
-            .field("user_id", &self.user_id)
+            .field("user_id", &"<redacted>")
             .field("display_name", &"<redacted>")
             .finish()
     }

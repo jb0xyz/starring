@@ -257,7 +257,7 @@ async fn exchange_fetches_identity_and_revokes_every_returned_credential() {
     assert_eq!(identity.display_name(), "Product Owner");
     assert_eq!(
         format!("{identity:?}"),
-        "VerifiedDiscordIdentityV1 { user_id: UserId(123), display_name: \"<redacted>\" }"
+        "VerifiedDiscordIdentityV1 { user_id: \"<redacted>\", display_name: \"<redacted>\" }"
     );
     let requests = mock.finish().await;
     assert_eq!(requests.len(), 4);
