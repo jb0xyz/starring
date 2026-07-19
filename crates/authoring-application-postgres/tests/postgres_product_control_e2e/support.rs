@@ -22,9 +22,10 @@ use authoring_application_discord::{
     InstallationAuthoritySource,
 };
 use authoring_application_postgres::{
-    digest_opaque_session_credential_v1, PostgresAuthentication, PostgresProductDecisions,
-    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
-    ProductDecisionReadinessErrorV1, MIGRATOR,
+    digest_opaque_session_credential_v1, PostgresAuthentication,
+    PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
+    PostgresProductDecisions, PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1,
+    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
     approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,

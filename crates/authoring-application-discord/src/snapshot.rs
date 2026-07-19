@@ -5,7 +5,7 @@ use discord_model::{GuildId, Permissions, RoleId, UserId};
 
 use crate::{DiscordApplicationIdV1, DiscordBotUserIdV1};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstallationAuthorityRecordV1 {
     pub tenant_id: TenantId,
     pub installation_id: AutomationInstallationId,
@@ -14,6 +14,12 @@ pub struct InstallationAuthorityRecordV1 {
     pub acting_user_id: UserId,
     pub authority_revision: NonZeroU64,
     pub authority_digest: String,
+}
+
+impl std::fmt::Debug for InstallationAuthorityRecordV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InstallationAuthorityRecordV1(<redacted>)")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

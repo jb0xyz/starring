@@ -315,6 +315,30 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(snapshot.contains("public.automation_installation_authority_versions"));
     assert!(snapshot.contains("pg_catalog.set_config("));
     assert!(!snapshot.contains("map_err(|error| session_backend(error.to_string()))"));
+    let installation_authority = include_str!("../src/installation_authority.rs");
+    assert!(installation_authority
+        .contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"));
+    assert!(installation_authority.contains("pg_catalog.set_config('statement_timeout'"));
+    assert!(installation_authority.contains("idle_in_transaction_session_timeout"));
+    assert!(installation_authority.contains("pg_catalog.clock_timestamp()"));
+    assert!(installation_authority.contains("actor_session.session_digest = $3"));
+    assert!(installation_authority.contains("principal.disabled AS principal_disabled"));
+    assert!(installation_authority.contains("actor_session.oauth_state_digest"));
+    assert!(installation_authority.contains("actor_session.revoked_at"));
+    assert!(installation_authority.contains("tenant.lifecycle_state AS tenant_lifecycle_state"));
+    assert!(installation_authority
+        .contains("installation.lifecycle_state AS installation_lifecycle_state"));
+    assert!(installation_authority.contains("fn active_lifecycle("));
+    assert!(installation_authority
+        .contains("authority.revision = installation.current_authority_revision"));
+    assert!(installation_authority.contains("authority.authority_payload_digest"));
+    assert!(installation_authority.contains("persisted_session_digest"));
+    assert!(installation_authority.contains(".ct_eq(actor.session_fingerprint().as_bytes())"));
+    assert!(!installation_authority.contains("MAX("));
+    assert!(!installation_authority.contains("created_by_principal_id"));
+    assert!(!installation_authority.contains("sqlx::Error::to_string"));
+    assert!(!installation_authority.contains("FOR SHARE"));
+    assert!(!installation_authority.contains("FOR UPDATE"));
     let identity = include_str!("../src/product_identity/store.rs")
         .split("#[cfg(test)]")
         .next()
@@ -341,6 +365,7 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(identity.contains("pg_catalog.set_config("));
     for (path, source) in [
         ("src/authentication.rs", authentication),
+        ("src/installation_authority.rs", installation_authority),
         ("src/snapshot.rs", snapshot),
         ("src/product_identity/store.rs", identity),
     ] {
@@ -412,6 +437,10 @@ fn source_files_contain_no_comments() {
         ),
         ("src/digest.rs", include_str!("../src/digest.rs")),
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
+        (
+            "src/installation_authority.rs",
+            include_str!("../src/installation_authority.rs"),
+        ),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         (
             "src/product_decisions/apply.rs",
@@ -546,6 +575,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/approval_apply_flow.rs",
             include_str!("postgres_product_control_e2e/approval_apply_flow.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/installation_authority.rs",
+            include_str!("postgres_product_control_e2e/installation_authority.rs"),
         ),
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",

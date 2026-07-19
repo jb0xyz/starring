@@ -147,7 +147,13 @@ payload-bound approval, atomic Apply, and deployment-status projection. Durable
 PostgreSQL adapters now persist OAuth flow digests, opaque session and CSRF
 digests, encrypted authoring generations, current and historical installation
 authority, approval receipts, audit evidence, atomic Apply outcomes, and exact
-runtime deployment selectors. Apply writes the guarded active pointer,
+runtime deployment selectors. The PostgreSQL installation-authority source now
+binds the exact authenticated principal and session fingerprint to one active
+tenant and installation plus its exact current authority revision and digest in
+a bounded read-only repeatable-read snapshot. It commits before the existing
+Discord adapter performs live guild authorization, and normal inaccessible
+states are non-enumerating while durable graph corruption is redacted and fails
+closed. Apply writes the guarded active pointer,
 `Approved -> Applying -> Applied`, Requested deployment, receipt, aliases, and
 audit evidence in one serializable transaction. Normal baseline, binding, or
 policy drift instead commits a durable `Superseded` terminal record. Immutable
@@ -416,6 +422,11 @@ Stated as capabilities (durable across the phase numbering):
 - PostgreSQL product identity, OAuth flow, opaque session and CSRF storage,
   encrypted authoring generations, current and historical installation
   authority, bounded retention, and replay-evidence persistence.
+- PostgreSQL installation-authority projection with exact actor/session/install
+  binding, database-time lifecycle revalidation, exact current-head selection,
+  bounded read-only snapshotting, non-enumerating inactive states, corruption
+  detection, and redacted records and failures. It remains a staging adapter
+  until the production scoped-function and role boundary is implemented.
 - Payload-bound product approval and serializable atomic Apply with one
   pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
   durable drift supersession, and redacted indeterminate-commit handling.
@@ -473,10 +484,12 @@ Stated as capabilities (durable across the phase numbering):
 - A production implementation of the HTTP `ProductControlFacade` and a runnable
   `tools/starring-api` composition root. The hardened router is not yet bound to
   the application and adapters.
-- Four remaining production adapters: a scoped PostgreSQL installation-authority
-  source, approval-environment provider, authenticated snapshot envelope cipher,
-  and atomic product-rejection adapter. `GET /v1/me` also needs a session-only
-  read projection that does not weaken mutation CSRF checks.
+- Three remaining production adapters: an approval-environment provider,
+  authenticated snapshot envelope cipher, and atomic product-rejection adapter.
+  `GET /v1/me` also needs a session-only read projection that does not weaken
+  mutation CSRF checks. The implemented PostgreSQL installation-authority source
+  is not production-composable until its direct read is moved behind the scoped
+  least-privilege function and startup capability contract below.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
   row policies, direct-DML denial, and a startup capability/readiness probe.
 - A production `tools/starring-runtime` worker that performs the actual Discord
@@ -588,28 +601,33 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Implement the remaining identity, installation-authority,
+1. Move installation-authority reads behind a versioned fixed-search-path
+   security-definer function, revoke direct API table reads, and add positive and
+   negative role-capability startup probes. Normalize inaccessible Discord
+   membership and unknown installation IDs at the later HTTP boundary without
+   turning a valid member's insufficient permission into a false 404.
+2. Implement the remaining session-only identity projection,
    approval-environment, rejection, and snapshot-crypto adapters with
    cross-scope, replay, contention, corruption, and secret-redaction tests.
-2. Bridge the existing hardened router to `ProductControlApplication` through a
+3. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry
    labels, and readiness that fails before accepting traffic.
-3. Add least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+4. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
    restrictive grants/default privileges; row policies; direct-DML denial; and
    a CI-tested positive/negative capability matrix.
-4. Build `tools/starring-runtime` with its separate DB role and bot credential,
+5. Build `tools/starring-runtime` with its separate DB role and bot credential,
    then prove Requested through exact Live and Live-loss recovery against a real
    Discord test guild.
-5. Connect a trusted server-side harness writer so only validated and simulated
+6. Connect a trusted server-side harness writer so only validated and simulated
    Luna output can advance encrypted `PreviewReady` generations.
-6. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+7. Preserve the passing clean-source cohort and failed diagnostic cohorts as
    separate immutable evidence, then measure queueing, concurrency, saturation,
    soak recovery, and worker high availability before setting a commercial SLO.
-7. Add typed multi-turn preference accumulation and the typed-planner handoff
+8. Add typed multi-turn preference accumulation and the typed-planner handoff
    while preserving the same deterministic candidate gates and no-deploy model
    boundary.
-8. Add whole-plan deterministic preflight, compensation, reconciliation, and
+9. Add whole-plan deterministic preflight, compensation, reconciliation, and
    uncertain-external-effect replay before expanding the recipe catalog or
    beginning the separate `StatefulSpec` runtime arc.
 
