@@ -25,17 +25,18 @@ gate.
 
 At design acceptance, `PostgresProductDecisions` routed queries, approvals,
 apply work, and keyring coverage through one `PgPool`. The implemented store
-shape now requires the three pools below. Queries and parts of apply still issue
-direct relation SQL, so the pool split alone is not a production capability
-seal.
+shape now requires the three pools below, and migrations 019 through 022 place
+all three operation families behind exact executable manifests. This completes
+the product-decision component boundary, but it is not the final whole-process
+capability seal.
 
 The Rust store requires three pools:
 
 | Pool | Final responsibility | Transitional state |
 | --- | --- | --- |
-| Decision reader | Approval preview and product-status projection | Direct SQL until its read function is introduced |
-| Approval executor | Approval mutation and approval/apply receipt keyring coverage | Fully function-scoped in the first slice |
-| Apply executor | Apply lock, artifact read, deterministic preparation, and atomic finalization | Existing SQL/functions until its boundary is completed |
+| Decision reader | Approval preview and product-status projection | Two exact functions; no direct relation SQL |
+| Approval executor | Approval mutation and approval/apply receipt keyring coverage | Three exact functions; no direct relation SQL |
+| Apply executor | Apply lock, artifact read, deterministic preparation, and atomic finalization | Five exact functions; deterministic preparation remains pure Rust |
 
 The constructor intentionally has no single-pool production convenience. Tests
 that exercise legacy semantics may explicitly provide three clones. Production
@@ -43,13 +44,13 @@ composition must provide three independently configured pools and direct-login
 roles. A rejection executor is added only when the product rejection adapter
 exists; an unused privileged credential is not provisioned in advance.
 
-This work is staged to avoid an upgrade outage. The first slice does not revoke
-legacy relation grants needed by the reader and apply adapters. A legacy grant
-on the approval slice's 16 protected relations makes approval readiness red.
-Legacy grants outside that manifest are not inspected by this component and
-remain an explicit whole-service ingress blocker until those adapters are
-function-scoped and a later sealing migration removes every non-owner relation,
-view, sequence, and column grant in the final process manifest.
+This work is staged to avoid an upgrade outage. Migrations 019 through 022 do
+not silently revoke legacy relation grants needed by other unfinished adapters.
+Any non-owner grant on a reader, approval, or Apply protected relation makes the
+corresponding readiness gate red. Grants outside those component manifests
+remain an explicit whole-service ingress blocker until the remaining adapters
+are function-scoped and a later sealing migration removes every non-owner
+relation, view, sequence, and column grant in the final process manifest.
 
 ## Threat model
 
@@ -208,27 +209,23 @@ approval executable check does not inspect routines outside `public`, ordinary
 non-`starring_*` security-invoker helpers, or objects outside its protected
 relation list.
 
-## Remaining slices
+## Component completion and remaining slices
 
 ### Decision reader
 
-Replace the direct multi-relation query with one versioned security-definer
-function returning the exact validated projection required by Rust. Preserve
-not-found and scope-hiding behavior. The reader role receives only its topology
-and read function. Add rollback-only valid and impossible-scope probes and the
-same exact executable manifest check.
+Migration 021 replaced the direct multi-relation query with one versioned
+security-definer projection. The reader role executes only its topology and read
+functions. The accepted details and rollout contract are in
+`2026-07-19-product-decision-reader-capability-design.md`.
 
 ### Apply executor
 
-Move every apply lock, target artifact read, and finalization operation behind
-an explicit apply manifest. Keep deterministic ruleset parsing and preparation
-in Rust. Preserve serializable retry limits, commit-indeterminate handling,
-artifact integrity, supersession, runtime request creation, receipts, and audit
-evidence. Add an apply-domain keyring-coverage capability, or an explicitly
-bounded shared receipt-coverage capability executable by the apply readiness
-path, before Apply can serve independently. Apply readiness must not depend on
-the approval credential having happened to run its startup check. The apply
-role must not execute approval or decision-read functions.
+Migration 022 moved lock, bounded target-artifact projection, finalization, and
+Apply-only keyring coverage behind an exact five-function manifest. Ruleset
+parsing and deterministic preparation remain in Rust inside the same bounded
+serializable transaction. The Apply role cannot execute approval, reader, or
+internal helper functions. The accepted details and stopped-maintenance rollout
+contract are in `2026-07-19-product-apply-executor-capability-design.md`.
 
 ### Rejection and status
 
@@ -249,12 +246,12 @@ deployment never opens ingress.
 
 1. Deploy the three-pool Rust shape while legacy tests may use explicit cloned
    pools.
-2. Apply migrations 019 and 020 in order under the migrator credential.
-3. Reapply only the documented topology, approval, and coverage grants to the
-   three direct-login roles.
-4. Run approval readiness. Any relation ACL needed by transitional reader or
-   apply roles is an expected hard failure, not a warning.
-5. Deploy and verify reader and apply slices independently.
+2. Apply migrations 019 through 022 in order under the reviewed owner handoff.
+3. Reapply only the documented reader, approval, and Apply function manifests
+   to the three direct-login roles.
+4. Run reader, approval, Apply, and aggregate product-decision readiness. Any
+   transitional relation ACL is an expected hard failure, not a warning.
+5. Deploy and verify the three slices independently before composition.
 6. Drain old connections, revoke legacy relation grants, apply the sealing
    migration, and run all aggregate gates before ingress.
 

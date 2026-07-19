@@ -476,8 +476,16 @@ Stated as capabilities (durable across the phase numbering):
   durable drift supersession, and redacted indeterminate-commit handling. The
   approval executor is function-scoped behind a separate credential with exact
   topology, approval, keyring-coverage, trigger, relation, rollback-probe, and
-  cross-pool readiness checks. Apply remains direct SQL and is not certified by
-  that approval gate.
+  cross-pool readiness checks. Apply is independently function-scoped behind a
+  five-function credential covering topology, lock, bounded target-artifact
+  projection, finalization, and Apply-only keyring coverage. Its readiness gate
+  verifies 18 direct and transitive relations, the exact internal helper and
+  24-trigger graph, trusted schema and role topology, exact executable and
+  argument manifests, rollback-only probes, and full reader/approval/Apply
+  three-role composition. A restricted direct-login PostgreSQL test completes
+  a real Apply and exact replay while direct relation access, DML, DDL,
+  temporary objects, unrelated capabilities, PUBLIC grants, metadata drift,
+  RLS drift, trigger drift, and incomplete key coverage fail closed.
 - Fenced PostgreSQL runtime convergence with exact desired-target digests,
   attestation, serving lease and heartbeat evidence, stale-Live recovery, and
   product status that never equates an Applied pointer with Live.
@@ -540,16 +548,15 @@ Stated as capabilities (durable across the phase numbering):
   decision reads, and approval execution are independently least-privilege
   composable, but no production composition root invokes their aggregate
   readiness contracts. Promotion persistence and its publication/link ports,
-  Apply artifact reads, deployment-status reads, and runtime convergence still
-  retain direct SQL. The complete API and runtime processes therefore cannot
-  yet use final execute-only roles. Product rejection has no production
-  persistence adapter.
+  deployment-status reads, and runtime convergence still retain direct SQL.
+  The complete API and runtime processes therefore cannot yet use final
+  execute-only roles. Product rejection has no production persistence adapter.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
   row policies, and whole-process capability probes. Installation-authority and
-  authentication read/touch slices now have isolated non-owner, direct-DML
-  denial tests and executable readiness probes. Declarative role bootstrap,
-  remaining function boundaries, startup wiring, and a whole-process probe are
-  still release blockers.
+  authentication read/touch slices and all three product-decision slices now
+  have isolated non-owner, direct-DML denial tests and executable readiness
+  probes. Declarative role bootstrap, remaining function boundaries, startup
+  wiring, and a whole-process probe are still release blockers.
 - A production `tools/starring-runtime` worker that performs the actual Discord
   drain, hydration, panel reconciliation, gateway start, attestation, and
   heartbeat loop. The durable state machine is implemented, but no production
@@ -659,37 +666,33 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Move product Apply behind its own versioned functions, credential, keyring
-   coverage, rollback-only functional probes, and exact readiness contract while
-   preserving serializable replay, drift supersession, and one-commit runtime
-   request creation.
-2. Scope the remaining API-side direct SQL for promotion and publication/link
+1. Scope the remaining API-side direct SQL for promotion and publication/link
    persistence and deployment status. Then add declarative owner/API bootstrap,
    restrictive defaults, and one complete non-owner process probe while keeping
    the runtime role separate.
-3. Implement the approval-environment, rejection, and snapshot-crypto adapters
+2. Implement the approval-environment, rejection, and snapshot-crypto adapters
    with cross-scope, replay, contention, corruption, and secret-redaction tests.
-4. Bridge the existing hardened router to `ProductControlApplication` through a
+3. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry
    labels, and readiness that fails before accepting traffic. Normalize
    inaccessible Discord membership and unknown installation IDs without turning
    a valid member's insufficient permission into a false 404.
-5. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+4. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
    restrictive grants/default privileges; row policies; direct-DML denial; and
    a CI-tested positive/negative capability matrix.
-6. Build `tools/starring-runtime` with its separate DB role and bot credential,
+5. Build `tools/starring-runtime` with its separate DB role and bot credential,
    then prove Requested through exact Live and Live-loss recovery against a real
    Discord test guild.
-7. Connect a trusted server-side harness writer so only validated and simulated
+6. Connect a trusted server-side harness writer so only validated and simulated
    Luna output can advance encrypted `PreviewReady` generations.
-8. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+7. Preserve the passing clean-source cohort and failed diagnostic cohorts as
    separate immutable evidence, then measure queueing, concurrency, saturation,
    soak recovery, and worker high availability before setting a commercial SLO.
-9. Add typed multi-turn preference accumulation and the typed-planner handoff
+8. Add typed multi-turn preference accumulation and the typed-planner handoff
    while preserving the same deterministic candidate gates and no-deploy model
    boundary.
-10. Add whole-plan deterministic preflight, compensation, reconciliation, and
+9. Add whole-plan deterministic preflight, compensation, reconciliation, and
    uncertain-external-effect replay before expanding the recipe catalog or
    beginning the separate `StatefulSpec` runtime arc.
 

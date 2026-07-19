@@ -600,24 +600,25 @@ issuer grantee as a rollout fallback.
 
 Migration 017 deliberately does not revoke pre-existing grants on the three
 legacy identity relations. Migration 021 removes the product-decision reader's
-need for those grants, but other staged adapters and Apply still prevent a
-global relation-ACL seal. The identity readiness ACL scan detects those grants,
+need for those grants, and migration 022 removes direct Apply artifact reads,
+but other staged adapters still prevent a global relation-ACL seal. The
+identity readiness ACL scan detects those grants,
 including column-only grants belonging to an unrelated role, and remains red.
 Keep ingress closed. After every remaining path is moved behind an exact
 function, apply a separate sealing migration that revokes every non-owner table
 and column grant, then require aggregate identity readiness to turn green. Do
 not reclassify the red readiness result as a warning.
 
-Migrations 014 through 018 and 021 cover installation-authority reads,
+Migrations 014 through 018 and 021 through 022 cover installation-authority reads,
 authentication reads and touches, authorized-snapshot reads, the complete
-request-serving OAuth and session lifecycle, and product-decision reads.
+request-serving OAuth and session lifecycle, product-decision reads, and Apply.
 Approval writes are function-scoped by migrations 019 and 020. Promotion and
-publication/link persistence, Apply artifact reads, deployment-status reads,
-and runtime convergence still contain direct SQL. Product rejection has no
-production persistence adapter. Whole-service execute-only readiness remains a
-future gate, and direct table grants are not a valid workaround.
+publication/link persistence, deployment-status reads, and runtime convergence
+still contain direct SQL. Product rejection has no production persistence
+adapter. Whole-service execute-only readiness remains a future gate, and direct
+table grants are not a valid workaround.
 
-## Product decision and approval boundaries
+## Product decision capability boundaries
 
 `PostgresProductDecisions` requires three pools named for decision reads,
 approval execution, and apply execution. Query code uses only the reader pool,
@@ -700,27 +701,36 @@ relation ACLs. Audit and restrict default function privileges, then remove every
 non-owner table and column grant on the 12-reader manifest before expecting
 reader readiness to become green.
 
-Treat 021 and the matching binary as a stopped maintenance rollout. Migration
-021 removes environment-specific reader grants, while granting the new read
-function makes the pre-021 exact-executable readiness contract red. Drain old
-processes, apply 021 as the common owner, install the new binary and exact two
-reader grants, run component and aggregate probes, and only then reopen traffic.
-Do not infer mixed-version compatibility from the preserved transitional table
-ACLs.
+Migration 022 replaces the Apply adapter's direct artifact-table read with a
+seven-input bounded target-artifact function and adds Apply-only keyring
+coverage. It normalizes the existing lock and finalizer plus their complete
+internal helper and 24-trigger graph. The Apply caller manifest is exactly five
+functions over 18 direct and transitive ordinary non-RLS relations. The lock,
+pure Rust preparation, artifact validation, and finalizer remain in one bounded
+`SERIALIZABLE, READ WRITE` transaction.
+
+Treat both 021 and 022 with their matching binaries as stopped-maintenance
+rollouts. Migration 021 removes environment-specific reader grants, while 022
+removes environment-specific Apply and internal-function grants. Either new
+grant set makes the previous binary's exact executable contract red. Drain old
+processes, apply each migration as the common owner, install the matching
+binary and exact grants, then run component and aggregate probes. Do not infer
+mixed-version compatibility from preserved transitional relation ACLs, and do
+not reopen whole-product ingress after 022 alone.
 
 The common owner must be a `NOLOGIN` role satisfying the same owner restrictions
 as the identity boundary. The `public` schema must not grant `CREATE` to
 `PUBLIC`, a request-serving role, or any other untrusted named principal. The
 database owner is a trusted operational principal. A separate migration role
-must `SET ROLE` to the schema owner for migration 020. Migration 021 instead
-requires `current_user` to equal the common object owner, and that owner must
+must `SET ROLE` to the schema owner for migration 020. Migrations 021 and 022
+require `current_user` to equal the common object owner, and that owner must
 have effective `CREATE` on `public`. Grant only the temporary membership needed
 for that audited `SET ROLE` handoff, then revoke it before readiness. The
 migrator must not retain its own schema `CREATE` ACL. Internal trigger functions
 use only `pg_catalog` in their path and every application relation reference is
 schema-qualified.
 
-After migrations 019 through 021, create or verify three distinct direct-login
+After migrations 019 through 022, create or verify three distinct direct-login
 roles with no membership. Replace `starring_production` below with the reviewed
 production database identifier. Revoke PostgreSQL defaults and any old
 database/schema privileges before granting only the staged manifest:
@@ -812,6 +822,93 @@ TO starring_decision_approval;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_apply_executor_database_identity_v1()
 TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_lock_v1(
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT
+    )
+TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_target_artifact_v1(
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        TEXT,
+        TEXT
+    )
+TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_finalize_v1(
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        JSONB,
+        TEXT,
+        JSONB,
+        JSONB,
+        JSONB
+    )
+TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_keyring_coverage_v1(TEXT[], TEXT[])
+TO starring_decision_apply;
 ```
 
 Inventory `pg_namespace.nspacl` after the revokes and remove `CREATE` from every
@@ -822,14 +919,12 @@ owner role without retaining its own `CREATE` ACL. Do not grant database
 option, owner membership, any other membership, or another
 `public.starring_*` function.
 
-The reader grant above is now a complete component credential; the Apply grant
-remains topology-only and cannot execute the current direct-SQL Apply adapter.
-Do not start the whole product service or open ingress with this staged
-manifest. Apply still needs its own function-scoping migration, exact grants,
-functional probes, and component readiness. Apply readiness must also receive
-an apply-domain keyring-coverage capability, or an explicitly bounded shared
-receipt-coverage capability; it must not depend on the approval credential
-having run coverage.
+The three grant sets above are complete component credentials for decision
+reads, approval, and Apply. The Apply readiness path uses its own coverage
+function and never depends on the approval credential having run first. Do not
+start the whole product service or open ingress from this component manifest
+alone. Promotion/publication, deployment-status, rejection, runtime, final
+relation ACL sealing, and whole-process executable inventory remain mandatory.
 
 `PostgresProductDecisions::verify_approval_executor_readiness` verifies the
 enumerated approval function, owner, role, 16-relation, internal trigger,
@@ -838,21 +933,21 @@ executable set against the exact approval allowlist for every public
 security-definer routine and every `public.starring_*` routine. An unrelated
 routine in that scope is a hard `ExcessCapability` failure.
 
-`PostgresProductDecisions::verify_approval_boundary_readiness` additionally
-requires the full reader component and approval component contracts, then
-requires reader, approval, and apply pools to resolve to one logical database
-UUID and database name through three distinct direct-login roles. This is a
-staged approval-boundary gate, not whole-service readiness. Apply still requires
-its function-scoping migration. Any legacy table or column grant on either
-protected relation set intentionally makes readiness red. Keep product ingress
-closed until Apply is converted, the final relation ACL sealing migration is
-applied, and the whole-process manifest gate is green.
+`PostgresProductDecisions::verify_apply_executor_readiness` verifies the exact
+five-function Apply interface, 18-relation manifest, full helper and trigger
+contract, dedicated keyring coverage, trusted topology, and rollback-only lock,
+artifact, and finalizer probes. `verify_product_decision_boundary_readiness`
+runs reader, approval, and Apply readiness and then requires one logical
+database UUID/name with three distinct direct-login roles. The older
+`verify_approval_boundary_readiness` remains a compatibility gate and is not an
+ingress decision. Any legacy table or column grant on a protected component
+manifest intentionally makes readiness red.
 
-This component does not inspect relations outside its 16-table list, views,
-sequences, routines outside `public`, ordinary non-`starring_*`
+These components do not inspect relations outside their enumerated manifests,
+views, sequences, routines outside `public`, ordinary non-`starring_*`
 security-invoker helpers, or schema privileges outside `public`. Those remain
 mandatory inputs to the final whole-process schema, object, and executable
-manifest. A green approval component result is never evidence that those wider
+manifest. Green product-decision components are never evidence that those wider
 capabilities are absent.
 
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
