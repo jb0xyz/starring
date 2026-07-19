@@ -3,6 +3,8 @@ const PRODUCT_APPROVAL_COVERAGE_FUNCTION: &str =
     "public.starring_product_approval_keyring_coverage_v1(text[],text[])";
 const PRODUCT_DECISION_READER_TOPOLOGY_FUNCTION: &str =
     "public.starring_product_decision_reader_database_identity_v1()";
+const PRODUCT_DECISION_READ_FUNCTION: &str =
+    "public.starring_product_decision_read_v1(text,text,text,text,text,text,bytea)";
 const PRODUCT_APPROVAL_TOPOLOGY_FUNCTION: &str =
     "public.starring_product_approval_executor_database_identity_v1()";
 const PRODUCT_APPLY_TOPOLOGY_FUNCTION: &str =
@@ -122,6 +124,8 @@ async fn product_approval_executor_is_exactly_scoped_and_topology_bound() {
         "product_tenants",
         "automation_installations",
         "automation_installation_authority_versions",
+        "authoring_sessions",
+        "authoring_session_generations",
         "product_principals",
         "product_auth_sessions",
         "product_action_receipts",
@@ -142,6 +146,7 @@ async fn product_approval_executor_is_exactly_scoped_and_topology_bound() {
     }
     for function in [
         PRODUCT_DECISION_READER_TOPOLOGY_FUNCTION,
+        PRODUCT_DECISION_READ_FUNCTION,
         PRODUCT_APPROVAL_TOPOLOGY_FUNCTION,
         PRODUCT_APPLY_TOPOLOGY_FUNCTION,
         PRODUCT_APPROVAL_FUNCTION,
@@ -191,7 +196,11 @@ async fn product_approval_executor_is_exactly_scoped_and_topology_bound() {
     for (role, functions) in [
         (
             &reader_role,
-            [PRODUCT_DECISION_READER_TOPOLOGY_FUNCTION].as_slice(),
+            [
+                PRODUCT_DECISION_READER_TOPOLOGY_FUNCTION,
+                PRODUCT_DECISION_READ_FUNCTION,
+            ]
+            .as_slice(),
         ),
         (
             &approval_role,

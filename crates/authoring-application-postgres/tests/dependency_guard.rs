@@ -66,6 +66,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
     let query = include_str!("../src/product_decisions/query.rs");
+    let reader_contract = include_str!("../src/product_decisions/reader_contract.rs");
+    let reader_readiness = include_str!("../src/product_decisions/reader_readiness.rs");
     let readiness = include_str!("../src/product_decisions/readiness.rs");
     let store = include_str!("../src/product_decisions/store.rs");
     let database_capability = include_str!("../src/database_capability.rs");
@@ -74,11 +76,43 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(store.contains("approval_executor: PgPool"));
     assert!(store.contains("apply_executor: PgPool"));
     assert!(query.contains(".decision_reader"));
+    assert!(query.contains("reader_contract::READ_QUERY"));
+    assert!(query.contains("sqlx::query_as::<_, ProductDecisionRow>(READ_QUERY)"));
+    assert!(query.contains(".bind(scope.acting_user_id().to_string())"));
+    assert!(query.contains(".fetch_all(&mut *transaction)"));
+    assert!(!query.contains("DECISION_QUERY"));
+    assert!(reader_contract
+        .contains("public.starring_product_decision_read_v1(text,text,text,text,text,text,bytea)"));
+    assert!(reader_contract
+        .contains("public.starring_product_decision_read_v1($1, $2, $3, $4, $5, $6, $7) LIMIT 2"));
+    for relation in [
+        "activation_requests",
+        "activation_request_approvals",
+        "authoring_promotions",
+        "product_tenants",
+        "automation_installations",
+        "automation_installation_authority_versions",
+        "authoring_sessions",
+        "authoring_session_generations",
+        "product_principals",
+        "product_auth_sessions",
+        "runtime_deployments",
+    ] {
+        assert!(
+            !query.contains(relation),
+            "raw product decision relation in query adapter: {relation}"
+        );
+        assert!(
+            !reader_contract.contains(relation),
+            "raw product decision relation in reader contract: {relation}"
+        );
+    }
     assert!(approval.contains(".approval_executor"));
     assert!(readiness.contains(".approval_executor"));
     assert!(apply.contains(".apply_executor"));
     assert!(readiness.contains("verify_approval_executor_readiness"));
     assert!(readiness.contains("verify_approval_boundary_readiness"));
+    assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
@@ -86,6 +120,9 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(database_capability.contains("pg_catalog.has_function_privilege"));
     assert!(approval.contains("public.starring_product_approve_v1"));
     assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+    assert!(database.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
+    assert!(database.contains("idle_in_transaction_session_timeout"));
+    assert!(database.contains("pg_catalog.set_config('search_path', 'pg_catalog', true)"));
     assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));
     assert!(approval.contains("request.session_fingerprint().as_bytes()"));
     assert!(!approval.contains(".bind(request.command().idempotency_key.as_str())"));
@@ -135,6 +172,68 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(database.contains("fn commit_outcome_is_uncertain"));
     assert!(database.contains("code.as_ref().starts_with(\"08\")"));
     assert!(database.contains("if commit_outcome_is_uncertain(&error)"));
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 2]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 12]",
+        "ScopedFunctionContractV1::set(READ_FUNCTION, READ_RESULT, 1.0)",
+        "verify_decision_reader_readiness",
+        "check_decision_reader_readiness",
+        "begin_scoped_database_readiness(",
+        "verify_scoped_executable_allowlist",
+        "verify_scoped_schema_trust",
+        "load_scoped_database_topology",
+        "public.starring_product_decision_read_v1(",
+        "pg_catalog.repeat('0', 64)",
+        "'18446744073709551615'",
+        "if probe_rows != 0",
+    ] {
+        assert!(
+            reader_readiness.contains(required),
+            "missing product decision reader readiness guard: {required}"
+        );
+    }
+    let reader_scope_migration =
+        include_str!("../../../migrations/202607190021_scope_product_decision_reads.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_product_decision_read_v1(",
+        "expected_acting_discord_user_id TEXT",
+        "expected_product_session_digest BYTEA",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "ROWS 1",
+        "product decision reader relations require one non-RLS owner",
+        "relation_count <> 12",
+        "table_count <> 12",
+        "rls_disabled_count <> 12",
+        "owner_count <> 1",
+        "product decision reader schema is not trusted",
+        "product decision reader migration requires the common owner",
+        "pg_catalog.to_regrole(current_user) <> common_owner",
+        "pg_catalog.has_schema_privilege(",
+        "product decision reader topology function contract is invalid",
+        "product decision read function already exists",
+        "expected_promotion_id ~ '^[0-9a-f]{64}$'",
+        "expected_principal_id ~ '^[A-Za-z0-9_.:-]{1,128}$'",
+        "principal.discord_user_id = expected_acting_discord_user_id",
+        "actor_session.session_digest = expected_product_session_digest",
+        "pg_catalog.octet_length(expected_product_session_digest) = 32",
+        "expected_guild_id::NUMERIC <= 18446744073709551615",
+        "expected_acting_discord_user_id::NUMERIC",
+        "pg_catalog.statement_timestamp()",
+        "LIMIT 2;",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "ARRAY['search_path=pg_catalog']::TEXT[]",
+        "pg_catalog.current_setting('quote_all_identifiers')",
+        "original_quote_all_identifiers",
+        "product decision reader function contract is invalid",
+    ] {
+        assert!(
+            reader_scope_migration.contains(required),
+            "missing product decision reader scope guard: {required}"
+        );
+    }
     let approval_scope_migration =
         include_str!("../../../migrations/202607190019_scope_product_approval_execution.sql");
     for required in [
@@ -921,6 +1020,14 @@ fn source_files_contain_no_comments() {
             include_str!("../src/product_decisions/query.rs"),
         ),
         (
+            "src/product_decisions/reader_contract.rs",
+            include_str!("../src/product_decisions/reader_contract.rs"),
+        ),
+        (
+            "src/product_decisions/reader_readiness.rs",
+            include_str!("../src/product_decisions/reader_readiness.rs"),
+        ),
+        (
             "src/product_decisions/readiness.rs",
             include_str!("../src/product_decisions/readiness.rs"),
         ),
@@ -1073,6 +1180,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/product_decision_security.rs",
             include_str!("postgres_product_control_e2e/product_decision_security.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/product_decision_reader_security.rs",
+            include_str!("postgres_product_control_e2e/product_decision_reader_security.rs"),
         ),
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",

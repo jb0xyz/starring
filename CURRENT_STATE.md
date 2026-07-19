@@ -459,9 +459,25 @@ Stated as capabilities (durable across the phase numbering):
   execution, ungranted roles, PUBLIC, grant option, hostile default grants,
   function-mode and search-path drift, RLS drift, and owner or caller privilege
   drift.
+- PostgreSQL product-decision reads through one seven-input, 49-column,
+  fixed-search-path security-definer function. The adapter uses a bounded
+  read-committed, read-only transaction, accepts exactly one row, maps every
+  identity or target miss to `NotFound`, and preserves Rust classification of
+  inactive state and persisted corruption. Reader readiness requires exactly
+  the topology and decision-read functions, one restricted common owner, no
+  direct table or column access across the 11 data relations plus topology
+  identity relation, a trusted schema, one logical database identity, and a
+  data-independent zero-row probe. Restricted-role PostgreSQL tests cover the
+  positive preview/status path, every caller input, malformed identities,
+  bounded lock waits, denied DML/DDL and unrelated execution, metadata and ACL
+  drift, hostile inherited grants, and atomic migration failure.
 - Payload-bound product approval and serializable atomic Apply with one
   pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
-  durable drift supersession, and redacted indeterminate-commit handling.
+  durable drift supersession, and redacted indeterminate-commit handling. The
+  approval executor is function-scoped behind a separate credential with exact
+  topology, approval, keyring-coverage, trigger, relation, rollback-probe, and
+  cross-pool readiness checks. Apply remains direct SQL and is not certified by
+  that approval gate.
 - Fenced PostgreSQL runtime convergence with exact desired-target digests,
   attestation, serving lease and heartbeat evidence, stale-Live recovery, and
   product status that never equates an Applied pointer with Live.
@@ -519,14 +535,15 @@ Stated as capabilities (durable across the phase numbering):
 - Three remaining production adapters: an approval-environment provider,
   authenticated snapshot envelope cipher, and atomic product-rejection adapter.
   `GET /v1/me` now has an independent session-only projection without relaxing
-  mutation CSRF checks. The installation-authority and authentication read/touch
-  slices are independently least-privilege composable, but no composition root
-  invokes their readiness contracts. Authorized snapshot loading, OAuth flow and
-  session issuance or logout, promotion persistence and its publication/link
-  ports, approval and status queries, Apply artifact reads, and runtime
-  convergence still retain direct SQL. The complete API and runtime processes
-  therefore cannot yet use final execute-only roles. Product rejection has no
-  production persistence adapter.
+  mutation CSRF checks. Installation authority, authentication read/touch,
+  authorized snapshots, request-serving OAuth and session lifecycle, product
+  decision reads, and approval execution are independently least-privilege
+  composable, but no production composition root invokes their aggregate
+  readiness contracts. Promotion persistence and its publication/link ports,
+  Apply artifact reads, deployment-status reads, and runtime convergence still
+  retain direct SQL. The complete API and runtime processes therefore cannot
+  yet use final execute-only roles. Product rejection has no production
+  persistence adapter.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
   row policies, and whole-process capability probes. Installation-authority and
   authentication read/touch slices now have isolated non-owner, direct-DML
@@ -642,14 +659,14 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Move authorized-snapshot access behind an equally narrow versioned function
-   and readiness contract while preserving atomic generation, actor, and
-   authority binding.
-2. Scope the remaining API-side direct SQL for OAuth and sessions, promotion and
-   publication/link persistence, decisions and status, Apply artifact reads,
-   and deployment status. Then add declarative owner/API bootstrap, restrictive
-   defaults, and one complete non-owner process probe while keeping the runtime
-   role separate.
+1. Move product Apply behind its own versioned functions, credential, keyring
+   coverage, rollback-only functional probes, and exact readiness contract while
+   preserving serializable replay, drift supersession, and one-commit runtime
+   request creation.
+2. Scope the remaining API-side direct SQL for promotion and publication/link
+   persistence and deployment status. Then add declarative owner/API bootstrap,
+   restrictive defaults, and one complete non-owner process probe while keeping
+   the runtime role separate.
 3. Implement the approval-environment, rejection, and snapshot-crypto adapters
    with cross-scope, replay, contention, corruption, and secret-redaction tests.
 4. Bridge the existing hardened router to `ProductControlApplication` through a

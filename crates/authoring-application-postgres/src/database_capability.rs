@@ -336,6 +336,53 @@ pub(crate) async fn verify_scoped_executable_allowlist(
     Ok(())
 }
 
+pub(crate) async fn verify_scoped_schema_trust(
+    transaction: &mut Transaction<'_, Postgres>,
+    schema_name: &str,
+    owner_function_identity: &str,
+) -> Result<(), ScopedDatabaseReadinessErrorV1> {
+    let trusted = sqlx::query_scalar::<_, bool>(
+        "WITH target AS ( \
+           SELECT pg_catalog.to_regnamespace($1) AS schema_oid, \
+            pg_catalog.to_regprocedure($2) AS function_oid \
+         ) \
+         SELECT COALESCE( \
+          namespace.oid IS NOT NULL \
+           AND function_row.oid IS NOT NULL \
+           AND namespace.nspowner IN ( \
+            function_row.proowner, \
+            pg_catalog.to_regrole('pg_database_owner'), \
+            database_row.datdba \
+           ) \
+           AND NOT EXISTS ( \
+            SELECT 1 \
+            FROM pg_catalog.aclexplode(COALESCE( \
+             namespace.nspacl, \
+             pg_catalog.acldefault('n', namespace.nspowner) \
+            )) AS privilege \
+            WHERE privilege.privilege_type = 'CREATE' \
+             AND privilege.grantee <> namespace.nspowner \
+           ), FALSE \
+         ) \
+         FROM target \
+         LEFT JOIN pg_catalog.pg_namespace AS namespace \
+          ON namespace.oid = target.schema_oid \
+         LEFT JOIN pg_catalog.pg_proc AS function_row \
+          ON function_row.oid = target.function_oid \
+         INNER JOIN pg_catalog.pg_database AS database_row \
+          ON database_row.datname = pg_catalog.current_database()",
+    )
+    .bind(schema_name)
+    .bind(owner_function_identity)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(readiness_database)?;
+    if !trusted {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_same_database_distinct_roles(
     topologies: &[ScopedDatabaseTopologyV1],
 ) -> Result<(), ScopedDatabaseReadinessErrorV1> {

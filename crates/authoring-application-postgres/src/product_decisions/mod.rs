@@ -6,6 +6,8 @@ mod config;
 mod database;
 mod digest;
 mod query;
+mod reader_contract;
+mod reader_readiness;
 mod readiness;
 mod row;
 mod store;

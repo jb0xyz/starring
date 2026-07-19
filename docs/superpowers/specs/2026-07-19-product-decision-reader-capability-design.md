@@ -26,11 +26,12 @@ product-session digest. All inputs are non-secret except the digest, which is
 already an irreversible 32-byte server-side session identity. The function
 never accepts raw session or OAuth credentials.
 
-The function returns zero or one server projection. Zero rows covers missing,
-wrong-scope, wrong-principal, wrong-Discord-user, wrong-session, malformed, and non-product
-activation inputs uniformly. Rust maps zero rows to `ProductControlPortError::NotFound`.
-The database function does not return a reason that could become an enumeration
-oracle.
+The database function returns zero, one, or at most two internal rows. Zero rows
+covers missing, wrong-scope, wrong-principal, wrong-Discord-user, wrong-session,
+malformed, and non-product activation inputs uniformly. Rust maps zero rows to
+`ProductControlPortError::NotFound`, exposes exactly one validated projection,
+and rejects two rows as persisted corruption. The database function does not
+return a reason that could become an enumeration oracle.
 
 ## Projection contract
 
@@ -46,7 +47,7 @@ the existing names and types:
 | Historical authority | binding revision, bindings/fingerprint, policy revision, quorum and activation TTL |
 | Request actor | Discord user, disabled flag, session revocation and expiry bounds |
 | Runtime | optional deployment ID and desired-target digest |
-| Clock | database transaction timestamp |
+| Clock | database statement timestamp |
 
 The database only projects persisted evidence. Rust continues to parse and
 validate the promotion record, recompute payload and binding fingerprints,
@@ -98,10 +99,11 @@ The function directly reads 11 ordinary relations:
 10. `product_auth_sessions`;
 11. `runtime_deployments`.
 
-Migration and readiness require all 11 to be ordinary, non-RLS tables with the
-same reviewed owner as both reader functions. The dedicated caller receives no
-table or column privilege. Existing non-owner relation grants are preserved by
-the migration because other transitional adapters still use direct SQL, but any
+Migration and readiness require those 11 data relations plus
+`product_control_plane_identity` to be 12 ordinary, non-RLS tables with the same
+reviewed owner as both reader functions. The dedicated caller receives no table
+or column privilege. Existing non-owner relation grants are preserved by the
+migration because other transitional adapters still use direct SQL, but any
 such grant on this manifest keeps reader component readiness red.
 
 This is a database least-privilege boundary, not a cryptographic authorization
@@ -116,13 +118,15 @@ isolation and final ingress threat model.
 `starring_product_decision_read_v1` is a SQL, `VOLATILE`, `STRICT`,
 `PARALLEL UNSAFE`, `SECURITY DEFINER` set-returning function with
 `search_path=pg_catalog` and `ROWS 1`. The common owner is a restricted
-`NOLOGIN` role. Migration removes `PUBLIC`, default, named-role, inherited-role,
-and grant-option exposure from the new function before production grants are
-applied.
+`NOLOGIN` role. Migration strips `PUBLIC`, named-role, grant-option, and any
+effective grants inherited from hostile default privileges from both current
+reader functions before production grants are applied. It does not rewrite the
+underlying default-privilege policy, which must be audited and restricted
+separately before ingress.
 
 Reader readiness checks exact signature, return shape, language, volatility,
 strictness, parallel mode, row estimate, owner, search path, relation shape,
-RLS state, global table and column ACLs on the 11 relations, and the direct-login
+RLS state, global table and column ACLs on all 12 relations, and the direct-login
 role contract. It also computes the caller's exact executable allowlist across
 every public `starring_*` routine and public security-definer routine.
 
@@ -142,18 +146,25 @@ Readiness executes two bounded checks in one read-only transaction:
    database name, and direct session role;
 2. a canonical but impossible seven-input tuple must return exactly zero rows.
 
-The impossible probe proves capability execution and non-enumerating behavior;
-the restricted-role end-to-end test supplies the positive functional probe.
-Readiness does not manufacture product rows or mutate production state.
+The impossible probe proves capability execution for one data-independent
+zero-row tuple. Query predicates and the restricted-role end-to-end mismatch
+matrix prove uniform non-enumerating behavior, while the positive test supplies
+the functional projection probe. Readiness does not attest the function body,
+manufacture product rows, or mutate production state.
 
 ## Migration behavior
 
-Migration 021 preflights the 11-relation owner/RLS contract and the existing
-reader-topology function before creating the read function. It then strips all
-non-owner function grants, transfers the new function to the common owner, and
-verifies the complete catalog contract. Invalid prerequisites or hostile
-metadata abort the migration atomically without leaving the function or ACL
-residue.
+Migration 021 preflights the 11 data relations, the topology identity relation,
+and the existing reader-topology function before creating the read function. It
+then strips all non-owner function grants, transfers the new function to the
+common owner, and verifies the complete catalog contract. Invalid prerequisites
+or hostile metadata abort the migration atomically without leaving the function
+or ACL residue.
+
+Migration must execute with `current_user` equal to the common object owner,
+which must have effective `CREATE` on `public`. A separate migrator therefore
+uses a reviewed temporary `SET ROLE` path and relinquishes that membership
+before readiness.
 
 The migration fixes deparser-sensitive session settings transaction-locally and
 does not leak them to the migration runner. Production grants are always
@@ -174,7 +185,8 @@ reapplied after migration and verified by readiness.
 - Owner, RLS, result shape, language, volatility, strictness, security mode,
   search path, row estimate, logical database, and repeated-role drift fail
   closed.
-- Hostile default and named function grants are removed by migration.
+- Effective grants inherited from hostile defaults and named function grants
+  are stripped from both reader functions by migration.
 - Split relation ownership aborts migration atomically.
 - Existing approval, exact replay, Apply, authority-history, and deployment
   status semantics remain green.
@@ -189,3 +201,11 @@ closed until Apply and remaining status/rejection paths are scoped, legacy
 relation and column grants are atomically sealed, and the final process-wide
 schema, object, executable, topology, keyring, and functional readiness gates
 all pass together.
+
+Readiness verifies catalog metadata rather than a function-body digest. Body
+integrity therefore depends on migration checksums, the restricted `NOLOGIN`
+owner, audited DDL credentials, and schema-change evidence. Before claiming a
+commercial read SLO, benchmark the function plan on production-shaped data and
+record pool-acquire plus end-to-end p50, p95, p99, timeout, and saturation
+metrics. Labels stay finite and exclude tenant, promotion, principal, Discord
+user, and digest values.

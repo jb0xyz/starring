@@ -11,8 +11,6 @@ use super::store::PostgresProductDecisions;
 
 const APPROVAL_RESULT: &str = "TABLE(outcome text, resulting_revision bigint, resulting_state text, exact_replay boolean, guild_id text)";
 const COVERAGE_RESULT: &str = "TABLE(outcome text)";
-const READER_DATABASE_IDENTITY: &str =
-    "public.starring_product_decision_reader_database_identity_v1()";
 const APPROVAL_DATABASE_IDENTITY: &str =
     "public.starring_product_approval_executor_database_identity_v1()";
 const APPLY_DATABASE_IDENTITY: &str =
@@ -20,11 +18,6 @@ const APPLY_DATABASE_IDENTITY: &str =
 const APPROVAL_IDENTITY: &str = "public.starring_product_approve_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text)";
 const COVERAGE_IDENTITY: &str =
     "public.starring_product_approval_keyring_coverage_v1(text[],text[])";
-const READER_TOPOLOGY_FUNCTIONS: [ScopedFunctionContractV1<'static>; 1] =
-    [ScopedFunctionContractV1::scalar(
-        READER_DATABASE_IDENTITY,
-        "text",
-    )];
 const APPROVAL_FUNCTIONS: [ScopedFunctionContractV1<'static>; 3] = [
     ScopedFunctionContractV1::scalar(APPROVAL_DATABASE_IDENTITY, "text"),
     ScopedFunctionContractV1::set_plpgsql(APPROVAL_IDENTITY, APPROVAL_RESULT, 1.0),
@@ -61,9 +54,6 @@ const TOPOLOGY_RELATIONS: [ScopedRelationContractV1<'static>; 1] =
     [ScopedRelationContractV1::ordinary_without_rls(
         "public.product_control_plane_identity",
     )];
-const READER_TOPOLOGY_QUERY: &str = "SELECT \
-     public.starring_product_decision_reader_database_identity_v1(), \
-     current_database()::TEXT, current_user::TEXT, session_user::TEXT";
 const APPROVAL_TOPOLOGY_QUERY: &str = "SELECT \
      public.starring_product_approval_executor_database_identity_v1(), \
      current_database()::TEXT, current_user::TEXT, session_user::TEXT";
@@ -388,13 +378,7 @@ impl PostgresProductDecisions {
         &self,
     ) -> Result<(), ProductDecisionReadinessErrorV1> {
         let topologies = [
-            check_topology(
-                &self.pools.decision_reader,
-                &self.config.statement_timeout(),
-                &READER_TOPOLOGY_FUNCTIONS,
-                READER_TOPOLOGY_QUERY,
-            )
-            .await?,
+            self.check_decision_reader_readiness().await?,
             self.check_approval_executor_readiness().await?,
             check_topology(
                 &self.pools.apply_executor,

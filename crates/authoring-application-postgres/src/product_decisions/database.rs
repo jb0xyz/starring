@@ -3,6 +3,28 @@ use authoring_application::ProductControlPortError;
 use super::config::PostgresProductDecisionsConfig;
 use crate::ProductDatabaseFailureV1;
 
+pub(super) async fn configure_read_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    config: &PostgresProductDecisionsConfig,
+) -> Result<(), ProductControlPortError> {
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_backend)?;
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $2, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true), \
+         pg_catalog.set_config('search_path', 'pg_catalog', true)",
+    )
+    .bind(config.statement_timeout())
+    .bind(config.lock_timeout())
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_backend)?;
+    Ok(())
+}
+
 pub(super) async fn configure_mutation_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     config: &PostgresProductDecisionsConfig,
