@@ -11,6 +11,7 @@ use crate::model::{
     EnqueueDeploymentOutcomeV1, EnqueueDeploymentV1, MutationReceiptV1, RuntimeDeploymentScopeV1,
     SubmitDeploymentMutationV1,
 };
+use crate::prepare::prepare_requested_deployment_v1;
 use crate::row::{
     runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, DEPLOYMENT_COLUMNS,
 };
@@ -77,22 +78,10 @@ impl PostgresRuntimeConvergence {
         .await?;
         let requested_at =
             Self::assert_previous_runtime_and_now(&mut transaction, &provisional_snapshot).await?;
-        let deployment = RuntimeDeployment::request(
-            request.identity.clone(),
-            request.target.clone(),
-            request.runtime_generation,
-            request.previous_runtime.clone(),
-            requested_at,
-        )?;
-        let snapshot = deployment.snapshot();
+        let prepared = prepare_requested_deployment_v1(request.clone(), requested_at)?;
+        let snapshot = prepared.snapshot().clone();
         let projection = DeploymentProjection::from_snapshot(&snapshot)?;
-        let previous_runtime = request
-            .previous_runtime
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|_| RuntimeConvergenceStoreError::InvalidInput("previous runtime"))?
-            .map(Json);
+        let previous_runtime = prepared.previous_runtime_json().cloned().map(Json);
         let inserted = sqlx::query_as::<_, DeploymentRow>(&format!(
             "INSERT INTO public.runtime_deployments (deployment_id, tenant_id, installation_id, \
              promotion_id, activation_request_id, installation_authority_revision, guild_id, \
@@ -123,7 +112,7 @@ impl PostgresRuntimeConvergence {
         .bind(runtime_i64(snapshot.runtime_generation.get())?)
         .bind(previous_runtime)
         .bind(snapshot.requested_at)
-        .bind(projection.snapshot)
+        .bind(Json(prepared.snapshot_json().clone()))
         .bind(runtime_i64(snapshot.revision.get())?)
         .bind(projection.phase)
         .bind(projection.controller_id)

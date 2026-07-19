@@ -1,6 +1,7 @@
 mod digest;
 mod error;
 mod model;
+mod prepare;
 mod row;
 mod store;
 
@@ -15,6 +16,7 @@ pub use model::{
     ServingLeaseReceiptV1, StrictLiveProjectionV1, SubmitDeploymentMutationV1,
     SubmitLiveAttestationV1,
 };
+pub use prepare::{prepare_requested_deployment_v1, PreparedRequestedDeploymentV1};
 pub use store::PostgresRuntimeConvergence;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
