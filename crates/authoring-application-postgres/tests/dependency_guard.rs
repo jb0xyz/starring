@@ -126,6 +126,27 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(database.contains("fn commit_outcome_is_uncertain"));
     assert!(database.contains("code.as_ref().starts_with(\"08\")"));
     assert!(database.contains("if commit_outcome_is_uncertain(&error)"));
+    let approval_scope_migration =
+        include_str!("../../../migrations/202607190019_scope_product_approval_execution.sql");
+    for required in [
+        "starring_product_decision_reader_database_identity_v1",
+        "starring_product_approval_executor_database_identity_v1",
+        "starring_product_apply_executor_database_identity_v1",
+        "product approval relations require one non-RLS owner",
+        "function_row.provolatile <> 'v'",
+        "function_row.proparallel <> 'u'",
+        "function_row.proconfig <> ARRAY['search_path=pg_catalog']::TEXT[]",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "RESET ALL",
+        "ROWS 1",
+        "FROM PUBLIC;",
+    ] {
+        assert!(
+            approval_scope_migration.contains(required),
+            "missing product approval scope guard: {required}"
+        );
+    }
     let binding_identity_migration =
         include_str!("../../../migrations/202607190009_separate_product_binding_identities.sql");
     for required in [
