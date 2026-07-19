@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use authoring_promotion::{
-    approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
-    AuthoringSessionId, AutomationInstallationId, BindingRevision, CreatePromotionOutcomeV1,
-    EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore, LinkPendingActivationV1,
-    ManualPromotionClock, PendingActivationDispositionV1, PendingActivationPort,
-    PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision, PrincipalId,
+    approval_payload_digest_v1, derive_promotion_identity_v1, plan_activation_link_v1,
+    plan_approval_environment_v1, plan_pending_activation_v1, plan_ruleset_publication_v1,
+    plan_start_promotion_v1, validate_exact_planned_record_v1, ApprovalPolicyV1,
+    AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId, BindingRevision,
+    CreatePromotionOutcomeV1, EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore,
+    LinkPendingActivationV1, LinkedActivationTransitionV1, ManualPromotionClock,
+    PendingActivationDispositionV1, PendingActivationPort, PendingActivationPortError,
+    PendingActivationReceiptV1, PendingActivationTransitionV1, PolicyRevision, PrincipalId,
     PromotionError, PromotionId, PromotionRecordV1, PromotionRecordValidationError,
     PromotionService, PromotionStageV1, PromotionStore, PromotionStoreError,
     PublicationDispositionV1, PublicationPortOutcomeV1, PublicationRecordV1,
@@ -363,6 +366,87 @@ fn start_input_from_artifact(
         context: context(ruleset_key),
         artifact: artifact.clone(),
     }
+}
+
+#[test]
+fn pure_planner_preserves_identity_digests_and_exact_transitions() {
+    block_on(async {
+        let idempotency_key = IdempotencyKey::parse("planner-secret").unwrap();
+        let context = context("studyrooms");
+        let identity = derive_promotion_identity_v1(
+            &context.tenant_id,
+            &context.principal_id,
+            &idempotency_key,
+        )
+        .unwrap();
+        let plan = plan_start_promotion_v1(StartPromotionV1 {
+            idempotency_key,
+            context,
+            artifact: artifact(true).await,
+        })
+        .unwrap();
+        assert_eq!(identity.promotion_id, plan.promotion_id);
+        assert_eq!(
+            plan.promotion_id.as_str(),
+            "490e8c1aa23981c65300756c82b5e001204c5c867a7c2920d57a0e1ecae7204f"
+        );
+        let encoded = serde_json::to_string(&plan).unwrap();
+        assert!(!encoded.contains("planner-secret"));
+        assert!(!format!("{plan:?}").contains("planner-secret"));
+        let mut unknown = serde_json::to_value(&plan).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), json!(true));
+        assert!(
+            serde_json::from_value::<authoring_promotion::PreparedPromotionPlanV1>(unknown)
+                .is_err()
+        );
+
+        let prepared = PromotionRecordV1::prepared(plan.materialize(fixed_now()).unwrap()).unwrap();
+        plan.validate_prepared_record(&prepared).unwrap();
+        let publication = PublicationSpy::default();
+        let publication_plan = plan_ruleset_publication_v1(&prepared).unwrap();
+        let publication_outcome = publication
+            .publish_ruleset(publication_plan.request())
+            .await
+            .unwrap();
+        let published = publication_plan
+            .complete(&prepared, publication_outcome, fixed_now())
+            .unwrap()
+            .expected_record;
+        validate_exact_planned_record_v1(&published, &published).unwrap();
+
+        let activation = PendingSpy::new();
+        let environment = plan_approval_environment_v1(&published).unwrap();
+        let resolved = activation
+            .resolve_product_approval_context(environment.request())
+            .await
+            .unwrap();
+        let pending_plan = plan_pending_activation_v1(&published, resolved).unwrap();
+        let receipt = activation
+            .ensure_pending_activation(pending_plan.request())
+            .await
+            .unwrap();
+        let PendingActivationTransitionV1::ActivationPending {
+            expected_record: pending,
+            ..
+        } = pending_plan
+            .complete(&published, &receipt, fixed_now())
+            .unwrap()
+        else {
+            panic!("expected activation-pending transition")
+        };
+        let link_plan = plan_activation_link_v1(&pending).unwrap();
+        let linked = activation
+            .link_pending_activation(link_plan.request())
+            .await
+            .unwrap();
+        assert!(matches!(
+            link_plan.complete(&pending, &linked, fixed_now()).unwrap(),
+            LinkedActivationTransitionV1::Linked { expected_record } if *expected_record == pending
+        ));
+    });
 }
 
 #[test]

@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 use automation_ruleset::{RuleSetContentHash, RuleSetSchemaVersion, RuleSetVersionId};
 use automation_ruleset_activation::ActivationDigest;
 
-use crate::id::{AuthoringHash, IdempotencyScopeDigest, PromotionRequestDigest};
-use crate::model::{
-    AuthenticatedPromotionContext, ProductApprovalPayloadV1, PromotionIntentV1, PublicationRecordV1,
+use crate::id::{
+    AuthoringHash, IdempotencyScopeDigest, PrincipalId, PromotionRequestDigest, TenantId,
 };
+use crate::model::{ProductApprovalPayloadV1, PromotionIntentV1, PublicationRecordV1};
 use crate::{IdempotencyKey, PromotionId};
 
 const IDEMPOTENCY_SCOPE_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.scope.v1\0";
@@ -25,12 +25,13 @@ struct IdempotencyScopeProjectionV1<'a> {
 }
 
 pub(crate) fn idempotency_scope_digest_v1(
-    context: &AuthenticatedPromotionContext,
+    tenant_id: &TenantId,
+    principal_id: &PrincipalId,
     key: &IdempotencyKey,
 ) -> Result<IdempotencyScopeDigest, DigestError> {
     let projection = IdempotencyScopeProjectionV1 {
-        tenant_id: context.tenant_id.as_str(),
-        principal_id: context.principal_id.as_str(),
+        tenant_id: tenant_id.as_str(),
+        principal_id: principal_id.as_str(),
         idempotency_key: key.as_str(),
     };
     canonical_digest(IDEMPOTENCY_SCOPE_DOMAIN_V1, &projection)
