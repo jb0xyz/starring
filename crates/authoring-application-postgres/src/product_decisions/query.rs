@@ -103,7 +103,7 @@ const DECISION_QUERY: &str = "SELECT \
     installation.lifecycle_state AS installation_lifecycle_state, \
     installation.current_authority_revision AS installation_current_authority_revision, \
     authority.binding_revision AS authority_binding_revision, \
-    authority.binding_fingerprint AS authority_binding_fingerprint, \
+    authority.binding_fingerprint AS authority_resource_context_fingerprint, \
     authority.policy_revision AS authority_policy_revision, \
     authority.required_approvals AS authority_required_approvals, \
     authority.activation_ttl_seconds AS authority_activation_ttl_seconds, \

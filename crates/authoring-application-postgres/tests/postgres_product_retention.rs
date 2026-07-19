@@ -6,6 +6,7 @@ use authoring_application_postgres::{
     ProductDatabaseFailureV1, ProductIdentityRetentionError, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
+use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Acquire, Postgres, Transaction};
@@ -878,7 +879,8 @@ async fn retention_purge_preserves_stable_session_subject_audit_history() {
     let application_id = numeric_id(&format!("{fixture}:application"));
     let guild_id = numeric_id(&format!("{fixture}:guild"));
     let ruleset_key = format!("retention_{}", &hex_digest(&fixture)[..24]);
-    let binding_fingerprint = hex_digest(&format!("{fixture}:binding"));
+    let resource_bindings = ResourceBindingMap::default();
+    let binding_fingerprint = resource_binding_fingerprint_v2(&resource_bindings).into_string();
     let authority_payload_digest = hex_digest(&format!("{fixture}:authority"));
     let authority_request_digest = hex_digest(&format!("{fixture}:authority-request"));
     let receipt_id = hex_digest(&format!("{fixture}:receipt"));
@@ -918,7 +920,10 @@ async fn retention_purge_preserves_stable_session_subject_audit_history() {
          (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
           binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
           authority_payload_digest, created_by_principal_id, created_by_request_digest) \
-         VALUES ($1, 1, $2, 1, '{}'::JSONB, $3, 1, 1, 3600, $4, $5, $6)",
+         VALUES ($1, 1, $2, 1, \
+          pg_catalog.jsonb_build_object(\
+           'role_bindings', '{}'::JSONB, 'channel_bindings', '{}'::JSONB), \
+          $3, 1, 1, 3600, $4, $5, $6)",
     )
     .bind(&installation_id)
     .bind(&tenant_id)

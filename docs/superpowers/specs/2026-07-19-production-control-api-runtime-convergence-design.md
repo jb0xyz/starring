@@ -426,8 +426,17 @@ process can produce generation rows.
 
 Raw idempotency keys are never stored. Promotion continues using its existing
 domain-separated request digest. Apply derives `ApplyAttemptId` deterministically
-from the product endpoint domain, activation request, authenticated actor, and
-idempotency scope, so an HTTP retry cannot create a second apply attempt.
+from the product endpoint domain, immutable promotion identity, authenticated
+actor, and idempotency scope. The database verifies the promotion's one-to-one
+activation link before mutation, so an HTTP retry cannot create a second apply
+attempt without requiring an untrusted pre-lock activation identifier.
+
+The authority resource-context fingerprint and approval binding fingerprint are
+different identities. The resource-context v2 fingerprint covers the complete
+binding map and binds authority versions, authoring evidence, runtime targets,
+and audits. The approval binding v1 fingerprint covers guild, binding revision,
+and only the required binding subset. Approval contexts carry the latter; code
+never compares it directly with the full authority fingerprint.
 
 `product_audit_events`
 
@@ -694,6 +703,10 @@ already present in a successful resource view never enter errors.
   Discord user derived from the product session.
 - Duplicate exact approval is an idempotent replay. A different digest or actor
   under the same key conflicts.
+- Approval replay reauthorizes the caller against the current authority head but
+  verifies the recorded result against its immutable historical authority,
+  audit, and receipt evidence. Authority rotation cannot rewrite or suppress a
+  valid retained result.
 - Rejection is terminal for that activation request and requires a new promotion
   idempotency key after redesign. Rejection never mutates the active pointer.
 - Apply requires linked product authority, satisfied quorum, unexpired request,

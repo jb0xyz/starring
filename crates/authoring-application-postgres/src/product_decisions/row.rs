@@ -39,7 +39,7 @@ pub(crate) struct ProductDecisionRow {
     pub installation_lifecycle_state: String,
     pub installation_current_authority_revision: i64,
     pub authority_binding_revision: i64,
-    pub authority_binding_fingerprint: String,
+    pub authority_resource_context_fingerprint: String,
     pub authority_policy_revision: i64,
     pub authority_required_approvals: i32,
     pub authority_activation_ttl_seconds: i64,
@@ -162,6 +162,8 @@ fn validate_record_and_activation(
         || record.intent.authority.ruleset_key.as_str() != row.activation_ruleset_key
         || record.request_digest.as_str() != row.promotion_request_digest
         || row.promotion_request_digest != row.activation_promotion_request_digest
+        || record.intent.evidence.context_fingerprint.as_str()
+            != row.authority_resource_context_fingerprint
         || row.activation_required_approvals != row.authority_required_approvals
     {
         return Err(invalid_persistence());
@@ -178,8 +180,6 @@ fn validate_record_and_activation(
     if row.activation_approval_context["context"] != expected_context
         || i64::try_from(activation.approval_context.binding.revision.get()).ok()
             != Some(row.authority_binding_revision)
-        || activation.approval_context.binding.fingerprint.as_str()
-            != row.authority_binding_fingerprint
         || i64::try_from(activation.approval_context.policy.revision.get()).ok()
             != Some(row.authority_policy_revision)
         || i32::try_from(activation.approval_context.policy.required_approvals.get()).ok()

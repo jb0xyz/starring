@@ -96,6 +96,27 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(approval
         .contains("database_commit(error, \"product approval commit outcome is unavailable\")"));
     assert!(database.contains("matches!(&error, sqlx::Error::Database(_))"));
+    let binding_identity_migration =
+        include_str!("../../../migrations/202607190009_separate_product_binding_identities.sql");
+    for required in [
+        "CREATE OR REPLACE FUNCTION public.starring_product_approve_v1",
+        "#>> '{intent,evidence,context_fingerprint}'",
+        "AS historical_authority",
+        "product_action_receipt_audit_evidence AS evidence",
+        "activation_row.approval_context -> 'context'",
+        "pg_catalog.set_config('starring.product_approval_gate', '', TRUE)",
+        "STRICT\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "FROM PUBLIC",
+    ] {
+        assert!(
+            binding_identity_migration.contains(required),
+            "missing binding identity guard: {required}"
+        );
+    }
+    assert!(!binding_identity_migration.contains(
+        "authority_row.binding_fingerprint\n            IS DISTINCT FROM activation_row.approval_context #>> '{context,binding,fingerprint}'"
+    ));
     let activation_store =
         include_str!("../../automation-ruleset-activation-postgres/src/store.rs");
     assert_eq!(

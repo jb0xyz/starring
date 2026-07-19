@@ -6,6 +6,7 @@ use authoring_application_postgres::{
     ProductActionRetentionError, ProductDatabaseFailureV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
+use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Connection, Executor, Postgres};
@@ -147,7 +148,8 @@ async fn seed_authority(pool: &PgPool, label: &str) -> AuthorityFixture {
     let tenant_id = format!("tenant:{token}");
     let installation_id = format!("installation:{token}");
     let principal_id = format!("principal:{token}");
-    let binding_fingerprint = digest(&format!("binding:{token}"));
+    let resource_bindings = ResourceBindingMap::default();
+    let binding_fingerprint = resource_binding_fingerprint_v2(&resource_bindings).into_string();
     let mut transaction = pool.begin().await.expect("begin authority fixture");
     sqlx::query(
         "INSERT INTO public.product_principals \
@@ -189,7 +191,10 @@ async fn seed_authority(pool: &PgPool, label: &str) -> AuthorityFixture {
           binding_fingerprint, policy_revision, required_approvals, \
           activation_ttl_seconds, authority_payload_digest, created_by_principal_id, \
           created_by_request_digest) \
-         VALUES ($1, 1, $2, 1, '{}'::JSONB, $3, 1, 1, 3600, $4, $5, $6)",
+         VALUES ($1, 1, $2, 1, \
+          pg_catalog.jsonb_build_object(\
+           'role_bindings', '{}'::JSONB, 'channel_bindings', '{}'::JSONB), \
+          $3, 1, 1, 3600, $4, $5, $6)",
     )
     .bind(&installation_id)
     .bind(&tenant_id)

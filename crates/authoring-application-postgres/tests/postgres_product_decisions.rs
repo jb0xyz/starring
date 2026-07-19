@@ -1,7 +1,14 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::num::NonZeroU64;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use authoring_application_postgres::MIGRATOR;
 use chrono::{DateTime, TimeDelta, Utc};
+use desired_state::ResourceKey;
+use discord_model::{ChannelId, GuildId};
+use resource_resolution::{
+    approval_binding_fingerprint_v1, resource_binding_fingerprint_v2, ResolvedApprovalBinding,
+    ResourceBindingMap,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -96,7 +103,8 @@ struct Fixture {
     ruleset_key: String,
     payload_digest: String,
     authority_digest: String,
-    binding_fingerprint: String,
+    authority_binding_fingerprint: String,
+    approval_binding_fingerprint: String,
     policy_digest: String,
     required_approvals: i32,
 }
@@ -128,7 +136,29 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
     let payload_digest = digest(&format!("payload:{suffix}"));
     let target_content_hash = digest(&format!("content:{suffix}"));
     let context_digest = digest(&format!("context:{suffix}"));
-    let binding_fingerprint = digest(&format!("binding:{suffix}"));
+    let guild = GuildId(guild_id.parse::<u64>().unwrap());
+    let channel_id = ChannelId(guild.0 + 1);
+    let binding_key = ResourceKey("community_hub".to_string());
+    let mut resource_bindings = ResourceBindingMap::default();
+    resource_bindings
+        .channel_bindings
+        .insert(binding_key.clone(), channel_id);
+    let authority_binding_fingerprint = resource_binding_fingerprint_v2(&resource_bindings);
+    let required_bindings = vec![ResolvedApprovalBinding::Channel {
+        key: binding_key,
+        id: channel_id,
+    }];
+    let approval_binding_fingerprint =
+        approval_binding_fingerprint_v1(guild, NonZeroU64::new(1).unwrap(), &required_bindings)
+            .unwrap();
+    assert_ne!(
+        authority_binding_fingerprint.as_str(),
+        approval_binding_fingerprint.as_str()
+    );
+    let stored_resource_bindings = json!({
+        "role_bindings": {},
+        "channel_bindings": {"community_hub": channel_id.to_string()}
+    });
     let policy_digest = digest(&format!("policy:{suffix}"));
     let authority_digest = digest(&format!("authority:{suffix}"));
     let approval_context = json!({
@@ -140,10 +170,10 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
             "approval_context_digest": context_digest,
             "binding": {
                 "revision": 1,
-                "fingerprint": binding_fingerprint,
-                "required_bindings": []
+                "fingerprint": approval_binding_fingerprint,
+                "required_bindings": required_bindings
             },
-            "baseline": {"baseline": "absent"},
+            "baseline": {"state": "absent"},
             "policy": {
                 "revision": 1,
                 "required_approvals": required_approvals,
@@ -170,7 +200,11 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
                 "principal_id": requester.principal_id,
                 "installation_id": installation_id,
                 "guild_id": guild_id,
-                "ruleset_key": ruleset_key
+                "ruleset_key": ruleset_key,
+                "binding_revision": 1
+            },
+            "evidence": {
+                "context_fingerprint": authority_binding_fingerprint
             }
         },
         "stage": {
@@ -270,11 +304,12 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
          (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
           binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
           authority_payload_digest, created_by_principal_id, created_by_request_digest) \
-         VALUES ($1, 1, $2, 1, '{}'::JSONB, $3, 1, $4, 3600, $5, $6, $7)",
+         VALUES ($1, 1, $2, 1, $3, $4, 1, $5, 3600, $6, $7, $8)",
     )
     .bind(&installation_id)
     .bind(&tenant_id)
-    .bind(&binding_fingerprint)
+    .bind(Json(&stored_resource_bindings))
+    .bind(authority_binding_fingerprint.as_str())
     .bind(required_approvals)
     .bind(&authority_digest)
     .bind(&requester.principal_id)
@@ -337,7 +372,8 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
         ruleset_key,
         payload_digest,
         authority_digest,
-        binding_fingerprint,
+        authority_binding_fingerprint: authority_binding_fingerprint.into_string(),
+        approval_binding_fingerprint: approval_binding_fingerprint.to_string(),
         policy_digest,
         required_approvals,
     }
@@ -368,10 +404,14 @@ async fn seed_additional_target(pool: &PgPool, fixture: &Fixture, label: &str) -
             "approval_context_digest": context_digest,
             "binding": {
                 "revision": 1,
-                "fingerprint": fixture.binding_fingerprint,
-                "required_bindings": []
+                "fingerprint": fixture.approval_binding_fingerprint,
+                "required_bindings": [{
+                    "kind": "channel",
+                    "key": "community_hub",
+                    "id": (fixture.guild_id.parse::<u64>().unwrap() + 1).to_string()
+                }]
             },
-            "baseline": {"baseline": "absent"},
+            "baseline": {"state": "absent"},
             "policy": {
                 "revision": 1,
                 "required_approvals": fixture.required_approvals,
@@ -390,7 +430,11 @@ async fn seed_additional_target(pool: &PgPool, fixture: &Fixture, label: &str) -
                 "principal_id": fixture.requester.principal_id,
                 "installation_id": fixture.installation_id,
                 "guild_id": fixture.guild_id,
-                "ruleset_key": fixture.ruleset_key
+                "ruleset_key": fixture.ruleset_key,
+                "binding_revision": 1
+            },
+            "evidence": {
+                "context_fingerprint": fixture.authority_binding_fingerprint
             }
         },
         "stage": {
@@ -636,6 +680,221 @@ async fn alias_count(pool: &PgPool, fixture: &Fixture, idempotency_digest: &str)
     .unwrap()
 }
 
+#[derive(Clone)]
+struct AuthorityRevisionFixture {
+    revision: i64,
+    payload_digest: String,
+    binding_fingerprint: String,
+}
+
+async fn advance_authority(pool: &PgPool, fixture: &Fixture) -> AuthorityRevisionFixture {
+    let revision = 2;
+    let binding_revision = 2;
+    let channel_id = ChannelId(fixture.guild_id.parse::<u64>().unwrap() + 2);
+    let binding_key = ResourceKey("community_hub".to_string());
+    let mut resource_bindings = ResourceBindingMap::default();
+    resource_bindings
+        .channel_bindings
+        .insert(binding_key, channel_id);
+    let binding_fingerprint = resource_binding_fingerprint_v2(&resource_bindings).into_string();
+    let stored_resource_bindings = json!({
+        "role_bindings": {},
+        "channel_bindings": {"community_hub": channel_id.to_string()}
+    });
+    let payload_digest = digest(&format!("{}:authority:v2", fixture.promotion_id));
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions \
+         (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
+          binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
+          authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 3600, $8, $9, $10)",
+    )
+    .bind(&fixture.installation_id)
+    .bind(revision)
+    .bind(&fixture.tenant_id)
+    .bind(binding_revision)
+    .bind(Json(&stored_resource_bindings))
+    .bind(&binding_fingerprint)
+    .bind(fixture.required_approvals)
+    .bind(&payload_digest)
+    .bind(&fixture.requester.principal_id)
+    .bind(digest(&format!(
+        "{}:authority-request:v2",
+        fixture.promotion_id
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.automation_installations \
+         SET current_authority_revision = $1, updated_at = pg_catalog.clock_timestamp() \
+         WHERE tenant_id = $2 AND installation_id = $3",
+    )
+    .bind(revision)
+    .bind(&fixture.tenant_id)
+    .bind(&fixture.installation_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    AuthorityRevisionFixture {
+        revision,
+        payload_digest,
+        binding_fingerprint,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn exact_replay_uses_current_authorization_and_preserves_historical_authority() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool, 2).await;
+    let first_invocation =
+        ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "authority-v1");
+    let first = approve(&pool, &fixture, &first_invocation).await.unwrap();
+    assert_eq!(first.outcome, "ok");
+    assert_eq!(first.resulting_revision, Some(2));
+    assert_eq!(first.resulting_state.as_deref(), Some("pending"));
+    assert!(!first.exact_replay);
+    let receipt_before = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT pg_catalog.to_jsonb(receipt) \
+         FROM public.product_action_receipts AS receipt WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let audit_before = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT pg_catalog.to_jsonb(audit) \
+         FROM public.product_audit_events AS audit WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let current_authority = advance_authority(&pool, &fixture).await;
+    assert_ne!(
+        current_authority.binding_fingerprint,
+        fixture.authority_binding_fingerprint
+    );
+    let mut replay = first_invocation.clone();
+    replay.authority_revision = current_authority.revision;
+    replay.authority_digest = current_authority.payload_digest.clone();
+    replay.actor.observation_digest = digest(&format!(
+        "{}:authority-v2-observation",
+        fixture.promotion_id
+    ));
+    replay.request_id = Some("approval.authority-v2-retry".to_string());
+    let replayed = approve(&pool, &fixture, &replay).await.unwrap();
+    assert_eq!(replayed.outcome, "ok");
+    assert_eq!(replayed.resulting_revision, first.resulting_revision);
+    assert_eq!(replayed.resulting_state, first.resulting_state);
+    assert!(replayed.exact_replay);
+    let receipt_after = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT pg_catalog.to_jsonb(receipt) \
+         FROM public.product_action_receipts AS receipt WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let audit_after = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT pg_catalog.to_jsonb(audit) \
+         FROM public.product_audit_events AS audit WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(receipt_after, receipt_before);
+    assert_eq!(audit_after, audit_before);
+    let historical_authority = sqlx::query_as::<_, (i64, String)>(
+        "SELECT installation_authority_revision, binding_fingerprint \
+         FROM public.product_audit_events WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(historical_authority.0, 1);
+    assert_eq!(
+        historical_authority.1,
+        fixture.authority_binding_fingerprint
+    );
+    assert_ne!(
+        historical_authority.1,
+        current_authority.binding_fingerprint
+    );
+    let stale_mutation =
+        ApprovalInvocation::new(&fixture, &fixture.second_approver, 2, "stale-authority-v1");
+    let rejected = approve(&pool, &fixture, &stale_mutation).await.unwrap();
+    assert_eq!(rejected.outcome, "authorization_stale");
+    assert_eq!(
+        persisted_counts(&pool, &fixture).await,
+        (1, 1, 1, 1, 2, "pending".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn approval_rechecks_expiring_authority_after_activation_lock_wait() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool, 2).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, String>(
+        "SELECT id FROM public.activation_requests WHERE id = $1 FOR UPDATE",
+    )
+    .bind(&fixture.activation_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let mut invocation =
+        ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "expiring-authority");
+    invocation.expires_offset_seconds = 1;
+    let approval_pool = pool.clone();
+    let approval_fixture = fixture.clone();
+    let approval =
+        tokio::spawn(async move { approve(&approval_pool, &approval_fixture, &invocation).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (\
+                 SELECT 1 FROM pg_catalog.pg_stat_activity \
+                 WHERE datname = pg_catalog.current_database() \
+                  AND pid <> pg_catalog.pg_backend_pid() \
+                  AND wait_event_type = 'Lock' \
+                  AND query LIKE '%starring_product_approve_v1%')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    blocker.rollback().await.unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(2), approval)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.outcome, "authorization_stale");
+    assert_eq!(
+        persisted_counts(&pool, &fixture).await,
+        (0, 0, 0, 0, 1, "pending".to_string())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() {
@@ -650,6 +909,21 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
     assert_eq!(first.resulting_revision, Some(2));
     assert_eq!(first.resulting_state.as_deref(), Some("pending"));
     assert!(!first.exact_replay);
+    let audit_binding_fingerprint = sqlx::query_scalar::<_, String>(
+        "SELECT binding_fingerprint FROM public.product_audit_events WHERE receipt_id = $1",
+    )
+    .bind(&first_invocation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit_binding_fingerprint,
+        fixture.authority_binding_fingerprint
+    );
+    assert_ne!(
+        audit_binding_fingerprint,
+        fixture.approval_binding_fingerprint
+    );
     let retired_idempotency = first_invocation.active_idempotency.clone();
     let mut replay_invocation = first_invocation.clone();
     replay_invocation.request_id = Some("approval.first.retry".to_string());
@@ -687,6 +961,8 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
     assert!(new_key_only_replay.exact_replay);
     let mut conflict_invocation = replay_invocation.clone();
     conflict_invocation.request_id = Some("approval.first.conflict".to_string());
+    conflict_invocation.payload_digest =
+        digest(&format!("{}:first:different-payload", fixture.promotion_id));
     conflict_invocation.semantic_request = digest(&format!(
         "{}:first:different-semantic",
         fixture.promotion_id

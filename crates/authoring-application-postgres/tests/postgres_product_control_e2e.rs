@@ -183,7 +183,7 @@ struct Fixture {
     guild_id: GuildId,
     manager_role_id: RoleId,
     authority_digest: String,
-    binding_fingerprint: String,
+    authority_binding_fingerprint: String,
     payload_digest: String,
     payload: ProductApprovalPayloadV1,
     credential: String,
@@ -238,14 +238,22 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     resource_bindings
         .channel_bindings
         .insert(ResourceKey("community_hub".to_string()), channel_id);
-    let context_fingerprint = resource_binding_fingerprint_v2(&resource_bindings);
+    let authority_binding_fingerprint = resource_binding_fingerprint_v2(&resource_bindings);
+    let stored_resource_bindings = json!({
+        "role_bindings": {},
+        "channel_bindings": {"community_hub": channel_id.to_string()}
+    });
     let required_bindings = vec![ResolvedApprovalBinding::Channel {
         key: ResourceKey("community_hub".to_string()),
         id: channel_id,
     }];
     let binding_revision = NonZeroU64::new(1).unwrap();
-    let binding_fingerprint =
+    let approval_binding_fingerprint =
         approval_binding_fingerprint_v1(guild_id, binding_revision, &required_bindings).unwrap();
+    assert_ne!(
+        authority_binding_fingerprint.as_str(),
+        approval_binding_fingerprint.as_str()
+    );
     let required_approvals = NonZeroU32::new(1).unwrap();
     let ttl_seconds = NonZeroU64::new(3_600).unwrap();
     let policy_revision = NonZeroU64::new(1).unwrap();
@@ -327,7 +335,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         )))
         .unwrap(),
         compiled_operations: 1,
-        context_fingerprint,
+        context_fingerprint: authority_binding_fingerprint.clone(),
         external_channel_bindings: vec!["community_hub".to_string()],
         stage_binding_digest: AuthoringHash::parse(&sha256_hex(&format!("stage-binding:{suffix}")))
             .unwrap(),
@@ -397,7 +405,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
             "binding": {
                 "revision": binding_revision,
                 "required_bindings": required_bindings,
-                "fingerprint": binding_fingerprint
+                "fingerprint": approval_binding_fingerprint
             },
             "baseline": {"state": "absent"},
             "policy": {
@@ -460,7 +468,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
             bytes(promotion_request_digest.as_str()),
             bytes(payload_digest.as_bytes()),
             bytes(binding_revision.get().to_be_bytes()),
-            bytes(binding_fingerprint.as_str()),
+            bytes(approval_binding_fingerprint.as_str()),
             bytes("channel"),
             bytes("community_hub"),
             bytes(channel_id.to_string()),
@@ -559,8 +567,8 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     )
     .bind(installation_id.as_str())
     .bind(tenant_id.as_str())
-    .bind(Json(json!({})))
-    .bind(binding_fingerprint.as_str())
+    .bind(Json(&stored_resource_bindings))
+    .bind(authority_binding_fingerprint.as_str())
     .bind(&authority_digest)
     .bind(requester_principal.as_str())
     .bind(sha256_hex(&format!("authority-request:{suffix}")))
@@ -640,7 +648,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         guild_id,
         manager_role_id,
         authority_digest,
-        binding_fingerprint: binding_fingerprint.to_string(),
+        authority_binding_fingerprint: authority_binding_fingerprint.into_string(),
         payload_digest,
         payload,
         credential,
@@ -1063,7 +1071,10 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
         effective_permissions.bits().to_string()
     );
     assert_eq!(audit.payload_digest, fixture.payload_digest);
-    assert_eq!(audit.binding_fingerprint, fixture.binding_fingerprint);
+    assert_eq!(
+        audit.binding_fingerprint,
+        fixture.authority_binding_fingerprint
+    );
     assert_eq!(audit.policy_revision, 1);
     assert_eq!(source_calls.load(Ordering::SeqCst), 5);
     assert_eq!(client_calls.load(Ordering::SeqCst), 5);
