@@ -10,9 +10,9 @@ use authoring_application::{
     DeploymentStatusPortError, DeploymentStatusProjectionV1, DeploymentStatusV1,
     ExactDeploymentSelectorV1, InstallationSelectorV1, ProductApplicationError,
     ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDecisionQueryPort,
-    ProductIdempotencyKeyV1, ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1,
-    ProductStatusV1, PromotionSelectorV1,
+    ProductCandidateErrorCodeV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort, ProductIdempotencyKeyV1, ProductRequestIdV1, ProductRevisionV1,
+    ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
 };
 use authoring_application_discord::{
     DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -64,8 +64,9 @@ use resource_resolution::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::types::Json;
+use sqlx::Connection;
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.approval.idempotency.v1";
 const SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.approval.request.v1";
@@ -109,6 +110,58 @@ async fn pool() -> PgPool {
         .expect("connect");
     MIGRATOR.run(&pool).await.expect("migrate");
     pool
+}
+
+struct ProductControlTestDatabase {
+    name: String,
+    administrator: PgConnection,
+    pool: PgPool,
+}
+
+async fn isolated_product_control_database(label: &str) -> ProductControlTestDatabase {
+    assert!(
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    let bounded_label = label.chars().take(16).collect::<String>();
+    let name = format!("starring_control_{bounded_label}_test_{}", suffix());
+    assert!(
+        name.len() <= 63
+            && name.starts_with("starring_")
+            && name.split('_').any(|segment| segment == "test")
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    let base = database_url().parse::<PgConnectOptions>().unwrap();
+    let mut administrator = PgConnection::connect_with(&base.clone().database("postgres"))
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(base.database(&name))
+        .await
+        .unwrap();
+    ProductControlTestDatabase {
+        name,
+        administrator,
+        pool,
+    }
+}
+
+async fn drop_isolated_product_control_database(database: ProductControlTestDatabase) {
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
 }
 
 fn suffix() -> String {

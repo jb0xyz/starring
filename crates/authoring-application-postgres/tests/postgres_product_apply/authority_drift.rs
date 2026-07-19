@@ -590,6 +590,219 @@ async fn policy_drift_persists_exact_expected_and_observed_policy() {
     assert!(persisted.audit_baseline_hash.is_none());
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactCorruption {
+    Definition,
+    Oversized,
+}
+
+#[derive(Clone, Copy)]
+enum IntegrityDrift {
+    Baseline,
+    Binding,
+    Policy,
+}
+
+async fn corrupt_target_artifact(
+    pool: &PgPool,
+    fixture: &Fixture,
+    corruption: ArtifactCorruption,
+) {
+    let definition = match corruption {
+        ArtifactCorruption::Definition => json!({
+            "version": 2,
+            "panels": [],
+            "modals": [],
+            "rules": []
+        }),
+        ArtifactCorruption::Oversized => json!({
+            "version": 1,
+            "panels": [],
+            "modals": [],
+            "rules": [],
+            "padding": "x".repeat(524_289)
+        }),
+    };
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DROP CONSTRAINT arv_content_integrity",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let changed = sqlx::query(
+        "UPDATE public.automation_ruleset_versions SET definition = $4 \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND version = $3",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .bind(1_i64)
+    .bind(Json(definition))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ADD CONSTRAINT arv_content_integrity CHECK (canonical_content_hash IS NOT NULL \
+          AND canonical_content_hash = content_hash) NOT VALID",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn integrity_drift_context(
+    pool: &PgPool,
+    fixture: &Fixture,
+    operation: &Operation,
+    drift: IntegrityDrift,
+) -> ApplyLockContext {
+    match drift {
+        IntegrityDrift::Baseline => {
+            set_competing_active_baseline(pool, fixture).await;
+            ApplyLockContext::single(fixture, operation)
+        }
+        IntegrityDrift::Binding => {
+            let guild_id = fixture.guild_id.parse::<u64>().unwrap();
+            let mut bindings = ResourceBindingMap::default();
+            bindings.channel_bindings.insert(
+                ResourceKey("community_hub".to_string()),
+                ChannelId(guild_id + 1_000_000_000),
+            );
+            bindings.role_bindings.insert(
+                ResourceKey("automation_operator".to_string()),
+                RoleId(guild_id + 2_000_000_000),
+            );
+            let fingerprint = resource_binding_fingerprint_v2(&bindings);
+            let stored = json!({
+                "role_bindings": &bindings.role_bindings,
+                "channel_bindings": &bindings.channel_bindings
+            });
+            let authority = advance_authority(
+                pool,
+                fixture,
+                AuthorityAdvance {
+                    binding_revision: 2,
+                    resource_bindings: &stored,
+                    binding_fingerprint: fingerprint.as_str(),
+                    policy_revision: 1,
+                    required_approvals: 1,
+                    activation_ttl_seconds: 3_600,
+                },
+            )
+            .await;
+            apply_context_at_authority(fixture, operation, &authority)
+        }
+        IntegrityDrift::Policy => {
+            let (bindings, fingerprint) = authority_binding_material(pool, fixture).await;
+            let authority = advance_authority(
+                pool,
+                fixture,
+                AuthorityAdvance {
+                    binding_revision: 1,
+                    resource_bindings: &bindings,
+                    binding_fingerprint: &fingerprint,
+                    policy_revision: 2,
+                    required_approvals: 1,
+                    activation_ttl_seconds: 3_600,
+                },
+            )
+            .await;
+            apply_context_at_authority(fixture, operation, &authority)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn corrupted_or_oversized_target_preempts_every_drift_without_product_mutation() {
+    for corruption in [ArtifactCorruption::Definition, ArtifactCorruption::Oversized] {
+        for drift in [
+            IntegrityDrift::Baseline,
+            IntegrityDrift::Binding,
+            IntegrityDrift::Policy,
+        ] {
+            let database = isolated_database("artifact_integrity_drift").await;
+            MIGRATOR.run(&database.pool).await.unwrap();
+            {
+                let pool = &database.pool;
+                let fixture = seed_fixture(pool).await;
+                corrupt_target_artifact(pool, &fixture, corruption).await;
+                let operation = Operation::new("artifact-integrity-drift");
+                let context = integrity_drift_context(pool, &fixture, &operation, drift).await;
+                let mut transaction = begin_serializable(pool).await;
+                let result = lock_apply_with_context(
+                    &mut transaction,
+                    &fixture,
+                    &operation,
+                    &Call::valid(&fixture),
+                    &context,
+                )
+                .await;
+                match result {
+                    Ok(locked) => {
+                        assert_eq!(locked.outcome, "target_mismatch");
+                        assert!(!locked.exact_replay);
+                        assert!(!locked.requires_commit);
+                        assert!(locked.locked_projection.is_none());
+                    }
+                    Err(error) => assert_eq!(
+                        error
+                            .as_database_error()
+                            .and_then(|database| database.code())
+                            .as_deref(),
+                        Some("PZ012")
+                    ),
+                }
+                transaction.rollback().await.unwrap();
+                let persisted = sqlx::query_as::<
+                    _,
+                    (String, i64, i64, Option<Json<Value>>, i64, i64, i64, i64),
+                >(
+                    "SELECT activation.state, activation.product_revision, \
+                     activation.apply_attempt_no, activation.termination, \
+                     (SELECT pg_catalog.count(*) FROM public.runtime_deployments \
+                      WHERE activation_request_id = activation.id), \
+                     (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+                      WHERE receipt_id = $2), \
+                     (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+                      WHERE receipt_id = $2), \
+                     (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+                      WHERE receipt_id = $2) \
+                     FROM public.activation_requests AS activation WHERE activation.id = $1",
+                )
+                .bind(&fixture.activation_id)
+                .bind(&operation.receipt_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    persisted,
+                    ("approved".to_string(), 2, 0, None, 0, 0, 0, 0)
+                );
+            }
+            drop_isolated_database(database).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn missing_target_with_policy_drift_remains_target_mismatch_without_supersession() {
@@ -609,16 +822,32 @@ async fn missing_target_with_policy_drift_remains_target_mismatch_without_supers
         },
     )
     .await;
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
     let deleted = sqlx::query(
         "DELETE FROM public.automation_ruleset_versions \
          WHERE guild_id = $1 AND ruleset_key = $2 AND version = 1",
     )
     .bind(&fixture.guild_id)
     .bind(&fixture.ruleset_key)
-    .execute(&pool)
+    .execute(&mut *corruption)
     .await
     .unwrap();
     assert_eq!(deleted.rows_affected(), 1);
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    corruption.commit().await.unwrap();
 
     let operation = Operation::new("missing-target-policy-drift");
     let context = apply_context_at_authority(&fixture, &operation, &authority);

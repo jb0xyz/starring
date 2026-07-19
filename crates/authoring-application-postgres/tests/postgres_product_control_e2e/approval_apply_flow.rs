@@ -26,6 +26,76 @@ fn apply_command(fixture: &Fixture, idempotency_key: &str) -> ApplyProductPromot
     }
 }
 
+async fn corrupt_e2e_target_with_baseline_drift(pool: &PgPool, fixture: &Fixture) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         SELECT activation.guild_id, activation.ruleset_key, 2, 1, \
+          pg_catalog.jsonb_build_object('version', 2, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $2, activation.requester_id \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind("91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_activations \
+         (guild_id, ruleset_key, active_version) \
+         SELECT guild_id, ruleset_key, 2 FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DROP CONSTRAINT arv_content_integrity",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let changed = sqlx::query(
+        "UPDATE public.automation_ruleset_versions AS version \
+         SET definition = pg_catalog.jsonb_build_object(\
+          'version', 2, 'panels', '[]'::JSONB, 'modals', '[]'::JSONB, 'rules', '[]'::JSONB) \
+         FROM public.activation_requests AS activation \
+         WHERE activation.id = $1 AND version.guild_id = activation.guild_id \
+           AND version.ruleset_key = activation.ruleset_key \
+           AND version.version = activation.target_version",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ADD CONSTRAINT arv_content_integrity CHECK (canonical_content_hash IS NOT NULL \
+          AND canonical_content_hash = content_hash) NOT VALID",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
 #[derive(sqlx::FromRow)]
 struct ReceiptRow {
     receipt_id: String,
@@ -432,4 +502,101 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
             .unwrap_err(),
         ProductApplicationError::Control(ProductControlPortError::InvalidState)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_evidence() {
+    let database = isolated_product_control_database("artifact_integrity").await;
+    MIGRATOR.run(&database.pool).await.unwrap();
+    {
+        let pool = &database.pool;
+        let fixture = seed_fixture(pool).await;
+        let authority = DiscordGuildAuthorityAdapter::new(
+            Source {
+                fixture: fixture.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            Client {
+                fixture: fixture.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            DiscordAuthorityConfigV1::new(
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let authentication = PostgresAuthentication::new(pool.clone());
+        let key_material = std::array::from_fn(|index| 151_u8.wrapping_add(index as u8));
+        let decisions = PostgresProductDecisions::new(
+            pool.clone(),
+            ProductDecisionDigestKeyringV1::new(
+                ProductDecisionDigestKeyV1::from_bytes("product-integrity-v1", key_material)
+                    .unwrap(),
+                [],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let deployments =
+            PostgresProductDeploymentStatuses::new(PostgresRuntimeConvergence::new(pool.clone()));
+        let application =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+        let installation = selector(&fixture);
+        application
+            .approve(
+                &fixture.credential,
+                &fixture.csrf,
+                &ProductRequestIdV1::parse(&format!("integrity.approve.{}", suffix())).unwrap(),
+                &installation,
+                approval_command(&fixture, &format!("integrity-approve-{}", suffix())),
+            )
+            .await
+            .unwrap();
+        corrupt_e2e_target_with_baseline_drift(pool, &fixture).await;
+        let error = application
+            .apply(
+                &fixture.credential,
+                &fixture.csrf,
+                &ProductRequestIdV1::parse(&format!("integrity.apply.{}", suffix())).unwrap(),
+                &installation,
+                apply_command(&fixture, &format!("integrity-apply-{}", suffix())),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProductApplicationError::Control(ProductControlPortError::InvalidServerCandidate(
+                ProductCandidateErrorCodeV1::TargetCorrupt
+            ))
+        );
+        let persisted = sqlx::query_as::<
+            _,
+            (String, i64, i64, Option<Json<Value>>, i64, i64, i64, i64),
+        >(
+            "SELECT activation.state, activation.product_revision, activation.apply_attempt_no, \
+             activation.termination, \
+             (SELECT pg_catalog.count(*) FROM public.runtime_deployments \
+              WHERE activation_request_id = activation.id), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+              WHERE endpoint_domain = 'product_apply_v1' AND target_resource_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+              WHERE action = 'promotion.apply' AND target_resource_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+              WHERE action = 'promotion.apply' AND target_resource_id = $2) \
+             FROM public.activation_requests AS activation WHERE activation.id = $1",
+        )
+        .bind(&fixture.activation_id)
+        .bind(fixture.promotion_id.as_str())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            ("approved".to_string(), 2, 0, None, 0, 0, 0, 0)
+        );
+    }
+    drop_isolated_product_control_database(database).await;
 }

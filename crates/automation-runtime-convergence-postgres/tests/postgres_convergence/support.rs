@@ -9,11 +9,13 @@ async fn certify_live_with_concurrent_active_drift(
     sqlx::query(
         "INSERT INTO public.automation_ruleset_versions (guild_id, ruleset_key, version, \
          schema_version, definition, content_hash, created_by) \
-         VALUES ($1, $2, 2, 1, '{}'::JSONB, $3, $4)",
+         VALUES ($1, $2, 2, 1, \
+          pg_catalog.jsonb_build_object('version', 2, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
     )
     .bind(GUILD.to_string())
     .bind(RULESET)
-    .bind("7".repeat(64))
+    .bind(NEXT_CONTENT_HASH)
     .bind(PRINCIPAL)
     .execute(pool)
     .await
@@ -840,7 +842,9 @@ async fn seed_product_target(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO automation_ruleset_versions (guild_id, ruleset_key, version, \
          schema_version, definition, content_hash, created_by) \
-         VALUES ($1, $2, 1, 1, '{}'::JSONB, $3, $4)",
+         VALUES ($1, $2, 1, 1, \
+          pg_catalog.jsonb_build_object('version', 1, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
     )
     .bind(GUILD.to_string())
     .bind(RULESET)
@@ -960,6 +964,122 @@ async fn seed_product_target(pool: &PgPool) {
         .execute(&mut *transaction)
         .await
         .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn corrupt_seeded_ruleset_artifact(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DROP CONSTRAINT arv_content_integrity",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let changed = sqlx::query(
+        "UPDATE public.automation_ruleset_versions \
+         SET definition = pg_catalog.jsonb_build_object(\
+          'version', 2, 'panels', '[]'::JSONB, 'modals', '[]'::JSONB, 'rules', '[]'::JSONB) \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND version = 1",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ADD CONSTRAINT arv_content_integrity CHECK (canonical_content_hash IS NOT NULL \
+          AND canonical_content_hash = content_hash) NOT VALID",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn replace_seeded_target_with_future_schema(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    for table in [
+        "automation_ruleset_versions",
+        "activation_requests",
+        "authoring_promotions",
+        "runtime_deployments",
+    ] {
+        sqlx::query(&format!("ALTER TABLE public.{table} DISABLE TRIGGER USER"))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    let future_hash = sqlx::query_scalar::<_, String>(
+        "UPDATE public.automation_ruleset_versions \
+         SET schema_version = 2, \
+          content_hash = public.starring_ruleset_content_hash_v1(2, definition) \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND version = 1 \
+         RETURNING content_hash",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.activation_requests SET target_content_hash = $2 WHERE id = $1",
+    )
+    .bind(ACTIVATION)
+    .bind(&future_hash)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET record = pg_catalog.jsonb_set(\
+          record, '{stage,activation,target,content_hash}', pg_catalog.to_jsonb($2::TEXT), FALSE) \
+         WHERE id = $1",
+    )
+    .bind(PROMOTION)
+    .bind(&future_hash)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments \
+         SET target_content_hash = $2, \
+          snapshot = pg_catalog.jsonb_set(\
+           snapshot, '{target,content_hash}', pg_catalog.to_jsonb($2::TEXT), FALSE) \
+         WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .bind(&future_hash)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    for table in [
+        "runtime_deployments",
+        "authoring_promotions",
+        "activation_requests",
+        "automation_ruleset_versions",
+    ] {
+        sqlx::query(&format!("ALTER TABLE public.{table} ENABLE TRIGGER USER"))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
     transaction.commit().await.unwrap();
 }
 

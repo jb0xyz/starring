@@ -35,9 +35,17 @@ struct TestDatabase {
 }
 
 async fn isolated_database(label: &str) -> TestDatabase {
-    let name = format!("starring_apply_{label}_test_{}", suffix());
     assert!(
-        name.starts_with("starring_")
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    let bounded_label = label.chars().take(16).collect::<String>();
+    let name = format!("starring_apply_{bounded_label}_test_{}", suffix());
+    assert!(
+        name.len() <= 63
+            && name.starts_with("starring_")
             && name.split('_').any(|segment| segment == "test")
             && name
                 .bytes()
@@ -364,7 +372,8 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     );
     let promotion_request_digest = digest(&format!("apply-promotion-request:{suffix}"));
     let payload_digest = digest(&format!("apply-payload:{suffix}"));
-    let target_content_hash = digest(&format!("apply-target:{suffix}"));
+    let target_content_hash =
+        "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6".to_string();
     let context_digest = digest(&format!("apply-context:{suffix}"));
     let guild = GuildId(guild_id.parse().unwrap());
     let required_channel_key = ResourceKey("community_hub".to_string());
@@ -562,7 +571,9 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     sqlx::query(
         "INSERT INTO public.automation_ruleset_versions \
          (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
-         VALUES ($1, $2, 1, 1, '{}'::JSONB, $3, $4)",
+         VALUES ($1, $2, 1, 1, \
+          pg_catalog.jsonb_build_object('version', 1, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
     )
     .bind(&guild_id)
     .bind(&ruleset_key)
@@ -758,10 +769,8 @@ fn apply_context_at_authority(
 }
 
 async fn set_competing_active_baseline(pool: &PgPool, fixture: &Fixture) -> String {
-    let content_hash = digest(&format!(
-        "apply-competing-baseline:{}",
-        fixture.activation_id
-    ));
+    let content_hash =
+        "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103".to_string();
     let mut transaction = pool.begin().await.unwrap();
     let advanced = sqlx::query(
         "UPDATE public.automation_ruleset_heads SET next_version = 3 \
@@ -776,7 +785,9 @@ async fn set_competing_active_baseline(pool: &PgPool, fixture: &Fixture) -> Stri
     sqlx::query(
         "INSERT INTO public.automation_ruleset_versions \
          (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
-         VALUES ($1, $2, 2, 1, '{}'::JSONB, $3, $4)",
+         VALUES ($1, $2, 2, 1, \
+          pg_catalog.jsonb_build_object('version', 2, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
     )
     .bind(&fixture.guild_id)
     .bind(&fixture.ruleset_key)

@@ -1,3 +1,4 @@
+use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
 use automation_runtime_convergence::{
     CommandGuardV1, LiveLossKindV1, RecoverLiveRequestV1, RuntimeDeploymentPhaseV1,
     TransitionOutcomeV1,
@@ -242,7 +243,7 @@ impl PostgresRuntimeConvergence {
         {
             return Err(RuntimeConvergenceStoreError::ServingLeaseConflict);
         }
-        Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
+        Self::assert_current_deployment_authority_canonical(&mut transaction, &persisted).await?;
         let current = Self::load_serving_lease_for_update(
             &mut transaction,
             persisted.deployment.target().guild_id.to_string(),
@@ -498,6 +499,8 @@ impl PostgresRuntimeConvergence {
               AND version.ruleset_key = active.ruleset_key \
               AND version.version = active.active_version \
               AND version.content_hash = deployment.target_content_hash \
+              AND version.canonical_content_hash = version.content_hash \
+              AND version.schema_version = $1 \
              WHERE deployment.phase = 'live' \
                AND promotion.record OPERATOR(pg_catalog.#>>) '{intent,authority,tenant_id}' \
                    = deployment.tenant_id \
@@ -534,6 +537,7 @@ impl PostgresRuntimeConvergence {
              ORDER BY serving.expires_at, deployment.updated_at, deployment.deployment_id \
              LIMIT 1 FOR UPDATE OF deployment SKIP LOCKED",
         )
+        .bind(i64::from(CURRENT_RULESET_SCHEMA_VERSION.get()))
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database)?;

@@ -30,6 +30,41 @@ pub(super) struct ApplyFinalizeRow {
     pub desired_target_digest: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(super) struct ApplyTargetArtifactRow {
+    pub schema_version: i64,
+    pub definition: Option<Json<Value>>,
+    pub content_hash: String,
+    pub canonical_content_hash: Option<String>,
+}
+
+pub(super) async fn load_apply_target_artifact(
+    transaction: &mut Transaction<'_, Postgres>,
+    request: &AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
+) -> Result<Option<ApplyTargetArtifactRow>, sqlx::Error> {
+    sqlx::query_as::<_, ApplyTargetArtifactRow>(
+        "SELECT version.schema_version, \
+         CASE WHEN pg_catalog.octet_length(version.definition::TEXT) <= 524288 \
+              THEN version.definition END AS definition, \
+         version.content_hash, version.canonical_content_hash \
+         FROM public.activation_requests AS activation \
+         INNER JOIN public.automation_ruleset_versions AS version \
+           ON version.guild_id = activation.guild_id \
+          AND version.ruleset_key = activation.ruleset_key \
+          AND version.version = activation.target_version \
+          AND version.content_hash = activation.target_content_hash \
+         WHERE activation.tenant_id = $1 \
+           AND activation.installation_id = $2 \
+           AND activation.promotion_id = $3 \
+         FOR SHARE OF activation, version",
+    )
+    .bind(request.scope().tenant_id().as_str())
+    .bind(request.scope().installation_id().as_str())
+    .bind(request.command().promotion.promotion_id().as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+}
+
 pub(super) async fn lock_apply(
     transaction: &mut Transaction<'_, Postgres>,
     request: &AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,

@@ -1,3 +1,4 @@
+use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
 use automation_runtime_convergence::{
     CommandGuardV1, FencingToken, LeaseRequestV1, RuntimeDeployment, RuntimeDeploymentError,
     RuntimeDeploymentPhaseV1, RuntimeFailureV1, RuntimePendingConditionV1, TransitionOutcomeV1,
@@ -52,14 +53,14 @@ impl PostgresRuntimeConvergence {
                 && existing.installation_authority_revision
                     == request.installation_authority_revision
                 && existing.desired_target_digest == desired_digest;
+            if exact {
+                Self::assert_current_deployment_authority(&mut transaction, &existing).await?;
+                let snapshot = existing.deployment.snapshot();
+                transaction.commit().await.map_err(database)?;
+                return Ok(EnqueueDeploymentOutcomeV1::ExactReplay(snapshot));
+            }
             transaction.commit().await.map_err(database)?;
-            return if exact {
-                Ok(EnqueueDeploymentOutcomeV1::ExactReplay(
-                    existing.deployment.snapshot(),
-                ))
-            } else {
-                Err(RuntimeConvergenceStoreError::IdempotencyConflict)
-            };
+            return Err(RuntimeConvergenceStoreError::IdempotencyConflict);
         }
         let provisional_at = Self::database_now(&mut transaction).await?;
         let provisional = RuntimeDeployment::request(
@@ -170,6 +171,9 @@ impl PostgresRuntimeConvergence {
             && existing.installation_authority_revision == request.installation_authority_revision
             && &existing.desired_target_digest == desired_digest;
         let snapshot = existing.deployment.snapshot();
+        if exact {
+            Self::assert_current_deployment_authority(&mut transaction, &existing).await?;
+        }
         transaction.commit().await.map_err(database)?;
         if exact {
             Ok(EnqueueDeploymentOutcomeV1::ExactReplay(snapshot))
@@ -286,6 +290,8 @@ impl PostgresRuntimeConvergence {
               AND version.ruleset_key = active.ruleset_key \
               AND version.version = active.active_version \
               AND version.content_hash = deployment.target_content_hash \
+              AND version.canonical_content_hash = version.content_hash \
+              AND version.schema_version = $1 \
              WHERE deployment.phase NOT IN ('live','superseded','cancelled') \
                AND promotion.record OPERATOR(pg_catalog.#>>) '{{intent,authority,tenant_id}}' \
                    = deployment.tenant_id \
@@ -318,6 +324,7 @@ impl PostgresRuntimeConvergence {
                       deployment.requested_at, deployment.deployment_id \
              LIMIT 1 FOR UPDATE OF deployment SKIP LOCKED) FOR UPDATE"
         ))
+        .bind(i64::from(CURRENT_RULESET_SCHEMA_VERSION.get()))
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database)?;

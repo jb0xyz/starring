@@ -30,10 +30,17 @@ async fn exact_live_status_and_fencing_survive_postgres() {
         adapter.enqueue(wrong_activation).await.unwrap_err(),
         RuntimeConvergenceStoreError::ScopeMismatch
     ));
-    let (first_enqueue, second_enqueue) = tokio::join!(
-        adapter.enqueue(request.clone()),
-        adapter.enqueue(request.clone())
-    );
+    let first_adapter = adapter.clone();
+    let first_request = request.clone();
+    let first_enqueue =
+        tokio::spawn(async move { first_adapter.enqueue(first_request).await });
+    let second_adapter = adapter.clone();
+    let second_request = request.clone();
+    let second_enqueue =
+        tokio::spawn(async move { second_adapter.enqueue(second_request).await });
+    let (first_enqueue, second_enqueue) = tokio::join!(first_enqueue, second_enqueue);
+    let first_enqueue = first_enqueue.unwrap();
+    let second_enqueue = second_enqueue.unwrap();
     let (created, replayed) = match (first_enqueue.unwrap(), second_enqueue.unwrap()) {
         (
             EnqueueDeploymentOutcomeV1::ExactReplay(created),
@@ -277,16 +284,25 @@ async fn exact_live_status_and_fencing_survive_postgres() {
     let second_adapter = adapter.clone();
     let first_identity = serving.identity.clone();
     let second_identity = serving.identity;
-    let (first, second) = tokio::join!(
-        first_adapter.heartbeat_serving(HeartbeatServingLeaseV1 {
-            identity: first_identity,
-            lease_for: Duration::from_secs(45),
-        }),
-        second_adapter.heartbeat_serving(HeartbeatServingLeaseV1 {
-            identity: second_identity,
-            lease_for: Duration::from_secs(45),
-        })
-    );
+    let first = tokio::spawn(async move {
+        first_adapter
+            .heartbeat_serving(HeartbeatServingLeaseV1 {
+                identity: first_identity,
+                lease_for: Duration::from_secs(45),
+            })
+            .await
+    });
+    let second = tokio::spawn(async move {
+        second_adapter
+            .heartbeat_serving(HeartbeatServingLeaseV1 {
+                identity: second_identity,
+                lease_for: Duration::from_secs(45),
+            })
+            .await
+    });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
     let heartbeat = match (first, second) {
         (Ok(receipt), Err(RuntimeConvergenceStoreError::RevisionConflict))
         | (Err(RuntimeConvergenceStoreError::RevisionConflict), Ok(receipt)) => receipt,
@@ -480,4 +496,68 @@ async fn exact_live_status_and_fencing_survive_postgres() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn live_status_fails_closed_after_ruleset_artifact_corruption() {
+    let database = isolated_runtime_migration_database().await;
+    MIGRATOR.run(&database.pool).await.unwrap();
+    {
+        let pool = &database.pool;
+        seed_product_target(pool).await;
+        let adapter = PostgresRuntimeConvergence::new(pool.clone());
+        let initial = adapter.status(&scope()).await.unwrap();
+        let claim = adapter
+            .claim(ClaimDeploymentV1 {
+                scope: scope(),
+                expected_revision: initial.snapshot.revision,
+                controller_id: ControllerId::parse("runtime-integrity-controller").unwrap(),
+                lease_for: Duration::from_secs(90),
+            })
+            .await
+            .unwrap();
+        converge_claimed(
+            &adapter,
+            claim,
+            ProcessInstanceId::parse("runtime-integrity-process").unwrap(),
+        )
+        .await;
+        assert_eq!(
+            adapter.status(&scope()).await.unwrap().availability,
+            DeploymentAvailabilityV1::Live
+        );
+        corrupt_seeded_ruleset_artifact(pool).await;
+        assert!(matches!(
+            adapter.enqueue(enqueue_request()).await.unwrap_err(),
+            RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
+        ));
+        assert!(matches!(
+            adapter.status(&scope()).await.unwrap_err(),
+            RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
+        ));
+    }
+    drop_runtime_migration_database(database).await;
+}
+
+#[tokio::test]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn worker_candidate_router_excludes_self_consistent_future_schema() {
+    let database = isolated_runtime_migration_database().await;
+    MIGRATOR.run(&database.pool).await.unwrap();
+    {
+        let pool = &database.pool;
+        seed_product_target(pool).await;
+        replace_seeded_target_with_future_schema(pool).await;
+        let adapter = PostgresRuntimeConvergence::new(pool.clone());
+        assert!(adapter
+            .claim_next(ClaimNextDeploymentV1 {
+                controller_id: ControllerId::parse("future-schema-controller").unwrap(),
+                lease_for: Duration::from_secs(90),
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+    drop_runtime_migration_database(database).await;
 }

@@ -45,6 +45,75 @@ async fn migration_preflight_refuses_ambiguous_applied_history() {
     outcome.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn artifact_integrity_upgrade_atomically_rejects_self_consistent_shadow_drift() {
+    let database = isolated_database("artifact_upgrade").await;
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 202_607_190_011)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        let fixture = seed_fixture(&database.pool).await;
+        let changed = sqlx::query(
+            "UPDATE public.automation_ruleset_versions AS version \
+             SET definition = pg_catalog.jsonb_build_object(\
+              'version', 2, 'panels', '[]'::JSONB, 'modals', '[]'::JSONB, 'rules', '[]'::JSONB), \
+              content_hash = $2 \
+             FROM public.activation_requests AS activation \
+             WHERE activation.id = $1 AND version.guild_id = activation.guild_id \
+               AND version.ruleset_key = activation.ruleset_key \
+               AND version.version = activation.target_version",
+        )
+        .bind(&fixture.activation_id)
+        .bind("91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103")
+        .execute(&database.pool)
+        .await?;
+        assert_eq!(changed.rows_affected(), 1);
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_190_012)
+            .unwrap();
+        let error = sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .expect_err("migration must reject self-consistent artifact shadow drift");
+        let sqlx::Error::Database(database_error) = error else {
+            panic!("expected migration preflight database error");
+        };
+        assert_eq!(database_error.code().as_deref(), Some("23514"));
+        assert_eq!(
+            database_error.constraint(),
+            Some("ruleset_shadow_target_integrity")
+        );
+        let generated_column_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+             SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'automation_ruleset_versions' \
+               AND column_name = 'canonical_content_hash')",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(!generated_column_exists);
+        let mutation_guard_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.to_regprocedure(\
+              'public.reject_ruleset_artifact_mutation()') IS NOT NULL",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(!mutation_guard_exists);
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
 async fn function_execute(pool: &PgPool, role: &str, identity: &str) -> bool {
     sqlx::query_scalar("SELECT pg_catalog.has_function_privilege($1, $2, 'EXECUTE')")
         .bind(role)

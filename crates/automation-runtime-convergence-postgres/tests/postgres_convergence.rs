@@ -38,7 +38,8 @@ const DEPLOYMENT: &str = "runtime-pg-deployment";
 const NEXT_PROMOTION: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const NEXT_ACTIVATION: &str = "runtime_pg_activation_next";
 const NEXT_DEPLOYMENT: &str = "runtime-pg-deployment-next";
-const CONTENT_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CONTENT_HASH: &str = "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6";
+const NEXT_CONTENT_HASH: &str = "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103";
 const BINDING_FINGERPRINT: &str =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const ROTATED_BINDING_FINGERPRINT: &str =

@@ -203,12 +203,15 @@ async fn exact_replay_survives_later_active_pointer_change() {
     assert_eq!(finalized.outcome, "ok");
     transaction.commit().await.unwrap();
 
-    let next_content_hash = digest(&format!("next-active:{}", fixture.activation_id));
+    let next_content_hash =
+        "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103".to_string();
     let mut pointer_transaction = pool.begin().await.unwrap();
     sqlx::query(
         "INSERT INTO public.automation_ruleset_versions \
          (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
-         VALUES ($1, $2, 2, 1, '{}'::JSONB, $3, $4)",
+         VALUES ($1, $2, 2, 1, \
+          pg_catalog.jsonb_build_object('version', 2, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
     )
     .bind(&fixture.guild_id)
     .bind(&fixture.ruleset_key)

@@ -4,9 +4,16 @@ use authoring_application::{
     ProductMutationReceiptV1, ProductRevisionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
+use automation_ruleset::{
+    content_hash, RuleSetContentHash, RuleSetSchemaVersion, CURRENT_RULESET_SCHEMA_VERSION,
+};
+use automation_state::InteractionRuleSet;
 
 use super::apply_projection::prepare_product_apply_v1;
-use super::apply_sql::{finalize_apply, lock_apply, ApplyFinalizeRow, ApplyLockRow};
+use super::apply_sql::{
+    finalize_apply, load_apply_target_artifact, lock_apply, ApplyFinalizeRow, ApplyLockRow,
+    ApplyTargetArtifactRow,
+};
 use super::database::{
     commit_failure_proves_rollback, configure_apply_transaction, database_backend, database_commit,
     is_safe_transaction_retry,
@@ -78,6 +85,22 @@ impl PostgresProductDecisions {
                 return Err(classify_precommit_failure(error));
             }
         };
+        if matches!(locked.outcome.as_str(), "ready" | "ok" | "superseded") {
+            let artifact = match load_apply_target_artifact(&mut transaction, request).await {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(classify_precommit_failure(error));
+                }
+            };
+            if artifact
+                .as_ref()
+                .is_none_or(|artifact| !target_artifact_is_valid(artifact))
+            {
+                let _ = transaction.rollback().await;
+                return Err(ApplyAttemptFailure::Control(target_corrupt()));
+            }
+        }
         if locked.outcome == "ok" || locked.outcome == "superseded" {
             let receipt = replay_or_terminal_receipt(request, &locked)?;
             commit_apply(transaction).await?;
@@ -369,11 +392,47 @@ async fn commit_apply(
 }
 
 fn classify_precommit_failure(error: sqlx::Error) -> ApplyAttemptFailure {
-    if is_safe_transaction_retry(&error) {
+    if error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .as_deref()
+        == Some("PZ012")
+    {
+        ApplyAttemptFailure::Control(target_corrupt())
+    } else if is_safe_transaction_retry(&error) {
         ApplyAttemptFailure::Retryable(error)
     } else {
         ApplyAttemptFailure::Control(database_backend(error))
     }
+}
+
+fn target_artifact_is_valid(artifact: &ApplyTargetArtifactRow) -> bool {
+    let Some(schema_version) = u32::try_from(artifact.schema_version)
+        .ok()
+        .and_then(|value| RuleSetSchemaVersion::new(value).ok())
+    else {
+        return false;
+    };
+    if schema_version != CURRENT_RULESET_SCHEMA_VERSION {
+        return false;
+    }
+    let Some(definition) = artifact.definition.as_ref().and_then(|definition| {
+        serde_json::from_value::<InteractionRuleSet>(definition.0.clone()).ok()
+    }) else {
+        return false;
+    };
+    let Some(persisted_hash) = RuleSetContentHash::parse_hex(&artifact.content_hash) else {
+        return false;
+    };
+    artifact.canonical_content_hash.as_deref() == Some(artifact.content_hash.as_str())
+        && automation_core::validate_structural(&definition).is_ok()
+        && content_hash(schema_version, &definition).ok() == Some(persisted_hash)
+}
+
+fn target_corrupt() -> ProductControlPortError {
+    ProductControlPortError::InvalidServerCandidate(
+        authoring_application::ProductCandidateErrorCodeV1::TargetCorrupt,
+    )
 }
 
 fn invalid_apply_result() -> ProductControlPortError {
@@ -389,7 +448,30 @@ enum ApplyAttemptFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_terminal_supersession, ApplyFinalizeRow};
+    use automation_ruleset::{content_hash, RuleSetSchemaVersion, CURRENT_RULESET_SCHEMA_VERSION};
+    use automation_state::InteractionRuleSet;
+    use sqlx::types::Json;
+
+    use super::{
+        is_terminal_supersession, target_artifact_is_valid, ApplyFinalizeRow,
+        ApplyTargetArtifactRow,
+    };
+
+    fn artifact(schema_version: RuleSetSchemaVersion) -> ApplyTargetArtifactRow {
+        let definition = InteractionRuleSet {
+            version: 1,
+            panels: Vec::new(),
+            modals: Vec::new(),
+            rules: Vec::new(),
+        };
+        let content_hash = content_hash(schema_version, &definition).unwrap().to_hex();
+        ApplyTargetArtifactRow {
+            schema_version: i64::from(schema_version.get()),
+            definition: Some(Json(serde_json::to_value(definition).unwrap())),
+            content_hash: content_hash.clone(),
+            canonical_content_hash: Some(content_hash),
+        }
+    }
 
     #[test]
     fn finalizer_supersession_requires_the_exact_terminal_shape() {
@@ -407,5 +489,15 @@ mod tests {
             exact_replay: true,
             ..terminal
         }));
+    }
+
+    #[test]
+    fn artifact_verifier_rejects_self_consistent_unsupported_schema() {
+        assert!(target_artifact_is_valid(&artifact(
+            CURRENT_RULESET_SCHEMA_VERSION
+        )));
+        assert!(!target_artifact_is_valid(&artifact(
+            RuleSetSchemaVersion::new(CURRENT_RULESET_SCHEMA_VERSION.get() + 1).unwrap()
+        )));
     }
 }

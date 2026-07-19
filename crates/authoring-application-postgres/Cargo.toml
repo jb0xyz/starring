@@ -7,9 +7,11 @@ edition.workspace = true
 authoring-application = { path = "../authoring-application" }
 authoring-application-discord = { path = "../authoring-application-discord" }
 authoring-promotion = { path = "../authoring-promotion" }
+automation-core = { path = "../automation-core" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-activation = { path = "../automation-ruleset-activation" }
 automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+automation-state = { path = "../automation-state" }
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
 automation-runtime-convergence-postgres = { path = "../automation-runtime-convergence-postgres" }
 base64 = "0.22"

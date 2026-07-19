@@ -546,6 +546,13 @@ async fn cleanup_product(pool: &PgPool, tenant: &str, guild_id: GuildId) {
         .execute(&mut *transaction)
         .await
         .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     for table in [
         "automation_ruleset_activations",
         "automation_ruleset_versions",
@@ -557,6 +564,13 @@ async fn cleanup_product(pool: &PgPool, tenant: &str, guild_id: GuildId) {
             .await
             .unwrap();
     }
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     transaction.commit().await.unwrap();
 }
 

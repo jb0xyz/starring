@@ -147,11 +147,13 @@ dependencies = [
  "authoring-application",
  "authoring-application-discord",
  "authoring-promotion",
+ "automation-core",
  "automation-ruleset",
  "automation-ruleset-activation",
  "automation-ruleset-readiness",
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
+ "automation-state",
  "base64",
  "chrono",
  "design-harness",
@@ -425,8 +427,10 @@ dependencies = [
 name = "automation-runtime-convergence-postgres"
 version = "0.1.0"
 dependencies = [
+ "automation-core",
  "automation-ruleset",
  "automation-runtime-convergence",
+ "automation-state",
  "chrono",
  "discord-model",
  "resource-resolution",

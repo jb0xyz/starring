@@ -4,11 +4,17 @@ mod status;
 
 use std::time::Duration;
 
+use automation_ruleset::{
+    content_hash, RuleSetContentHash, RuleSetSchemaVersion, CURRENT_RULESET_SCHEMA_VERSION,
+};
 use automation_runtime_convergence::{
     ControllerId, FencingToken, RuntimeDeployment, RuntimeDeploymentError,
     RuntimeDeploymentSnapshotV1, RuntimeGeneration,
 };
+use automation_state::InteractionRuleSet;
 use chrono::{DateTime, TimeDelta, Utc};
+use serde_json::Value;
+use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::error::database;
@@ -23,6 +29,14 @@ use crate::RuntimeConvergenceStoreError;
 pub struct PostgresRuntimeConvergence {
     pool: PgPool,
     config: PostgresRuntimeConvergenceConfigV1,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuntimeTargetArtifactRow {
+    schema_version: i64,
+    definition: Option<Json<Value>>,
+    content_hash: String,
+    canonical_content_hash: Option<String>,
 }
 
 impl PostgresRuntimeConvergence {
@@ -292,6 +306,44 @@ impl PostgresRuntimeConvergence {
         snapshot: &RuntimeDeploymentSnapshotV1,
         installation_authority_revision: u64,
     ) -> Result<(), RuntimeConvergenceStoreError> {
+        Self::lock_current_snapshot_authority(
+            transaction,
+            snapshot,
+            installation_authority_revision,
+        )
+        .await?;
+        let artifact = sqlx::query_as::<_, RuntimeTargetArtifactRow>(
+            "SELECT version.schema_version, \
+             CASE WHEN pg_catalog.octet_length(version.definition::TEXT) <= 524288 \
+                  THEN version.definition END AS definition, \
+             version.content_hash, version.canonical_content_hash \
+             FROM public.automation_ruleset_versions AS version \
+             WHERE version.guild_id = $1 AND version.ruleset_key = $2 \
+               AND version.version = $3 AND version.content_hash = $4 FOR SHARE",
+        )
+        .bind(snapshot.target.guild_id.to_string())
+        .bind(snapshot.target.ruleset_key.as_str())
+        .bind(i64::from(snapshot.target.version.get()))
+        .bind(snapshot.target.content_hash.to_hex())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        if artifact.as_ref().is_some_and(|artifact| {
+            runtime_target_artifact_is_valid(artifact, &snapshot.target.content_hash)
+        }) {
+            Ok(())
+        } else {
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "RuleSet artifact integrity",
+            ))
+        }
+    }
+
+    async fn lock_current_snapshot_authority(
+        transaction: &mut Transaction<'_, Postgres>,
+        snapshot: &RuntimeDeploymentSnapshotV1,
+        installation_authority_revision: u64,
+    ) -> Result<(), RuntimeConvergenceStoreError> {
         let outcome = sqlx::query_scalar::<_, String>(
             "SELECT public.starring_runtime_lock_current_authority(\
                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
@@ -335,6 +387,43 @@ impl PostgresRuntimeConvergence {
         .await
     }
 
+    async fn assert_current_deployment_authority_canonical(
+        transaction: &mut Transaction<'_, Postgres>,
+        persisted: &PersistedDeployment,
+    ) -> Result<(), RuntimeConvergenceStoreError> {
+        let snapshot = persisted.deployment.snapshot();
+        Self::lock_current_snapshot_authority(
+            transaction,
+            &snapshot,
+            persisted.installation_authority_revision,
+        )
+        .await?;
+        let exact = sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE(\
+              version.canonical_content_hash = $4 \
+              AND version.content_hash = $4 \
+              AND version.schema_version = $5, FALSE) \
+             FROM public.automation_ruleset_versions AS version \
+             WHERE version.guild_id = $1 AND version.ruleset_key = $2 \
+               AND version.version = $3 FOR SHARE",
+        )
+        .bind(snapshot.target.guild_id.to_string())
+        .bind(snapshot.target.ruleset_key.as_str())
+        .bind(i64::from(snapshot.target.version.get()))
+        .bind(snapshot.target.content_hash.to_hex())
+        .bind(i64::from(CURRENT_RULESET_SCHEMA_VERSION.get()))
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        if exact == Some(true) {
+            Ok(())
+        } else {
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "RuleSet artifact integrity",
+            ))
+        }
+    }
+
     async fn assert_previous_runtime_and_now(
         transaction: &mut Transaction<'_, Postgres>,
         snapshot: &RuntimeDeploymentSnapshotV1,
@@ -372,5 +461,72 @@ impl PostgresRuntimeConvergence {
         } else {
             Err(RuntimeDeploymentError::PreviousRuntimeMismatch.into())
         }
+    }
+}
+
+fn runtime_target_artifact_is_valid(
+    artifact: &RuntimeTargetArtifactRow,
+    expected_hash: &RuleSetContentHash,
+) -> bool {
+    let Some(schema_version) = u32::try_from(artifact.schema_version)
+        .ok()
+        .and_then(|value| RuleSetSchemaVersion::new(value).ok())
+    else {
+        return false;
+    };
+    if schema_version != CURRENT_RULESET_SCHEMA_VERSION {
+        return false;
+    }
+    let Some(definition) = artifact.definition.as_ref().and_then(|definition| {
+        serde_json::from_value::<InteractionRuleSet>(definition.0.clone()).ok()
+    }) else {
+        return false;
+    };
+    artifact.canonical_content_hash.as_deref() == Some(artifact.content_hash.as_str())
+        && RuleSetContentHash::parse_hex(&artifact.content_hash).as_ref() == Some(expected_hash)
+        && automation_core::validate_structural(&definition).is_ok()
+        && content_hash(schema_version, &definition).ok().as_ref() == Some(expected_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use automation_ruleset::{content_hash, RuleSetSchemaVersion, CURRENT_RULESET_SCHEMA_VERSION};
+    use automation_state::InteractionRuleSet;
+    use sqlx::types::Json;
+
+    use super::{runtime_target_artifact_is_valid, RuntimeTargetArtifactRow};
+
+    fn artifact(
+        schema_version: RuleSetSchemaVersion,
+    ) -> (
+        RuntimeTargetArtifactRow,
+        automation_ruleset::RuleSetContentHash,
+    ) {
+        let definition = InteractionRuleSet {
+            version: 1,
+            panels: Vec::new(),
+            modals: Vec::new(),
+            rules: Vec::new(),
+        };
+        let expected_hash = content_hash(schema_version, &definition).unwrap();
+        let content_hash = expected_hash.to_hex();
+        (
+            RuntimeTargetArtifactRow {
+                schema_version: i64::from(schema_version.get()),
+                definition: Some(Json(serde_json::to_value(definition).unwrap())),
+                content_hash: content_hash.clone(),
+                canonical_content_hash: Some(content_hash),
+            },
+            expected_hash,
+        )
+    }
+
+    #[test]
+    fn artifact_verifier_rejects_self_consistent_unsupported_schema() {
+        let (current, current_hash) = artifact(CURRENT_RULESET_SCHEMA_VERSION);
+        assert!(runtime_target_artifact_is_valid(&current, &current_hash));
+        let (future, future_hash) =
+            artifact(RuleSetSchemaVersion::new(CURRENT_RULESET_SCHEMA_VERSION.get() + 1).unwrap());
+        assert!(!runtime_target_artifact_is_valid(&future, &future_hash));
     }
 }
