@@ -427,8 +427,8 @@ Stated as capabilities (durable across the phase numbering):
   bounded read-only snapshotting, non-enumerating inactive states, corruption
   detection, and redacted records and failures. Its direct read now runs only
   through a versioned fixed-search-path security-definer function owned by the
-  common non-login relation owner. The adapter-exposed readiness contract
-  verifies the exact
+  common relation owner. The adapter-exposed readiness contract requires that
+  owner to be non-login and verifies the exact
   signature, result shape, owner, ACL, role attributes, schema/database
   capabilities, a direct login session, absence of role memberships and table
   or column privileges, and a real empty-scope execution probe. Migration tests
@@ -597,11 +597,11 @@ Stated as capabilities (durable across the phase numbering):
   reasoning through the private ChatGPT-auth Codex worker. The retained local
   Gemma artifact is rollback material and cannot be mixed into Luna acceptance
   evidence.
-- On this Mac mini, some newly linked Rust host binaries can stall before test
-  process entry while macOS AMFI/trust evaluation runs. Relevant scoped gates
-  are green, but this operational issue prevents claiming that the latest full
-  workspace gate completed locally and should be resolved before relying on
-  repeated whole-workspace runs.
+- On this Mac mini, some newly linked Rust host binaries have stalled before
+  test process entry while macOS AMFI/trust evaluation runs. The current full
+  workspace test, Clippy, and formatting gates completed locally; treat a
+  recurrence as a host operational fault and continue requiring independent CI
+  before merge.
 - The data volume is about 91% used with roughly 20 GiB free. Recover at least
   another 30 GiB before retaining additional large build or evaluation cohorts;
   this is an operational capacity target, not a certified production margin.

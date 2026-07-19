@@ -230,10 +230,14 @@ Revoke temporary migrator-to-owner membership after the ownership handoff; the
 installation-authority API readiness contract rejects memberships into or out
 of the owner role.
 
-The role bootstrap must grant `starring_api` schema usage and execution of only
-the exact versioned signature without grant option:
+If `starring_owner` does not own the `public` schema, the role bootstrap must
+grant it schema usage so the security-definer body can resolve its fully
+qualified relations after `PUBLIC` privileges are revoked. It must grant
+`starring_api` schema usage and execution of only the exact versioned signature
+without grant option:
 
 ```sql
+GRANT USAGE ON SCHEMA public TO starring_owner;
 GRANT USAGE ON SCHEMA public TO starring_api;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_installation_authority_read_v1(TEXT, TEXT, BYTEA)
@@ -253,6 +257,8 @@ capabilities, a direct login session, absence of all role memberships, table-
 and column-level privilege denial, and executes a data-independent empty-scope
 probe under a bounded read-only transaction. Running readiness after `SET ROLE`
 is rejected because that session can reset to the more privileged login role.
+The execution probe also fails closed when the function owner lacks schema
+usage.
 
 This authority-read probe certifies only that adapter boundary. Authentication
 and authorized-snapshot access still need their own narrow database functions
