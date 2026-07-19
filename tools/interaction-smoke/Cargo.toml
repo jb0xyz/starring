@@ -2,9 +2,11 @@
 name = "interaction-smoke"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [features]
-unsafe-dev-activation = ["automation-ruleset-activation/unsafe-dev-activation"]
+legacy-smoke = []
+unsafe-dev-activation = ["legacy-smoke", "automation-ruleset-activation/unsafe-dev-activation"]
 
 [dependencies]
 automation-core = { path = "../../crates/automation-core" }
