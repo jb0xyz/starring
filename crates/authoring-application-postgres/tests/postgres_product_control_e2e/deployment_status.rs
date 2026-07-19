@@ -8,7 +8,7 @@ async fn deployment_status_redacts_controller_failure_evidence() {
     let authentication = PostgresAuthentication::new(pool.clone());
     let authority = authority_adapter(fixture.clone());
     let runtime = PostgresRuntimeConvergence::new(pool.clone());
-    let deployments = PostgresProductDeploymentStatuses::new(runtime.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let applied = application
@@ -343,6 +343,100 @@ fn applied_projection(
     )
 }
 
+#[derive(Clone)]
+struct RawDeploymentStatusRequest {
+    deployment_id: String,
+    promotion_id: String,
+    desired_target_digest: String,
+    tenant_id: String,
+    installation_id: String,
+    guild_id: String,
+    principal_id: String,
+    acting_discord_user_id: String,
+    product_session_digest: [u8; 32],
+}
+
+impl RawDeploymentStatusRequest {
+    fn exact(fixture: &Fixture, exact: &ExactDeploymentSelectorV1) -> Self {
+        Self {
+            deployment_id: exact.deployment_reference().to_string(),
+            promotion_id: exact.promotion_id().as_str().to_string(),
+            desired_target_digest: exact.target_digest().to_string(),
+            tenant_id: fixture.tenant_id.as_str().to_string(),
+            installation_id: fixture.installation_id.as_str().to_string(),
+            guild_id: fixture.guild_id.to_string(),
+            principal_id: fixture.approver_principal.as_str().to_string(),
+            acting_discord_user_id: fixture.approver_user.to_string(),
+            product_session_digest: fixture.session_digest,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct RawDeploymentStatusEnvelopeShape {
+    request_outcome: String,
+    payload_is_empty: bool,
+    database_now_is_present: bool,
+}
+
+async fn read_raw_deployment_status(
+    connection: &mut PgConnection,
+    request: &RawDeploymentStatusRequest,
+) -> Vec<RawDeploymentStatusEnvelopeShape> {
+    sqlx::query_as::<_, RawDeploymentStatusEnvelopeShape>(
+        "SELECT request_outcome, \
+            deployment_projection IS NULL \
+                AND activation_projection IS NULL \
+                AND promotion_projection IS NULL \
+                AND tenant_lifecycle_state IS NULL \
+                AND installation_projection IS NULL \
+                AND historical_authority_projection IS NULL \
+                AND current_authority_projection IS NULL \
+                AND active_target_version IS NULL \
+                AND artifact_projection IS NULL \
+                AND attestation_projection IS NULL \
+                AND serving_projection IS NULL AS payload_is_empty, \
+            database_now IS NOT NULL AS database_now_is_present \
+         FROM public.starring_product_deployment_status_read_v1(\
+            $1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         LIMIT 2",
+    )
+    .bind(&request.deployment_id)
+    .bind(&request.promotion_id)
+    .bind(&request.desired_target_digest)
+    .bind(&request.tenant_id)
+    .bind(&request.installation_id)
+    .bind(&request.guild_id)
+    .bind(&request.principal_id)
+    .bind(&request.acting_discord_user_id)
+    .bind(request.product_session_digest.as_slice())
+    .fetch_all(connection)
+    .await
+    .unwrap()
+}
+
+async fn applied_status_reader_fixture(pool: &PgPool) -> (Fixture, ExactDeploymentSelectorV1) {
+    let fixture = seed_fixture(pool).await;
+    let decisions = product_decisions(pool);
+    approve_fixture(pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.raw-status.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-raw-status-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    (fixture, applied.exact_deployment().clone())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn product_status_requires_exact_attestation_and_connected_unexpired_serving() {
@@ -362,7 +456,7 @@ async fn product_status_requires_exact_attestation_and_connected_unexpired_servi
     )
     .unwrap();
     let deployments =
-        RecordingDeploymentStatuses::new(PostgresProductDeploymentStatuses::new(runtime.clone()));
+        RecordingDeploymentStatuses::new(PostgresProductDeploymentStatuses::new(pool.clone()));
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let apply_key = format!("apply-live-{}", suffix());
@@ -549,7 +643,7 @@ async fn product_status_maps_blocked_failure_to_stable_public_code() {
     let authentication = PostgresAuthentication::new(pool.clone());
     let authority = authority_adapter(fixture.clone());
     let runtime = PostgresRuntimeConvergence::new(pool.clone());
-    let deployments = PostgresProductDeploymentStatuses::new(runtime.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let applied = application
@@ -619,8 +713,7 @@ async fn product_status_fails_closed_for_exact_identity_digest_and_scope_mismatc
     approve_fixture(&pool, &fixture, &decisions).await;
     let authentication = PostgresAuthentication::new(pool.clone());
     let authority = authority_adapter(fixture.clone());
-    let runtime = PostgresRuntimeConvergence::new(pool.clone());
-    let deployments = PostgresProductDeploymentStatuses::new(runtime);
+    let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let applied = application
@@ -739,4 +832,428 @@ async fn product_status_fails_closed_for_exact_identity_digest_and_scope_mismatc
             .unwrap_err(),
         ProductApplicationError::InvalidProjection
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_reader_request_mismatch_is_payload_free() {
+    let pool = pool().await;
+    let (fixture, exact) = applied_status_reader_fixture(&pool).await;
+    let request = RawDeploymentStatusRequest::exact(&fixture, &exact);
+    let mut connection = pool.acquire().await.unwrap();
+    assert_eq!(
+        read_raw_deployment_status(&mut connection, &request).await,
+        vec![RawDeploymentStatusEnvelopeShape {
+            request_outcome: "exact".to_string(),
+            payload_is_empty: false,
+            database_now_is_present: true,
+        }]
+    );
+
+    let mut wrong_promotion = request.clone();
+    wrong_promotion.promotion_id = sha256_hex(&format!("wrong-raw-promotion:{}", suffix()));
+    let mut wrong_digest = request.clone();
+    wrong_digest.desired_target_digest = if request.desired_target_digest == "0".repeat(64) {
+        "1".repeat(64)
+    } else {
+        "0".repeat(64)
+    };
+    let mut wrong_guild = request.clone();
+    wrong_guild.guild_id = fixture.guild_id.0.checked_add(10_000).unwrap().to_string();
+
+    for mismatch in [wrong_promotion, wrong_digest, wrong_guild] {
+        assert_eq!(
+            read_raw_deployment_status(&mut connection, &mismatch).await,
+            vec![RawDeploymentStatusEnvelopeShape {
+                request_outcome: "request_mismatch".to_string(),
+                payload_is_empty: true,
+                database_now_is_present: true,
+            }]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_reader_denies_enumeration_and_inactive_session_state() {
+    let pool = pool().await;
+    let (fixture, exact) = applied_status_reader_fixture(&pool).await;
+    let request = RawDeploymentStatusRequest::exact(&fixture, &exact);
+    let mut connection = pool.acquire().await.unwrap();
+
+    let mut wrong_deployment = request.clone();
+    wrong_deployment.deployment_id = format!("missing-deployment-{}", suffix());
+    let mut wrong_tenant = request.clone();
+    wrong_tenant.tenant_id = format!("missing-tenant-{}", suffix());
+    let mut wrong_installation = request.clone();
+    wrong_installation.installation_id = format!("missing-installation-{}", suffix());
+    let mut wrong_principal = request.clone();
+    wrong_principal.principal_id = format!("missing-principal-{}", suffix());
+    let mut wrong_user = request.clone();
+    wrong_user.acting_discord_user_id = fixture
+        .approver_user
+        .0
+        .checked_add(10_000)
+        .unwrap()
+        .to_string();
+    let mut wrong_session = request.clone();
+    wrong_session.product_session_digest[0] ^= 0xff;
+
+    for unauthorized in [
+        wrong_deployment,
+        wrong_tenant,
+        wrong_installation,
+        wrong_principal,
+        wrong_user,
+        wrong_session,
+    ] {
+        assert!(read_raw_deployment_status(&mut connection, &unauthorized)
+            .await
+            .is_empty());
+    }
+    drop(connection);
+
+    let mut disabled = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE public.product_principals \
+         SET disabled = TRUE, \
+             identity_revision = identity_revision + 1, \
+             updated_at = GREATEST(\
+                pg_catalog.clock_timestamp(), updated_at + INTERVAL '1 microsecond'\
+             ) \
+         WHERE principal_id = $1",
+    )
+    .bind(fixture.approver_principal.as_str())
+    .execute(&mut *disabled)
+    .await
+    .unwrap();
+    assert!(read_raw_deployment_status(&mut disabled, &request)
+        .await
+        .is_empty());
+    disabled.rollback().await.unwrap();
+
+    let mut revoked = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE public.product_auth_sessions \
+         SET revoked_at = GREATEST(pg_catalog.clock_timestamp(), last_seen_at), \
+             revocation_reason = 'status_security_test' \
+         WHERE session_digest = $1",
+    )
+    .bind(request.product_session_digest.as_slice())
+    .execute(&mut *revoked)
+    .await
+    .unwrap();
+    assert!(read_raw_deployment_status(&mut revoked, &request)
+        .await
+        .is_empty());
+    revoked.rollback().await.unwrap();
+
+    let mut expired = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *expired)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.product_auth_sessions \
+         SET authenticated_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
+             created_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
+             last_seen_at = pg_catalog.clock_timestamp() - INTERVAL '90 minutes', \
+             idle_expires_at = pg_catalog.clock_timestamp() - INTERVAL '80 minutes', \
+             absolute_expires_at = pg_catalog.clock_timestamp() - INTERVAL '60 minutes' \
+         WHERE session_digest = $1",
+    )
+    .bind(request.product_session_digest.as_slice())
+    .execute(&mut *expired)
+    .await
+    .unwrap();
+    assert!(read_raw_deployment_status(&mut expired, &request)
+        .await
+        .is_empty());
+    expired.rollback().await.unwrap();
+
+    let mut oauth_unbound = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *oauth_unbound)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.product_auth_sessions \
+         SET oauth_state_digest = NULL, \
+             revoked_at = GREATEST(pg_catalog.clock_timestamp(), last_seen_at), \
+             revocation_reason = 'oauth_binding_removed' \
+         WHERE session_digest = $1",
+    )
+    .bind(request.product_session_digest.as_slice())
+    .execute(&mut *oauth_unbound)
+    .await
+    .unwrap();
+    assert!(read_raw_deployment_status(&mut oauth_unbound, &request)
+        .await
+        .is_empty());
+    oauth_unbound.rollback().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_reader_direct_login_is_ready_and_returns_pending_without_relation_access() {
+    let mut database = isolated_product_control_database("status_reader").await;
+    MIGRATOR.run(&database.pool).await.unwrap();
+    let fixture = seed_fixture(&database.pool).await;
+    let decisions = product_decisions(&database.pool);
+    approve_fixture(&database.pool, &fixture, &decisions).await;
+    let setup_authentication = PostgresAuthentication::new(database.pool.clone());
+    let setup_authority = authority_adapter(fixture.clone());
+    let setup_deployments = PostgresProductDeploymentStatuses::new(database.pool.clone());
+    let setup_application = ProductControlApplication::new(
+        &setup_authentication,
+        &setup_authority,
+        &decisions,
+        &setup_deployments,
+    );
+    let applied = setup_application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.restricted.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-restricted-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), ProductStatusV1::RuntimePending);
+    let role_suffix = suffix();
+    let owner_role = format!("starring_status_owner_{role_suffix}");
+    let reader_role = format!("starring_status_reader_{role_suffix}");
+    let reader_password = database_role_password();
+    for role in [&owner_role, &reader_role] {
+        assert!(
+            role.len() <= 63
+                && role
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        );
+    }
+    sqlx::query(&format!(
+        "CREATE ROLE {owner_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 0"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
+        .bind(&reader_password)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE ROLE {reader_role} LOGIN PASSWORD {password_literal} \
+         NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
+         NOBYPASSRLS CONNECTION LIMIT 4"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    for relation in [
+        "product_control_plane_identity",
+        "product_principals",
+        "product_auth_sessions",
+        "runtime_deployments",
+        "activation_requests",
+        "authoring_promotions",
+        "product_tenants",
+        "automation_installations",
+        "automation_installation_authority_versions",
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+        "runtime_attestations",
+        "runtime_serving_leases",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE public.{relation} OWNER TO {owner_role}"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    for function in [
+        "public.starring_product_deployment_status_reader_database_identity_v1()",
+        "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.validate_runtime_deployment_projection()",
+        "public.enforce_runtime_deployment_policy_shadow()",
+        "public.guard_runtime_ruleset_artifact_transition()",
+        "public.reject_runtime_deployment_delete()",
+        "public.validate_runtime_attestation_projection()",
+        "public.reject_immutable_product_row()",
+        "public.validate_runtime_serving_lease_transition()",
+        "public.reject_runtime_serving_lease_delete()",
+        "public.reject_ruleset_artifact_mutation()",
+        "public.starring_canonical_json_v1(JSONB)",
+        "public.starring_ruleset_content_hash_v1(BIGINT,JSONB)",
+    ] {
+        sqlx::query(&format!(
+            "ALTER FUNCTION {function} OWNER TO {owner_role}"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "REVOKE ALL ON DATABASE {} FROM PUBLIC",
+        database.name
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("REVOKE ALL ON SCHEMA public FROM PUBLIC")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "GRANT CONNECT ON DATABASE {} TO {reader_role}",
+        database.name
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT USAGE ON SCHEMA public TO {owner_role}, {reader_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.starring_product_deployment_status_reader_database_identity_v1(), \
+         public.starring_product_deployment_status_read_v1( \
+          TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let reader_pool =
+        database_role_login_pool(&database.name, &reader_role, &reader_password).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let deployments = PostgresProductDeploymentStatuses::new(reader_pool.clone());
+        deployments.verify_readiness().await.unwrap();
+        let authentication = ClaimsAuthentication {
+            claims: authoring_application::AuthenticationClaimsV1::from_authentication(
+                fixture.approver_principal.clone(),
+                authoring_application::AuthenticatedSessionFingerprintV1::from_sha256_digest(
+                    fixture.session_digest,
+                ),
+            ),
+        };
+        let authority = authority_adapter(fixture.clone());
+        let projected = ProjectedDecision {
+            projection: applied_projection(&fixture, applied.exact_deployment().clone()),
+        };
+        let application =
+            ProductControlApplication::new(&authentication, &authority, &projected, &deployments);
+        let mut writer_lock = database.pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {owner_role}"))
+            .execute(&mut *writer_lock)
+            .await
+            .unwrap();
+        sqlx::query(
+            "SELECT deployment_id FROM public.runtime_deployments \
+             WHERE deployment_id = $1 FOR UPDATE",
+        )
+        .bind(applied.exact_deployment().deployment_reference())
+        .execute(&mut *writer_lock)
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                application.get_deployment_status(
+                    &fixture.credential,
+                    &selector(&fixture),
+                    authoring_application::RuntimeDeploymentQueryV1 {
+                        promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                    },
+                ),
+            )
+            .await
+            .expect("status reader must not wait for a runtime row lock")
+            .unwrap(),
+            DeploymentStatusV1::Pending
+        );
+        writer_lock.rollback().await.unwrap();
+        let raw_request = RawDeploymentStatusRequest::exact(
+            &fixture,
+            applied.exact_deployment(),
+        );
+        let mut open_status_read = reader_pool.begin().await.unwrap();
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+            .execute(&mut *open_status_read)
+            .await
+            .unwrap();
+        let row_count = sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) FROM \
+             public.starring_product_deployment_status_read_v1(\
+                $1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(&raw_request.deployment_id)
+        .bind(&raw_request.promotion_id)
+        .bind(&raw_request.desired_target_digest)
+        .bind(&raw_request.tenant_id)
+        .bind(&raw_request.installation_id)
+        .bind(&raw_request.guild_id)
+        .bind(&raw_request.principal_id)
+        .bind(&raw_request.acting_discord_user_id)
+        .bind(raw_request.product_session_digest.as_slice())
+        .fetch_one(&mut *open_status_read)
+        .await
+        .unwrap();
+        assert_eq!(row_count, 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut writer = database.pool.begin().await.unwrap();
+            sqlx::query(&format!("SET LOCAL ROLE {owner_role}"))
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query(
+                "SELECT deployment_id FROM public.runtime_deployments \
+                 WHERE deployment_id = $1 FOR UPDATE",
+            )
+            .bind(applied.exact_deployment().deployment_reference())
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+            writer.rollback().await.unwrap();
+        })
+        .await
+        .expect("an open status snapshot must not block a runtime row lock");
+        open_status_read.rollback().await.unwrap();
+        for statement in [
+            "SELECT deployment_id FROM public.runtime_deployments LIMIT 1",
+            "INSERT INTO public.runtime_deployments DEFAULT VALUES",
+            "UPDATE public.runtime_deployments SET phase = phase WHERE FALSE",
+            "DELETE FROM public.runtime_deployments WHERE FALSE",
+            "TRUNCATE TABLE public.runtime_deployments",
+            "CREATE TABLE public.forbidden_status_table (value INTEGER)",
+            "CREATE TEMPORARY TABLE forbidden_status_temp (value INTEGER)",
+            "CREATE SCHEMA forbidden_status_schema",
+            "SELECT public.starring_product_apply_executor_database_identity_v1()",
+        ] {
+            assert_database_permission_denied(&reader_pool, statement).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+    reader_pool.close().await;
+    database.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+    for role in [&reader_role, &owner_role] {
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(&mut database.administrator)
+            .await
+            .unwrap();
+    }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }

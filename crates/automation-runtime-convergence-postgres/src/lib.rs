@@ -1,11 +1,18 @@
+mod artifact;
 mod digest;
 mod error;
+mod evidence;
 mod model;
 mod prepare;
+mod projection;
 mod row;
 mod store;
 
 pub use error::RuntimeConvergenceStoreError;
+pub use evidence::{
+    project_runtime_deployment_status_v1, RuntimeDeploymentStatusEvidenceV1,
+    RuntimeDeploymentStatusExpectationV1,
+};
 pub use model::{
     AttestationIdV1, ClaimDeploymentV1, ClaimNextDeploymentV1, ClaimReceiptV1,
     DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,

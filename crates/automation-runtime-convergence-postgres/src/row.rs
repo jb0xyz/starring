@@ -3,6 +3,7 @@ use automation_runtime_convergence::{
     RuntimeFailureDispositionV1, RuntimePendingConditionV1,
 };
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::Value;
 use sqlx::types::Json;
 
@@ -19,7 +20,8 @@ pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installat
     last_fencing_token, next_retry_at, last_stable_error_code, live_attestation_id, live_at, \
     blocked_at, superseded_at, cancelled_at, created_at, updated_at";
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeploymentRow {
     pub deployment_id: String,
     pub tenant_id: String,
@@ -229,7 +231,8 @@ pub(crate) const ATTESTATION_COLUMNS: &str = "attestation_id, attestation_digest
     runtime_build_revision, panel_certificate_id, panel_report_digest, gateway_shard_id, \
     gateway_ready_kind, gateway_ready_at, certified_at, record_format_version, record, created_at";
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AttestationRow {
     pub attestation_id: String,
     pub attestation_digest: String,
@@ -263,6 +266,11 @@ pub(crate) struct AttestationRow {
 pub(crate) struct PersistedAttestation {
     pub id: AttestationIdV1,
     pub record: AttestationRecordV1,
+    pub deployment_id: String,
+    pub tenant_id: String,
+    pub installation_id: String,
+    pub promotion_id: String,
+    pub activation_request_id: String,
 }
 
 impl AttestationRow {
@@ -312,7 +320,15 @@ impl AttestationRow {
                 "attestation projections",
             ));
         }
-        Ok(PersistedAttestation { id, record })
+        Ok(PersistedAttestation {
+            id,
+            record,
+            deployment_id: self.deployment_id,
+            tenant_id: self.tenant_id,
+            installation_id: self.installation_id,
+            promotion_id: self.promotion_id,
+            activation_request_id: self.activation_request_id,
+        })
     }
 }
 
@@ -321,7 +337,8 @@ pub(crate) const SERVING_LEASE_COLUMNS: &str = "guild_id, ruleset_key, tenant_id
     target_version, target_content_hash, binding_revision, binding_fingerprint, lease_epoch, \
     revision, connected, serving, acquired_at, last_heartbeat_at, expires_at";
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ServingLeaseRow {
     pub guild_id: String,
     pub ruleset_key: String,
@@ -345,6 +362,20 @@ pub(crate) struct ServingLeaseRow {
 }
 
 impl ServingLeaseRow {
+    pub fn validate(&self) -> Result<(), RuntimeConvergenceStoreError> {
+        self.checked_epoch()?;
+        self.checked_revision()?;
+        if self.connected != self.serving
+            || self.acquired_at > self.last_heartbeat_at
+            || self.last_heartbeat_at > self.expires_at
+        {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "serving lease projections",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn checked_epoch(&self) -> Result<u64, RuntimeConvergenceStoreError> {
         positive_u64(self.lease_epoch, "serving lease epoch")
     }

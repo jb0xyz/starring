@@ -1080,6 +1080,75 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
 }
 
 #[test]
+fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
+    let adapter = include_str!("../src/deployment_status/mod.rs");
+    let contract = include_str!("../src/deployment_status/contract.rs");
+    let query = include_str!("../src/deployment_status/query.rs");
+    let row = include_str!("../src/deployment_status/row.rs");
+    let readiness = include_str!("../src/deployment_status/readiness.rs");
+    assert!(adapter.contains("pool: PgPool"));
+    assert!(!adapter.contains("PostgresRuntimeConvergence"));
+    for required in [
+        "RuntimeDeploymentStatusExpectationV1::new",
+        "project_runtime_deployment_status_v1",
+        "evidence.application_id().get()",
+        "evidence.installation_authority_revision().get()",
+        "evidence.installation_authority_digest()",
+    ] {
+        assert!(
+            adapter.contains(required),
+            "missing status binding: {required}"
+        );
+    }
+    for required in [
+        "starring_product_deployment_status_reader_database_identity_v1()",
+        "starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
+        "expected_product_session_digest bytea",
+        "LIMIT 2",
+    ] {
+        assert!(
+            contract.contains(required),
+            "missing status contract: {required}"
+        );
+    }
+    assert!(query.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
+    assert!(query.contains("sqlx::query_as::<_, ProductDeploymentStatusRow>(STATUS_QUERY)"));
+    assert!(query.contains(".bind(actor.session_fingerprint().as_bytes().as_slice())"));
+    assert!(query.contains(".fetch_all(&mut *transaction)"));
+    for forbidden in [
+        "runtime_deployments",
+        "runtime_attestations",
+        "runtime_serving_leases",
+        "activation_requests",
+        "authoring_promotions",
+        "automation_ruleset_versions",
+        "FOR SHARE",
+        "FOR UPDATE",
+    ] {
+        assert!(
+            !query.contains(forbidden),
+            "raw status SQL edge: {forbidden}"
+        );
+    }
+    assert!(row.contains("request_mismatch"));
+    assert!(row.contains("sensitive_evidence_is_empty"));
+    assert!(!row.contains("derive(Debug"));
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 2]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 13]",
+        "verify_scoped_executable_allowlist",
+        "verify_scoped_schema_trust",
+        "SUPPORT_CONTRACT_QUERY",
+        "load_scoped_database_topology",
+    ] {
+        assert!(
+            readiness.contains(required),
+            "missing status readiness: {required}"
+        );
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         (
@@ -1097,8 +1166,32 @@ fn source_files_contain_no_comments() {
             include_str!("../src/database_capability.rs"),
         ),
         (
-            "src/deployment_status.rs",
-            include_str!("../src/deployment_status.rs"),
+            "src/deployment_status/mod.rs",
+            include_str!("../src/deployment_status/mod.rs"),
+        ),
+        (
+            "src/deployment_status/config.rs",
+            include_str!("../src/deployment_status/config.rs"),
+        ),
+        (
+            "src/deployment_status/contract.rs",
+            include_str!("../src/deployment_status/contract.rs"),
+        ),
+        (
+            "src/deployment_status/projection.rs",
+            include_str!("../src/deployment_status/projection.rs"),
+        ),
+        (
+            "src/deployment_status/query.rs",
+            include_str!("../src/deployment_status/query.rs"),
+        ),
+        (
+            "src/deployment_status/readiness.rs",
+            include_str!("../src/deployment_status/readiness.rs"),
+        ),
+        (
+            "src/deployment_status/row.rs",
+            include_str!("../src/deployment_status/row.rs"),
         ),
         ("src/digest.rs", include_str!("../src/digest.rs")),
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
@@ -1324,6 +1417,14 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",
             include_str!("postgres_product_control_e2e/deployment_status.rs"),
+        ),
+        (
+            "tests/postgres_product_deployment_status_migration_security.rs",
+            include_str!("postgres_product_deployment_status_migration_security.rs"),
+        ),
+        (
+            "tests/postgres_product_deployment_status_readiness.rs",
+            include_str!("postgres_product_deployment_status_readiness.rs"),
         ),
     ];
     for (path, source) in sources {

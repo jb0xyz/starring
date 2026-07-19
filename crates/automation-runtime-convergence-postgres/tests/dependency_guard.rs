@@ -23,6 +23,33 @@ fn adapter_does_not_depend_on_runtime_or_product_authority_edges() {
 }
 
 #[test]
+fn adapter_sources_contain_no_comments() {
+    let sources = [
+        include_str!("../src/artifact.rs"),
+        include_str!("../src/digest.rs"),
+        include_str!("../src/error.rs"),
+        include_str!("../src/evidence.rs"),
+        include_str!("../src/lib.rs"),
+        include_str!("../src/model.rs"),
+        include_str!("../src/prepare.rs"),
+        include_str!("../src/projection.rs"),
+        include_str!("../src/row.rs"),
+        include_str!("../src/store/deployment.rs"),
+        include_str!("../src/store/mod.rs"),
+        include_str!("../src/store/serving.rs"),
+        include_str!("../src/store/status.rs"),
+    ];
+    for source in sources {
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            assert!(!trimmed.starts_with("//"));
+            assert!(!trimmed.starts_with("/*"));
+            assert!(!trimmed.starts_with('*'));
+        }
+    }
+}
+
+#[test]
 fn runtime_security_definers_have_fixed_resolution_and_revoked_public_execution() {
     let migration = include_str!("../../../migrations/202607190002_create_runtime_convergence.sql");
     let definer_count = migration.matches("SECURITY DEFINER").count();
