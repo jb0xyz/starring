@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -736,18 +736,6 @@ fn enqueue_request() -> EnqueueDeploymentV1 {
     }
 }
 
-async fn test_pool() -> PgPool {
-    let url = std::env::var("STARRING_TEST_DATABASE_URL")
-        .expect("STARRING_TEST_DATABASE_URL required for ignored PostgreSQL tests");
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .unwrap();
-    MIGRATOR.run(&pool).await.unwrap();
-    pool
-}
-
 async fn seed_product_target(pool: &PgPool) {
     let now = Utc::now();
     let expires_at = now + TimeDelta::hours(1);
@@ -1281,11 +1269,10 @@ async fn authority_lock_result(
     .unwrap()
 }
 
-async fn assert_adapter_search_path_resistance() {
-    let url = std::env::var("STARRING_TEST_DATABASE_URL").unwrap();
+async fn assert_adapter_search_path_resistance(connect_options: &PgConnectOptions) {
     let setup_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect_with(connect_options.clone())
         .await
         .unwrap();
     sqlx::query(
@@ -1313,7 +1300,7 @@ async fn assert_adapter_search_path_resistance() {
                 Ok(())
             })
         })
-        .connect(&url)
+        .connect_with(connect_options.clone())
         .await
         .unwrap();
     let adapter = PostgresRuntimeConvergence::new(pool);

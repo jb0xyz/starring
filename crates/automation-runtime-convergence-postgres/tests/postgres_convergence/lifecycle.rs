@@ -1,7 +1,17 @@
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn exact_live_status_and_fencing_survive_postgres() {
-    let pool = test_pool().await;
+    run_migrated_runtime_database_test(
+        "exact_lifecycle",
+        exact_live_status_and_fencing_survive_postgres_scenario,
+    )
+    .await;
+}
+
+async fn exact_live_status_and_fencing_survive_postgres_scenario(
+    pool: PgPool,
+    connect_options: PgConnectOptions,
+) {
     seed_product_target(&pool).await;
     assert_search_path_shadow_resistance(&pool).await;
     let adapter = PostgresRuntimeConvergence::new(pool.clone());
@@ -50,7 +60,7 @@ async fn exact_live_status_and_fencing_survive_postgres() {
     };
     assert_eq!(created, replayed);
     let initial = created;
-    assert_adapter_search_path_resistance().await;
+    assert_adapter_search_path_resistance(&connect_options).await;
     assert!(matches!(
         adapter.enqueue(request).await.unwrap(),
         EnqueueDeploymentOutcomeV1::ExactReplay(_)
@@ -501,63 +511,73 @@ async fn exact_live_status_and_fencing_survive_postgres() {
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn live_status_fails_closed_after_ruleset_artifact_corruption() {
-    let database = isolated_runtime_migration_database().await;
-    MIGRATOR.run(&database.pool).await.unwrap();
-    {
-        let pool = &database.pool;
-        seed_product_target(pool).await;
-        let adapter = PostgresRuntimeConvergence::new(pool.clone());
-        let initial = adapter.status(&scope()).await.unwrap();
-        let claim = adapter
-            .claim(ClaimDeploymentV1 {
-                scope: scope(),
-                expected_revision: initial.snapshot.revision,
-                controller_id: ControllerId::parse("runtime-integrity-controller").unwrap(),
-                lease_for: Duration::from_secs(90),
-            })
-            .await
-            .unwrap();
-        converge_claimed(
-            &adapter,
-            claim,
-            ProcessInstanceId::parse("runtime-integrity-process").unwrap(),
-        )
-        .await;
-        assert_eq!(
-            adapter.status(&scope()).await.unwrap().availability,
-            DeploymentAvailabilityV1::Live
-        );
-        corrupt_seeded_ruleset_artifact(pool).await;
-        assert!(matches!(
-            adapter.enqueue(enqueue_request()).await.unwrap_err(),
-            RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
-        ));
-        assert!(matches!(
-            adapter.status(&scope()).await.unwrap_err(),
-            RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
-        ));
-    }
-    drop_runtime_migration_database(database).await;
+    run_migrated_runtime_database_test(
+        "artifact_corruption",
+        live_status_fails_closed_after_ruleset_artifact_corruption_scenario,
+    )
+    .await;
+}
+
+async fn live_status_fails_closed_after_ruleset_artifact_corruption_scenario(
+    pool: PgPool,
+    _: PgConnectOptions,
+) {
+    seed_product_target(&pool).await;
+    let adapter = PostgresRuntimeConvergence::new(pool.clone());
+    let initial = adapter.status(&scope()).await.unwrap();
+    let claim = adapter
+        .claim(ClaimDeploymentV1 {
+            scope: scope(),
+            expected_revision: initial.snapshot.revision,
+            controller_id: ControllerId::parse("runtime-integrity-controller").unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    converge_claimed(
+        &adapter,
+        claim,
+        ProcessInstanceId::parse("runtime-integrity-process").unwrap(),
+    )
+    .await;
+    assert_eq!(
+        adapter.status(&scope()).await.unwrap().availability,
+        DeploymentAvailabilityV1::Live
+    );
+    corrupt_seeded_ruleset_artifact(&pool).await;
+    assert!(matches!(
+        adapter.enqueue(enqueue_request()).await.unwrap_err(),
+        RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
+    ));
+    assert!(matches!(
+        adapter.status(&scope()).await.unwrap_err(),
+        RuntimeConvergenceStoreError::InvalidPersistedState("RuleSet artifact integrity")
+    ));
 }
 
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn worker_candidate_router_excludes_self_consistent_future_schema() {
-    let database = isolated_runtime_migration_database().await;
-    MIGRATOR.run(&database.pool).await.unwrap();
-    {
-        let pool = &database.pool;
-        seed_product_target(pool).await;
-        replace_seeded_target_with_future_schema(pool).await;
-        let adapter = PostgresRuntimeConvergence::new(pool.clone());
-        assert!(adapter
-            .claim_next(ClaimNextDeploymentV1 {
-                controller_id: ControllerId::parse("future-schema-controller").unwrap(),
-                lease_for: Duration::from_secs(90),
-            })
-            .await
-            .unwrap()
-            .is_none());
-    }
-    drop_runtime_migration_database(database).await;
+    run_migrated_runtime_database_test(
+        "future_schema",
+        worker_candidate_router_excludes_self_consistent_future_schema_scenario,
+    )
+    .await;
+}
+
+async fn worker_candidate_router_excludes_self_consistent_future_schema_scenario(
+    pool: PgPool,
+    _: PgConnectOptions,
+) {
+    seed_product_target(&pool).await;
+    replace_seeded_target_with_future_schema(&pool).await;
+    let adapter = PostgresRuntimeConvergence::new(pool.clone());
+    assert!(adapter
+        .claim_next(ClaimNextDeploymentV1 {
+            controller_id: ControllerId::parse("future-schema-controller").unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap()
+        .is_none());
 }

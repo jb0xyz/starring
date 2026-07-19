@@ -1,7 +1,17 @@
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn runtime_authority_tracks_binding_identity_across_policy_rotation() {
-    let pool = test_pool().await;
+    run_migrated_runtime_database_test(
+        "binding_authority",
+        runtime_authority_tracks_binding_identity_across_policy_rotation_scenario,
+    )
+    .await;
+}
+
+async fn runtime_authority_tracks_binding_identity_across_policy_rotation_scenario(
+    pool: PgPool,
+    _: PgConnectOptions,
+) {
     seed_product_target(&pool).await;
     let adapter = PostgresRuntimeConvergence::new(pool.clone());
     let created = match adapter.enqueue(enqueue_request()).await.unwrap() {
