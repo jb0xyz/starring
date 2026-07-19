@@ -616,6 +616,202 @@ convergence still contain direct SQL. Product rejection has no production
 persistence adapter. Whole-service execute-only readiness remains a future
 gate, and direct table grants are not a valid workaround.
 
+## Product approval executor boundary
+
+`PostgresProductDecisions` requires three pools named for decision reads,
+approval execution, and apply execution. Query code uses only the reader pool,
+approval and receipt-key coverage use only the approval pool, and apply uses
+only the apply pool. Production composition must not clone one pool into all
+three fields.
+
+Migration 019 adds three logical-database topology functions and normalizes the
+approval and keyring-coverage functions. It requires the 13 directly referenced
+approval relations to be ordinary non-RLS tables under one existing owner and
+requires the existing approval and coverage functions to have that same owner.
+It removes `PUBLIC`, named-role, and grant-option execution from all five
+functions. Environment-specific grants are not preserved.
+
+Before applying migration 020, execute as the current `public` schema owner or
+`SET ROLE` to that owner. Revoke `CREATE` from `PUBLIC` and every named grantee
+other than the schema owner, then verify `pg_namespace.nspacl`. A separate
+migrator `CREATE` grant is not accepted even when the migrator is operationally
+trusted:
+
+```sql
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+SELECT privilege.grantee::REGROLE, privilege.privilege_type
+FROM pg_catalog.pg_namespace AS namespace
+CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+    namespace.nspacl,
+    pg_catalog.acldefault('n', namespace.nspowner)
+)) AS privilege
+WHERE namespace.nspname = 'public'
+  AND privilege.privilege_type = 'CREATE'
+  AND privilege.grantee <> namespace.nspowner;
+```
+
+Revoke every row returned by that query before continuing. Migration 020 also
+requires the schema owner itself to be the common product owner,
+`pg_database_owner`, or the current database owner.
+
+Migration 020 closes the currently enumerated user-trigger support boundary.
+The six tables mutated by approval carry 19 user-defined triggers; one approval
+INSERT or UPDATE executes the applicable subset rather than all 19. The shared
+trigger graph can read three additional ruleset and runtime relations. Before
+migration, all 16 relations, the 17 approval-specific trigger functions that
+remain in the post-migration manifest, the shared
+`starring_runtime_desired_target_digest_v1(JSONB, BIGINT)` helper, and the
+existing Apply lock wrapper, lock core, and finalization functions must already
+have the same reviewed owner, be ordinary functions, remain security definers,
+and have exactly `search_path=pg_catalog`. This is a metadata prerequisite, not
+Apply executor certification.
+
+Migration 020 validates each trigger's relation, function, row/statement level,
+event, timing, enabled state, constraint and parent relation binding,
+deferrability, initially-deferred state, normalized `WHEN` predicate,
+update-column vector, argument count and bytes, and old/new transition-table
+bindings. It schema-qualifies the one legacy `authoring_promotions` reference,
+replaces the globally shared immutable-row trigger binding on two approval
+tables with an approval-only function, makes the resulting 18 trigger functions
+internal security-definer capabilities fixed to `search_path=pg_catalog`,
+normalizes the digest helper, and removes every non-owner execution grant from
+those resulting 18 functions and the helper. Request roles never receive direct
+execution on these internal functions. Existing Apply functions and the legacy
+global `reject_immutable_product_row()` remain outside that revoke scope.
+
+The common owner must be a `NOLOGIN` role satisfying the same owner restrictions
+as the identity boundary. The `public` schema must not grant `CREATE` to
+`PUBLIC`, a request-serving role, or any other untrusted named principal. The
+database owner is a trusted operational principal. A separate migration role
+must `SET ROLE` to the schema owner; it must not retain its own schema `CREATE`
+ACL when migration or readiness runs. Internal trigger functions use only
+`pg_catalog` in their path and every application relation reference is
+schema-qualified.
+
+After migrations 019 and 020, create or verify three distinct direct-login
+roles with no membership. Replace `starring_production` below with the reviewed
+production database identifier. Revoke PostgreSQL defaults and any old
+database/schema privileges before granting only the staged manifest:
+
+```sql
+REVOKE CONNECT, TEMPORARY
+ON DATABASE starring_production
+FROM PUBLIC;
+
+REVOKE ALL PRIVILEGES
+ON DATABASE starring_production
+FROM starring_decision_reader,
+     starring_decision_approval,
+     starring_decision_apply;
+
+REVOKE ALL PRIVILEGES
+ON SCHEMA public
+FROM PUBLIC,
+     starring_decision_reader,
+     starring_decision_approval,
+     starring_decision_apply;
+
+GRANT CONNECT
+ON DATABASE starring_production
+TO starring_decision_reader,
+   starring_decision_approval,
+   starring_decision_apply;
+
+GRANT USAGE ON SCHEMA public TO starring_owner;
+GRANT USAGE ON SCHEMA public
+TO starring_decision_reader,
+   starring_decision_approval,
+   starring_decision_apply;
+
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_decision_reader_database_identity_v1()
+TO starring_decision_reader;
+
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_approval_executor_database_identity_v1()
+TO starring_decision_approval;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_approve_v1(
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT
+    )
+TO starring_decision_approval;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_approval_keyring_coverage_v1(TEXT[], TEXT[])
+TO starring_decision_approval;
+
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_executor_database_identity_v1()
+TO starring_decision_apply;
+```
+
+Inventory `pg_namespace.nspacl` after the revokes and remove `CREATE` from every
+untrusted named grantee, not only these three request roles. The schema owner and
+database owner are trusted operational principals. A separate migrator uses the
+owner role without retaining its own `CREATE` ACL. Do not grant database
+`CREATE` or `TEMPORARY`, schema `CREATE`, table access, column access, grant
+option, owner membership, any other membership, or another
+`public.starring_*` function.
+
+The reader and apply grants above are topology-only staged credentials. They
+cannot execute the current direct-SQL reader or Apply adapter. Do not start the
+whole product service or open ingress with this manifest. Reader and Apply need
+their own function-scoping migrations, exact grants, functional probes, and
+component readiness first. Apply readiness must also receive an apply-domain
+keyring-coverage capability, or an explicitly bounded shared receipt-coverage
+capability; it must not depend on the approval credential having run coverage.
+
+`PostgresProductDecisions::verify_approval_executor_readiness` verifies the
+enumerated approval function, owner, role, 16-relation, internal trigger,
+keyring, and rollback-only execution contract. It compares the caller's
+executable set against the exact approval allowlist for every public
+security-definer routine and every `public.starring_*` routine. An unrelated
+routine in that scope is a hard `ExcessCapability` failure.
+
+`PostgresProductDecisions::verify_approval_boundary_readiness` additionally
+requires the reader, approval, and apply pools to resolve to one logical
+database UUID and database name through three distinct direct-login roles. This
+is a staged approval-boundary gate, not whole-service readiness. Reader and
+apply still require their future function-scoping migrations. Any legacy table
+or column grant on the protected relation set intentionally makes approval
+readiness red. Keep product ingress closed until reader and apply are converted,
+the final relation ACL sealing migration is applied, and the whole-process
+manifest gate is green.
+
+This component does not inspect relations outside its 16-table list, views,
+sequences, routines outside `public`, ordinary non-`starring_*`
+security-invoker helpers, or schema privileges outside `public`. Those remain
+mandatory inputs to the final whole-process schema, object, and executable
+manifest. A green approval component result is never evidence that those wider
+capabilities are absent.
+
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
 `STARRING_ALLOW_INTERACTION_SMOKE=1`, is marked non-publishable, and requires an

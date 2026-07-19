@@ -11,17 +11,25 @@ deployment safety boundary.
 
 The completed boundary must be suitable for production ingress. Compromise of
 one direct-login database credential must not grant another operation family,
-direct relation access, role escalation, schema mutation, or execution of an
-unlisted `public.starring_*` function.
+direct access to a protected product-control relation, role escalation, schema
+mutation, or execution of an unlisted product-control routine.
+
+The approval slice proves only its enumerated 16-relation manifest and routines
+in the `public` schema that are either named `starring_*` or are security
+definers. Views, sequences, relations outside that manifest, routines in other
+schemas, and schema privileges outside `public` remain part of the final
+whole-process object and executable manifest. This slice is not that final
+gate.
 
 ## Current state and staged target
 
-`PostgresProductDecisions` currently routes queries, approvals, apply work, and
-keyring coverage through one `PgPool`. Queries and parts of apply still issue
-direct relation SQL. Approval is already one atomic security-definer function,
-but the Rust adapter cannot give it a dedicated credential.
+At design acceptance, `PostgresProductDecisions` routed queries, approvals,
+apply work, and keyring coverage through one `PgPool`. The implemented store
+shape now requires the three pools below. Queries and parts of apply still issue
+direct relation SQL, so the pool split alone is not a production capability
+seal.
 
-The Rust store moves immediately to three required pools:
+The Rust store requires three pools:
 
 | Pool | Final responsibility | Transitional state |
 | --- | --- | --- |
@@ -36,9 +44,12 @@ roles. A rejection executor is added only when the product rejection adapter
 exists; an unused privileged credential is not provisioned in advance.
 
 This work is staged to avoid an upgrade outage. The first slice does not revoke
-legacy relation grants needed by the reader and apply adapters. Their presence
-keeps the production ingress gate red until those adapters are function-scoped
-and a later sealing migration removes every non-owner relation grant.
+legacy relation grants needed by the reader and apply adapters. A legacy grant
+on the approval slice's 16 protected relations makes approval readiness red.
+Legacy grants outside that manifest are not inspected by this component and
+remain an explicit whole-service ingress blocker until those adapters are
+function-scoped and a later sealing migration removes every non-owner relation,
+view, sequence, and column grant in the final process manifest.
 
 ## Threat model
 
@@ -46,9 +57,11 @@ The boundary protects against:
 
 - accidental pool wiring across environments or restored database clones;
 - theft of one database credential;
-- a caller receiving direct table or column privileges;
+- a caller receiving direct table or column privileges on the enumerated
+  protected relations;
 - `PUBLIC`, named-role, inherited-role, or grant-option privilege drift;
-- execution of an unrelated `public.starring_*` function;
+- execution of an unrelated `public.starring_*` function or public
+  security-definer routine;
 - a login role that can create databases, temporary objects, schemas, or roles;
 - ownership drift, owner-role membership, RLS drift, search-path injection, and
   function metadata drift;
@@ -76,12 +89,18 @@ All decision pools must:
    without grant option;
 7. have no direct table or column privilege on protected relations.
 
-Every protected function is `SECURITY DEFINER`, `VOLATILE`, `STRICT`,
-`PARALLEL UNSAFE`, fixed to `search_path=pg_catalog`, closed to `PUBLIC`, owned
-by the common non-login relation owner, and assigned an explicit singleton row
-estimate when set-returning. Migrations remove every named non-owner function
-grant before ownership normalization. Production grants are always reapplied
-after migration and checked before ingress.
+Every caller-exposed protected function is `SECURITY DEFINER`, `VOLATILE`,
+`STRICT`, `PARALLEL UNSAFE`, fixed to `search_path=pg_catalog`, closed to
+`PUBLIC`, owned by the common non-login relation owner, and assigned an explicit
+singleton row estimate when set-returning. Internal approval trigger functions
+are not caller capabilities. Migration 020 schema-qualifies the one legacy
+`authoring_promotions` reference that previously depended on `public` path
+resolution, then fixes every internal trigger function to
+`search_path=pg_catalog`. The production schema contract separately forbids
+schema creation by request roles and every other untrusted principal.
+Migrations remove every named non-owner function grant before ownership
+normalization. Production grants are always reapplied after migration and
+checked before ingress.
 
 ## Logical database identity
 
@@ -117,12 +136,48 @@ prove that configured keys cover every live approval and apply receipt before
 it accepts a mutation. This is metadata read authority exposed only through the
 coverage function, not direct receipt-table access.
 
-The first migration normalizes approval and coverage function metadata to the
-exact readiness contract, adds the three topology functions, validates the 13
-protected ordinary non-RLS relations and their common owner, removes all
+Migration 019 normalizes approval and coverage function metadata to the exact
+readiness contract, adds the three topology functions, validates the 13 directly
+referenced ordinary non-RLS relations and their common owner, removes all
 non-owner grants from the five protected functions, and transfers the topology
-functions to that owner. It deliberately preserves legacy relation ACLs so an
-upgrade cannot silently break the still-direct reader or apply code.
+functions to that owner.
+
+Restricted-role execution exposed a transitive database boundary that direct
+approval-function inspection does not show. The six tables mutated by approval
+carry 19 user-defined triggers; a concrete approval INSERT or UPDATE executes
+the applicable subset. The shared trigger graph can read
+`automation_ruleset_activations`, `automation_ruleset_versions`, and
+`runtime_deployments`, and can call one shared digest helper.
+
+Migration 020 therefore validates an exact trigger semantic manifest. Each
+entry binds the trigger name, relation, function, row/statement level, event,
+timing, enabled state, constraint and parent relation identity, constraint
+trigger status, deferrability, initially-deferred state, normalized `WHEN`
+predicate, update-column vector, argument count and bytes, and old/new
+transition-table bindings. An extra, missing, disabled, repointed, narrowed, or
+re-timed trigger is contract drift. The migration expands the owner and non-RLS
+relation boundary to 16 tables, replaces the two approval-table bindings to the
+globally shared immutable-row trigger function with a dedicated approval-only
+function, converts the resulting 18 unique trigger functions to internal
+security-definer capabilities fixed to `search_path=pg_catalog`, normalizes the
+shared digest helper, and removes every public and named non-owner function
+grant from those 18 functions and the helper. Existing Apply functions and the
+legacy global immutable-row function are not part of that revoke. It does not
+grant application roles direct execution of the internal functions. Before
+making those changes, it requires the other 17 trigger functions in the
+resulting manifest to have the common owner; the new dedicated function is
+created and transferred atomically.
+
+The digest helper is also called by the existing Apply lock core and
+finalization functions. Migration 020 requires the Apply lock wrapper, lock
+core, and finalization functions to match the reviewed common owner, remain
+security definers, have ordinary-function kind, and use exactly
+`search_path=pg_catalog` before it changes helper metadata; it fails instead of
+repairing drift. This prerequisite does not function-scope or certify the Apply
+executor.
+
+Both migrations deliberately preserve legacy relation ACLs so an upgrade
+cannot silently break the still-direct reader or apply code.
 
 ## Readiness contract
 
@@ -133,8 +188,9 @@ Approval readiness has four layers:
    flag, fixed search path, owner, and ACL;
 2. protected relation shape, common ownership, RLS state, and global table and
    column ACL verification;
-3. direct-login role verification plus an exact executable manifest for every
-   `public.starring_*` function visible to the caller;
+3. direct-login role verification plus an exact executable manifest covering
+   every `public.starring_*` routine and every public security-definer routine
+   visible to the caller;
 4. bounded rollback-only probes for topology, keyring coverage, and an invalid
    approval request that must deterministically return `invalid_input` without
    mutation.
@@ -147,7 +203,10 @@ and database failures separately. It fails closed on unknown outcomes.
 Approval component readiness also compares the three topology projections. It
 does not claim that reader and apply capabilities are complete. Whole-service
 ingress additionally requires their future component readiness and the final
-global manifest and relation-ACL sealing gate.
+global schema, object, executable, and relation-ACL sealing gate. The current
+approval executable check does not inspect routines outside `public`, ordinary
+non-`starring_*` security-invoker helpers, or objects outside its protected
+relation list.
 
 ## Remaining slices
 
@@ -165,7 +224,11 @@ Move every apply lock, target artifact read, and finalization operation behind
 an explicit apply manifest. Keep deterministic ruleset parsing and preparation
 in Rust. Preserve serializable retry limits, commit-indeterminate handling,
 artifact integrity, supersession, runtime request creation, receipts, and audit
-evidence. The apply role must not execute approval or decision-read functions.
+evidence. Add an apply-domain keyring-coverage capability, or an explicitly
+bounded shared receipt-coverage capability executable by the apply readiness
+path, before Apply can serve independently. Apply readiness must not depend on
+the approval credential having happened to run its startup check. The apply
+role must not execute approval or decision-read functions.
 
 ### Rejection and status
 
@@ -176,16 +239,17 @@ write protected relations must receive their own narrowly named capabilities.
 ### Final sealing
 
 After all request-serving adapters are function-scoped, apply one atomic
-migration that removes every non-owner table and column grant from all protected
-relations. Then require every component readiness check and a process-level
-exact function manifest to pass together. A component-green but aggregate-red
+migration that removes every non-owner table, view, sequence, and column grant
+from the final protected object manifest. Then require every component readiness
+check and a process-level executable manifest across every caller-accessible
+non-system schema to pass together. A component-green but aggregate-red
 deployment never opens ingress.
 
 ## Rollout and rollback
 
 1. Deploy the three-pool Rust shape while legacy tests may use explicit cloned
    pools.
-2. Apply the approval-boundary migration under the migrator credential.
+2. Apply migrations 019 and 020 in order under the migrator credential.
 3. Reapply only the documented topology, approval, and coverage grants to the
    three direct-login roles.
 4. Run approval readiness. Any relation ACL needed by transitional reader or
@@ -206,8 +270,9 @@ be restored and readiness rerun before reopening traffic.
   its assigned pool.
 - Approval and keyring coverage work through a dedicated direct-login role.
 - Exact approval replay preserves existing semantics.
-- Direct relation access, schema/database mutation, unrelated function calls,
-  grant option, and role membership are denied and detected.
+- Direct access to the 16 protected relations, schema/database mutation,
+  unrelated public `starring_*` and security-definer calls, grant option, and
+  role membership are denied and detected.
 - Missing capability, excessive capability, metadata drift, owner drift, RLS
   drift, mixed logical databases, and repeated role wiring fail closed.
 - Hostile default and named function grants are removed by migration.
@@ -215,6 +280,10 @@ be restored and readiness rerun before reopening traffic.
   residue.
 - Legacy relation grants are not silently removed before their callers are
   replaced, and their presence blocks production ingress.
+- Exact trigger semantics include constraint, deferral, `WHEN`, update-column,
+  argument, parent/constraint relation, and transition-table bindings.
+- Final production ingress additionally rejects unexpected relations, views,
+  sequences, routines, and schema privileges outside this component manifest.
 - Package tests, real PostgreSQL tests, dependency guards, workspace tests,
   clippy with warnings denied, formatting, source-comment checks, and migration
   checks are green.

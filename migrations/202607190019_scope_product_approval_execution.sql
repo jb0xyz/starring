@@ -10,6 +10,7 @@ DECLARE
     expected_signature TEXT;
     function_oid OID;
 BEGIN
+    PERFORM pg_catalog.set_config('quote_all_identifiers', 'off', TRUE);
     SELECT pg_catalog.count(relation.oid),
         pg_catalog.count(relation.oid) FILTER (WHERE relation.relkind = 'r'),
         pg_catalog.count(relation.oid) FILTER (

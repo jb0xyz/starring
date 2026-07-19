@@ -66,15 +66,24 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
     let query = include_str!("../src/product_decisions/query.rs");
+    let readiness = include_str!("../src/product_decisions/readiness.rs");
     let store = include_str!("../src/product_decisions/store.rs");
+    let database_capability = include_str!("../src/database_capability.rs");
     assert!(store.contains("ProductDecisionDatabasePoolsV1"));
     assert!(store.contains("decision_reader: PgPool"));
     assert!(store.contains("approval_executor: PgPool"));
     assert!(store.contains("apply_executor: PgPool"));
     assert!(query.contains(".decision_reader"));
     assert!(approval.contains(".approval_executor"));
-    assert!(store.contains(".approval_executor"));
+    assert!(readiness.contains(".approval_executor"));
     assert!(apply.contains(".apply_executor"));
+    assert!(readiness.contains("verify_approval_executor_readiness"));
+    assert!(readiness.contains("verify_approval_boundary_readiness"));
+    assert!(readiness.contains("verify_scoped_executable_allowlist"));
+    assert!(readiness.contains("fetch_all(&mut *probe)"));
+    assert!(database_capability.contains("function_row.prosecdef"));
+    assert!(database_capability.contains("function_row.proname::TEXT, 9"));
+    assert!(database_capability.contains("pg_catalog.has_function_privilege"));
     assert!(approval.contains("public.starring_product_approve_v1"));
     assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
     assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));
@@ -145,6 +154,31 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         assert!(
             approval_scope_migration.contains(required),
             "missing product approval scope guard: {required}"
+        );
+    }
+    let approval_trigger_migration = include_str!(
+        "../../../migrations/202607190020_scope_product_approval_trigger_execution.sql"
+    );
+    for required in [
+        "product approval trigger relations require one non-RLS owner",
+        "product approval trigger manifest is invalid",
+        "public.assert_product_approval_receipt_alias()",
+        "public.capture_product_action_receipt_audit_evidence()",
+        "public.starring_runtime_desired_target_digest_v1(jsonb,bigint)",
+        "ALTER FUNCTION %s SECURITY DEFINER",
+        "ALTER FUNCTION %s SET search_path = pg_catalog",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE",
+        "function_row.proconfig",
+        "ARRAY['search_path=pg_catalog']::TEXT[]",
+        "pg_catalog.pg_get_triggerdef",
+        "quote_all_identifiers",
+        "public.reject_immutable_product_approval_row()",
+        "public.starring_product_apply_lock_core_v1",
+        "product approval shared apply function contract is invalid",
+    ] {
+        assert!(
+            approval_trigger_migration.contains(required),
+            "missing product approval trigger guard: {required}"
         );
     }
     let binding_identity_migration =
@@ -887,6 +921,10 @@ fn source_files_contain_no_comments() {
             include_str!("../src/product_decisions/query.rs"),
         ),
         (
+            "src/product_decisions/readiness.rs",
+            include_str!("../src/product_decisions/readiness.rs"),
+        ),
+        (
             "src/product_decisions/row.rs",
             include_str!("../src/product_decisions/row.rs"),
         ),
@@ -1027,6 +1065,14 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/authentication_migration_security.rs",
             include_str!("postgres_product_control_e2e/authentication_migration_security.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/product_identity_security.rs",
+            include_str!("postgres_product_control_e2e/product_identity_security.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/product_decision_security.rs",
+            include_str!("postgres_product_control_e2e/product_decision_security.rs"),
         ),
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",

@@ -259,7 +259,9 @@ pub(crate) async fn begin_bounded_database_probe<'a>(
     sqlx::query(
         "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
          pg_catalog.set_config('lock_timeout', $1, true), \
-         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true), \
+         pg_catalog.set_config('search_path', 'pg_catalog', true), \
+         pg_catalog.set_config('quote_all_identifiers', 'off', true)",
     )
     .bind(timeout)
     .execute(&mut *transaction)
@@ -292,6 +294,46 @@ pub(crate) async fn load_scoped_database_topology(
         database_name,
         role_name,
     })
+}
+
+pub(crate) async fn verify_scoped_executable_allowlist(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected: &[ScopedFunctionContractV1<'_>],
+) -> Result<(), ScopedDatabaseReadinessErrorV1> {
+    let identities = expected
+        .iter()
+        .map(|contract| contract.identity)
+        .collect::<Vec<_>>();
+    let exact = sqlx::query_scalar::<_, bool>(
+        "WITH expected AS ( \
+           SELECT pg_catalog.to_regprocedure(item.identity) AS function_oid \
+           FROM pg_catalog.unnest($1::TEXT[]) AS item(identity) \
+         ) \
+         SELECT NOT EXISTS ( \
+          SELECT 1 \
+          FROM pg_catalog.pg_proc AS function_row \
+          INNER JOIN pg_catalog.pg_namespace AS namespace \
+           ON namespace.oid = function_row.pronamespace \
+          WHERE namespace.nspname = 'public' \
+           AND function_row.prokind IN ('f', 'p') \
+           AND (function_row.prosecdef \
+            OR pg_catalog.left(function_row.proname::TEXT, 9) = 'starring_') \
+           AND pg_catalog.has_function_privilege( \
+            current_user, function_row.oid, 'EXECUTE') \
+           AND NOT EXISTS ( \
+            SELECT 1 FROM expected \
+            WHERE expected.function_oid = function_row.oid \
+           ) \
+         )",
+    )
+    .bind(&identities)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(readiness_database)?;
+    if !exact {
+        return Err(ScopedDatabaseReadinessErrorV1::ExcessCapability);
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_same_database_distinct_roles(
