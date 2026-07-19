@@ -475,13 +475,20 @@ impl PostgresRuntimeConvergence {
                ON installation.tenant_id = deployment.tenant_id \
               AND installation.installation_id = deployment.installation_id \
               AND installation.lifecycle_state = 'active' \
-              AND installation.current_authority_revision = deployment.installation_authority_revision \
-             JOIN public.automation_installation_authority_versions authority \
-               ON authority.tenant_id = installation.tenant_id \
-              AND authority.installation_id = installation.installation_id \
-              AND authority.revision = installation.current_authority_revision \
-              AND authority.binding_revision = deployment.binding_revision \
-              AND authority.binding_fingerprint = deployment.binding_fingerprint \
+             JOIN public.automation_installation_authority_versions historical_authority \
+               ON historical_authority.tenant_id = installation.tenant_id \
+              AND historical_authority.installation_id = installation.installation_id \
+              AND historical_authority.revision = deployment.installation_authority_revision \
+              AND historical_authority.binding_revision = deployment.binding_revision \
+              AND historical_authority.binding_fingerprint = deployment.binding_fingerprint \
+             JOIN public.automation_installation_authority_versions current_authority \
+               ON current_authority.tenant_id = installation.tenant_id \
+              AND current_authority.installation_id = installation.installation_id \
+              AND current_authority.revision = installation.current_authority_revision \
+              AND current_authority.binding_revision = deployment.binding_revision \
+              AND current_authority.binding_fingerprint = deployment.binding_fingerprint \
+              AND current_authority.resource_bindings \
+                  IS NOT DISTINCT FROM historical_authority.resource_bindings \
              JOIN public.automation_ruleset_activations active \
                ON active.guild_id = deployment.guild_id \
               AND active.ruleset_key = deployment.ruleset_key \

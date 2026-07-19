@@ -815,6 +815,14 @@ Every transition uses revision CAS and a lease epoch. A worker may write phase,
 failure, attestation, or heartbeat only while it owns the current unexpired
 epoch. An expired worker cannot overwrite a newer worker's evidence.
 
+Runtime authorization preserves two identities. The deployment retains the exact
+historical installation-authority revision used by Apply for audit and digest
+verification. Every claim, mutation, recovery, heartbeat, and status read also
+checks the current authority head for active lifecycle and exact binding revision,
+fingerprint, and resource-binding map equality. A policy, quorum, or TTL-only
+rotation therefore keeps the same deployment eligible and Live; an actual binding
+change or a spoofed fingerprint with different binding content fails closed.
+
 Retryable dependency failures use bounded exponential backoff with jitter and a
 maximum delay. Deterministic corruption, target mismatch, or unsupported schema
 moves to `Blocked` with a stable code and requires operator action. If the active

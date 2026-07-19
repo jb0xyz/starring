@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetVersionId};
 use automation_runtime_convergence::{
@@ -10,7 +11,8 @@ use automation_runtime_convergence::{
     RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_convergence_postgres::{
-    ClaimDeploymentV1, DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,
+    prepare_requested_deployment_v1, ClaimDeploymentV1, ClaimNextDeploymentV1,
+    DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
     PostgresRuntimeConvergenceConfigV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
@@ -21,9 +23,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::types::Json;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 const TENANT: &str = "runtime-pg-tenant";
 const INSTALLATION: &str = "runtime-pg-installation";
@@ -39,6 +41,304 @@ const NEXT_DEPLOYMENT: &str = "runtime-pg-deployment-next";
 const CONTENT_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BINDING_FINGERPRINT: &str =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const ROTATED_BINDING_FINGERPRINT: &str =
+    "7777777777777777777777777777777777777777777777777777777777777777";
+
+struct RuntimeMigrationDatabase {
+    name: String,
+    administrator: PgConnection,
+    pool: PgPool,
+}
+
+async fn isolated_runtime_migration_database() -> RuntimeMigrationDatabase {
+    let url = std::env::var("STARRING_TEST_DATABASE_URL")
+        .expect("STARRING_TEST_DATABASE_URL required for ignored PostgreSQL tests");
+    let base = url
+        .parse::<PgConnectOptions>()
+        .expect("STARRING_TEST_DATABASE_URL must be a PostgreSQL URL");
+    let configured_database = base
+        .get_database()
+        .expect("STARRING_TEST_DATABASE_URL must name a database");
+    assert!(
+        configured_database.starts_with("starring_")
+            && configured_database
+                .split('_')
+                .any(|segment| segment == "test")
+            && configured_database
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "refusing to create a database outside the strict Starring test namespace"
+    );
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("starring_runtime_acl_test_{suffix}");
+    let mut administrator = PgConnection::connect_with(&base.clone().database("postgres"))
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(base.database(&name))
+        .await
+        .unwrap();
+    RuntimeMigrationDatabase {
+        name,
+        administrator,
+        pool,
+    }
+}
+
+async fn drop_runtime_migration_database(database: RuntimeMigrationDatabase) {
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+}
+
+async fn runtime_authority_function_acl(pool: &PgPool) -> (i64, i64, String, bool, bool, bool) {
+    sqlx::query_as(
+        "SELECT \
+          routine.oid::BIGINT, \
+          routine.proowner::BIGINT, \
+          owner.rolname, \
+          EXISTS (\
+           SELECT 1 FROM pg_catalog.aclexplode(routine.proacl) AS privilege \
+           INNER JOIN pg_catalog.pg_roles AS grantee ON grantee.oid = privilege.grantee \
+           WHERE grantee.rolname = 'pg_read_all_data' \
+            AND privilege.privilege_type = 'EXECUTE'), \
+          EXISTS (\
+           SELECT 1 FROM pg_catalog.aclexplode(routine.proacl) AS privilege \
+           INNER JOIN pg_catalog.pg_roles AS grantee ON grantee.oid = privilege.grantee \
+           WHERE grantee.rolname = 'pg_read_all_data' \
+            AND privilege.privilege_type = 'EXECUTE' \
+            AND privilege.is_grantable), \
+          EXISTS (\
+           SELECT 1 FROM pg_catalog.aclexplode(routine.proacl) AS privilege \
+           WHERE privilege.grantee = 0 \
+            AND privilege.privilege_type = 'EXECUTE') \
+         FROM pg_catalog.pg_proc AS routine \
+         INNER JOIN pg_catalog.pg_roles AS owner ON owner.oid = routine.proowner \
+         WHERE routine.oid = pg_catalog.to_regprocedure(\
+          'public.starring_runtime_lock_current_authority(text,text,text,text,bigint,text,text,bigint,text,bigint,text)')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn authority_lock_upgrade_preserves_owner_and_explicit_execute_acl() {
+    let database = isolated_runtime_migration_database().await;
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version < 202_607_190_011)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        sqlx::raw_sql(
+            "GRANT EXECUTE ON FUNCTION public.starring_runtime_lock_current_authority(\
+             text,text,text,text,bigint,text,text,bigint,text,bigint,text) \
+             TO pg_read_all_data WITH GRANT OPTION",
+        )
+        .execute(&database.pool)
+        .await?;
+        let before = runtime_authority_function_acl(&database.pool).await;
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_190_011)
+            .expect("runtime authority upgrade migration must exist");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await?;
+        let after = runtime_authority_function_acl(&database.pool).await;
+        Ok::<_, sqlx::Error>((before, after))
+    }
+    .await;
+    drop_runtime_migration_database(database).await;
+    let (before, after) = outcome.unwrap();
+    assert_eq!(before.0, after.0);
+    assert_eq!(before.1, after.1);
+    assert_eq!(before.2, after.2);
+    assert_eq!((before.3, before.4, before.5), (true, true, false));
+    assert_eq!((after.3, after.4, after.5), (true, true, false));
+}
+
+#[tokio::test]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn runtime_authority_tracks_binding_identity_across_policy_rotation() {
+    let pool = test_pool().await;
+    seed_product_target(&pool).await;
+    let adapter = PostgresRuntimeConvergence::new(pool.clone());
+    let created = match adapter.enqueue(enqueue_request()).await.unwrap() {
+        EnqueueDeploymentOutcomeV1::ExactReplay(snapshot) => snapshot,
+        outcome => panic!("atomically seeded deployment must replay exactly: {outcome:?}"),
+    };
+
+    let unchanged_bindings = json!({});
+    rotate_authority(
+        &pool,
+        AuthorityRotation {
+            revision: 2,
+            binding_revision: 1,
+            resource_bindings: &unchanged_bindings,
+            binding_fingerprint: BINDING_FINGERPRINT,
+            policy_revision: 2,
+            required_approvals: 2,
+            activation_ttl_seconds: 7200,
+        },
+    )
+    .await;
+
+    let controller = ControllerId::parse("runtime-policy-controller").unwrap();
+    let claim = adapter
+        .claim_next(ClaimNextDeploymentV1 {
+            controller_id: controller,
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap()
+        .expect("policy-only authority rotation must leave the deployment claimable");
+    assert_eq!(
+        claim.snapshot.identity.deployment_id,
+        created.identity.deployment_id
+    );
+    let (live, serving) = converge_claimed(
+        &adapter,
+        claim,
+        ProcessInstanceId::parse("runtime-policy-process").unwrap(),
+    )
+    .await;
+    assert!(live.snapshot.live.is_some());
+    let status = adapter.status(&scope()).await.unwrap();
+    assert_eq!(status.availability, DeploymentAvailabilityV1::Live);
+    assert_eq!(status.reason_code, "live");
+
+    let heartbeat = adapter
+        .heartbeat_serving(HeartbeatServingLeaseV1 {
+            identity: serving.identity,
+            lease_for: Duration::from_secs(45),
+        })
+        .await
+        .unwrap();
+    let disconnected = adapter
+        .mark_serving_disconnected(MarkServingDisconnectedV1 {
+            identity: heartbeat.identity,
+        })
+        .await
+        .unwrap();
+    assert!(!disconnected.connected);
+    let spoofed_bindings = json!({
+        "channel_bindings": {"community_hub": "9200401"},
+        "role_bindings": {}
+    });
+    rotate_authority(
+        &pool,
+        AuthorityRotation {
+            revision: 3,
+            binding_revision: 1,
+            resource_bindings: &spoofed_bindings,
+            binding_fingerprint: BINDING_FINGERPRINT,
+            policy_revision: 3,
+            required_approvals: 2,
+            activation_ttl_seconds: 7200,
+        },
+    )
+    .await;
+    assert_eq!(
+        adapter.status(&scope()).await.unwrap().availability,
+        DeploymentAvailabilityV1::Superseded
+    );
+    assert!(adapter.recover_next_stale_live().await.unwrap().is_none());
+    assert!(matches!(
+        adapter
+            .heartbeat_serving(HeartbeatServingLeaseV1 {
+                identity: disconnected.identity.clone(),
+                lease_for: Duration::from_secs(45),
+            })
+            .await
+            .unwrap_err(),
+        RuntimeConvergenceStoreError::BindingAuthorityMismatch
+    ));
+    rotate_authority(
+        &pool,
+        AuthorityRotation {
+            revision: 4,
+            binding_revision: 1,
+            resource_bindings: &unchanged_bindings,
+            binding_fingerprint: BINDING_FINGERPRINT,
+            policy_revision: 4,
+            required_approvals: 2,
+            activation_ttl_seconds: 7200,
+        },
+    )
+    .await;
+    let recovered = adapter
+        .recover_next_stale_live()
+        .await
+        .unwrap()
+        .expect("policy-only authority rotation must leave stale Live recovery eligible");
+    let recovered_claim = adapter
+        .claim(ClaimDeploymentV1 {
+            scope: scope(),
+            expected_revision: recovered.snapshot.revision,
+            controller_id: ControllerId::parse("runtime-policy-controller-recovered").unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    let (_, recovered_serving) = converge_recovered(
+        &adapter,
+        recovered_claim,
+        ProcessInstanceId::parse("runtime-policy-process-recovered").unwrap(),
+        "policy-build-recovered",
+        "7",
+        Duration::from_secs(45),
+    )
+    .await;
+    assert_eq!(
+        adapter.status(&scope()).await.unwrap().availability,
+        DeploymentAvailabilityV1::Live
+    );
+
+    rotate_authority(
+        &pool,
+        AuthorityRotation {
+            revision: 5,
+            binding_revision: 2,
+            resource_bindings: &unchanged_bindings,
+            binding_fingerprint: ROTATED_BINDING_FINGERPRINT,
+            policy_revision: 5,
+            required_approvals: 2,
+            activation_ttl_seconds: 7200,
+        },
+    )
+    .await;
+
+    let status = adapter.status(&scope()).await.unwrap();
+    assert_eq!(status.availability, DeploymentAvailabilityV1::Superseded);
+    assert_eq!(status.reason_code, "binding_authority_changed");
+    assert!(matches!(
+        adapter
+            .heartbeat_serving(HeartbeatServingLeaseV1 {
+                identity: recovered_serving.identity,
+                lease_for: Duration::from_secs(45),
+            })
+            .await
+            .unwrap_err(),
+        RuntimeConvergenceStoreError::BindingAuthorityMismatch
+    ));
+}
 
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
@@ -78,14 +378,10 @@ async fn exact_live_status_and_fencing_survive_postgres() {
     );
     let (created, replayed) = match (first_enqueue.unwrap(), second_enqueue.unwrap()) {
         (
-            EnqueueDeploymentOutcomeV1::Created(created),
+            EnqueueDeploymentOutcomeV1::ExactReplay(created),
             EnqueueDeploymentOutcomeV1::ExactReplay(replayed),
-        )
-        | (
-            EnqueueDeploymentOutcomeV1::ExactReplay(replayed),
-            EnqueueDeploymentOutcomeV1::Created(created),
         ) => (created, replayed),
-        outcome => panic!("one create and one exact replay expected: {outcome:?}"),
+        outcome => panic!("atomically seeded deployment must replay exactly: {outcome:?}"),
     };
     assert_eq!(created, replayed);
     let initial = created;
@@ -708,7 +1004,6 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
     current_live: &automation_runtime_convergence_postgres::MutationReceiptV1,
     current_serving: &automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
 ) {
-    seed_next_product_journal(pool).await;
     let next_generation = RuntimeGeneration::new(2).unwrap();
     let previous_runtime = RuntimeProcessIdentityV1 {
         target: target(),
@@ -728,9 +1023,10 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         previous_runtime: Some(previous_runtime.clone()),
         installation_authority_revision: 1,
     };
+    seed_next_product_journal(pool, &next_request).await;
     let next = match adapter.enqueue(next_request).await.unwrap() {
-        EnqueueDeploymentOutcomeV1::Created(snapshot) => snapshot,
-        outcome => panic!("newer deployment must be created: {outcome:?}"),
+        EnqueueDeploymentOutcomeV1::ExactReplay(snapshot) => snapshot,
+        outcome => panic!("atomically seeded newer deployment must replay exactly: {outcome:?}"),
     };
     let controller = ControllerId::parse("runtime-pg-controller-next").unwrap();
     let claim = adapter
@@ -906,6 +1202,192 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
     certification_result.unwrap().unwrap();
     let status = adapter.status(&next_scope()).await.unwrap();
     assert_eq!(status.availability, DeploymentAvailabilityV1::Live);
+}
+
+struct AuthorityRotation<'a> {
+    revision: i64,
+    binding_revision: i64,
+    resource_bindings: &'a Value,
+    binding_fingerprint: &'a str,
+    policy_revision: i64,
+    required_approvals: i32,
+    activation_ttl_seconds: i64,
+}
+
+async fn rotate_authority(pool: &PgPool, rotation: AuthorityRotation<'_>) {
+    let AuthorityRotation {
+        revision,
+        binding_revision,
+        resource_bindings,
+        binding_fingerprint,
+        policy_revision,
+        required_approvals,
+        activation_ttl_seconds,
+    } = rotation;
+    let authority_payload_digest = format!("{:x}", revision + 3).repeat(64);
+    let request_digest = format!("{:x}", revision + 8).repeat(64);
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions (installation_id, \
+         revision, tenant_id, binding_revision, resource_bindings, binding_fingerprint, \
+         policy_revision, required_approvals, activation_ttl_seconds, \
+         authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(INSTALLATION)
+    .bind(revision)
+    .bind(TENANT)
+    .bind(binding_revision)
+    .bind(Json(resource_bindings))
+    .bind(binding_fingerprint)
+    .bind(policy_revision)
+    .bind(required_approvals)
+    .bind(activation_ttl_seconds)
+    .bind(authority_payload_digest)
+    .bind(PRINCIPAL)
+    .bind(request_digest)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.automation_installations SET current_authority_revision = $3, \
+         updated_at = GREATEST(pg_catalog.clock_timestamp(), updated_at + INTERVAL '1 microsecond') \
+         WHERE tenant_id = $1 AND installation_id = $2 \
+           AND current_authority_revision = $3 - 1",
+    )
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn converge_claimed(
+    adapter: &PostgresRuntimeConvergence,
+    claim: automation_runtime_convergence_postgres::ClaimReceiptV1,
+    process_instance_id: ProcessInstanceId,
+) -> (
+    automation_runtime_convergence_postgres::MutationReceiptV1,
+    automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
+) {
+    let controller_id = claim.controller_id.clone();
+    let fencing_token = claim.fencing_token;
+    let mut revision = mutate(
+        adapter,
+        claim.snapshot.revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
+            target: target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            observed_runtime: None,
+            checked_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::RequestDrain,
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
+            previous_runtime: None,
+            target_runtime_generation: RuntimeGeneration::FIRST,
+            drained_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::BeginActivation,
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
+            activation_request_id: ActivationRequestId::parse(ACTIVATION).unwrap(),
+            target: target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            kind: ActivationOutcomeKindV1::AlreadyActive,
+            activated_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::BeginPanelReconciliation,
+    )
+    .await;
+    revision = mutate(
+        adapter,
+        revision,
+        &controller_id,
+        fencing_token,
+        DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
+            certificate_id: PanelCertificateId::parse("runtime-policy-panel").unwrap(),
+            target: target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            process_instance_id: process_instance_id.clone(),
+            declared_count: 0,
+            installed_count: 0,
+            unchanged_count: 0,
+            skipped_transient_count: 0,
+            skipped_unresolved_channel_count: 0,
+            failed_count: 0,
+            ambiguous_outcome_count: 0,
+            stale_message_cleanup_pending_count: 0,
+            orphan_message_cleanup_pending_count: 0,
+            reposted_old_message_cleanup_pending_count: 0,
+            reconciled_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    adapter
+        .certify_live(SubmitLiveAttestationV1 {
+            scope: scope(),
+            expected_revision: revision,
+            controller_id,
+            fencing_token,
+            runtime_generation: RuntimeGeneration::FIRST,
+            gateway_ready: GatewayReadyAttestationV1 {
+                target: target(),
+                runtime_generation: RuntimeGeneration::FIRST,
+                process_instance_id,
+                kind: GatewayReadyKindV1::DiscordReady,
+                ready_at: claim.acquired_at,
+            },
+            metadata: LiveMetadataV1 {
+                runtime_build_revision: RuntimeBuildRevisionV1::parse("policy-build").unwrap(),
+                panel_report_digest: PanelReportDigestV1::parse("7".repeat(64)).unwrap(),
+                gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+            },
+            serving_lease_for: Duration::from_secs(45),
+        })
+        .await
+        .unwrap()
 }
 
 async fn converge_recovered(
@@ -1261,10 +1743,53 @@ async fn seed_product_target(pool: &PgPool) {
     .execute(&mut *transaction)
     .await
     .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let requested_at =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+    let prepared = prepare_requested_deployment_v1(enqueue_request(), requested_at).unwrap();
+    sqlx::query("SELECT pg_catalog.set_config('starring.runtime_mutation_clock', $1, TRUE)")
+        .bind(requested_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_deployments (deployment_id, tenant_id, installation_id, \
+         promotion_id, activation_request_id, installation_authority_revision, guild_id, \
+         ruleset_key, target_version, target_content_hash, binding_revision, \
+         binding_fingerprint, desired_target_digest, runtime_generation, requested_at, \
+         snapshot_format_version, snapshot, revision, phase, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 1, $8, 1, $9, $10, 1, $11, \
+                 1, $12, 1, 'requested', $11, $11)",
+    )
+    .bind(DEPLOYMENT)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(PROMOTION)
+    .bind(ACTIVATION)
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .bind(CONTENT_HASH)
+    .bind(BINDING_FINGERPRINT)
+    .bind(prepared.desired_target_digest())
+    .bind(requested_at)
+    .bind(Json(prepared.snapshot_json().clone()))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("SELECT pg_catalog.set_config('starring.runtime_mutation_clock', '', TRUE)")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
     transaction.commit().await.unwrap();
 }
 
-async fn seed_next_product_journal(pool: &PgPool) {
+async fn seed_next_product_journal(pool: &PgPool, request: &EnqueueDeploymentV1) {
     let now = Utc::now();
     let expires_at = now + TimeDelta::hours(1);
     let linked_at = now + TimeDelta::seconds(1);
@@ -1364,6 +1889,51 @@ async fn seed_next_product_journal(pool: &PgPool) {
     .execute(&mut *transaction)
     .await
     .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let requested_at =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+    let prepared = prepare_requested_deployment_v1(request.clone(), requested_at).unwrap();
+    let previous_runtime = prepared.previous_runtime_json().cloned().map(Json);
+    sqlx::query("SELECT pg_catalog.set_config('starring.runtime_mutation_clock', $1, TRUE)")
+        .bind(requested_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_deployments (deployment_id, tenant_id, installation_id, \
+         promotion_id, activation_request_id, installation_authority_revision, guild_id, \
+         ruleset_key, target_version, target_content_hash, binding_revision, \
+         binding_fingerprint, desired_target_digest, runtime_generation, previous_runtime, \
+         requested_at, snapshot_format_version, snapshot, revision, phase, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 1, $8, 1, $9, $10, 2, $11, $12, \
+                 1, $13, 1, 'requested', $12, $12)",
+    )
+    .bind(NEXT_DEPLOYMENT)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(NEXT_PROMOTION)
+    .bind(NEXT_ACTIVATION)
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .bind(CONTENT_HASH)
+    .bind(BINDING_FINGERPRINT)
+    .bind(prepared.desired_target_digest())
+    .bind(previous_runtime)
+    .bind(requested_at)
+    .bind(Json(prepared.snapshot_json().clone()))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("SELECT pg_catalog.set_config('starring.runtime_mutation_clock', '', TRUE)")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
     transaction.commit().await.unwrap();
 }
 

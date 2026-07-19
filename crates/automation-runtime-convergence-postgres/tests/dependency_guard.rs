@@ -47,6 +47,41 @@ fn runtime_security_definers_have_fixed_resolution_and_revoked_public_execution(
 }
 
 #[test]
+fn runtime_authority_rotation_preserves_historical_identity_and_current_binding() {
+    let migration =
+        include_str!("../../../migrations/202607190011_separate_runtime_binding_authority.sql");
+    assert!(migration
+        .contains("CREATE OR REPLACE FUNCTION public.starring_runtime_lock_current_authority("));
+    assert!(migration.contains("SECURITY DEFINER\nSET search_path = pg_catalog"));
+    assert!(migration
+        .contains("REVOKE ALL ON FUNCTION public.starring_runtime_lock_current_authority("));
+    assert!(!migration.contains("SET search_path = pg_catalog,"));
+    assert!(!migration.contains(
+        "installation_row.current_authority_revision\n        IS DISTINCT FROM expected_installation_authority_revision"
+    ));
+    assert!(migration.contains("revision = expected_installation_authority_revision"));
+    assert!(migration.contains("revision = installation_row.current_authority_revision"));
+    assert!(migration.contains(
+        "historical_authority_row.binding_revision IS DISTINCT FROM expected_binding_revision"
+    ));
+    assert!(migration.contains(
+        "historical_authority_row.binding_fingerprint IS DISTINCT FROM expected_binding_fingerprint"
+    ));
+    assert!(migration.contains(
+        "current_authority_row.binding_revision IS DISTINCT FROM expected_binding_revision"
+    ));
+    assert!(migration.contains(
+        "current_authority_row.binding_fingerprint IS DISTINCT FROM expected_binding_fingerprint"
+    ));
+    assert!(migration.contains(
+        "current_authority_row.resource_bindings\n            IS DISTINCT FROM historical_authority_row.resource_bindings"
+    ));
+    assert!(!migration.contains("current_authority_row.policy_revision"));
+    assert!(!migration.contains("current_authority_row.required_approvals"));
+    assert!(!migration.contains("current_authority_row.activation_ttl_seconds"));
+}
+
+#[test]
 fn mutable_runtime_authority_is_locked_once_in_canonical_order() {
     let migration = include_str!("../../../migrations/202607190002_create_runtime_convergence.sql");
     let authority = migration
@@ -116,9 +151,26 @@ fn adapter_sql_does_not_depend_on_session_search_path() {
     let status = include_str!("../src/store/status.rs");
     let store = include_str!("../src/store/mod.rs");
     let serving = include_str!("../src/store/serving.rs");
+    let deployment = include_str!("../src/store/deployment.rs");
     assert!(store.contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
     assert!(!store.contains("REPEATABLE READ READ ONLY"));
     assert!(store.contains("deployment_id = $3 FOR SHARE"));
     assert!(status.contains("ruleset_key = $2 FOR SHARE"));
     assert!(!serving.contains("LIMIT 1 FOR KEY SHARE"));
+    for source in [deployment, serving] {
+        assert!(!source.contains(
+            "installation.current_authority_revision = deployment.installation_authority_revision"
+        ));
+        assert!(source.contains(
+            "historical_authority.revision = deployment.installation_authority_revision"
+        ));
+        assert!(
+            source.contains("current_authority.revision = installation.current_authority_revision")
+        );
+        assert!(source.contains("current_authority.binding_revision = deployment.binding_revision"));
+        assert!(source
+            .contains("current_authority.binding_fingerprint = deployment.binding_fingerprint"));
+        assert!(source.contains("current_authority.resource_bindings"));
+        assert!(source.contains("IS NOT DISTINCT FROM historical_authority.resource_bindings"));
+    }
 }

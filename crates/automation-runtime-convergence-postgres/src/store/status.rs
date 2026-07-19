@@ -2,7 +2,7 @@ use automation_runtime_convergence::{RuntimeDeploymentPhaseV1, RuntimePendingCon
 
 use crate::error::database;
 use crate::model::{
-    DeploymentAvailabilityV1, RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1,
+    DeploymentAvailabilityV1, RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1, RuntimeDigestV1,
     StrictLiveProjectionV1,
 };
 use crate::row::{metadata, runtime_i64, ServingLeaseRow, SERVING_LEASE_COLUMNS};
@@ -16,7 +16,8 @@ impl PostgresRuntimeConvergence {
         let mut transaction = self.begin_status().await?;
         let persisted = Self::load_scoped_for_share(&mut transaction, scope).await?;
         let snapshot = persisted.deployment.snapshot();
-        let non_live = match &snapshot.phase {
+        let desired_target_digest = persisted.desired_target_digest.clone();
+        let terminal = match &snapshot.phase {
             RuntimeDeploymentPhaseV1::Cancelled { .. } => {
                 Some((DeploymentAvailabilityV1::Cancelled, "deployment_cancelled"))
             }
@@ -24,6 +25,36 @@ impl PostgresRuntimeConvergence {
                 DeploymentAvailabilityV1::Superseded,
                 "deployment_superseded",
             )),
+            _ => None,
+        };
+        if let Some((availability, reason_code)) = terminal {
+            let observed_at = Self::database_now(&mut transaction).await?;
+            transaction.commit().await.map_err(database)?;
+            return Ok(status_projection(
+                snapshot,
+                observed_at,
+                availability,
+                reason_code,
+                None,
+                &desired_target_digest,
+            ));
+        }
+        if let Err(error) =
+            Self::assert_current_deployment_authority(&mut transaction, &persisted).await
+        {
+            let (availability, reason_code) = authority_failure_status(error)?;
+            let observed_at = Self::database_now(&mut transaction).await?;
+            transaction.commit().await.map_err(database)?;
+            return Ok(status_projection(
+                snapshot,
+                observed_at,
+                availability,
+                reason_code,
+                None,
+                &desired_target_digest,
+            ));
+        }
+        let non_live = match &snapshot.phase {
             RuntimeDeploymentPhaseV1::RuntimePending {
                 condition: RuntimePendingConditionV1::Blocked { .. },
             } => Some((DeploymentAvailabilityV1::Blocked, "deployment_blocked")),
@@ -36,85 +67,40 @@ impl PostgresRuntimeConvergence {
         if let Some((availability, reason_code)) = non_live {
             let observed_at = Self::database_now(&mut transaction).await?;
             transaction.commit().await.map_err(database)?;
-            return Ok(RuntimeDeploymentStatusV1 {
+            return Ok(status_projection(
                 snapshot,
                 observed_at,
                 availability,
                 reason_code,
-                live: None,
-            });
-        }
-        match Self::assert_current_deployment_authority(&mut transaction, &persisted).await {
-            Ok(()) => {}
-            Err(RuntimeConvergenceStoreError::ActiveTargetMismatch) => {
-                let observed_at = Self::database_now(&mut transaction).await?;
-                transaction.commit().await.map_err(database)?;
-                return Ok(RuntimeDeploymentStatusV1 {
-                    snapshot,
-                    observed_at,
-                    availability: DeploymentAvailabilityV1::Superseded,
-                    reason_code: "active_target_changed",
-                    live: None,
-                });
-            }
-            Err(RuntimeConvergenceStoreError::BindingAuthorityMismatch) => {
-                let observed_at = Self::database_now(&mut transaction).await?;
-                transaction.commit().await.map_err(database)?;
-                return Ok(RuntimeDeploymentStatusV1 {
-                    snapshot,
-                    observed_at,
-                    availability: DeploymentAvailabilityV1::Superseded,
-                    reason_code: "binding_authority_changed",
-                    live: None,
-                });
-            }
-            Err(RuntimeConvergenceStoreError::ProductAuthorityInactive) => {
-                let observed_at = Self::database_now(&mut transaction).await?;
-                transaction.commit().await.map_err(database)?;
-                return Ok(RuntimeDeploymentStatusV1 {
-                    snapshot,
-                    observed_at,
-                    availability: DeploymentAvailabilityV1::Blocked,
-                    reason_code: "product_authority_inactive",
-                    live: None,
-                });
-            }
-            Err(RuntimeConvergenceStoreError::ScopeMismatch) => {
-                let observed_at = Self::database_now(&mut transaction).await?;
-                transaction.commit().await.map_err(database)?;
-                return Ok(RuntimeDeploymentStatusV1 {
-                    snapshot,
-                    observed_at,
-                    availability: DeploymentAvailabilityV1::RuntimePending,
-                    reason_code: "product_authority_not_current",
-                    live: None,
-                });
-            }
-            Err(error) => return Err(error),
+                None,
+                &desired_target_digest,
+            ));
         }
         let Some(attestation_id) = persisted.live_attestation_id else {
             let observed_at = Self::database_now(&mut transaction).await?;
             transaction.commit().await.map_err(database)?;
-            return Ok(RuntimeDeploymentStatusV1 {
+            return Ok(status_projection(
                 snapshot,
                 observed_at,
-                availability: DeploymentAvailabilityV1::RuntimePending,
-                reason_code: "live_attestation_missing",
-                live: None,
-            });
+                DeploymentAvailabilityV1::RuntimePending,
+                "live_attestation_missing",
+                None,
+                &desired_target_digest,
+            ));
         };
         let Some(attestation) =
             Self::load_attestation(&mut transaction, scope, &attestation_id, false).await?
         else {
             let observed_at = Self::database_now(&mut transaction).await?;
             transaction.commit().await.map_err(database)?;
-            return Ok(RuntimeDeploymentStatusV1 {
+            return Ok(status_projection(
                 snapshot,
                 observed_at,
-                availability: DeploymentAvailabilityV1::RuntimePending,
-                reason_code: "live_attestation_missing",
-                live: None,
-            });
+                DeploymentAvailabilityV1::RuntimePending,
+                "live_attestation_missing",
+                None,
+                &desired_target_digest,
+            ));
         };
         if snapshot.live.as_ref() != Some(&attestation.record.live)
             || attestation.record.deployment_revision != snapshot.revision
@@ -196,12 +182,100 @@ impl PostgresRuntimeConvergence {
             )
         };
         transaction.commit().await.map_err(database)?;
-        Ok(RuntimeDeploymentStatusV1 {
+        Ok(status_projection(
             snapshot,
             observed_at,
             availability,
             reason_code,
             live,
-        })
+            &desired_target_digest,
+        ))
+    }
+}
+
+fn authority_failure_status(
+    error: RuntimeConvergenceStoreError,
+) -> Result<(DeploymentAvailabilityV1, &'static str), RuntimeConvergenceStoreError> {
+    match error {
+        RuntimeConvergenceStoreError::ActiveTargetMismatch => Ok((
+            DeploymentAvailabilityV1::Superseded,
+            "active_target_changed",
+        )),
+        RuntimeConvergenceStoreError::BindingAuthorityMismatch => Ok((
+            DeploymentAvailabilityV1::Superseded,
+            "binding_authority_changed",
+        )),
+        RuntimeConvergenceStoreError::ProductAuthorityInactive => Ok((
+            DeploymentAvailabilityV1::Blocked,
+            "product_authority_inactive",
+        )),
+        RuntimeConvergenceStoreError::ScopeMismatch => Ok((
+            DeploymentAvailabilityV1::Blocked,
+            "product_authority_not_current",
+        )),
+        error => Err(error),
+    }
+}
+
+fn status_projection(
+    snapshot: automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    availability: DeploymentAvailabilityV1,
+    reason_code: &'static str,
+    live: Option<StrictLiveProjectionV1>,
+    desired_target_digest: &RuntimeDigestV1,
+) -> RuntimeDeploymentStatusV1 {
+    RuntimeDeploymentStatusV1 {
+        snapshot,
+        observed_at,
+        availability,
+        reason_code,
+        live,
+        desired_target_digest: desired_target_digest.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_authority_failures_never_preserve_pending_availability() {
+        let cases = [
+            (
+                RuntimeConvergenceStoreError::ActiveTargetMismatch,
+                DeploymentAvailabilityV1::Superseded,
+                "active_target_changed",
+            ),
+            (
+                RuntimeConvergenceStoreError::BindingAuthorityMismatch,
+                DeploymentAvailabilityV1::Superseded,
+                "binding_authority_changed",
+            ),
+            (
+                RuntimeConvergenceStoreError::ProductAuthorityInactive,
+                DeploymentAvailabilityV1::Blocked,
+                "product_authority_inactive",
+            ),
+            (
+                RuntimeConvergenceStoreError::ScopeMismatch,
+                DeploymentAvailabilityV1::Blocked,
+                "product_authority_not_current",
+            ),
+        ];
+        for (error, expected_availability, expected_reason) in cases {
+            let (availability, reason) = authority_failure_status(error).unwrap();
+            assert_eq!(availability, expected_availability);
+            assert_ne!(availability, DeploymentAvailabilityV1::RuntimePending);
+            assert_eq!(reason, expected_reason);
+        }
+    }
+
+    #[test]
+    fn unrelated_runtime_errors_remain_errors() {
+        assert!(matches!(
+            authority_failure_status(RuntimeConvergenceStoreError::DatabaseTimeout),
+            Err(RuntimeConvergenceStoreError::DatabaseTimeout)
+        ));
     }
 }

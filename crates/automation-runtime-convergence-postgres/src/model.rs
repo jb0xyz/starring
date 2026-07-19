@@ -340,4 +340,11 @@ pub struct RuntimeDeploymentStatusV1 {
     pub availability: DeploymentAvailabilityV1,
     pub reason_code: &'static str,
     pub live: Option<StrictLiveProjectionV1>,
+    pub(crate) desired_target_digest: RuntimeDigestV1,
+}
+
+impl RuntimeDeploymentStatusV1 {
+    pub fn desired_target_digest(&self) -> &str {
+        self.desired_target_digest.as_str()
+    }
 }
