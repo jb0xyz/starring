@@ -43,14 +43,15 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
 
 #[test]
 fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
-    let store = include_str!("../src/product_decisions/store.rs");
+    let approval = include_str!("../src/product_decisions/approve.rs");
+    let database = include_str!("../src/product_decisions/database.rs");
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
-    assert!(store.contains("public.starring_product_approve_v1"));
-    assert!(store.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
-    assert!(store.contains("FreshDiscordAuthorityEvidenceV1"));
-    assert!(store.contains("request.session_fingerprint().as_bytes()"));
-    assert!(!store.contains(".bind(request.command().idempotency_key.as_str())"));
+    assert!(approval.contains("public.starring_product_approve_v1"));
+    assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+    assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));
+    assert!(approval.contains("request.session_fingerprint().as_bytes()"));
+    assert!(!approval.contains(".bind(request.command().idempotency_key.as_str())"));
     assert!(digest.contains("Hmac<Sha256>"));
     assert!(digest.contains("IDEMPOTENCY_DOMAIN"));
     assert!(digest.contains("SEMANTIC_REQUEST_DOMAIN"));
@@ -92,9 +93,9 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         approval_migration.contains("DROP CONSTRAINT product_audit_events_session_principal_fk")
     );
     assert!(!approval_migration.contains("idempotency_key TEXT"));
-    let decision_store = include_str!("../src/product_decisions/store.rs");
-    assert!(decision_store.contains("transaction.commit().await.map_err(database_commit)?"));
-    assert!(decision_store.contains("matches!(&error, sqlx::Error::Database(_))"));
+    assert!(approval
+        .contains("database_commit(error, \"product approval commit outcome is unavailable\")"));
+    assert!(database.contains("matches!(&error, sqlx::Error::Database(_))"));
     let activation_store =
         include_str!("../../automation-ruleset-activation-postgres/src/store.rs");
     assert_eq!(
@@ -317,8 +318,16 @@ fn source_files_contain_no_comments() {
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         (
+            "src/product_decisions/approve.rs",
+            include_str!("../src/product_decisions/approve.rs"),
+        ),
+        (
             "src/product_decisions/config.rs",
             include_str!("../src/product_decisions/config.rs"),
+        ),
+        (
+            "src/product_decisions/database.rs",
+            include_str!("../src/product_decisions/database.rs"),
         ),
         (
             "src/product_decisions/digest.rs",
@@ -327,6 +336,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_decisions/mod.rs",
             include_str!("../src/product_decisions/mod.rs"),
+        ),
+        (
+            "src/product_decisions/query.rs",
+            include_str!("../src/product_decisions/query.rs"),
         ),
         (
             "src/product_decisions/row.rs",

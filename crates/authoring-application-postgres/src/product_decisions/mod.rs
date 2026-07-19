@@ -1,5 +1,8 @@
+mod approve;
 mod config;
+mod database;
 mod digest;
+mod query;
 mod row;
 mod store;
 
