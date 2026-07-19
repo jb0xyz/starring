@@ -4,6 +4,11 @@ Date: 2026-07-19
 
 Status: accepted implementation contract
 
+The `Current architecture and gaps` section records the baseline at design
+acceptance. It is not a live progress report. `CURRENT_STATE.md` is the
+authoritative implementation inventory; this document remains authoritative
+for the target contract and sequencing.
+
 Supersedes: the unimplemented production-edge and runtime-convergence sections of
 `2026-07-18-authoring-promotion-bridge-design.md`
 

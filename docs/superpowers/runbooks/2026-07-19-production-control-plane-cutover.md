@@ -4,7 +4,7 @@
 
 This runbook describes the fail-closed migration and maintenance contract for
 the production control plane. It does not authorize production cutover until
-the database-role, RLS, capability-probe, HTTP composition, atomic apply, and
+the database-role, RLS, capability-probe, HTTP composition, and
 runtime Live gates in the accepted design are implemented and green.
 
 ## Required operators and credentials
@@ -21,12 +21,13 @@ runtime Live gates in the accepted design are implemented and green.
 1. Record the running application revision and migration version.
 2. Take and verify a restorable PostgreSQL backup.
 3. Stop new promotion, approval, rejection, and apply requests.
-4. Drain legacy writers and confirm no activation is `applying`.
+4. Drain legacy writers, including every old `interaction-smoke` process, and
+   confirm no activation is `applying`.
 5. Confirm every product-authored promotion is provisioned into exactly one
    active tenant installation with the same tenant, guild, and RuleSet key.
 6. Estimate table and index size and schedule a maintenance window for the
    table locks, synchronous index builds, and artifact rewrite in migrations
-   004, 006, 007, and 012.
+   004, 006, 007, 012, and 013.
 7. Run all migration preflight queries from a read-only transaction and save
    only aggregate counts.
 
@@ -57,6 +58,58 @@ WHERE authority_kind = 'product_authoring'
         OR approval_context_digest IS NULL
         OR link_state_name <> 'linked'
     );
+
+SELECT pg_catalog.count(*) AS product_slots_with_legacy_applying
+FROM public.activation_requests AS activation
+INNER JOIN public.automation_installations AS installation
+    ON installation.discord_guild_id = activation.guild_id
+    AND installation.ruleset_key = activation.ruleset_key
+WHERE activation.authority_kind = 'legacy_manual'
+    AND activation.state = 'applying';
+
+WITH ranked_deployments AS (
+    SELECT
+        deployment.*,
+        pg_catalog.row_number() OVER (
+            PARTITION BY deployment.tenant_id,
+                deployment.installation_id,
+                deployment.guild_id,
+                deployment.ruleset_key
+            ORDER BY deployment.runtime_generation DESC,
+                deployment.deployment_id DESC
+        ) AS generation_rank
+    FROM public.runtime_deployments AS deployment
+)
+SELECT pg_catalog.count(*) AS product_pointer_lineage_failures
+FROM public.automation_installations AS installation
+INNER JOIN public.automation_ruleset_activations AS active
+    ON active.guild_id = installation.discord_guild_id
+    AND active.ruleset_key = installation.ruleset_key
+LEFT JOIN ranked_deployments AS deployment
+    ON deployment.tenant_id = installation.tenant_id
+    AND deployment.installation_id = installation.installation_id
+    AND deployment.guild_id = installation.discord_guild_id
+    AND deployment.ruleset_key = installation.ruleset_key
+    AND deployment.target_version = active.active_version
+    AND deployment.generation_rank = 1
+LEFT JOIN public.activation_requests AS activation
+    ON activation.id = deployment.activation_request_id
+LEFT JOIN public.automation_ruleset_versions AS version
+    ON version.guild_id = deployment.guild_id
+    AND version.ruleset_key = deployment.ruleset_key
+    AND version.version = deployment.target_version
+WHERE deployment.deployment_id IS NULL
+    OR activation.authority_kind IS DISTINCT FROM 'product_authoring'
+    OR activation.link_state_name IS DISTINCT FROM 'linked'
+    OR activation.state IS DISTINCT FROM 'applied'
+    OR activation.tenant_id IS DISTINCT FROM deployment.tenant_id
+    OR activation.installation_id IS DISTINCT FROM deployment.installation_id
+    OR activation.promotion_id IS DISTINCT FROM deployment.promotion_id
+    OR activation.guild_id IS DISTINCT FROM deployment.guild_id
+    OR activation.ruleset_key IS DISTINCT FROM deployment.ruleset_key
+    OR activation.target_version IS DISTINCT FROM deployment.target_version
+    OR activation.target_content_hash IS DISTINCT FROM deployment.target_content_hash
+    OR version.content_hash IS DISTINCT FROM deployment.target_content_hash;
 
 SELECT
     pg_catalog.count(*) AS ruleset_artifact_rows,
@@ -101,11 +154,10 @@ GROUP BY shadow.source
 ORDER BY shadow.source;
 ```
 
-The first three control-plane counts, `ruleset_artifact_shape_failures`, and
-every returned shadow mismatch count must be zero. Record the artifact row,
-table-size, and largest-definition values for the migration rehearsal. A
-nonzero failure count stops the cutover; do not weaken or skip the migration
-constraints.
+Every control-plane failure count, `ruleset_artifact_shape_failures`, and every
+returned shadow mismatch count must be zero. Record the artifact row, table-size,
+and largest-definition values for the migration rehearsal. A nonzero failure
+count stops the cutover; do not weaken or skip the migration constraints.
 
 ## Migration sequence
 
@@ -149,6 +201,29 @@ RuleSet publishing boundary the minimum execution capability needed by the
 stored generated expression. Before ingress opens, a non-owner publish probe
 must succeed through that boundary while direct table mutation and direct
 function execution from API and runtime roles remain denied.
+
+Migration 013 takes strong locks over `automation_installations`,
+`activation_requests`, `automation_ruleset_activations`, `runtime_deployments`,
+and `automation_ruleset_versions`. Its preflight rejects product `Applying`
+residue, in-flight legacy activation in a product slot, and any product pointer
+without exact latest-deployment lineage. Legacy or generic direct activation
+and product installation takeover serialize through the same
+transaction-scoped slot advisory lock. Product Apply instead retains its
+product-lane lock and atomic transaction. Deferred invariants re-read the final
+transaction state, so a product pointer may change only with exact
+latest-deployment lineage. Do not bypass its triggers, disable trigger
+execution, or grant application roles direct execution on its security-definer
+functions.
+
+`interaction-smoke` is test-only manual tooling, not an operational fallback.
+It requires the `legacy-smoke` compile feature,
+`STARRING_ALLOW_INTERACTION_SMOKE=1`, is marked non-publishable, and requires an
+ASCII alphanumeric/underscore database name with the `starring_` prefix and an
+underscore-delimited `test` segment. These controls do not authenticate Discord
+credentials. Never pass a production bot token or production guild identity to
+it, and confirm every old smoke process is drained before migration or ingress.
+Exclude the binary and both smoke features from every production artifact and
+deployment manifest; `publish = false` is not a deployment security boundary.
 
 ## Identity retention
 
