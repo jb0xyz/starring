@@ -702,9 +702,10 @@ already present in a successful resource view never enter errors.
   a valid activation lease.
 - Binding, baseline, policy, or target drift supersedes the request before pointer
   mutation.
-- Indeterminate pointer mutation remains `Applying` and is recovered through the
-  existing activation recovery path. It is never blindly retried as a new
-  attempt.
+- An indeterminate product-apply commit is resolved only by replaying the same
+  idempotency key. The committed outcome contains pointer, `Applied`, Requested
+  deployment, receipt, and audit together; the rolled-back outcome contains
+  none of them. A new key is never used to guess the result.
 - A guild and RuleSet key may have only one unresolved runtime deployment. A new
   apply cannot advance the pointer while the current target is runtime-pending,
   unless an explicit operator recovery first resolves or supersedes it.
@@ -741,11 +742,27 @@ already present in a successful resource view never enter errors.
 - connected/serving state, heartbeat time, and lease expiry
 - revision CAS and no customer-controlled fields
 
-An activation-request transition to `Applied` inserts the exact deployment row
-through a database trigger or transactional outbox. Startup recovery also scans
-for an `Applied` product activation whose exact target is current but lacks a
-deployment row and backfills it idempotently. This closes a crash between
-pointer mutation, activation completion, and convergence enqueueing.
+The desired-target digest remains version 1 for this increment. It already
+binds the immutable installation-authority revision, whose referenced row binds
+policy revision, quorum, TTL, and resource bindings. `policy_revision` remains
+an immutable deployment shadow for audit and query parity, while
+`desired_target_digest_version` explicitly records version 1. A future digest
+version uses dual-read and versioned golden vectors; version 1 is never changed
+in place.
+
+Product apply uses one serializable transaction rather than composing the
+independently committing activation and runtime stores. A lock phase copies the
+exact server-owned target, baseline, binding, policy, current serving identity,
+and next runtime generation. Rust builds the existing version-1 Requested
+snapshot and digest from that locked projection. A finalizer in the same
+transaction revalidates every locked identity, performs the baseline CAS,
+transitions `Approved -> Applying -> Applied`, inserts the Requested deployment,
+and appends the receipt, aliases, audit, and forensic receipt evidence.
+
+A deferred invariant requires every product activation that is `Applied` at
+commit to have exactly one matching deployment whose target is the active
+pointer. Migration preflight fails on an existing ambiguous `Applied` row;
+startup never guesses a deployment or previous runtime to backfill it.
 
 ### State machine
 
@@ -955,7 +972,7 @@ credential rotation remain required operational defenses.
 | Approval or rejection response lost | committed receipt and decision | exact idempotency replay |
 | Apply readiness failure | `Approved` | retry same request after environment repair with a new apply key |
 | Baseline, binding, or policy drift | `Superseded` | new preview and promotion |
-| Pointer outcome indeterminate | `Applying` | existing activation recovery only |
+| Product apply commit indeterminate | unknown until replay | retry the same idempotency key only |
 | Pointer applied before deployment enqueue | `Applied`, no deployment | startup scanner backfills exact deployment |
 | Runtime process crashes during convergence | leased `Converging` | lease expiry, fenced reclaim, resume from safe phase |
 | Runtime process crashes while Live | stale serving lease | status loses Live; worker reconverges and writes a new process attestation |
