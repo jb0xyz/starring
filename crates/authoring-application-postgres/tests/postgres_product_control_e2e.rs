@@ -714,10 +714,14 @@ impl DiscordGuildAuthorityClient for Client {
                 DiscordRoleSnapshotV1 {
                     role_id: RoleId(guild_id.0),
                     permissions: Permissions::VIEW_CHANNEL,
+                    position: 0,
+                    managed: false,
                 },
                 DiscordRoleSnapshotV1 {
                     role_id: self.fixture.manager_role_id,
                     permissions: Permissions::MANAGE_GUILD,
+                    position: 10,
+                    managed: false,
                 },
             ],
         })
