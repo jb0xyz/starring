@@ -61,9 +61,20 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
 #[test]
 fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let approval = include_str!("../src/product_decisions/approve.rs");
+    let apply = include_str!("../src/product_decisions/apply.rs");
     let database = include_str!("../src/product_decisions/database.rs");
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
+    let query = include_str!("../src/product_decisions/query.rs");
+    let store = include_str!("../src/product_decisions/store.rs");
+    assert!(store.contains("ProductDecisionDatabasePoolsV1"));
+    assert!(store.contains("decision_reader: PgPool"));
+    assert!(store.contains("approval_executor: PgPool"));
+    assert!(store.contains("apply_executor: PgPool"));
+    assert!(query.contains(".decision_reader"));
+    assert!(approval.contains(".approval_executor"));
+    assert!(store.contains(".approval_executor"));
+    assert!(apply.contains(".apply_executor"));
     assert!(approval.contains("public.starring_product_approve_v1"));
     assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
     assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));

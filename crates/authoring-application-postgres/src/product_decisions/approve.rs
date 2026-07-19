@@ -22,7 +22,12 @@ impl ProductApprovalPort<FreshDiscordAuthorityEvidenceV1> for PostgresProductDec
         let observed_at = evidence.observed_at();
         let expires_at = evidence.expires_at();
         let permission_bits = evidence.effective_permissions_bits().to_string();
-        let mut transaction = self.pool.begin().await.map_err(database_backend)?;
+        let mut transaction = self
+            .pools
+            .approval_executor
+            .begin()
+            .await
+            .map_err(database_backend)?;
         configure_mutation_transaction(&mut transaction, &self.config).await?;
         let outcome = sqlx::query_as::<_, ApprovalOutcomeRow>(
             "SELECT outcome, resulting_revision, resulting_state, exact_replay, guild_id \

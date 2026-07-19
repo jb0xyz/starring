@@ -48,7 +48,12 @@ impl PostgresProductDecisions {
         evidence: &FreshDiscordAuthorityEvidenceV1,
         promotion: &authoring_application::PromotionSelectorV1,
     ) -> Result<super::row::ValidatedDecisionRow, ProductControlPortError> {
-        let mut transaction = self.pool.begin().await.map_err(database_backend)?;
+        let mut transaction = self
+            .pools
+            .decision_reader
+            .begin()
+            .await
+            .map_err(database_backend)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await

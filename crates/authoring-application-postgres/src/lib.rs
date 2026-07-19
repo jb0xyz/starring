@@ -32,8 +32,8 @@ pub use installation_authority::{
 };
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
-    ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
-    ProductDecisionReadinessErrorV1,
+    ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1,
+    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,

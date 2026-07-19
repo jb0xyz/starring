@@ -166,7 +166,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
         .unwrap()],
     )
     .unwrap();
-    let decisions = PostgresProductDecisions::new(pool.clone(), keyring).unwrap();
+    let decisions = PostgresProductDecisions::new(product_decision_pools(&pool), keyring).unwrap();
     decisions.verify_keyring_coverage().await.unwrap();
     let deployments =
         PostgresProductDeploymentStatuses::new(PostgresRuntimeConvergence::new(pool.clone()));
@@ -239,7 +239,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     );
     decisions.verify_keyring_coverage().await.unwrap();
     let unknown_only = PostgresProductDecisions::new(
-        pool.clone(),
+        product_decision_pools(&pool),
         ProductDecisionDigestKeyringV1::new(
             ProductDecisionDigestKeyV1::from_bytes(
                 "product-e2e-v3",
@@ -257,7 +257,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     );
     let next_key_material = std::array::from_fn(|index| 97_u8.wrapping_add(index as u8));
     let rolling = PostgresProductDecisions::new(
-        pool.clone(),
+        product_decision_pools(&pool),
         ProductDecisionDigestKeyringV1::new(
             ProductDecisionDigestKeyV1::from_bytes("product-e2e-v2", next_key_material).unwrap(),
             [ProductDecisionDigestKeyV1::from_bytes("product-e2e-v1", key_material).unwrap()],
@@ -547,7 +547,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
         let authentication = PostgresAuthentication::new(pool.clone());
         let key_material = std::array::from_fn(|index| 151_u8.wrapping_add(index as u8));
         let decisions = PostgresProductDecisions::new(
-            pool.clone(),
+            product_decision_pools(pool),
             ProductDecisionDigestKeyringV1::new(
                 ProductDecisionDigestKeyV1::from_bytes("product-integrity-v1", key_material)
                     .unwrap(),

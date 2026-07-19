@@ -62,7 +62,8 @@ impl PostgresProductDecisions {
         authority_revision: i64,
     ) -> Result<ProductMutationReceiptV1, ApplyAttemptFailure> {
         let mut transaction = self
-            .pool
+            .pools
+            .apply_executor
             .begin()
             .await
             .map_err(classify_precommit_failure)?;

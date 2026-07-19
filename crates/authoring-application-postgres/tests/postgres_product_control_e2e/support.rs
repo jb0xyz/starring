@@ -27,7 +27,8 @@ use authoring_application_postgres::{
     InstallationAuthorityReadinessErrorV1, PostgresAuthentication,
     PostgresAuthenticationConfig, PostgresInstallationAuthoritySource,
     PostgresInstallationAuthoritySourceConfig, PostgresProductDecisions,
-    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    PostgresProductDeploymentStatuses, ProductDecisionDatabasePoolsV1,
+    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
     ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
@@ -1052,7 +1053,11 @@ fn product_decisions(pool: &PgPool) -> PostgresProductDecisions {
         .unwrap()],
     )
     .unwrap();
-    PostgresProductDecisions::new(pool.clone(), keyring).unwrap()
+    PostgresProductDecisions::new(product_decision_pools(pool), keyring).unwrap()
+}
+
+fn product_decision_pools(pool: &PgPool) -> ProductDecisionDatabasePoolsV1 {
+    ProductDecisionDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone())
 }
 
 async fn approve_fixture(pool: &PgPool, fixture: &Fixture, decisions: &PostgresProductDecisions) {

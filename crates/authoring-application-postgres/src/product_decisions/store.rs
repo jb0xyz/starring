@@ -7,29 +7,54 @@ use super::digest::keyring_coverage_identity;
 use crate::ProductDatabaseFailureV1;
 
 #[derive(Clone)]
+pub struct ProductDecisionDatabasePoolsV1 {
+    pub(super) decision_reader: PgPool,
+    pub(super) approval_executor: PgPool,
+    pub(super) apply_executor: PgPool,
+}
+
+impl ProductDecisionDatabasePoolsV1 {
+    pub fn new(decision_reader: PgPool, approval_executor: PgPool, apply_executor: PgPool) -> Self {
+        Self {
+            decision_reader,
+            approval_executor,
+            apply_executor,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PostgresProductDecisions {
-    pub(super) pool: PgPool,
+    pub(super) pools: ProductDecisionDatabasePoolsV1,
     pub(super) config: PostgresProductDecisionsConfig,
 }
 
 impl PostgresProductDecisions {
     pub fn new(
-        pool: PgPool,
+        pools: ProductDecisionDatabasePoolsV1,
         keyring: ProductDecisionDigestKeyringV1,
     ) -> Result<Self, ProductDecisionConfigError> {
         Ok(Self {
-            pool,
+            pools,
             config: PostgresProductDecisionsConfig::production(keyring)?,
         })
     }
 
-    pub fn with_config(pool: PgPool, config: PostgresProductDecisionsConfig) -> Self {
-        Self { pool, config }
+    pub fn with_config(
+        pools: ProductDecisionDatabasePoolsV1,
+        config: PostgresProductDecisionsConfig,
+    ) -> Self {
+        Self { pools, config }
     }
 
     pub async fn verify_keyring_coverage(&self) -> Result<(), ProductDecisionReadinessErrorV1> {
         let identity = keyring_coverage_identity(self.config.keyring());
-        let mut transaction = self.pool.begin().await.map_err(readiness_database)?;
+        let mut transaction = self
+            .pools
+            .approval_executor
+            .begin()
+            .await
+            .map_err(readiness_database)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await
