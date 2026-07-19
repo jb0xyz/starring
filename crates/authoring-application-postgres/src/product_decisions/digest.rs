@@ -1,4 +1,4 @@
-use authoring_application::AuthorizedApproveProductV1;
+use authoring_application::{AuthorizedApplyProductV1, AuthorizedApproveProductV1};
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,12 @@ const AUDIT_EVENT_ID_DOMAIN: &[u8] = b"starring.product.approval.audit.v1";
 const SESSION_SUBJECT_DOMAIN: &[u8] = b"starring.product.session.subject.v1";
 const KEY_MATERIAL_FINGERPRINT_DOMAIN: &[u8] =
     b"starring.product.approval.digest-key-fingerprint.v1";
+const APPLY_IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.apply.idempotency.v1";
+const APPLY_SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.apply.request.v1";
+const APPLY_RECEIPT_ID_DOMAIN: &[u8] = b"starring.product.apply.receipt.v1";
+const APPLY_AUDIT_EVENT_ID_DOMAIN: &[u8] = b"starring.product.apply.audit.v1";
+const APPLY_ATTEMPT_ID_DOMAIN: &[u8] = b"starring.product.apply.attempt.v1";
+const APPLY_DEPLOYMENT_ID_DOMAIN: &[u8] = b"starring.product.apply.deployment.v1";
 
 pub(crate) struct ApprovalDigests {
     pub active_idempotency: String,
@@ -22,6 +28,20 @@ pub(crate) struct ApprovalDigests {
     pub semantic_request: String,
     pub receipt_id: String,
     pub audit_event_id: String,
+    pub session_subject: Vec<u8>,
+}
+
+pub(crate) struct ApplyDigests {
+    pub active_idempotency: String,
+    pub idempotency_candidates: Vec<String>,
+    pub idempotency_candidate_key_ids: Vec<String>,
+    pub idempotency_candidate_key_fingerprints: Vec<String>,
+    pub active_key_id: String,
+    pub semantic_request: String,
+    pub receipt_id: String,
+    pub audit_event_id: String,
+    pub apply_attempt_id: String,
+    pub deployment_id: String,
     pub session_subject: Vec<u8>,
 }
 
@@ -105,6 +125,82 @@ pub(crate) fn approval_digests(
         semantic_request,
         receipt_id,
         audit_event_id,
+        session_subject,
+    }
+}
+
+pub(crate) fn apply_digests(
+    keyring: &ProductDecisionDigestKeyringV1,
+    request: &AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
+) -> ApplyDigests {
+    let scope = request.scope();
+    let command = request.command();
+    let expected_revision = command.expected_revision.get().to_string();
+    let idempotency_fields = [
+        scope.tenant_id().as_str().as_bytes(),
+        scope.installation_id().as_str().as_bytes(),
+        request.actor().principal_id().as_str().as_bytes(),
+        b"product_apply_v1".as_slice(),
+        command.idempotency_key.as_str().as_bytes(),
+    ];
+    let idempotency_candidates = keyring
+        .keys()
+        .iter()
+        .map(|key| keyed_digest(key, APPLY_IDEMPOTENCY_DOMAIN, &idempotency_fields))
+        .collect::<Vec<_>>();
+    let active_idempotency = idempotency_candidates[0].clone();
+    let keyring_identity = keyring_coverage_identity(keyring);
+    let semantic_request = unkeyed_digest(
+        APPLY_SEMANTIC_REQUEST_DOMAIN,
+        &[
+            scope.tenant_id().as_str().as_bytes(),
+            scope.installation_id().as_str().as_bytes(),
+            request.actor().principal_id().as_str().as_bytes(),
+            command.promotion.promotion_id().as_str().as_bytes(),
+            expected_revision.as_bytes(),
+            command.expected_payload_digest.as_str().as_bytes(),
+        ],
+    );
+    let identity_fields = [
+        scope.tenant_id().as_str().as_bytes(),
+        scope.installation_id().as_str().as_bytes(),
+        request.actor().principal_id().as_str().as_bytes(),
+        command.promotion.promotion_id().as_str().as_bytes(),
+        active_idempotency.as_bytes(),
+        semantic_request.as_bytes(),
+    ];
+    let receipt_id = keyed_digest(keyring.active(), APPLY_RECEIPT_ID_DOMAIN, &identity_fields);
+    let audit_event_id = keyed_digest(
+        keyring.active(),
+        APPLY_AUDIT_EVENT_ID_DOMAIN,
+        &identity_fields,
+    );
+    let apply_attempt_id =
+        keyed_digest(keyring.active(), APPLY_ATTEMPT_ID_DOMAIN, &identity_fields);
+    let deployment_id = keyed_digest(
+        keyring.active(),
+        APPLY_DEPLOYMENT_ID_DOMAIN,
+        &identity_fields,
+    );
+    let session_subject = unkeyed_digest_bytes(
+        SESSION_SUBJECT_DOMAIN,
+        &[
+            scope.tenant_id().as_str().as_bytes(),
+            request.actor().principal_id().as_str().as_bytes(),
+            request.session_fingerprint().as_bytes().as_slice(),
+        ],
+    );
+    ApplyDigests {
+        active_idempotency,
+        idempotency_candidates,
+        idempotency_candidate_key_ids: keyring_identity.key_ids,
+        idempotency_candidate_key_fingerprints: keyring_identity.key_fingerprints,
+        active_key_id: keyring.active().key_id().to_string(),
+        semantic_request,
+        receipt_id,
+        audit_event_id,
+        apply_attempt_id,
+        deployment_id,
         session_subject,
     }
 }

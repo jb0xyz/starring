@@ -148,6 +148,8 @@ dependencies = [
  "authoring-application-discord",
  "authoring-promotion",
  "automation-ruleset",
+ "automation-ruleset-activation",
+ "automation-ruleset-readiness",
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "base64",

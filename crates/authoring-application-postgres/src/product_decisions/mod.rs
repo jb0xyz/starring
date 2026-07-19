@@ -1,3 +1,6 @@
+mod apply;
+mod apply_projection;
+mod apply_sql;
 mod approve;
 mod config;
 mod database;

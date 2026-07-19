@@ -8,6 +8,10 @@ authoring-application = { path = "../authoring-application" }
 authoring-application-discord = { path = "../authoring-application-discord" }
 authoring-promotion = { path = "../authoring-promotion" }
 automation-ruleset = { path = "../automation-ruleset" }
+automation-ruleset-activation = { path = "../automation-ruleset-activation" }
+automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+automation-runtime-convergence-postgres = { path = "../automation-runtime-convergence-postgres" }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 design-harness = { path = "../design-harness" }
@@ -26,7 +30,5 @@ url = "2"
 zeroize = "1"
 
 [dev-dependencies]
-automation-runtime-convergence = { path = "../automation-runtime-convergence" }
-automation-runtime-convergence-postgres = { path = "../automation-runtime-convergence-postgres" }
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
