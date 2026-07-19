@@ -25,7 +25,8 @@ runtime Live gates in the accepted design are implemented and green.
 5. Confirm every product-authored promotion is provisioned into exactly one
    active tenant installation with the same tenant, guild, and RuleSet key.
 6. Estimate table and index size and schedule a maintenance window for the
-   table locks and synchronous index builds in migrations 004, 006, and 007.
+   table locks, synchronous index builds, and artifact rewrite in migrations
+   004, 006, 007, and 012.
 7. Run all migration preflight queries from a read-only transaction and save
    only aggregate counts.
 
@@ -56,10 +57,55 @@ WHERE authority_kind = 'product_authoring'
         OR approval_context_digest IS NULL
         OR link_state_name <> 'linked'
     );
+
+SELECT
+    pg_catalog.count(*) AS ruleset_artifact_rows,
+    pg_catalog.pg_total_relation_size(
+        'public.automation_ruleset_versions'::REGCLASS
+    ) AS ruleset_artifact_total_bytes,
+    pg_catalog.max(pg_catalog.octet_length(definition::TEXT))
+        AS largest_ruleset_definition_bytes,
+    pg_catalog.count(*) FILTER (
+        WHERE schema_version NOT BETWEEN 1 AND 4294967295
+            OR pg_catalog.jsonb_typeof(definition) <> 'object'
+            OR pg_catalog.octet_length(definition::TEXT) > 524288
+    ) AS ruleset_artifact_shape_failures
+FROM public.automation_ruleset_versions;
+
+WITH shadow_targets(source, guild_id, ruleset_key, target_version, target_hash) AS (
+    SELECT 'activation', guild_id, ruleset_key, target_version,
+        target_content_hash
+    FROM public.activation_requests
+    UNION ALL
+    SELECT 'deployment', guild_id, ruleset_key, target_version,
+        target_content_hash
+    FROM public.runtime_deployments
+    UNION ALL
+    SELECT 'attestation', guild_id, ruleset_key, target_version,
+        target_content_hash
+    FROM public.runtime_attestations
+    UNION ALL
+    SELECT 'serving', guild_id, ruleset_key, target_version,
+        target_content_hash
+    FROM public.runtime_serving_leases
+)
+SELECT shadow.source, pg_catalog.count(*) AS mismatches
+FROM shadow_targets AS shadow
+LEFT JOIN public.automation_ruleset_versions AS version
+    ON version.guild_id = shadow.guild_id
+    AND version.ruleset_key = shadow.ruleset_key
+    AND version.version = shadow.target_version
+WHERE version.guild_id IS NULL
+    OR version.content_hash IS DISTINCT FROM shadow.target_hash
+GROUP BY shadow.source
+ORDER BY shadow.source;
 ```
 
-Every count must be zero. A nonzero count stops the cutover; do not weaken or
-skip the migration constraints.
+The first three control-plane counts, `ruleset_artifact_shape_failures`, and
+every returned shadow mismatch count must be zero. Record the artifact row,
+table-size, and largest-definition values for the migration rehearsal. A
+nonzero failure count stops the cutover; do not weaken or skip the migration
+constraints.
 
 ## Migration sequence
 
@@ -80,6 +126,29 @@ cannot be scoped to provisioned installations. Migrations 006 and 007 build
 bounded retention indexes synchronously. Migration 007 is forward-only after
 its first successful receipt purge because live replay receipts may no longer
 exist; rollback then requires backup restore or a forward fix.
+
+Migration 012 adds and materializes a stored canonical RuleSet hash for every
+published artifact, validates the full artifact table, and checks every
+activation and runtime hash shadow. It therefore requires an exclusive-write
+maintenance window sized from a production-like rehearsal. Set a bounded
+`lock_timeout` for lock acquisition and a rehearsed, bounded
+`statement_timeout` for the rewrite and validation; an expiry aborts the whole
+migration transaction. Do not start API, authoring, or runtime writers between
+the rewrite and the post-migration capability probes.
+
+Migration 012 proves current content against its stored hash and any retained
+activation or runtime hash shadow. A legacy artifact whose definition and hash
+were both altered before migration and which has no retained shadow has no
+independent database trust anchor. Restore such history only from a verified
+backup or signed external evidence; never declare it trusted from a newly
+computed self-hash alone.
+
+Migration 012 also revokes public execution of the canonical hash functions.
+The ownership-and-grant migration must explicitly give only the approved
+RuleSet publishing boundary the minimum execution capability needed by the
+stored generated expression. Before ingress opens, a non-owner publish probe
+must succeed through that boundary while direct table mutation and direct
+function execution from API and runtime roles remain denied.
 
 ## Identity retention
 
