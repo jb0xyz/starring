@@ -9,10 +9,11 @@ use resource_resolution::{
     approval_binding_fingerprint_v1, resource_binding_fingerprint_v2, ResolvedApprovalBinding,
     ResourceBindingMap,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::types::Json;
+use sqlx::{Postgres, Transaction};
 
 fn database_url() -> String {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
@@ -60,6 +61,60 @@ fn digest(seed: &str) -> String {
         write!(&mut output, "{byte:02x}").unwrap();
     }
     output
+}
+
+async fn insert_activation_pending_promotion(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: &str,
+    request_digest: &str,
+    tenant_id: &str,
+    installation_id: &str,
+    principal_id: &str,
+    record: &Value,
+) {
+    let mut prepared = record.clone();
+    prepared["revision"] = json!(1);
+    prepared["stage"] = json!({"state": "prepared"});
+    prepared["updated_at"] = prepared["created_at"].clone();
+    let mut published = record.clone();
+    published["revision"] = json!(2);
+    published["stage"] = json!({
+        "state": "published",
+        "publication": record["stage"]["publication"].clone()
+    });
+    published["updated_at"] = published["created_at"].clone();
+    sqlx::query(
+        "INSERT INTO public.authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, installation_id, \
+          principal_id, record) VALUES ($1, 1, 1, 'prepared', $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(request_digest)
+    .bind(tenant_id)
+    .bind(installation_id)
+    .bind(principal_id)
+    .bind(Json(&prepared))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 2, stage = 'published', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(&published))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(record))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
 }
 
 #[derive(Clone)]
@@ -209,6 +264,13 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
         },
         "stage": {
             "state": "activation_pending",
+            "publication": {
+                "version": 1,
+                "schema_version": 1,
+                "content_hash": target_content_hash,
+                "disposition": "created",
+                "registry_created_by": requester.user_id
+            },
             "activation": {
                 "request_id": activation_id,
                 "target": {
@@ -219,12 +281,16 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
                 },
                 "requester": requester.user_id,
                 "required_approvals": required_approvals,
+                "observed_active": null,
                 "created_at": created_at,
                 "expires_at": expires_at,
+                "disposition": "created",
                 "request_state_at_journal": "pending",
                 "approval_context": approval_context["context"]
             }
-        }
+        },
+        "created_at": created_at,
+        "updated_at": linked_at
     });
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -317,19 +383,16 @@ async fn seed_fixture(pool: &PgPool, required_approvals: i32) -> Fixture {
     .execute(&mut *transaction)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO public.authoring_promotions \
-         (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, \
-          record) VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5)",
+    insert_activation_pending_promotion(
+        &mut transaction,
+        &promotion_id,
+        &request_digest,
+        &tenant_id,
+        &installation_id,
+        &requester.principal_id,
+        &promotion_record,
     )
-    .bind(&promotion_id)
-    .bind(&request_digest)
-    .bind(&tenant_id)
-    .bind(&requester.principal_id)
-    .bind(Json(&promotion_record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO public.activation_requests \
          (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \
@@ -439,6 +502,13 @@ async fn seed_additional_target(pool: &PgPool, fixture: &Fixture, label: &str) -
         },
         "stage": {
             "state": "activation_pending",
+            "publication": {
+                "version": 1,
+                "schema_version": 1,
+                "content_hash": target_content_hash,
+                "disposition": "created",
+                "registry_created_by": fixture.requester.user_id
+            },
             "activation": {
                 "request_id": activation_id,
                 "target": {
@@ -449,31 +519,32 @@ async fn seed_additional_target(pool: &PgPool, fixture: &Fixture, label: &str) -
                 },
                 "requester": fixture.requester.user_id,
                 "required_approvals": fixture.required_approvals,
+                "observed_active": null,
                 "created_at": created_at,
                 "expires_at": expires_at,
+                "disposition": "created",
                 "request_state_at_journal": "pending",
                 "approval_context": approval_context["context"]
             }
-        }
+        },
+        "created_at": created_at,
+        "updated_at": linked_at
     });
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO public.authoring_promotions \
-         (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, \
-          record) VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5)",
+    insert_activation_pending_promotion(
+        &mut transaction,
+        &promotion_id,
+        &request_digest,
+        &fixture.tenant_id,
+        &fixture.installation_id,
+        &fixture.requester.principal_id,
+        &promotion_record,
     )
-    .bind(&promotion_id)
-    .bind(&request_digest)
-    .bind(&fixture.tenant_id)
-    .bind(&fixture.requester.principal_id)
-    .bind(Json(&promotion_record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO public.activation_requests \
          (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \

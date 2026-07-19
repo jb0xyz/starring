@@ -866,19 +866,13 @@ async fn seed_product_target(pool: &PgPool) {
     .execute(&mut *transaction)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO authoring_promotions (id, record_format_version, revision, stage, \
-         request_digest, tenant_id, principal_id, record) \
-         VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5)",
+    insert_activation_pending_promotion(
+        &mut transaction,
+        PROMOTION,
+        &request_digest,
+        &promotion_record,
     )
-    .bind(PROMOTION)
-    .bind(&request_digest)
-    .bind(TENANT)
-    .bind(PRINCIPAL)
-    .bind(Json(promotion_record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO activation_requests (id, guild_id, ruleset_key, target_version, \
          target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
@@ -1127,19 +1121,13 @@ async fn seed_next_product_journal(pool: &PgPool, request: &EnqueueDeploymentV1)
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO public.authoring_promotions (id, record_format_version, revision, stage, \
-         request_digest, tenant_id, principal_id, record) \
-         VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5)",
+    insert_activation_pending_promotion(
+        &mut transaction,
+        NEXT_PROMOTION,
+        &request_digest,
+        &record,
     )
-    .bind(NEXT_PROMOTION)
-    .bind(&request_digest)
-    .bind(TENANT)
-    .bind(PRINCIPAL)
-    .bind(Json(record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO public.activation_requests (id, guild_id, ruleset_key, target_version, \
          target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
@@ -1356,6 +1344,13 @@ fn promotion_record(
         },
         "stage": {
             "state": "activation_pending",
+            "publication": {
+                "version": 1,
+                "schema_version": 1,
+                "content_hash": CONTENT_HASH,
+                "disposition": "created",
+                "registry_created_by": requester_id
+            },
             "activation": {
                 "request_id": activation_request_id,
                 "target": {
@@ -1366,13 +1361,66 @@ fn promotion_record(
                 },
                 "requester": requester_id,
                 "required_approvals": NonZeroU32::new(1).unwrap(),
+                "observed_active": null,
                 "created_at": created_at,
                 "expires_at": expires_at,
+                "disposition": "created",
                 "request_state_at_journal": "pending",
                 "approval_context": approval_context
             }
-        }
+        },
+        "created_at": created_at,
+        "updated_at": created_at
     })
+}
+
+async fn insert_activation_pending_promotion(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    request_digest: &str,
+    record: &Value,
+) {
+    let mut prepared = record.clone();
+    prepared["revision"] = json!(1);
+    prepared["stage"] = json!({"state": "prepared"});
+    let mut published = record.clone();
+    published["revision"] = json!(2);
+    published["stage"] = json!({
+        "state": "published",
+        "publication": record["stage"]["publication"].clone()
+    });
+    sqlx::query(
+        "INSERT INTO public.authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, installation_id, \
+          principal_id, record) VALUES ($1, 1, 1, 'prepared', $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(request_digest)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(PRINCIPAL)
+    .bind(Json(&prepared))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 2, stage = 'published', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(&published))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(record))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
 }
 
 async fn database_now(pool: &PgPool) -> DateTime<Utc> {

@@ -25,7 +25,7 @@ use automation_state::InteractionRuleSet;
 use chrono::Duration;
 use discord_model::{GuildId, Permissions, UserId};
 use resource_resolution::{approval_binding_fingerprint_v1, ResourceBindingMap};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Notify;
@@ -241,22 +241,47 @@ async fn prepare_product_promotion(
     context: &ProductApprovalContextV1,
 ) {
     let installation_id = product_installation_id(target.guild_id);
-    let record = json!({
+    let created_at =
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let intent = json!({
+        "authority": {
+            "tenant_id": PRODUCT_TENANT_ID,
+            "installation_id": installation_id,
+            "principal_id": PRODUCT_PRINCIPAL_ID,
+            "guild_id": target.guild_id,
+            "ruleset_key": target.ruleset_key
+        }
+    });
+    let publication = json!({
+        "version": target.version,
+        "schema_version": target.schema_version,
+        "content_hash": target.content_hash,
+        "disposition": "reused",
+        "registry_created_by": target.created_by
+    });
+    let prepared_record = json!({
+        "id": context.promotion_id.as_str(),
+        "revision": 1,
+        "request_digest": context.promotion_request_digest.as_str(),
+        "intent": intent,
+        "stage": {"state": "prepared"},
+        "created_at": created_at,
+        "updated_at": created_at
+    });
+    let published_record = json!({
         "id": context.promotion_id.as_str(),
         "revision": 2,
         "request_digest": context.promotion_request_digest.as_str(),
-        "intent": {
-            "authority": {
-                "tenant_id": PRODUCT_TENANT_ID,
-                "installation_id": installation_id,
-                "principal_id": PRODUCT_PRINCIPAL_ID,
-                "guild_id": target.guild_id,
-                "ruleset_key": target.ruleset_key
-            }
-        },
+        "intent": intent,
         "stage": {
-            "state": "published"
-        }
+            "state": "published",
+            "publication": publication
+        },
+        "created_at": created_at,
+        "updated_at": created_at
     });
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -326,14 +351,23 @@ async fn prepare_product_promotion(
         "INSERT INTO public.authoring_promotions \
          (id, record_format_version, revision, stage, request_digest, tenant_id, \
           installation_id, principal_id, record) \
-         VALUES ($1, 1, 2, 'published', $2, $3, $4, $5, $6)",
+         VALUES ($1, 1, 1, 'prepared', $2, $3, $4, $5, $6)",
     )
     .bind(context.promotion_id.as_str())
     .bind(context.promotion_request_digest.as_str())
     .bind(PRODUCT_TENANT_ID)
     .bind(&installation_id)
     .bind(PRODUCT_PRINCIPAL_ID)
-    .bind(record)
+    .bind(prepared_record)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 2, stage = 'published', record = $2 WHERE id = $1",
+    )
+    .bind(context.promotion_id.as_str())
+    .bind(published_record)
     .execute(&mut *transaction)
     .await
     .unwrap();
@@ -346,47 +380,49 @@ async fn journal_product_link(
     target: &RuleSetVersion,
     context: &ProductApprovalContextV1,
 ) {
-    let (created_at, expires_at) =
-        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-            "SELECT created_at, expires_at FROM activation_requests WHERE id = $1",
-        )
-        .bind(id.as_str())
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    let (created_at, expires_at, mut record) = sqlx::query_as::<
+        _,
+        (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            Value,
+        ),
+    >(
+        "SELECT activation.created_at, activation.expires_at, promotion.record \
+         FROM public.activation_requests AS activation \
+         JOIN public.authoring_promotions AS promotion ON promotion.id = $2 \
+         WHERE activation.id = $1",
+    )
+    .bind(id.as_str())
+    .bind(context.promotion_id.as_str())
+    .fetch_one(pool)
+    .await
+    .unwrap();
     let activation_target = ActivationTarget {
         guild_id: target.guild_id,
         ruleset_key: target.ruleset_key.clone(),
         version: target.version,
         content_hash: target.content_hash,
     };
-    let record = json!({
-        "id": context.promotion_id.as_str(),
-        "revision": 3,
-        "request_digest": context.promotion_request_digest.as_str(),
-        "intent": {
-            "authority": {
-                "tenant_id": PRODUCT_TENANT_ID,
-                "installation_id": product_installation_id(target.guild_id),
-                "principal_id": PRODUCT_PRINCIPAL_ID,
-                "guild_id": target.guild_id,
-                "ruleset_key": target.ruleset_key
-            }
-        },
-        "stage": {
-            "state": "activation_pending",
-            "activation": {
-                "request_id": id,
-                "target": activation_target,
-                "requester": UserId(10),
-                "required_approvals": context.policy.required_approvals,
-                "created_at": created_at,
-                "expires_at": expires_at,
-                "request_state_at_journal": "pending",
-                "approval_context": context
-            }
+    let publication = record["stage"]["publication"].clone();
+    record["revision"] = json!(3);
+    record["stage"] = json!({
+        "state": "activation_pending",
+        "publication": publication,
+        "activation": {
+            "request_id": id,
+            "target": activation_target,
+            "requester": UserId(10),
+            "required_approvals": context.policy.required_approvals,
+            "observed_active": null,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "disposition": "created",
+            "request_state_at_journal": "pending",
+            "approval_context": context
         }
     });
+    record["updated_at"] = json!(created_at);
     sqlx::query(
         "UPDATE public.authoring_promotions \
          SET revision = 3, stage = 'activation_pending', record = $2 \
