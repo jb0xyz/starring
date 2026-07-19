@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod id;
 pub mod model;
+pub mod product_preflight;
 pub mod service;
 pub mod store;
 
@@ -20,12 +21,18 @@ pub use model::{
     LinkDecisionError, ObservedActive, Rejection, RejectionDecisionError, SupersessionReasonV1,
     TransitionError, WithdrawDecisionError,
 };
+pub use product_preflight::{
+    assess_product_target_v1, check_product_readiness_v1, product_active_baseline_v1,
+    validate_product_target_v1, ActivationEnvironment, ProductPreflightErrorCodeV1,
+    ProductPreflightErrorV1, ProductPreflightReadyV1, ProductReadinessAssessmentV1,
+    ProductTargetAssessmentV1, ProductTargetReadyV1, ValidatedProductTargetV1,
+};
 #[cfg(feature = "unsafe-dev-activation")]
 pub use service::unsafe_dev_activate;
 pub use service::{
-    ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
-    ActivationService, ApplyError, ApplyOutcome, RecoveryDisposition, RecoveryEntry,
-    RecoveryReport, RequestActivation, RequestActivationError,
+    ActivationEnvironmentError, ActivationEnvironmentProvider, ActivationService, ApplyError,
+    ApplyOutcome, RecoveryDisposition, RecoveryEntry, RecoveryReport, RequestActivation,
+    RequestActivationError,
 };
 pub use store::{
     ActivationClock, ActivationRequestStore, ActivationStoreError, ApproveError, ClaimOutcome,

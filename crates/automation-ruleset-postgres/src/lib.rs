@@ -12,6 +12,8 @@ use sqlx::{PgConnection, PgPool, Row};
 
 const VERSION_COLUMNS: &str =
     "guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by";
+const PRODUCT_CONTROL_REQUIRED: &str =
+    "product-managed RuleSet requires authenticated product control";
 
 pub struct PostgresRuleSetStore<H: RuleSetHasher = Sha256RuleSetHasher> {
     pool: PgPool,
@@ -97,6 +99,39 @@ async fn lock_ruleset_head(
         Ok(())
     } else {
         Err(RuleSetStoreError::VersionNotFound)
+    }
+}
+
+async fn require_legacy_activation_scope(
+    connection: &mut PgConnection,
+    guild_id: &str,
+    ruleset_key: &str,
+) -> Result<(), RuleSetStoreError> {
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(\
+         pg_catalog.hashtextextended(\
+          'starring.ruleset-slot.v1:' || $1 || ':' || $2, 0))",
+    )
+    .bind(guild_id)
+    .bind(ruleset_key)
+    .execute(&mut *connection)
+    .await
+    .map_err(backend)?;
+    let product_managed = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+          SELECT 1 FROM public.automation_installations AS installation \
+          WHERE installation.discord_guild_id = $1 \
+           AND installation.ruleset_key = $2)",
+    )
+    .bind(guild_id)
+    .bind(ruleset_key)
+    .fetch_one(connection)
+    .await
+    .map_err(backend)?;
+    if product_managed {
+        Err(backend(PRODUCT_CONTROL_REQUIRED))
+    } else {
+        Ok(())
     }
 }
 
@@ -326,6 +361,10 @@ impl<H: RuleSetHasher> RuleSetStore for PostgresRuleSetStore<H> {
     ) -> Result<RuleSetActivation, RuleSetStoreError> {
         let guild = guild_id.to_string();
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        if let Err(error) = require_legacy_activation_scope(&mut tx, &guild, key.as_str()).await {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         lock_ruleset_head(&mut tx, &guild, key.as_str()).await?;
         let row = sqlx::query(
             "INSERT INTO automation_ruleset_activations (guild_id, ruleset_key, active_version) \
@@ -363,6 +402,10 @@ impl<H: RuleSetHasher> RuleSetStore for PostgresRuleSetStore<H> {
         let guild = request.guild_id.to_string();
         let key = request.ruleset_key.as_str();
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        if let Err(error) = require_legacy_activation_scope(&mut tx, &guild, key).await {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let target = sqlx::query_as::<_, RuleSetVersionRow>(&format!(
             "SELECT {VERSION_COLUMNS} FROM automation_ruleset_versions \
              WHERE guild_id = $1 AND ruleset_key = $2 AND version = $3"

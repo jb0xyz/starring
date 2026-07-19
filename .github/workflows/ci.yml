@@ -46,6 +46,8 @@ jobs:
         run: npm --prefix eval/codex-worker-slo run check
       - name: Install design harness evaluation dependencies
         run: npm --prefix eval/design-harness ci
+      - name: Audit design harness evaluation dependencies
+        run: npm --prefix eval/design-harness run audit
       - name: Check design harness evaluations
         run: npm --prefix eval/design-harness run check
 
@@ -90,7 +92,11 @@ jobs:
         run: cargo test -p automation-ruleset-activation-postgres -- --ignored --test-threads=1
       - name: Test authoring promotion PostgreSQL store
         run: cargo test -p authoring-promotion-postgres -- --ignored --test-threads=1
+      - name: Test authoring application PostgreSQL store
+        run: cargo test -p authoring-application-postgres -- --ignored --test-threads=1
       - name: Test pinned RuleSet dispatch
         run: cargo test -p automation-ruleset-dispatch -- --ignored --test-threads=1
       - name: Test RuleSet readiness activation
         run: cargo test -p automation-ruleset-readiness -- --ignored --test-threads=1
+      - name: Test runtime convergence PostgreSQL store
+        run: cargo test -p automation-runtime-convergence-postgres -- --ignored --test-threads=1

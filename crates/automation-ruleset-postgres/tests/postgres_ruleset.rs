@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use automation_ruleset::{
-    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, PublishOutcome,
-    PublishRuleSetRequest, RuleSetContentHash, RuleSetHashError, RuleSetHasher, RuleSetKey,
-    RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
-    RuleSetVersionIdentity,
+    content_hash, ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation,
+    PublishOutcome, PublishRuleSetRequest, RuleSetContentHash, RuleSetHashError, RuleSetHasher,
+    RuleSetKey, RuleSetSchemaVersion, RuleSetStore, RuleSetStoreError, RuleSetVersion,
+    RuleSetVersionId, RuleSetVersionIdentity, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_ruleset_postgres::{PostgresRuleSetStore, MIGRATOR};
 use automation_state::{
@@ -13,6 +13,7 @@ use automation_state::{
 };
 use discord_model::{GuildId, UserId};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Json;
 use sqlx::PgPool;
 
 fn database_url() -> String {
@@ -37,6 +38,14 @@ async fn pool() -> PgPool {
 
 async fn cleanup(pool: &PgPool, guild: GuildId) {
     let g = guild.to_string();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     for table in [
         "automation_ruleset_activations",
         "automation_ruleset_versions",
@@ -44,10 +53,18 @@ async fn cleanup(pool: &PgPool, guild: GuildId) {
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
             .bind(&g)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .unwrap();
     }
+    sqlx::query(
+        "ALTER TABLE automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 fn definition(alias: &str) -> InteractionRuleSet {
@@ -271,9 +288,21 @@ async fn version_overflow_boundary() {
     cleanup(&pool, guild).await;
 }
 
-struct FixedHasher;
+struct FixedHasher(RuleSetContentHash);
 
 impl RuleSetHasher for FixedHasher {
+    fn hash(
+        &self,
+        _schema_version: RuleSetSchemaVersion,
+        _definition: &InteractionRuleSet,
+    ) -> Result<RuleSetContentHash, RuleSetHashError> {
+        Ok(self.0)
+    }
+}
+
+struct NonCanonicalHasher;
+
+impl RuleSetHasher for NonCanonicalHasher {
     fn hash(
         &self,
         _schema_version: RuleSetSchemaVersion,
@@ -289,7 +318,8 @@ async fn hash_collision_leaves_store_unchanged() {
     let pool = pool().await;
     let guild = GuildId(9_000_005);
     cleanup(&pool, guild).await;
-    let store = PostgresRuleSetStore::with_hasher(pool.clone(), FixedHasher);
+    let fixed = content_hash(CURRENT_RULESET_SCHEMA_VERSION, &definition("a")).unwrap();
+    let store = PostgresRuleSetStore::with_hasher(pool.clone(), FixedHasher(fixed));
 
     store
         .publish(request(guild, &key(), definition("a")))
@@ -302,6 +332,102 @@ async fn hash_collision_leaves_store_unchanged() {
     assert_eq!(err, RuleSetStoreError::HashCollision);
     assert_eq!(store.list_versions(guild, &key()).await.unwrap().len(), 1);
     assert_eq!(head_next(&pool, guild, &key()).await, 2);
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn database_canonical_hash_matches_rust_and_rejects_noncanonical_writes() {
+    let pool = pool().await;
+    let guild = GuildId(9_000_015);
+    cleanup(&pool, guild).await;
+    for alias in ["member_role", "한글\n\t\"\\/role"] {
+        let definition = definition(alias);
+        let expected = content_hash(CURRENT_RULESET_SCHEMA_VERSION, &definition)
+            .unwrap()
+            .to_hex();
+        let actual = sqlx::query_scalar::<_, String>(
+            "SELECT public.starring_ruleset_content_hash_v1($1, $2)",
+        )
+        .bind(i64::from(CURRENT_RULESET_SCHEMA_VERSION.get()))
+        .bind(Json(&definition))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+    let store = PostgresRuleSetStore::with_hasher(pool.clone(), NonCanonicalHasher);
+    let rejected = store
+        .publish(request(guild, &key(), definition("invalid_hash")))
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, RuleSetStoreError::Backend(_)));
+    assert!(store.list_versions(guild, &key()).await.unwrap().is_empty());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn published_artifacts_reject_update_delete_and_oversize_insert() {
+    let pool = pool().await;
+    let guild = GuildId(9_000_016);
+    cleanup(&pool, guild).await;
+    let store = PostgresRuleSetStore::new(pool.clone());
+    store
+        .publish(request(guild, &key(), definition("immutable")))
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE automation_ruleset_versions SET definition = '{}'::JSONB \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+        "DELETE FROM automation_ruleset_versions \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(guild.to_string())
+            .bind(key().as_str())
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref(),
+            Some("55000")
+        );
+    }
+    let truncate_error = sqlx::query("TRUNCATE TABLE automation_ruleset_versions CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        truncate_error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("55000")
+    );
+    let oversized = serde_json::json!({"payload": "x".repeat(524_289)});
+    let error = sqlx::query(
+        "INSERT INTO automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         VALUES ($1, 'oversized', 1, 1, $2, $3, '1')",
+    )
+    .bind(guild.to_string())
+    .bind(Json(oversized))
+    .bind("ab".repeat(32))
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("23514")
+    );
+    assert_eq!(store.list_versions(guild, &key()).await.unwrap().len(), 1);
     cleanup(&pool, guild).await;
 }
 

@@ -62,6 +62,14 @@ async fn pool() -> PgPool {
 }
 
 async fn cleanup(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     for table in [
         "automation_ruleset_activations",
         "automation_ruleset_versions",
@@ -69,10 +77,18 @@ async fn cleanup(pool: &PgPool) {
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
             .bind(GUILD.to_string())
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .unwrap();
     }
+    sqlx::query(
+        "ALTER TABLE automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 fn key() -> RuleSetKey {

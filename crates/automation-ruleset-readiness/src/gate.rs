@@ -14,6 +14,9 @@ pub fn required_capabilities(ruleset: &InteractionRuleSet) -> Permissions {
                 | ActionSpec::GrantRole { .. }
                 | ActionSpec::UpsertOverwrite { .. } => required |= Permissions::MANAGE_ROLES,
                 ActionSpec::CreateChannel { .. } => required |= Permissions::MANAGE_CHANNELS,
+                ActionSpec::TeardownInstance { .. } => {
+                    required |= Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS;
+                }
                 _ => {}
             }
         }
@@ -170,6 +173,12 @@ mod tests {
             buttons: vec![],
         }]))
         .contains(Permissions::SEND_MESSAGES));
+        assert_eq!(
+            required_capabilities(&ruleset(vec![ActionSpec::TeardownInstance {
+                instance: automation_state::InstanceRef::Event,
+            }])),
+            Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS
+        );
     }
 
     #[test]

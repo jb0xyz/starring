@@ -16,7 +16,11 @@ pub use custom_id::{
     PANEL_RENDER_REVISION,
 };
 pub use error::classify_error;
-pub use gateway::run;
+pub use gateway::{
+    control_channel, run, run_controlled, GatewayCommandV1, GatewayControlV1,
+    GatewayDisconnectKindV1, GatewayExitV1, GatewayLifecycleEventV1, GatewayReadyKindV1,
+    GatewayRuntimeControlV1,
+};
 pub use instance_deleter::TwilightInstanceDeleter;
 pub use mutation::TwilightMutationAdapter;
 pub use panel_installer::TwilightPanelInstaller;

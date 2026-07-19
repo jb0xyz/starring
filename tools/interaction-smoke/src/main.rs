@@ -9,6 +9,7 @@ use automation_ruleset_activation::{
     ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
     ActivationRequestId, ActivationService, ActivationTarget, ApplyOutcome, RequestActivation,
 };
+use automation_ruleset_readiness::{GuildRoleHierarchyV1, GuildRoleStateV1};
 use automation_runtime::gateway;
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -18,6 +19,7 @@ use automation_state::{
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, Permissions, RoleId, UserId};
 use resource_resolution::ResourceBindingMap;
+use sqlx::postgres::PgConnectOptions;
 use twilight_http::Client;
 use twilight_model::id::Id;
 
@@ -398,6 +400,80 @@ fn resolve_ruleset_key(
     RuleSetKey::parse(raw).map_err(|error| CliError::InvalidRulesetKey(format!("{error:?}")))
 }
 
+fn require_legacy_smoke_scope(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(feature = "legacy-smoke") {
+        return Err("interaction-smoke requires the legacy-smoke build feature".into());
+    }
+    if env::var("STARRING_ALLOW_INTERACTION_SMOKE").as_deref() != Ok("1") {
+        return Err("interaction-smoke requires STARRING_ALLOW_INTERACTION_SMOKE=1".into());
+    }
+    let options = database_url
+        .parse::<PgConnectOptions>()
+        .map_err(|_| "interaction-smoke requires a PostgreSQL URL")?;
+    let database = options
+        .get_database()
+        .ok_or("interaction-smoke requires an explicit database name")?;
+    if !strict_test_database_name(database) {
+        return Err(
+            "interaction-smoke is restricted to the strict Starring test database namespace".into(),
+        );
+    }
+    Ok(())
+}
+
+fn strict_test_database_name(database: &str) -> bool {
+    database.starts_with("starring_")
+        && database.split('_').any(|segment| segment == "test")
+        && database
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+async fn reject_product_managed_command(
+    pool: &sqlx::PgPool,
+    guild_id: u64,
+    ruleset_key: &RuleSetKey,
+    command: &Command,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let guild_id = guild_id.to_string();
+    let request_id = match command {
+        Command::ApproveActivation { request_id, .. }
+        | Command::RejectActivation { request_id, .. }
+        | Command::ApplyActivation { request_id, .. }
+        | Command::ResumeActivation { request_id, .. } => Some(request_id),
+        _ => None,
+    };
+    let product_managed = if let Some(request_id) = request_id {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+              SELECT 1 FROM public.activation_requests AS activation \
+              INNER JOIN public.automation_installations AS installation \
+               ON installation.discord_guild_id = activation.guild_id \
+               AND installation.ruleset_key = activation.ruleset_key \
+              WHERE activation.id = $1)",
+        )
+        .bind(request_id.as_str())
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+              SELECT 1 FROM public.automation_installations AS installation \
+              WHERE installation.discord_guild_id = $1 \
+               AND installation.ruleset_key = $2)",
+        )
+        .bind(&guild_id)
+        .bind(ruleset_key.as_str())
+        .fetch_one(pool)
+        .await
+    }
+    .map_err(|_| "interaction-smoke RuleSet ownership check failed")?;
+    if product_managed {
+        return Err("interaction-smoke cannot access a product-managed RuleSet slot".into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -422,6 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let guild_id: u64 = env::var("DISCORD_TEST_GUILD")?.parse()?;
     let database_url = env::var("STARRING_DATABASE_URL")?;
+    require_legacy_smoke_scope(&database_url)?;
 
     let pool = sqlx::PgPool::connect(&database_url)
         .await
@@ -464,6 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ruleset_store,
         &activation_provider,
     );
+    reject_product_managed_command(&pool, guild_id, &ruleset_key, &parsed.command).await?;
     match parsed.command {
         Command::Seed { variant } => {
             return seed_studyroom(&ruleset_store, guild_id, &ruleset_key, variant).await;
@@ -582,15 +660,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Run => {}
     }
 
-    match activation_service.recover_applying(GuildId(guild_id)).await {
-        Ok(report) => {
-            for entry in report.entries {
-                eprintln!("activation recovery: {entry:?}");
-            }
+    let recovery = activation_service
+        .recover_applying(GuildId(guild_id))
+        .await
+        .map_err(|error| format!("activation recovery failed; refusing startup: {error}"))?;
+    for entry in recovery.entries {
+        if entry.disposition != automation_ruleset_activation::RecoveryDisposition::Recovered {
+            return Err(format!(
+                "activation recovery remained unresolved; refusing startup: {entry:?}"
+            )
+            .into());
         }
-        Err(error) => {
-            eprintln!("activation recovery list failed; continuing startup: {error}");
-        }
+        eprintln!("activation recovery: {entry:?}");
     }
 
     let token = env::var("DISCORD_TEST_TOKEN")?;
@@ -598,7 +679,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bindings = bindings(channel_id);
 
     let http = Client::new(token.clone());
-    let (guild_capabilities, role_permissions) =
+    let (guild_capabilities, role_permissions, _) =
         readiness_context(&http, guild_id, &bindings).await?;
 
     let runtime = automation_ruleset_readiness::hydrate_active_ruleset(
@@ -700,7 +781,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
             .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
         let bindings = bindings(channel_id);
         let http = Client::new(token);
-        let (guild_capabilities, role_permissions) =
+        let (guild_capabilities, role_permissions, role_hierarchy) =
             readiness_context(&http, target.guild_id.0, &bindings)
                 .await
                 .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
@@ -709,6 +790,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
             bindings,
             guild_capabilities,
             role_permissions,
+            role_hierarchy: Some(role_hierarchy),
         })
     }
 }
@@ -750,6 +832,7 @@ async fn readiness_context(
     (
         automation_ruleset_readiness::GuildCapabilities,
         BTreeMap<ResourceKey, Permissions>,
+        GuildRoleHierarchyV1,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -770,13 +853,32 @@ async fn readiness_context(
         })
         .collect();
     let bot_role_ids: Vec<RoleId> = bot_member.roles.iter().map(|id| RoleId(id.get())).collect();
-    automation_ruleset_readiness::build_readiness_context(
+    let role_hierarchy = GuildRoleHierarchyV1::new(
         GuildId(guild_id),
-        bindings,
-        &roles_snapshot,
-        &bot_role_ids,
+        guild_roles
+            .iter()
+            .map(|role| {
+                (
+                    RoleId(role.id.get()),
+                    GuildRoleStateV1 {
+                        position: role.position,
+                        managed: role.managed,
+                    },
+                )
+            })
+            .collect(),
+        bot_role_ids.clone(),
     )
-    .map_err(|e| format!("readiness context failed: {e:?}").into())
+    .map_err(|error| format!("role hierarchy context failed: {error:?}"))?;
+    let (guild_capabilities, role_permissions) =
+        automation_ruleset_readiness::build_readiness_context(
+            GuildId(guild_id),
+            bindings,
+            &roles_snapshot,
+            &bot_role_ids,
+        )
+        .map_err(|error| format!("readiness context failed: {error:?}"))?;
+    Ok((guild_capabilities, role_permissions, role_hierarchy))
 }
 
 async fn seed_studyroom(
@@ -1020,6 +1122,22 @@ mod tests {
         InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetVersionId,
     };
     use automation_ruleset_readiness::{policy_severity, required_capabilities};
+
+    #[test]
+    fn legacy_smoke_database_namespace_is_strict() {
+        for accepted in ["starring_test", "starring_full_release_test_20260719"] {
+            assert!(strict_test_database_name(accepted));
+        }
+        for rejected in [
+            "starring",
+            "starring_production",
+            "starring_test-production",
+            "other_test",
+            "starring_contest",
+        ] {
+            assert!(!strict_test_database_name(rejected));
+        }
+    }
 
     fn cli_args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()

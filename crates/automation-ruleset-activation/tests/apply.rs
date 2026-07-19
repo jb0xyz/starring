@@ -17,7 +17,7 @@ use automation_ruleset_activation::{
     LinkProductActivation, ManualActivationClock, ProductApprovalContextV1, RecoveryDisposition,
     RequestActivation, SupersessionReasonV1,
 };
-use automation_ruleset_readiness::GuildCapabilities;
+use automation_ruleset_readiness::{GuildCapabilities, GuildRoleHierarchyV1, GuildRoleStateV1};
 use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
 use chrono::{Duration, TimeZone, Utc};
 use desired_state::ResourceKey;
@@ -28,6 +28,31 @@ use resource_resolution::{
 };
 
 const GUILD: GuildId = GuildId(7);
+
+fn ready_role_hierarchy() -> GuildRoleHierarchyV1 {
+    let bot_role = RoleId(70);
+    GuildRoleHierarchyV1::new(
+        GUILD,
+        BTreeMap::from([
+            (
+                RoleId(GUILD.0),
+                GuildRoleStateV1 {
+                    position: 0,
+                    managed: false,
+                },
+            ),
+            (
+                bot_role,
+                GuildRoleStateV1 {
+                    position: 10,
+                    managed: true,
+                },
+            ),
+        ]),
+        vec![bot_role],
+    )
+    .unwrap()
+}
 
 fn key() -> RuleSetKey {
     RuleSetKey::parse("studyroom").unwrap()
@@ -152,6 +177,7 @@ impl RuleSetStore for SpyRuleSetStore {
 enum ProviderMode {
     Ready,
     ProductReady,
+    ProductRoleHierarchyMissing,
     ProductBindingRevisionDrift,
     ProductBindingFingerprintDrift,
     MissingCapability,
@@ -183,6 +209,7 @@ impl ActivationEnvironmentProvider for SpyProvider {
                     base_permissions: Permissions::ADMINISTRATOR,
                 },
                 role_permissions: BTreeMap::new(),
+                role_hierarchy: Some(ready_role_hierarchy()),
             }),
             ProviderMode::ProductReady => Ok(ActivationEnvironment {
                 binding_revision: NonZeroU64::new(3),
@@ -191,6 +218,16 @@ impl ActivationEnvironmentProvider for SpyProvider {
                     base_permissions: Permissions::ADMINISTRATOR,
                 },
                 role_permissions: BTreeMap::new(),
+                role_hierarchy: Some(ready_role_hierarchy()),
+            }),
+            ProviderMode::ProductRoleHierarchyMissing => Ok(ActivationEnvironment {
+                binding_revision: NonZeroU64::new(3),
+                bindings: ResourceBindingMap::default(),
+                guild_capabilities: GuildCapabilities {
+                    base_permissions: Permissions::ADMINISTRATOR,
+                },
+                role_permissions: BTreeMap::new(),
+                role_hierarchy: None,
             }),
             ProviderMode::ProductBindingRevisionDrift => Ok(ActivationEnvironment {
                 binding_revision: NonZeroU64::new(4),
@@ -199,6 +236,7 @@ impl ActivationEnvironmentProvider for SpyProvider {
                     base_permissions: Permissions::ADMINISTRATOR,
                 },
                 role_permissions: BTreeMap::new(),
+                role_hierarchy: Some(ready_role_hierarchy()),
             }),
             ProviderMode::ProductBindingFingerprintDrift => {
                 let mut bindings = ResourceBindingMap::default();
@@ -212,6 +250,7 @@ impl ActivationEnvironmentProvider for SpyProvider {
                         base_permissions: Permissions::ADMINISTRATOR,
                     },
                     role_permissions: BTreeMap::new(),
+                    role_hierarchy: Some(ready_role_hierarchy()),
                 })
             }
             ProviderMode::MissingCapability => Ok(ActivationEnvironment {
@@ -221,6 +260,7 @@ impl ActivationEnvironmentProvider for SpyProvider {
                     base_permissions: Permissions::SEND_MESSAGES,
                 },
                 role_permissions: BTreeMap::new(),
+                role_hierarchy: Some(ready_role_hierarchy()),
             }),
             ProviderMode::Fail => Err(ActivationEnvironmentError::Load(
                 "snapshot failed".to_string(),
@@ -397,11 +437,61 @@ fn create_approved_product_with_context(
     .unwrap();
     block_on(
         fixture
-            .requests
+            .service()
             .approve_bound(&id, UserId(20), &context.approval_payload_digest),
     )
     .unwrap();
     (id, context)
+}
+
+#[test]
+fn product_approval_service_requires_the_exact_payload_digest() {
+    let fixture = Fixture::new(ProviderMode::ProductReady);
+    let target = fixture.rulesets.publish(false);
+    let id = ActivationRequestId::parse("bound_service").unwrap();
+    let context = product_context(&id, &target, ExpectedActiveBaselineV1::Absent);
+    block_on(
+        fixture
+            .requests
+            .create_product(CreateProductActivationRequest {
+                id: id.clone(),
+                target: ActivationTarget {
+                    guild_id: target.guild_id,
+                    ruleset_key: target.ruleset_key.clone(),
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                requester: UserId(10),
+                context: context.clone(),
+            }),
+    )
+    .unwrap();
+    block_on(fixture.requests.link_product(
+        &id,
+        LinkProductActivation {
+            promotion_id: context.promotion_id.clone(),
+            promotion_request_digest: context.promotion_request_digest.clone(),
+            approval_context_digest: context.approval_context_digest.clone(),
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(
+        block_on(
+            fixture
+                .service()
+                .approve_bound(&id, UserId(20), &digest('f'))
+        )
+        .unwrap_err(),
+        automation_ruleset_activation::ApproveError::PayloadMismatch
+    );
+    let approved = block_on(fixture.service().approve_bound(
+        &id,
+        UserId(20),
+        &context.approval_payload_digest,
+    ))
+    .unwrap();
+    assert_eq!(approved.state, ActivationRequestState::Approved);
 }
 
 #[test]
@@ -638,6 +728,38 @@ fn product_activation_uses_guarded_pointer_cas() {
 }
 
 #[test]
+fn product_activation_releases_claim_when_role_hierarchy_is_unavailable() {
+    let fixture = Fixture::new(ProviderMode::ProductRoleHierarchyMissing);
+    let target = fixture.rulesets.publish(true);
+    let (id, _) = create_approved_product(
+        &fixture,
+        "product_role_hierarchy_missing",
+        &target,
+        ExpectedActiveBaselineV1::Absent,
+    );
+
+    assert_eq!(
+        block_on(
+            fixture
+                .service()
+                .apply(&id, attempt("product_role_hierarchy"), UserId(10)),
+        )
+        .unwrap_err(),
+        ApplyError::RoleHierarchyNotReady(
+            automation_ruleset_readiness::RoleHierarchyReadinessErrorV1::EvidenceUnavailable,
+        )
+    );
+    assert_eq!(fixture.rulesets.activate_calls(), 0);
+    assert!(block_on(fixture.rulesets.active(GUILD, &key()))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        block_on(fixture.requests.get(&id)).unwrap().unwrap().state,
+        ActivationRequestState::Approved
+    );
+}
+
+#[test]
 fn product_activation_is_superseded_before_snapshot_when_baseline_drifted() {
     let fixture = Fixture::new(ProviderMode::ProductReady);
     let target = fixture.rulesets.publish(false);
@@ -712,6 +834,58 @@ fn product_activation_is_superseded_when_approved_binding_revision_drifted() {
     assert!(block_on(fixture.rulesets.active(GUILD, &key()))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn policy_drift_reason_roundtrips_with_exact_policy_evidence() {
+    let reason = SupersessionReasonV1::PolicyDrift {
+        expected_revision: NonZeroU64::new(3).unwrap(),
+        observed_revision: NonZeroU64::new(4).unwrap(),
+        expected_required_approvals: NonZeroU32::new(2).unwrap(),
+        observed_required_approvals: NonZeroU32::new(3).unwrap(),
+        expected_ttl_seconds: NonZeroU64::new(1_800).unwrap(),
+        observed_ttl_seconds: NonZeroU64::new(900).unwrap(),
+    };
+
+    let value = serde_json::to_value(&reason).unwrap();
+
+    assert_eq!(value["reason"], "policy_drift");
+    assert_eq!(value["expected_revision"], 3);
+    assert_eq!(value["observed_revision"], 4);
+    assert_eq!(value["expected_required_approvals"], 2);
+    assert_eq!(value["observed_required_approvals"], 3);
+    assert_eq!(value["expected_ttl_seconds"], 1_800);
+    assert_eq!(value["observed_ttl_seconds"], 900);
+    assert_eq!(
+        serde_json::from_value::<SupersessionReasonV1>(value).unwrap(),
+        reason
+    );
+}
+
+#[test]
+fn policy_drift_reason_rejects_zero_and_unknown_evidence() {
+    let zero = serde_json::json!({
+        "reason": "policy_drift",
+        "expected_revision": 0,
+        "observed_revision": 4,
+        "expected_required_approvals": 2,
+        "observed_required_approvals": 3,
+        "expected_ttl_seconds": 1800,
+        "observed_ttl_seconds": 900
+    });
+    let unknown = serde_json::json!({
+        "reason": "policy_drift",
+        "expected_revision": 3,
+        "observed_revision": 4,
+        "expected_required_approvals": 2,
+        "observed_required_approvals": 3,
+        "expected_ttl_seconds": 1800,
+        "observed_ttl_seconds": 900,
+        "unexpected": true
+    });
+
+    assert!(serde_json::from_value::<SupersessionReasonV1>(zero).is_err());
+    assert!(serde_json::from_value::<SupersessionReasonV1>(unknown).is_err());
 }
 
 #[test]
@@ -855,6 +1029,7 @@ impl ActivationEnvironmentProvider for BaselineDriftingProvider<'_> {
                 base_permissions: Permissions::ADMINISTRATOR,
             },
             role_permissions: BTreeMap::new(),
+            role_hierarchy: Some(ready_role_hierarchy()),
         })
     }
 }
@@ -919,6 +1094,7 @@ impl ActivationEnvironmentProvider for StealingProvider<'_> {
                 base_permissions: Permissions::ADMINISTRATOR,
             },
             role_permissions: BTreeMap::new(),
+            role_hierarchy: Some(ready_role_hierarchy()),
         })
     }
 }

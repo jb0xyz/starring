@@ -83,14 +83,15 @@ async fn persist_transition(
     let next_revision = database_revision(next.revision)?;
     let row = sqlx::query_as::<_, PromotionRow>(&format!(
         "UPDATE authoring_promotions SET revision = $2, stage = $3, request_digest = $4, \
-         tenant_id = $5, principal_id = $6, record = $7 \
-         WHERE id = $1 AND revision = $8 RETURNING {PROMOTION_COLUMNS}"
+         tenant_id = $5, installation_id = $6, principal_id = $7, record = $8 \
+         WHERE id = $1 AND revision = $9 RETURNING {PROMOTION_COLUMNS}"
     ))
     .bind(next.id.as_str())
     .bind(next_revision)
     .bind(stage_name(&next.stage))
     .bind(next.request_digest.as_str())
     .bind(next.intent.authority.tenant_id.as_str())
+    .bind(next.intent.authority.installation_id.as_str())
     .bind(next.intent.authority.principal_id.as_str())
     .bind(Json(next))
     .bind(current_revision)
@@ -113,15 +114,16 @@ impl PromotionStore for PostgresPromotionStore {
         let revision = database_revision(record.revision)?;
         let result = sqlx::query(
             "INSERT INTO authoring_promotions \
-             (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, record) \
-             VALUES ($1, 1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (id) DO NOTHING",
+             (id, record_format_version, revision, stage, request_digest, tenant_id, installation_id, principal_id, record) \
+             VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(record.id.as_str())
         .bind(revision)
         .bind(stage_name(&record.stage))
         .bind(record.request_digest.as_str())
         .bind(record.intent.authority.tenant_id.as_str())
+        .bind(record.intent.authority.installation_id.as_str())
         .bind(record.intent.authority.principal_id.as_str())
         .bind(Json(&record))
         .execute(&self.pool)

@@ -12,7 +12,7 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **33 crates and 5
+Discord with a natural-language frontend." A Rust workspace of **38 crates and 5
 tools**, PostgreSQL-backed at its durable runtime boundaries, organized into
 three layers. The defining safety principle is constant across all layers:
 
@@ -121,9 +121,11 @@ checkpoint, not a production API or UI. The only implemented product recipe is
 the private study room recipe. Typed-planner fallback is classified but not yet
 handed off to an actual typed-planner session.
 
-The intended `authoring-application` route loads an owned, revalidated
-`PreviewReadyArtifactV1` through trusted session ports and passes it to the pure
-`authoring-promotion` workflow. That workflow publishes its exact
+The implemented `authoring-application` route authenticates an opaque product
+session, derives a fresh Discord guild-authority observation, and loads one
+atomic, revalidated `PreviewReadyArtifactV1` generation through server-owned
+ports before passing it to the pure `authoring-promotion` workflow. That
+workflow publishes its exact
 `InteractionRuleSet` as an inactive immutable version, creates a
 `ProductAuthoring` activation request, and durably binds that request to the
 exact promotion journal. The lower-level workflow remains a public core API and
@@ -132,20 +134,54 @@ The
 `authoring-promotion-postgres` adapter persists the monotonic workflow. A
 database trigger rejects a product activation link unless the exact
 `ActivationPending` promotion row, request, target, requester, policy, payload,
-and approval-context identities agree. Approval and apply continue through the
-existing activation authority; publication and promotion never change the
-active pointer.
+and approval-context identities agree. Approval reuses the product-bound
+decision evidence, but ProductAuthoring claim, apply, and resume are rejected by
+the generic activation store. Product Apply is allowed only through the
+authenticated atomic product-control boundary; publication and promotion never
+change the active pointer.
 
-The pure `authoring-application` boundary accepts only an idempotency key,
-session ID, and expected generation from the client-facing command. It receives
-an in-process trusted-principal assertion and delegates owner and generation
-checks to owned-session and server-authority ports. The latter resolves guild,
-installation, RuleSet key, requester, binding revision, and policy. The boundary
-then starts the promotion, attempts advancement, and returns the resulting state,
-which may also be terminal expiry. Durable session, authority, HTTP
-authentication, approval, rejection, and apply adapters are not yet attached,
-so this is an authentication-ready internal contract rather than a production
-endpoint.
+The pure `authoring-application` boundary accepts only bounded product commands
+and opaque credentials. It sequences authentication, CSRF verification for
+mutations, fresh Discord authority, exact tenant and installation scope,
+payload-bound approval, atomic Apply, and deployment-status projection. Durable
+PostgreSQL adapters now persist OAuth flow digests, opaque session and CSRF
+digests, encrypted authoring generations, current and historical installation
+authority, approval receipts, audit evidence, atomic Apply outcomes, and exact
+runtime deployment selectors. Apply writes the guarded active pointer,
+`Approved -> Applying -> Applied`, Requested deployment, receipt, aliases, and
+audit evidence in one serializable transaction. Normal baseline, binding, or
+policy drift instead commits a durable `Superseded` terminal record. Immutable
+target corruption remains a distinct bounded error and does not get hidden as
+drift.
+
+A provisioned product installation exclusively owns its `(guild, RuleSet key)`
+slot. Legacy and generic direct activation attempts plus installation takeover
+share one transaction-scoped slot lock and recheck ownership after waiting.
+Product Apply retains its separate product-lane lock and atomic transaction. A
+product activation cannot
+remain `Applying` at commit, an `Applied` product activation record is immutable,
+and the active pointer must identify the exact latest deployment lineage for
+that installation. Database constraints and Rust store guards both reject
+legacy or generic activation of a product-owned slot.
+
+The runtime convergence core and PostgreSQL adapter implement fenced claim,
+drain, activation, panel reconciliation, exact attestation, serving leases,
+heartbeat, disconnect, stale-Live recovery, and strict status projection. A
+deployment retains its historical Apply authority while every runtime mutation
+checks the current lifecycle and exact binding identity. Policy-only authority
+rotation keeps Live; a changed binding map, including one paired with a spoofed
+unchanged fingerprint, fails closed. Product status reports Live only for the
+exact desired-target digest, attestation, process generation, connected serving
+lease, and unexpired heartbeat.
+
+`product-control-http` now provides the hardened Axum route contract for OAuth,
+session, promotion, approval, rejection, Apply, product status, deployment
+status, and health. It enforces exact Host and Origin, strict JSON, bounded
+bodies and concurrency, deadlines, panic isolation, double-submit CSRF,
+host-only Secure cookies, idempotency-key validation, no-store responses, and
+closed response validation. It remains a library boundary rather than a
+runnable service because a production `ProductControlFacade` bridge and
+`tools/starring-api` composition root are not yet implemented.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -186,7 +222,7 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-33 crates, 5 Rust tools. The recurring pattern is **pure core + edge adapter**: pure
+38 crates, 5 Rust tools. The recurring pattern is **pure core + edge adapter**: pure
 crates hold the domain and logic and are forbidden `sqlx`/`twilight`
 dependencies (guarded by `dependency_guard` tests); a paired `*-postgres`
 adapter (or the `automation-runtime` Twilight edge) provides persistence and
@@ -201,9 +237,16 @@ Discord I/O.
   (interpret/run/validate), `automation-runtime` (Twilight edge).
 - **Layer 3 authoring**: `design-harness` (pure Draft, conversation, Intent IR,
   Recipe Compiler, candidate gates, and exact simulation).
-- **Layer 3 to Layer 2 promotion**: `authoring-application` (pure trusted-edge
-  application contract), `authoring-promotion` (workflow and product activation
-  bridge), and `authoring-promotion-postgres` (durable journal).
+- **Layer 3 to Layer 2 promotion and product control**:
+  `authoring-application` (pure authenticated use cases),
+  `authoring-application-discord` (Discord OAuth and fresh guild authority),
+  `authoring-application-postgres` (identity, encrypted snapshots, decisions,
+  Apply, and status), `product-control-http` (hardened transport contract),
+  `authoring-promotion` (workflow and product activation bridge), and
+  `authoring-promotion-postgres` (durable journal).
+- **Runtime convergence**: `automation-runtime-convergence` (fenced state
+  machine) and `automation-runtime-convergence-postgres` (durable claims,
+  attestations, serving leases, recovery, and status).
 - **Layer 2 durable ruleset**: `automation-ruleset` (registry core),
   `automation-ruleset-postgres`, `automation-ruleset-readiness` (hydration +
   activation gate), `automation-ruleset-dispatch` (pinned dispatch),
@@ -211,15 +254,17 @@ Discord I/O.
   authority).
 - **Layer 2 durable instances**: `automation-instance` + `-postgres`,
   `automation-instance-teardown`, `automation-panel-installation` + `-postgres`.
-- **Rust tools**: `interaction-smoke` (Layer 2 live runner + activation CLI),
+- **Rust tools**: `interaction-smoke` (feature-gated, test-database-only Layer 2
+  manual runner),
   `executor-smoke`, `starring-demo`, `ai-eval`, `design-harness`
   (Luna-medium/SQLite CLI and evaluation edge). `codex-worker` is a separate
   private loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is fourteen migrations under `/migrations`, including the original
-instance and RuleSet stores, product-bound activation context and terminal
-states, the authoring promotion journal, guarded activation, and the exact
-promotion-journal link gate.
+Persistence is twenty-seven migrations under `/migrations`, including the
+original instance and RuleSet stores, product-bound activation context and
+terminal states, the authoring promotion journal, atomic Product Apply and
+runtime deployment, runtime convergence, current-versus-historical binding
+separation, artifact integrity, and exclusive product-slot ownership.
 
 ## Durable RuleSet Lifecycle
 
@@ -250,24 +295,36 @@ teardown  Active → Deleting → Deleted; delete messages → channels → role
 
 ## Activation and Approval Safety Boundary
 
-The active RuleSet pointer changes only through the activation authority
-(`automation-ruleset-activation`). No CLI, API, or runtime path calls the
-low-level activation (`activate_if_ready` / `RuleSetStore::activate`) directly —
-a guard test enforces the allowlist. An activation is a durable request bound to
-an immutable target (guild, key, version, content hash); it requires a quorum of
-**distinct** authenticated approvers (the requester cannot self-approve); the
-leased apply service re-verifies the target and runs a **fresh** readiness check
-at execution time before mutating the pointer; crashes and concurrent execution
-converge through per-request and per-`(guild, key)` CAS. A development-only
-`unsafe-dev-activate` escape (compile-feature-gated, absent from normal builds)
-skips approval but keeps every technical safeguard.
+Legacy and manual RuleSet pointers change only through the activation authority
+(`automation-ruleset-activation`). No normal CLI, API, or runtime path calls its
+low-level activation (`activate_if_ready` / `RuleSetStore::activate`) directly;
+guard tests enforce the allowlist. A legacy activation is a durable request
+bound to an immutable target (guild, key, version, content hash); it requires a
+quorum of **distinct** approver identities supplied by its trusted caller (the
+requester cannot self-approve). Its leased apply service re-verifies the target
+and runs a **fresh** readiness check before mutating the pointer, while
+per-request and per-`(guild, key)` CAS converge crashes and concurrent
+execution. A development-only `unsafe-dev-activate` escape is
+compile-feature-gated, absent from normal builds, and cannot target a
+product-owned slot.
 
 Product-authored requests begin `Unlinked`. Both the pure bridge and a
 PostgreSQL trigger require an exact `ActivationPending` promotion journal before
 the request becomes approvable. Approval binds the exact promotion payload,
 resource projection, policy, and observed active baseline. Apply reloads the
 fresh environment and rechecks binding revision, fingerprint, baseline, and
-readiness even when the requested target is already active.
+readiness even when the requested target is already active. Product-authored
+pointers change only through this authenticated, serializable, atomic Product
+Apply boundary; generic activation claim, apply, resume, and direct store paths
+reject them.
+
+Once an installation claims a RuleSet slot, every committed active pointer for
+that slot must be backed by its exact latest product deployment and linked,
+`Applied` activation request. Legacy activation and installation takeover
+serialize on the same slot lock and recheck after waiting, so both race orders
+fail closed. Direct SQL cannot leave a product activation in `Applying`, mutate
+an `Applied` record, delete or retarget the pointer, or install over an
+in-flight legacy activation.
 
 ## Core Safety Invariants
 
@@ -284,14 +341,30 @@ readiness even when the requested target is already active.
   and write side cannot diverge.
 - Interactions dispatch against the instance's pinned version, re-checking
   readiness against a fresh snapshot per click.
-- The active pointer mutates only through the approval-bound activation authority.
+- Legacy/manual pointers mutate only through the approval-bound activation
+  authority; product-owned pointers mutate only through authenticated atomic
+  Product Apply.
+- Product Apply commits pointer, decision, Requested deployment, receipt, and
+  audit evidence atomically, or commits none of them. Lost outcomes are resolved
+  only by replaying the same idempotency key.
+- A product installation exclusively owns its RuleSet slot. Every active
+  pointer has exact latest-deployment lineage, legacy or generic direct
+  activation and takeover serialize on one slot-lock namespace, Product Apply
+  serializes on its product lane, and no product `Applying` residue or mutable
+  `Applied` evidence can commit.
+- Product Live requires exact current target, historical Apply identity, current
+  binding identity, immutable attestation, connected serving ownership, and an
+  unexpired heartbeat. Policy-only authority changes do not invalidate the
+  binding; binding content drift does.
+- The model-facing harness has no product identity, approval, Apply, deployment,
+  Discord, or PostgreSQL tool and cannot cross the production control boundary.
 
 ## Verification and CI
 
 - **CI** (`.github/workflows/ci.yml`, GitHub Actions, push + PR): a DB-less job
   (fmt, build, `cargo test --workspace`, clippy `-D warnings`, unsafe-dev feature
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
-  job (five adapter packages' ignored integration tests, serial). No live Discord
+  job (nine adapter or integration packages' ignored tests, serial). No live Discord
   or LLM in CI.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
@@ -308,6 +381,10 @@ readiness even when the requested target is already active.
 - **Live certification**: Layer 2 manual runbooks (real bot, guild, PostgreSQL)
   prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
   authoring cohort did not run a live Discord integration.
+- **Current product-slot checkpoint**: the exact clean-database PostgreSQL CI
+  sequence passed all nine packages and 123 tests. Focused product Apply passed
+  34/34, including both advisory-lock race orders and final-pointer transaction
+  semantics. The isolated `interaction-smoke` suite passed 24/24.
 
 ## What Is Complete
 
@@ -323,14 +400,34 @@ Stated as capabilities (durable across the phase numbering):
 - Preallocated instance identity with a complete, owned resource footprint.
 - Resumable, idempotent instance teardown.
 - Live-proven durable RuleSet rollback.
-- Approval-bound, un-bypassable activation authority (two-person, leased,
-  fresh-readiness-at-apply).
+- Normal-build approval-bound legacy/manual activation authority (two-person,
+  leased, fresh-readiness-at-apply) that rejects product-owned slots.
 - PreviewReady-to-approval promotion core: exact inactive publication,
   idempotent durable journal, product-bound approval payload, two-layer journal
-  link gate, and guarded active-pointer mutation through the existing authority.
-- Pure authentication-ready authoring application contract that derives
-  promotion authority from trusted-edge principal and server-owned session
-  ports.
+  link gate, and no active-pointer mutation during publication or promotion.
+- Pure authenticated product application that sequences opaque-session
+  authentication, mutation CSRF, fresh Discord authority, atomic server-owned
+  session snapshots, promotion, approval, Apply, and exact status projection.
+- Hardened product HTTP transport contract with exact-origin checks, secure
+  cookie and CSRF boundaries, strict payload parsing, resource limits, stable
+  response validation, and no raw authority-bearing fields.
+- Discord identify-only OAuth exchange and fresh bot-observed guild manager
+  evidence with bounded write and read lifetimes.
+- PostgreSQL product identity, OAuth flow, opaque session and CSRF storage,
+  encrypted authoring generations, current and historical installation
+  authority, bounded retention, and replay-evidence persistence.
+- Payload-bound product approval and serializable atomic Apply with one
+  pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
+  durable drift supersession, and redacted indeterminate-commit handling.
+- Fenced PostgreSQL runtime convergence with exact desired-target digests,
+  attestation, serving lease and heartbeat evidence, stale-Live recovery, and
+  product status that never equates an Applied pointer with Live.
+- Current-versus-historical authority separation: policy-only rotation preserves
+  runtime eligibility, while lifecycle, target, binding revision, fingerprint,
+  or binding-map mismatch fails closed.
+- Exclusive product RuleSet-slot ownership with shared advisory locking,
+  commit-time exact-deployment lineage, terminal product activation evidence,
+  and Rust plus database rejection of legacy or generic bypass paths.
 - Pure conversational Intent IR and deterministic Recipe Compiler for the first
   private-study-room recipe.
 - Intent protocol V4 semantic identity: ordered human request evidence; closed
@@ -373,16 +470,25 @@ Stated as capabilities (durable across the phase numbering):
 
 - A production user-facing authoring API or UI. The current harness is a CLI and
   evaluation checkpoint.
-- Durable owned-session and guild-installation authority adapters for
-  `authoring-application`; its pure ports are implemented but not wired to an
-  authenticated HTTP edge.
-- An authenticated production approval surface (the CLI's manual actor input is
-  workflow validation only, not identity assurance).
-- Promotion status convergence after approval, rejection, expiry, apply, and
-  runtime hydration. The activation request is authoritative today; promotion
-  stages stop at `ActivationPending` or `Expired`.
-- Runtime activation acknowledgement and controlled reload/hot-swap. A guarded
-  active-pointer change is not yet a `Live` product acknowledgement.
+- A production implementation of the HTTP `ProductControlFacade` and a runnable
+  `tools/starring-api` composition root. The hardened router is not yet bound to
+  the application and adapters.
+- Four remaining production adapters: a scoped PostgreSQL installation-authority
+  source, approval-environment provider, authenticated snapshot envelope cipher,
+  and atomic product-rejection adapter. `GET /v1/me` also needs a session-only
+  read projection that does not weaken mutation CSRF checks.
+- Least-privilege PostgreSQL deployment roles, restrictive default privileges,
+  row policies, direct-DML denial, and a startup capability/readiness probe.
+- A production `tools/starring-runtime` worker that performs the actual Discord
+  drain, hydration, panel reconciliation, gateway start, attestation, and
+  heartbeat loop. The durable state machine is implemented, but no production
+  process currently advances Requested deployments to Live.
+- A trusted server-side writer that accepts only harness-validated
+  `PreviewReadyArtifactV1` output and advances encrypted PostgreSQL authoring
+  generations. Existing product control can start from a pre-seeded durable
+  generation but is not yet connected to the Luna harness output.
+- Product rejection persistence. Approval, Apply, and status have PostgreSQL
+  adapters; the rejection port remains an unimplemented production boundary.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
 - A periodic teardown-retry worker (teardown resumes on boot, not on a schedule).
@@ -400,17 +506,25 @@ Stated as capabilities (durable across the phase numbering):
 
 ## Known Limitations
 
-- Manual CLI `--actor` input provides no production identity assurance; the real
-  approval boundary completes when an authenticated surface attaches.
-- `authoring-application` is an internal trust-boundary contract, not an
-  authenticator. `VerifiedPrincipalV1::from_trusted_edge` must be called only
-  after transport authentication, and production composition must not expose
-  `PromotionService::start` directly.
-  `OwnedPreviewReadyArtifactV1::from_owned_session` is likewise a public
-  in-process trust constructor, not ownership proof by itself. The owned-artifact
-  and authority adapters must enforce the same durable generation in one
-  transaction or equivalent snapshot before this boundary is
-  production-authenticated.
+- The current branch proves the product-control core and PostgreSQL adapters,
+  not a publicly runnable service. Exposing the HTTP router before the facade,
+  remaining adapters, least-privilege roles, and startup probes exist is a
+  release-blocking configuration error.
+- `interaction-smoke` is non-production manual tooling. It is unavailable
+  without its compile feature, requires `STARRING_ALLOW_INTERACTION_SMOKE=1`,
+  is marked non-publishable, and accepts only ASCII alphanumeric/underscore
+  database names with the `starring_` prefix and an underscore-delimited `test`
+  segment. Those gates do not authenticate Discord credentials: never provide
+  production bot or guild credentials, and drain every old smoke process before
+  a cutover. Production build and deployment manifests must exclude the binary
+  and both smoke features entirely.
+- The HTTP `/v1/me` contract intentionally carries only the session cookie,
+  while the current PostgreSQL principal lookup requires CSRF. A separate
+  session-only read method is required; mutation authentication must not be
+  relaxed to solve this mismatch.
+- Apply can durably reach `RuntimePending`, and tests can drive exact simulated
+  attestation to Live. Commercial operation still requires the separate runtime
+  worker and real Discord lifecycle integration.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
@@ -462,8 +576,8 @@ Stated as capabilities (durable across the phase numbering):
   are green, but this operational issue prevents claiming that the latest full
   workspace gate completed locally and should be resolved before relying on
   repeated whole-workspace runs.
-- The data volume is about 86% used with roughly 31 GiB free. Recover at least
-  another 20 GiB before retaining additional large build or evaluation cohorts;
+- The data volume is about 91% used with roughly 20 GiB free. Recover at least
+  another 30 GiB before retaining additional large build or evaluation cohorts;
   this is an operational capacity target, not a certified production margin.
 
 ## Next Phase: Prove Commercial Operation
@@ -474,27 +588,30 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Preserve the passing clean-source cohort and the earlier failed or
-   interrupted diagnostic cohorts as immutable, separate evidence. Keep the raw
-   worker loopback-only and retain exact provider/model/effort/auth pinning.
-2. Measure queueing, concurrency, saturation, long-running soak recovery, and
-   worker high availability on the Mac mini before setting a commercial SLO.
-3. Run the existing live Discord and PostgreSQL safety scenarios for the
-   integrated authoring-to-approval path; the passing authoring matrix itself
-   did not exercise Discord.
-4. Add typed multi-turn preference accumulation plus atomic recipe-owned-region
-   edit and recompile with explicit `keep`, `set`, and `reset_default`
-   semantics.
-5. Complete the actual typed-planner handoff for supported custom static
-   automation while preserving the same candidate gates and no-deploy boundary.
-6. Add an authenticated authoring API/UI, guild-binding authority, session
-   ownership, and the existing approval/publication/activation integration.
-7. Add whole-plan deterministic preflight before the first side effect, then
-   provisioning state, compensation, reconciliation, and replay idempotency for
-   uncertain external effects.
-8. Release a bounded next private-room recipe, expand the recipe catalog, then
-   begin the separate `StatefulSpec` runtime arc for state, conditions, timers,
-   sessions, and games.
+1. Implement the remaining identity, installation-authority,
+   approval-environment, rejection, and snapshot-crypto adapters with
+   cross-scope, replay, contention, corruption, and secret-redaction tests.
+2. Bridge the existing hardened router to `ProductControlApplication` through a
+   closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
+   binary with bounded configuration, graceful shutdown, finite telemetry
+   labels, and readiness that fails before accepting traffic.
+3. Add least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+   restrictive grants/default privileges; row policies; direct-DML denial; and
+   a CI-tested positive/negative capability matrix.
+4. Build `tools/starring-runtime` with its separate DB role and bot credential,
+   then prove Requested through exact Live and Live-loss recovery against a real
+   Discord test guild.
+5. Connect a trusted server-side harness writer so only validated and simulated
+   Luna output can advance encrypted `PreviewReady` generations.
+6. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+   separate immutable evidence, then measure queueing, concurrency, saturation,
+   soak recovery, and worker high availability before setting a commercial SLO.
+7. Add typed multi-turn preference accumulation and the typed-planner handoff
+   while preserving the same deterministic candidate gates and no-deploy model
+   boundary.
+8. Add whole-plan deterministic preflight, compensation, reconciliation, and
+   uncertain-external-effect replay before expanding the recipe catalog or
+   beginning the separate `StatefulSpec` runtime arc.
 
 The handoff document linked above is authoritative for the detailed ordering,
 current evidence, commands, and known maintenance debt.

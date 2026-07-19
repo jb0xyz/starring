@@ -53,8 +53,10 @@ fn regular_dependencies_stay_pure() {
     let forbidden = [
         "sqlx",
         "rusqlite",
+        "axum",
         "ai-gateway",
         "automation-runtime",
+        "automation-ruleset-activation",
         "automation-ruleset-readiness",
         "approval-manager",
         "policy-engine",
@@ -104,7 +106,7 @@ ai-gateway = "1"
 
 #[test]
 fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
-    let source = include_str!("../src/lib.rs");
+    let source = source();
     assert!(!source.contains("Deserialize"));
     let command = source
         .split("pub struct PromoteOwnedSessionV1")
@@ -127,4 +129,162 @@ fn authority_inputs_stay_non_deserializable_and_out_of_the_client_command() {
             "client command leaked {forbidden}"
         );
     }
+}
+
+#[test]
+fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
+    let source = source();
+    assert!(!source.contains("from_trusted_edge"));
+    assert!(!source.contains("pub fn from_authenticated_session"));
+    assert!(!source.contains("pub fn from_authentication_claims"));
+    assert!(!source.contains("pub trait OwnedSessionArtifactPort"));
+    assert!(!source.contains("pub trait PromotionAuthorityPort"));
+    assert!(source.contains("pub trait AuthenticationPort"));
+    assert!(source.contains("pub trait MutationAuthenticationPort"));
+    assert!(source.contains("pub trait AuthorizedPromotionSnapshotPort"));
+    assert!(source.contains("load_atomic_authorized_snapshot"));
+    let identity = include_str!("../src/identity.rs");
+    let authenticated_session = identity
+        .split("struct AuthenticatedSessionV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!identity.contains("pub struct AuthenticatedSessionV1"));
+    assert!(!authenticated_session.contains("tenant"));
+    let authentication_claims = identity
+        .split("pub struct AuthenticationClaimsV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!authentication_claims.contains("tenant"));
+    assert!(authentication_claims.contains("session_fingerprint"));
+    assert!(identity.contains("AuthenticatedSessionFingerprintV1(<redacted>)"));
+    assert!(identity.contains("AuthenticationClaimsV1(<redacted>)"));
+    let application = include_str!("../src/application.rs");
+    assert!(application.contains("authenticate_mutation(credential, csrf)"));
+    for mutation in ["promote_owned_session", "approve", "reject", "apply"] {
+        let method = application
+            .split(&format!("fn {mutation}"))
+            .nth(1)
+            .unwrap()
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            method.contains("csrf"),
+            "mutation {mutation} omitted CSRF proof"
+        );
+    }
+}
+
+#[test]
+fn product_commands_never_accept_trusted_authority_or_apply_attempt_fields() {
+    let source = source();
+    for command_name in [
+        "ApproveProductPromotionV1",
+        "RejectProductPromotionV1",
+        "ApplyProductPromotionV1",
+    ] {
+        let command = source
+            .split(&format!("pub struct {command_name}"))
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        for forbidden in [
+            "actor",
+            "guild_id",
+            "requester",
+            "policy",
+            "target",
+            "attempt_id",
+        ] {
+            assert!(
+                !command.contains(forbidden),
+                "client command {command_name} leaked {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decision_port_has_only_bound_decisions_and_adapter_derived_apply_identity() {
+    let source = include_str!("../src/control.rs");
+    for (trait_name, methods) in [
+        (
+            "ProductDecisionQueryPort",
+            &["load_approval_preview", "load_product_status"][..],
+        ),
+        ("ProductApprovalPort", &["approve_payload_bound"][..]),
+        ("ProductRejectionPort", &["reject_payload_bound"][..]),
+        ("ProductApplyPort", &["apply_idempotent"][..]),
+    ] {
+        let port = source
+            .split(&format!("pub trait {trait_name}"))
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        for method in methods {
+            assert!(port.contains(method), "{trait_name} omitted {method}");
+        }
+    }
+    let marker = source
+        .split("pub trait ProductDecisionPort")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    for capability in [
+        "ProductDecisionQueryPort",
+        "ProductApprovalPort",
+        "ProductRejectionPort",
+        "ProductApplyPort",
+    ] {
+        assert!(marker.contains(capability));
+    }
+    assert!(!marker.contains("async fn"));
+    assert!(!source.contains("ApplyAttemptId"));
+    assert!(!source.contains("async fn approve("));
+    assert!(!source.contains("async fn reject("));
+    assert!(!source.contains("async fn apply("));
+}
+
+#[test]
+fn product_mutation_context_is_crate_issued_bound_and_redacted() {
+    let control = include_str!("../src/control.rs");
+    let context = control
+        .split("pub struct ProductMutationContextV1")
+        .nth(1)
+        .unwrap()
+        .split("pub struct AuthorizedApprovalPreviewV1")
+        .next()
+        .unwrap();
+    for bound_value in ["request_id", "actor", "scope", "evidence"] {
+        assert!(context.contains(bound_value));
+    }
+    assert!(context.contains("pub(crate) fn new"));
+    assert!(!context.contains("pub fn new"));
+    assert!(context.contains("ProductMutationContextV1(<redacted>)"));
+    assert!(control.contains("ProductRequestIdV1(<redacted>)"));
+}
+
+fn source() -> String {
+    [
+        include_str!("../src/lib.rs"),
+        include_str!("../src/application.rs"),
+        include_str!("../src/authority.rs"),
+        include_str!("../src/control.rs"),
+        include_str!("../src/identity.rs"),
+        include_str!("../src/promotion.rs"),
+        include_str!("../src/status.rs"),
+    ]
+    .join("\n")
 }

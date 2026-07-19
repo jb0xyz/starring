@@ -11,12 +11,12 @@ use automation_ruleset_activation::{
     approval_policy_digest_v1, product_approval_context_digest_v1, ActivationDigest,
     ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
     ActivationLinkStateV1, ActivationPromotionId, ActivationRequest, ActivationRequestId,
-    ActivationRequestState, ActivationRequestStore, ActivationService, ActivationTarget,
-    ApplyAttemptId, ApplyError, ApplyErrorRecord, ApplyFailureKind, ApplyOutcome,
+    ActivationRequestState, ActivationRequestStore, ActivationService, ActivationStoreError,
+    ActivationTarget, ApplyAttemptId, ApplyError, ApplyErrorRecord, ApplyFailureKind, ApplyOutcome,
     ApprovalBindingContextV1, ApprovalPolicyBindingV1, ApproveError, ClaimOutcome, CompletionKind,
     CreateActivationRequest, CreateProductActivationRequest, ExpectedActiveBaselineV1,
     LinkProductActivation, LinkProductError, ProductApprovalContextV1, RecoveryDisposition,
-    SupersessionReasonV1, WithdrawError,
+    RejectError, SupersessionReasonV1, WithdrawError,
 };
 use automation_ruleset_activation_postgres::{PostgresActivationRequestStore, MIGRATOR};
 use automation_ruleset_postgres::PostgresRuleSetStore;
@@ -29,6 +29,11 @@ use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Notify;
+
+const PRODUCT_TENANT_ID: &str = "activation-postgres-tests";
+const PRODUCT_PRINCIPAL_ID: &str = "activation-postgres-tests";
+const PRODUCT_APPLICATION_ID: &str = "9100000";
+const PRODUCT_DISCORD_USER_ID: &str = "10";
 
 fn database_url() -> String {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
@@ -52,20 +57,54 @@ async fn pool() -> PgPool {
 
 async fn cleanup(pool: &PgPool, guild_id: GuildId) {
     let guild = guild_id.to_string();
-    sqlx::query(
-        "DELETE FROM authoring_promotions WHERE id IN \
-         (SELECT promotion_id FROM activation_requests WHERE guild_id = $1 \
-          AND promotion_id IS NOT NULL)",
-    )
-    .bind(&guild)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM activation_requests WHERE guild_id = $1")
-        .bind(&guild)
-        .execute(pool)
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.activation_request_approvals IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *transaction)
         .await
         .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.activation_request_approvals \
+         DISABLE TRIGGER activation_request_approvals_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM public.activation_request_approvals AS approval \
+         USING public.activation_requests AS activation \
+         WHERE approval.request_id = activation.id AND activation.guild_id = $1",
+    )
+    .bind(&guild)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.activation_request_approvals \
+         ENABLE TRIGGER activation_request_approvals_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH deleted_requests AS ( \
+             DELETE FROM public.activation_requests WHERE guild_id = $1 \
+             RETURNING promotion_id \
+         ) \
+         DELETE FROM public.authoring_promotions AS promotion \
+         USING deleted_requests AS request \
+         WHERE request.promotion_id IS NOT NULL AND promotion.id = request.promotion_id",
+    )
+    .bind(&guild)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DISABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     for table in [
         "automation_ruleset_activations",
         "automation_ruleset_versions",
@@ -73,10 +112,18 @@ async fn cleanup(pool: &PgPool, guild_id: GuildId) {
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
             .bind(&guild)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .unwrap();
     }
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         ENABLE TRIGGER automation_ruleset_versions_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 fn key() -> RuleSetKey {
@@ -104,15 +151,29 @@ fn digest(value: char) -> ActivationDigest {
     ActivationDigest::parse(&value.to_string().repeat(64)).unwrap()
 }
 
+fn product_control_required() -> ActivationStoreError {
+    ActivationStoreError::InvalidRequest(
+        "product activation requires authenticated product control".to_string(),
+    )
+}
+
 fn product_context(
     id: &ActivationRequestId,
     target: &RuleSetVersion,
     promotion_value: char,
 ) -> ProductApprovalContextV1 {
+    product_context_with_ttl(id, target, promotion_value, NonZeroU64::new(1_800).unwrap())
+}
+
+fn product_context_with_ttl(
+    id: &ActivationRequestId,
+    target: &RuleSetVersion,
+    promotion_value: char,
+    ttl_seconds: NonZeroU64,
+) -> ProductApprovalContextV1 {
     let binding_revision = NonZeroU64::new(3).unwrap();
     let policy_revision = NonZeroU64::new(7).unwrap();
     let required_approvals = NonZeroU32::new(1).unwrap();
-    let ttl_seconds = NonZeroU64::new(1_800).unwrap();
     let activation_target = ActivationTarget {
         guild_id: target.guild_id,
         ruleset_key: target.ruleset_key.clone(),
@@ -170,6 +231,115 @@ fn product_link(context: &ProductApprovalContextV1) -> LinkProductActivation {
     }
 }
 
+fn product_installation_id(guild_id: GuildId) -> String {
+    format!("activation-postgres-{guild_id}")
+}
+
+async fn prepare_product_promotion(
+    pool: &PgPool,
+    target: &RuleSetVersion,
+    context: &ProductApprovalContextV1,
+) {
+    let installation_id = product_installation_id(target.guild_id);
+    let record = json!({
+        "id": context.promotion_id.as_str(),
+        "revision": 2,
+        "request_digest": context.promotion_request_digest.as_str(),
+        "intent": {
+            "authority": {
+                "tenant_id": PRODUCT_TENANT_ID,
+                "installation_id": installation_id,
+                "principal_id": PRODUCT_PRINCIPAL_ID,
+                "guild_id": target.guild_id,
+                "ruleset_key": target.ruleset_key
+            }
+        },
+        "stage": {
+            "state": "published"
+        }
+    });
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.product_principals (principal_id, discord_user_id) \
+         VALUES ($1, $2) ON CONFLICT (principal_id) DO NOTHING",
+    )
+    .bind(PRODUCT_PRINCIPAL_ID)
+    .bind(PRODUCT_DISCORD_USER_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.product_tenants \
+         (tenant_id, lifecycle_state, display_name, display_metadata) \
+         VALUES ($1, 'active', 'Activation PostgreSQL Tests', '{}'::JSONB) \
+         ON CONFLICT (tenant_id) DO NOTHING",
+    )
+    .bind(PRODUCT_TENANT_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installations \
+         (installation_id, tenant_id, discord_application_id, discord_guild_id, ruleset_key, \
+          lifecycle_state, current_authority_revision) \
+         VALUES ($1, $2, $3, $4, $5, 'active', 1) \
+         ON CONFLICT (installation_id) DO NOTHING",
+    )
+    .bind(&installation_id)
+    .bind(PRODUCT_TENANT_ID)
+    .bind(PRODUCT_APPLICATION_ID)
+    .bind(target.guild_id.to_string())
+    .bind(target.ruleset_key.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions \
+         (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
+          binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
+          authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         SELECT $1, 1, $2, $3, '{}'::JSONB, $4, $5, $6, $7, $8, $9, $10 \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM public.automation_installation_authority_versions \
+             WHERE installation_id = $1 AND revision = 1 \
+         ) \
+         ON CONFLICT (installation_id, revision) DO NOTHING",
+    )
+    .bind(&installation_id)
+    .bind(PRODUCT_TENANT_ID)
+    .bind(i64::try_from(context.binding.revision.get()).unwrap())
+    .bind(context.binding.fingerprint.as_str())
+    .bind(i64::try_from(context.policy.revision.get()).unwrap())
+    .bind(i32::try_from(context.policy.required_approvals.get()).unwrap())
+    .bind(i64::try_from(context.policy.ttl_seconds.get()).unwrap())
+    .bind(context.approval_context_digest.as_str())
+    .bind(PRODUCT_PRINCIPAL_ID)
+    .bind(context.promotion_request_digest.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, \
+          installation_id, principal_id, record) \
+         VALUES ($1, 1, 2, 'published', $2, $3, $4, $5, $6)",
+    )
+    .bind(context.promotion_id.as_str())
+    .bind(context.promotion_request_digest.as_str())
+    .bind(PRODUCT_TENANT_ID)
+    .bind(&installation_id)
+    .bind(PRODUCT_PRINCIPAL_ID)
+    .bind(record)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
 async fn journal_product_link(
     pool: &PgPool,
     id: &ActivationRequestId,
@@ -196,8 +366,11 @@ async fn journal_product_link(
         "request_digest": context.promotion_request_digest.as_str(),
         "intent": {
             "authority": {
-                "tenant_id": "activation-postgres-tests",
-                "principal_id": "activation-postgres-tests"
+                "tenant_id": PRODUCT_TENANT_ID,
+                "installation_id": product_installation_id(target.guild_id),
+                "principal_id": PRODUCT_PRINCIPAL_ID,
+                "guild_id": target.guild_id,
+                "ruleset_key": target.ruleset_key
             }
         },
         "stage": {
@@ -215,13 +388,11 @@ async fn journal_product_link(
         }
     });
     sqlx::query(
-        "INSERT INTO authoring_promotions \
-         (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, record) \
-         VALUES ($1, 1, 3, 'activation_pending', $2, $3, $3, $4)",
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', record = $2 \
+         WHERE id = $1",
     )
     .bind(context.promotion_id.as_str())
-    .bind(context.promotion_request_digest.as_str())
-    .bind("activation-postgres-tests")
     .bind(record)
     .execute(pool)
     .await
@@ -308,6 +479,7 @@ fn ready_environment() -> ActivationEnvironment {
             base_permissions: Permissions::ADMINISTRATOR,
         },
         role_permissions: BTreeMap::new(),
+        role_hierarchy: None,
     }
 }
 
@@ -407,6 +579,57 @@ async fn approve(
     store.approve(id, UserId(approver)).await.unwrap()
 }
 
+async fn decision_snapshot(pool: &PgPool, id: &ActivationRequestId) -> (String, Option<i64>, i64) {
+    sqlx::query_as(
+        "SELECT activation.state, activation.product_revision, \
+         (SELECT pg_catalog.count(*) FROM public.activation_request_approvals AS approval \
+          WHERE approval.request_id = activation.id) \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_product_approval(
+    pool: &PgPool,
+    id: &ActivationRequestId,
+    context: &ProductApprovalContextV1,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.set_config('starring.product_approval_gate', $1, TRUE)",
+    )
+    .bind(context.approval_context_digest.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(bound, context.approval_context_digest.as_str());
+    sqlx::query(
+        "INSERT INTO public.activation_request_approvals \
+         (request_id, approver_id, approved_at, approval_payload_digest) \
+         VALUES ($1, '20', clock_timestamp(), $2)",
+    )
+    .bind(id.as_str())
+    .bind(context.approval_payload_digest.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let updated = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'approved', product_revision = product_revision + 1 \
+         WHERE id = $1 AND authority_kind = 'product_authoring' \
+         AND state = 'pending' AND product_revision = 1",
+    )
+    .bind(id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    transaction.commit().await.unwrap();
+}
+
 async fn create_approved(
     store: &PostgresActivationRequestStore,
     id: &str,
@@ -426,6 +649,7 @@ async fn create_approved_product(
 ) -> (ActivationRequestId, ProductApprovalContextV1) {
     let id = request_id(id_value);
     let context = product_context(&id, target, promotion_value);
+    prepare_product_promotion(pool, target, &context).await;
     store
         .create_product(product_input(id.clone(), target, context.clone()))
         .await
@@ -435,10 +659,7 @@ async fn create_approved_product(
         .link_product(&id, product_link(&context))
         .await
         .unwrap();
-    store
-        .approve_bound(&id, UserId(20), &context.approval_payload_digest)
-        .await
-        .unwrap();
+    seed_product_approval(pool, &id, &context).await;
     (id, context)
 }
 
@@ -781,21 +1002,14 @@ async fn expiry_and_apply_claim_cannot_both_transition() {
     let target = publish(&rulesets, guild, 1).await;
     let id = create_approved(&requests, "expiry_claim", &target).await;
     sqlx::query(
-        "UPDATE activation_request_approvals SET approved_at = NOW() - INTERVAL '2 seconds' \
-         WHERE request_id = $1",
+        "UPDATE activation_requests \
+         SET expires_at = clock_timestamp() + INTERVAL '50 milliseconds' WHERE id = $1",
     )
     .bind(id.as_str())
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE activation_requests SET created_at = NOW() - INTERVAL '3 seconds', \
-         expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
-    )
-    .bind(id.as_str())
-    .execute(&pool)
-    .await
-    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let (expired, claim) = tokio::join!(
         requests.mark_expired(&id),
@@ -963,6 +1177,7 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
         let rulesets = PostgresRuleSetStore::new(first_pool.clone());
         let target = publish(&rulesets, guild, 1).await;
         context = product_context(&id, &target, '1');
+        prepare_product_promotion(&first_pool, &target, &context).await;
         let created = requests
             .create_product(product_input(id.clone(), &target, context.clone()))
             .await
@@ -977,14 +1192,14 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
                 .approve_bound(&id, UserId(20), &context.approval_payload_digest)
                 .await
                 .unwrap_err(),
-            ApproveError::Unlinked
+            ApproveError::BoundApprovalRequired
         );
         assert_eq!(
             requests
                 .claim_apply(&id, attempt_id("product_unlinked"), 60)
                 .await
-                .unwrap(),
-            ClaimOutcome::Unlinked
+                .unwrap_err(),
+            product_control_required()
         );
         let mut wrong = product_link(&context);
         wrong.approval_context_digest = digest('e');
@@ -1008,22 +1223,36 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
                 .unwrap(),
             linked
         );
+        let before = decision_snapshot(&first_pool, &id).await;
+        assert_eq!(before, ("pending".to_string(), Some(1), 0));
+        assert_eq!(
+            requests.approve(&id, UserId(20)).await.unwrap_err(),
+            ApproveError::BoundApprovalRequired
+        );
         assert_eq!(
             requests
                 .approve_bound(&id, UserId(20), &digest('f'))
                 .await
                 .unwrap_err(),
-            ApproveError::PayloadMismatch
+            ApproveError::BoundApprovalRequired
         );
-        requests
-            .approve_bound(&id, UserId(20), &context.approval_payload_digest)
-            .await
-            .unwrap();
-        requests
-            .claim_apply(&id, attempt_id("product_apply"), 60)
-            .await
-            .unwrap();
-        assert_eq!(requests.list_applying(guild).await.unwrap().len(), 1);
+        assert_eq!(
+            requests
+                .approve_bound(&id, UserId(20), &context.approval_payload_digest)
+                .await
+                .unwrap_err(),
+            ApproveError::BoundApprovalRequired
+        );
+        assert_eq!(decision_snapshot(&first_pool, &id).await, before);
+        seed_product_approval(&first_pool, &id, &context).await;
+        assert_eq!(
+            requests
+                .claim_apply(&id, attempt_id("product_apply"), 60)
+                .await
+                .unwrap_err(),
+            product_control_required()
+        );
+        assert!(requests.list_applying(guild).await.unwrap().is_empty());
         first_pool.close().await;
     }
 
@@ -1039,13 +1268,15 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
         stored.approvals[0].approval_payload_digest.as_ref(),
         Some(&context.approval_payload_digest)
     );
-    assert_eq!(stored.state, ActivationRequestState::Applying);
+    assert_eq!(stored.state, ActivationRequestState::Approved);
+    assert_eq!(stored.apply_attempt_no, 0);
+    assert!(stored.apply_attempt_id.is_none());
     cleanup(&second_pool, guild).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn concurrent_product_link_and_approval_serialize_without_unbound_approval() {
+async fn legacy_approval_adapter_cannot_race_product_link_or_mutate_product_request() {
     let pool = pool().await;
     let guild = GuildId(9_100_016);
     cleanup(&pool, guild).await;
@@ -1054,6 +1285,7 @@ async fn concurrent_product_link_and_approval_serialize_without_unbound_approval
     let target = publish(&rulesets, guild, 1).await;
     let id = request_id("product_concurrent");
     let context = product_context(&id, &target, '2');
+    prepare_product_promotion(&pool, &target, &context).await;
     requests
         .create_product(product_input(id.clone(), &target, context.clone()))
         .await
@@ -1065,23 +1297,76 @@ async fn concurrent_product_link_and_approval_serialize_without_unbound_approval
         requests.approve_bound(&id, UserId(20), &context.approval_payload_digest)
     );
     assert!(link.is_ok());
-    match approval {
-        Ok(_) => {}
-        Err(ApproveError::Unlinked) => {
-            requests
-                .approve_bound(&id, UserId(20), &context.approval_payload_digest)
-                .await
-                .unwrap();
-        }
-        Err(error) => panic!("unexpected approval result: {error:?}"),
-    }
-    let stored = requests.get(&id).await.unwrap().unwrap();
-    assert_eq!(stored.state, ActivationRequestState::Approved);
-    assert_eq!(stored.approvals.len(), 1);
+    assert_eq!(approval.unwrap_err(), ApproveError::BoundApprovalRequired);
     assert_eq!(
-        stored.approvals[0].approval_payload_digest.as_ref(),
-        Some(&context.approval_payload_digest)
+        requests
+            .reject(&id, UserId(30), "reject".to_string())
+            .await
+            .unwrap_err(),
+        RejectError::Store(product_control_required())
     );
+    assert_eq!(
+        requests
+            .withdraw(&id, UserId(10), "withdraw".to_string())
+            .await
+            .unwrap_err(),
+        WithdrawError::Store(product_control_required())
+    );
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActivationRequestState::Pending);
+    assert!(stored.approvals.is_empty());
+    assert_eq!(
+        decision_snapshot(&pool, &id).await,
+        ("pending".to_string(), Some(1), 0)
+    );
+
+    let legacy_id = request_id("legacy_after_product");
+    assert_eq!(
+        requests
+            .create(CreateActivationRequest {
+                id: legacy_id.clone(),
+                target: ActivationTarget {
+                    guild_id: target.guild_id,
+                    ruleset_key: target.ruleset_key.clone(),
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                requester: UserId(10),
+                required_approvals: 1,
+                ttl: Duration::minutes(30),
+                observed_active: None,
+            })
+            .await
+            .unwrap_err(),
+        product_control_required()
+    );
+    assert!(requests.get(&legacy_id).await.unwrap().is_none());
+    for error in [
+        rulesets
+            .activate(guild, &key(), target.version)
+            .await
+            .unwrap_err(),
+        rulesets
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: automation_ruleset::RuleSetVersionIdentity {
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                expected_active: automation_ruleset::ExpectedActiveRuleSet::Absent,
+            })
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            error,
+            RuleSetStoreError::Backend(
+                "product-managed RuleSet requires authenticated product control".to_string()
+            )
+        );
+    }
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
     cleanup(&pool, guild).await;
 }
 
@@ -1096,6 +1381,7 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
     let target = publish(&rulesets, guild, 1).await;
     let first_id = request_id("product_trigger_first");
     let context = product_context(&first_id, &target, '3');
+    prepare_product_promotion(&pool, &target, &context).await;
     requests
         .create_product(product_input(first_id.clone(), &target, context.clone()))
         .await
@@ -1109,16 +1395,23 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
     let unbound = sqlx::query(
         "INSERT INTO activation_request_approvals \
          (request_id, approver_id, approved_at, approval_payload_digest) \
-         VALUES ($1, '20', clock_timestamp(), NULL)",
+         VALUES ($1, '20', clock_timestamp(), $2)",
     )
     .bind(first_id.as_str())
+    .bind(context.approval_payload_digest.as_str())
     .execute(&pool)
     .await;
     assert!(unbound.is_err());
-    requests
-        .approve_bound(&first_id, UserId(20), &context.approval_payload_digest)
-        .await
-        .unwrap();
+    let before = decision_snapshot(&pool, &first_id).await;
+    assert_eq!(before, ("pending".to_string(), Some(1), 0));
+    assert_eq!(
+        requests
+            .approve_bound(&first_id, UserId(20), &context.approval_payload_digest)
+            .await
+            .unwrap_err(),
+        ApproveError::BoundApprovalRequired
+    );
+    assert_eq!(decision_snapshot(&pool, &first_id).await, before);
     let unguarded_executor = sqlx::query(
         "UPDATE activation_requests SET state = 'applying', apply_attempt_id = 'old_binary', \
          apply_attempt_no = apply_attempt_no + 1, \
@@ -1130,7 +1423,7 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
     assert!(unguarded_executor.is_err());
     assert_eq!(
         requests.get(&first_id).await.unwrap().unwrap().state,
-        ActivationRequestState::Approved
+        ActivationRequestState::Pending
     );
 
     let second_id = request_id("product_trigger_second");
@@ -1156,7 +1449,7 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baseline() {
+async fn legacy_product_apply_rejects_same_baseline_requests_without_mutation() {
     let pool = pool().await;
     let guild = GuildId(9_100_018);
     cleanup(&pool, guild).await;
@@ -1181,44 +1474,207 @@ async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baselin
     )
     .await;
     let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+    let first_before = requests.get(&first_id).await.unwrap().unwrap();
+    let second_before = requests.get(&second_id).await.unwrap().unwrap();
 
     assert_eq!(
         service
             .apply(&first_id, attempt_id("guarded_product_a"), UserId(10))
             .await
-            .unwrap(),
-        ApplyOutcome::Activated
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
     );
-    let second = service
-        .apply(&second_id, attempt_id("guarded_product_b"), UserId(10))
+    assert_eq!(
+        service
+            .apply(&second_id, attempt_id("guarded_product_b"), UserId(10))
+            .await
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
+    );
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    assert_eq!(
+        requests.get(&first_id).await.unwrap().unwrap(),
+        first_before
+    );
+    assert_eq!(
+        requests.get(&second_id).await.unwrap().unwrap(),
+        second_before
+    );
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn legacy_product_claim_cannot_expire_or_mutate_a_due_request() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_021);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = request_id("legacy_product_expired");
+    let context = product_context_with_ttl(&id, &target, '7', NonZeroU64::new(1).unwrap());
+    prepare_product_promotion(&pool, &target, &context).await;
+    requests
+        .create_product(product_input(id.clone(), &target, context.clone()))
         .await
         .unwrap();
-    assert!(matches!(
-        second,
-        ApplyOutcome::Superseded {
-            reason: SupersessionReasonV1::ActiveBaselineDrift { .. }
-        }
-    ));
-    assert_eq!(rulesets.activate_calls(), 1);
+    journal_product_link(&pool, &id, &target, &context).await;
+    requests
+        .link_product(&id, product_link(&context))
+        .await
+        .unwrap();
+    seed_product_approval(&pool, &id, &context).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let before = sqlx::query_as::<_, (String, i64, Option<String>, bool)>(
+        "SELECT state, apply_attempt_no, apply_attempt_id, \
+         expires_at <= clock_timestamp() FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, "approved");
+    assert!(before.3);
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
     assert_eq!(
-        rulesets
-            .active(guild, &key())
+        requests
+            .claim_apply(&id, attempt_id("legacy_product_expired_claim"), 60)
             .await
-            .unwrap()
-            .unwrap()
-            .version,
-        first_target.version
+            .unwrap_err(),
+        product_control_required()
     );
-    let stored = requests.get(&second_id).await.unwrap().unwrap();
-    assert_eq!(stored.state, ActivationRequestState::Superseded);
-    assert_eq!(stored.approvals.len(), 1);
-    assert!(matches!(
+    assert_eq!(
         service
-            .apply(&second_id, attempt_id("guarded_product_replay"), UserId(10))
+            .apply(
+                &id,
+                attempt_id("legacy_product_expired_service"),
+                UserId(10)
+            )
             .await
-            .unwrap(),
-        ApplyOutcome::Superseded { .. }
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
+    );
+    assert!(!requests.mark_expired(&id).await.unwrap());
+    let after = sqlx::query_as::<_, (String, i64, Option<String>, bool)>(
+        "SELECT state, apply_attempt_no, apply_attempt_id, \
+         expires_at <= clock_timestamp() FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_applying_residue_is_rejected_and_legacy_recovery_stays_inert() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_020);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let (id, context) =
+        create_approved_product(&pool, &requests, "legacy_product_residue", &target, '6').await;
+    let stale = attempt_id("legacy_product_stale");
+    let before = requests.get(&id).await.unwrap().unwrap();
+    let mut residue = pool.begin().await.unwrap();
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.set_config('starring.product_approval_context_digest', $1, TRUE)",
+    )
+    .bind(context.approval_context_digest.as_str())
+    .fetch_one(&mut *residue)
+    .await
+    .unwrap();
+    assert_eq!(bound, context.approval_context_digest.as_str());
+    let updated = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'applying', apply_attempt_id = $2, \
+         apply_attempt_no = apply_attempt_no + 1, \
+         apply_lease_until = clock_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1 AND state = 'approved'",
+    )
+    .bind(id.as_str())
+    .bind(stale.as_str())
+    .execute(&mut *residue)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    let error = residue
+        .commit()
+        .await
+        .expect_err("product Applying residue must be rejected at commit");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint()
+                    == Some("product_activation_applying_residue_absent")
     ));
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    assert_eq!(
+        requests
+            .claim_resume(&id, attempt_id("legacy_product_resume"), 60)
+            .await
+            .unwrap_err(),
+        product_control_required()
+    );
+    assert_eq!(
+        service
+            .resume(&id, attempt_id("legacy_product_service_resume"), UserId(10))
+            .await
+            .unwrap_err(),
+        ApplyError::NotApproved
+    );
+    assert!(!requests.renew_lease(&id, &stale, 60).await.unwrap());
+    assert!(!requests
+        .complete_applied(&id, &stale, UserId(10), CompletionKind::Activated, None)
+        .await
+        .unwrap());
+    assert!(!requests
+        .release_to_approved(
+            &id,
+            &stale,
+            ApplyErrorRecord {
+                kind: ApplyFailureKind::Activation,
+                message: "legacy product residue".to_string(),
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        requests
+            .supersede_applying(
+                &id,
+                &stale,
+                SupersessionReasonV1::ActiveBaselineDrift {
+                    expected: ExpectedActiveBaselineV1::Absent,
+                    observed: ExpectedActiveBaselineV1::Absent,
+                }
+            )
+            .await
+            .unwrap_err(),
+        product_control_required()
+    );
+    assert!(!requests.bookkeep_applied(&id, UserId(10)).await.unwrap());
+    assert!(requests.list_applying(guild).await.unwrap().is_empty());
+    assert!(service
+        .recover_applying(guild)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    assert_eq!(requests.get(&id).await.unwrap().unwrap(), before);
     cleanup(&pool, guild).await;
 }
 
