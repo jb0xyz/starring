@@ -136,8 +136,8 @@ async fn stale_applied_replay_cannot_commit_a_rotated_idempotency_alias() {
     )
     .await;
     let rotated_digest = digest(&format!("rotated-alias:{}", operation.request_id));
-    let rotated_key_id = "apply-key-v2".to_string();
-    let rotated_key_fingerprint = digest("apply-key-v2-material");
+    let rotated_key_id = TEST_DECISION_KEY_V2_ID.to_string();
+    let rotated_key_fingerprint = test_decision_key_fingerprint(97);
     let mut stale_context = ApplyLockContext::single(&fixture, &operation);
     stale_context.active_idempotency_digest = rotated_digest.clone();
     stale_context.idempotency_candidates =
@@ -190,12 +190,12 @@ async fn replay_rechecks_discord_freshness_after_the_final_receipt_lock() {
     context.active_idempotency_digest = rotated_digest.clone();
     context.idempotency_candidates =
         vec![rotated_digest.clone(), operation.idempotency_digest.clone()];
-    context.candidate_key_ids = vec!["apply-key-v2".to_string(), operation.key_id.clone()];
+    context.candidate_key_ids = vec![TEST_DECISION_KEY_V2_ID.to_string(), operation.key_id.clone()];
     context.candidate_key_fingerprints = vec![
-        digest("apply-key-v2-material"),
+        test_decision_key_fingerprint(97),
         operation.key_fingerprint.clone(),
     ];
-    context.active_key_id = "apply-key-v2".to_string();
+    context.active_key_id = TEST_DECISION_KEY_V2_ID.to_string();
     let observed_at = Utc::now() - TimeDelta::milliseconds(20);
     let call = Call {
         expected_revision: 2,
@@ -933,14 +933,24 @@ async fn existing_runtime_deployment_blocks_fresh_drift_supersession() {
     let fixture = seed_fixture(&pool).await;
     let applied_operation = Operation::new("malformed-runtime-seed");
     complete_apply(&pool, &fixture, &applied_operation).await;
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE public.activation_requests SET state = 'approved' \
          WHERE id = $1 AND state = 'applied' AND product_revision = 4",
     )
     .bind(&fixture.activation_id)
-    .execute(&pool)
+    .execute(&mut *corruption)
     .await
     .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = origin")
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    corruption.commit().await.unwrap();
     let (bindings, fingerprint) = authority_binding_material(&pool, &fixture).await;
     let authority = advance_authority(
         &pool,

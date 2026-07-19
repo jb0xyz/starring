@@ -413,15 +413,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         DeploymentAvailabilityV1::RuntimePending
     );
     assert_eq!(status.reason_code, "serving_lease_expired");
-    sqlx::query(
-        "UPDATE automation_ruleset_activations SET active_version = 2 \
-         WHERE guild_id = $1 AND ruleset_key = $2",
-    )
-    .bind(GUILD.to_string())
-    .bind(RULESET)
-    .execute(&pool)
-    .await
-    .unwrap();
+    corrupt_active_pointer_for_test(&pool, 2).await.unwrap();
     let superseded_status = adapter.status(&scope()).await.unwrap();
     assert_eq!(
         superseded_status.availability,

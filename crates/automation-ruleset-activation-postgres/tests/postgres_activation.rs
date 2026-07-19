@@ -630,37 +630,6 @@ async fn seed_product_approval(
     transaction.commit().await.unwrap();
 }
 
-async fn seed_expired_product_applying(
-    pool: &PgPool,
-    id: &ActivationRequestId,
-    context: &ProductApprovalContextV1,
-    attempt: &ApplyAttemptId,
-) {
-    let mut transaction = pool.begin().await.unwrap();
-    let bound = sqlx::query_scalar::<_, String>(
-        "SELECT pg_catalog.set_config('starring.product_approval_context_digest', $1, TRUE)",
-    )
-    .bind(context.approval_context_digest.as_str())
-    .fetch_one(&mut *transaction)
-    .await
-    .unwrap();
-    assert_eq!(bound, context.approval_context_digest.as_str());
-    let updated = sqlx::query(
-        "UPDATE public.activation_requests \
-         SET state = 'applying', apply_attempt_id = $2, \
-         apply_attempt_no = apply_attempt_no + 1, \
-         apply_lease_until = clock_timestamp() - INTERVAL '1 second' \
-         WHERE id = $1 AND state = 'approved'",
-    )
-    .bind(id.as_str())
-    .bind(attempt.as_str())
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    assert_eq!(updated.rows_affected(), 1);
-    transaction.commit().await.unwrap();
-}
-
 async fn create_approved(
     store: &PostgresActivationRequestStore,
     id: &str,
@@ -1351,14 +1320,53 @@ async fn legacy_approval_adapter_cannot_race_product_link_or_mutate_product_requ
         ("pending".to_string(), Some(1), 0)
     );
 
-    let legacy_id = create_request(&requests, "legacy_after_product", &target, 1).await;
-    let legacy = requests.approve(&legacy_id, UserId(20)).await.unwrap();
-    assert_eq!(legacy.state, ActivationRequestState::Approved);
-    assert_eq!(legacy.approvals.len(), 1);
+    let legacy_id = request_id("legacy_after_product");
     assert_eq!(
-        decision_snapshot(&pool, &legacy_id).await,
-        ("approved".to_string(), None, 1)
+        requests
+            .create(CreateActivationRequest {
+                id: legacy_id.clone(),
+                target: ActivationTarget {
+                    guild_id: target.guild_id,
+                    ruleset_key: target.ruleset_key.clone(),
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                requester: UserId(10),
+                required_approvals: 1,
+                ttl: Duration::minutes(30),
+                observed_active: None,
+            })
+            .await
+            .unwrap_err(),
+        product_control_required()
     );
+    assert!(requests.get(&legacy_id).await.unwrap().is_none());
+    for error in [
+        rulesets
+            .activate(guild, &key(), target.version)
+            .await
+            .unwrap_err(),
+        rulesets
+            .activate_guarded(GuardedRuleSetActivation {
+                guild_id: guild,
+                ruleset_key: key(),
+                target: automation_ruleset::RuleSetVersionIdentity {
+                    version: target.version,
+                    content_hash: target.content_hash,
+                },
+                expected_active: automation_ruleset::ExpectedActiveRuleSet::Absent,
+            })
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            error,
+            RuleSetStoreError::Backend(
+                "product-managed RuleSet requires authenticated product control".to_string()
+            )
+        );
+    }
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
     cleanup(&pool, guild).await;
 }
 
@@ -1566,7 +1574,7 @@ async fn legacy_product_claim_cannot_expire_or_mutate_a_due_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn legacy_resume_and_recovery_cannot_mutate_product_applying_residue() {
+async fn product_applying_residue_is_rejected_and_legacy_recovery_stays_inert() {
     let pool = pool().await;
     let guild = GuildId(9_100_020);
     cleanup(&pool, guild).await;
@@ -1576,8 +1584,40 @@ async fn legacy_resume_and_recovery_cannot_mutate_product_applying_residue() {
     let (id, context) =
         create_approved_product(&pool, &requests, "legacy_product_residue", &target, '6').await;
     let stale = attempt_id("legacy_product_stale");
-    seed_expired_product_applying(&pool, &id, &context, &stale).await;
     let before = requests.get(&id).await.unwrap().unwrap();
+    let mut residue = pool.begin().await.unwrap();
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.set_config('starring.product_approval_context_digest', $1, TRUE)",
+    )
+    .bind(context.approval_context_digest.as_str())
+    .fetch_one(&mut *residue)
+    .await
+    .unwrap();
+    assert_eq!(bound, context.approval_context_digest.as_str());
+    let updated = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'applying', apply_attempt_id = $2, \
+         apply_attempt_no = apply_attempt_no + 1, \
+         apply_lease_until = clock_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1 AND state = 'approved'",
+    )
+    .bind(id.as_str())
+    .bind(stale.as_str())
+    .execute(&mut *residue)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    let error = residue
+        .commit()
+        .await
+        .expect_err("product Applying residue must be rejected at commit");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint()
+                    == Some("product_activation_applying_residue_absent")
+    ));
     let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
 
     assert_eq!(
@@ -1592,7 +1632,7 @@ async fn legacy_resume_and_recovery_cannot_mutate_product_applying_residue() {
             .resume(&id, attempt_id("legacy_product_service_resume"), UserId(10))
             .await
             .unwrap_err(),
-        ApplyError::Store(product_control_required())
+        ApplyError::NotApproved
     );
     assert!(!requests.renew_lease(&id, &stale, 60).await.unwrap());
     assert!(!requests
@@ -1625,14 +1665,13 @@ async fn legacy_resume_and_recovery_cannot_mutate_product_applying_residue() {
         product_control_required()
     );
     assert!(!requests.bookkeep_applied(&id, UserId(10)).await.unwrap());
-    assert_eq!(
-        requests.list_applying(guild).await.unwrap_err(),
-        product_control_required()
-    );
-    assert_eq!(
-        service.recover_applying(guild).await.unwrap_err(),
-        product_control_required()
-    );
+    assert!(requests.list_applying(guild).await.unwrap().is_empty());
+    assert!(service
+        .recover_applying(guild)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
     assert_eq!(rulesets.activate_calls(), 0);
     assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
     assert_eq!(requests.get(&id).await.unwrap().unwrap(), before);

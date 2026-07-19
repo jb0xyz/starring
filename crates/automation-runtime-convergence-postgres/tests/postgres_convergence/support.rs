@@ -45,17 +45,8 @@ async fn certify_live_with_concurrent_active_drift(
     let certifying = tokio::spawn(async move { certifying_adapter.certify_live(request).await });
     wait_for_ungranted_locks(pool, 1).await;
     let drift_pool = pool.clone();
-    let drifting = tokio::spawn(async move {
-        sqlx::query_scalar::<_, DateTime<Utc>>(
-            "UPDATE public.automation_ruleset_activations SET active_version = 2 \
-             WHERE guild_id = $1 AND ruleset_key = $2 \
-             RETURNING pg_catalog.clock_timestamp()",
-        )
-        .bind(GUILD.to_string())
-        .bind(RULESET)
-        .fetch_one(&drift_pool)
-        .await
-    });
+    let drifting =
+        tokio::spawn(async move { corrupt_active_pointer_for_test(&drift_pool, 2).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!drifting.is_finished());
     let released_at = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
@@ -92,6 +83,31 @@ async fn certify_live_with_concurrent_active_drift(
     .await
     .unwrap();
     certified
+}
+
+async fn corrupt_active_pointer_for_test(
+    pool: &PgPool,
+    version: i64,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    let mut corruption = pool.begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption)
+        .await?;
+    let changed_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "UPDATE public.automation_ruleset_activations SET active_version = $3 \
+         WHERE guild_id = $1 AND ruleset_key = $2 \
+         RETURNING pg_catalog.clock_timestamp()",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .bind(version)
+    .fetch_one(&mut *corruption)
+    .await?;
+    sqlx::query("SET LOCAL session_replication_role = origin")
+        .execute(&mut *corruption)
+        .await?;
+    corruption.commit().await?;
+    Ok(changed_at)
 }
 
 async fn wait_for_ungranted_locks(pool: &PgPool, minimum: i64) {

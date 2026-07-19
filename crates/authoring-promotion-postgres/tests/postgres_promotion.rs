@@ -24,7 +24,7 @@ use automation_ruleset_activation::{
     ActivationDigest, ActivationEnvironment, ActivationEnvironmentError,
     ActivationEnvironmentProvider, ActivationLinkStateV1, ActivationPromotionId, ActivationRequest,
     ActivationRequestId, ActivationRequestState, ActivationRequestStore, ActivationService,
-    ActivationStoreError, ActivationTarget, ApplyAttemptId, ApplyOutcome, ApprovalBindingContextV1,
+    ActivationStoreError, ActivationTarget, ApplyAttemptId, ApplyError, ApprovalBindingContextV1,
     ApprovalPolicyBindingV1, CreateProductActivationRequest, ExpectedActiveBaselineV1,
     ProductApprovalContextV1,
 };
@@ -919,7 +919,7 @@ async fn crash_resume_reuses_publication_and_survives_reconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
+async fn sealed_authoring_reaches_bound_approval_and_requires_atomic_product_apply() {
     let tenant = "postgres-end-to-end";
     let guild_id = context(tenant).guild_id;
     let sealed = artifact().await;
@@ -950,11 +950,7 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
     else {
         panic!("expected linked product activation")
     };
-    let PromotionStageV1::ActivationPending {
-        publication,
-        activation,
-    } = &journaled.stage
-    else {
+    let PromotionStageV1::ActivationPending { activation, .. } = &journaled.stage else {
         panic!("expected activation pending")
     };
     let pending = requests.get(&activation.request_id).await.unwrap().unwrap();
@@ -999,30 +995,32 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
     let approved = requests.get(&activation.request_id).await.unwrap().unwrap();
     assert_eq!(approved.state, ActivationRequestState::Approved);
     let activation_service = ActivationService::new(&requests, &rulesets, &environment);
-    let outcome = activation_service
+    let error = activation_service
         .apply(
             &activation.request_id,
             ApplyAttemptId::parse("authoring_end_to_end_apply").unwrap(),
             UserId(300),
         )
         .await
-        .unwrap();
-    assert_eq!(outcome, ApplyOutcome::Activated);
-    let active = rulesets
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ApplyError::Store(ActivationStoreError::InvalidRequest(
+            "product activation requires authenticated product control".to_string()
+        ))
+    );
+    assert!(rulesets
         .active(guild_id, &journaled.intent.authority.ruleset_key)
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(active.version, publication.version);
-    assert_eq!(active.content_hash, publication.content_hash);
+        .is_none());
     assert_eq!(
-        requests
-            .get(&activation.request_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        ActivationRequestState::Applied
+        requests.get(&activation.request_id).await.unwrap().unwrap(),
+        approved
+    );
+    assert_eq!(
+        promotions.get(&prepared.id).await.unwrap().unwrap(),
+        journaled
     );
     cleanup_product(&pool, tenant, guild_id).await;
 }

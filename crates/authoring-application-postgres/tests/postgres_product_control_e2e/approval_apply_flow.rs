@@ -29,6 +29,13 @@ fn apply_command(fixture: &Fixture, idempotency_key: &str) -> ApplyProductPromot
 async fn corrupt_e2e_target_with_baseline_drift(pool: &PgPool, fixture: &Fixture) {
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         DISABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO public.automation_ruleset_versions \
          (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
          SELECT activation.guild_id, activation.ruleset_key, 2, 1, \
@@ -47,6 +54,13 @@ async fn corrupt_e2e_target_with_baseline_drift(pool: &PgPool, fixture: &Fixture
          SELECT guild_id, ruleset_key, 2 FROM public.activation_requests WHERE id = $1",
     )
     .bind(&fixture.activation_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         ENABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
     .execute(&mut *transaction)
     .await
     .unwrap();
@@ -148,7 +162,11 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     let key_material = std::array::from_fn(|index| 41_u8.wrapping_add(index as u8));
     let keyring = ProductDecisionDigestKeyringV1::new(
         ProductDecisionDigestKeyV1::from_bytes("product-e2e-v1", key_material).unwrap(),
-        [],
+        [ProductDecisionDigestKeyV1::from_bytes(
+            "product-e2e-v2",
+            std::array::from_fn(|index| 97_u8.wrapping_add(index as u8)),
+        )
+        .unwrap()],
     )
     .unwrap();
     let decisions = PostgresProductDecisions::new(pool.clone(), keyring).unwrap();

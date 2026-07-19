@@ -1026,7 +1026,11 @@ fn product_decisions(pool: &PgPool) -> PostgresProductDecisions {
     let key_material = std::array::from_fn(|index| 41_u8.wrapping_add(index as u8));
     let keyring = ProductDecisionDigestKeyringV1::new(
         ProductDecisionDigestKeyV1::from_bytes("product-e2e-v1", key_material).unwrap(),
-        [],
+        [ProductDecisionDigestKeyV1::from_bytes(
+            "product-e2e-v2",
+            std::array::from_fn(|index| 97_u8.wrapping_add(index as u8)),
+        )
+        .unwrap()],
     )
     .unwrap();
     PostgresProductDecisions::new(pool.clone(), keyring).unwrap()

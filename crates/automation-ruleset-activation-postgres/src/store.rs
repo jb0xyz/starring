@@ -97,6 +97,42 @@ fn require_legacy_execution(request: &ActivationRequest) -> Result<(), Activatio
     Ok(())
 }
 
+async fn require_legacy_activation_scope(
+    connection: &mut PgConnection,
+    guild_id: GuildId,
+    ruleset_key: &str,
+) -> Result<(), ActivationStoreError> {
+    let guild_id = guild_id.to_string();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(\
+         pg_catalog.hashtextextended(\
+          'starring.ruleset-slot.v1:' || $1 || ':' || $2, 0))",
+    )
+    .bind(&guild_id)
+    .bind(ruleset_key)
+    .execute(&mut *connection)
+    .await
+    .map_err(backend)?;
+    let product_managed = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+          SELECT 1 FROM public.automation_installations AS installation \
+          WHERE installation.discord_guild_id = $1 \
+           AND installation.ruleset_key = $2)",
+    )
+    .bind(&guild_id)
+    .bind(ruleset_key)
+    .fetch_one(connection)
+    .await
+    .map_err(backend)?;
+    if product_managed {
+        Err(ActivationStoreError::InvalidRequest(
+            PRODUCT_CONTROL_REQUIRED.to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_constraint(error: &sqlx::Error, name: &str) -> bool {
     matches!(error, sqlx::Error::Database(database) if database.constraint() == Some(name))
 }
@@ -169,6 +205,16 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             .as_ref()
             .map(|observed| observed.content_hash.to_hex());
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        if let Err(error) = require_legacy_activation_scope(
+            &mut tx,
+            input.target.guild_id,
+            input.target.ruleset_key.as_str(),
+        )
+        .await
+        {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let result = sqlx::query(
             "INSERT INTO activation_requests (id, guild_id, ruleset_key, target_version, \
              target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
@@ -621,6 +667,16 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             tx.rollback().await.map_err(backend)?;
             return Err(error);
         }
+        if let Err(error) = require_legacy_activation_scope(
+            &mut tx,
+            request.target.guild_id,
+            request.target.ruleset_key.as_str(),
+        )
+        .await
+        {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let (now, lease_until) = database_lease(&mut tx, lease_seconds).await?;
         let decision = request
             .claim_apply_at(attempt_id.clone(), now, lease_until)
@@ -684,6 +740,16 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
         if let Err(error) = require_legacy_execution(&request) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
+        if let Err(error) = require_legacy_activation_scope(
+            &mut tx,
+            request.target.guild_id,
+            request.target.ruleset_key.as_str(),
+        )
+        .await
+        {
             tx.rollback().await.map_err(backend)?;
             return Err(error);
         }

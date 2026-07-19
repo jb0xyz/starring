@@ -98,6 +98,25 @@ fn digest(seed: &str) -> String {
     output
 }
 
+const TEST_DECISION_KEY_V1_ID: &str = "product-e2e-v1";
+const TEST_DECISION_KEY_V2_ID: &str = "product-e2e-v2";
+
+fn test_decision_key_fingerprint(first_byte: u8) -> String {
+    let domain = b"starring.product.approval.digest-key-fingerprint.v1";
+    let material = std::array::from_fn::<_, 32, _>(|index| first_byte.wrapping_add(index as u8));
+    let mut hasher = Sha256::new();
+    for value in [domain.as_slice(), material.as_slice()] {
+        hasher.update(u64::try_from(value.len()).unwrap().to_be_bytes());
+        hasher.update(value);
+    }
+    let mut output = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").unwrap();
+    }
+    output
+}
+
 #[derive(Clone)]
 struct Actor {
     principal_id: String,
@@ -157,8 +176,8 @@ impl Operation {
         Self {
             request_id: format!("apply-request-{label}-{suffix}"),
             idempotency_digest: digest(&format!("idempotency:{label}:{suffix}")),
-            key_id: "apply-key-v1".to_string(),
-            key_fingerprint: digest("apply-key-v1-material"),
+            key_id: TEST_DECISION_KEY_V1_ID.to_string(),
+            key_fingerprint: test_decision_key_fingerprint(41),
             semantic_digest: digest(&format!("semantic:{label}:{suffix}")),
             receipt_id: digest(&format!("receipt:{label}:{suffix}")),
             audit_event_id: digest(&format!("audit:{label}:{suffix}")),
@@ -772,6 +791,13 @@ async fn set_competing_active_baseline(pool: &PgPool, fixture: &Fixture) -> Stri
     let content_hash =
         "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103".to_string();
     let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         DISABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     let advanced = sqlx::query(
         "UPDATE public.automation_ruleset_heads SET next_version = 3 \
          WHERE guild_id = $1 AND ruleset_key = $2 AND next_version = 2",
@@ -802,6 +828,13 @@ async fn set_competing_active_baseline(pool: &PgPool, fixture: &Fixture) -> Stri
     )
     .bind(&fixture.guild_id)
     .bind(&fixture.ruleset_key)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         ENABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
     .execute(&mut *transaction)
     .await
     .unwrap();

@@ -6,8 +6,8 @@ async fn apply_key_rotation_requires_coverage_and_promotes_new_alias() {
     let operation = Operation::new("key-rotation");
     let prepared = complete_apply(&pool, &fixture, &operation).await;
     let new_digest = digest(&format!("idempotency:v2:{}", operation.request_id));
-    let new_key_id = "apply-key-v2".to_string();
-    let new_key_fingerprint = digest("apply-key-v2-material");
+    let new_key_id = TEST_DECISION_KEY_V2_ID.to_string();
+    let new_key_fingerprint = test_decision_key_fingerprint(97);
     let mut new_only = ApplyLockContext::single(&fixture, &operation);
     new_only.active_idempotency_digest = new_digest.clone();
     new_only.idempotency_candidates = vec![new_digest.clone()];

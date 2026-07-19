@@ -10,6 +10,16 @@ fn pure_application_does_not_depend_on_postgres_adapter() {
 }
 
 #[test]
+fn shared_migrators_watch_the_root_migration_history() {
+    for build_script in [
+        include_str!("../build.rs"),
+        include_str!("../../automation-runtime-convergence-postgres/build.rs"),
+    ] {
+        assert!(build_script.contains("cargo:rerun-if-changed=../../migrations"));
+    }
+}
+
+#[test]
 fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_decision_stores() {
     let manifest = include_str!("../Cargo.toml");
     let regular = manifest
@@ -147,8 +157,39 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         );
     }
     assert!(!apply_drift_migration.contains("INSERT INTO public.runtime_deployments"));
+    let slot_migration =
+        include_str!("../../../migrations/202607190013_own_product_ruleset_slots.sql");
+    for required in [
+        "product_activation_applying_residue_absent",
+        "product_activation_applied_record_immutable",
+        "product_ruleset_slot_legacy_apply_absent",
+        "product_ruleset_slot_pointer_exact",
+        "product_ruleset_slot_pointer_delete_forbidden",
+        "product_ruleset_slot_legacy_apply_forbidden",
+        "starring_product_ruleset_slot_exact_v1",
+        "activation_requests_guard_legacy_product_slot",
+        "activation_requests_assert_no_product_applying",
+        "activation_requests_guard_product_applied_record",
+        "automation_installations_lock_ruleset_slot_takeover",
+        "automation_installations_assert_ruleset_slot_takeover",
+        "automation_ruleset_activations_assert_product_slot",
+        "pg_catalog.pg_advisory_xact_lock",
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "FROM PUBLIC",
+    ] {
+        assert!(
+            slot_migration.contains(required),
+            "missing product RuleSet slot guard: {required}"
+        );
+    }
+    assert!(!slot_migration.contains("current_setting("));
     let activation_store =
         include_str!("../../automation-ruleset-activation-postgres/src/store.rs");
+    let ruleset_store = include_str!("../../automation-ruleset-postgres/src/lib.rs");
+    for source in [slot_migration, activation_store, ruleset_store] {
+        assert!(source.contains("starring.ruleset-slot.v1:"));
+    }
     assert_eq!(
         activation_store
             .matches("product activation requires authenticated product control")

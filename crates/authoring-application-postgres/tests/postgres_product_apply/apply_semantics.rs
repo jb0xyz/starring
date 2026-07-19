@@ -104,6 +104,46 @@ async fn fresh_apply_exact_replay_and_semantic_conflict_are_atomic() {
         .await
         .unwrap();
     assert_eq!(&status.snapshot, prepared.snapshot());
+    let error = sqlx::query(
+        "UPDATE public.activation_requests SET state = 'approved' WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&pool)
+    .await
+    .expect_err("Applied product activation record must be immutable");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint()
+                    == Some("product_activation_applied_record_immutable")
+    ));
+    let error = sqlx::query(
+        "UPDATE public.activation_requests SET applied_by = $2 WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind("forged-product-actor")
+    .execute(&pool)
+    .await
+    .expect_err("Applied product activation evidence must be immutable");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint()
+                    == Some("product_activation_applied_record_immutable")
+    ));
+    let exact_lineage = sqlx::query_scalar::<_, bool>(
+        "SELECT public.starring_product_ruleset_slot_exact_v1($1, $2, $3, $4, 1)",
+    )
+    .bind(&fixture.tenant_id)
+    .bind(&fixture.installation_id)
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(exact_lineage);
 
     let mut replay_transaction = begin_serializable(&pool).await;
     let replay_call = Call::valid(&fixture);
@@ -175,7 +215,7 @@ async fn successful_finalize_clears_runtime_mutation_clock() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
-async fn exact_replay_survives_later_active_pointer_change() {
+async fn exact_replay_survives_rejected_direct_pointer_change() {
     let pool = pool().await;
     let fixture = seed_fixture(&pool).await;
     let operation = Operation::new("replay-after-pointer-change");
@@ -206,6 +246,15 @@ async fn exact_replay_survives_later_active_pointer_change() {
     let next_content_hash =
         "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103".to_string();
     let mut pointer_transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.set_config(\
+          'starring.product_approval_context_digest', approval_context_digest, TRUE) \
+         FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&mut *pointer_transaction)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO public.automation_ruleset_versions \
          (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
@@ -240,7 +289,49 @@ async fn exact_replay_survives_later_active_pointer_change() {
     .await
     .unwrap();
     assert_eq!(changed.rows_affected(), 1);
-    pointer_transaction.commit().await.unwrap();
+    let error = pointer_transaction
+        .commit()
+        .await
+        .expect_err("direct product pointer change must roll back");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint() == Some("product_ruleset_slot_pointer_exact")
+    ));
+    let active_version = sqlx::query_scalar::<_, i64>(
+        "SELECT active_version FROM public.automation_ruleset_activations \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_version, 1);
+
+    let mut delete_transaction = pool.begin().await.unwrap();
+    let deleted = sqlx::query(
+        "DELETE FROM public.automation_ruleset_activations \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .execute(&mut *delete_transaction)
+    .await
+    .unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
+    let error = delete_transaction
+        .commit()
+        .await
+        .expect_err("product pointer deletion must roll back");
+    assert!(matches!(
+        error,
+        sqlx::Error::Database(database)
+            if database.code().as_deref() == Some("23514")
+                && database.constraint()
+                    == Some("product_ruleset_slot_pointer_delete_forbidden")
+    ));
 
     let mut replay_transaction = begin_serializable(&pool).await;
     let replay = lock_apply(
@@ -266,6 +357,63 @@ async fn exact_replay_survives_later_active_pointer_change() {
     );
     assert!(replay.locked_projection.is_none());
     replay_transaction.commit().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn deferred_pointer_invariant_checks_the_final_transaction_pointer() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    complete_apply(&pool, &fixture, &Operation::new("final-pointer")).await;
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         VALUES ($1, $2, 2, 1, \
+          pg_catalog.jsonb_build_object('version', 2, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $3, $4)",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .bind("91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103")
+    .bind(&fixture.actor.user_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let advanced = sqlx::query(
+        "UPDATE public.automation_ruleset_heads SET next_version = 3 \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND next_version = 2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(advanced.rows_affected(), 1);
+    for version in [2_i64, 1] {
+        let changed = sqlx::query(
+            "UPDATE public.automation_ruleset_activations SET active_version = $3 \
+             WHERE guild_id = $1 AND ruleset_key = $2",
+        )
+        .bind(&fixture.guild_id)
+        .bind(&fixture.ruleset_key)
+        .bind(version)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+    }
+    transaction.commit().await.unwrap();
+    let active_version = sqlx::query_scalar::<_, i64>(
+        "SELECT active_version FROM public.automation_ruleset_activations \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_version, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -429,14 +577,24 @@ async fn applied_replay_rejects_tampered_revision_and_disposition_evidence() {
     let operation = Operation::new("applied-replay-forensic");
     complete_apply(&pool, &fixture, &operation).await;
 
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE public.activation_requests SET product_revision = 5 \
          WHERE id = $1 AND state = 'applied' AND product_revision = 4",
     )
     .bind(&fixture.activation_id)
-    .execute(&pool)
+    .execute(&mut *corruption)
     .await
     .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = origin")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    corruption.commit().await.unwrap();
     let mut revision_transaction = begin_serializable(&pool).await;
     let revision = lock_apply(
         &mut revision_transaction,
