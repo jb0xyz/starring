@@ -520,7 +520,7 @@ documented `missing` or partial state.
 ### Prepare
 
 ```text
-public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,text,text[],text[],text[],text,text,text,text)
+public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,jsonb,text,text,text[],text[],text[],text,text,text,text)
 ```
 
 Arguments after `AccessV1` are:
@@ -536,6 +536,8 @@ expected_binding_fingerprint TEXT,
 expected_promotion_id TEXT,
 expected_promotion_request_digest TEXT,
 prepared_promotion_intent JSONB,
+product_admission_payload JSONB,
+product_admission_digest TEXT,
 active_idempotency_key_digest TEXT,
 idempotency_key_digest_candidates TEXT[],
 idempotency_digest_key_id_candidates TEXT[],
