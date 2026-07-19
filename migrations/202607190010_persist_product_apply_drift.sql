@@ -1271,6 +1271,7 @@ DECLARE
     grantee_name TEXT;
     privilege_grantees OID[];
     privilege_grantable BOOLEAN[];
+    core_privilege_grantees OID[];
     privilege_index INTEGER;
     function_owner OID;
     finalizer_owner OID;
@@ -1305,26 +1306,120 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc AS core
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+                core.proacl,
+                pg_catalog.acldefault('f', core.proowner)
+            )
+        ) AS core_privilege
+        WHERE core.oid = pg_catalog.to_regprocedure(core_identity)
+            AND core_privilege.privilege_type = 'EXECUTE'
+            AND core_privilege.grantee <> 0
+            AND core_privilege.grantee <> core.proowner
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc AS finalizer
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    COALESCE(
+                        finalizer.proacl,
+                        pg_catalog.acldefault('f', finalizer.proowner)
+                    )
+                ) AS finalizer_privilege
+                WHERE finalizer.oid = pg_catalog.to_regprocedure(finalizer_identity)
+                    AND finalizer_privilege.privilege_type = 'EXECUTE'
+                    AND finalizer_privilege.grantee = core_privilege.grantee
+            )
+    ) THEN
+        RAISE EXCEPTION 'product apply lock grantee lacks explicit finalizer authorization'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc AS core
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+                core.proacl,
+                pg_catalog.acldefault('f', core.proowner)
+            )
+        ) AS core_privilege
+        WHERE core.oid = pg_catalog.to_regprocedure(core_identity)
+            AND core_privilege.privilege_type = 'EXECUTE'
+            AND core_privilege.grantee <> 0
+            AND core_privilege.grantee <> core.proowner
+            AND core_privilege.is_grantable
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc AS finalizer
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    COALESCE(
+                        finalizer.proacl,
+                        pg_catalog.acldefault('f', finalizer.proowner)
+                    )
+                ) AS finalizer_privilege
+                WHERE finalizer.oid = pg_catalog.to_regprocedure(finalizer_identity)
+                    AND finalizer_privilege.privilege_type = 'EXECUTE'
+                    AND finalizer_privilege.grantee = core_privilege.grantee
+                    AND finalizer_privilege.is_grantable
+            )
+    ) THEN
+        RAISE EXCEPTION 'product apply grant option lacks explicit finalizer authorization'
+            USING ERRCODE = '55000';
+    END IF;
+
     SELECT pg_catalog.array_agg(grant_row.grantee ORDER BY grant_row.grantee),
         pg_catalog.array_agg(grant_row.is_grantable ORDER BY grant_row.grantee)
     INTO privilege_grantees,
         privilege_grantable
     FROM (
-        SELECT privilege.grantee,
-            pg_catalog.bool_or(privilege.is_grantable) AS is_grantable
-        FROM pg_catalog.pg_proc AS function_row
+        SELECT core_privilege.grantee,
+            pg_catalog.bool_or(
+                core_privilege.is_grantable
+                AND finalizer_privilege.is_grantable
+            ) AS is_grantable
+        FROM pg_catalog.pg_proc AS core
         CROSS JOIN LATERAL pg_catalog.aclexplode(
             COALESCE(
-                function_row.proacl,
-                pg_catalog.acldefault('f', function_row.proowner)
+                core.proacl,
+                pg_catalog.acldefault('f', core.proowner)
             )
-        ) AS privilege
-        WHERE function_row.oid = pg_catalog.to_regprocedure(core_identity)
-            AND privilege.privilege_type = 'EXECUTE'
-            AND privilege.grantee <> 0
-            AND privilege.grantee <> function_row.proowner
-        GROUP BY privilege.grantee
+        ) AS core_privilege
+        INNER JOIN pg_catalog.pg_proc AS finalizer
+            ON finalizer.oid = pg_catalog.to_regprocedure(finalizer_identity)
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+                finalizer.proacl,
+                pg_catalog.acldefault('f', finalizer.proowner)
+            )
+        ) AS finalizer_privilege
+        WHERE core.oid = pg_catalog.to_regprocedure(core_identity)
+            AND core_privilege.privilege_type = 'EXECUTE'
+            AND finalizer_privilege.privilege_type = 'EXECUTE'
+            AND finalizer_privilege.grantee = core_privilege.grantee
+            AND core_privilege.grantee <> 0
+            AND core_privilege.grantee <> core.proowner
+        GROUP BY core_privilege.grantee
     ) AS grant_row;
+
+    SELECT pg_catalog.array_agg(DISTINCT
+        core_privilege.grantee
+        ORDER BY core_privilege.grantee
+    )
+    INTO core_privilege_grantees
+    FROM pg_catalog.pg_proc AS core
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(
+            core.proacl,
+            pg_catalog.acldefault('f', core.proowner)
+        )
+    ) AS core_privilege
+    WHERE core.oid = pg_catalog.to_regprocedure(core_identity)
+        AND core_privilege.privilege_type = 'EXECUTE'
+        AND core_privilege.grantee <> 0
+        AND core_privilege.grantee <> core.proowner;
 
     EXECUTE pg_catalog.format(
         'ALTER FUNCTION %s OWNER TO %I',
@@ -1354,10 +1449,13 @@ BEGIN
             );
         END LOOP;
 
-        FOR privilege_index IN 1..pg_catalog.cardinality(privilege_grantees)
+    END IF;
+
+    IF pg_catalog.cardinality(core_privilege_grantees) > 0 THEN
+        FOR privilege_index IN 1..pg_catalog.cardinality(core_privilege_grantees)
         LOOP
             grantee_name := pg_catalog.pg_get_userbyid(
-                privilege_grantees[privilege_index]
+                core_privilege_grantees[privilege_index]
             );
             EXECUTE pg_catalog.format(
                 'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE',
@@ -1366,5 +1464,10 @@ BEGIN
             );
         END LOOP;
     END IF;
+
+    EXECUTE pg_catalog.format(
+        'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC',
+        finalizer_identity
+    );
 END;
 $privilege_transfer$;
