@@ -1,6 +1,7 @@
 mod authentication;
 mod bindings;
 mod database;
+mod database_capability;
 mod deployment_status;
 mod digest;
 mod envelope;
@@ -12,7 +13,8 @@ mod secret;
 mod snapshot;
 
 pub use authentication::{
-    AuthenticationConfigError, PostgresAuthentication, PostgresAuthenticationConfig,
+    AuthenticationConfigError, AuthenticationReadinessErrorV1, PostgresAuthentication,
+    PostgresAuthenticationConfig,
 };
 pub use database::ProductDatabaseFailureV1;
 pub use deployment_status::PostgresProductDeploymentStatuses;
@@ -30,14 +32,15 @@ pub use installation_authority::{
 };
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
-    ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
-    ProductDecisionReadinessErrorV1,
+    ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1,
+    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,
     OAuthFlowIssueV1, PostgresProductIdentityConfig, PostgresProductIdentityStore,
-    ProductIdentityConfigError, ProductIdentityError, ProductIdentityLifetimesV1,
-    ProductLogoutDispositionV1, ProductSessionRevocationReasonV1,
+    ProductIdentityConfigError, ProductIdentityDatabasePoolsV1, ProductIdentityError,
+    ProductIdentityLifetimesV1, ProductIdentityReadinessErrorV1, ProductLogoutDispositionV1,
+    ProductSessionRevocationReasonV1,
 };
 pub use product_retention::{
     PostgresProductActionRetention, PostgresProductActionRetentionConfig,
@@ -51,8 +54,8 @@ pub use secret::{
     ProductSecretV1,
 };
 pub use snapshot::{
-    AuthorizedSnapshotConfigError, PostgresAuthorizedPromotionSnapshots,
-    PostgresAuthorizedPromotionSnapshotsConfig,
+    AuthorizedSnapshotConfigError, AuthorizedSnapshotReadinessErrorV1,
+    PostgresAuthorizedPromotionSnapshots, PostgresAuthorizedPromotionSnapshotsConfig,
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");

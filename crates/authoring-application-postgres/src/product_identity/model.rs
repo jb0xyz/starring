@@ -264,12 +264,3 @@ pub enum ProductLogoutDispositionV1 {
     Revoked,
     ExactReplay,
 }
-
-impl ProductSessionRevocationReasonV1 {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::UserLogout => "user_logout",
-            Self::SecurityRevocation => "security_revocation",
-        }
-    }
-}

@@ -31,6 +31,10 @@ use crate::envelope::{
 };
 use crate::ProductDatabaseFailureV1;
 
+mod readiness;
+
+pub use readiness::AuthorizedSnapshotReadinessErrorV1;
+
 const DEFAULT_STATEMENT_TIMEOUT_MILLIS: u64 = 2_000;
 const DEFAULT_FRESH_AUTHORITY_MILLIS: u64 = 5_000;
 const DEFAULT_MAX_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -63,14 +67,15 @@ impl PostgresAuthorizedPromotionSnapshotsConfig {
         fresh_authority_lifetime: Duration,
         max_plaintext_bytes: usize,
     ) -> Result<Self, AuthorizedSnapshotConfigError> {
-        let statement_timeout_millis = statement_timeout.as_millis();
-        if statement_timeout_millis == 0
-            || statement_timeout_millis > u128::from(MAX_STATEMENT_TIMEOUT_MILLIS)
+        if statement_timeout.is_zero()
+            || statement_timeout > Duration::from_millis(MAX_STATEMENT_TIMEOUT_MILLIS)
+            || !statement_timeout.subsec_nanos().is_multiple_of(1_000_000)
         {
             return Err(AuthorizedSnapshotConfigError::InvalidStatementTimeout);
         }
-        let authority_millis = fresh_authority_lifetime.as_millis();
-        if authority_millis == 0 || authority_millis > u128::from(MAX_FRESH_AUTHORITY_MILLIS) {
+        if fresh_authority_lifetime.is_zero()
+            || fresh_authority_lifetime > Duration::from_millis(MAX_FRESH_AUTHORITY_MILLIS)
+        {
             return Err(AuthorizedSnapshotConfigError::InvalidFreshAuthorityLifetime);
         }
         if max_plaintext_bytes == 0 || max_plaintext_bytes > MAX_PLAINTEXT_BYTES {
@@ -207,15 +212,19 @@ where
         expected_generation: SessionGeneration,
     ) -> Result<AuthorizedPromotionSnapshotV1, AuthorizedPromotionSnapshotError> {
         let mut transaction = self.pool.begin().await.map_err(session_database_backend)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
             .execute(&mut *transaction)
             .await
             .map_err(session_database_backend)?;
-        sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
-            .bind(self.config.statement_timeout())
-            .execute(&mut *transaction)
-            .await
-            .map_err(session_database_backend)?;
+        sqlx::query(
+            "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+             pg_catalog.set_config('lock_timeout', $1, true), \
+             pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
+        )
+        .bind(self.config.statement_timeout())
+        .execute(&mut *transaction)
+        .await
+        .map_err(session_database_backend)?;
         let row = fetch_atomic_snapshot(&mut transaction, session_id, actor, scope)
             .await?
             .ok_or(OwnedSessionLoadError::NotFound)?;
@@ -247,62 +256,11 @@ async fn fetch_atomic_snapshot(
     scope: &AuthorizedInstallationScopeV1,
 ) -> Result<Option<AtomicSnapshotRow>, AuthorizedPromotionSnapshotError> {
     sqlx::query_as::<_, AtomicSnapshotRow>(
-        "SELECT authoring_session.tenant_id AS session_tenant_id, \
-         authoring_session.installation_id AS session_installation_id, \
-         authoring_session.owner_principal_id, principal.discord_user_id AS owner_discord_user_id, \
-         principal.disabled AS owner_disabled, \
-         actor_session.session_digest AS actor_session_digest, \
-         authoring_session.current_generation, \
-         authoring_session.lifecycle_state AS session_lifecycle_state, \
-         tenant.lifecycle_state AS tenant_lifecycle_state, \
-         installation.tenant_id AS installation_tenant_id, \
-         installation.discord_application_id, installation.discord_guild_id, \
-         installation.ruleset_key, \
-         installation.lifecycle_state AS installation_lifecycle_state, \
-         installation.current_authority_revision, generation.generation, \
-         generation.snapshot_schema_version, generation.snapshot_ciphertext, \
-         generation.snapshot_nonce, generation.encryption_key_id, generation.encryption_suite, \
-         generation.encryption_suite_version, generation.authenticated_metadata_digest, \
-         generation.resource_bindings AS generation_resource_bindings, \
-         generation.binding_fingerprint AS generation_binding_fingerprint, \
-         generation.installation_authority_revision, generation.stage AS generation_stage, \
-         generation.candidate_revision, generation.candidate_hash, \
-         generation.harness_contract_revision, \
-         authority.tenant_id AS authority_tenant_id, authority.binding_revision, \
-         authority.resource_bindings AS authority_resource_bindings, \
-         authority.binding_fingerprint AS authority_binding_fingerprint, \
-         authority.policy_revision, authority.required_approvals, \
-         authority.activation_ttl_seconds, authority.authority_payload_digest, \
-         CURRENT_TIMESTAMP AS database_now \
-         FROM public.authoring_sessions AS authoring_session \
-         INNER JOIN public.product_principals AS principal \
-         ON principal.principal_id = authoring_session.owner_principal_id \
-         INNER JOIN public.product_auth_sessions AS actor_session \
-         ON actor_session.principal_id = authoring_session.owner_principal_id \
-         AND actor_session.session_digest = $2 \
-         AND actor_session.oauth_state_digest IS NOT NULL \
-         AND actor_session.revoked_at IS NULL \
-         AND CURRENT_TIMESTAMP < actor_session.idle_expires_at \
-         AND CURRENT_TIMESTAMP < actor_session.absolute_expires_at \
-         INNER JOIN public.product_tenants AS tenant \
-         ON tenant.tenant_id = authoring_session.tenant_id \
-         INNER JOIN public.automation_installations AS installation \
-         ON installation.tenant_id = authoring_session.tenant_id \
-         AND installation.installation_id = authoring_session.installation_id \
-         INNER JOIN public.authoring_session_generations AS generation \
-         ON generation.tenant_id = authoring_session.tenant_id \
-         AND generation.installation_id = authoring_session.installation_id \
-         AND generation.session_id = authoring_session.session_id \
-         AND generation.generation = authoring_session.current_generation \
-         INNER JOIN public.automation_installation_authority_versions AS authority \
-         ON authority.tenant_id = generation.tenant_id \
-         AND authority.installation_id = generation.installation_id \
-         AND authority.revision = generation.installation_authority_revision \
-         WHERE authoring_session.session_id = $1 \
-         AND authoring_session.tenant_id = $3 \
-         AND authoring_session.installation_id = $4",
+        "SELECT * \
+         FROM public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)",
     )
     .bind(session_id.as_str())
+    .bind(actor.principal_id().as_str())
     .bind(actor.session_fingerprint().as_bytes().as_slice())
     .bind(scope.tenant_id().as_str())
     .bind(scope.installation_id().as_str())
@@ -958,8 +916,40 @@ mod tests {
         );
         assert_eq!(
             PostgresAuthorizedPromotionSnapshotsConfig::new(
+                Duration::from_nanos(1),
+                Duration::from_secs(5),
+                1
+            ),
+            Err(AuthorizedSnapshotConfigError::InvalidStatementTimeout)
+        );
+        assert_eq!(
+            PostgresAuthorizedPromotionSnapshotsConfig::new(
+                Duration::from_millis(1) + Duration::from_nanos(1),
+                Duration::from_secs(5),
+                1
+            ),
+            Err(AuthorizedSnapshotConfigError::InvalidStatementTimeout)
+        );
+        assert_eq!(
+            PostgresAuthorizedPromotionSnapshotsConfig::new(
+                Duration::from_secs(60) + Duration::from_nanos(1),
+                Duration::from_secs(5),
+                1
+            ),
+            Err(AuthorizedSnapshotConfigError::InvalidStatementTimeout)
+        );
+        assert_eq!(
+            PostgresAuthorizedPromotionSnapshotsConfig::new(
                 Duration::from_secs(1),
                 Duration::from_secs(61),
+                1
+            ),
+            Err(AuthorizedSnapshotConfigError::InvalidFreshAuthorityLifetime)
+        );
+        assert_eq!(
+            PostgresAuthorizedPromotionSnapshotsConfig::new(
+                Duration::from_secs(1),
+                Duration::from_secs(60) + Duration::from_nanos(1),
                 1
             ),
             Err(AuthorizedSnapshotConfigError::InvalidFreshAuthorityLifetime)

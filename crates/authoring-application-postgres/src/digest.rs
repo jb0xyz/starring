@@ -59,6 +59,16 @@ pub fn digest_opaque_session_credential_v1(
     Ok(ProductSessionDigestV1(digest))
 }
 
+pub(crate) fn csrf_comparison_tag_v1(
+    session_digest: &[u8; 32],
+    csrf_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(session_digest);
+    digest.update(csrf_digest);
+    digest.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

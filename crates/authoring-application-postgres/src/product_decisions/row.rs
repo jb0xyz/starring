@@ -365,7 +365,7 @@ fn parse_guild(value: &str) -> Result<GuildId, ProductControlPortError> {
     Ok(parsed)
 }
 
-fn invalid_persistence() -> ProductControlPortError {
+pub(super) fn invalid_persistence() -> ProductControlPortError {
     ProductControlPortError::Backend(
         "persisted product decision violates its integrity contract".to_string(),
     )

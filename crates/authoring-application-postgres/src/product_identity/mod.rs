@@ -1,5 +1,11 @@
 mod config;
+mod database;
 mod model;
+mod oauth_flow;
+mod principal;
+mod readiness;
+mod session_issue;
+mod session_revoke;
 mod store;
 
 pub use config::{
@@ -10,4 +16,5 @@ pub use model::{
     OAuthFlowIssueV1, ProductIdentityError, ProductLogoutDispositionV1,
     ProductSessionRevocationReasonV1,
 };
-pub use store::PostgresProductIdentityStore;
+pub use readiness::ProductIdentityReadinessErrorV1;
+pub use store::{PostgresProductIdentityStore, ProductIdentityDatabasePoolsV1};

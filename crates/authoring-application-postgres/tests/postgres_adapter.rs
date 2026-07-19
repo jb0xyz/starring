@@ -739,3 +739,5 @@ fn authenticated_session_context_is_non_authority_and_redacts_fingerprint() {
     assert!(!format!("{session:?}").contains("adapter-contract"));
     assert!(!format!("{session:?}").contains("050505"));
 }
+
+include!("postgres_adapter/authorized_snapshot_security.rs");

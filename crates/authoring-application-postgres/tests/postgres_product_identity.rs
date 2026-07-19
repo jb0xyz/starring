@@ -8,9 +8,9 @@ use authoring_application::{
 use authoring_application_postgres::{
     digest_opaque_session_credential_v1, PostgresAuthentication, PostgresAuthenticationConfig,
     PostgresProductIdentityConfig, PostgresProductIdentityStore, ProductDatabaseFailureV1,
-    ProductIdentityError, ProductIdentityLifetimesV1, ProductLogoutDispositionV1,
-    ProductSecretGenerator, ProductSecretGeneratorError, ProductSessionRevocationReasonV1,
-    MIGRATOR,
+    ProductIdentityDatabasePoolsV1, ProductIdentityError, ProductIdentityLifetimesV1,
+    ProductLogoutDispositionV1, ProductSecretGenerator, ProductSecretGeneratorError,
+    ProductSessionRevocationReasonV1, MIGRATOR,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -130,7 +130,11 @@ fn production_store(
         ["/".to_string(), "/app".to_string()],
     )
     .unwrap();
-    PostgresProductIdentityStore::new(pool, DeterministicGenerator::new(seed), config)
+    PostgresProductIdentityStore::new(
+        ProductIdentityDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone(), pool),
+        DeterministicGenerator::new(seed),
+        config,
+    )
 }
 
 fn configurable_store(
@@ -142,7 +146,11 @@ fn configurable_store(
 ) -> PostgresProductIdentityStore<DeterministicGenerator> {
     let config =
         PostgresProductIdentityConfig::new(redirect_uri, allowed_return_paths, lifetimes).unwrap();
-    PostgresProductIdentityStore::new(pool, DeterministicGenerator::new(seed), config)
+    PostgresProductIdentityStore::new(
+        ProductIdentityDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone(), pool),
+        DeterministicGenerator::new(seed),
+        config,
+    )
 }
 
 fn unique_user_id() -> UserId {
@@ -426,10 +434,7 @@ async fn product_identity_and_authentication_ignore_a_shadow_search_path() {
         43_200.0,
     )
     .await;
-    let current = store
-        .current_principal(&fixture.session, &fixture.csrf)
-        .await
-        .unwrap();
+    let current = store.current_principal(&fixture.session).await.unwrap();
     assert_eq!(
         current.session_fingerprint(),
         &digest_opaque_session_credential_v1(&fixture.session).unwrap()
@@ -746,7 +751,7 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
         Duration::from_secs(60),
         Duration::from_secs(60),
         Duration::from_secs(300),
-        Duration::from_millis(1),
+        Duration::from_secs(1),
         Duration::from_millis(250),
     )
     .unwrap();
@@ -815,11 +820,16 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    sqlx::query("SELECT pg_sleep(0.01)")
+    sqlx::query("SELECT pg_sleep(1.05)")
         .execute(&pool)
         .await
         .unwrap();
-    let current = store.current_principal(&session, &csrf).await.unwrap();
+    let (current, concurrent_current) = join!(
+        store.current_principal(&session),
+        store.current_principal(&session)
+    );
+    let current = current.unwrap();
+    assert_eq!(concurrent_current.unwrap(), current);
     assert!(!format!("{current:?}").contains("Product Owner"));
     assert!(!format!("{current:?}").contains(&user_id.to_string()));
     assert_eq!(
@@ -847,6 +857,42 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
     assert!(after.0 < after.1);
     assert!(after.1 <= after.2);
     assert!(after.3);
+
+    let tightened_authentication = PostgresAuthentication::with_config(
+        pool.clone(),
+        PostgresAuthenticationConfig::new(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+        )
+        .unwrap(),
+    );
+    sqlx::query("SELECT pg_sleep(1.05)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    tightened_authentication
+        .authenticate(&session)
+        .await
+        .unwrap();
+    let after_tightening = sqlx::query_as::<
+        _,
+        (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            bool,
+        ),
+    >(
+        "SELECT last_seen_at, idle_expires_at, absolute_expires_at, \
+          idle_expires_at <= last_seen_at + INTERVAL '30 minutes' \
+         FROM product_auth_sessions WHERE session_digest = $1",
+    )
+    .bind(session_digest.as_bytes().as_slice())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_tightening, after);
 
     assert_eq!(store.verify_csrf(&session, &csrf).await.unwrap(), current);
     let last_seen_before_invalid_csrf = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
@@ -884,7 +930,7 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
     .await
     .unwrap();
     assert_eq!(
-        store.current_principal(&session, &csrf).await,
+        store.current_principal(&session).await,
         Err(ProductIdentityError::Database(
             ProductDatabaseFailureV1::Timeout
         ))
@@ -913,7 +959,7 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
         )
     ));
     assert!(matches!(
-        store.current_principal(&session, &csrf).await,
+        store.current_principal(&session).await,
         Err(ProductIdentityError::Revoked)
     ));
     assert!(matches!(
@@ -928,6 +974,15 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
     .await
     .unwrap();
     assert_eq!(revocation_reason, "user_logout");
+    assert_eq!(
+        store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await,
+        Err(ProductIdentityError::Revoked)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -953,10 +1008,7 @@ async fn postgres_principal_is_canonical_revised_and_disabled_fail_closed() {
     .execute(&pool)
     .await
     .unwrap();
-    let current_first = store
-        .current_principal(&fixture.session, &fixture.csrf)
-        .await
-        .unwrap();
+    let current_first = store.current_principal(&fixture.session).await.unwrap();
     assert_eq!(current_first.identity_revision(), 2);
     assert_eq!(current_first.display_name(), "Second Name");
 
@@ -971,9 +1023,7 @@ async fn postgres_principal_is_canonical_revised_and_disabled_fail_closed() {
     .await
     .unwrap();
     assert!(matches!(
-        store
-            .current_principal(&fixture.session, &fixture.csrf)
-            .await,
+        store.current_principal(&fixture.session).await,
         Err(ProductIdentityError::InvalidCredential)
     ));
 }
@@ -1024,10 +1074,10 @@ async fn postgres_database_time_expires_oauth_and_idle_sessions() {
     ));
     let session_lifetimes = ProductIdentityLifetimesV1::new(
         Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_secs(3),
         Duration::from_secs(1),
-        Duration::from_secs(2),
-        Duration::from_millis(100),
-        Duration::from_secs(2),
+        Duration::from_secs(3),
     )
     .unwrap();
     let session_store = configurable_store(
@@ -1038,9 +1088,8 @@ async fn postgres_database_time_expires_oauth_and_idle_sessions() {
         session_lifetimes,
     );
     let fixture =
-        insert_direct_product_session(&pool, &session_store, "/", "Idle Session", 1.0, 2.0).await;
+        insert_direct_product_session(&pool, &session_store, "/", "Idle Session", 2.0, 3.0).await;
     let session = fixture.session;
-    let csrf = fixture.csrf;
     let session_digest = digest_opaque_session_credential_v1(&session).unwrap();
     let mut session_blocker = pool.begin().await.unwrap();
     sqlx::query(
@@ -1052,13 +1101,9 @@ async fn postgres_database_time_expires_oauth_and_idle_sessions() {
     .unwrap();
     let blocked_store = session_store.clone();
     let blocked_session = session.clone();
-    let blocked_csrf = csrf.clone();
-    let blocked_current = tokio::spawn(async move {
-        blocked_store
-            .current_principal(&blocked_session, &blocked_csrf)
-            .await
-    });
-    sqlx::query("SELECT pg_sleep(1.05)")
+    let blocked_current =
+        tokio::spawn(async move { blocked_store.current_principal(&blocked_session).await });
+    sqlx::query("SELECT pg_sleep(2.05)")
         .execute(&pool)
         .await
         .unwrap();
@@ -1067,11 +1112,24 @@ async fn postgres_database_time_expires_oauth_and_idle_sessions() {
         blocked_current.await.unwrap(),
         Err(ProductIdentityError::Expired)
     ));
-    session_store
-        .revoke_session(
-            &session,
-            ProductSessionRevocationReasonV1::SecurityRevocation,
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        session_store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await
+            .unwrap(),
+        ProductLogoutDispositionV1::Revoked
+    );
+    assert_eq!(
+        session_store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await
+            .unwrap(),
+        ProductLogoutDispositionV1::ExactReplay
+    );
 }

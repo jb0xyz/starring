@@ -62,7 +62,8 @@ impl PostgresProductDecisions {
         authority_revision: i64,
     ) -> Result<ProductMutationReceiptV1, ApplyAttemptFailure> {
         let mut transaction = self
-            .pool
+            .pools
+            .apply_executor
             .begin()
             .await
             .map_err(classify_precommit_failure)?;
@@ -86,19 +87,23 @@ impl PostgresProductDecisions {
             }
         };
         if matches!(locked.outcome.as_str(), "ready" | "ok" | "superseded") {
-            let artifact = match load_apply_target_artifact(&mut transaction, request).await {
-                Ok(artifact) => artifact,
+            let artifacts = match load_apply_target_artifact(&mut transaction, request).await {
+                Ok(artifacts) => artifacts,
                 Err(error) => {
                     let _ = transaction.rollback().await;
                     return Err(classify_precommit_failure(error));
                 }
             };
-            if artifact
-                .as_ref()
-                .is_none_or(|artifact| !target_artifact_is_valid(artifact))
-            {
-                let _ = transaction.rollback().await;
-                return Err(ApplyAttemptFailure::Control(target_corrupt()));
+            match artifacts.as_slice() {
+                [artifact] if target_artifact_is_valid(artifact) => {}
+                [] | [_] => {
+                    let _ = transaction.rollback().await;
+                    return Err(ApplyAttemptFailure::Control(target_corrupt()));
+                }
+                _ => {
+                    let _ = transaction.rollback().await;
+                    return Err(ApplyAttemptFailure::Control(invalid_apply_result()));
+                }
             }
         }
         if locked.outcome == "ok" || locked.outcome == "superseded" {
