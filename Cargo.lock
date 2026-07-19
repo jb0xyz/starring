@@ -113,11 +113,14 @@ version = "0.1.0"
 dependencies = [
  "authoring-promotion",
  "automation-ruleset",
+ "automation-ruleset-activation",
  "design-harness",
  "discord-model",
  "futures",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

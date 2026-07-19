@@ -1,19 +1,22 @@
 use authoring_promotion::approval_payload_digest_v1;
 
 use crate::authority::validate_authorized_scope;
-use crate::promotion::build_start_promotion;
+use crate::promotion::{
+    build_start_promotion, validate_authorized_replay, validate_authorized_submission,
+};
 use crate::status::{map_non_applied_status, validate_decision_projection, validate_exact_live};
 use crate::{
     ApplyProductPromotionV1, AuthenticatedActorV1, AuthenticationPort, AuthorizedApplyProductV1,
     AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1,
-    AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionSnapshotPort,
-    AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusProjectionV1,
-    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
-    MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApplyResultV1,
-    ProductApprovalPort, ProductApprovalPreviewV1, ProductControlPortError, ProductDecisionPhaseV1,
-    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductMutationReceiptV1,
-    ProductRejectionPort, ProductRequestIdV1, ProductStatusQueryV1, ProductStatusV1,
-    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
+    AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionAccessV1,
+    AuthorizedPromotionSnapshotPort, AuthorizedPromotionSubmissionPort,
+    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
+    DeploymentStatusProjectionV1, DeploymentStatusV1, FreshGuildAuthorityPort,
+    InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
+    ProductApplyResultV1, ProductApprovalPort, ProductApprovalPreviewV1, ProductControlPortError,
+    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDecisionQueryPort,
+    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1, ProductStatusQueryV1,
+    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionV1, RejectProductPromotionV1,
     RuntimeDeploymentQueryV1,
 };
 use crate::{ApproveProductPromotionV1, AuthoringApplicationError};
@@ -46,15 +49,16 @@ where
     A: MutationAuthenticationPort,
     G: FreshGuildAuthorityPort,
     S: AuthorizedPromotionSnapshotPort<G::Evidence>,
-    P: PromotionSubmissionPort,
+    P: AuthorizedPromotionSubmissionPort<G::Evidence>,
 {
     pub async fn promote_owned_session(
         &self,
         credential: &A::Credential,
         csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
         installation: &InstallationSelectorV1,
         command: PromoteOwnedSessionV1,
-    ) -> Result<P::Output, AuthoringApplicationError> {
+    ) -> Result<PromotionSubmissionV1, AuthoringApplicationError> {
         let claims = self
             .authentication
             .authenticate_mutation(credential, csrf)
@@ -65,21 +69,39 @@ where
             .authorize_installation(&actor, installation, CapabilityV1::Promote)
             .await?;
         validate_authorized_scope(installation, authorized.scope())?;
+        let access = AuthorizedPromotionAccessV1::new(
+            request_id,
+            &actor,
+            authorized.scope(),
+            authorized.evidence(),
+            command,
+        );
+        if let Some(submission) = self
+            .promotions
+            .find_or_resume_authorized_promotion(&access)
+            .await?
+        {
+            validate_authorized_replay(&access, &submission)?;
+            return Ok(submission);
+        }
         let snapshot = self
             .snapshots
             .load_atomic_authorized_snapshot(
                 &actor,
                 authorized.scope(),
                 authorized.evidence(),
-                &command.session_id,
-                command.expected_generation,
+                access.session_id(),
+                access.expected_generation(),
             )
             .await?;
-        let input = build_start_promotion(&actor, authorized.scope(), command, snapshot)?;
-        self.promotions
-            .submit_verified_promotion(input)
-            .await
-            .map_err(AuthoringApplicationError::Promotion)
+        let input = build_start_promotion(&actor, authorized.scope(), &access, snapshot)?;
+        let expected = input.context.clone();
+        let submission = self
+            .promotions
+            .submit_authorized_promotion(AuthorizedPromotionSubmissionV1::new(access, input))
+            .await?;
+        validate_authorized_submission(&expected, &submission)?;
+        Ok(submission)
     }
 }
 

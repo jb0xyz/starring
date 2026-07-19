@@ -8,24 +8,32 @@ use authoring_application::{
     AuthenticationError, AuthenticationPort, AuthoringApplication, AuthoringApplicationError,
     AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1,
     AuthorizedDeploymentStatusV1, AuthorizedInstallationScopeV1, AuthorizedInstallationV1,
-    AuthorizedProductStatusV1, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
-    AuthorizedPromotionSnapshotV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
+    AuthorizedProductStatusV1, AuthorizedPromotionAccessV1, AuthorizedPromotionSnapshotError,
+    AuthorizedPromotionSnapshotPort, AuthorizedPromotionSnapshotV1,
+    AuthorizedPromotionSubmissionErrorV1, AuthorizedPromotionSubmissionPort,
+    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
     DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
     ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
     InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
     ProductApprovalPort, ProductApprovalPreviewV1, ProductCandidateErrorCodeV1,
     ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
     ProductDecisionPort, ProductDecisionProjectionV1, ProductDecisionQueryPort,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdError,
+    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductPromotionIdempotencyKeyError,
+    ProductPromotionIdempotencyKeyV1, ProductRejectionPort, ProductRequestIdError,
     ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
-    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError,
-    RejectionReasonV1, ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
+    PromoteOwnedSessionV1, PromotionSubmissionDispositionV1, PromotionSubmissionPort,
+    PromotionSubmissionV1, RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
+    ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
-    ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
-    IdempotencyKey, PolicyRevision, PrincipalId, PromotionError, PromotionId, SessionGeneration,
-    StartPromotionV1, TenantId,
+    ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId,
+    BindingRevision, EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore,
+    PendingActivationDispositionV1, PendingActivationPort, PendingActivationPortError,
+    PendingActivationReceiptV1, PolicyRevision, PrincipalId, PromotionId, PromotionService,
+    ResolveProductApprovalContextV1, ResolvedProductApprovalContextV1, SessionGeneration,
+    StartPromotionV1, TenantId, UtcPromotionClock,
 };
+use automation_ruleset::InMemoryRuleSetStore;
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, PreviewReadyArtifactV1,
     ResourceBindingMap, ToolCall, ToolDefinition,
@@ -228,22 +236,215 @@ impl AuthorizedPromotionSnapshotPort<Evidence> for AuthorizedSnapshot {
     }
 }
 
-struct PromotionCapture {
-    events: Arc<Mutex<Vec<&'static str>>>,
-    input: Mutex<Option<StartPromotionV1>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedPromotion {
+    request_id: String,
+    principal_id: String,
+    session_fingerprint: [u8; 32],
+    tenant_id: String,
+    installation_id: String,
+    guild_id: GuildId,
+    acting_user_id: UserId,
+    evidence: Evidence,
+    context: AuthenticatedPromotionContext,
+    debug: String,
 }
 
-impl PromotionSubmissionPort for PromotionCapture {
-    type Output = ();
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedPromotionAccess {
+    request_id: String,
+    principal_id: String,
+    session_fingerprint: [u8; 32],
+    tenant_id: String,
+    installation_id: String,
+    guild_id: GuildId,
+    acting_user_id: UserId,
+    evidence: Evidence,
+    session_id: String,
+    expected_generation: u64,
+    idempotency_key: Vec<u8>,
+    debug: String,
+}
 
-    async fn submit_verified_promotion(
-        &self,
-        input: StartPromotionV1,
-    ) -> Result<Self::Output, PromotionError> {
-        self.events.lock().unwrap().push("submit");
-        *self.input.lock().unwrap() = Some(input);
-        Ok(())
+struct PromotionCapture {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    access: Mutex<Option<CapturedPromotionAccess>>,
+    captured: Mutex<Option<CapturedPromotion>>,
+    failure: Option<AuthorizedPromotionSubmissionErrorV1>,
+    wrong_projection: bool,
+    replay_artifact: Option<PreviewReadyArtifactV1>,
+}
+
+struct PendingPipeline {
+    request: Mutex<Option<serde_json::Value>>,
+}
+
+impl PendingPipeline {
+    fn new() -> Self {
+        Self {
+            request: Mutex::new(None),
+        }
     }
+}
+
+impl PendingActivationPort for PendingPipeline {
+    async fn resolve_product_approval_context(
+        &self,
+        request: ResolveProductApprovalContextV1,
+    ) -> Result<ResolvedProductApprovalContextV1, PendingActivationPortError> {
+        assert_eq!(request.binding_revision.get(), 3);
+        assert_eq!(request.required_channel_bindings, ["community_hub"]);
+        let binding = serde_json::from_value(json!({
+            "revision": 3,
+            "required_bindings": [{
+                "kind": "channel",
+                "key": "community_hub",
+                "id": "700"
+            }],
+            "fingerprint": "4c696fdcfce71c5b3a67e52d9c8762ee1b96510b576a67bb7f462fabc959a6d9"
+        }))
+        .unwrap();
+        let baseline = serde_json::from_value(json!({"state": "absent"})).unwrap();
+        Ok(ResolvedProductApprovalContextV1 { binding, baseline })
+    }
+
+    async fn ensure_pending_activation(
+        &self,
+        request: EnsurePendingActivationV1,
+    ) -> Result<PendingActivationReceiptV1, PendingActivationPortError> {
+        let context = serde_json::to_value(&request.create.context).unwrap();
+        let value = json!({
+            "id": request.create.id,
+            "target": request.create.target,
+            "requester": request.create.requester,
+            "required_approvals": request.create.context.policy.required_approvals.get(),
+            "approval_context": {
+                "authority": "product_authoring",
+                "context": context
+            },
+            "link_state": {"state": "unlinked"},
+            "approvals": [],
+            "state": "pending",
+            "rejection": null,
+            "apply_attempt_id": null,
+            "apply_attempt_no": 0,
+            "apply_lease_until": null,
+            "last_apply_error": null,
+            "observed_active": null,
+            "completion": null,
+            "termination": null,
+            "created_at": "2099-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T01:00:00Z"
+        });
+        let activation = serde_json::from_value(value.clone()).unwrap();
+        *self.request.lock().unwrap() = Some(value);
+        Ok(PendingActivationReceiptV1 {
+            request: activation,
+            disposition: PendingActivationDispositionV1::Created,
+        })
+    }
+
+    async fn link_pending_activation(
+        &self,
+        _request: authoring_promotion::LinkPendingActivationV1,
+    ) -> Result<automation_ruleset_activation::ActivationRequest, PendingActivationPortError> {
+        let mut value = self.request.lock().unwrap().take().unwrap();
+        value["link_state"] = json!({"state": "linked", "linked_at": "2099-01-01T00:00:00Z"});
+        Ok(serde_json::from_value(value).unwrap())
+    }
+}
+
+impl AuthorizedPromotionSubmissionPort<Evidence> for PromotionCapture {
+    async fn find_or_resume_authorized_promotion(
+        &self,
+        access: &AuthorizedPromotionAccessV1<'_, Evidence>,
+    ) -> Result<Option<PromotionSubmissionV1>, AuthorizedPromotionSubmissionErrorV1> {
+        self.events.lock().unwrap().push("resume");
+        *self.access.lock().unwrap() = Some(CapturedPromotionAccess {
+            request_id: access.request_id().as_str().to_string(),
+            principal_id: access.actor().principal_id().as_str().to_string(),
+            session_fingerprint: *access.session_fingerprint().as_bytes(),
+            tenant_id: access.scope().tenant_id().as_str().to_string(),
+            installation_id: access.scope().installation_id().as_str().to_string(),
+            guild_id: access.scope().guild_id(),
+            acting_user_id: access.scope().acting_user_id(),
+            evidence: access.evidence().clone(),
+            session_id: access.session_id().as_str().to_string(),
+            expected_generation: access.expected_generation().get(),
+            idempotency_key: access.with_product_idempotency_secret(<[u8]>::to_vec),
+            debug: format!("{access:?}"),
+        });
+        let Some(artifact) = &self.replay_artifact else {
+            return Ok(None);
+        };
+        let idempotency_key = access.with_product_idempotency_secret(|secret| {
+            IdempotencyKey::parse(std::str::from_utf8(secret).unwrap()).unwrap()
+        });
+        let input = StartPromotionV1 {
+            idempotency_key,
+            context: AuthenticatedPromotionContext {
+                tenant_id: access.scope().tenant_id().clone(),
+                principal_id: access.actor().principal_id().clone(),
+                session_owner_id: access.actor().principal_id().clone(),
+                session_id: access.session_id().clone(),
+                session_generation: access.expected_generation(),
+                guild_id: access.scope().guild_id(),
+                installation_id: access.scope().installation_id().clone(),
+                ruleset_key: "studyrooms".parse().unwrap(),
+                requester: access.scope().acting_user_id(),
+                binding_revision: BindingRevision::new(3).unwrap(),
+                policy: ApprovalPolicyV1 {
+                    revision: PolicyRevision::new(5).unwrap(),
+                    required_approvals: NonZeroU32::new(2).unwrap(),
+                    ttl_seconds: NonZeroU64::new(3600).unwrap(),
+                },
+            },
+            artifact: artifact.clone(),
+        };
+        let mut submission = run_test_promotion(input).await?;
+        submission.disposition = PromotionSubmissionDispositionV1::ExactReplay;
+        Ok(Some(submission))
+    }
+
+    async fn submit_authorized_promotion(
+        &self,
+        request: AuthorizedPromotionSubmissionV1<'_, Evidence>,
+    ) -> Result<PromotionSubmissionV1, AuthorizedPromotionSubmissionErrorV1> {
+        self.events.lock().unwrap().push("submit");
+        let captured = CapturedPromotion {
+            request_id: request.request_id().as_str().to_string(),
+            principal_id: request.actor().principal_id().as_str().to_string(),
+            session_fingerprint: *request.session_fingerprint().as_bytes(),
+            tenant_id: request.scope().tenant_id().as_str().to_string(),
+            installation_id: request.scope().installation_id().as_str().to_string(),
+            guild_id: request.scope().guild_id(),
+            acting_user_id: request.scope().acting_user_id(),
+            evidence: request.evidence().clone(),
+            context: request.input().context.clone(),
+            debug: format!("{request:?}"),
+        };
+        *self.captured.lock().unwrap() = Some(captured);
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let mut input = request.into_input();
+        if self.wrong_projection {
+            input.context.tenant_id = TenantId::parse("tenant-wrong").unwrap();
+        }
+        run_test_promotion(input).await
+    }
+}
+
+async fn run_test_promotion(
+    input: StartPromotionV1,
+) -> Result<PromotionSubmissionV1, AuthorizedPromotionSubmissionErrorV1> {
+    let promotions = InMemoryPromotionStore::default();
+    let rulesets = InMemoryRuleSetStore::default();
+    let pending = PendingPipeline::new();
+    let service = PromotionService::new(&promotions, &rulesets, &pending, UtcPromotionClock);
+    PromotionSubmissionPort::submit_verified_promotion(&service, input)
+        .await
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)
 }
 
 fn installation() -> InstallationSelectorV1 {
@@ -252,10 +453,35 @@ fn installation() -> InstallationSelectorV1 {
 
 fn promote_command() -> PromoteOwnedSessionV1 {
     PromoteOwnedSessionV1 {
-        idempotency_key: IdempotencyKey::parse("promotion-key").unwrap(),
+        idempotency_key: ProductPromotionIdempotencyKeyV1::parse("promotion-key").unwrap(),
         session_id: AuthoringSessionId::parse("session-1").unwrap(),
         expected_generation: SessionGeneration::new(7).unwrap(),
     }
+}
+
+#[test]
+fn promotion_idempotency_secret_is_bounded_and_redacted() {
+    assert_eq!(
+        ProductPromotionIdempotencyKeyV1::parse("").unwrap_err(),
+        ProductPromotionIdempotencyKeyError::Empty
+    );
+    assert_eq!(
+        ProductPromotionIdempotencyKeyV1::parse(&"a".repeat(129)).unwrap_err(),
+        ProductPromotionIdempotencyKeyError::TooLong
+    );
+    assert_eq!(
+        ProductPromotionIdempotencyKeyV1::parse("key with spaces").unwrap_err(),
+        ProductPromotionIdempotencyKeyError::InvalidCharacter
+    );
+    let key = ProductPromotionIdempotencyKeyV1::parse("private-promotion-key").unwrap();
+    assert_eq!(
+        format!("{key:?}"),
+        "ProductPromotionIdempotencyKeyV1(<redacted>)"
+    );
+    assert_ne!(
+        key,
+        ProductPromotionIdempotencyKeyV1::parse("different-key").unwrap()
+    );
 }
 
 #[test]
@@ -276,12 +502,17 @@ fn promotion_orders_authentication_fresh_authority_atomic_snapshot_and_submissio
         };
         let promotions = PromotionCapture {
             events: events.clone(),
-            input: Mutex::new(None),
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            wrong_projection: false,
+            replay_artifact: None,
         };
         AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
             .promote_owned_session(
                 "opaque-session-token",
                 "csrf-proof",
+                &product_request_id(),
                 &installation(),
                 promote_command(),
             )
@@ -292,16 +523,98 @@ fn promotion_orders_authentication_fresh_authority_atomic_snapshot_and_submissio
             vec![
                 "authenticate_mutation",
                 "authorize",
+                "resume",
                 "atomic_snapshot",
                 "submit"
             ]
         );
-        let captured = promotions.input.lock().unwrap().take().unwrap();
+        let access = promotions.access.lock().unwrap().take().unwrap();
+        assert_eq!(access.request_id, product_request_id().as_str());
+        assert_eq!(access.principal_id, "principal-1");
+        assert_eq!(access.session_fingerprint, [7_u8; 32]);
+        assert_eq!(access.tenant_id, "tenant-1");
+        assert_eq!(access.installation_id, "installation-2");
+        assert_eq!(access.guild_id, GuildId(900));
+        assert_eq!(access.acting_user_id, UserId(200));
+        assert_eq!(access.evidence, Evidence("fresh-authority-evidence"));
+        assert_eq!(access.session_id, "session-1");
+        assert_eq!(access.expected_generation, 7);
+        assert_eq!(access.idempotency_key, b"promotion-key");
+        assert_eq!(access.debug, "AuthorizedPromotionAccessV1(<redacted>)");
+        assert!(!access.debug.contains(product_request_id().as_str()));
+        assert!(!access.debug.contains("promotion-key"));
+        let captured = promotions.captured.lock().unwrap().take().unwrap();
+        assert_eq!(captured.request_id, product_request_id().as_str());
+        assert_eq!(captured.principal_id, "principal-1");
+        assert_eq!(captured.session_fingerprint, [7_u8; 32]);
+        assert_eq!(captured.tenant_id, "tenant-1");
+        assert_eq!(captured.installation_id, "installation-2");
+        assert_eq!(captured.guild_id, GuildId(900));
+        assert_eq!(captured.acting_user_id, UserId(200));
+        assert_eq!(captured.evidence, Evidence("fresh-authority-evidence"));
         assert_eq!(captured.context.tenant_id.as_str(), "tenant-1");
         assert_eq!(captured.context.principal_id.as_str(), "principal-1");
         assert_eq!(captured.context.installation_id.as_str(), "installation-2");
         assert_eq!(captured.context.guild_id, GuildId(900));
         assert_eq!(captured.context.requester, UserId(200));
+        assert_eq!(
+            captured.debug,
+            "AuthorizedPromotionSubmissionV1(<redacted>)"
+        );
+        assert!(!captured.debug.contains(product_request_id().as_str()));
+        assert!(!captured.debug.contains("principal-1"));
+    });
+}
+
+#[test]
+fn exact_replay_resumes_before_snapshot_and_skips_new_submission() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let replay_artifact = artifact().await;
+        let snapshots = AuthorizedSnapshot {
+            artifact: replay_artifact.clone(),
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events: events.clone(),
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            wrong_projection: false,
+            replay_artifact: Some(replay_artifact),
+        };
+        let output =
+            AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+                .promote_owned_session(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    promote_command(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(
+            output.disposition,
+            PromotionSubmissionDispositionV1::ExactReplay
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["authenticate_mutation", "authorize", "resume"]
+        );
+        let access = promotions.access.lock().unwrap().take().unwrap();
+        assert_eq!(access.request_id, product_request_id().as_str());
+        assert_eq!(access.session_id, "session-1");
+        assert_eq!(access.expected_generation, 7);
+        assert!(promotions.captured.lock().unwrap().is_none());
     });
 }
 
@@ -335,7 +648,11 @@ fn authentication_and_authority_failures_stop_every_downstream_port() {
             };
             let promotions = PromotionCapture {
                 events: events.clone(),
-                input: Mutex::new(None),
+                access: Mutex::new(None),
+                captured: Mutex::new(None),
+                failure: None,
+                wrong_projection: false,
+                replay_artifact: None,
             };
             assert!(AuthoringApplication::new(
                 &authentication,
@@ -346,13 +663,15 @@ fn authentication_and_authority_failures_stop_every_downstream_port() {
             .promote_owned_session(
                 "opaque-session-token",
                 "csrf-proof",
+                &product_request_id(),
                 &installation(),
                 promote_command(),
             )
             .await
             .is_err());
             assert_eq!(*events.lock().unwrap(), expected);
-            assert!(promotions.input.lock().unwrap().is_none());
+            assert!(promotions.access.lock().unwrap().is_none());
+            assert!(promotions.captured.lock().unwrap().is_none());
         }
     });
 }
@@ -375,12 +694,17 @@ fn invalid_csrf_stops_before_authority_and_snapshot_access() {
         };
         let promotions = PromotionCapture {
             events: events.clone(),
-            input: Mutex::new(None),
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            wrong_projection: false,
+            replay_artifact: None,
         };
         let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
             .promote_owned_session(
                 "opaque-session-token",
                 "wrong-csrf",
+                &product_request_id(),
                 &installation(),
                 promote_command(),
             )
@@ -391,7 +715,110 @@ fn invalid_csrf_stops_before_authority_and_snapshot_access() {
             AuthoringApplicationError::Authentication(AuthenticationError::InvalidCsrf)
         );
         assert_eq!(*events.lock().unwrap(), vec!["authenticate_mutation"]);
-        assert!(promotions.input.lock().unwrap().is_none());
+        assert!(promotions.access.lock().unwrap().is_none());
+        assert!(promotions.captured.lock().unwrap().is_none());
+    });
+}
+
+#[test]
+fn authorized_promotion_error_propagates_without_losing_the_authenticated_boundary() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events: events.clone(),
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: Some(AuthorizedPromotionSubmissionErrorV1::Indeterminate),
+            wrong_projection: false,
+            replay_artifact: None,
+        };
+        let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+            .promote_owned_session(
+                "opaque-session-token",
+                "csrf-proof",
+                &product_request_id(),
+                &installation(),
+                promote_command(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AuthoringApplicationError::AuthorizedPromotion(
+                AuthorizedPromotionSubmissionErrorV1::Indeterminate
+            )
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "authenticate_mutation",
+                "authorize",
+                "resume",
+                "atomic_snapshot",
+                "submit"
+            ]
+        );
+        let captured = promotions.captured.lock().unwrap().take().unwrap();
+        assert_eq!(captured.request_id, product_request_id().as_str());
+        assert_eq!(captured.session_fingerprint, [7_u8; 32]);
+        assert_eq!(captured.evidence, Evidence("fresh-authority-evidence"));
+    });
+}
+
+#[test]
+fn valid_but_wrong_final_promotion_projection_is_rejected() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events,
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            wrong_projection: true,
+            replay_artifact: None,
+        };
+        let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+            .promote_owned_session(
+                "opaque-session-token",
+                "csrf-proof",
+                &product_request_id(),
+                &installation(),
+                promote_command(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AuthoringApplicationError::AuthorizedPromotion(
+                AuthorizedPromotionSubmissionErrorV1::ScopeMismatch
+            )
+        );
+        let captured = promotions.captured.lock().unwrap().take().unwrap();
+        assert_eq!(captured.context.tenant_id.as_str(), "tenant-1");
     });
 }
 

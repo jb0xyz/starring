@@ -276,6 +276,31 @@ fn product_mutation_context_is_crate_issued_bound_and_redacted() {
     assert!(control.contains("ProductRequestIdV1(<redacted>)"));
 }
 
+#[test]
+fn production_promotion_uses_only_the_authorized_resume_first_boundary() {
+    let application = include_str!("../src/application.rs");
+    let promotion = application
+        .split("impl<A, G, S, P> AuthoringApplication")
+        .nth(1)
+        .unwrap()
+        .split("pub struct ProductControlApplication")
+        .next()
+        .unwrap();
+    assert!(promotion.contains("P: AuthorizedPromotionSubmissionPort<G::Evidence>"));
+    assert!(!promotion.contains("P: PromotionSubmissionPort"));
+    let resume = promotion
+        .find("find_or_resume_authorized_promotion")
+        .unwrap();
+    let snapshot = promotion.find("load_atomic_authorized_snapshot").unwrap();
+    let submit = promotion.find("submit_authorized_promotion").unwrap();
+    assert!(resume < snapshot);
+    assert!(snapshot < submit);
+    let boundary = include_str!("../src/promotion.rs");
+    assert!(boundary.contains("AuthorizedPromotionAccessV1(<redacted>)"));
+    assert!(boundary.contains("AuthorizedPromotionSubmissionV1(<redacted>)"));
+    assert!(boundary.contains("with_product_idempotency_secret"));
+}
+
 fn source() -> String {
     [
         include_str!("../src/lib.rs"),

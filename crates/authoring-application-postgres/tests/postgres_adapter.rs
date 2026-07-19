@@ -5,9 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use authoring_application::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
     AuthenticationPort, AuthoringApplication, AuthorizedInstallationScopeV1,
-    AuthorizedInstallationV1, CapabilityV1, FreshGuildAuthorityError, FreshGuildAuthorityEvidence,
-    FreshGuildAuthorityPort, InstallationSelectorV1, MutationAuthenticationPort,
-    PromoteOwnedSessionV1, PromotionSubmissionPort,
+    AuthorizedInstallationV1, AuthorizedPromotionAccessV1, AuthorizedPromotionSubmissionErrorV1,
+    AuthorizedPromotionSubmissionPort, AuthorizedPromotionSubmissionV1, CapabilityV1,
+    FreshGuildAuthorityError, FreshGuildAuthorityEvidence, FreshGuildAuthorityPort,
+    InstallationSelectorV1, MutationAuthenticationPort, ProductPromotionIdempotencyKeyV1,
+    ProductRequestIdV1, PromoteOwnedSessionV1, PromotionSubmissionV1,
 };
 use authoring_application_postgres::{
     build_snapshot_authenticated_data_v1, digest_opaque_session_credential_v1,
@@ -16,8 +18,7 @@ use authoring_application_postgres::{
     MIGRATOR,
 };
 use authoring_promotion::{
-    AuthoringSessionId, AutomationInstallationId, IdempotencyKey, PrincipalId, PromotionError,
-    SessionGeneration, StartPromotionV1, TenantId,
+    AuthoringSessionId, AutomationInstallationId, PrincipalId, SessionGeneration, TenantId,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -201,20 +202,28 @@ impl FreshGuildAuthorityPort for TestGuildAuthority {
     }
 }
 
-struct PromotionCapture;
+struct PromotionCapture {
+    captured: Mutex<Option<(String, u64, String)>>,
+}
 
-impl PromotionSubmissionPort for PromotionCapture {
-    type Output = (String, u64, String);
-
-    async fn submit_verified_promotion(
+impl AuthorizedPromotionSubmissionPort<Evidence> for PromotionCapture {
+    async fn find_or_resume_authorized_promotion(
         &self,
-        input: StartPromotionV1,
-    ) -> Result<Self::Output, PromotionError> {
-        Ok((
-            input.context.tenant_id.to_string(),
-            input.artifact.receipt().candidate_revision,
-            input.artifact.context_fingerprint().to_string(),
-        ))
+        _access: &AuthorizedPromotionAccessV1<'_, Evidence>,
+    ) -> Result<Option<PromotionSubmissionV1>, AuthorizedPromotionSubmissionErrorV1> {
+        Ok(None)
+    }
+
+    async fn submit_authorized_promotion(
+        &self,
+        request: AuthorizedPromotionSubmissionV1<'_, Evidence>,
+    ) -> Result<PromotionSubmissionV1, AuthorizedPromotionSubmissionErrorV1> {
+        *self.captured.lock().unwrap() = Some((
+            request.input().context.tenant_id.to_string(),
+            request.input().artifact.receipt().candidate_revision,
+            request.input().artifact.context_fingerprint().to_string(),
+        ));
+        Err(AuthorizedPromotionSubmissionErrorV1::Indeterminate)
     }
 }
 
@@ -625,25 +634,38 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         user_id: fixture.user_id,
     };
     let snapshots = PostgresAuthorizedPromotionSnapshots::new(shadow_pool, PassthroughCipher);
-    let promotions = PromotionCapture;
+    let promotions = PromotionCapture {
+        captured: Mutex::new(None),
+    };
     let application =
         AuthoringApplication::new(&authentication, &guild_authority, &snapshots, &promotions);
     let output = application
         .promote_owned_session(
             &fixture.credential,
             &fixture.csrf,
+            &ProductRequestIdV1::parse("postgres-atomic-snapshot").unwrap(),
             &InstallationSelectorV1::new(fixture.installation_id.clone()),
             PromoteOwnedSessionV1 {
-                idempotency_key: IdempotencyKey::parse("postgres-atomic-snapshot").unwrap(),
+                idempotency_key: ProductPromotionIdempotencyKeyV1::parse(
+                    "postgres-atomic-snapshot",
+                )
+                .unwrap(),
                 session_id: fixture.session_id.clone(),
                 expected_generation: SessionGeneration::new(1).unwrap(),
             },
         )
         .await
-        .unwrap();
-    assert_eq!(output.0, fixture.tenant_id.as_str());
-    assert_eq!(output.1, fixture.candidate_revision);
-    assert_eq!(output.2, fixture.binding_fingerprint);
+        .unwrap_err();
+    assert_eq!(
+        output,
+        authoring_application::AuthoringApplicationError::AuthorizedPromotion(
+            AuthorizedPromotionSubmissionErrorV1::Indeterminate
+        )
+    );
+    let captured = promotions.captured.lock().unwrap().take().unwrap();
+    assert_eq!(captured.0, fixture.tenant_id.as_str());
+    assert_eq!(captured.1, fixture.candidate_revision);
+    assert_eq!(captured.2, fixture.binding_fingerprint);
     assert!(fixture.principal_id.as_str().starts_with("principal-"));
     let known_cross_tenant_authority = TestGuildAuthority {
         tenant_id: other_fixture.tenant_id,
@@ -662,9 +684,13 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         .promote_owned_session(
             &fixture.credential,
             &fixture.csrf,
+            &ProductRequestIdV1::parse("postgres-known-cross-tenant").unwrap(),
             &InstallationSelectorV1::new(other_fixture.installation_id),
             PromoteOwnedSessionV1 {
-                idempotency_key: IdempotencyKey::parse("postgres-known-cross-tenant").unwrap(),
+                idempotency_key: ProductPromotionIdempotencyKeyV1::parse(
+                    "postgres-known-cross-tenant",
+                )
+                .unwrap(),
                 session_id: fixture.session_id.clone(),
                 expected_generation: SessionGeneration::new(1).unwrap(),
             },
@@ -696,9 +722,13 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         .promote_owned_session(
             &fixture.credential,
             &fixture.csrf,
+            &ProductRequestIdV1::parse("postgres-random-cross-tenant").unwrap(),
             &InstallationSelectorV1::new(random_installation_id),
             PromoteOwnedSessionV1 {
-                idempotency_key: IdempotencyKey::parse("postgres-random-cross-tenant").unwrap(),
+                idempotency_key: ProductPromotionIdempotencyKeyV1::parse(
+                    "postgres-random-cross-tenant",
+                )
+                .unwrap(),
                 session_id: fixture.session_id.clone(),
                 expected_generation: SessionGeneration::new(1).unwrap(),
             },
@@ -714,9 +744,11 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         .promote_owned_session(
             &fixture.credential,
             &fixture.csrf,
+            &ProductRequestIdV1::parse("postgres-stale-snapshot").unwrap(),
             &InstallationSelectorV1::new(fixture.installation_id),
             PromoteOwnedSessionV1 {
-                idempotency_key: IdempotencyKey::parse("postgres-stale-snapshot").unwrap(),
+                idempotency_key: ProductPromotionIdempotencyKeyV1::parse("postgres-stale-snapshot")
+                    .unwrap(),
                 session_id: fixture.session_id,
                 expected_generation: SessionGeneration::new(2).unwrap(),
             },
