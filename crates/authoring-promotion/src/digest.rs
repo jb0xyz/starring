@@ -29,10 +29,19 @@ pub(crate) fn idempotency_scope_digest_v1(
     principal_id: &PrincipalId,
     key: &IdempotencyKey,
 ) -> Result<IdempotencyScopeDigest, DigestError> {
+    idempotency_scope_digest_from_secret_v1(tenant_id, principal_id, key.as_str())
+}
+
+pub(crate) fn idempotency_scope_digest_from_secret_v1(
+    tenant_id: &TenantId,
+    principal_id: &PrincipalId,
+    secret: &str,
+) -> Result<IdempotencyScopeDigest, DigestError> {
+    IdempotencyKey::validate_secret(secret).map_err(DigestError::IdempotencyIdentity)?;
     let projection = IdempotencyScopeProjectionV1 {
         tenant_id: tenant_id.as_str(),
         principal_id: principal_id.as_str(),
-        idempotency_key: key.as_str(),
+        idempotency_key: secret,
     };
     canonical_digest(IDEMPOTENCY_SCOPE_DOMAIN_V1, &projection)
         .and_then(|value| IdempotencyScopeDigest::parse(&value).map_err(DigestError::Identity))
@@ -128,6 +137,8 @@ pub enum DigestError {
     Serialize(String),
     #[error("promotion digest identity is invalid: {0}")]
     Identity(crate::PromotionIdError),
+    #[error("promotion idempotency identity is invalid: {0}")]
+    IdempotencyIdentity(crate::OpaqueIdError),
     #[error("activation digest identity is invalid: {0}")]
     ActivationIdentity(String),
 }

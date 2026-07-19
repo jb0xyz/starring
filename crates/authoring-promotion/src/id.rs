@@ -122,7 +122,7 @@ impl Display for OpaqueIdError {
 
 impl std::error::Error for OpaqueIdError {}
 
-fn parse_opaque_id(value: &str) -> Result<String, OpaqueIdError> {
+fn validate_opaque_id(value: &str) -> Result<(), OpaqueIdError> {
     if value.is_empty() {
         return Err(OpaqueIdError::Empty);
     }
@@ -137,6 +137,11 @@ fn parse_opaque_id(value: &str) -> Result<String, OpaqueIdError> {
     {
         return Err(OpaqueIdError::InvalidCharacter);
     }
+    Ok(())
+}
+
+fn parse_opaque_id(value: &str) -> Result<String, OpaqueIdError> {
+    validate_opaque_id(value)?;
     Ok(value.to_string())
 }
 
@@ -197,6 +202,10 @@ impl IdempotencyKey {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn validate_secret(value: &str) -> Result<(), OpaqueIdError> {
+        validate_opaque_id(value)
     }
 }
 

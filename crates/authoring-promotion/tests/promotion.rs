@@ -4,20 +4,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use authoring_promotion::{
-    approval_payload_digest_v1, derive_promotion_identity_v1, plan_activation_link_v1,
-    plan_approval_environment_v1, plan_pending_activation_v1, plan_ruleset_publication_v1,
-    plan_start_promotion_v1, validate_exact_planned_record_v1, ApprovalPolicyV1,
-    AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId, BindingRevision,
-    CreatePromotionOutcomeV1, EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore,
-    LinkPendingActivationV1, LinkedActivationTransitionV1, ManualPromotionClock,
-    PendingActivationDispositionV1, PendingActivationPort, PendingActivationPortError,
-    PendingActivationReceiptV1, PendingActivationTransitionV1, PolicyRevision, PrincipalId,
-    PromotionError, PromotionId, PromotionRecordV1, PromotionRecordValidationError,
-    PromotionService, PromotionStageV1, PromotionStore, PromotionStoreError,
-    PublicationDispositionV1, PublicationPortOutcomeV1, PublicationRecordV1,
-    PublishAuthoringRuleSetV1, PublishedAuthoringRuleSetV1, ResolveProductApprovalContextV1,
-    ResolvedProductApprovalContextV1, ResumePromotionOutcomeV1, RuleSetPublicationPort,
-    SessionGeneration, StartPromotionV1, TenantId,
+    approval_payload_digest_v1, derive_promotion_identity_from_secret_v1,
+    derive_promotion_identity_v1, plan_activation_link_v1, plan_approval_environment_v1,
+    plan_pending_activation_v1, plan_ruleset_publication_v1, plan_start_promotion_v1,
+    validate_exact_planned_record_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
+    AuthoringSessionId, AutomationInstallationId, BindingRevision, CreatePromotionOutcomeV1,
+    EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore, LinkPendingActivationV1,
+    LinkedActivationTransitionV1, ManualPromotionClock, PendingActivationDispositionV1,
+    PendingActivationPort, PendingActivationPortError, PendingActivationReceiptV1,
+    PendingActivationTransitionV1, PolicyRevision, PrincipalId, PromotionError, PromotionId,
+    PromotionRecordV1, PromotionRecordValidationError, PromotionService, PromotionStageV1,
+    PromotionStore, PromotionStoreError, PublicationDispositionV1, PublicationPortOutcomeV1,
+    PublicationRecordV1, PublishAuthoringRuleSetV1, PublishedAuthoringRuleSetV1,
+    ResolveProductApprovalContextV1, ResolvedProductApprovalContextV1, ResumePromotionOutcomeV1,
+    RuleSetPublicationPort, SessionGeneration, StartPromotionV1, TenantId,
 };
 use automation_ruleset::{
     InMemoryRuleSetStore, PublishOutcome, PublishRuleSetRequest, RuleSetStore, RuleSetStoreError,
@@ -379,6 +379,21 @@ fn pure_planner_preserves_identity_digests_and_exact_transitions() {
             &idempotency_key,
         )
         .unwrap();
+        assert_eq!(
+            derive_promotion_identity_from_secret_v1(
+                &context.tenant_id,
+                &context.principal_id,
+                "planner-secret",
+            )
+            .unwrap(),
+            identity
+        );
+        assert!(derive_promotion_identity_from_secret_v1(
+            &context.tenant_id,
+            &context.principal_id,
+            "invalid secret",
+        )
+        .is_err());
         let plan = plan_start_promotion_v1(StartPromotionV1 {
             idempotency_key,
             context,

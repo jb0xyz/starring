@@ -12,7 +12,8 @@ use design_harness::IntentRequestedOutcome;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{
-    activation_request_hash_v1, approval_payload_digest_v1, idempotency_scope_digest_v1,
+    activation_request_hash_v1, approval_payload_digest_v1,
+    idempotency_scope_digest_from_secret_v1, idempotency_scope_digest_v1,
     promotion_request_digest_v1,
 };
 use crate::id::AuthoringHash;
@@ -42,6 +43,19 @@ pub fn derive_promotion_identity_v1(
 ) -> Result<PromotionIdentityV1, PromotionError> {
     let idempotency_scope_digest =
         idempotency_scope_digest_v1(tenant_id, principal_id, idempotency_key)?;
+    Ok(PromotionIdentityV1 {
+        promotion_id: PromotionId::from_scope_digest(&idempotency_scope_digest),
+        idempotency_scope_digest,
+    })
+}
+
+pub fn derive_promotion_identity_from_secret_v1(
+    tenant_id: &TenantId,
+    principal_id: &PrincipalId,
+    idempotency_secret: &str,
+) -> Result<PromotionIdentityV1, PromotionError> {
+    let idempotency_scope_digest =
+        idempotency_scope_digest_from_secret_v1(tenant_id, principal_id, idempotency_secret)?;
     Ok(PromotionIdentityV1 {
         promotion_id: PromotionId::from_scope_digest(&idempotency_scope_digest),
         idempotency_scope_digest,
