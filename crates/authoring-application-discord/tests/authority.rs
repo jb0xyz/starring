@@ -288,6 +288,15 @@ fn record() -> InstallationAuthorityRecordV1 {
     }
 }
 
+#[test]
+fn installation_authority_record_debug_is_redacted() {
+    let rendered = format!("{:?}", record());
+    assert_eq!(rendered, "InstallationAuthorityRecordV1(<redacted>)");
+    assert!(!rendered.contains("tenant-1"));
+    assert!(!rendered.contains("install-1"));
+    assert!(!rendered.contains(&"a".repeat(64)));
+}
+
 fn snapshot(permissions: Permissions) -> DiscordGuildAuthoritySnapshotV1 {
     DiscordGuildAuthoritySnapshotV1 {
         guild_id: GuildId(10),
