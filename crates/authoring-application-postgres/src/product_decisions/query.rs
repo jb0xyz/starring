@@ -102,12 +102,24 @@ const DECISION_QUERY: &str = "SELECT \
     installation.ruleset_key AS installation_ruleset_key, \
     installation.lifecycle_state AS installation_lifecycle_state, \
     installation.current_authority_revision AS installation_current_authority_revision, \
-    authority.binding_revision AS authority_binding_revision, \
-    authority.binding_fingerprint AS authority_resource_context_fingerprint, \
-    authority.policy_revision AS authority_policy_revision, \
-    authority.required_approvals AS authority_required_approvals, \
-    authority.activation_ttl_seconds AS authority_activation_ttl_seconds, \
-    authority.authority_payload_digest AS authority_payload_digest, \
+    current_authority.authority_payload_digest AS current_authority_payload_digest, \
+    promoted_session.owner_principal_id AS promoted_session_owner_principal_id, \
+    promoted_owner.discord_user_id AS promoted_session_owner_discord_user_id, \
+    promoted_generation.session_id AS promoted_generation_session_id, \
+    promoted_generation.generation AS promoted_generation, \
+    promoted_generation.stage AS promoted_generation_stage, \
+    promoted_generation.candidate_revision AS promoted_generation_candidate_revision, \
+    promoted_generation.candidate_hash AS promoted_generation_candidate_hash, \
+    promoted_generation.resource_bindings AS promoted_generation_resource_bindings, \
+    promoted_generation.binding_fingerprint AS promoted_generation_binding_fingerprint, \
+    historical_authority.binding_revision AS historical_authority_binding_revision, \
+    historical_authority.resource_bindings AS historical_authority_resource_bindings, \
+    historical_authority.binding_fingerprint \
+        AS historical_authority_resource_context_fingerprint, \
+    historical_authority.policy_revision AS historical_authority_policy_revision, \
+    historical_authority.required_approvals AS historical_authority_required_approvals, \
+    historical_authority.activation_ttl_seconds \
+        AS historical_authority_activation_ttl_seconds, \
     principal.discord_user_id AS actor_discord_user_id, \
     principal.disabled AS actor_disabled, \
     actor_session.revoked_at AS actor_session_revoked_at, \
@@ -126,10 +138,26 @@ INNER JOIN public.product_tenants AS tenant \
 INNER JOIN public.automation_installations AS installation \
     ON installation.tenant_id = activation.tenant_id \
     AND installation.installation_id = activation.installation_id \
-INNER JOIN public.automation_installation_authority_versions AS authority \
-    ON authority.tenant_id = installation.tenant_id \
-    AND authority.installation_id = installation.installation_id \
-    AND authority.revision = installation.current_authority_revision \
+INNER JOIN public.automation_installation_authority_versions AS current_authority \
+    ON current_authority.tenant_id = installation.tenant_id \
+    AND current_authority.installation_id = installation.installation_id \
+    AND current_authority.revision = installation.current_authority_revision \
+LEFT JOIN public.authoring_sessions AS promoted_session \
+    ON promoted_session.tenant_id = promotion.tenant_id \
+    AND promoted_session.installation_id = promotion.installation_id \
+    AND promoted_session.session_id = promotion.record #>> '{intent,authority,session_id}' \
+LEFT JOIN public.authoring_session_generations AS promoted_generation \
+    ON promoted_generation.tenant_id = promoted_session.tenant_id \
+    AND promoted_generation.installation_id = promoted_session.installation_id \
+    AND promoted_generation.session_id = promoted_session.session_id \
+    AND promoted_generation.generation::TEXT \
+        = promotion.record #>> '{intent,authority,session_generation}' \
+LEFT JOIN public.product_principals AS promoted_owner \
+    ON promoted_owner.principal_id = promoted_session.owner_principal_id \
+LEFT JOIN public.automation_installation_authority_versions AS historical_authority \
+    ON historical_authority.tenant_id = promoted_generation.tenant_id \
+    AND historical_authority.installation_id = promoted_generation.installation_id \
+    AND historical_authority.revision = promoted_generation.installation_authority_revision \
 INNER JOIN public.product_principals AS principal \
     ON principal.principal_id = $5 \
 INNER JOIN public.product_auth_sessions AS actor_session \

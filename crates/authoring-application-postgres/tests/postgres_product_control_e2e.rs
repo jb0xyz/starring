@@ -1,25 +1,30 @@
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
-    ApprovalPayloadDigestV1, ApproveProductPromotionV1, AuthenticatedActorV1, AuthenticationError,
-    AuthorizedDeploymentStatusV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1, InstallationSelectorV1, ProductApplicationError,
-    ProductControlApplication, ProductDecisionPhaseV1, ProductIdempotencyKeyV1, ProductRequestIdV1,
-    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
+    ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
+    AuthenticatedActorV1, AuthenticationError, AuthorizedApprovalPreviewV1,
+    AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1, CapabilityV1, DeploymentStatusPort,
+    DeploymentStatusPortError, DeploymentStatusProjectionV1, DeploymentStatusV1,
+    ExactDeploymentSelectorV1, InstallationSelectorV1, ProductApplicationError,
+    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
+    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDecisionQueryPort,
+    ProductIdempotencyKeyV1, ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1,
+    ProductStatusV1, PromotionSelectorV1,
 };
 use authoring_application_discord::{
     DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
-    DiscordAuthoritySourceError, DiscordGuildAuthorityAdapter, DiscordGuildAuthorityClient,
-    DiscordGuildAuthoritySnapshotV1, DiscordRoleSnapshotV1, FreshDiscordAuthorityEvidenceV1,
-    InstallationAuthorityRecordV1, InstallationAuthoritySource,
+    DiscordAuthoritySourceError, DiscordBotUserIdV1, DiscordGuildApplyAuthoritySnapshotV1,
+    DiscordGuildAuthorityAdapter, DiscordGuildAuthorityClient, DiscordGuildAuthoritySnapshotV1,
+    DiscordRoleSnapshotV1, FreshDiscordAuthorityEvidenceV1, InstallationAuthorityRecordV1,
+    InstallationAuthoritySource,
 };
 use authoring_application_postgres::{
     digest_opaque_session_credential_v1, PostgresAuthentication, PostgresProductDecisions,
-    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
-    MIGRATOR,
+    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
     approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
@@ -31,6 +36,19 @@ use authoring_promotion::{
 };
 use automation_ruleset::{
     content_hash, RuleSetKey, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
+};
+use automation_runtime_convergence::{
+    ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, ControllerId,
+    DeploymentId, DeploymentRevision, DrainAttestationV1, FencingToken, GatewayReadyAttestationV1,
+    GatewayReadyKindV1, InstallationId as RuntimeInstallationId, PanelCertificateId,
+    PanelCertificateV1, PreflightAttestationV1, ProcessInstanceId, RuntimeFailureId,
+    RuntimeFailureKindV1, RuntimeGeneration, TenantId as RuntimeTenantId,
+};
+use automation_runtime_convergence_postgres::{
+    ClaimDeploymentV1, DeploymentMutationV1, GatewayShardIdV1, LiveMetadataV1,
+    MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
+    PostgresRuntimeConvergenceConfigV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
+    RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1, SubmitLiveAttestationV1,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -182,6 +200,7 @@ struct Fixture {
     application_id: DiscordApplicationIdV1,
     guild_id: GuildId,
     manager_role_id: RoleId,
+    authority_revision: NonZeroU64,
     authority_digest: String,
     authority_binding_fingerprint: String,
     payload_digest: String,
@@ -213,16 +232,8 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     ))
     .unwrap();
     let session_id = AuthoringSessionId::parse(&format!("session-e2e-{suffix}")).unwrap();
-    let credential_secret: [u8; 32] = std::array::from_fn(|index| {
-        17_u8
-            .wrapping_add(index as u8)
-            .wrapping_add(numeric_tail as u8)
-    });
-    let csrf_secret: [u8; 32] = std::array::from_fn(|index| {
-        113_u8
-            .wrapping_add(index as u8)
-            .wrapping_add(numeric_tail as u8)
-    });
+    let credential_secret: [u8; 32] = Sha256::digest(format!("credential:{suffix}")).into();
+    let csrf_secret: [u8; 32] = Sha256::digest(format!("csrf:{suffix}")).into();
     let credential = URL_SAFE_NO_PAD.encode(credential_secret);
     let csrf = URL_SAFE_NO_PAD.encode(csrf_secret);
     let session_digest = digest_opaque_session_credential_v1(&credential)
@@ -279,7 +290,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         tenant_id: tenant_id.clone(),
         principal_id: requester_principal.clone(),
         session_owner_id: requester_principal.clone(),
-        session_id,
+        session_id: session_id.clone(),
         session_generation: SessionGeneration::new(1).unwrap(),
         guild_id,
         installation_id: installation_id.clone(),
@@ -292,6 +303,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
             ttl_seconds,
         },
     };
+    let candidate_ruleset_hash = sha256_hex(&format!("candidate-ruleset:{suffix}"));
     let evidence = AuthoringEvidenceV1 {
         artifact_version: 1,
         intent_protocol_version: 1,
@@ -326,10 +338,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         .unwrap(),
         compiled_plan_hash: AuthoringHash::parse(&sha256_hex(&format!("compiled-plan:{suffix}")))
             .unwrap(),
-        candidate_ruleset_hash: AuthoringHash::parse(&sha256_hex(&format!(
-            "candidate-ruleset:{suffix}"
-        )))
-        .unwrap(),
+        candidate_ruleset_hash: AuthoringHash::parse(&candidate_ruleset_hash).unwrap(),
         candidate_draft_hash: AuthoringHash::parse(&sha256_hex(&format!(
             "candidate-draft:{suffix}"
         )))
@@ -344,7 +353,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         idempotency_scope_digest,
         authority,
         evidence,
-        definition,
+        definition: definition.clone(),
         preview: AuthoringPreviewV1 {
             revision: 1,
             summary: AuthoringPreviewSummaryV1 {
@@ -576,6 +585,66 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .await
     .unwrap();
     sqlx::query(
+        "INSERT INTO public.authoring_sessions \
+         (session_id, tenant_id, installation_id, owner_principal_id, current_generation, \
+          lifecycle_state) VALUES ($1, $2, $3, $4, 1, 'active')",
+    )
+    .bind(session_id.as_str())
+    .bind(tenant_id.as_str())
+    .bind(installation_id.as_str())
+    .bind(requester_principal.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.authoring_session_generations \
+         (session_id, generation, tenant_id, installation_id, snapshot_schema_version, \
+          snapshot_ciphertext, snapshot_nonce, encryption_key_id, encryption_suite, \
+          encryption_suite_version, authenticated_metadata_digest, resource_bindings, \
+          binding_fingerprint, installation_authority_revision, summary, stage, \
+          candidate_revision, candidate_hash, writer_request_digest, harness_contract_revision) \
+         VALUES ($1, 1, $2, $3, 1, $4, $5, $6, $7, 1, $8, $9, $10, 1, \
+          '{}'::JSONB, 'preview_ready', 1, $11, $12, 1)",
+    )
+    .bind(session_id.as_str())
+    .bind(tenant_id.as_str())
+    .bind(installation_id.as_str())
+    .bind(vec![11_u8; 16])
+    .bind(vec![13_u8; 24])
+    .bind("keychain:e2e-authoring-v1")
+    .bind("xchacha20_poly1305")
+    .bind(sha256_hex(&format!("authenticated-metadata:{suffix}")))
+    .bind(Json(&stored_resource_bindings))
+    .bind(authority_binding_fingerprint.as_str())
+    .bind(&candidate_ruleset_hash)
+    .bind(sha256_hex(&format!("generation-write:{suffix}")))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_heads \
+         (guild_id, ruleset_key, next_version) VALUES ($1, $2, 2)",
+    )
+    .bind(guild_id.to_string())
+    .bind(ruleset_key.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         VALUES ($1, $2, 1, $3, $4, $5, $6)",
+    )
+    .bind(guild_id.to_string())
+    .bind(ruleset_key.as_str())
+    .bind(i64::from(CURRENT_RULESET_SCHEMA_VERSION.get()))
+    .bind(Json(&definition))
+    .bind(ruleset_content_hash.to_hex())
+    .bind(requester_user.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO public.authoring_promotions \
          (id, record_format_version, revision, stage, request_digest, tenant_id, \
           installation_id, principal_id, record) \
@@ -647,6 +716,7 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         application_id,
         guild_id,
         manager_role_id,
+        authority_revision: NonZeroU64::new(1).unwrap(),
         authority_digest,
         authority_binding_fingerprint: authority_binding_fingerprint.into_string(),
         payload_digest,
@@ -685,7 +755,7 @@ impl InstallationAuthoritySource for Source {
             application_id: self.fixture.application_id,
             guild_id: self.fixture.guild_id,
             acting_user_id: self.fixture.approver_user,
-            authority_revision: NonZeroU64::new(1).unwrap(),
+            authority_revision: self.fixture.authority_revision,
             authority_digest: self.fixture.authority_digest.clone(),
         })
     }
@@ -700,6 +770,10 @@ struct Client {
 impl DiscordGuildAuthorityClient for Client {
     fn application_id(&self) -> DiscordApplicationIdV1 {
         self.fixture.application_id
+    }
+
+    fn bot_user_id(&self) -> Option<DiscordBotUserIdV1> {
+        DiscordBotUserIdV1::new(self.fixture.approver_user.0 + 2).ok()
     }
 
     async fn fetch_authority_snapshot(
@@ -734,17 +808,513 @@ impl DiscordGuildAuthorityClient for Client {
             ],
         })
     }
+
+    async fn fetch_apply_authority_snapshot(
+        &self,
+        guild_id: GuildId,
+        user_id: UserId,
+    ) -> Result<DiscordGuildApplyAuthoritySnapshotV1, DiscordAuthorityClientError> {
+        assert_eq!(guild_id, self.fixture.guild_id);
+        assert_eq!(user_id, self.fixture.approver_user);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let bot_user = self.bot_user_id().unwrap().to_user_id();
+        Ok(DiscordGuildApplyAuthoritySnapshotV1 {
+            authority: DiscordGuildAuthoritySnapshotV1 {
+                guild_id,
+                owner_id: UserId(self.fixture.approver_user.0 + 1),
+                member_user_id: user_id,
+                member_is_bot: false,
+                member_is_system: false,
+                member_pending: false,
+                member_role_ids: vec![self.fixture.manager_role_id],
+                roles: vec![
+                    DiscordRoleSnapshotV1 {
+                        role_id: RoleId(guild_id.0),
+                        permissions: Permissions::VIEW_CHANNEL,
+                        position: 0,
+                        managed: false,
+                    },
+                    DiscordRoleSnapshotV1 {
+                        role_id: self.fixture.manager_role_id,
+                        permissions: Permissions::MANAGE_GUILD,
+                        position: 10,
+                        managed: false,
+                    },
+                ],
+            },
+            bot_member_user_id: bot_user,
+            bot_member_is_bot: true,
+            bot_member_is_system: false,
+            bot_member_pending: false,
+            bot_member_role_ids: vec![self.fixture.manager_role_id],
+        })
+    }
 }
 
-struct UnusedDeployments;
+struct PendingDeployments;
 
-impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for UnusedDeployments {
+impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for PendingDeployments {
     async fn load_exact_deployment_status(
         &self,
         _request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
     ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
-        unreachable!()
+        Ok(DeploymentStatusProjectionV1::Pending)
     }
+}
+
+#[derive(Clone, Copy)]
+enum AuthorityRotation {
+    Safe,
+    Binding,
+    Policy,
+}
+
+async fn rotate_authority(
+    pool: &PgPool,
+    fixture: &Fixture,
+    rotation: AuthorityRotation,
+) -> Fixture {
+    let channel_id = match rotation {
+        AuthorityRotation::Binding => ChannelId(fixture.guild_id.0 + 3),
+        AuthorityRotation::Safe | AuthorityRotation::Policy => ChannelId(fixture.guild_id.0 + 2),
+    };
+    let mut bindings = ResourceBindingMap::default();
+    bindings
+        .channel_bindings
+        .insert(ResourceKey("community_hub".to_string()), channel_id);
+    let binding_fingerprint = resource_binding_fingerprint_v2(&bindings);
+    let binding_revision = match rotation {
+        AuthorityRotation::Binding => 2_i64,
+        AuthorityRotation::Safe | AuthorityRotation::Policy => 1_i64,
+    };
+    let policy_revision = match rotation {
+        AuthorityRotation::Policy => 2_i64,
+        AuthorityRotation::Safe | AuthorityRotation::Binding => 1_i64,
+    };
+    let ttl_seconds = match rotation {
+        AuthorityRotation::Policy => 7_200_i64,
+        AuthorityRotation::Safe | AuthorityRotation::Binding => 3_600_i64,
+    };
+    let authority_digest = sha256_hex(&format!(
+        "authority-rotation:{}:{binding_revision}:{policy_revision}:{ttl_seconds}",
+        fixture.promotion_id.as_str()
+    ));
+    let request_digest = sha256_hex(&format!(
+        "authority-rotation-request:{}:{binding_revision}:{policy_revision}:{ttl_seconds}",
+        fixture.promotion_id.as_str()
+    ));
+    let stored_bindings = json!({
+        "role_bindings": {},
+        "channel_bindings": {"community_hub": channel_id.to_string()}
+    });
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions \
+         (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
+          binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
+          authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         VALUES ($1, 2, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10)",
+    )
+    .bind(fixture.installation_id.as_str())
+    .bind(fixture.tenant_id.as_str())
+    .bind(binding_revision)
+    .bind(Json(&stored_bindings))
+    .bind(binding_fingerprint.as_str())
+    .bind(policy_revision)
+    .bind(ttl_seconds)
+    .bind(&authority_digest)
+    .bind(fixture.approver_principal.as_str())
+    .bind(&request_digest)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.automation_installations \
+         SET current_authority_revision = 2, updated_at = pg_catalog.clock_timestamp() \
+         WHERE tenant_id = $1 AND installation_id = $2",
+    )
+    .bind(fixture.tenant_id.as_str())
+    .bind(fixture.installation_id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let mut rotated = fixture.clone();
+    rotated.authority_revision = NonZeroU64::new(2).unwrap();
+    rotated.authority_digest = authority_digest;
+    rotated.authority_binding_fingerprint = binding_fingerprint.into_string();
+    rotated
+}
+
+fn authority_adapter(fixture: Fixture) -> DiscordGuildAuthorityAdapter<Source, Client> {
+    DiscordGuildAuthorityAdapter::new(
+        Source {
+            fixture: fixture.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        Client {
+            fixture,
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        DiscordAuthorityConfigV1::new(
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+}
+
+fn product_decisions(pool: &PgPool) -> PostgresProductDecisions {
+    let key_material = std::array::from_fn(|index| 41_u8.wrapping_add(index as u8));
+    let keyring = ProductDecisionDigestKeyringV1::new(
+        ProductDecisionDigestKeyV1::from_bytes("product-e2e-v1", key_material).unwrap(),
+        [],
+    )
+    .unwrap();
+    PostgresProductDecisions::new(pool.clone(), keyring).unwrap()
+}
+
+async fn approve_fixture(pool: &PgPool, fixture: &Fixture, decisions: &PostgresProductDecisions) {
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let deployments = PendingDeployments;
+    let application =
+        ProductControlApplication::new(&authentication, &authority, decisions, &deployments);
+    application
+        .approve(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("approve.drift.{}", suffix())).unwrap(),
+            &selector(fixture),
+            approval_command(fixture, &format!("approve-drift-{}", suffix())),
+        )
+        .await
+        .unwrap();
+}
+
+async fn assert_drift_supersession(rotation: AuthorityRotation, expected_reason: &str) {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let rotated = rotate_authority(&pool, &fixture, rotation).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(rotated.clone());
+    let deployments = PendingDeployments;
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let error = application
+        .apply(
+            &rotated.credential,
+            &rotated.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.drift.{}", suffix())).unwrap(),
+            &selector(&rotated),
+            apply_command(&rotated, &format!("apply-drift-{}", suffix())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ProductApplicationError::Control(ProductControlPortError::Superseded)
+    );
+    assert_eq!(
+        application
+            .get_product_status(
+                &rotated.credential,
+                &selector(&rotated),
+                status_query(&rotated)
+            )
+            .await
+            .unwrap(),
+        ProductStatusV1::Superseded
+    );
+    let persisted = sqlx::query_as::<_, (String, i64, String, i64)>(
+        "SELECT activation.state, activation.product_revision, \
+         activation.termination #>> '{reason,reason}', \
+         (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+          WHERE deployment.activation_request_id = activation.id) \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&rotated.activation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted,
+        ("superseded".to_string(), 4, expected_reason.to_string(), 0)
+    );
+    let stale_authority = authority_adapter(fixture.clone());
+    let stale_application =
+        ProductControlApplication::new(&authentication, &stale_authority, &decisions, &deployments);
+    assert_eq!(
+        stale_application
+            .get_product_status(
+                &fixture.credential,
+                &selector(&fixture),
+                status_query(&fixture)
+            )
+            .await
+            .unwrap_err(),
+        ProductApplicationError::Control(ProductControlPortError::InvalidState)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn binding_drift_is_terminal_and_readable_with_current_authority() {
+    assert_drift_supersession(AuthorityRotation::Binding, "binding_drift").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn policy_drift_is_terminal_and_readable_with_current_authority() {
+    assert_drift_supersession(AuthorityRotation::Policy, "policy_drift").await;
+}
+
+async fn assert_applied_history_survives_authority_rotation(rotation: AuthorityRotation) {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let original_authority = authority_adapter(fixture.clone());
+    let deployments = PendingDeployments;
+    let original = ProductControlApplication::new(
+        &authentication,
+        &original_authority,
+        &decisions,
+        &deployments,
+    );
+    let applied = original
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.history.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-history-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    let rotated = rotate_authority(&pool, &fixture, rotation).await;
+    let current_authority = authority_adapter(rotated.clone());
+    let current = ProductControlApplication::new(
+        &authentication,
+        &current_authority,
+        &decisions,
+        &deployments,
+    );
+    let preview = current
+        .get_approval_preview(
+            &rotated.credential,
+            &selector(&rotated),
+            status_query(&rotated),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.phase(),
+        &ProductDecisionPhaseV1::Applied {
+            exact_deployment: applied.exact_deployment().clone(),
+        }
+    );
+    assert_eq!(
+        original
+            .get_approval_preview(
+                &fixture.credential,
+                &selector(&fixture),
+                status_query(&fixture),
+            )
+            .await
+            .unwrap_err(),
+        ProductApplicationError::Control(ProductControlPortError::InvalidState)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn applied_history_survives_later_binding_rotation_for_current_readers() {
+    assert_applied_history_survives_authority_rotation(AuthorityRotation::Binding).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn applied_history_survives_later_policy_rotation_for_current_readers() {
+    assert_applied_history_survives_authority_rotation(AuthorityRotation::Policy).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn corrupted_historical_generation_hash_returns_redacted_integrity_failure() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let deployments = PendingDeployments;
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let installation = selector(&fixture);
+    let query = status_query(&fixture);
+    application
+        .get_approval_preview(&fixture.credential, &installation, query.clone())
+        .await
+        .unwrap();
+
+    let original_hash = sqlx::query_scalar::<_, String>(
+        "SELECT generation.candidate_hash FROM public.authoring_session_generations AS generation \
+         INNER JOIN public.authoring_promotions AS promotion \
+           ON promotion.tenant_id = generation.tenant_id \
+           AND promotion.installation_id = generation.installation_id \
+           AND promotion.record #>> '{intent,authority,session_id}' = generation.session_id \
+           AND (promotion.record #>> '{intent,authority,session_generation}')::BIGINT \
+             = generation.generation \
+         WHERE promotion.id = $1",
+    )
+    .bind(fixture.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let corrupted_hash = sha256_hex(&format!(
+        "corrupted-historical-generation:{}",
+        fixture.promotion_id.as_str()
+    ));
+    assert_ne!(corrupted_hash, original_hash);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.authoring_session_generations \
+         DISABLE TRIGGER authoring_generations_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let update = sqlx::query(
+        "UPDATE public.authoring_session_generations AS generation \
+         SET candidate_hash = $1 \
+         FROM public.authoring_promotions AS promotion \
+         WHERE promotion.id = $2 \
+           AND promotion.tenant_id = generation.tenant_id \
+           AND promotion.installation_id = generation.installation_id \
+           AND promotion.record #>> '{intent,authority,session_id}' = generation.session_id \
+           AND (promotion.record #>> '{intent,authority,session_generation}')::BIGINT \
+             = generation.generation",
+    )
+    .bind(&corrupted_hash)
+    .bind(fixture.promotion_id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(update.rows_affected(), 1);
+    sqlx::query(
+        "ALTER TABLE public.authoring_session_generations \
+         ENABLE TRIGGER authoring_generations_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    let expected = ProductApplicationError::Control(ProductControlPortError::Backend(
+        "persisted product decision violates its integrity contract".to_string(),
+    ));
+    let preview_error = application
+        .get_approval_preview(&fixture.credential, &installation, query.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(preview_error, expected);
+    assert!(!format!("{preview_error:?}").contains(&corrupted_hash));
+
+    let status_error = application
+        .get_product_status(&fixture.credential, &installation, query)
+        .await
+        .unwrap_err();
+    assert_eq!(status_error, expected);
+    assert!(!format!("{status_error:?}").contains(&corrupted_hash));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn deployment_status_redacts_controller_failure_evidence() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let runtime = PostgresRuntimeConvergence::new(pool.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(runtime.clone());
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.failure.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-failure-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    let runtime_scope = RuntimeDeploymentScopeV1 {
+        tenant_id: RuntimeTenantId::parse(fixture.tenant_id.as_str()).unwrap(),
+        installation_id: RuntimeInstallationId::parse(fixture.installation_id.as_str()).unwrap(),
+        deployment_id: DeploymentId::parse(applied.exact_deployment().deployment_reference())
+            .unwrap(),
+    };
+    let requested = runtime.status(&runtime_scope).await.unwrap();
+    let controller = ControllerId::parse(format!("controller-{}", suffix())).unwrap();
+    let claim = runtime
+        .claim(ClaimDeploymentV1 {
+            scope: runtime_scope.clone(),
+            expected_revision: requested.snapshot.revision,
+            controller_id: controller.clone(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    let ready_revision = advance_product_runtime_to_ready(&runtime, &runtime_scope, &claim).await;
+    let private_code = sha256_hex(&format!("private-runtime-code:{}", suffix()));
+    runtime
+        .mutate(SubmitDeploymentMutationV1 {
+            scope: runtime_scope,
+            expected_revision: ready_revision,
+            controller_id: controller,
+            fencing_token: claim.fencing_token,
+            runtime_generation: RuntimeGeneration::FIRST,
+            mutation: DeploymentMutationV1::RecordRetryableFailure {
+                failure_id: RuntimeFailureId::parse(format!("failure-{}", suffix())).unwrap(),
+                kind: RuntimeFailureKindV1::GatewayStart,
+                code: private_code.clone(),
+                message: "private runtime diagnostic".to_string(),
+                attempt: NonZeroU32::MIN,
+                retry_after: Duration::from_secs(1),
+            },
+        })
+        .await
+        .unwrap();
+    let status = application
+        .get_deployment_status(
+            &fixture.credential,
+            &selector(&fixture),
+            authoring_application::RuntimeDeploymentQueryV1 {
+                promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        DeploymentStatusV1::Failed {
+            retryable: true,
+            failure_code: "gateway_start_failed".to_string(),
+        }
+    );
+    assert!(!format!("{status:?}").contains(&private_code));
 }
 
 fn selector(fixture: &Fixture) -> InstallationSelectorV1 {
@@ -762,6 +1332,15 @@ fn approval_command(fixture: &Fixture, idempotency_key: &str) -> ApproveProductP
         promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
         expected_payload_digest: ApprovalPayloadDigestV1::parse(&fixture.payload_digest).unwrap(),
         expected_revision: ProductRevisionV1::new(1).unwrap(),
+        idempotency_key: ProductIdempotencyKeyV1::parse(idempotency_key).unwrap(),
+    }
+}
+
+fn apply_command(fixture: &Fixture, idempotency_key: &str) -> ApplyProductPromotionV1 {
+    ApplyProductPromotionV1 {
+        promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+        expected_payload_digest: ApprovalPayloadDigestV1::parse(&fixture.payload_digest).unwrap(),
+        expected_revision: ProductRevisionV1::new(2).unwrap(),
         idempotency_key: ProductIdempotencyKeyV1::parse(idempotency_key).unwrap(),
     }
 }
@@ -810,7 +1389,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
         DiscordAuthorityConfigV1::new(
             Duration::from_secs(2),
             Duration::from_secs(5),
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .unwrap(),
     );
@@ -823,7 +1402,8 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     .unwrap();
     let decisions = PostgresProductDecisions::new(pool.clone(), keyring).unwrap();
     decisions.verify_keyring_coverage().await.unwrap();
-    let deployments = UnusedDeployments;
+    let deployments =
+        PostgresProductDeploymentStatuses::new(PostgresRuntimeConvergence::new(pool.clone()));
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let installation = selector(&fixture);
@@ -1078,4 +1658,761 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     assert_eq!(audit.policy_revision, 1);
     assert_eq!(source_calls.load(Ordering::SeqCst), 5);
     assert_eq!(client_calls.load(Ordering::SeqCst), 5);
+
+    let apply_key = format!("apply-e2e-{}", suffix());
+    let apply_request = ProductRequestIdV1::parse(&format!("apply.first.{}", suffix())).unwrap();
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &apply_request,
+            &installation,
+            apply_command(&fixture, &apply_key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), ProductStatusV1::RuntimePending);
+    assert!(!applied.exact_replay());
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &installation,
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Pending
+    );
+
+    let replay_request = ProductRequestIdV1::parse(&format!("apply.replay.{}", suffix())).unwrap();
+    let replay = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &replay_request,
+            &installation,
+            apply_command(&fixture, &apply_key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), ProductStatusV1::RuntimePending);
+    assert!(replay.exact_replay());
+    assert_eq!(replay.exact_deployment(), applied.exact_deployment());
+
+    let applied_state = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        "SELECT activation.state, activation.product_revision, \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations AS active \
+          WHERE active.guild_id = activation.guild_id \
+            AND active.ruleset_key = activation.ruleset_key \
+            AND active.active_version = activation.target_version), \
+         (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+          WHERE deployment.activation_request_id = activation.id \
+            AND deployment.phase = 'requested'), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts AS receipt \
+          WHERE receipt.target_resource_id = activation.promotion_id \
+            AND receipt.endpoint_domain = 'product_apply_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events AS audit \
+          WHERE audit.target_resource_id = activation.promotion_id \
+            AND audit.action = 'promotion.apply') \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied_state, ("applied".to_string(), 4, 1, 1, 1, 1));
+
+    let rotated = rotate_authority(&pool, &fixture, AuthorityRotation::Safe).await;
+    let rotated_authority = authority_adapter(rotated.clone());
+    let rotated_application = ProductControlApplication::new(
+        &authentication,
+        &rotated_authority,
+        &decisions,
+        &deployments,
+    );
+    assert_eq!(
+        rotated_application
+            .get_product_status(
+                &rotated.credential,
+                &selector(&rotated),
+                status_query(&rotated)
+            )
+            .await
+            .unwrap(),
+        ProductStatusV1::RuntimePending
+    );
+    assert_eq!(
+        application
+            .get_product_status(&fixture.credential, &installation, status_query(&fixture))
+            .await
+            .unwrap_err(),
+        ProductApplicationError::Control(ProductControlPortError::InvalidState)
+    );
+}
+
+#[derive(Clone)]
+struct RecordingDeploymentStatuses {
+    inner: PostgresProductDeploymentStatuses,
+    authority_windows: Arc<Mutex<Vec<(CapabilityV1, i64)>>>,
+}
+
+impl RecordingDeploymentStatuses {
+    fn new(inner: PostgresProductDeploymentStatuses) -> Self {
+        Self {
+            inner,
+            authority_windows: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn authority_windows(&self) -> Vec<(CapabilityV1, i64)> {
+        self.authority_windows.lock().unwrap().clone()
+    }
+}
+
+impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for RecordingDeploymentStatuses {
+    async fn load_exact_deployment_status(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
+        let evidence = request.evidence();
+        self.authority_windows.lock().unwrap().push((
+            evidence.capability(),
+            (evidence.expires_at() - evidence.observed_at()).num_milliseconds(),
+        ));
+        self.inner.load_exact_deployment_status(request).await
+    }
+}
+
+#[derive(Clone)]
+struct ProjectedDecision {
+    projection: ProductDecisionProjectionV1,
+}
+
+impl ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1> for ProjectedDecision {
+    async fn load_approval_preview(
+        &self,
+        _request: AuthorizedApprovalPreviewV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<ProductApprovalPreviewV1, ProductControlPortError> {
+        Err(ProductControlPortError::InvalidState)
+    }
+
+    async fn load_product_status(
+        &self,
+        _request: AuthorizedProductStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<ProductDecisionProjectionV1, ProductControlPortError> {
+        Ok(self.projection.clone())
+    }
+}
+
+fn product_runtime_scope(
+    fixture: &Fixture,
+    exact: &ExactDeploymentSelectorV1,
+) -> RuntimeDeploymentScopeV1 {
+    RuntimeDeploymentScopeV1 {
+        tenant_id: RuntimeTenantId::parse(fixture.tenant_id.as_str()).unwrap(),
+        installation_id: RuntimeInstallationId::parse(fixture.installation_id.as_str()).unwrap(),
+        deployment_id: DeploymentId::parse(exact.deployment_reference()).unwrap(),
+    }
+}
+
+async fn mutate_product_runtime(
+    runtime: &PostgresRuntimeConvergence,
+    scope: &RuntimeDeploymentScopeV1,
+    expected_revision: DeploymentRevision,
+    controller_id: &ControllerId,
+    fencing_token: FencingToken,
+    runtime_generation: RuntimeGeneration,
+    mutation: DeploymentMutationV1,
+) -> DeploymentRevision {
+    runtime
+        .mutate(SubmitDeploymentMutationV1 {
+            scope: scope.clone(),
+            expected_revision,
+            controller_id: controller_id.clone(),
+            fencing_token,
+            runtime_generation,
+            mutation,
+        })
+        .await
+        .unwrap()
+        .snapshot
+        .revision
+}
+
+async fn advance_product_runtime_to_ready(
+    runtime: &PostgresRuntimeConvergence,
+    scope: &RuntimeDeploymentScopeV1,
+    claim: &automation_runtime_convergence_postgres::ClaimReceiptV1,
+) -> DeploymentRevision {
+    let target = claim.snapshot.target.clone();
+    let generation = claim.snapshot.runtime_generation;
+    let mut revision = mutate_product_runtime(
+        runtime,
+        scope,
+        claim.snapshot.revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
+            target: target.clone(),
+            runtime_generation: generation,
+            observed_runtime: None,
+            checked_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    revision = mutate_product_runtime(
+        runtime,
+        scope,
+        revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::RequestDrain,
+    )
+    .await;
+    revision = mutate_product_runtime(
+        runtime,
+        scope,
+        revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
+            previous_runtime: None,
+            target_runtime_generation: generation,
+            drained_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    revision = mutate_product_runtime(
+        runtime,
+        scope,
+        revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::BeginActivation,
+    )
+    .await;
+    mutate_product_runtime(
+        runtime,
+        scope,
+        revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
+            activation_request_id: ActivationRequestId::parse(
+                claim.snapshot.identity.activation_request_id.as_str(),
+            )
+            .unwrap(),
+            target,
+            runtime_generation: generation,
+            kind: ActivationOutcomeKindV1::AlreadyActive,
+            activated_at: claim.acquired_at,
+        }),
+    )
+    .await
+}
+
+async fn certify_product_runtime_live(
+    runtime: &PostgresRuntimeConvergence,
+    scope: &RuntimeDeploymentScopeV1,
+    claim: &automation_runtime_convergence_postgres::ClaimReceiptV1,
+    ready_revision: DeploymentRevision,
+    serving_lease_for: Duration,
+) -> (
+    automation_runtime_convergence_postgres::MutationReceiptV1,
+    automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
+) {
+    let target = claim.snapshot.target.clone();
+    let generation = claim.snapshot.runtime_generation;
+    let process_instance_id =
+        ProcessInstanceId::parse(format!("product-live-process-{}", suffix())).unwrap();
+    let revision = mutate_product_runtime(
+        runtime,
+        scope,
+        ready_revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::BeginPanelReconciliation,
+    )
+    .await;
+    let revision = mutate_product_runtime(
+        runtime,
+        scope,
+        revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        generation,
+        DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
+            certificate_id: PanelCertificateId::parse(format!(
+                "product-live-certificate-{}",
+                suffix()
+            ))
+            .unwrap(),
+            target: target.clone(),
+            runtime_generation: generation,
+            process_instance_id: process_instance_id.clone(),
+            declared_count: 0,
+            installed_count: 0,
+            unchanged_count: 0,
+            skipped_transient_count: 0,
+            skipped_unresolved_channel_count: 0,
+            failed_count: 0,
+            ambiguous_outcome_count: 0,
+            stale_message_cleanup_pending_count: 0,
+            orphan_message_cleanup_pending_count: 0,
+            reposted_old_message_cleanup_pending_count: 0,
+            reconciled_at: claim.acquired_at,
+        }),
+    )
+    .await;
+    runtime
+        .certify_live(SubmitLiveAttestationV1 {
+            scope: scope.clone(),
+            expected_revision: revision,
+            controller_id: claim.controller_id.clone(),
+            fencing_token: claim.fencing_token,
+            runtime_generation: generation,
+            gateway_ready: GatewayReadyAttestationV1 {
+                target,
+                runtime_generation: generation,
+                process_instance_id,
+                kind: GatewayReadyKindV1::DiscordReady,
+                ready_at: claim.acquired_at,
+            },
+            metadata: LiveMetadataV1 {
+                runtime_build_revision: RuntimeBuildRevisionV1::parse("product-status-e2e")
+                    .unwrap(),
+                panel_report_digest: PanelReportDigestV1::parse(sha256_hex(&format!(
+                    "product-panel-report:{}",
+                    suffix()
+                )))
+                .unwrap(),
+                gateway_shard_id: GatewayShardIdV1::parse("shard:product-status").unwrap(),
+            },
+            serving_lease_for,
+        })
+        .await
+        .unwrap()
+}
+
+fn applied_projection(
+    fixture: &Fixture,
+    exact: ExactDeploymentSelectorV1,
+) -> ProductDecisionProjectionV1 {
+    ProductDecisionProjectionV1::from_server_projection(
+        fixture.tenant_id.clone(),
+        fixture.installation_id.clone(),
+        fixture.guild_id,
+        fixture.promotion_id.clone(),
+        ProductRevisionV1::new(4).unwrap(),
+        ProductDecisionPhaseV1::Applied {
+            exact_deployment: exact,
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_requires_exact_attestation_and_connected_unexpired_serving() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let runtime = PostgresRuntimeConvergence::with_config(
+        pool.clone(),
+        PostgresRuntimeConvergenceConfigV1 {
+            statement_timeout: Duration::from_millis(500),
+            lock_timeout: Duration::from_millis(250),
+            ..PostgresRuntimeConvergenceConfigV1::default()
+        },
+    )
+    .unwrap();
+    let deployments =
+        RecordingDeploymentStatuses::new(PostgresProductDeploymentStatuses::new(runtime.clone()));
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let apply_key = format!("apply-live-{}", suffix());
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.live.first.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &apply_key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), ProductStatusV1::RuntimePending);
+    assert_eq!(
+        application
+            .apply(
+                &fixture.credential,
+                &fixture.csrf,
+                &ProductRequestIdV1::parse(&format!("apply.live.replay.{}", suffix())).unwrap(),
+                &selector(&fixture),
+                apply_command(&fixture, &apply_key),
+            )
+            .await
+            .unwrap()
+            .status(),
+        ProductStatusV1::RuntimePending
+    );
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Pending
+    );
+    let scope = product_runtime_scope(&fixture, applied.exact_deployment());
+    let requested = runtime.status(&scope).await.unwrap();
+    let claim = runtime
+        .claim(ClaimDeploymentV1 {
+            scope: scope.clone(),
+            expected_revision: requested.snapshot.revision,
+            controller_id: ControllerId::parse(format!("product-live-controller-{}", suffix()))
+                .unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    let ready_revision = advance_product_runtime_to_ready(&runtime, &scope, &claim).await;
+    let (live, serving) = certify_product_runtime_live(
+        &runtime,
+        &scope,
+        &claim,
+        ready_revision,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Live {
+            attestation_revision: NonZeroU64::new(live.snapshot.revision.get()).unwrap(),
+        }
+    );
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Pending
+    );
+    let recovered = runtime
+        .recover_stale_live(RecoverStaleLiveV1 {
+            identity: serving.identity,
+            expected_deployment_revision: live.snapshot.revision,
+        })
+        .await
+        .unwrap();
+    let recovered_claim = runtime
+        .claim(ClaimDeploymentV1 {
+            scope: scope.clone(),
+            expected_revision: recovered.snapshot.revision,
+            controller_id: ControllerId::parse(format!(
+                "product-live-recovery-controller-{}",
+                suffix()
+            ))
+            .unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    let (recovered_live, recovered_serving) = certify_product_runtime_live(
+        &runtime,
+        &scope,
+        &recovered_claim,
+        recovered_claim.snapshot.revision,
+        Duration::from_secs(45),
+    )
+    .await;
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Live {
+            attestation_revision: NonZeroU64::new(recovered_live.snapshot.revision.get()).unwrap(),
+        }
+    );
+    runtime
+        .mark_serving_disconnected(MarkServingDisconnectedV1 {
+            identity: recovered_serving.identity,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        application
+            .get_deployment_status(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        DeploymentStatusV1::Pending
+    );
+    let authority_windows = deployments.authority_windows();
+    assert!(authority_windows.contains(&(CapabilityV1::Apply, 5_000)));
+    assert!(authority_windows.contains(&(CapabilityV1::Read, 30_000)));
+    assert!(authority_windows.iter().all(|(capability, lifetime)| {
+        matches!(
+            (capability, lifetime),
+            (CapabilityV1::Apply, 5_000) | (CapabilityV1::Read, 30_000)
+        )
+    }));
+    assert!(DiscordAuthorityConfigV1::new(
+        Duration::from_secs(2),
+        Duration::from_millis(5_001),
+        Duration::from_secs(30),
+    )
+    .is_err());
+    assert!(DiscordAuthorityConfigV1::new(
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        Duration::from_millis(30_001),
+    )
+    .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_maps_blocked_failure_to_stable_public_code() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let runtime = PostgresRuntimeConvergence::new(pool.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(runtime.clone());
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.blocked.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-blocked-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    let scope = product_runtime_scope(&fixture, applied.exact_deployment());
+    let requested = runtime.status(&scope).await.unwrap();
+    let claim = runtime
+        .claim(ClaimDeploymentV1 {
+            scope: scope.clone(),
+            expected_revision: requested.snapshot.revision,
+            controller_id: ControllerId::parse(format!("product-blocked-{}", suffix())).unwrap(),
+            lease_for: Duration::from_secs(90),
+        })
+        .await
+        .unwrap();
+    let ready_revision = advance_product_runtime_to_ready(&runtime, &scope, &claim).await;
+    let private_code = sha256_hex(&format!("private-blocked-code:{}", suffix()));
+    mutate_product_runtime(
+        &runtime,
+        &scope,
+        ready_revision,
+        &claim.controller_id,
+        claim.fencing_token,
+        claim.snapshot.runtime_generation,
+        DeploymentMutationV1::RecordBlockedFailure {
+            failure_id: RuntimeFailureId::parse(format!("blocked-{}", suffix())).unwrap(),
+            kind: RuntimeFailureKindV1::InvariantViolation,
+            code: private_code.clone(),
+            message: "private blocked diagnostic".to_string(),
+        },
+    )
+    .await;
+    let status = application
+        .get_deployment_status(
+            &fixture.credential,
+            &selector(&fixture),
+            authoring_application::RuntimeDeploymentQueryV1 {
+                promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        DeploymentStatusV1::Failed {
+            retryable: false,
+            failure_code: "runtime_invariant_violation".to_string(),
+        }
+    );
+    assert!(!format!("{status:?}").contains(&private_code));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn product_status_fails_closed_for_exact_identity_digest_and_scope_mismatch() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let decisions = product_decisions(&pool);
+    approve_fixture(&pool, &fixture, &decisions).await;
+    let authentication = PostgresAuthentication::new(pool.clone());
+    let authority = authority_adapter(fixture.clone());
+    let runtime = PostgresRuntimeConvergence::new(pool.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(runtime);
+    let application =
+        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+    let applied = application
+        .apply(
+            &fixture.credential,
+            &fixture.csrf,
+            &ProductRequestIdV1::parse(&format!("apply.mismatch.{}", suffix())).unwrap(),
+            &selector(&fixture),
+            apply_command(&fixture, &format!("apply-mismatch-{}", suffix())),
+        )
+        .await
+        .unwrap();
+    let exact = applied.exact_deployment().clone();
+    let query = authoring_application::RuntimeDeploymentQueryV1 {
+        promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+    };
+
+    let wrong_deployment = ExactDeploymentSelectorV1::from_server_projection(
+        fixture.installation_id.clone(),
+        fixture.promotion_id.clone(),
+        format!("missing-deployment-{}", suffix()),
+        exact.target_digest(),
+    )
+    .unwrap();
+    let wrong_deployment_decision = ProjectedDecision {
+        projection: applied_projection(&fixture, wrong_deployment),
+    };
+    let wrong_deployment_application = ProductControlApplication::new(
+        &authentication,
+        &authority,
+        &wrong_deployment_decision,
+        &deployments,
+    );
+    assert_eq!(
+        wrong_deployment_application
+            .get_deployment_status(&fixture.credential, &selector(&fixture), query.clone())
+            .await
+            .unwrap_err(),
+        ProductApplicationError::Deployment(DeploymentStatusPortError::NotFound)
+    );
+
+    let wrong_digest = ExactDeploymentSelectorV1::from_server_projection(
+        fixture.installation_id.clone(),
+        fixture.promotion_id.clone(),
+        exact.deployment_reference(),
+        if exact.target_digest() == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        },
+    )
+    .unwrap();
+    let wrong_digest_decision = ProjectedDecision {
+        projection: applied_projection(&fixture, wrong_digest),
+    };
+    let wrong_digest_application = ProductControlApplication::new(
+        &authentication,
+        &authority,
+        &wrong_digest_decision,
+        &deployments,
+    );
+    assert_eq!(
+        wrong_digest_application
+            .get_deployment_status(&fixture.credential, &selector(&fixture), query.clone())
+            .await
+            .unwrap_err(),
+        ProductApplicationError::Deployment(DeploymentStatusPortError::Indeterminate(
+            "runtime deployment status projection is inconsistent".to_string(),
+        ))
+    );
+
+    let wrong_promotion = ExactDeploymentSelectorV1::from_server_projection(
+        fixture.installation_id.clone(),
+        PromotionId::parse(&sha256_hex(&format!("wrong-promotion:{}", suffix()))).unwrap(),
+        exact.deployment_reference(),
+        exact.target_digest(),
+    )
+    .unwrap();
+    let wrong_promotion_decision = ProjectedDecision {
+        projection: applied_projection(&fixture, wrong_promotion),
+    };
+    let wrong_promotion_application = ProductControlApplication::new(
+        &authentication,
+        &authority,
+        &wrong_promotion_decision,
+        &deployments,
+    );
+    assert_eq!(
+        wrong_promotion_application
+            .get_deployment_status(&fixture.credential, &selector(&fixture), query.clone())
+            .await
+            .unwrap_err(),
+        ProductApplicationError::InvalidProjection
+    );
+
+    let wrong_installation = ExactDeploymentSelectorV1::from_server_projection(
+        AutomationInstallationId::parse(&format!("wrong-installation-{}", suffix())).unwrap(),
+        fixture.promotion_id.clone(),
+        exact.deployment_reference(),
+        exact.target_digest(),
+    )
+    .unwrap();
+    let wrong_installation_decision = ProjectedDecision {
+        projection: applied_projection(&fixture, wrong_installation),
+    };
+    let wrong_installation_application = ProductControlApplication::new(
+        &authentication,
+        &authority,
+        &wrong_installation_decision,
+        &deployments,
+    );
+    assert_eq!(
+        wrong_installation_application
+            .get_deployment_status(&fixture.credential, &selector(&fixture), query)
+            .await
+            .unwrap_err(),
+        ProductApplicationError::InvalidProjection
+    );
 }

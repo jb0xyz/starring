@@ -8,8 +8,16 @@ use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use authoring_promotion::{approval_payload_digest_v1, PromotionRecordV1, PromotionStageV1};
 use chrono::{DateTime, Utc};
 use discord_model::GuildId;
+use resource_resolution::{
+    approval_binding_fingerprint_v1, project_required_bindings, resource_binding_fingerprint_v2,
+};
 use serde_json::Value;
 use sqlx::types::Json;
+
+use crate::bindings::decode_resource_bindings;
+
+const MAX_WRITE_AUTHORITY_LIFETIME: chrono::Duration = chrono::Duration::seconds(5);
+const MAX_READ_AUTHORITY_LIFETIME: chrono::Duration = chrono::Duration::seconds(30);
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct ProductDecisionRow {
@@ -38,12 +46,22 @@ pub(crate) struct ProductDecisionRow {
     pub installation_ruleset_key: String,
     pub installation_lifecycle_state: String,
     pub installation_current_authority_revision: i64,
-    pub authority_binding_revision: i64,
-    pub authority_resource_context_fingerprint: String,
-    pub authority_policy_revision: i64,
-    pub authority_required_approvals: i32,
-    pub authority_activation_ttl_seconds: i64,
-    pub authority_payload_digest: String,
+    pub current_authority_payload_digest: String,
+    pub promoted_session_owner_principal_id: Option<String>,
+    pub promoted_session_owner_discord_user_id: Option<String>,
+    pub promoted_generation_session_id: Option<String>,
+    pub promoted_generation: Option<i64>,
+    pub promoted_generation_stage: Option<String>,
+    pub promoted_generation_candidate_revision: Option<i64>,
+    pub promoted_generation_candidate_hash: Option<String>,
+    pub promoted_generation_resource_bindings: Option<Json<Value>>,
+    pub promoted_generation_binding_fingerprint: Option<String>,
+    pub historical_authority_binding_revision: Option<i64>,
+    pub historical_authority_resource_bindings: Option<Json<Value>>,
+    pub historical_authority_resource_context_fingerprint: Option<String>,
+    pub historical_authority_policy_revision: Option<i64>,
+    pub historical_authority_required_approvals: Option<i32>,
+    pub historical_authority_activation_ttl_seconds: Option<i64>,
     pub actor_discord_user_id: String,
     pub actor_disabled: bool,
     pub actor_session_revoked_at: Option<DateTime<Utc>>,
@@ -122,12 +140,12 @@ fn validate_authority(
         && evidence.guild_id() == scope.guild_id()
         && evidence.acting_user_id() == scope.acting_user_id()
         && evidence.discord_application_id().get().to_string() == row.installation_application_id
-        && evidence.installation_authority_revision().get().to_string()
-            == row.installation_current_authority_revision.to_string()
-        && evidence.installation_authority_digest() == row.authority_payload_digest
+        && i64::try_from(evidence.installation_authority_revision().get()).ok()
+            == Some(row.installation_current_authority_revision)
+        && evidence.installation_authority_digest() == row.current_authority_payload_digest
         && observed_at <= row.database_now
         && row.database_now < expires_at
-        && expires_at <= observed_at + chrono::Duration::seconds(5);
+        && authority_evidence_lifetime_is_bounded(expected_capability, observed_at, expires_at);
     if !evidence_matches
         || row.tenant_lifecycle_state != "active"
         || row.installation_lifecycle_state != "active"
@@ -150,11 +168,30 @@ fn validate_authority(
     Ok(())
 }
 
+fn authority_evidence_lifetime_is_bounded(
+    capability: CapabilityV1,
+    observed_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> bool {
+    let maximum = match capability {
+        CapabilityV1::Read => MAX_READ_AUTHORITY_LIFETIME,
+        CapabilityV1::Promote
+        | CapabilityV1::Approve
+        | CapabilityV1::Reject
+        | CapabilityV1::Apply => MAX_WRITE_AUTHORITY_LIFETIME,
+    };
+    expires_at > observed_at
+        && observed_at
+            .checked_add_signed(maximum)
+            .is_some_and(|latest| expires_at <= latest)
+}
+
 fn validate_record_and_activation(
     row: &ProductDecisionRow,
     record: &PromotionRecordV1,
     promotion: &PromotionSelectorV1,
 ) -> Result<(), ProductControlPortError> {
+    let requester_id = record.intent.authority.requester.to_string();
     if &record.id != promotion.promotion_id()
         || record.intent.authority.tenant_id.as_str() != row.promotion_tenant_id
         || record.intent.authority.installation_id.as_str() != row.activation_installation_id
@@ -162,9 +199,59 @@ fn validate_record_and_activation(
         || record.intent.authority.ruleset_key.as_str() != row.activation_ruleset_key
         || record.request_digest.as_str() != row.promotion_request_digest
         || row.promotion_request_digest != row.activation_promotion_request_digest
-        || record.intent.evidence.context_fingerprint.as_str()
-            != row.authority_resource_context_fingerprint
-        || row.activation_required_approvals != row.authority_required_approvals
+        || Some(record.intent.authority.principal_id.as_str())
+            != row.promoted_session_owner_principal_id.as_deref()
+        || Some(record.intent.authority.session_owner_id.as_str())
+            != row.promoted_session_owner_principal_id.as_deref()
+        || Some(requester_id.as_str()) != row.promoted_session_owner_discord_user_id.as_deref()
+        || Some(record.intent.authority.session_id.as_str())
+            != row.promoted_generation_session_id.as_deref()
+        || i64::try_from(record.intent.authority.session_generation.get()).ok()
+            != row.promoted_generation
+        || row.promoted_generation_stage.as_deref() != Some("preview_ready")
+        || i64::try_from(record.intent.evidence.candidate_revision).ok()
+            != row.promoted_generation_candidate_revision
+        || Some(record.intent.evidence.candidate_ruleset_hash.as_str())
+            != row.promoted_generation_candidate_hash.as_deref()
+        || Some(record.intent.evidence.context_fingerprint.as_str())
+            != row.promoted_generation_binding_fingerprint.as_deref()
+        || row.promoted_generation_binding_fingerprint
+            != row.historical_authority_resource_context_fingerprint
+        || i64::try_from(record.intent.authority.binding_revision.get()).ok()
+            != row.historical_authority_binding_revision
+        || i64::try_from(record.intent.authority.policy.revision.get()).ok()
+            != row.historical_authority_policy_revision
+        || i32::try_from(record.intent.authority.policy.required_approvals.get()).ok()
+            != row.historical_authority_required_approvals
+        || i64::try_from(record.intent.authority.policy.ttl_seconds.get()).ok()
+            != row.historical_authority_activation_ttl_seconds
+        || Some(row.activation_required_approvals) != row.historical_authority_required_approvals
+    {
+        return Err(invalid_persistence());
+    }
+    let generation_bindings = decode_resource_bindings(
+        row.promoted_generation_resource_bindings
+            .as_ref()
+            .ok_or_else(invalid_persistence)?
+            .0
+            .clone(),
+    )
+    .map_err(|_| invalid_persistence())?;
+    let historical_bindings = decode_resource_bindings(
+        row.historical_authority_resource_bindings
+            .as_ref()
+            .ok_or_else(invalid_persistence)?
+            .0
+            .clone(),
+    )
+    .map_err(|_| invalid_persistence())?;
+    if generation_bindings != historical_bindings
+        || Some(resource_binding_fingerprint_v2(&generation_bindings).as_str())
+            != row.promoted_generation_binding_fingerprint.as_deref()
+        || Some(resource_binding_fingerprint_v2(&historical_bindings).as_str())
+            != row
+                .historical_authority_resource_context_fingerprint
+                .as_deref()
     {
         return Err(invalid_persistence());
     }
@@ -177,15 +264,28 @@ fn validate_record_and_activation(
     };
     let expected_context =
         serde_json::to_value(&activation.approval_context).map_err(|_| invalid_persistence())?;
+    let projected_bindings = project_required_bindings(
+        &activation.approval_context.binding.required_bindings,
+        &historical_bindings,
+    )
+    .map_err(|_| invalid_persistence())?;
+    let historical_approval_fingerprint = approval_binding_fingerprint_v1(
+        record.intent.authority.guild_id,
+        activation.approval_context.binding.revision,
+        &projected_bindings,
+    )
+    .map_err(|_| invalid_persistence())?;
     if row.activation_approval_context["context"] != expected_context
+        || projected_bindings != activation.approval_context.binding.required_bindings
+        || historical_approval_fingerprint != activation.approval_context.binding.fingerprint
         || i64::try_from(activation.approval_context.binding.revision.get()).ok()
-            != Some(row.authority_binding_revision)
+            != row.historical_authority_binding_revision
         || i64::try_from(activation.approval_context.policy.revision.get()).ok()
-            != Some(row.authority_policy_revision)
+            != row.historical_authority_policy_revision
         || i32::try_from(activation.approval_context.policy.required_approvals.get()).ok()
-            != Some(row.authority_required_approvals)
+            != row.historical_authority_required_approvals
         || i64::try_from(activation.approval_context.policy.ttl_seconds.get()).ok()
-            != Some(row.authority_activation_ttl_seconds)
+            != row.historical_authority_activation_ttl_seconds
         || activation.request_id.as_str() != row.activation_request_id
         || activation.target.guild_id.to_string() != row.activation_guild_id
         || activation.target.ruleset_key.as_str() != row.activation_ruleset_key
@@ -334,5 +434,42 @@ mod tests {
         assert_eq!(approval_guild_from_database("42").unwrap(), GuildId(42));
         assert!(approval_revision_from_database(0).is_err());
         assert!(approval_guild_from_database("01").is_err());
+    }
+
+    #[test]
+    fn read_and_mutation_authority_lifetimes_follow_their_distinct_contracts() {
+        let observed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        assert!(authority_evidence_lifetime_is_bounded(
+            CapabilityV1::Read,
+            observed_at,
+            observed_at + chrono::Duration::seconds(30)
+        ));
+        assert!(!authority_evidence_lifetime_is_bounded(
+            CapabilityV1::Read,
+            observed_at,
+            observed_at + chrono::Duration::seconds(30) + chrono::Duration::microseconds(1)
+        ));
+        for capability in [
+            CapabilityV1::Promote,
+            CapabilityV1::Approve,
+            CapabilityV1::Reject,
+            CapabilityV1::Apply,
+        ] {
+            assert!(authority_evidence_lifetime_is_bounded(
+                capability,
+                observed_at,
+                observed_at + chrono::Duration::seconds(5)
+            ));
+            assert!(!authority_evidence_lifetime_is_bounded(
+                capability,
+                observed_at,
+                observed_at + chrono::Duration::seconds(5) + chrono::Duration::microseconds(1)
+            ));
+        }
+        assert!(!authority_evidence_lifetime_is_bounded(
+            CapabilityV1::Read,
+            DateTime::<Utc>::MAX_UTC,
+            DateTime::<Utc>::MAX_UTC
+        ));
     }
 }
