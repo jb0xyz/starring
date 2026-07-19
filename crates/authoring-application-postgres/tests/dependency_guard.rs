@@ -287,13 +287,17 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         .contains("load_active_product_session(&self.pool, self.config, credential, Some(csrf))"));
     assert!(authentication
         .contains("SessionValidationError::InvalidCsrf => AuthenticationError::InvalidCsrf"));
-    assert!(authentication.contains("FOR SHARE OF authentication_session, principal"));
+    assert!(authentication.contains("public.starring_product_session_read_v1($1)"));
+    assert!(authentication.contains("public.starring_product_session_mutation_read_v1($1)"));
+    assert!(authentication.contains("public.starring_product_session_touch_v1($1, $2, $3, $4, $5)"));
+    assert!(authentication.contains("csrf_comparison_tag"));
+    assert!(authentication.contains("SessionProofModeV1::SessionOnly"));
+    assert!(authentication.contains("SessionProofModeV1::Mutation"));
     assert!(authentication.contains("touch_active_product_session"));
     assert!(authentication.contains("SELECT pg_catalog.clock_timestamp()"));
-    assert!(authentication.contains("public.product_auth_sessions"));
-    assert!(authentication.contains("public.product_principals"));
+    assert!(!authentication.contains("public.product_auth_sessions"));
+    assert!(!authentication.contains("public.product_principals"));
     assert!(authentication.contains("pg_catalog.set_config("));
-    assert!(authentication.contains("pg_catalog.make_interval("));
     assert!(!authentication.contains(".bind(credential)"));
     let snapshot = include_str!("../src/snapshot.rs");
     assert!(snapshot.contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"));
@@ -425,7 +429,11 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(!identity.contains(".bind(csrf)"));
     assert!(identity.contains("oauth_state_digest"));
     assert!(identity.contains("validate_consumed_flow"));
-    assert!(authentication.contains("persisted_csrf.ct_eq(expected)"));
+    assert!(authentication.contains("persisted_tag.ct_eq(&expected_tag)"));
+    assert!(identity.contains("pub async fn current_principal("));
+    assert!(identity.contains("credential,\n            None,"));
+    assert!(identity.contains("pub async fn verify_csrf("));
+    assert!(identity.contains("credential,\n            Some(csrf),"));
     assert!(identity.contains("persisted.ct_eq(expected.as_bytes())"));
     assert!(identity.contains("ProductLogoutDispositionV1::ExactReplay"));
     assert!(identity.contains("inserted.idle_expires_at.min(inserted.absolute_expires_at)"));
@@ -435,6 +443,50 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(identity.contains("pg_catalog.clock_timestamp()"));
     assert!(identity.contains("pg_catalog.make_interval("));
     assert!(identity.contains("pg_catalog.set_config("));
+    let authentication_scope_migration =
+        include_str!("../../../migrations/202607190015_scope_product_authentication.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_product_session_read_v1(",
+        "CREATE FUNCTION public.starring_product_session_mutation_read_v1(",
+        "CREATE FUNCTION public.starring_product_session_touch_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "FOR SHARE OF authentication_session, principal",
+        "pg_catalog.sha256(pg_catalog.byteacat(",
+        "csrf_digest_length",
+        "oauth_state_digest_length",
+        "touch_interval_seconds >= 1",
+        "observed_idle_expires_at - observed_last_seen_at",
+        "touch_clock.touched_at >= authentication_session.last_seen_at",
+        "relation.relrowsecurity",
+        "relation.relforcerowsecurity",
+        "pg_catalog.aclexplode(COALESCE(",
+        "REVOKE ALL PRIVILEGES ON FUNCTION",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "FROM PUBLIC;",
+    ] {
+        assert!(
+            authentication_scope_migration.contains(required),
+            "missing authentication scope guard: {required}"
+        );
+    }
+    assert!(!authentication_scope_migration.contains("authentication_session.csrf_digest,"));
+    let authentication_readiness = include_str!("../src/authentication/readiness.rs");
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 3]",
+        "ScopedRelationContractV1::ordinary_without_rls",
+        "begin_scoped_database_readiness(",
+        "ScopedDatabaseProbeModeV1::ReadWrite",
+        "public.starring_product_session_read_v1($1)",
+        "public.starring_product_session_mutation_read_v1($1)",
+        "public.starring_product_session_touch_v1(",
+        "write_transaction\n            .rollback()",
+    ] {
+        assert!(
+            authentication_readiness.contains(required),
+            "missing authentication readiness guard: {required}"
+        );
+    }
     for (path, source) in [
         ("src/authentication.rs", authentication),
         ("src/installation_authority.rs", installation_authority),
@@ -500,6 +552,10 @@ fn source_files_contain_no_comments() {
         (
             "src/authentication.rs",
             include_str!("../src/authentication.rs"),
+        ),
+        (
+            "src/authentication/readiness.rs",
+            include_str!("../src/authentication/readiness.rs"),
         ),
         ("src/bindings.rs", include_str!("../src/bindings.rs")),
         ("src/database.rs", include_str!("../src/database.rs")),
@@ -663,6 +719,14 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/installation_authority_security.rs",
             include_str!("postgres_product_control_e2e/installation_authority_security.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/authentication_security.rs",
+            include_str!("postgres_product_control_e2e/authentication_security.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/authentication_migration_security.rs",
+            include_str!("postgres_product_control_e2e/authentication_migration_security.rs"),
         ),
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",

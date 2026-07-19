@@ -261,9 +261,78 @@ The execution probe also fails closed when the function owner lacks schema
 usage.
 
 This authority-read probe certifies only that adapter boundary. Authentication
-and authorized-snapshot access still need their own narrow database functions
-before one final execute-only `starring_api` process can pass whole-service
-readiness. Do not compensate by granting the API role direct table access.
+and authorized-snapshot access require independent certification. Do not
+compensate by granting the API role direct table access.
+
+Migration 015 creates the independently scoped product-session authentication
+boundary. Session-only reads, mutation reads, and touches use three separate
+volatile, strict, parallel-unsafe security-definer functions fixed to
+`search_path=pg_catalog`. The two reads lock the exact session and principal
+rows. The mutation read exposes only a SHA-256 comparison tag bound to the
+session digest and stored CSRF digest; neither read exposes the stored CSRF or
+OAuth verifier digest. Touch uses the database clock and an exact observed-row
+compare-and-set. It inherits the current session's exact idle window and rechecks
+revocation, active expiry, the 30-minute global idle maximum, and a minimum
+one-second touch interval. When configuration tightens the idle policy, an older
+session with a longer issued window stops sliding and expires at its current
+deadline. Immediate policy enforcement requires explicit session revocation and
+reissuance through a separate management boundary.
+Migration 015 requires the two identity relations to be ordinary non-RLS tables
+under one owner, strips non-owner and hostile default function grants, transfers
+all three functions to that owner, and revokes `PUBLIC` execution in one
+migration transaction.
+
+Grant the API role only these exact signatures without grant option:
+
+```sql
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_session_read_v1(BYTEA)
+TO starring_api;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_session_mutation_read_v1(BYTEA)
+TO starring_api;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_session_touch_v1(
+        BYTEA,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        DOUBLE PRECISION
+    )
+TO starring_api;
+```
+
+For this authentication slice, `starring_api` must have no table or column
+privilege on `product_principals` or `product_auth_sessions`. Retain the same
+direct-login, role-attribute, role-membership, database, and schema restrictions
+required by the installation-authority slice. Call
+`PostgresAuthentication::verify_readiness` through a direct `starring_api` login
+before opening ingress. It verifies exact function and relation metadata, the
+common non-login owner, ACLs, capabilities, disabled RLS, and actual
+data-independent execution. The metadata phase is bounded repeatable-read and
+read-only. The execution phase must be bounded read-write because both read
+functions take `FOR SHARE` locks; its impossible 31-byte digest cannot select a
+session, the expected read counts are both zero, the expected touch count is
+zero, and the transaction is rolled back. Do not weaken this probe to read-only.
+This is a capability and function-shape probe, not privileged-DDL attestation.
+Migration checksum verification, restricted DDL credentials, and schema-change
+audit evidence remain separate cutover requirements.
+
+Migrations 014 and 015 certify only installation-authority reads and session
+authentication reads or touches. Authorized-snapshot loading, OAuth flow and
+session issuance or logout, promotion and publication/link persistence,
+approval and status queries, Apply artifact reads, and runtime convergence still
+contain direct SQL. Product rejection has no production persistence adapter.
+Whole-service execute-only readiness remains a future gate, and direct table
+grants are not a valid workaround.
+
+Authentication transactions set statement, lock, and idle-in-transaction
+deadlines. Also restrict API login connection counts, pool and request
+concurrency, and transaction age, and alert on abnormal direct function calls.
+An actor holding a valid session digest can still consume its granted function
+capacity and create bounded row-lock pressure, although it cannot enumerate the
+identity tables, choose a sub-second touch interval, enlarge the current idle
+window, or extend beyond absolute session expiry.
 
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
@@ -338,9 +407,11 @@ retention.
 - aggregate preflight counts
 - migration duration and lock-wait metrics
 - role capability-probe results
+- authentication readiness outcome, function identities, and role names only
 - retention deleted counts and backlog flags
 - keyring coverage outcome and key IDs only
 - backup and restore-drill identifiers
 
-Do not retain credentials, raw OAuth state, cookies, CSRF values, raw
-idempotency keys, RuleSet JSON, or user message bodies in operational evidence.
+Do not retain credentials, raw OAuth state, cookies, session or CSRF digests,
+derived comparison tags, raw idempotency keys, RuleSet JSON, or user message
+bodies in operational evidence.

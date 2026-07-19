@@ -5,10 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
-    AuthenticatedActorV1, AuthenticationError, AuthorizedApprovalPreviewV1,
+    AuthenticatedActorV1, AuthenticationError, AuthenticationPort, AuthorizedApprovalPreviewV1,
     AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1, CapabilityV1, DeploymentStatusPort,
     DeploymentStatusPortError, DeploymentStatusProjectionV1, DeploymentStatusV1,
-    ExactDeploymentSelectorV1, InstallationSelectorV1, ProductApplicationError,
+    ExactDeploymentSelectorV1, InstallationSelectorV1, MutationAuthenticationPort,
+    ProductApplicationError,
     ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
     ProductCandidateErrorCodeV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
     ProductDecisionQueryPort, ProductIdempotencyKeyV1, ProductRequestIdV1, ProductRevisionV1,
@@ -22,11 +23,12 @@ use authoring_application_discord::{
     InstallationAuthoritySource,
 };
 use authoring_application_postgres::{
-    digest_opaque_session_credential_v1, InstallationAuthorityReadinessErrorV1,
-    PostgresAuthentication, PostgresInstallationAuthoritySource,
+    digest_opaque_session_credential_v1, AuthenticationReadinessErrorV1,
+    InstallationAuthorityReadinessErrorV1, PostgresAuthentication,
+    PostgresAuthenticationConfig, PostgresInstallationAuthoritySource,
     PostgresInstallationAuthoritySourceConfig, PostgresProductDecisions,
-    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1,
-    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1, MIGRATOR,
+    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
     approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,

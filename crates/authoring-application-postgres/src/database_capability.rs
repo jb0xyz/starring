@@ -20,6 +20,15 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows,
         }
     }
+
+    pub(crate) const fn scalar(identity: &'a str, result: &'a str) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: false,
+            rows: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -35,6 +44,13 @@ impl<'a> ScopedRelationContractV1<'a> {
             require_rls_disabled: false,
         }
     }
+
+    pub(crate) const fn ordinary_without_rls(identity: &'a str) -> Self {
+        Self {
+            identity,
+            require_rls_disabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +59,12 @@ pub(crate) enum ScopedDatabaseReadinessErrorV1 {
     CapabilityMissing,
     ExcessCapability,
     Database(ProductDatabaseFailureV1),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScopedDatabaseProbeModeV1 {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(sqlx::FromRow)]
@@ -154,20 +176,8 @@ pub(crate) async fn begin_scoped_database_readiness<'a>(
     functions: &[ScopedFunctionContractV1<'_>],
     relations: &[ScopedRelationContractV1<'_>],
 ) -> Result<Transaction<'a, Postgres>, ScopedDatabaseReadinessErrorV1> {
-    let mut transaction = pool.begin().await.map_err(readiness_database)?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *transaction)
-        .await
-        .map_err(readiness_database)?;
-    sqlx::query(
-        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
-         pg_catalog.set_config('lock_timeout', $1, true), \
-         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
-    )
-    .bind(timeout)
-    .execute(&mut *transaction)
-    .await
-    .map_err(readiness_database)?;
+    let mut transaction =
+        begin_bounded_database_probe(pool, timeout, ScopedDatabaseProbeModeV1::ReadOnly).await?;
 
     let mut capabilities = ScopedDatabaseCapabilitiesV1::new();
     for function in functions {
@@ -187,6 +197,34 @@ pub(crate) async fn begin_scoped_database_readiness<'a>(
         transaction.rollback().await.map_err(readiness_database)?;
         return Err(error);
     }
+    Ok(transaction)
+}
+
+pub(crate) async fn begin_bounded_database_probe<'a>(
+    pool: &'a PgPool,
+    timeout: &str,
+    mode: ScopedDatabaseProbeModeV1,
+) -> Result<Transaction<'a, Postgres>, ScopedDatabaseReadinessErrorV1> {
+    let mut transaction = pool.begin().await.map_err(readiness_database)?;
+    let transaction_mode = match mode {
+        ScopedDatabaseProbeModeV1::ReadOnly => {
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        }
+        ScopedDatabaseProbeModeV1::ReadWrite => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    };
+    sqlx::query(transaction_mode)
+        .execute(&mut *transaction)
+        .await
+        .map_err(readiness_database)?;
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $1, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
+    )
+    .bind(timeout)
+    .execute(&mut *transaction)
+    .await
+    .map_err(readiness_database)?;
     Ok(transaction)
 }
 

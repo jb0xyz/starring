@@ -1,10 +1,10 @@
-fn installation_authority_role_password() -> String {
+fn database_role_password() -> String {
     let mut material = [0_u8; 32];
     getrandom::fill(&mut material).unwrap();
     lower_hex(&material)
 }
 
-async fn installation_authority_login_pool(
+async fn database_role_login_pool(
     database_name: &str,
     role: &str,
     password: &str,
@@ -52,8 +52,8 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
     let owner_role = format!("starring_authority_owner_{role_suffix}");
     let api_role = format!("starring_authority_api_{role_suffix}");
     let denied_role = format!("starring_authority_denied_{role_suffix}");
-    let api_password = installation_authority_role_password();
-    let denied_password = installation_authority_role_password();
+    let api_password = database_role_password();
+    let denied_password = database_role_password();
     let roles = [&owner_role, &api_role, &denied_role];
     for role in roles {
         assert!(
@@ -145,10 +145,8 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
     .execute(&database.pool)
     .await
     .unwrap();
-    let api_pool =
-        installation_authority_login_pool(&database.name, &api_role, &api_password).await;
-    let denied_pool =
-        installation_authority_login_pool(&database.name, &denied_role, &denied_password).await;
+    let api_pool = database_role_login_pool(&database.name, &api_role, &api_password).await;
+    let denied_pool = database_role_login_pool(&database.name, &denied_role, &denied_password).await;
     let outcome = std::panic::AssertUnwindSafe(async {
         let role_identity = sqlx::query_as::<_, (String, String)>(
             "SELECT current_user::TEXT, session_user::TEXT",
@@ -631,7 +629,7 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
     let owner_role = format!("starring_authority_owner_{role_suffix}");
     let migrator_role = format!("starring_authority_migrator_{role_suffix}");
     let hostile_role = format!("starring_authority_hostile_{role_suffix}");
-    let migrator_password = installation_authority_role_password();
+    let migrator_password = database_role_password();
     for role in [&owner_role, &migrator_role, &hostile_role] {
         assert!(
             role.len() <= 63
@@ -708,7 +706,7 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
     .execute(&database.pool)
     .await
     .unwrap();
-    let migrator_pool = installation_authority_login_pool(
+    let migrator_pool = database_role_login_pool(
         &database.name,
         &migrator_role,
         &migrator_password,

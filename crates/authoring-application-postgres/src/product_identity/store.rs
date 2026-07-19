@@ -424,13 +424,12 @@ where
     pub async fn current_principal(
         &self,
         credential: &str,
-        csrf: &str,
     ) -> Result<CurrentProductPrincipalV1, ProductIdentityError> {
         let active = load_active_product_session(
             &self.pool,
             self.config.lifetimes().authentication(),
             credential,
-            Some(csrf),
+            None,
         )
         .await
         .map_err(map_session_validation)?;
@@ -442,7 +441,15 @@ where
         credential: &str,
         csrf: &str,
     ) -> Result<CurrentProductPrincipalV1, ProductIdentityError> {
-        self.current_principal(credential, csrf).await
+        let active = load_active_product_session(
+            &self.pool,
+            self.config.lifetimes().authentication(),
+            credential,
+            Some(csrf),
+        )
+        .await
+        .map_err(map_session_validation)?;
+        decode_active_principal(active)
     }
 
     pub async fn logout(
@@ -1043,10 +1050,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.principal().identity_revision(), 2);
         assert_eq!(second.principal().display_name(), "Second Name");
-        let current = store
-            .current_principal(&first_session, &first_csrf)
-            .await
-            .unwrap();
+        let current = store.current_principal(&first_session).await.unwrap();
         assert_eq!(current.identity_revision(), 2);
         assert_eq!(current.display_name(), "Second Name");
         sqlx::query(

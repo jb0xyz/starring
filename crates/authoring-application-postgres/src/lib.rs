@@ -13,7 +13,8 @@ mod secret;
 mod snapshot;
 
 pub use authentication::{
-    AuthenticationConfigError, PostgresAuthentication, PostgresAuthenticationConfig,
+    AuthenticationConfigError, AuthenticationReadinessErrorV1, PostgresAuthentication,
+    PostgresAuthenticationConfig,
 };
 pub use database::ProductDatabaseFailureV1;
 pub use deployment_status::PostgresProductDeploymentStatuses;

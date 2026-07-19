@@ -153,7 +153,14 @@ tenant and installation plus its exact current authority revision and digest in
 a bounded read-only repeatable-read snapshot. It commits before the existing
 Discord adapter performs live guild authorization, and normal inaccessible
 states are non-enumerating while durable graph corruption is redacted and fails
-closed. Apply writes the guarded active pointer,
+closed. Product-session authentication now reads session-only and mutation
+projections through separate versioned, fixed-search-path database functions.
+The mutation projection returns a session-bound comparison tag instead of the
+stored CSRF digest. A separate compare-and-set touch function rechecks database
+time, expiry, revocation, observed timestamps, the idle bound, and the touch
+interval before extending an active session. These authentication read and touch
+operations are independently usable by a non-owner role with only the exact
+function execution privileges. Apply writes the guarded active pointer,
 `Approved -> Applying -> Applied`, Requested deployment, receipt, aliases, and
 audit evidence in one serializable transaction. Normal baseline, binding, or
 policy drift instead commits a durable `Superseded` terminal record. Immutable
@@ -266,11 +273,12 @@ Discord I/O.
   (Luna-medium/SQLite CLI and evaluation edge). `codex-worker` is a separate
   private loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is twenty-seven migrations under `/migrations`, including the
+Persistence is twenty-nine migrations under `/migrations`, including the
 original instance and RuleSet stores, product-bound activation context and
 terminal states, the authoring promotion journal, atomic Product Apply and
 runtime deployment, runtime convergence, current-versus-historical binding
-separation, artifact integrity, and exclusive product-slot ownership.
+separation, artifact integrity, exclusive product-slot ownership, scoped
+installation-authority reads, and scoped product-session authentication.
 
 ## Durable RuleSet Lifecycle
 
@@ -437,6 +445,20 @@ Stated as capabilities (durable across the phase numbering):
   product path succeeds while direct table reads and writes, schema and
   temporary-table creation, unrelated privileged functions, PUBLIC, and an
   ungranted role fail closed.
+- PostgreSQL session-only authentication, mutation authentication, and bounded
+  session touch through three versioned fixed-search-path security-definer
+  functions owned by the common identity-relation owner. Raw CSRF and OAuth
+  verifier digests are never projected to the caller; mutation proof uses a
+  constant-time comparison against a SHA-256 tag bound to the session digest.
+  The adapter readiness contract verifies exact signatures and result shapes,
+  function metadata, one non-login owner, ACLs, direct login and database/schema
+  capability, no role memberships, no direct table or column privilege, no RLS,
+  and data-independent read and rolled-back touch probes. An isolated non-owner
+  role test proves valid authentication and compare-and-set touch while denying
+  direct identity DML, schema and temporary-table creation, unrelated function
+  execution, ungranted roles, PUBLIC, grant option, hostile default grants,
+  function-mode and search-path drift, RLS drift, and owner or caller privilege
+  drift.
 - Payload-bound product approval and serializable atomic Apply with one
   pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
   durable drift supersession, and redacted indeterminate-commit handling.
@@ -496,15 +518,21 @@ Stated as capabilities (durable across the phase numbering):
   the application and adapters.
 - Three remaining production adapters: an approval-environment provider,
   authenticated snapshot envelope cipher, and atomic product-rejection adapter.
-  `GET /v1/me` also needs a session-only read projection that does not weaken
-  mutation CSRF checks. The installation-authority source is independently
-  least-privilege composable, but the current authentication and authorized
-  snapshot adapters still read tables directly, so the complete API process
-  cannot yet run with the final execute-only `starring_api` role.
+  `GET /v1/me` now has an independent session-only projection without relaxing
+  mutation CSRF checks. The installation-authority and authentication read/touch
+  slices are independently least-privilege composable, but no composition root
+  invokes their readiness contracts. Authorized snapshot loading, OAuth flow and
+  session issuance or logout, promotion persistence and its publication/link
+  ports, approval and status queries, Apply artifact reads, and runtime
+  convergence still retain direct SQL. The complete API and runtime processes
+  therefore cannot yet use final execute-only roles. Product rejection has no
+  production persistence adapter.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
-  row policies, and whole-process capability probes. The installation-authority
-  read slice now has direct-DML denial and an executable readiness probe, but no
-  composition root calls it yet; this is not the complete database-role cutover.
+  row policies, and whole-process capability probes. Installation-authority and
+  authentication read/touch slices now have isolated non-owner, direct-DML
+  denial tests and executable readiness probes. Declarative role bootstrap,
+  remaining function boundaries, startup wiring, and a whole-process probe are
+  still release blockers.
 - A production `tools/starring-runtime` worker that performs the actual Discord
   drain, hydration, panel reconciliation, gateway start, attestation, and
   heartbeat loop. The durable state machine is implemented, but no production
@@ -544,10 +572,10 @@ Stated as capabilities (durable across the phase numbering):
   production bot or guild credentials, and drain every old smoke process before
   a cutover. Production build and deployment manifests must exclude the binary
   and both smoke features entirely.
-- The HTTP `/v1/me` contract intentionally carries only the session cookie,
-  while the current PostgreSQL principal lookup requires CSRF. A separate
-  session-only read method is required; mutation authentication must not be
-  relaxed to solve this mismatch.
+- The HTTP `/v1/me` database mismatch is resolved: `current_principal` uses the
+  session-only projection, while `verify_csrf` uses the distinct mutation
+  projection. This is adapter-level only; the production facade and startup
+  composition do not exist, and OAuth issuance and logout retain direct DML.
 - Apply can durably reach `RuntimePending`, and tests can drive exact simulated
   attestation to Live. Commercial operation still requires the separate runtime
   worker and real Discord lifecycle integration.
@@ -614,34 +642,37 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Move authentication and authorized-snapshot database access behind equally
-   narrow versioned functions, add declarative production role/bootstrap and
-   restrictive default-privilege policy, then prove the complete API process
-   under the final non-owner role. Normalize inaccessible Discord membership and
-   unknown installation IDs at the later HTTP boundary without turning a valid
-   member's insufficient permission into a false 404.
-2. Implement the remaining session-only identity projection,
-   approval-environment, rejection, and snapshot-crypto adapters with
-   cross-scope, replay, contention, corruption, and secret-redaction tests.
-3. Bridge the existing hardened router to `ProductControlApplication` through a
+1. Move authorized-snapshot access behind an equally narrow versioned function
+   and readiness contract while preserving atomic generation, actor, and
+   authority binding.
+2. Scope the remaining API-side direct SQL for OAuth and sessions, promotion and
+   publication/link persistence, decisions and status, Apply artifact reads,
+   and deployment status. Then add declarative owner/API bootstrap, restrictive
+   defaults, and one complete non-owner process probe while keeping the runtime
+   role separate.
+3. Implement the approval-environment, rejection, and snapshot-crypto adapters
+   with cross-scope, replay, contention, corruption, and secret-redaction tests.
+4. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry
-   labels, and readiness that fails before accepting traffic.
-4. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+   labels, and readiness that fails before accepting traffic. Normalize
+   inaccessible Discord membership and unknown installation IDs without turning
+   a valid member's insufficient permission into a false 404.
+5. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
    restrictive grants/default privileges; row policies; direct-DML denial; and
    a CI-tested positive/negative capability matrix.
-5. Build `tools/starring-runtime` with its separate DB role and bot credential,
+6. Build `tools/starring-runtime` with its separate DB role and bot credential,
    then prove Requested through exact Live and Live-loss recovery against a real
    Discord test guild.
-6. Connect a trusted server-side harness writer so only validated and simulated
+7. Connect a trusted server-side harness writer so only validated and simulated
    Luna output can advance encrypted `PreviewReady` generations.
-7. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+8. Preserve the passing clean-source cohort and failed diagnostic cohorts as
    separate immutable evidence, then measure queueing, concurrency, saturation,
    soak recovery, and worker high availability before setting a commercial SLO.
-8. Add typed multi-turn preference accumulation and the typed-planner handoff
+9. Add typed multi-turn preference accumulation and the typed-planner handoff
    while preserving the same deterministic candidate gates and no-deploy model
    boundary.
-9. Add whole-plan deterministic preflight, compensation, reconciliation, and
+10. Add whole-plan deterministic preflight, compensation, reconciliation, and
    uncertain-external-effect replay before expanding the recipe catalog or
    beginning the separate `StatefulSpec` runtime arc.
 

@@ -1,3 +1,5 @@
+mod readiness;
+
 use std::time::Duration;
 
 use authoring_application::{
@@ -7,6 +9,7 @@ use authoring_application::{
 use authoring_promotion::PrincipalId;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use sqlx::types::Json;
 use subtle::ConstantTimeEq;
@@ -14,11 +17,17 @@ use subtle::ConstantTimeEq;
 use crate::digest::digest_opaque_session_credential_v1;
 use crate::{ProductDatabaseFailureV1, ProductSessionDigestV1};
 
+pub use readiness::AuthenticationReadinessErrorV1;
+
 const DEFAULT_IDLE_LIFETIME_SECONDS: u64 = 30 * 60;
 const DEFAULT_TOUCH_INTERVAL_SECONDS: u64 = 5 * 60;
 const DEFAULT_STATEMENT_TIMEOUT_MILLIS: u64 = 2_000;
 const MAX_IDLE_LIFETIME_SECONDS: u64 = 30 * 60;
 const MAX_STATEMENT_TIMEOUT_MILLIS: u64 = 60_000;
+const MIN_TOUCH_INTERVAL_SECONDS: u64 = 1;
+const SESSION_READ_QUERY: &str = "SELECT * FROM public.starring_product_session_read_v1($1)";
+const MUTATION_SESSION_READ_QUERY: &str =
+    "SELECT * FROM public.starring_product_session_mutation_read_v1($1)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthenticationConfigError {
@@ -27,7 +36,7 @@ pub enum AuthenticationConfigError {
     #[error("product authentication idle lifetime exceeds the supported maximum")]
     IdleLifetimeTooLong,
     #[error(
-        "product authentication touch interval must be positive and shorter than the idle lifetime"
+        "product authentication touch interval must be at least one second and shorter than the idle lifetime"
     )]
     InvalidTouchInterval,
     #[error("product authentication statement timeout is outside the supported range")]
@@ -55,7 +64,9 @@ impl PostgresAuthenticationConfig {
         if idle_lifetime > Duration::from_secs(MAX_IDLE_LIFETIME_SECONDS) {
             return Err(AuthenticationConfigError::IdleLifetimeTooLong);
         }
-        if touch_interval.is_zero() || touch_interval >= idle_lifetime {
+        if touch_interval < Duration::from_secs(MIN_TOUCH_INTERVAL_SECONDS)
+            || touch_interval >= idle_lifetime
+        {
             return Err(AuthenticationConfigError::InvalidTouchInterval);
         }
         let statement_timeout_millis = statement_timeout.as_millis();
@@ -75,8 +86,13 @@ impl PostgresAuthenticationConfig {
         })
     }
 
-    fn idle_lifetime_seconds(self) -> f64 {
-        self.idle_lifetime.as_secs_f64()
+    fn idle_lifetime(self) -> TimeDelta {
+        TimeDelta::from_std(self.idle_lifetime)
+            .expect("validated product authentication idle lifetime remains in chrono range")
+    }
+
+    fn touch_interval_seconds(self) -> f64 {
+        self.touch_interval.as_secs_f64()
     }
 
     fn touch_interval(self) -> TimeDelta {
@@ -125,9 +141,10 @@ struct AuthenticationRow {
     discord_user_id: String,
     identity_revision: i64,
     display_profile: Json<Value>,
-    disabled: bool,
-    csrf_digest: Vec<u8>,
-    oauth_state_digest: Option<Vec<u8>>,
+    principal_disabled: bool,
+    csrf_digest_length: i32,
+    oauth_state_digest_length: Option<i32>,
+    csrf_comparison_tag: Option<Vec<u8>>,
     last_seen_at: DateTime<Utc>,
     idle_expires_at: DateTime<Utc>,
     absolute_expires_at: DateTime<Utc>,
@@ -138,32 +155,50 @@ impl AuthenticationRow {
     fn authenticate(
         &self,
         session_fingerprint: ProductSessionDigestV1,
-        csrf_digest: Option<&[u8; 32]>,
+        proof: SessionProofModeV1<'_>,
         database_now: DateTime<Utc>,
     ) -> Result<ActiveProductSessionV1, SessionValidationError> {
-        let persisted_csrf: [u8; 32] = self
-            .csrf_digest
-            .as_slice()
-            .try_into()
-            .map_err(|_| SessionValidationError::Invariant)?;
-        if let Some(expected) = csrf_digest {
-            if persisted_csrf.ct_eq(expected).unwrap_u8() != 1 {
-                return Err(SessionValidationError::InvalidCsrf);
+        if self.csrf_digest_length != 32 {
+            return Err(SessionValidationError::Invariant);
+        }
+        match proof {
+            SessionProofModeV1::SessionOnly => {
+                if self.csrf_comparison_tag.is_some() {
+                    return Err(SessionValidationError::Invariant);
+                }
+            }
+            SessionProofModeV1::Mutation(expected_csrf_digest) => {
+                let persisted_tag: [u8; 32] = self
+                    .csrf_comparison_tag
+                    .as_deref()
+                    .ok_or(SessionValidationError::Invariant)?
+                    .try_into()
+                    .map_err(|_| SessionValidationError::Invariant)?;
+                let expected_tag = csrf_comparison_tag(
+                    session_fingerprint.as_bytes(),
+                    expected_csrf_digest.as_bytes(),
+                );
+                if persisted_tag.ct_eq(&expected_tag).unwrap_u8() != 1 {
+                    return Err(SessionValidationError::InvalidCsrf);
+                }
             }
         }
-        if self.disabled {
+        if self.principal_disabled {
             return Err(SessionValidationError::InvalidCredential);
         }
         if self.revoked_at.is_some() {
             return Err(SessionValidationError::Revoked);
         }
-        if self.oauth_state_digest.as_deref().map(<[u8]>::len) != Some(32) {
+        if self.oauth_state_digest_length != Some(32) {
             return Err(SessionValidationError::Invariant);
         }
         if database_now >= self.idle_expires_at || database_now >= self.absolute_expires_at {
             return Err(SessionValidationError::Expired);
         }
-        if self.last_seen_at > database_now || self.idle_expires_at > self.absolute_expires_at {
+        if self.last_seen_at > database_now
+            || self.idle_expires_at > self.absolute_expires_at
+            || self.idle_expires_at - self.last_seen_at > TimeDelta::minutes(30)
+        {
             return Err(SessionValidationError::Invariant);
         }
         let principal_id = PrincipalId::parse(&self.principal_id)
@@ -186,8 +221,22 @@ impl AuthenticationRow {
     }
 
     fn touch_due(&self, config: PostgresAuthenticationConfig, database_now: DateTime<Utc>) -> bool {
-        database_now - self.last_seen_at >= config.touch_interval()
+        self.idle_expires_at - self.last_seen_at <= config.idle_lifetime()
+            && database_now - self.last_seen_at >= config.touch_interval()
     }
+}
+
+#[derive(Clone, Copy)]
+enum SessionProofModeV1<'a> {
+    SessionOnly,
+    Mutation(&'a ProductSessionDigestV1),
+}
+
+fn csrf_comparison_tag(session_digest: &[u8; 32], csrf_digest: &[u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(session_digest);
+    digest.update(csrf_digest);
+    digest.finalize().into()
 }
 
 #[derive(Clone)]
@@ -223,28 +272,25 @@ pub(crate) async fn load_active_product_session(
         .transpose()
         .map_err(|_| SessionValidationError::InvalidCsrf)?;
     let mut transaction = pool.begin().await.map_err(database_session_error)?;
-    sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
-        .bind(config.statement_timeout())
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_session_error)?;
-    let row = sqlx::query_as::<_, AuthenticationRow>(
-        "SELECT authentication_session.principal_id, principal.discord_user_id, \
-         principal.identity_revision, principal.display_profile, principal.disabled, \
-         authentication_session.csrf_digest, authentication_session.oauth_state_digest, \
-         authentication_session.last_seen_at, \
-         authentication_session.idle_expires_at, authentication_session.absolute_expires_at, \
-         authentication_session.revoked_at \
-         FROM public.product_auth_sessions AS authentication_session \
-         INNER JOIN public.product_principals AS principal \
-         ON principal.principal_id = authentication_session.principal_id \
-         WHERE authentication_session.session_digest = $1 \
-         FOR SHARE OF authentication_session, principal",
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $1, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
     )
-    .bind(digest.as_bytes().as_slice())
-    .fetch_optional(&mut *transaction)
+    .bind(config.statement_timeout())
+    .execute(&mut *transaction)
     .await
     .map_err(database_session_error)?;
+    let query = if csrf_digest.is_some() {
+        MUTATION_SESSION_READ_QUERY
+    } else {
+        SESSION_READ_QUERY
+    };
+    let row = sqlx::query_as::<_, AuthenticationRow>(query)
+        .bind(digest.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_session_error)?;
     let Some(row) = row else {
         transaction
             .rollback()
@@ -268,7 +314,10 @@ pub(crate) async fn load_active_product_session(
     };
     let active = match row.authenticate(
         digest.clone(),
-        csrf_digest.as_ref().map(|digest| digest.as_bytes()),
+        match csrf_digest.as_ref() {
+            Some(digest) => SessionProofModeV1::Mutation(digest),
+            None => SessionProofModeV1::SessionOnly,
+        },
         database_now,
     ) {
         Ok(active) => active,
@@ -295,36 +344,25 @@ async fn touch_active_product_session(
     observed: &AuthenticationRow,
 ) -> Result<(), SessionValidationError> {
     let mut transaction = pool.begin().await.map_err(database_session_error)?;
-    sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
-        .bind(config.statement_timeout())
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_session_error)?;
-    let idle_lifetime_seconds = config.idle_lifetime_seconds();
-    let result = sqlx::query(
-        "WITH locked_session AS MATERIALIZED ( \
-           SELECT session_digest FROM public.product_auth_sessions \
-           WHERE session_digest = $1 AND revoked_at IS NULL \
-           AND last_seen_at = $2 AND idle_expires_at = $3 AND absolute_expires_at = $4 \
-           FOR UPDATE \
-         ), touch_clock AS MATERIALIZED ( \
-           SELECT pg_catalog.clock_timestamp() AS touched_at FROM locked_session \
-         ) \
-         UPDATE public.product_auth_sessions AS authentication_session \
-         SET last_seen_at = touch_clock.touched_at, \
-          idle_expires_at = LEAST(authentication_session.absolute_expires_at, \
-           touch_clock.touched_at + pg_catalog.make_interval(secs => $5::DOUBLE PRECISION)) \
-         FROM locked_session, touch_clock \
-         WHERE authentication_session.session_digest = locked_session.session_digest \
-         AND touch_clock.touched_at < authentication_session.idle_expires_at \
-         AND touch_clock.touched_at < authentication_session.absolute_expires_at",
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $1, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
+    )
+    .bind(config.statement_timeout())
+    .execute(&mut *transaction)
+    .await
+    .map_err(database_session_error)?;
+    let touch_interval_seconds = config.touch_interval_seconds();
+    let result = sqlx::query_scalar::<_, i64>(
+        "SELECT public.starring_product_session_touch_v1($1, $2, $3, $4, $5)",
     )
     .bind(session_digest.as_slice())
     .bind(observed.last_seen_at)
     .bind(observed.idle_expires_at)
     .bind(observed.absolute_expires_at)
-    .bind(idle_lifetime_seconds)
-    .execute(&mut *transaction)
+    .bind(touch_interval_seconds)
+    .fetch_one(&mut *transaction)
     .await;
     let result = match result {
         Ok(result) => result,
@@ -337,7 +375,7 @@ async fn touch_active_product_session(
             return Err(failure);
         }
     };
-    if result.rows_affected() > 1 {
+    if !(0..=1).contains(&result) {
         transaction
             .rollback()
             .await
@@ -431,9 +469,10 @@ mod tests {
             discord_user_id: "100".to_string(),
             identity_revision: 1,
             display_profile: Json(serde_json::json!({"display_name": "Principal"})),
-            disabled: false,
-            csrf_digest: vec![7_u8; 32],
-            oauth_state_digest: Some(vec![9_u8; 32]),
+            principal_disabled: false,
+            csrf_digest_length: 32,
+            oauth_state_digest_length: Some(32),
+            csrf_comparison_tag: None,
             last_seen_at: Utc.with_ymd_and_hms(2026, 7, 19, 11, 50, 0).unwrap(),
             idle_expires_at: Utc.with_ymd_and_hms(2026, 7, 19, 12, 10, 0).unwrap(),
             absolute_expires_at: Utc.with_ymd_and_hms(2026, 7, 19, 20, 0, 0).unwrap(),
@@ -449,6 +488,17 @@ mod tests {
         ProductSessionDigestV1::from_digest_bytes([3_u8; 32])
     }
 
+    fn csrf_fingerprint(value: u8) -> ProductSessionDigestV1 {
+        ProductSessionDigestV1::from_digest_bytes([value; 32])
+    }
+
+    fn mutation_row(csrf_digest: &ProductSessionDigestV1) -> AuthenticationRow {
+        let mut row = row();
+        row.csrf_comparison_tag =
+            Some(csrf_comparison_tag(fingerprint().as_bytes(), csrf_digest.as_bytes()).to_vec());
+        row
+    }
+
     #[test]
     fn configuration_rejects_unbounded_and_unsafe_intervals() {
         assert_eq!(
@@ -458,6 +508,14 @@ mod tests {
                 Duration::from_secs(1)
             ),
             Err(AuthenticationConfigError::IdleLifetimeZero)
+        );
+        assert_eq!(
+            PostgresAuthenticationConfig::new(
+                Duration::from_secs(30),
+                Duration::from_millis(999),
+                Duration::from_secs(1)
+            ),
+            Err(AuthenticationConfigError::InvalidTouchInterval)
         );
         assert_eq!(
             PostgresAuthenticationConfig::new(
@@ -488,26 +546,56 @@ mod tests {
     #[test]
     fn classification_fails_closed_for_disabled_revoked_and_expired_rows() {
         let mut disabled = row();
-        disabled.disabled = true;
+        disabled.principal_disabled = true;
         assert!(matches!(
-            disabled.authenticate(fingerprint(), None, database_now()),
+            disabled.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            ),
             Err(SessionValidationError::InvalidCredential)
         ));
         let mut revoked = row();
         revoked.revoked_at = Some(database_now());
         assert!(matches!(
-            revoked.authenticate(fingerprint(), None, database_now()),
+            revoked.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            ),
             Err(SessionValidationError::Revoked)
         ));
+        let persisted_csrf = csrf_fingerprint(7);
+        let wrong_csrf = csrf_fingerprint(8);
+        let mut revoked = mutation_row(&persisted_csrf);
+        revoked.revoked_at = Some(database_now());
         assert!(matches!(
-            revoked.authenticate(fingerprint(), Some(&[8_u8; 32]), database_now()),
+            revoked.authenticate(
+                fingerprint(),
+                SessionProofModeV1::Mutation(&wrong_csrf),
+                database_now()
+            ),
             Err(SessionValidationError::InvalidCsrf)
         ));
         let mut expired = row();
         expired.idle_expires_at = database_now();
         assert!(matches!(
-            expired.authenticate(fingerprint(), None, database_now()),
+            expired.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            ),
             Err(SessionValidationError::Expired)
+        ));
+        let mut unbounded = row();
+        unbounded.idle_expires_at = unbounded.last_seen_at + TimeDelta::minutes(31);
+        assert!(matches!(
+            unbounded.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            ),
+            Err(SessionValidationError::Invariant)
         ));
     }
 
@@ -516,24 +604,54 @@ mod tests {
         let row = row();
         let config = PostgresAuthenticationConfig::default();
         assert_eq!(
-            row.authenticate(fingerprint(), None, database_now())
-                .unwrap()
-                .principal_id
-                .as_str(),
+            row.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            )
+            .unwrap()
+            .principal_id
+            .as_str(),
             "principal-1"
         );
         assert!(row.touch_due(config, database_now()));
+        let tightened = PostgresAuthenticationConfig::new(
+            Duration::from_secs(10 * 60),
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(!row.touch_due(tightened, database_now()));
     }
 
     #[test]
     fn csrf_digest_comparison_is_exact() {
-        let row = row();
+        let persisted_csrf = csrf_fingerprint(7);
+        let matching_csrf = csrf_fingerprint(7);
+        let wrong_csrf = csrf_fingerprint(8);
+        let row = mutation_row(&persisted_csrf);
         assert!(row
-            .authenticate(fingerprint(), Some(&[7_u8; 32]), database_now())
+            .authenticate(
+                fingerprint(),
+                SessionProofModeV1::Mutation(&matching_csrf),
+                database_now()
+            )
             .is_ok());
         assert!(matches!(
-            row.authenticate(fingerprint(), Some(&[8_u8; 32]), database_now()),
+            row.authenticate(
+                fingerprint(),
+                SessionProofModeV1::Mutation(&wrong_csrf),
+                database_now()
+            ),
             Err(SessionValidationError::InvalidCsrf)
+        ));
+        assert!(matches!(
+            row.authenticate(
+                fingerprint(),
+                SessionProofModeV1::SessionOnly,
+                database_now()
+            ),
+            Err(SessionValidationError::Invariant)
         ));
     }
 
