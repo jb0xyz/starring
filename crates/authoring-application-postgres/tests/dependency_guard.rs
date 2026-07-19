@@ -117,6 +117,34 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(!binding_identity_migration.contains(
         "authority_row.binding_fingerprint\n            IS DISTINCT FROM activation_row.approval_context #>> '{context,binding,fingerprint}'"
     ));
+    let apply_drift_migration =
+        include_str!("../../../migrations/202607190010_persist_product_apply_drift.sql");
+    for required in [
+        "RENAME TO starring_product_apply_lock_core_v1",
+        "CREATE FUNCTION public.starring_product_apply_lock_v1",
+        "STRICT\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "pg_catalog.set_config(\n        'starring.product_approval_context_digest'",
+        "'superseded_baseline_drift'",
+        "'superseded_binding_drift'",
+        "'superseded_policy_drift'",
+        "historical_authority_row public.automation_installation_authority_versions%ROWTYPE",
+        "installation_row.current_authority_revision\n                    IS DISTINCT FROM expected_authority_revision",
+        "public.product_action_receipt_audit_evidence AS evidence",
+        "UPDATE public.activation_requests AS activation\n    SET state = 'superseded'",
+        "pg_catalog.aclexplode(",
+        "pg_catalog.array_agg(grant_row.grantee ORDER BY grant_row.grantee)",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "GRANT EXECUTE ON FUNCTION %s TO %I%s",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE",
+        "FROM PUBLIC",
+    ] {
+        assert!(
+            apply_drift_migration.contains(required),
+            "missing product apply drift guard: {required}"
+        );
+    }
+    assert!(!apply_drift_migration.contains("INSERT INTO public.runtime_deployments"));
     let activation_store =
         include_str!("../../automation-ruleset-activation-postgres/src/store.rs");
     assert_eq!(

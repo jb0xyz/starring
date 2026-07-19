@@ -264,6 +264,31 @@ struct FinalizeRow {
     desired_target_digest: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct TerminalPersistenceRow {
+    state: String,
+    product_revision: i64,
+    apply_attempt_no: i64,
+    apply_attempt_id: Option<String>,
+    apply_lease_until: Option<DateTime<Utc>>,
+    termination: Option<Json<Value>>,
+    receipt_resulting_revision: Option<i64>,
+    receipt_resulting_state: Option<String>,
+    receipt_result_code: Option<String>,
+    receipt_http_disposition_class: Option<i16>,
+    receipt_completed_at: Option<DateTime<Utc>>,
+    audit_authority_revision: Option<i64>,
+    audit_binding_fingerprint: Option<String>,
+    audit_policy_revision: Option<i64>,
+    audit_baseline_version: Option<i64>,
+    audit_baseline_hash: Option<String>,
+    audit_occurred_at: Option<DateTime<Utc>>,
+    runtime_count: i64,
+    alias_count: i64,
+    audit_count: i64,
+    evidence_count: i64,
+}
+
 async fn begin_serializable(pool: &PgPool) -> Transaction<'_, Postgres> {
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
@@ -279,6 +304,69 @@ async fn begin_serializable(pool: &PgPool) -> Transaction<'_, Postgres> {
         .await
         .unwrap();
     transaction
+}
+
+async fn terminal_persistence(
+    pool: &PgPool,
+    fixture: &Fixture,
+    operation: &Operation,
+) -> TerminalPersistenceRow {
+    sqlx::query_as::<_, TerminalPersistenceRow>(
+        "SELECT activation.state, activation.product_revision, activation.apply_attempt_no, \
+          activation.apply_attempt_id, activation.apply_lease_until, activation.termination, \
+          receipt.resulting_revision AS receipt_resulting_revision, \
+          receipt.resulting_state AS receipt_resulting_state, \
+          receipt.result_code AS receipt_result_code, \
+          receipt.http_disposition_class AS receipt_http_disposition_class, \
+          receipt.completed_at AS receipt_completed_at, \
+          audit.installation_authority_revision AS audit_authority_revision, \
+          audit.binding_fingerprint AS audit_binding_fingerprint, \
+          audit.policy_revision AS audit_policy_revision, \
+          audit.active_baseline_version AS audit_baseline_version, \
+          audit.active_baseline_hash AS audit_baseline_hash, \
+          audit.occurred_at AS audit_occurred_at, \
+          (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+           WHERE deployment.activation_request_id = activation.id) AS runtime_count, \
+          (SELECT pg_catalog.count(*) \
+           FROM public.product_action_receipt_idempotency_aliases AS alias \
+           WHERE alias.receipt_id = $2) AS alias_count, \
+          (SELECT pg_catalog.count(*) FROM public.product_audit_events AS event \
+           WHERE event.receipt_id = $2) AS audit_count, \
+          (SELECT pg_catalog.count(*) \
+           FROM public.product_action_receipt_audit_evidence AS evidence \
+           WHERE evidence.receipt_id = $2) AS evidence_count \
+         FROM public.activation_requests AS activation \
+         LEFT JOIN public.product_action_receipts AS receipt ON receipt.receipt_id = $2 \
+         LEFT JOIN public.product_audit_events AS audit ON audit.receipt_id = $2 \
+         WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind(&operation.receipt_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn assert_terminal_persistence(row: &TerminalPersistenceRow, result_code: &str) {
+    assert_eq!(row.state, "superseded");
+    assert_eq!(row.product_revision, 4);
+    assert_eq!(row.apply_attempt_no, 1);
+    assert!(row.apply_attempt_id.is_none());
+    assert!(row.apply_lease_until.is_none());
+    assert_eq!(row.receipt_resulting_revision, Some(4));
+    assert_eq!(row.receipt_resulting_state.as_deref(), Some("superseded"));
+    assert_eq!(row.receipt_result_code.as_deref(), Some(result_code));
+    assert_eq!(row.receipt_http_disposition_class, Some(4));
+    assert_eq!(row.receipt_completed_at, row.audit_occurred_at);
+    let termination_at =
+        DateTime::parse_from_rfc3339(row.termination.as_ref().unwrap().0["at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+    assert_eq!(Some(termination_at), row.receipt_completed_at);
+    assert_eq!(row.runtime_count, 0);
+    assert_eq!(row.alias_count, 1);
+    assert_eq!(row.audit_count, 1);
+    assert_eq!(row.evidence_count, 1);
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
@@ -593,6 +681,151 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     }
 }
 
+#[derive(Clone)]
+struct AuthorityHead {
+    revision: i64,
+    digest: String,
+}
+
+struct AuthorityAdvance<'a> {
+    binding_revision: i64,
+    resource_bindings: &'a Value,
+    binding_fingerprint: &'a str,
+    policy_revision: i64,
+    required_approvals: i32,
+    activation_ttl_seconds: i64,
+}
+
+async fn authority_binding_material(pool: &PgPool, fixture: &Fixture) -> (Value, String) {
+    let (bindings, fingerprint) = sqlx::query_as::<_, (Json<Value>, String)>(
+        "SELECT resource_bindings, binding_fingerprint \
+         FROM public.automation_installation_authority_versions \
+         WHERE tenant_id = $1 AND installation_id = $2 AND revision = 1",
+    )
+    .bind(&fixture.tenant_id)
+    .bind(&fixture.installation_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (bindings.0, fingerprint)
+}
+
+async fn advance_authority(
+    pool: &PgPool,
+    fixture: &Fixture,
+    advance: AuthorityAdvance<'_>,
+) -> AuthorityHead {
+    let AuthorityAdvance {
+        binding_revision,
+        resource_bindings,
+        binding_fingerprint,
+        policy_revision,
+        required_approvals,
+        activation_ttl_seconds,
+    } = advance;
+    let authority_digest = digest(&format!(
+        "apply-authority-head:{}:{binding_revision}:{policy_revision}:{required_approvals}:{activation_ttl_seconds}",
+        fixture.installation_id
+    ));
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions \
+         (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
+          binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
+          authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(&fixture.installation_id)
+    .bind(&fixture.tenant_id)
+    .bind(binding_revision)
+    .bind(Json(resource_bindings))
+    .bind(binding_fingerprint)
+    .bind(policy_revision)
+    .bind(required_approvals)
+    .bind(activation_ttl_seconds)
+    .bind(&authority_digest)
+    .bind(&fixture.actor.principal_id)
+    .bind(digest(&format!(
+        "apply-authority-head-request:{}",
+        fixture.installation_id
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let advanced = sqlx::query(
+        "UPDATE public.automation_installations \
+         SET current_authority_revision = 2, updated_at = pg_catalog.clock_timestamp() \
+         WHERE tenant_id = $1 AND installation_id = $2 AND current_authority_revision = 1",
+    )
+    .bind(&fixture.tenant_id)
+    .bind(&fixture.installation_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(advanced.rows_affected(), 1);
+    transaction.commit().await.unwrap();
+    AuthorityHead {
+        revision: 2,
+        digest: authority_digest,
+    }
+}
+
+fn apply_context_at_authority(
+    fixture: &Fixture,
+    operation: &Operation,
+    authority: &AuthorityHead,
+) -> ApplyLockContext {
+    let mut context = ApplyLockContext::single(fixture, operation);
+    context.expected_authority_revision = authority.revision;
+    context.expected_authority_digest = authority.digest.clone();
+    context
+}
+
+async fn set_competing_active_baseline(pool: &PgPool, fixture: &Fixture) -> String {
+    let content_hash = digest(&format!(
+        "apply-competing-baseline:{}",
+        fixture.activation_id
+    ));
+    let mut transaction = pool.begin().await.unwrap();
+    let advanced = sqlx::query(
+        "UPDATE public.automation_ruleset_heads SET next_version = 3 \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND next_version = 2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(advanced.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         VALUES ($1, $2, 2, 1, '{}'::JSONB, $3, $4)",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .bind(&content_hash)
+    .bind(&fixture.actor.user_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_activations \
+         (guild_id, ruleset_key, active_version) VALUES ($1, $2, 2)",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    content_hash
+}
+
 async fn lock_apply(
     transaction: &mut Transaction<'_, Postgres>,
     fixture: &Fixture,
@@ -801,42 +1034,41 @@ async fn assert_runtime_mutation_clock_cleared(transaction: &mut Transaction<'_,
         .unwrap();
 }
 
+struct FinalizeProjection<'a> {
+    desired_target_digest: &'a str,
+    previous_runtime: Option<&'a Value>,
+    snapshot: &'a Value,
+    notices: &'a Value,
+}
+
+fn finalize_projection<'a>(
+    desired_target_digest: &'a str,
+    previous_runtime: Option<&'a Value>,
+    snapshot: &'a Value,
+) -> FinalizeProjection<'a> {
+    static EMPTY_NOTICES: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| json!([]));
+    FinalizeProjection {
+        desired_target_digest,
+        previous_runtime,
+        snapshot,
+        notices: &EMPTY_NOTICES,
+    }
+}
+
 async fn finalize_apply(
     transaction: &mut Transaction<'_, Postgres>,
     fixture: &Fixture,
     operation: &Operation,
     call: &Call,
     lock: &LockRow,
-    desired_target_digest: &str,
-    previous_runtime: Option<&Value>,
-    snapshot: &Value,
+    projection_input: FinalizeProjection<'_>,
 ) -> Result<FinalizeRow, sqlx::Error> {
-    let notices = json!([]);
-    finalize_apply_with_notices(
-        transaction,
-        fixture,
-        operation,
-        call,
-        lock,
+    let FinalizeProjection {
         desired_target_digest,
         previous_runtime,
         snapshot,
-        &notices,
-    )
-    .await
-}
-
-async fn finalize_apply_with_notices(
-    transaction: &mut Transaction<'_, Postgres>,
-    fixture: &Fixture,
-    operation: &Operation,
-    call: &Call,
-    lock: &LockRow,
-    desired_target_digest: &str,
-    previous_runtime: Option<&Value>,
-    snapshot: &Value,
-    notices: &Value,
-) -> Result<FinalizeRow, sqlx::Error> {
+        notices,
+    } = projection_input;
     let projection = lock
         .locked_projection
         .as_ref()
@@ -936,9 +1168,11 @@ async fn complete_apply(
         operation,
         &call,
         &lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .unwrap();
@@ -999,9 +1233,11 @@ async fn fresh_apply_exact_replay_and_semantic_conflict_are_atomic() {
         &operation,
         &call,
         &lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .unwrap();
@@ -1117,9 +1353,11 @@ async fn successful_finalize_clears_runtime_mutation_clock() {
         &operation,
         &call,
         &lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .unwrap();
@@ -1147,9 +1385,11 @@ async fn exact_replay_survives_later_active_pointer_change() {
         &operation,
         &call,
         &lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .unwrap();
@@ -1239,9 +1479,11 @@ async fn one_bit_wrong_desired_digest_is_rejected_without_mutation() {
         &operation,
         &call,
         &lock,
-        &wrong_digest,
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            &wrong_digest,
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .unwrap();
@@ -1296,16 +1538,18 @@ async fn malformed_runtime_projection_shapes_are_stable_and_atomic() {
             "notices-object" => notices = json!({}),
             _ => unreachable!(),
         }
-        let finalized = finalize_apply_with_notices(
+        let finalized = finalize_apply(
             &mut transaction,
             &fixture,
             &operation,
             &call,
             &lock,
-            prepared.desired_target_digest(),
-            prepared.previous_runtime_json(),
-            &snapshot,
-            &notices,
+            FinalizeProjection {
+                desired_target_digest: prepared.desired_target_digest(),
+                previous_runtime: prepared.previous_runtime_json(),
+                snapshot: &snapshot,
+                notices: &notices,
+            },
         )
         .await
         .unwrap();
@@ -1369,6 +1613,90 @@ async fn exact_replay_with_wrong_payload_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn applied_replay_rejects_tampered_revision_and_disposition_evidence() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let operation = Operation::new("applied-replay-forensic");
+    complete_apply(&pool, &fixture, &operation).await;
+
+    sqlx::query(
+        "UPDATE public.activation_requests SET product_revision = 5 \
+         WHERE id = $1 AND state = 'applied' AND product_revision = 4",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut revision_transaction = begin_serializable(&pool).await;
+    let revision = lock_apply(
+        &mut revision_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(revision.outcome, "indeterminate");
+    assert!(!revision.exact_replay);
+    revision_transaction.rollback().await.unwrap();
+
+    let fixture = seed_fixture(&pool).await;
+    let operation = Operation::new("applied-replay-disposition");
+    complete_apply(&pool, &fixture, &operation).await;
+
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE public.product_action_receipts \
+         DISABLE TRIGGER product_action_receipts_reject_mutation; \
+         ALTER TABLE public.product_action_receipt_audit_evidence \
+         DISABLE TRIGGER product_action_receipt_audit_evidence_reject_mutation",
+    )
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.product_action_receipts SET http_disposition_class = 4 \
+         WHERE receipt_id = $1",
+    )
+    .bind(&operation.receipt_id)
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.product_action_receipt_audit_evidence \
+         SET http_disposition_class = 4 WHERE receipt_id = $1",
+    )
+    .bind(&operation.receipt_id)
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE public.product_action_receipts \
+         ENABLE TRIGGER product_action_receipts_reject_mutation; \
+         ALTER TABLE public.product_action_receipt_audit_evidence \
+         ENABLE TRIGGER product_action_receipt_audit_evidence_reject_mutation",
+    )
+    .execute(&mut *corruption)
+    .await
+    .unwrap();
+    corruption.commit().await.unwrap();
+
+    let mut disposition_transaction = begin_serializable(&pool).await;
+    let disposition = lock_apply(
+        &mut disposition_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(disposition.outcome, "indeterminate");
+    assert!(!disposition.exact_replay);
+    disposition_transaction.rollback().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn authority_drift_preserves_recorded_replay_and_blocks_fresh_apply() {
     let pool = pool().await;
     let fixture = seed_fixture(&pool).await;
@@ -1424,12 +1752,32 @@ async fn authority_drift_preserves_recorded_replay_and_blocks_fresh_apply() {
     assert_eq!(advanced.rows_affected(), 1);
     authority_transaction.commit().await.unwrap();
 
+    let mut stale_replay_transaction = begin_serializable(&pool).await;
+    let stale_replay = lock_apply(
+        &mut stale_replay_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale_replay.outcome, "authority_mismatch");
+    assert!(!stale_replay.exact_replay);
+    assert!(!stale_replay.requires_commit);
+    stale_replay_transaction.rollback().await.unwrap();
+
+    let current_authority = AuthorityHead {
+        revision: 2,
+        digest: next_authority_digest,
+    };
+    let current_context = apply_context_at_authority(&fixture, &operation, &current_authority);
     let mut replay_transaction = begin_serializable(&pool).await;
-    let replay = lock_apply(
+    let replay = lock_apply_with_context(
         &mut replay_transaction,
         &fixture,
         &operation,
         &Call::valid(&fixture),
+        &current_context,
     )
     .await
     .unwrap();
@@ -1461,6 +1809,699 @@ async fn authority_drift_preserves_recorded_replay_and_blocks_fresh_apply() {
     assert!(!fresh.requires_commit);
     assert!(fresh.locked_projection.is_none());
     fresh_transaction.rollback().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn stale_applied_replay_cannot_commit_a_rotated_idempotency_alias() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let operation = Operation::new("stale-replay-alias");
+    complete_apply(&pool, &fixture, &operation).await;
+    let (bindings, fingerprint) = authority_binding_material(&pool, &fixture).await;
+    advance_authority(
+        &pool,
+        &fixture,
+        AuthorityAdvance {
+            binding_revision: 1,
+            resource_bindings: &bindings,
+            binding_fingerprint: &fingerprint,
+            policy_revision: 2,
+            required_approvals: 1,
+            activation_ttl_seconds: 3_600,
+        },
+    )
+    .await;
+    let rotated_digest = digest(&format!("rotated-alias:{}", operation.request_id));
+    let rotated_key_id = "apply-key-v2".to_string();
+    let rotated_key_fingerprint = digest("apply-key-v2-material");
+    let mut stale_context = ApplyLockContext::single(&fixture, &operation);
+    stale_context.active_idempotency_digest = rotated_digest.clone();
+    stale_context.idempotency_candidates =
+        vec![rotated_digest.clone(), operation.idempotency_digest.clone()];
+    stale_context.candidate_key_ids = vec![rotated_key_id.clone(), operation.key_id.clone()];
+    stale_context.candidate_key_fingerprints = vec![
+        rotated_key_fingerprint.clone(),
+        operation.key_fingerprint.clone(),
+    ];
+    stale_context.active_key_id = rotated_key_id;
+
+    let mut transaction = begin_serializable(&pool).await;
+    let replay = lock_apply_with_context(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+        &stale_context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, "authority_mismatch");
+    assert!(!replay.exact_replay);
+    assert!(!replay.requires_commit);
+    transaction.commit().await.unwrap();
+
+    let aliases = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT pg_catalog.count(*), \
+          pg_catalog.count(*) FILTER (WHERE idempotency_key_digest = $2) \
+         FROM public.product_action_receipt_idempotency_aliases \
+         WHERE receipt_id = $1",
+    )
+    .bind(&operation.receipt_id)
+    .bind(&rotated_digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(aliases, (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn replay_rechecks_discord_freshness_after_the_final_receipt_lock() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let operation = Operation::new("replay-final-freshness");
+    complete_apply(&pool, &fixture, &operation).await;
+    let rotated_digest = digest(&format!("freshness-alias:{}", operation.request_id));
+    let mut context = ApplyLockContext::single(&fixture, &operation);
+    context.active_idempotency_digest = rotated_digest.clone();
+    context.idempotency_candidates =
+        vec![rotated_digest.clone(), operation.idempotency_digest.clone()];
+    context.candidate_key_ids = vec!["apply-key-v2".to_string(), operation.key_id.clone()];
+    context.candidate_key_fingerprints = vec![
+        digest("apply-key-v2-material"),
+        operation.key_fingerprint.clone(),
+    ];
+    context.active_key_id = "apply-key-v2".to_string();
+    let observed_at = Utc::now() - TimeDelta::milliseconds(20);
+    let call = Call {
+        expected_revision: 2,
+        capability: "apply".to_string(),
+        session_digest: fixture.actor.session_digest.clone(),
+        observed_at,
+        expires_at: observed_at + TimeDelta::seconds(2),
+        effective_permissions: "32".to_string(),
+        guild_owner: false,
+    };
+    let expires_at = call.expires_at;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT receipt_id FROM public.product_action_receipts \
+         WHERE receipt_id = $1 FOR UPDATE",
+    )
+    .bind(&operation.receipt_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let replay_pool = pool.clone();
+    let replay_fixture = fixture.clone();
+    let replay_operation = operation.clone();
+    let replay = tokio::spawn(async move {
+        let mut transaction = begin_serializable(&replay_pool).await;
+        let locked = lock_apply_with_context(
+            &mut transaction,
+            &replay_fixture,
+            &replay_operation,
+            &call,
+            &context,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        locked
+    });
+    let mut reached_final_lock = false;
+    for _ in 0..100 {
+        reached_final_lock = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+              SELECT 1 FROM pg_catalog.pg_stat_activity \
+              WHERE datname = pg_catalog.current_database() \
+               AND pid <> pg_catalog.pg_backend_pid() \
+               AND wait_event_type = 'Lock' \
+               AND query LIKE '%starring_product_apply_lock_v1%')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if reached_final_lock {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(reached_final_lock);
+    let remaining = (expires_at - Utc::now())
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    tokio::time::sleep(remaining + std::time::Duration::from_millis(100)).await;
+    blocker.commit().await.unwrap();
+    let replay = replay.await.unwrap();
+    assert_eq!(replay.outcome, "authorization_stale");
+    assert!(!replay.exact_replay);
+    assert!(!replay.requires_commit);
+    let aliases = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT pg_catalog.count(*), \
+          pg_catalog.count(*) FILTER (WHERE idempotency_key_digest = $2) \
+         FROM public.product_action_receipt_idempotency_aliases \
+         WHERE receipt_id = $1",
+    )
+    .bind(&operation.receipt_id)
+    .bind(&rotated_digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(aliases, (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn baseline_drift_is_durably_superseded_and_exactly_replayed() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let competing_hash = set_competing_active_baseline(&pool, &fixture).await;
+    let operation = Operation::new("superseded-baseline");
+    let call = Call::valid(&fixture);
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply(&mut transaction, &fixture, &operation, &call)
+        .await
+        .unwrap();
+    assert_eq!(locked.outcome, "superseded");
+    assert!(!locked.exact_replay);
+    assert!(locked.requires_commit);
+    assert_eq!(locked.resulting_revision, Some(4));
+    assert_eq!(locked.resulting_state.as_deref(), Some("superseded"));
+    assert!(locked.deployment_id.is_none());
+    assert!(locked.desired_target_digest.is_none());
+    assert!(locked.locked_projection.is_none());
+    transaction.commit().await.unwrap();
+
+    let persisted = terminal_persistence(&pool, &fixture, &operation).await;
+    assert_terminal_persistence(&persisted, "superseded_baseline_drift");
+    let termination = &persisted.termination.as_ref().unwrap().0;
+    assert_eq!(termination["kind"], "superseded");
+    assert_eq!(termination["reason"]["reason"], "active_baseline_drift");
+    assert_eq!(termination["reason"]["expected"]["state"], "absent");
+    assert_eq!(termination["reason"]["observed"]["state"], "exact");
+    assert_eq!(termination["reason"]["observed"]["version"], 2);
+    assert_eq!(
+        termination["reason"]["observed"]["content_hash"],
+        competing_hash
+    );
+    assert_eq!(persisted.audit_authority_revision, Some(1));
+    assert_eq!(persisted.audit_policy_revision, Some(1));
+    assert_eq!(persisted.audit_baseline_version, Some(2));
+    assert_eq!(
+        persisted.audit_baseline_hash.as_deref(),
+        Some(&*competing_hash)
+    );
+
+    let mut replay_transaction = begin_serializable(&pool).await;
+    let replay = lock_apply(
+        &mut replay_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, "superseded");
+    assert!(replay.exact_replay);
+    assert!(replay.requires_commit);
+    assert_eq!(replay.resulting_revision, Some(4));
+    assert_eq!(replay.resulting_state.as_deref(), Some("superseded"));
+    assert!(replay.deployment_id.is_none());
+    assert!(replay.desired_target_digest.is_none());
+    assert!(replay.locked_projection.is_none());
+    replay_transaction.commit().await.unwrap();
+
+    let replayed = terminal_persistence(&pool, &fixture, &operation).await;
+    assert_terminal_persistence(&replayed, "superseded_baseline_drift");
+    assert_eq!(replayed.termination.unwrap().0, termination.clone());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn terminal_replay_rejects_mismatched_baseline_and_clock_evidence() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    set_competing_active_baseline(&pool, &fixture).await;
+    let operation = Operation::new("terminal-evidence-tamper");
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked.outcome, "superseded");
+    transaction.commit().await.unwrap();
+    let original = terminal_persistence(&pool, &fixture, &operation)
+        .await
+        .termination
+        .unwrap()
+        .0;
+
+    sqlx::query(
+        "UPDATE public.activation_requests \
+         SET termination = pg_catalog.jsonb_set(\
+          termination, '{reason,expected}', \
+          pg_catalog.jsonb_build_object(\
+           'state', 'exact', 'version', 1, 'content_hash', target_content_hash)) \
+         WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut baseline_transaction = begin_serializable(&pool).await;
+    let baseline = lock_apply(
+        &mut baseline_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(baseline.outcome, "indeterminate");
+    assert!(!baseline.exact_replay);
+    baseline_transaction.rollback().await.unwrap();
+
+    sqlx::query("UPDATE public.activation_requests SET termination = $2 WHERE id = $1")
+        .bind(&fixture.activation_id)
+        .bind(Json(&original))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.activation_requests AS activation \
+         SET termination = pg_catalog.jsonb_set(\
+          activation.termination, '{at}', pg_catalog.to_jsonb(receipt.completed_at + INTERVAL '1 second')) \
+         FROM public.product_action_receipts AS receipt \
+         WHERE activation.id = $1 AND receipt.receipt_id = $2",
+    )
+    .bind(&fixture.activation_id)
+    .bind(&operation.receipt_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut clock_transaction = begin_serializable(&pool).await;
+    let clock = lock_apply(
+        &mut clock_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(clock.outcome, "indeterminate");
+    assert!(!clock.exact_replay);
+    clock_transaction.rollback().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn binding_drift_uses_current_authority_and_historical_replay_evidence() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let guild_id = fixture.guild_id.parse::<u64>().unwrap();
+    let mut bindings = ResourceBindingMap::default();
+    bindings.channel_bindings.insert(
+        ResourceKey("community_hub".to_string()),
+        ChannelId(guild_id + 1_000_000_000),
+    );
+    bindings.role_bindings.insert(
+        ResourceKey("automation_operator".to_string()),
+        RoleId(guild_id + 2_000_000_000),
+    );
+    let fingerprint = resource_binding_fingerprint_v2(&bindings);
+    let stored_bindings = json!({
+        "role_bindings": &bindings.role_bindings,
+        "channel_bindings": &bindings.channel_bindings
+    });
+    let authority = advance_authority(
+        &pool,
+        &fixture,
+        AuthorityAdvance {
+            binding_revision: 2,
+            resource_bindings: &stored_bindings,
+            binding_fingerprint: fingerprint.as_str(),
+            policy_revision: 1,
+            required_approvals: 1,
+            activation_ttl_seconds: 3_600,
+        },
+    )
+    .await;
+    let operation = Operation::new("superseded-binding");
+    let context = apply_context_at_authority(&fixture, &operation, &authority);
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply_with_context(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked.outcome, "superseded");
+    assert!(!locked.exact_replay);
+    assert!(locked.requires_commit);
+    assert_eq!(locked.resulting_revision, Some(4));
+    assert_eq!(locked.resulting_state.as_deref(), Some("superseded"));
+    assert!(locked.deployment_id.is_none());
+    assert!(locked.desired_target_digest.is_none());
+    assert!(locked.locked_projection.is_none());
+    transaction.commit().await.unwrap();
+
+    let persisted = terminal_persistence(&pool, &fixture, &operation).await;
+    assert_terminal_persistence(&persisted, "superseded_binding_drift");
+    let termination = &persisted.termination.as_ref().unwrap().0;
+    assert_eq!(termination["reason"]["reason"], "binding_drift");
+    assert_eq!(termination["reason"]["expected_revision"], 1);
+    assert_eq!(termination["reason"]["observed_revision"], 2);
+    assert!(termination["reason"]["observed_fingerprint"].is_null());
+    assert_eq!(persisted.audit_authority_revision, Some(2));
+    assert_eq!(
+        persisted.audit_binding_fingerprint.as_deref(),
+        Some(fingerprint.as_str())
+    );
+    assert_eq!(persisted.audit_policy_revision, Some(1));
+    assert!(persisted.audit_baseline_version.is_none());
+    assert!(persisted.audit_baseline_hash.is_none());
+
+    let mut stale_replay_transaction = begin_serializable(&pool).await;
+    let stale_replay = lock_apply(
+        &mut stale_replay_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale_replay.outcome, "authority_mismatch");
+    assert!(!stale_replay.exact_replay);
+    assert!(!stale_replay.requires_commit);
+    stale_replay_transaction.rollback().await.unwrap();
+
+    let mut replay_transaction = begin_serializable(&pool).await;
+    let replay = lock_apply_with_context(
+        &mut replay_transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.outcome, "superseded");
+    assert!(replay.exact_replay);
+    assert!(replay.requires_commit);
+    assert_eq!(replay.resulting_revision, Some(4));
+    assert_eq!(replay.resulting_state.as_deref(), Some("superseded"));
+    assert!(replay.locked_projection.is_none());
+    replay_transaction.commit().await.unwrap();
+
+    let replayed = terminal_persistence(&pool, &fixture, &operation).await;
+    assert_terminal_persistence(&replayed, "superseded_binding_drift");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn policy_drift_persists_exact_expected_and_observed_policy() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let (bindings, fingerprint) = authority_binding_material(&pool, &fixture).await;
+    let authority = advance_authority(
+        &pool,
+        &fixture,
+        AuthorityAdvance {
+            binding_revision: 1,
+            resource_bindings: &bindings,
+            binding_fingerprint: &fingerprint,
+            policy_revision: 2,
+            required_approvals: 2,
+            activation_ttl_seconds: 1_800,
+        },
+    )
+    .await;
+    let operation = Operation::new("superseded-policy");
+    let context = apply_context_at_authority(&fixture, &operation, &authority);
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply_with_context(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked.outcome, "superseded");
+    assert!(!locked.exact_replay);
+    assert!(locked.requires_commit);
+    assert_eq!(locked.resulting_revision, Some(4));
+    assert_eq!(locked.resulting_state.as_deref(), Some("superseded"));
+    assert!(locked.deployment_id.is_none());
+    assert!(locked.desired_target_digest.is_none());
+    assert!(locked.locked_projection.is_none());
+    transaction.commit().await.unwrap();
+
+    let persisted = terminal_persistence(&pool, &fixture, &operation).await;
+    assert_terminal_persistence(&persisted, "superseded_policy_drift");
+    let termination = &persisted.termination.as_ref().unwrap().0;
+    assert_eq!(termination["reason"]["reason"], "policy_drift");
+    assert_eq!(termination["reason"]["expected_revision"], 1);
+    assert_eq!(termination["reason"]["observed_revision"], 2);
+    assert_eq!(termination["reason"]["expected_required_approvals"], 1);
+    assert_eq!(termination["reason"]["observed_required_approvals"], 2);
+    assert_eq!(termination["reason"]["expected_ttl_seconds"], 3_600);
+    assert_eq!(termination["reason"]["observed_ttl_seconds"], 1_800);
+    assert_eq!(persisted.audit_authority_revision, Some(2));
+    assert_eq!(
+        persisted.audit_binding_fingerprint.as_deref(),
+        Some(&*fingerprint)
+    );
+    assert_eq!(persisted.audit_policy_revision, Some(2));
+    assert!(persisted.audit_baseline_version.is_none());
+    assert!(persisted.audit_baseline_hash.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn missing_target_with_policy_drift_remains_target_mismatch_without_supersession() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let (bindings, fingerprint) = authority_binding_material(&pool, &fixture).await;
+    let authority = advance_authority(
+        &pool,
+        &fixture,
+        AuthorityAdvance {
+            binding_revision: 1,
+            resource_bindings: &bindings,
+            binding_fingerprint: &fingerprint,
+            policy_revision: 2,
+            required_approvals: 1,
+            activation_ttl_seconds: 3_600,
+        },
+    )
+    .await;
+    let deleted = sqlx::query(
+        "DELETE FROM public.automation_ruleset_versions \
+         WHERE guild_id = $1 AND ruleset_key = $2 AND version = 1",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
+
+    let operation = Operation::new("missing-target-policy-drift");
+    let context = apply_context_at_authority(&fixture, &operation, &authority);
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply_with_context(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked.outcome, "target_mismatch");
+    assert!(!locked.exact_replay);
+    assert!(!locked.requires_commit);
+    assert!(locked.resulting_revision.is_none());
+    assert!(locked.resulting_state.is_none());
+    assert!(locked.deployment_id.is_none());
+    assert!(locked.desired_target_digest.is_none());
+    assert!(locked.locked_projection.is_none());
+    transaction.commit().await.unwrap();
+
+    let persisted = sqlx::query_as::<
+        _,
+        (
+            String,
+            i64,
+            i64,
+            Option<Json<Value>>,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ),
+    >(
+        "SELECT activation.state, activation.product_revision, activation.apply_attempt_no, \
+          activation.termination, \
+          (SELECT head.next_version FROM public.automation_ruleset_heads AS head \
+           WHERE head.guild_id = $2 AND head.ruleset_key = $3), \
+          (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations AS active \
+           WHERE active.guild_id = $2 AND active.ruleset_key = $3), \
+          (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+           WHERE deployment.activation_request_id = activation.id), \
+          (SELECT pg_catalog.count(*) FROM public.product_action_receipts AS receipt \
+           WHERE receipt.receipt_id = $4), \
+          (SELECT pg_catalog.count(*) \
+           FROM public.product_action_receipt_idempotency_aliases AS alias \
+           WHERE alias.receipt_id = $4), \
+          (SELECT pg_catalog.count(*) FROM public.product_audit_events AS audit \
+           WHERE audit.receipt_id = $4), \
+          (SELECT pg_catalog.count(*) \
+           FROM public.product_action_receipt_audit_evidence AS evidence \
+           WHERE evidence.receipt_id = $4) \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .bind(&operation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted.0, "approved");
+    assert_eq!(persisted.1, 2);
+    assert_eq!(persisted.2, 0);
+    assert!(persisted.3.is_none());
+    assert_eq!(persisted.4, 2);
+    assert_eq!((persisted.5, persisted.6), (0, 0));
+    assert_eq!(
+        (persisted.7, persisted.8, persisted.9, persisted.10),
+        (0, 0, 0, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn existing_runtime_deployment_blocks_fresh_drift_supersession() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    let applied_operation = Operation::new("malformed-runtime-seed");
+    complete_apply(&pool, &fixture, &applied_operation).await;
+    sqlx::query(
+        "UPDATE public.activation_requests SET state = 'approved' \
+         WHERE id = $1 AND state = 'applied' AND product_revision = 4",
+    )
+    .bind(&fixture.activation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (bindings, fingerprint) = authority_binding_material(&pool, &fixture).await;
+    let authority = advance_authority(
+        &pool,
+        &fixture,
+        AuthorityAdvance {
+            binding_revision: 1,
+            resource_bindings: &bindings,
+            binding_fingerprint: &fingerprint,
+            policy_revision: 2,
+            required_approvals: 1,
+            activation_ttl_seconds: 3_600,
+        },
+    )
+    .await;
+    let operation = Operation::new("malformed-runtime-drift");
+    let context = apply_context_at_authority(&fixture, &operation, &authority);
+    let mut call = Call::valid(&fixture);
+    call.expected_revision = 4;
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply_with_context(&mut transaction, &fixture, &operation, &call, &context)
+        .await
+        .unwrap();
+    assert_eq!(locked.outcome, "indeterminate");
+    assert!(!locked.exact_replay);
+    assert!(!locked.requires_commit);
+    transaction.commit().await.unwrap();
+
+    let unchanged = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        "SELECT activation.state, activation.product_revision, \
+          (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+           WHERE deployment.activation_request_id = activation.id), \
+          (SELECT pg_catalog.count(*) FROM public.product_action_receipts AS receipt \
+           WHERE receipt.receipt_id = $2) \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind(&operation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, ("approved".to_string(), 4, 1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn supersession_rolls_back_as_one_atomic_unit() {
+    let pool = pool().await;
+    let fixture = seed_fixture(&pool).await;
+    set_competing_active_baseline(&pool, &fixture).await;
+    let operation = Operation::new("superseded-rollback");
+    let mut transaction = begin_serializable(&pool).await;
+    let locked = lock_apply(
+        &mut transaction,
+        &fixture,
+        &operation,
+        &Call::valid(&fixture),
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked.outcome, "superseded");
+    assert!(!locked.exact_replay);
+    assert!(locked.requires_commit);
+    transaction.rollback().await.unwrap();
+
+    let rolled_back = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, i64)>(
+        "SELECT activation.state, activation.product_revision, activation.apply_attempt_no, \
+          (SELECT pg_catalog.count(*) FROM public.runtime_deployments AS deployment \
+           WHERE deployment.activation_request_id = activation.id), \
+          (SELECT pg_catalog.count(*) FROM public.product_action_receipts AS receipt \
+           WHERE receipt.receipt_id = $2), \
+          (SELECT pg_catalog.count(*) FROM public.product_audit_events AS audit \
+           WHERE audit.receipt_id = $2), \
+          (SELECT pg_catalog.count(*) \
+           FROM public.product_action_receipt_audit_evidence AS evidence \
+           WHERE evidence.receipt_id = $2) \
+         FROM public.activation_requests AS activation WHERE activation.id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .bind(&operation.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rolled_back, ("approved".to_string(), 2, 0, 0, 0, 0, 0));
+    let active_version = sqlx::query_scalar::<_, i64>(
+        "SELECT active_version FROM public.automation_ruleset_activations \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    )
+    .bind(&fixture.guild_id)
+    .bind(&fixture.ruleset_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_version, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1626,9 +2667,11 @@ async fn finalize_failure_rolls_back_pointer_activation_and_runtime() {
         &operation,
         &call,
         &lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        prepared.snapshot_json(),
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            prepared.snapshot_json(),
+        ),
     )
     .await
     .expect_err("receipt collision must abort the atomic finalizer");
@@ -1779,9 +2822,11 @@ async fn apply_with_serializable_retry(
             &operation,
             &call,
             &lock,
-            prepared.desired_target_digest(),
-            prepared.previous_runtime_json(),
-            prepared.snapshot_json(),
+            finalize_projection(
+                prepared.desired_target_digest(),
+                prepared.previous_runtime_json(),
+                prepared.snapshot_json(),
+            ),
         )
         .await
         {
@@ -1948,9 +2993,11 @@ async fn deferred_invariant_and_security_contract_reject_bypass() {
         &oversized_operation,
         &oversized_call,
         &oversized_lock,
-        prepared.desired_target_digest(),
-        prepared.previous_runtime_json(),
-        &oversized_snapshot,
+        finalize_projection(
+            prepared.desired_target_digest(),
+            prepared.previous_runtime_json(),
+            &oversized_snapshot,
+        ),
     )
     .await
     .unwrap();
@@ -2024,5 +3071,200 @@ async fn migration_preflight_refuses_ambiguous_applied_history() {
     }
     .await;
     drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn migration_moves_explicit_apply_execute_privileges_to_the_wrapper() {
+    let database = isolated_database("acl").await;
+    let migration_role = format!("starring_apply_migrator_{}", suffix());
+    let owner = sqlx::query_scalar::<_, String>("SELECT current_user")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let quoted_owner = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_ident($1)")
+        .bind(&owner)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE ROLE {migration_role} NOLOGIN"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("GRANT {quoted_owner} TO {migration_role}"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 202_607_190_009)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        sqlx::raw_sql(
+            "GRANT EXECUTE ON FUNCTION public.starring_product_apply_lock_v1(\
+             text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,\
+             timestamptz,timestamptz,text,boolean,text,text,text[],text[],text[],text,text,text,\
+             text,text,text) TO pg_read_all_data WITH GRANT OPTION",
+        )
+        .execute(&database.pool)
+        .await?;
+        let mut delegated_grant = database.pool.begin().await?;
+        sqlx::query("SET LOCAL ROLE pg_read_all_data")
+            .execute(&mut *delegated_grant)
+            .await?;
+        sqlx::raw_sql(
+            "GRANT EXECUTE ON FUNCTION public.starring_product_apply_lock_v1(\
+             text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,\
+             timestamptz,timestamptz,text,boolean,text,text,text[],text[],text[],text,text,text,\
+             text,text,text) TO pg_write_all_data",
+        )
+        .execute(&mut *delegated_grant)
+        .await?;
+        delegated_grant.commit().await?;
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_190_010)
+            .unwrap();
+        let mut migration_transaction = database.pool.begin().await?;
+        sqlx::query(&format!("SET LOCAL ROLE {migration_role}"))
+            .execute(&mut *migration_transaction)
+            .await?;
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&mut *migration_transaction)
+            .await?;
+        migration_transaction.commit().await?;
+        let privileges = sqlx::query_as::<_, (bool, bool, bool, bool, bool, bool, bool, bool)>(
+            "SELECT \
+              pg_catalog.has_function_privilege(\
+               'pg_read_all_data', \
+               'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+                bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                text,text,text[],text[],text[],text,text,text,text,text,text)', 'EXECUTE'), \
+              pg_catalog.has_function_privilege(\
+               'pg_read_all_data', \
+               'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,\
+                bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                text,text,text[],text[],text[],text,text,text,text,text,text)', 'EXECUTE'), \
+              EXISTS (\
+               SELECT 1 FROM pg_catalog.pg_proc AS function_row \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(function_row.proacl) AS privilege \
+               INNER JOIN pg_catalog.pg_roles AS role ON role.oid = privilege.grantee \
+               WHERE function_row.oid = pg_catalog.to_regprocedure(\
+                'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+                 bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                 text,text,text[],text[],text[],text,text,text,text,text,text)') \
+                AND role.rolname = 'pg_read_all_data' \
+                AND privilege.privilege_type = 'EXECUTE' \
+                AND privilege.is_grantable), \
+              EXISTS (\
+               SELECT 1 FROM pg_catalog.pg_proc AS function_row \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(function_row.proacl) AS privilege \
+               WHERE function_row.oid = pg_catalog.to_regprocedure(\
+                'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+                 bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                 text,text,text[],text[],text[],text,text,text,text,text,text)') \
+                AND privilege.grantee = 0 \
+                AND privilege.privilege_type = 'EXECUTE'), \
+              EXISTS (\
+               SELECT 1 FROM pg_catalog.pg_proc AS function_row \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(function_row.proacl) AS privilege \
+               WHERE function_row.oid = pg_catalog.to_regprocedure(\
+                'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,\
+                 bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                 text,text,text[],text[],text[],text,text,text,text,text,text)') \
+                AND privilege.grantee = 0 \
+                AND privilege.privilege_type = 'EXECUTE'), \
+              wrapper.proowner = core.proowner, \
+              wrapper.proowner = finalizer.proowner, \
+              wrapper.proowner <> migration_role.oid \
+             FROM pg_catalog.pg_proc AS wrapper \
+             CROSS JOIN pg_catalog.pg_proc AS core \
+             CROSS JOIN pg_catalog.pg_proc AS finalizer \
+             CROSS JOIN pg_catalog.pg_roles AS migration_role \
+             WHERE wrapper.oid = pg_catalog.to_regprocedure(\
+              'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+               bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+               text,text,text[],text[],text[],text,text,text,text,text,text)') \
+              AND core.oid = pg_catalog.to_regprocedure(\
+              'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,\
+               bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+               text,text,text[],text[],text[],text,text,text,text,text,text)') \
+              AND finalizer.oid = pg_catalog.to_regprocedure(\
+              'public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,\
+               bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+               text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)') \
+              AND migration_role.rolname = $1",
+        )
+        .bind(&migration_role)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            privileges,
+            (true, false, true, false, false, true, true, true)
+        );
+        let delegated = sqlx::query_as::<_, (bool, bool, bool)>(
+            "SELECT \
+              pg_catalog.has_function_privilege(\
+               'pg_write_all_data', \
+               'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+                bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                text,text,text[],text[],text[],text,text,text,text,text,text)', 'EXECUTE'), \
+              pg_catalog.has_function_privilege(\
+               'pg_write_all_data', \
+               'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,\
+                bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                text,text,text[],text[],text[],text,text,text,text,text,text)', 'EXECUTE'), \
+              EXISTS (\
+               SELECT 1 FROM pg_catalog.pg_proc AS function_row \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(function_row.proacl) AS privilege \
+               INNER JOIN pg_catalog.pg_roles AS role ON role.oid = privilege.grantee \
+               WHERE function_row.oid = pg_catalog.to_regprocedure(\
+                'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,\
+                 bytea,text,text,text,text,bigint,text,text,timestamptz,timestamptz,text,boolean,\
+                 text,text,text[],text[],text[],text,text,text,text,text,text)') \
+                AND role.rolname = 'pg_write_all_data' \
+                AND privilege.privilege_type = 'EXECUTE' \
+                AND privilege.is_grantable)",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(delegated, (true, false, false));
+        let fixture = seed_fixture(&database.pool).await;
+        let operation = Operation::new("acl-nested-core");
+        let mut transaction = begin_serializable(&database.pool).await;
+        sqlx::query("SET LOCAL ROLE pg_read_all_data")
+            .execute(&mut *transaction)
+            .await?;
+        let locked = lock_apply(
+            &mut transaction,
+            &fixture,
+            &operation,
+            &Call::valid(&fixture),
+        )
+        .await?;
+        assert_eq!(locked.outcome, "ready");
+        transaction.rollback().await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("REVOKE {quoted_owner} FROM {migration_role}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {migration_role}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
     outcome.unwrap();
 }

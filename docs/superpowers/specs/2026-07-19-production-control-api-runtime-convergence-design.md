@@ -713,12 +713,18 @@ already present in a successful resource view never enter errors.
   exact approval payload, fresh manager authority, unchanged active baseline,
   unchanged resource-binding fingerprint, current server policy, readiness, and
   a valid activation lease.
-- Binding, baseline, policy, or target drift supersedes the request before pointer
-  mutation.
+- Binding, active-baseline, or policy drift supersedes the request before pointer
+  mutation. A missing, oversized, or hash-mismatched immutable target is
+  persistence corruption rather than drift; it returns the bounded invalid-candidate
+  result without hiding the forensic signal behind supersession.
 - An indeterminate product-apply commit is resolved only by replaying the same
   idempotency key. The committed outcome contains pointer, `Applied`, Requested
   deployment, receipt, and audit together; the rolled-back outcome contains
   none of them. A new key is never used to guess the result.
+- Apply replay reauthorizes the caller against the current installation-authority
+  head while verifying the retained receipt, audit, deployment, and decision
+  against their immutable historical authority. An old authority observation
+  cannot replay a result after authority rotation.
 - A guild and RuleSet key may have only one unresolved runtime deployment. A new
   apply cannot advance the pointer while the current target is runtime-pending,
   unless an explicit operator recovery first resolves or supersedes it.
