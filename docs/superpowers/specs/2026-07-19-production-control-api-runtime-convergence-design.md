@@ -759,10 +759,12 @@ transaction revalidates every locked identity, performs the baseline CAS,
 transitions `Approved -> Applying -> Applied`, inserts the Requested deployment,
 and appends the receipt, aliases, audit, and forensic receipt evidence.
 
-A deferred invariant requires every product activation that is `Applied` at
-commit to have exactly one matching deployment whose target is the active
-pointer. Migration preflight fails on an existing ambiguous `Applied` row;
-startup never guesses a deployment or previous runtime to backfill it.
+A deferred invariant requires each product activation transitioning to `Applied`
+to have exactly one matching canonical deployment whose target is the active
+pointer in that transaction. Historical `Applied` activations retain their exact
+immutable deployment after a newer target supersedes the pointer. Migration
+preflight fails on an existing ambiguous `Applied` row; startup never guesses a
+deployment or previous runtime to backfill it.
 
 ### State machine
 
@@ -973,7 +975,7 @@ credential rotation remain required operational defenses.
 | Apply readiness failure | `Approved` | retry same request after environment repair with a new apply key |
 | Baseline, binding, or policy drift | `Superseded` | new preview and promotion |
 | Product apply commit indeterminate | unknown until replay | retry the same idempotency key only |
-| Pointer applied before deployment enqueue | `Applied`, no deployment | startup scanner backfills exact deployment |
+| Legacy `Applied` row has no exact deployment | invalid migration state | migration fails; operator repairs or explicitly retires the legacy record before retrying |
 | Runtime process crashes during convergence | leased `Converging` | lease expiry, fenced reclaim, resume from safe phase |
 | Runtime process crashes while Live | stale serving lease | status loses Live; worker reconverges and writes a new process attestation |
 | Panel reconciliation partial | `RetryWait`, old dispatcher stopped | retry exact target; never attest partial state |
@@ -1186,7 +1188,7 @@ checks remain green at every merge boundary.
 
 ### Runtime convergence
 
-- An Applied product activation creates or backfills exactly one deployment.
+- A product activation transitioning to Applied atomically creates exactly one deployment; no startup backfill infers runtime identity.
 - Two workers racing to claim produce one current lease epoch; the expired loser
   cannot write phase, attestation, or heartbeat.
 - Drain stops new events and finishes one accepted serial interaction within the
