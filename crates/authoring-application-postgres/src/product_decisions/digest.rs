@@ -1,9 +1,11 @@
 use authoring_application::{AuthorizedApplyProductV1, AuthorizedApproveProductV1};
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 
-use super::config::{ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1};
+use crate::product_action_digest::{
+    keyed_digest, product_action_keyring_coverage_identity_v1,
+    product_action_session_subject_digest_v1, unkeyed_digest, ProductActionDigestKeyringV1,
+    ProductActionKeyringCoverageIdentityV1,
+};
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.approval.idempotency.v1";
 const SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.approval.request.v1";
@@ -45,30 +47,14 @@ pub(crate) struct ApplyDigests {
     pub session_subject: Vec<u8>,
 }
 
-pub(crate) struct KeyringCoverageIdentity {
-    pub key_ids: Vec<String>,
-    pub key_fingerprints: Vec<String>,
-}
-
 pub(crate) fn keyring_coverage_identity(
-    keyring: &ProductDecisionDigestKeyringV1,
-) -> KeyringCoverageIdentity {
-    KeyringCoverageIdentity {
-        key_ids: keyring
-            .keys()
-            .iter()
-            .map(|key| key.key_id().to_string())
-            .collect(),
-        key_fingerprints: keyring
-            .keys()
-            .iter()
-            .map(|key| unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[key.secret()]))
-            .collect(),
-    }
+    keyring: &ProductActionDigestKeyringV1,
+) -> ProductActionKeyringCoverageIdentityV1 {
+    product_action_keyring_coverage_identity_v1(keyring, KEY_MATERIAL_FINGERPRINT_DOMAIN)
 }
 
 pub(crate) fn approval_digests(
-    keyring: &ProductDecisionDigestKeyringV1,
+    keyring: &ProductActionDigestKeyringV1,
     request: &AuthorizedApproveProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
 ) -> ApprovalDigests {
     let scope = request.scope();
@@ -108,13 +94,11 @@ pub(crate) fn approval_digests(
     ];
     let receipt_id = keyed_digest(keyring.active(), RECEIPT_ID_DOMAIN, &identity_fields);
     let audit_event_id = keyed_digest(keyring.active(), AUDIT_EVENT_ID_DOMAIN, &identity_fields);
-    let session_subject = unkeyed_digest_bytes(
+    let session_subject = product_action_session_subject_digest_v1(
         SESSION_SUBJECT_DOMAIN,
-        &[
-            scope.tenant_id().as_str().as_bytes(),
-            request.actor().principal_id().as_str().as_bytes(),
-            request.session_fingerprint().as_bytes().as_slice(),
-        ],
+        scope.tenant_id().as_str().as_bytes(),
+        request.actor().principal_id().as_str().as_bytes(),
+        request.session_fingerprint().as_bytes().as_slice(),
     );
     ApprovalDigests {
         active_idempotency,
@@ -130,7 +114,7 @@ pub(crate) fn approval_digests(
 }
 
 pub(crate) fn apply_digests(
-    keyring: &ProductDecisionDigestKeyringV1,
+    keyring: &ProductActionDigestKeyringV1,
     request: &AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
 ) -> ApplyDigests {
     let scope = request.scope();
@@ -182,13 +166,11 @@ pub(crate) fn apply_digests(
         APPLY_DEPLOYMENT_ID_DOMAIN,
         &identity_fields,
     );
-    let session_subject = unkeyed_digest_bytes(
+    let session_subject = product_action_session_subject_digest_v1(
         SESSION_SUBJECT_DOMAIN,
-        &[
-            scope.tenant_id().as_str().as_bytes(),
-            request.actor().principal_id().as_str().as_bytes(),
-            request.session_fingerprint().as_bytes().as_slice(),
-        ],
+        scope.tenant_id().as_str().as_bytes(),
+        request.actor().principal_id().as_str().as_bytes(),
+        request.session_fingerprint().as_bytes().as_slice(),
     );
     ApplyDigests {
         active_idempotency,
@@ -205,87 +187,26 @@ pub(crate) fn apply_digests(
     }
 }
 
-fn keyed_digest(key: &ProductDecisionDigestKeyV1, domain: &[u8], fields: &[&[u8]]) -> String {
-    lower_hex(&keyed_digest_bytes(key, domain, fields))
-}
-
-fn keyed_digest_bytes(
-    key: &ProductDecisionDigestKeyV1,
-    domain: &[u8],
-    fields: &[&[u8]],
-) -> Vec<u8> {
-    let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(key.secret())
-        .expect("validated product decision digest key has a supported length");
-    update_hmac(&mut hmac, domain);
-    for field in fields {
-        update_hmac(&mut hmac, field);
-    }
-    hmac.finalize().into_bytes().to_vec()
-}
-
-fn unkeyed_digest(domain: &[u8], fields: &[&[u8]]) -> String {
-    unkeyed_digest_owned(domain, fields.iter().copied())
-}
-
-fn unkeyed_digest_owned<'a>(domain: &[u8], fields: impl IntoIterator<Item = &'a [u8]>) -> String {
-    lower_hex(&unkeyed_digest_bytes_owned(domain, fields))
-}
-
-fn unkeyed_digest_bytes(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
-    unkeyed_digest_bytes_owned(domain, fields.iter().copied())
-}
-
-fn unkeyed_digest_bytes_owned<'a>(
-    domain: &[u8],
-    fields: impl IntoIterator<Item = &'a [u8]>,
-) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    update_sha256(&mut hasher, domain);
-    for field in fields {
-        update_sha256(&mut hasher, field);
-    }
-    hasher.finalize().to_vec()
-}
-
-fn update_hmac(digest: &mut Hmac<Sha256>, value: &[u8]) {
-    let length =
-        u64::try_from(value.len()).expect("product decision digest input exceeds u64::MAX");
-    Mac::update(digest, &length.to_be_bytes());
-    Mac::update(digest, value);
-}
-
-fn update_sha256(digest: &mut Sha256, value: &[u8]) {
-    let length =
-        u64::try_from(value.len()).expect("product decision digest input exceeds u64::MAX");
-    Digest::update(digest, length.to_be_bytes());
-    Digest::update(digest, value);
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::product_action_digest::{unkeyed_digest_bytes, ProductActionDigestKeyV1};
 
     #[test]
     fn hmac_is_domain_separated_and_key_bound() {
         let first =
-            ProductDecisionDigestKeyV1::from_bytes("v1", std::array::from_fn(|index| index as u8))
+            ProductActionDigestKeyV1::from_bytes("v1", std::array::from_fn(|index| index as u8))
                 .unwrap();
-        let second = ProductDecisionDigestKeyV1::from_bytes(
+        let second = ProductActionDigestKeyV1::from_bytes(
             "v2",
             std::array::from_fn(|index| 255_u8.wrapping_sub(index as u8)),
         )
         .unwrap();
         let fields = [b"tenant".as_slice(), b"same-low-entropy-key".as_slice()];
+        assert_eq!(
+            keyed_digest(&first, IDEMPOTENCY_DOMAIN, &fields),
+            "bd00aaead854aea123bcb9021f835f7f7b26698d3bed0faf8a28645dca12d705"
+        );
         assert_ne!(
             keyed_digest(&first, IDEMPOTENCY_DOMAIN, &fields),
             keyed_digest(&second, IDEMPOTENCY_DOMAIN, &fields)
@@ -302,6 +223,10 @@ mod tests {
 
     #[test]
     fn length_framing_distinguishes_ambiguous_field_boundaries() {
+        assert_eq!(
+            unkeyed_digest(SEMANTIC_REQUEST_DOMAIN, &[b"a", b"bc"]),
+            "340f29cac7e35289d9ff44dcaefe36c87fb698d562863e334bd99b8e125e0f92"
+        );
         assert_ne!(
             unkeyed_digest(SEMANTIC_REQUEST_DOMAIN, &[b"a", b"bc"]),
             unkeyed_digest(SEMANTIC_REQUEST_DOMAIN, &[b"ab", b"c"])
@@ -329,12 +254,12 @@ mod tests {
 
     #[test]
     fn key_material_fingerprint_changes_when_an_identifier_is_reused() {
-        let first = ProductDecisionDigestKeyV1::from_bytes(
+        let first = ProductActionDigestKeyV1::from_bytes(
             "reused",
             std::array::from_fn(|index| 17_u8.wrapping_add(index as u8)),
         )
         .unwrap();
-        let second = ProductDecisionDigestKeyV1::from_bytes(
+        let second = ProductActionDigestKeyV1::from_bytes(
             "reused",
             std::array::from_fn(|index| 113_u8.wrapping_add(index as u8)),
         )
@@ -347,17 +272,17 @@ mod tests {
 
     #[test]
     fn keyring_coverage_identity_preserves_secret_order_without_secret_material() {
-        let first = ProductDecisionDigestKeyV1::from_bytes(
+        let first = ProductActionDigestKeyV1::from_bytes(
             "first",
             std::array::from_fn(|index| 31_u8.wrapping_add(index as u8)),
         )
         .unwrap();
-        let second = ProductDecisionDigestKeyV1::from_bytes(
+        let second = ProductActionDigestKeyV1::from_bytes(
             "second",
             std::array::from_fn(|index| 97_u8.wrapping_add(index as u8)),
         )
         .unwrap();
-        let keyring = ProductDecisionDigestKeyringV1::new(first, [second]).unwrap();
+        let keyring = ProductActionDigestKeyringV1::new(first, [second]).unwrap();
         let identity = keyring_coverage_identity(&keyring);
         assert_eq!(identity.key_ids, ["first", "second"]);
         assert_eq!(identity.key_fingerprints.len(), 2);

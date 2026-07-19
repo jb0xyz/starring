@@ -6,6 +6,7 @@ mod deployment_status;
 mod digest;
 mod envelope;
 mod installation_authority;
+mod product_action_digest;
 mod product_decisions;
 mod product_identity;
 mod product_retention;
@@ -32,6 +33,10 @@ pub use envelope::{
 pub use installation_authority::{
     InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,
     PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
+};
+pub use product_action_digest::{
+    ProductActionDigestKeyError, ProductActionDigestKeyV1, ProductActionDigestKeyringError,
+    ProductActionDigestKeyringV1,
 };
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
