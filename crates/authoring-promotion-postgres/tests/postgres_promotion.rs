@@ -30,13 +30,13 @@ use automation_ruleset_activation::{
 };
 use automation_ruleset_activation_postgres::PostgresActivationRequestStore;
 use automation_ruleset_postgres::PostgresRuleSetStore;
-use automation_ruleset_readiness::GuildCapabilities;
+use automation_ruleset_readiness::{GuildCapabilities, GuildRoleHierarchyV1, GuildRoleStateV1};
 use chrono::{DateTime, TimeZone, Utc};
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, PreviewReadyArtifactV1,
     ResourceBindingMap, ToolCall, ToolDefinition,
 };
-use discord_model::{ChannelId, GuildId, Permissions, UserId};
+use discord_model::{ChannelId, GuildId, Permissions, RoleId, UserId};
 use resource_resolution::{approval_binding_fingerprint_v1, ResolvedApprovalBinding};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -320,8 +320,30 @@ impl ProductApprovalEnvironmentProvider for ReadyProductEnvironment {
 impl ActivationEnvironmentProvider for ReadyProductEnvironment {
     async fn load_fresh(
         &self,
-        _target: &automation_ruleset_activation::ActivationTarget,
+        target: &automation_ruleset_activation::ActivationTarget,
     ) -> Result<ActivationEnvironment, ActivationEnvironmentError> {
+        let bot_role = RoleId(target.guild_id.0 + 1);
+        let role_hierarchy = GuildRoleHierarchyV1::new(
+            target.guild_id,
+            BTreeMap::from([
+                (
+                    RoleId(target.guild_id.0),
+                    GuildRoleStateV1 {
+                        position: 0,
+                        managed: false,
+                    },
+                ),
+                (
+                    bot_role,
+                    GuildRoleStateV1 {
+                        position: 10,
+                        managed: true,
+                    },
+                ),
+            ]),
+            vec![bot_role],
+        )
+        .unwrap();
         Ok(ActivationEnvironment {
             binding_revision: Some(self.revision),
             bindings: self.bindings.clone(),
@@ -329,6 +351,7 @@ impl ActivationEnvironmentProvider for ReadyProductEnvironment {
                 base_permissions: Permissions::ADMINISTRATOR,
             },
             role_permissions: BTreeMap::new(),
+            role_hierarchy: Some(role_hierarchy),
         })
     }
 }

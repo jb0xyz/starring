@@ -451,6 +451,7 @@ fn ready_environment() -> ActivationEnvironment {
             base_permissions: Permissions::ADMINISTRATOR,
         },
         role_permissions: BTreeMap::new(),
+        role_hierarchy: None,
     }
 }
 

@@ -9,7 +9,9 @@ use automation_ruleset::{
     GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetKey, RuleSetStore,
     RuleSetStoreError, RuleSetVersion, RuleSetVersionId, RuleSetVersionIdentity,
 };
-use automation_ruleset_readiness::{activate_if_ready, ActivationError, ReadinessError};
+use automation_ruleset_readiness::{
+    activate_if_ready, ActivationError, ReadinessError, RoleHierarchyReadinessErrorV1,
+};
 use chrono::Duration;
 use discord_model::{GuildId, UserId};
 
@@ -199,6 +201,8 @@ pub enum ApplyError {
     Environment(#[from] ActivationEnvironmentError),
     #[error("ruleset is not ready: {0:?}")]
     NotReady(Box<ReadinessError>),
+    #[error("ruleset role hierarchy is not ready: {0}")]
+    RoleHierarchyNotReady(RoleHierarchyReadinessErrorV1),
     #[error("ruleset store error: {0:?}")]
     RuleSet(RuleSetStoreError),
     #[error("activation outcome is indeterminate: {0:?}")]
@@ -801,6 +805,7 @@ fn product_preflight_apply_error(error: ProductPreflightErrorV1) -> ApplyError {
             ))
         }
         ProductPreflightCauseV1::Readiness(error) => ApplyError::NotReady(error),
+        ProductPreflightCauseV1::RoleHierarchy(error) => ApplyError::RoleHierarchyNotReady(error),
     }
 }
 
@@ -887,6 +892,7 @@ fn apply_error_record(error: &ApplyError) -> ApplyErrorRecord {
         ApplyError::TargetCorrupt => ApplyFailureKind::TargetCorrupt,
         ApplyError::Environment(_) => ApplyFailureKind::Environment,
         ApplyError::NotReady(_) => ApplyFailureKind::NotReady,
+        ApplyError::RoleHierarchyNotReady(_) => ApplyFailureKind::NotReady,
         _ => ApplyFailureKind::Activation,
     };
     ApplyErrorRecord {

@@ -4,7 +4,8 @@ use std::num::NonZeroU64;
 
 use automation_ruleset::{ExpectedActiveRuleSet, RuleSetVersion, RuleSetVersionIdentity};
 use automation_ruleset_readiness::{
-    check_readiness, GuildCapabilities, ReadinessError, RuleSetReadinessInput,
+    check_readiness, check_role_hierarchy_v1, GuildCapabilities, GuildRoleHierarchyV1,
+    ReadinessError, RoleHierarchyReadinessErrorV1, RoleHierarchyReadyV1, RuleSetReadinessInput,
 };
 use desired_state::ResourceKey;
 use discord_model::Permissions;
@@ -22,6 +23,7 @@ pub struct ActivationEnvironment {
     pub bindings: ResourceBindingMap,
     pub guild_capabilities: GuildCapabilities,
     pub role_permissions: BTreeMap<ResourceKey, Permissions>,
+    pub role_hierarchy: Option<GuildRoleHierarchyV1>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +37,9 @@ pub enum ProductPreflightErrorCodeV1 {
     BindingInvalid,
     BlockingPolicy,
     MissingCapabilities,
+    RoleHierarchyUnavailable,
+    RoleHierarchyIncomplete,
+    RoleUnmanageable,
 }
 
 #[derive(Clone)]
@@ -42,6 +47,7 @@ pub(crate) enum ProductPreflightCauseV1 {
     TargetCorrupt,
     BindingRevisionUnavailable,
     Readiness(Box<ReadinessError>),
+    RoleHierarchy(RoleHierarchyReadinessErrorV1),
 }
 
 #[derive(Clone)]
@@ -68,6 +74,12 @@ impl ProductPreflightErrorV1 {
         }
     }
 
+    fn from_role_hierarchy(error: RoleHierarchyReadinessErrorV1) -> Self {
+        Self {
+            cause: ProductPreflightCauseV1::RoleHierarchy(error),
+        }
+    }
+
     pub fn code(&self) -> ProductPreflightErrorCodeV1 {
         match &self.cause {
             ProductPreflightCauseV1::TargetCorrupt => ProductPreflightErrorCodeV1::TargetCorrupt,
@@ -89,6 +101,25 @@ impl ProductPreflightErrorV1 {
                 ReadinessError::BlockingPolicy(_) => ProductPreflightErrorCodeV1::BlockingPolicy,
                 ReadinessError::MissingCapabilities { .. } => {
                     ProductPreflightErrorCodeV1::MissingCapabilities
+                }
+            },
+            ProductPreflightCauseV1::RoleHierarchy(error) => match error {
+                RoleHierarchyReadinessErrorV1::EvidenceUnavailable => {
+                    ProductPreflightErrorCodeV1::RoleHierarchyUnavailable
+                }
+                RoleHierarchyReadinessErrorV1::TargetBindingMissing
+                | RoleHierarchyReadinessErrorV1::TargetRoleMissing
+                | RoleHierarchyReadinessErrorV1::ContextGuildMismatch => {
+                    ProductPreflightErrorCodeV1::RoleHierarchyIncomplete
+                }
+                RoleHierarchyReadinessErrorV1::CreatedRoleReferenceInvalid
+                | RoleHierarchyReadinessErrorV1::UnsupportedDynamicRoleReference => {
+                    ProductPreflightErrorCodeV1::StructurallyInvalid
+                }
+                RoleHierarchyReadinessErrorV1::TargetRoleUnassignable
+                | RoleHierarchyReadinessErrorV1::TargetRoleOutranksBot
+                | RoleHierarchyReadinessErrorV1::BotHierarchyInsufficient => {
+                    ProductPreflightErrorCodeV1::RoleUnmanageable
                 }
             },
         }
@@ -133,6 +164,15 @@ impl Display for ProductPreflightErrorV1 {
             }
             ProductPreflightErrorCodeV1::MissingCapabilities => {
                 "product target requires unavailable capabilities"
+            }
+            ProductPreflightErrorCodeV1::RoleHierarchyUnavailable => {
+                "product target role hierarchy evidence is unavailable"
+            }
+            ProductPreflightErrorCodeV1::RoleHierarchyIncomplete => {
+                "product target role hierarchy evidence is incomplete"
+            }
+            ProductPreflightErrorCodeV1::RoleUnmanageable => {
+                "product target requires a role the bot cannot manage"
             }
         })
     }
@@ -196,6 +236,7 @@ pub enum ProductTargetAssessmentV1 {
     Superseded { reason: SupersessionReasonV1 },
 }
 
+#[must_use]
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProductPreflightReadyV1 {
     target: ValidatedProductTargetV1,
@@ -203,6 +244,7 @@ pub struct ProductPreflightReadyV1 {
     target_is_active: bool,
     expected_active: ExpectedActiveRuleSet,
     activation_notices: Vec<String>,
+    role_hierarchy: RoleHierarchyReadyV1,
 }
 
 impl ProductPreflightReadyV1 {
@@ -226,6 +268,10 @@ impl ProductPreflightReadyV1 {
         &self.activation_notices
     }
 
+    pub fn role_hierarchy(&self) -> RoleHierarchyReadyV1 {
+        self.role_hierarchy
+    }
+
     pub fn into_activation_notices(self) -> Vec<String> {
         self.activation_notices
     }
@@ -241,6 +287,7 @@ impl Debug for ProductPreflightReadyV1 {
             .field("target_is_active", &self.target_is_active)
             .field("expected_active", &self.expected_active)
             .field("activation_notice_count", &self.activation_notices.len())
+            .field("role_hierarchy", &self.role_hierarchy)
             .finish()
     }
 }
@@ -313,6 +360,12 @@ pub fn check_product_readiness_v1(
         role_permissions: &environment.role_permissions,
     })
     .map_err(ProductPreflightErrorV1::from_readiness)?;
+    let role_hierarchy = check_role_hierarchy_v1(
+        artifact,
+        &environment.bindings,
+        environment.role_hierarchy.as_ref(),
+    )
+    .map_err(ProductPreflightErrorV1::from_role_hierarchy)?;
     Ok(ProductReadinessAssessmentV1::Ready(
         ProductPreflightReadyV1 {
             target: target.target,
@@ -324,6 +377,7 @@ pub fn check_product_readiness_v1(
                 .into_iter()
                 .map(|notice| format!("{notice:?}"))
                 .collect(),
+            role_hierarchy,
         },
     ))
 }
@@ -391,7 +445,7 @@ mod tests {
     use automation_ruleset::{
         content_hash, RuleSetKey, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
     };
-    use automation_ruleset_readiness::GuildCapabilities;
+    use automation_ruleset_readiness::{GuildCapabilities, GuildRoleHierarchyV1, GuildRoleStateV1};
     use automation_state::{ActionSpec, InteractionRule, InteractionRuleSet, TriggerSpec};
     use discord_model::{GuildId, Permissions, UserId};
     use resource_resolution::{approval_binding_fingerprint_v1, ResourceBindingMap};
@@ -484,6 +538,28 @@ mod tests {
         revision: Option<NonZeroU64>,
         permissions: Permissions,
     ) -> ActivationEnvironment {
+        let bot_role = discord_model::RoleId(100);
+        let role_hierarchy = GuildRoleHierarchyV1::new(
+            GUILD,
+            BTreeMap::from([
+                (
+                    discord_model::RoleId(GUILD.0),
+                    GuildRoleStateV1 {
+                        position: 0,
+                        managed: false,
+                    },
+                ),
+                (
+                    bot_role,
+                    GuildRoleStateV1 {
+                        position: 10,
+                        managed: true,
+                    },
+                ),
+            ]),
+            vec![bot_role],
+        )
+        .unwrap();
         ActivationEnvironment {
             binding_revision: revision,
             bindings: ResourceBindingMap::default(),
@@ -491,6 +567,7 @@ mod tests {
                 base_permissions: permissions,
             },
             role_permissions: BTreeMap::new(),
+            role_hierarchy: Some(role_hierarchy),
         }
     }
 
@@ -650,6 +727,58 @@ mod tests {
         assert_eq!(ready.target().target(), &target(&artifact));
         assert_eq!(ready.binding(), &context.binding);
         assert!(!ready.activation_notices().is_empty());
+        assert!(ready.role_hierarchy().created_role_postcheck_required());
         assert!(!format!("{ready:?}").contains("sensitive"));
+    }
+
+    #[test]
+    fn role_hierarchy_evidence_is_required_after_capability_readiness() {
+        let artifact = artifact(true);
+        let context = context();
+        let ready = target_ready(&artifact, &context, None);
+        let mut environment = environment(NonZeroU64::new(3), Permissions::ADMINISTRATOR);
+        environment.role_hierarchy = None;
+
+        let error = check_product_readiness_v1(ready, &artifact, &environment).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            ProductPreflightErrorCodeV1::RoleHierarchyUnavailable
+        );
+        assert!(!format!("{error:?}").contains("sensitive"));
+    }
+
+    #[test]
+    fn capability_failure_precedes_missing_hierarchy_evidence() {
+        let artifact = artifact(true);
+        let context = context();
+        let ready = target_ready(&artifact, &context, None);
+        let mut environment = environment(NonZeroU64::new(3), Permissions::SEND_MESSAGES);
+        environment.role_hierarchy = None;
+
+        let error = check_product_readiness_v1(ready, &artifact, &environment).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            ProductPreflightErrorCodeV1::MissingCapabilities
+        );
+    }
+
+    #[test]
+    fn binding_drift_precedes_missing_hierarchy_evidence() {
+        let artifact = artifact(true);
+        let context = context();
+        let ready = target_ready(&artifact, &context, None);
+        let mut environment = environment(NonZeroU64::new(4), Permissions::ADMINISTRATOR);
+        environment.role_hierarchy = None;
+
+        let assessment = check_product_readiness_v1(ready, &artifact, &environment).unwrap();
+
+        assert!(matches!(
+            assessment,
+            ProductReadinessAssessmentV1::Superseded {
+                reason: SupersessionReasonV1::BindingDrift { .. }
+            }
+        ));
     }
 }

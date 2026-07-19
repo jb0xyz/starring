@@ -9,6 +9,7 @@ use automation_ruleset_activation::{
     ActivationEnvironment, ActivationEnvironmentError, ActivationEnvironmentProvider,
     ActivationRequestId, ActivationService, ActivationTarget, ApplyOutcome, RequestActivation,
 };
+use automation_ruleset_readiness::{GuildRoleHierarchyV1, GuildRoleStateV1};
 use automation_runtime::gateway;
 use automation_state::{
     ActionSpec, ActionTarget, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceKind,
@@ -598,7 +599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bindings = bindings(channel_id);
 
     let http = Client::new(token.clone());
-    let (guild_capabilities, role_permissions) =
+    let (guild_capabilities, role_permissions, _) =
         readiness_context(&http, guild_id, &bindings).await?;
 
     let runtime = automation_ruleset_readiness::hydrate_active_ruleset(
@@ -700,7 +701,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
             .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
         let bindings = bindings(channel_id);
         let http = Client::new(token);
-        let (guild_capabilities, role_permissions) =
+        let (guild_capabilities, role_permissions, role_hierarchy) =
             readiness_context(&http, target.guild_id.0, &bindings)
                 .await
                 .map_err(|error| ActivationEnvironmentError::Load(error.to_string()))?;
@@ -709,6 +710,7 @@ impl ActivationEnvironmentProvider for TwilightActivationEnvironmentProvider {
             bindings,
             guild_capabilities,
             role_permissions,
+            role_hierarchy: Some(role_hierarchy),
         })
     }
 }
@@ -750,6 +752,7 @@ async fn readiness_context(
     (
         automation_ruleset_readiness::GuildCapabilities,
         BTreeMap<ResourceKey, Permissions>,
+        GuildRoleHierarchyV1,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -770,13 +773,32 @@ async fn readiness_context(
         })
         .collect();
     let bot_role_ids: Vec<RoleId> = bot_member.roles.iter().map(|id| RoleId(id.get())).collect();
-    automation_ruleset_readiness::build_readiness_context(
+    let role_hierarchy = GuildRoleHierarchyV1::new(
         GuildId(guild_id),
-        bindings,
-        &roles_snapshot,
-        &bot_role_ids,
+        guild_roles
+            .iter()
+            .map(|role| {
+                (
+                    RoleId(role.id.get()),
+                    GuildRoleStateV1 {
+                        position: role.position,
+                        managed: role.managed,
+                    },
+                )
+            })
+            .collect(),
+        bot_role_ids.clone(),
     )
-    .map_err(|e| format!("readiness context failed: {e:?}").into())
+    .map_err(|error| format!("role hierarchy context failed: {error:?}"))?;
+    let (guild_capabilities, role_permissions) =
+        automation_ruleset_readiness::build_readiness_context(
+            GuildId(guild_id),
+            bindings,
+            &roles_snapshot,
+            &bot_role_ids,
+        )
+        .map_err(|error| format!("readiness context failed: {error:?}"))?;
+    Ok((guild_capabilities, role_permissions, role_hierarchy))
 }
 
 async fn seed_studyroom(
