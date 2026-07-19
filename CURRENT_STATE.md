@@ -425,8 +425,18 @@ Stated as capabilities (durable across the phase numbering):
 - PostgreSQL installation-authority projection with exact actor/session/install
   binding, database-time lifecycle revalidation, exact current-head selection,
   bounded read-only snapshotting, non-enumerating inactive states, corruption
-  detection, and redacted records and failures. It remains a staging adapter
-  until the production scoped-function and role boundary is implemented.
+  detection, and redacted records and failures. Its direct read now runs only
+  through a versioned fixed-search-path security-definer function owned by the
+  common non-login relation owner. The adapter-exposed readiness contract
+  verifies the exact
+  signature, result shape, owner, ACL, role attributes, schema/database
+  capabilities, a direct login session, absence of role memberships and table
+  or column privileges, and a real empty-scope execution probe. Migration tests
+  also prove hostile default function grants are removed. An isolated non-owner
+  role test proves the function-backed
+  product path succeeds while direct table reads and writes, schema and
+  temporary-table creation, unrelated privileged functions, PUBLIC, and an
+  ungranted role fail closed.
 - Payload-bound product approval and serializable atomic Apply with one
   pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
   durable drift supersession, and redacted indeterminate-commit handling.
@@ -487,11 +497,14 @@ Stated as capabilities (durable across the phase numbering):
 - Three remaining production adapters: an approval-environment provider,
   authenticated snapshot envelope cipher, and atomic product-rejection adapter.
   `GET /v1/me` also needs a session-only read projection that does not weaken
-  mutation CSRF checks. The implemented PostgreSQL installation-authority source
-  is not production-composable until its direct read is moved behind the scoped
-  least-privilege function and startup capability contract below.
+  mutation CSRF checks. The installation-authority source is independently
+  least-privilege composable, but the current authentication and authorized
+  snapshot adapters still read tables directly, so the complete API process
+  cannot yet run with the final execute-only `starring_api` role.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
-  row policies, direct-DML denial, and a startup capability/readiness probe.
+  row policies, and whole-process capability probes. The installation-authority
+  read slice now has direct-DML denial and an executable readiness probe, but no
+  composition root calls it yet; this is not the complete database-role cutover.
 - A production `tools/starring-runtime` worker that performs the actual Discord
   drain, hydration, panel reconciliation, gateway start, attestation, and
   heartbeat loop. The durable state machine is implemented, but no production
@@ -601,11 +614,12 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Move installation-authority reads behind a versioned fixed-search-path
-   security-definer function, revoke direct API table reads, and add positive and
-   negative role-capability startup probes. Normalize inaccessible Discord
-   membership and unknown installation IDs at the later HTTP boundary without
-   turning a valid member's insufficient permission into a false 404.
+1. Move authentication and authorized-snapshot database access behind equally
+   narrow versioned functions, add declarative production role/bootstrap and
+   restrictive default-privilege policy, then prove the complete API process
+   under the final non-owner role. Normalize inaccessible Discord membership and
+   unknown installation IDs at the later HTTP boundary without turning a valid
+   member's insufficient permission into a false 404.
 2. Implement the remaining session-only identity projection,
    approval-environment, rejection, and snapshot-crypto adapters with
    cross-scope, replay, contention, corruption, and secret-redaction tests.

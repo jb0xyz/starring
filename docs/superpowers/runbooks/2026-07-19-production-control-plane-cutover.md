@@ -215,6 +215,50 @@ latest-deployment lineage. Do not bypass its triggers, disable trigger
 execution, or grant application roles direct execution on its security-definer
 functions.
 
+Migration 014 creates
+`public.starring_product_installation_authority_read_v1(TEXT,TEXT,BYTEA)` as
+the only supported installation-authority read boundary. It is volatile,
+strict, parallel-unsafe, security-definer, and fixed to
+`search_path=pg_catalog`. The migration fails with SQLSTATE `55000` unless the
+five referenced identity, tenant, installation, and authority relations exist
+under one owner. It transfers the function to that owner and revokes `PUBLIC`
+execution in the same transaction. The owner must be the non-login,
+non-superuser, non-`BYPASSRLS` `starring_owner` role before production
+readiness is attempted. Migration 014 also removes every default-privilege
+function grant inherited by a non-owner role before transferring ownership.
+Revoke temporary migrator-to-owner membership after the ownership handoff; the
+installation-authority API readiness contract rejects memberships into or out
+of the owner role.
+
+The role bootstrap must grant `starring_api` schema usage and execution of only
+the exact versioned signature without grant option:
+
+```sql
+GRANT USAGE ON SCHEMA public TO starring_api;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_installation_authority_read_v1(TEXT, TEXT, BYTEA)
+TO starring_api;
+```
+
+For this slice, `starring_api` must have no `SELECT`, `INSERT`, `UPDATE`,
+`DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER` privilege on
+`product_principals`, `product_auth_sessions`, `product_tenants`,
+`automation_installations`, or
+`automation_installation_authority_versions`. It must also lack database
+`CREATE` and `TEMPORARY`, schema `CREATE`, owner membership, superuser,
+`CREATEDB`, `CREATEROLE`, replication, and `BYPASSRLS`. Call
+`PostgresInstallationAuthoritySource::verify_readiness` before opening ingress;
+it checks the exact function result contract, owner and ACL, current-role
+capabilities, a direct login session, absence of all role memberships, table-
+and column-level privilege denial, and executes a data-independent empty-scope
+probe under a bounded read-only transaction. Running readiness after `SET ROLE`
+is rejected because that session can reset to the more privileged login role.
+
+This authority-read probe certifies only that adapter boundary. Authentication
+and authorized-snapshot access still need their own narrow database functions
+before one final execute-only `starring_api` process can pass whole-service
+readiness. Do not compensate by granting the API role direct table access.
+
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
 `STARRING_ALLOW_INTERACTION_SMOKE=1`, is marked non-publishable, and requires an

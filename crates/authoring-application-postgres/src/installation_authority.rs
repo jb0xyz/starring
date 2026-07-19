@@ -12,6 +12,10 @@ use discord_model::{GuildId, UserId};
 use sqlx::postgres::PgPool;
 use subtle::ConstantTimeEq;
 
+mod readiness;
+
+pub use readiness::InstallationAuthorityReadinessErrorV1;
+
 const DEFAULT_STATEMENT_TIMEOUT_MILLIS: u64 = 2_000;
 const MAX_STATEMENT_TIMEOUT_MILLIS: u64 = 60_000;
 const AUTHORITY_DIGEST_LENGTH: usize = 64;
@@ -79,7 +83,7 @@ struct InstallationAuthorityRow {
     principal_disabled: bool,
     session_digest: Vec<u8>,
     session_principal_id: String,
-    oauth_state_digest: Option<Vec<u8>>,
+    oauth_state_digest_length: Option<i32>,
     last_seen_at: DateTime<Utc>,
     idle_expires_at: DateTime<Utc>,
     absolute_expires_at: DateTime<Utc>,
@@ -121,8 +125,8 @@ impl InstallationAuthorityRow {
         {
             return Err(DiscordAuthoritySourceError::InvalidRecord);
         }
-        if self.oauth_state_digest.as_deref().map(<[u8]>::len) != Some(32) {
-            return match self.oauth_state_digest {
+        if self.oauth_state_digest_length != Some(32) {
+            return match self.oauth_state_digest_length {
                 None => Err(DiscordAuthoritySourceError::NotFound),
                 Some(_) => Err(DiscordAuthoritySourceError::InvalidRecord),
             };
@@ -230,39 +234,8 @@ impl InstallationAuthoritySource for PostgresInstallationAuthoritySource {
         .await
         .map_err(|_| DiscordAuthoritySourceError::Unavailable)?;
         let row = sqlx::query_as::<_, InstallationAuthorityRow>(
-            "WITH request_clock AS MATERIALIZED ( \
-               SELECT pg_catalog.clock_timestamp() AS database_now \
-             ) \
-             SELECT principal.principal_id, principal.discord_user_id AS acting_user_id, \
-              principal.disabled AS principal_disabled, actor_session.session_digest, \
-              actor_session.principal_id AS session_principal_id, \
-              actor_session.oauth_state_digest, actor_session.last_seen_at, \
-              actor_session.idle_expires_at, actor_session.absolute_expires_at, \
-              actor_session.revoked_at, \
-              installation.tenant_id AS installation_tenant_id, \
-              installation.installation_id, tenant.tenant_id, \
-              tenant.lifecycle_state AS tenant_lifecycle_state, \
-              installation.lifecycle_state AS installation_lifecycle_state, \
-              installation.discord_application_id, \
-              installation.discord_guild_id, installation.current_authority_revision, \
-              authority.tenant_id AS authority_tenant_id, \
-              authority.installation_id AS authority_installation_id, \
-              authority.revision AS authority_revision, \
-              authority.authority_payload_digest, request_clock.database_now \
-             FROM public.automation_installations AS installation \
-             LEFT JOIN public.product_tenants AS tenant \
-              ON tenant.tenant_id = installation.tenant_id \
-             INNER JOIN public.product_principals AS principal \
-              ON principal.principal_id = $2 \
-             INNER JOIN public.product_auth_sessions AS actor_session \
-              ON actor_session.principal_id = principal.principal_id \
-              AND actor_session.session_digest = $3 \
-             LEFT JOIN public.automation_installation_authority_versions AS authority \
-              ON authority.tenant_id = installation.tenant_id \
-              AND authority.installation_id = installation.installation_id \
-              AND authority.revision = installation.current_authority_revision \
-             CROSS JOIN request_clock \
-             WHERE installation.installation_id = $1",
+            "SELECT * \
+             FROM public.starring_product_installation_authority_read_v1($1, $2, $3)",
         )
         .bind(installation.installation_id().as_str())
         .bind(actor.principal_id().as_str())

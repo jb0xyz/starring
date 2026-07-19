@@ -22,9 +22,10 @@ use authoring_application_discord::{
     InstallationAuthoritySource,
 };
 use authoring_application_postgres::{
-    digest_opaque_session_credential_v1, PostgresAuthentication,
-    PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
-    PostgresProductDecisions, PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1,
+    digest_opaque_session_credential_v1, InstallationAuthorityReadinessErrorV1,
+    PostgresAuthentication, PostgresInstallationAuthoritySource,
+    PostgresInstallationAuthoritySourceConfig, PostgresProductDecisions,
+    PostgresProductDeploymentStatuses, ProductDecisionDigestKeyV1,
     ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
@@ -57,6 +58,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use design_harness::IntentRequestedOutcome;
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, Permissions, RoleId, UserId};
+use futures::FutureExt;
 use hmac::{Hmac, Mac};
 use resource_resolution::{
     approval_binding_fingerprint_v1, resource_binding_fingerprint_v2, ResolvedApprovalBinding,

@@ -320,18 +320,10 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         .contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"));
     assert!(installation_authority.contains("pg_catalog.set_config('statement_timeout'"));
     assert!(installation_authority.contains("idle_in_transaction_session_timeout"));
-    assert!(installation_authority.contains("pg_catalog.clock_timestamp()"));
-    assert!(installation_authority.contains("actor_session.session_digest = $3"));
-    assert!(installation_authority.contains("principal.disabled AS principal_disabled"));
-    assert!(installation_authority.contains("actor_session.oauth_state_digest"));
-    assert!(installation_authority.contains("actor_session.revoked_at"));
-    assert!(installation_authority.contains("tenant.lifecycle_state AS tenant_lifecycle_state"));
     assert!(installation_authority
-        .contains("installation.lifecycle_state AS installation_lifecycle_state"));
+        .contains("public.starring_product_installation_authority_read_v1($1, $2, $3)"));
+    assert!(installation_authority.contains("oauth_state_digest_length"));
     assert!(installation_authority.contains("fn active_lifecycle("));
-    assert!(installation_authority
-        .contains("authority.revision = installation.current_authority_revision"));
-    assert!(installation_authority.contains("authority.authority_payload_digest"));
     assert!(installation_authority.contains("persisted_session_digest"));
     assert!(installation_authority.contains(".ct_eq(actor.session_fingerprint().as_bytes())"));
     assert!(!installation_authority.contains("MAX("));
@@ -339,6 +331,69 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(!installation_authority.contains("sqlx::Error::to_string"));
     assert!(!installation_authority.contains("FOR SHARE"));
     assert!(!installation_authority.contains("FOR UPDATE"));
+    for forbidden in [
+        "public.product_principals",
+        "public.product_auth_sessions",
+        "public.product_tenants",
+        "public.automation_installations",
+        "public.automation_installation_authority_versions",
+    ] {
+        assert!(!installation_authority.contains(forbidden));
+    }
+    let authority_read_migration =
+        include_str!("../../../migrations/202607190014_scope_installation_authority_reads.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_product_installation_authority_read_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "pg_catalog.clock_timestamp()",
+        "actor_session.session_digest = expected_product_session_digest",
+        "principal.disabled AS principal_disabled",
+        "pg_catalog.octet_length(actor_session.oauth_state_digest)",
+        "actor_session.revoked_at",
+        "tenant.lifecycle_state AS tenant_lifecycle_state",
+        "installation.lifecycle_state AS installation_lifecycle_state",
+        "authority.revision = installation.current_authority_revision",
+        "authority.authority_payload_digest",
+        "relation_count <> 5",
+        "table_count <> 5",
+        "owner_count <> 1",
+        "pg_catalog.aclexplode(COALESCE(",
+        "privilege.grantee <> function_row.proowner",
+        "REVOKE ALL PRIVILEGES ON FUNCTION",
+        "ALTER FUNCTION public.starring_product_installation_authority_read_v1",
+        ") FROM PUBLIC;",
+    ] {
+        assert!(
+            authority_read_migration.contains(required),
+            "missing installation authority read guard: {required}"
+        );
+    }
+    assert!(!authority_read_migration.contains("created_by_principal_id"));
+    assert!(!authority_read_migration.contains("MAX("));
+    let authority_readiness = include_str!("../src/installation_authority/readiness.rs");
+    for required in [
+        "pg_catalog.to_regprocedure($1)",
+        "pg_catalog.pg_get_function_result(function_row.oid)",
+        "function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]",
+        "pg_catalog.aclexplode(COALESCE(",
+        "privilege.is_grantable",
+        "pg_catalog.has_table_privilege(",
+        "pg_catalog.has_any_column_privilege(",
+        "pg_catalog.pg_auth_members",
+        "membership.roleid = caller_role.oid",
+        "owner_membership.roleid = owner_role.oid",
+        "current_user = session_user",
+        "unexpected_function_grant",
+        "caller_role.rolbypassrls",
+        "owner_role.rolcanlogin",
+        "public.starring_product_installation_authority_read_v1($1, $2, $3)",
+    ] {
+        assert!(
+            authority_readiness.contains(required),
+            "missing installation authority readiness guard: {required}"
+        );
+    }
     let identity = include_str!("../src/product_identity/store.rs")
         .split("#[cfg(test)]")
         .next()
@@ -440,6 +495,10 @@ fn source_files_contain_no_comments() {
         (
             "src/installation_authority.rs",
             include_str!("../src/installation_authority.rs"),
+        ),
+        (
+            "src/installation_authority/readiness.rs",
+            include_str!("../src/installation_authority/readiness.rs"),
         ),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         (
@@ -579,6 +638,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_control_e2e/installation_authority.rs",
             include_str!("postgres_product_control_e2e/installation_authority.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/installation_authority_security.rs",
+            include_str!("postgres_product_control_e2e/installation_authority_security.rs"),
         ),
         (
             "tests/postgres_product_control_e2e/deployment_status.rs",

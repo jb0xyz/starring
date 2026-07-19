@@ -25,8 +25,8 @@ pub use envelope::{
     SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
 };
 pub use installation_authority::{
-    InstallationAuthoritySourceConfigError, PostgresInstallationAuthoritySource,
-    PostgresInstallationAuthoritySourceConfig,
+    InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,
+    PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
 };
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
