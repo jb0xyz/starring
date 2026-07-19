@@ -84,6 +84,8 @@ fn promotion_migration_is_fail_closed_and_scoped() {
         "product_admission_digest TEXT",
         "authoring_promotions_enforce_product_admission",
         "authoring_promotions_enforce_product_transition",
+        "starring.product_promotion_legacy_repair_gate",
+        ") = NEW.product_admission_digest",
         "OLD.stage = 'prepared'",
         "OLD.stage = 'published'",
         "OLD.stage = 'activation_pending'",
@@ -97,6 +99,9 @@ fn promotion_migration_is_fail_closed_and_scoped() {
     }
     assert!(!migration.contains("CREATE ROLE"));
     assert!(!migration.contains("GRANT EXECUTE"));
+    assert!(!migration.contains(
+        "NEW.product_admission ->> 'admitted_at'\n            IS DISTINCT FROM NEW.record ->> 'created_at'"
+    ));
     assert!(!migration.contains("--"));
     assert!(!migration.contains("/*"));
     for function in [

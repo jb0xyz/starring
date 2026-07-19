@@ -359,8 +359,6 @@ BEGIN
         OR (payload ->> 'effective_permission_bits' ~ '^(0|[1-9][0-9]{0,19})$')
             IS DISTINCT FROM TRUE
         OR pg_catalog.jsonb_typeof(payload -> 'guild_owner') IS DISTINCT FROM 'boolean'
-        OR NEW.product_admission ->> 'admitted_at'
-            IS DISTINCT FROM NEW.record ->> 'created_at'
     THEN
         RAISE EXCEPTION 'product promotion admission evidence is inconsistent'
             USING ERRCODE = '23514';
@@ -855,7 +853,7 @@ BEGIN
         AND pg_catalog.current_setting(
             'starring.product_promotion_legacy_repair_gate',
             TRUE
-        ) = 'starring.product.promotion.legacy.repair.v1'
+        ) = NEW.product_admission_digest
     THEN
         RETURN NEW;
     END IF;
