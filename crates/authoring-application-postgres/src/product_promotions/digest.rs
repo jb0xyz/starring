@@ -8,7 +8,8 @@ use authoring_promotion::{
 
 use crate::product_action_digest::{
     keyed_digest, product_action_keyring_coverage_identity_v1,
-    product_action_session_subject_digest_v1, unkeyed_digest, ProductActionDigestKeyringV1,
+    product_action_session_subject_digest_v1, unkeyed_digest, ProductActionDigestKeyV1,
+    ProductActionDigestKeyringV1,
 };
 
 const ENDPOINT_DOMAIN: &[u8] = b"product_promote_v1";
@@ -41,6 +42,11 @@ pub(super) struct ProductPromotionDigestsV1 {
     pub receipt_id: String,
     pub audit_event_id: String,
     pub session_subject: Vec<u8>,
+}
+
+pub(super) struct ProductPromotionActionIdsV1 {
+    pub receipt_id: String,
+    pub audit_event_id: String,
 }
 
 impl Debug for ProductPromotionDigestsV1 {
@@ -127,16 +133,15 @@ fn promotion_digests_from_secret_v1(
             promotion_id.as_str().as_bytes(),
         ],
     );
-    let identity_fields = [
-        scope.tenant_id.as_str().as_bytes(),
-        scope.installation_id.as_str().as_bytes(),
-        scope.principal_id.as_str().as_bytes(),
-        promotion_id.as_str().as_bytes(),
-        active_idempotency.as_bytes(),
-        semantic_request.as_bytes(),
-    ];
-    let receipt_id = keyed_digest(keyring.active(), RECEIPT_ID_DOMAIN, &identity_fields);
-    let audit_event_id = keyed_digest(keyring.active(), AUDIT_EVENT_ID_DOMAIN, &identity_fields);
+    let action_ids = promotion_action_ids_v1(
+        keyring.active(),
+        scope.tenant_id.as_str(),
+        scope.installation_id.as_str(),
+        scope.principal_id.as_str(),
+        promotion_id.as_str(),
+        &active_idempotency,
+        &semantic_request,
+    );
     let session_subject = product_action_session_subject_digest_v1(
         SESSION_SUBJECT_DOMAIN,
         scope.tenant_id.as_str().as_bytes(),
@@ -152,10 +157,33 @@ fn promotion_digests_from_secret_v1(
         active_key_id: keyring_identity.key_ids[0].clone(),
         active_key_fingerprint: keyring_identity.key_fingerprints[0].clone(),
         semantic_request,
-        receipt_id,
-        audit_event_id,
+        receipt_id: action_ids.receipt_id,
+        audit_event_id: action_ids.audit_event_id,
         session_subject,
     })
+}
+
+pub(super) fn promotion_action_ids_v1(
+    key: &ProductActionDigestKeyV1,
+    tenant_id: &str,
+    installation_id: &str,
+    principal_id: &str,
+    promotion_id: &str,
+    idempotency_key_digest: &str,
+    semantic_request_digest: &str,
+) -> ProductPromotionActionIdsV1 {
+    let identity_fields = [
+        tenant_id.as_bytes(),
+        installation_id.as_bytes(),
+        principal_id.as_bytes(),
+        promotion_id.as_bytes(),
+        idempotency_key_digest.as_bytes(),
+        semantic_request_digest.as_bytes(),
+    ];
+    ProductPromotionActionIdsV1 {
+        receipt_id: keyed_digest(key, RECEIPT_ID_DOMAIN, &identity_fields),
+        audit_event_id: keyed_digest(key, AUDIT_EVENT_ID_DOMAIN, &identity_fields),
+    }
 }
 
 pub(super) fn encode_lower_hex(bytes: &[u8]) -> String {
@@ -273,5 +301,31 @@ mod tests {
             ProductPromotionDigestErrorV1::InvalidIdempotencySecret
         );
         assert!(!format!("{error:?}").contains("invalid secret"));
+    }
+
+    #[test]
+    fn historical_action_ids_are_keyed_and_field_bound() {
+        let key = key("retired-v1", 17);
+        let expected = promotion_action_ids_v1(
+            &key,
+            "tenant-one",
+            "installation-one",
+            "principal-one",
+            &"01".repeat(32),
+            &"02".repeat(32),
+            &"03".repeat(32),
+        );
+        let changed = promotion_action_ids_v1(
+            &key,
+            "tenant-one",
+            "installation-one",
+            "principal-one",
+            &"01".repeat(32),
+            &"02".repeat(32),
+            &"04".repeat(32),
+        );
+        assert_ne!(expected.receipt_id, expected.audit_event_id);
+        assert_ne!(expected.receipt_id, changed.receipt_id);
+        assert_ne!(expected.audit_event_id, changed.audit_event_id);
     }
 }

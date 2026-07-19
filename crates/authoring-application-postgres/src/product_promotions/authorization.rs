@@ -56,6 +56,11 @@ pub(super) fn product_promotion_access_args_v1(
     validate_authority_source_v1(&source)?;
     let observed_current_authority_revision = i64::try_from(source.authority_revision)
         .map_err(|_| AuthorizedPromotionSubmissionErrorV1::Forbidden)?;
+    let authority_observed_at = postgres_timestamp_v1(source.observed_at)?;
+    let authority_expires_at = postgres_timestamp_v1(source.expires_at)?;
+    if authority_observed_at >= authority_expires_at {
+        return Err(AuthorizedPromotionSubmissionErrorV1::Forbidden);
+    }
     Ok(ProductPromotionAccessArgsV1 {
         expected_tenant_id: scope.tenant_id().as_str().to_string(),
         expected_installation_id: scope.installation_id().as_str().to_string(),
@@ -68,11 +73,18 @@ pub(super) fn product_promotion_access_args_v1(
         observed_current_authority_revision,
         observed_current_authority_payload_digest: source.authority_payload_digest.to_string(),
         authority_observation_digest: source.observation_digest.to_string(),
-        authority_observed_at: source.observed_at,
-        authority_expires_at: source.expires_at,
+        authority_observed_at,
+        authority_expires_at,
         effective_permission_bits: source.effective_permission_bits.to_string(),
         guild_owner: source.guild_owner,
     })
+}
+
+fn postgres_timestamp_v1(
+    value: DateTime<Utc>,
+) -> Result<DateTime<Utc>, AuthorizedPromotionSubmissionErrorV1> {
+    DateTime::from_timestamp_micros(value.timestamp_micros())
+        .ok_or(AuthorizedPromotionSubmissionErrorV1::Forbidden)
 }
 
 pub(super) fn validate_product_promotion_submission_v1(
@@ -224,5 +236,13 @@ mod tests {
             validate_authority_source_v1(&overflow),
             Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
         );
+    }
+
+    #[test]
+    fn authority_timestamps_are_canonicalized_to_postgres_precision() {
+        let base = source().observed_at;
+        let canonical = postgres_timestamp_v1(base + Duration::nanoseconds(999)).unwrap();
+        assert_eq!(canonical, base);
+        assert_eq!(canonical.timestamp_subsec_nanos() % 1_000, 0);
     }
 }

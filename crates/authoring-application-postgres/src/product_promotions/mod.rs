@@ -5,7 +5,15 @@ mod authorization;
 mod config;
 #[allow(dead_code)]
 mod digest;
+#[allow(dead_code)]
+mod prepare;
+#[allow(dead_code)]
+mod replay;
+#[allow(dead_code)]
+mod row;
 mod store;
+#[allow(dead_code)]
+mod transaction;
 
 pub use config::{PostgresProductPromotionsConfig, ProductPromotionConfigError};
 pub use store::PostgresProductPromotions;

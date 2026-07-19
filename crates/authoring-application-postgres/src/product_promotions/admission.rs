@@ -2,7 +2,7 @@ use std::fmt::{Debug, Formatter};
 
 use authoring_application::AuthorizedPromotionAccessV1;
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
-use authoring_promotion::PreparedPromotionPlanV1;
+use authoring_promotion::{AuthoringSessionId, PreparedPromotionPlanV1, SessionGeneration};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -40,7 +40,7 @@ pub(super) enum ProductPromotionAdmissionErrorV1 {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ProductPromotionAdmissionPayloadV1 {
+pub(crate) struct ProductPromotionAdmissionPayloadV1 {
     pub endpoint_domain: String,
     pub product_request_id: String,
     pub tenant_id: String,
@@ -82,7 +82,7 @@ impl Debug for ProductPromotionAdmissionPayloadV1 {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ProductPromotionAdmissionEvidenceV1 {
+pub(crate) struct ProductPromotionAdmissionEvidenceV1 {
     pub format_version: u16,
     pub payload: ProductPromotionAdmissionPayloadV1,
     pub admitted_at: DateTime<Utc>,
@@ -105,24 +105,46 @@ impl Debug for PreparedProductPromotionAdmissionV1 {
     }
 }
 
+pub(super) struct ProductPromotionAdmissionContextV1 {
+    pub product_request_id: String,
+    pub authoring_session_id: AuthoringSessionId,
+    pub generation: SessionGeneration,
+}
+
+impl Debug for ProductPromotionAdmissionContextV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProductPromotionAdmissionContextV1(<redacted>)")
+    }
+}
+
+pub(super) fn product_promotion_admission_context_v1(
+    access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
+) -> ProductPromotionAdmissionContextV1 {
+    ProductPromotionAdmissionContextV1 {
+        product_request_id: access.request_id().as_str().to_string(),
+        authoring_session_id: access.session_id().clone(),
+        generation: access.expected_generation(),
+    }
+}
+
 pub(super) fn prepare_product_promotion_admission_v1(
     keyring: &ProductActionDigestKeyringV1,
-    access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    context: &ProductPromotionAdmissionContextV1,
     access_args: &ProductPromotionAccessArgsV1,
     plan: &PreparedPromotionPlanV1,
     digests: &ProductPromotionDigestsV1,
 ) -> Result<PreparedProductPromotionAdmissionV1, ProductPromotionAdmissionErrorV1> {
-    validate_plan_projection_v1(access, access_args, plan, digests)?;
+    validate_plan_projection_v1(context, access_args, plan, digests)?;
     let candidate_revision = bounded_positive_i64_string(plan.intent.evidence.candidate_revision)?;
     let policy_revision = bounded_positive_i64_string(plan.intent.authority.policy.revision.get())?;
     let payload = ProductPromotionAdmissionPayloadV1 {
         endpoint_domain: ENDPOINT_DOMAIN.to_string(),
-        product_request_id: access.request_id().as_str().to_string(),
+        product_request_id: context.product_request_id.clone(),
         tenant_id: access_args.expected_tenant_id.clone(),
         installation_id: access_args.expected_installation_id.clone(),
         principal_id: access_args.expected_principal_id.clone(),
-        authoring_session_id: access.session_id().as_str().to_string(),
-        generation: access.expected_generation().get().to_string(),
+        authoring_session_id: context.authoring_session_id.as_str().to_string(),
+        generation: context.generation.get().to_string(),
         candidate_revision,
         candidate_hash: plan
             .intent
@@ -201,7 +223,7 @@ pub(super) fn validate_product_promotion_admission_v1(
 }
 
 fn validate_plan_projection_v1(
-    access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    context: &ProductPromotionAdmissionContextV1,
     access_args: &ProductPromotionAccessArgsV1,
     plan: &PreparedPromotionPlanV1,
     digests: &ProductPromotionDigestsV1,
@@ -212,8 +234,8 @@ fn validate_plan_projection_v1(
         || authority.installation_id.as_str() != access_args.expected_installation_id
         || authority.principal_id.as_str() != access_args.expected_principal_id
         || authority.session_owner_id != authority.principal_id
-        || authority.session_id != *access.session_id()
-        || authority.session_generation != access.expected_generation()
+        || authority.session_id != context.authoring_session_id
+        || authority.session_generation != context.generation
         || authority.guild_id.to_string() != access_args.expected_guild_id
         || authority.requester.to_string() != access_args.expected_acting_user_id
         || access_args.expected_capability != "promote"
