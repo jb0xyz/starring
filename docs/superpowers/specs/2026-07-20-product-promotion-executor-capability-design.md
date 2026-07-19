@@ -332,6 +332,13 @@ scalar against server state, supplies `admitted_at` from its materialized clock,
 and stores the wrapper atomically. Database-owned admission time is immutable
 and validated separately rather than included in the client HMAC.
 
+For first admission, `admitted_at` is the same database instant as the Prepared
+record's `created_at`. For the restricted legacy ActivationPending repair it is
+the later recovery transaction's database instant and must be greater than or
+equal to `created_at`. The Prepare function enforces equality; the admission
+trigger enforces ordering so a historical repair never forges its admission
+time back to the journal creation time.
+
 The deny-unknown-fields envelope contains only:
 
 - endpoint domain `product_promote_v1` and original product request ID;
@@ -515,6 +522,7 @@ TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
     admission_evidence JSONB,
+    admission_digest TEXT,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
     database_now TIMESTAMPTZ
@@ -522,9 +530,14 @@ TABLE(
 ```
 
 `outcome_code` is `missing`, `partial_exact`, `final_exact`,
+`legacy_repair_required`,
 `idempotency_conflict`, `access_denied`, `scope_mismatch`, or
 `persistence_corrupt`. Missing nullable projections are SQL `NULL` only for the
-documented `missing` or partial state.
+documented `missing` or partial state. Admission evidence and its persisted
+digest are both non-null for every partial or final exact result and both null
+for `missing`. `legacy_repair_required` returns only the exact legacy
+ActivationPending promotion record, with all admission and final projections
+null. Rust recomputes and constant-time checks every returned admission digest.
 
 ### Prepare
 
@@ -564,6 +577,7 @@ TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
     admission_evidence JSONB,
+    admission_digest TEXT,
     database_now TIMESTAMPTZ
 )
 ```
@@ -574,6 +588,10 @@ for a true miss, materializes the Prepared record with database time, inserts
 the record and admission atomically, and returns `created`, `partial_exact`,
 `final_exact`, `idempotency_conflict`, `generation_mismatch`, `access_denied`,
 `scope_mismatch`, `invalid_candidate`, or `persistence_corrupt`.
+Admission evidence and its persisted digest are both non-null for every created
+or exact result. A concurrent `final_exact` response is followed by the Replay
+capability before the adapter returns success so the final receipt and audit are
+also validated.
 
 ### Publish
 
@@ -657,6 +675,8 @@ It returns:
 TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
+    admission_evidence JSONB,
+    admission_digest TEXT,
     activation_projection JSONB,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
@@ -678,7 +698,7 @@ There is no normal-path follow-up link call.
 ### Legacy activation-link repair
 
 ```text
-public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,text,text[],text[],text[],text,text,text,text)
+public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,jsonb,text,text,text[],text[],text[],text,text,text,text)
 ```
 
 Arguments after `AccessV1` are:
@@ -688,6 +708,8 @@ expected_promotion_id TEXT,
 expected_promotion_request_digest TEXT,
 recovery_product_request_id TEXT,
 recovery_session_subject_digest BYTEA,
+recovery_admission_payload JSONB,
+recovery_admission_digest TEXT,
 active_idempotency_key_digest TEXT,
 idempotency_key_digest_candidates TEXT[],
 idempotency_digest_key_id_candidates TEXT[],
@@ -698,12 +720,14 @@ new_receipt_id TEXT,
 new_audit_event_id TEXT
 ```
 
-It returns exactly the same six-column table contract as activation-link:
+It returns exactly the same eight-column table contract as activation-link:
 
 ```sql
 TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
+    admission_evidence JSONB,
+    admission_digest TEXT,
     activation_projection JSONB,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
@@ -804,6 +828,12 @@ The migration installs an exact promotion transition trigger. It permits only:
 - Published two to ActivationPending three;
 - Published two to Expired three;
 - ActivationPending three to Expired four.
+
+The only same-stage exception is the restricted legacy repair: an exact
+ActivationPending revision-three row with all admission columns null may receive
+one version-one admission sidecar while every journal field remains byte-for-byte
+unchanged. A transaction-local owner-only repair gate is required. Any other
+admission-column update is rejected.
 
 Promotion ID, request digest, intent, tenant, installation, principal, creation
 time, and admission columns are immutable. Updated time is monotonic. A stage,

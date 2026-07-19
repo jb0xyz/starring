@@ -381,7 +381,7 @@ BEGIN
                 USING ERRCODE = '23514';
     END;
 
-    IF admitted_at IS DISTINCT FROM record_created_at
+    IF admitted_at < record_created_at
         OR observed_at > admitted_at
         OR observed_at >= expires_at
         OR expires_at > observed_at + INTERVAL '5 seconds'
@@ -519,6 +519,8 @@ CREATE FUNCTION public.starring_product_promotion_activation_link_v1(
 RETURNS TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
+    admission_evidence JSONB,
+    admission_digest TEXT,
     activation_projection JSONB,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
@@ -535,6 +537,8 @@ AS $function$
 BEGIN
     RETURN QUERY SELECT 'persistence_corrupt',
         NULL::JSONB,
+        NULL::JSONB,
+        NULL::TEXT,
         NULL::JSONB,
         NULL::JSONB,
         NULL::JSONB,
@@ -562,6 +566,8 @@ CREATE FUNCTION public.starring_product_promotion_repair_link_v1(
     expected_promotion_request_digest TEXT,
     recovery_product_request_id TEXT,
     recovery_session_subject_digest BYTEA,
+    recovery_admission_payload JSONB,
+    recovery_admission_digest TEXT,
     active_idempotency_key_digest TEXT,
     idempotency_key_digest_candidates TEXT[],
     idempotency_digest_key_id_candidates TEXT[],
@@ -574,6 +580,8 @@ CREATE FUNCTION public.starring_product_promotion_repair_link_v1(
 RETURNS TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
+    admission_evidence JSONB,
+    admission_digest TEXT,
     activation_projection JSONB,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
@@ -590,6 +598,8 @@ AS $function$
 BEGIN
     RETURN QUERY SELECT 'persistence_corrupt',
         NULL::JSONB,
+        NULL::JSONB,
+        NULL::TEXT,
         NULL::JSONB,
         NULL::JSONB,
         NULL::JSONB,
@@ -822,6 +832,31 @@ BEGIN
             RAISE EXCEPTION 'product promotion insert must be prepared revision one'
                 USING ERRCODE = '23514';
         END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.stage = 'activation_pending'
+        AND OLD.revision = 3
+        AND NEW.stage = OLD.stage
+        AND NEW.revision = OLD.revision
+        AND NEW.id IS NOT DISTINCT FROM OLD.id
+        AND NEW.record_format_version IS NOT DISTINCT FROM OLD.record_format_version
+        AND NEW.request_digest IS NOT DISTINCT FROM OLD.request_digest
+        AND NEW.tenant_id IS NOT DISTINCT FROM OLD.tenant_id
+        AND NEW.installation_id IS NOT DISTINCT FROM OLD.installation_id
+        AND NEW.principal_id IS NOT DISTINCT FROM OLD.principal_id
+        AND NEW.record IS NOT DISTINCT FROM OLD.record
+        AND OLD.product_admission_format_version IS NULL
+        AND OLD.product_admission_digest IS NULL
+        AND OLD.product_admission IS NULL
+        AND NEW.product_admission_format_version = 1
+        AND NEW.product_admission_digest IS NOT NULL
+        AND NEW.product_admission IS NOT NULL
+        AND pg_catalog.current_setting(
+            'starring.product_promotion_legacy_repair_gate',
+            TRUE
+        ) = 'starring.product.promotion.legacy.repair.v1'
+    THEN
         RETURN NEW;
     END IF;
 
@@ -1858,6 +1893,7 @@ RETURNS TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
     admission_evidence JSONB,
+    admission_digest TEXT,
     receipt_projection JSONB,
     audit_evidence_projection JSONB,
     database_now TIMESTAMPTZ
@@ -1896,6 +1932,7 @@ BEGIN
         RETURN QUERY SELECT access_result.outcome_code,
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             NULL::JSONB,
             NULL::JSONB,
             access_result.database_now;
@@ -1916,6 +1953,7 @@ BEGIN
         RETURN QUERY SELECT 'persistence_corrupt',
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             NULL::JSONB,
             NULL::JSONB,
             access_result.database_now;
@@ -1924,6 +1962,7 @@ BEGIN
     RETURN QUERY SELECT 'persistence_corrupt',
         NULL::JSONB,
         NULL::JSONB,
+        NULL::TEXT,
         NULL::JSONB,
         NULL::JSONB,
         access_result.database_now;
@@ -1971,6 +2010,7 @@ RETURNS TABLE(
     outcome_code TEXT,
     promotion_record JSONB,
     admission_evidence JSONB,
+    admission_digest TEXT,
     database_now TIMESTAMPTZ
 )
 LANGUAGE plpgsql
@@ -2011,6 +2051,7 @@ BEGIN
         RETURN QUERY SELECT access_result.outcome_code,
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             access_result.database_now;
         RETURN;
     END IF;
@@ -2202,6 +2243,7 @@ BEGIN
         RETURN QUERY SELECT 'invalid_candidate',
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             access_result.database_now;
         RETURN;
     END IF;
@@ -2218,6 +2260,7 @@ BEGIN
             RETURN QUERY SELECT 'invalid_candidate',
                 NULL::JSONB,
                 NULL::JSONB,
+                NULL::TEXT,
                 access_result.database_now;
             RETURN;
     END;
@@ -2228,6 +2271,7 @@ BEGIN
         RETURN QUERY SELECT 'invalid_candidate',
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             access_result.database_now;
         RETURN;
     END IF;
@@ -2263,12 +2307,14 @@ BEGIN
         RETURN QUERY SELECT 'generation_mismatch',
             NULL::JSONB,
             NULL::JSONB,
+            NULL::TEXT,
             access_result.database_now;
         RETURN;
     END IF;
     RETURN QUERY SELECT 'persistence_corrupt',
         NULL::JSONB,
         NULL::JSONB,
+        NULL::TEXT,
         access_result.database_now;
 END;
 $function$;
@@ -2289,7 +2335,7 @@ DECLARE
         'public.starring_product_promotion_publish_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)',
         'public.starring_product_promotion_approval_environment_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)',
         'public.starring_product_promotion_activation_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text,jsonb)',
-        'public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,text,text[],text[],text[],text,text,text,text)',
+        'public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,jsonb,text,text,text[],text[],text[],text,text,text,text)',
         'public.starring_product_promotion_keyring_coverage_v1(text[],text[])',
         'public.starring_product_promotion_authorize_current_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean)',
         'public.starring_product_promotion_finalize_receipt_v1(jsonb,jsonb,jsonb,jsonb,jsonb)'
