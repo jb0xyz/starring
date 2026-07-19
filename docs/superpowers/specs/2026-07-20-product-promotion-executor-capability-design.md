@@ -324,6 +324,14 @@ All three are null or non-null together. New product admission requires format
 version one, a lowercase 64-character HMAC digest, an object no larger than
 32,768 bytes, and an exact `ProductPromotionAdmissionEvidenceV1` envelope.
 
+The envelope is exactly
+`{format_version:1,payload:<ProductPromotionAdmissionPayloadV1>,admitted_at:<database time>}`.
+Rust computes `product_admission_digest` over the canonical deny-unknown-fields
+payload only. PostgreSQL never receives key material; it validates every payload
+scalar against server state, supplies `admitted_at` from its materialized clock,
+and stores the wrapper atomically. Database-owned admission time is immutable
+and validated separately rather than included in the client HMAC.
+
 The deny-unknown-fields envelope contains only:
 
 - endpoint domain `product_promote_v1` and original product request ID;
@@ -335,8 +343,7 @@ The deny-unknown-fields envelope contains only:
 - original Discord application, guild, acting user, Promote capability,
   authority revision and payload digest, observation digest and interval,
   effective permission bits, and owner flag;
-- admitted candidate hash, binding fingerprint, policy revision, and admitted
-  database timestamp.
+- admitted candidate hash, binding fingerprint, and policy revision.
 
 `expected_product_session_digest` is supplied to functions only to authenticate
 the current database session row. It is never persisted. The audit field is
@@ -346,10 +353,11 @@ Promotion reuses the approval and Apply domain and framing unchanged. The raw
 fingerprint and raw database session digest are never stored in admission,
 receipt, audit, or logs.
 
-The admission HMAC covers the complete canonical envelope. PostgreSQL validates
+The admission HMAC covers the complete canonical payload. PostgreSQL validates
 every scalar against server state before storing it, and the transition trigger
 makes all admission columns immutable. Rust recomputes and constant-time checks
-the HMAC whenever a partial admission is resumed.
+the payload HMAC and separately validates the database admission time whenever a
+partial admission is resumed.
 
 ### Final product receipt
 
