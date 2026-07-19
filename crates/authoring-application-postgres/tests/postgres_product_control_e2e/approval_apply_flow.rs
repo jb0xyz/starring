@@ -169,7 +169,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     let decisions = PostgresProductDecisions::new(product_decision_pools(&pool), keyring).unwrap();
     decisions.verify_keyring_coverage().await.unwrap();
     let deployments =
-        PostgresProductDeploymentStatuses::new(PostgresRuntimeConvergence::new(pool.clone()));
+        PostgresProductDeploymentStatuses::new(pool.clone());
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let installation = selector(&fixture);
@@ -557,7 +557,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
         )
         .unwrap();
         let deployments =
-            PostgresProductDeploymentStatuses::new(PostgresRuntimeConvergence::new(pool.clone()));
+            PostgresProductDeploymentStatuses::new(pool.clone());
         let application =
             ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
         let installation = selector(&fixture);

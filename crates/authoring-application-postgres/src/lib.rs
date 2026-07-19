@@ -17,7 +17,10 @@ pub use authentication::{
     PostgresAuthenticationConfig,
 };
 pub use database::ProductDatabaseFailureV1;
-pub use deployment_status::PostgresProductDeploymentStatuses;
+pub use deployment_status::{
+    PostgresProductDeploymentStatuses, PostgresProductDeploymentStatusesConfig,
+    ProductDeploymentStatusConfigError, ProductDeploymentStatusReadinessErrorV1,
+};
 pub use digest::{
     digest_opaque_session_credential_v1, OpaqueSessionCredentialError, ProductSessionDigestV1,
 };

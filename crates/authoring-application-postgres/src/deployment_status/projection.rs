@@ -1,96 +1,30 @@
 use std::num::NonZeroU64;
 
 use authoring_application::{
-    AuthorizedDeploymentStatusV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1, ExactLiveProjectionV1,
+    AuthorizedDeploymentStatusV1, DeploymentStatusPortError, DeploymentStatusProjectionV1,
+    ExactLiveProjectionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use automation_runtime_convergence::{
-    DeploymentId, InstallationId, RuntimeDeploymentPhaseV1, RuntimeFailureKindV1,
-    RuntimePendingConditionV1, TenantId,
+    RuntimeDeploymentPhaseV1, RuntimeFailureKindV1, RuntimePendingConditionV1,
 };
 use automation_runtime_convergence_postgres::{
-    DeploymentAvailabilityV1, PostgresRuntimeConvergence, RuntimeConvergenceStoreError,
-    RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1,
+    DeploymentAvailabilityV1, RuntimeConvergenceStoreError, RuntimeDeploymentStatusV1,
 };
 
-const MAX_READ_AUTHORITY_LIFETIME: chrono::Duration = chrono::Duration::seconds(30);
-const MAX_APPLY_AUTHORITY_LIFETIME: chrono::Duration = chrono::Duration::seconds(5);
+use crate::ProductDatabaseFailureV1;
 
-#[derive(Clone)]
-pub struct PostgresProductDeploymentStatuses {
-    runtime: PostgresRuntimeConvergence,
-}
+use super::row::indeterminate;
 
-impl PostgresProductDeploymentStatuses {
-    pub fn new(runtime: PostgresRuntimeConvergence) -> Self {
-        Self { runtime }
-    }
-}
-
-impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for PostgresProductDeploymentStatuses {
-    async fn load_exact_deployment_status(
-        &self,
-        request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
-    ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
-        validate_request_scope(&request)?;
-        let scope = runtime_scope(&request)?;
-        let status = self.runtime.status(&scope).await.map_err(map_store_error)?;
-        validate_runtime_projection(&request, &status)?;
-        project_status(request.exact_deployment(), &status)
-    }
-}
-
-fn validate_request_scope(
-    request: &AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
-) -> Result<(), DeploymentStatusPortError> {
-    let evidence = request.evidence();
-    let scope = request.scope();
-    let exact = request.exact_deployment();
-    if status_authority_lifetime(evidence.capability()).is_none()
-        || evidence.tenant_id() != scope.tenant_id()
-        || evidence.installation_id() != scope.installation_id()
-        || evidence.guild_id() != scope.guild_id()
-        || evidence.acting_user_id() != scope.acting_user_id()
-        || exact.installation_id() != scope.installation_id()
-    {
-        return Err(indeterminate());
-    }
-    Ok(())
-}
-
-fn runtime_scope(
-    request: &AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
-) -> Result<RuntimeDeploymentScopeV1, DeploymentStatusPortError> {
-    Ok(RuntimeDeploymentScopeV1 {
-        tenant_id: TenantId::parse(request.scope().tenant_id().as_str())
-            .map_err(|_| indeterminate())?,
-        installation_id: InstallationId::parse(request.scope().installation_id().as_str())
-            .map_err(|_| indeterminate())?,
-        deployment_id: DeploymentId::parse(request.exact_deployment().deployment_reference())
-            .map_err(|_| indeterminate())?,
-    })
-}
-
-fn validate_runtime_projection(
+pub(super) fn validate_runtime_projection(
     request: &AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
     status: &RuntimeDeploymentStatusV1,
 ) -> Result<(), DeploymentStatusPortError> {
     let scope = request.scope();
     let exact = request.exact_deployment();
-    let evidence = request.evidence();
     let identity = &status.snapshot.identity;
     let target = &status.snapshot.target;
-    let maximum_lifetime =
-        status_authority_lifetime(evidence.capability()).ok_or_else(indeterminate)?;
-    let evidence_window_is_valid = evidence.observed_at() <= status.observed_at
-        && status.observed_at < evidence.expires_at()
-        && evidence
-            .observed_at()
-            .checked_add_signed(maximum_lifetime)
-            .is_some_and(|latest| evidence.expires_at() <= latest);
-    if !evidence_window_is_valid
-        || identity.tenant_id.as_str() != scope.tenant_id().as_str()
+    if identity.tenant_id.as_str() != scope.tenant_id().as_str()
         || identity.installation_id.as_str() != scope.installation_id().as_str()
         || identity.deployment_id.as_str() != exact.deployment_reference()
         || identity.promotion_id.as_str() != exact.promotion_id().as_str()
@@ -116,7 +50,7 @@ fn validate_runtime_projection(
     Ok(())
 }
 
-fn project_status(
+pub(super) fn project_status(
     exact: &authoring_application::ExactDeploymentSelectorV1,
     status: &RuntimeDeploymentStatusV1,
 ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
@@ -201,15 +135,19 @@ fn public_status_reason_code(value: &str) -> Result<&'static str, DeploymentStat
     }
 }
 
-fn status_authority_lifetime(capability: CapabilityV1) -> Option<chrono::Duration> {
-    match capability {
-        CapabilityV1::Read => Some(MAX_READ_AUTHORITY_LIFETIME),
-        CapabilityV1::Apply => Some(MAX_APPLY_AUTHORITY_LIFETIME),
-        CapabilityV1::Promote | CapabilityV1::Approve | CapabilityV1::Reject => None,
+pub(super) fn map_database_error(error: ProductDatabaseFailureV1) -> DeploymentStatusPortError {
+    match error {
+        ProductDatabaseFailureV1::Timeout
+        | ProductDatabaseFailureV1::Retryable
+        | ProductDatabaseFailureV1::Unavailable => DeploymentStatusPortError::Backend(
+            "runtime deployment status backend is unavailable".to_string(),
+        ),
     }
 }
 
-fn map_store_error(error: RuntimeConvergenceStoreError) -> DeploymentStatusPortError {
+pub(super) fn map_projector_error(
+    error: RuntimeConvergenceStoreError,
+) -> DeploymentStatusPortError {
     match error {
         RuntimeConvergenceStoreError::NotFound => DeploymentStatusPortError::NotFound,
         RuntimeConvergenceStoreError::DatabaseTimeout
@@ -222,22 +160,9 @@ fn map_store_error(error: RuntimeConvergenceStoreError) -> DeploymentStatusPortE
     }
 }
 
-fn indeterminate() -> DeploymentStatusPortError {
-    DeploymentStatusPortError::Indeterminate(
-        "runtime deployment status projection is inconsistent".to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use authoring_application::{CapabilityV1, DeploymentStatusPortError};
-    use automation_runtime_convergence::RuntimeFailureKindV1;
-    use automation_runtime_convergence_postgres::RuntimeConvergenceStoreError;
-
-    use super::{
-        blocked_failure_code, map_store_error, public_runtime_failure_code,
-        public_status_reason_code, status_authority_lifetime,
-    };
+    use super::*;
 
     #[test]
     fn controller_failure_evidence_never_crosses_the_product_boundary() {
@@ -297,34 +222,15 @@ mod tests {
     }
 
     #[test]
-    fn status_accepts_read_and_apply_evidence_with_distinct_freshness_bounds() {
+    fn database_and_projector_errors_are_redacted() {
         assert_eq!(
-            status_authority_lifetime(CapabilityV1::Read),
-            Some(chrono::Duration::seconds(30))
-        );
-        assert_eq!(
-            status_authority_lifetime(CapabilityV1::Apply),
-            Some(chrono::Duration::seconds(5))
-        );
-        assert_eq!(status_authority_lifetime(CapabilityV1::Promote), None);
-        assert_eq!(status_authority_lifetime(CapabilityV1::Approve), None);
-        assert_eq!(status_authority_lifetime(CapabilityV1::Reject), None);
-    }
-
-    #[test]
-    fn runtime_backend_errors_are_redacted_at_the_product_boundary() {
-        assert_eq!(
-            map_store_error(RuntimeConvergenceStoreError::NotFound),
-            DeploymentStatusPortError::NotFound
-        );
-        assert_eq!(
-            map_store_error(RuntimeConvergenceStoreError::DatabaseFailure),
+            map_database_error(ProductDatabaseFailureV1::Unavailable),
             DeploymentStatusPortError::Backend(
                 "runtime deployment status backend is unavailable".to_string()
             )
         );
         assert_eq!(
-            map_store_error(RuntimeConvergenceStoreError::InvalidPersistedState(
+            map_projector_error(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "sensitive database detail"
             )),
             DeploymentStatusPortError::Indeterminate(
