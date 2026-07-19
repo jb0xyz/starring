@@ -45,7 +45,14 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
     assert!(!source.contains("DiscordIdentityError"));
     let identity_model = include_str!("../src/product_identity/model.rs");
     assert!(!identity_model.contains("from_verified_oauth_exchange"));
-    let identity_store = include_str!("../src/product_identity/store.rs");
+    let identity_store = concat!(
+        include_str!("../src/product_identity/store.rs"),
+        include_str!("../src/product_identity/oauth_flow.rs"),
+        include_str!("../src/product_identity/session_issue.rs"),
+        include_str!("../src/product_identity/session_revoke.rs"),
+        include_str!("../src/product_identity/principal.rs"),
+        include_str!("../src/product_identity/database.rs"),
+    );
     assert!(identity_store.contains("identity: VerifiedDiscordIdentityV1"));
     assert!(identity_store.contains("VerifiedIdentityProjection::from_capability"));
     assert!(!identity_store.contains("pub fn from_capability"));
@@ -477,10 +484,14 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
             "missing scoped database readiness guard: {required}"
         );
     }
-    let identity = include_str!("../src/product_identity/store.rs")
-        .split("#[cfg(test)]")
-        .next()
-        .unwrap();
+    let identity = concat!(
+        include_str!("../src/product_identity/store.rs"),
+        include_str!("../src/product_identity/oauth_flow.rs"),
+        include_str!("../src/product_identity/session_issue.rs"),
+        include_str!("../src/product_identity/session_revoke.rs"),
+        include_str!("../src/product_identity/principal.rs"),
+        include_str!("../src/product_identity/database.rs"),
+    );
     assert!(identity.contains("digest_opaque_session_credential_v1(state)"));
     assert!(identity.contains("digest_opaque_session_credential_v1(browser_nonce)"));
     assert!(identity.contains("digest_opaque_session_credential_v1(session.expose_secret())"));
@@ -699,6 +710,30 @@ fn source_files_contain_no_comments() {
         (
             "src/product_identity/store.rs",
             include_str!("../src/product_identity/store.rs"),
+        ),
+        (
+            "src/product_identity/database.rs",
+            include_str!("../src/product_identity/database.rs"),
+        ),
+        (
+            "src/product_identity/oauth_flow.rs",
+            include_str!("../src/product_identity/oauth_flow.rs"),
+        ),
+        (
+            "src/product_identity/principal.rs",
+            include_str!("../src/product_identity/principal.rs"),
+        ),
+        (
+            "src/product_identity/session_issue.rs",
+            include_str!("../src/product_identity/session_issue.rs"),
+        ),
+        (
+            "src/product_identity/session_revoke.rs",
+            include_str!("../src/product_identity/session_revoke.rs"),
+        ),
+        (
+            "src/product_identity/store_tests.rs",
+            include_str!("../src/product_identity/store_tests.rs"),
         ),
         (
             "src/product_retention.rs",

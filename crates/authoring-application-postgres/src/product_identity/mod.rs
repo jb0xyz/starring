@@ -1,5 +1,10 @@
 mod config;
+mod database;
 mod model;
+mod oauth_flow;
+mod principal;
+mod session_issue;
+mod session_revoke;
 mod store;
 
 pub use config::{
