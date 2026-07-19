@@ -753,7 +753,7 @@ fn enqueue_request() -> EnqueueDeploymentV1 {
 }
 
 async fn seed_product_target(pool: &PgPool) {
-    let now = Utc::now();
+    let now = database_now(pool).await;
     let expires_at = now + TimeDelta::hours(1);
     let linked_at = now + TimeDelta::seconds(1);
     let request_digest = "e".repeat(64);
@@ -1088,7 +1088,7 @@ async fn replace_seeded_target_with_future_schema(pool: &PgPool) {
 }
 
 async fn seed_next_product_journal(pool: &PgPool, request: &EnqueueDeploymentV1) {
-    let now = Utc::now();
+    let now = database_now(pool).await;
     let expires_at = now + TimeDelta::hours(1);
     let linked_at = now + TimeDelta::seconds(1);
     let request_digest = "8".repeat(64);
@@ -1373,4 +1373,11 @@ fn promotion_record(
             }
         }
     })
+}
+
+async fn database_now(pool: &PgPool) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
