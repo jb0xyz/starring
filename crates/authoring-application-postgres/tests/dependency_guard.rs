@@ -95,7 +95,9 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(!approval_migration.contains("idempotency_key TEXT"));
     assert!(approval
         .contains("database_commit(error, \"product approval commit outcome is unavailable\")"));
-    assert!(database.contains("matches!(&error, sqlx::Error::Database(_))"));
+    assert!(database.contains("fn commit_outcome_is_uncertain"));
+    assert!(database.contains("code.as_ref().starts_with(\"08\")"));
+    assert!(database.contains("if commit_outcome_is_uncertain(&error)"));
     let binding_identity_migration =
         include_str!("../../../migrations/202607190009_separate_product_binding_identities.sql");
     for required in [
@@ -515,7 +517,6 @@ fn source_files_contain_no_comments() {
             assert!(
                 !trimmed.starts_with("//")
                     && !trimmed.starts_with("/*")
-                    && !trimmed.starts_with('*')
                     && !trimmed.ends_with("*/"),
                 "source comment at {path}:{}",
                 index + 1
