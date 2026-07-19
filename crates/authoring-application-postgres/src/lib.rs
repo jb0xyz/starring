@@ -1,6 +1,7 @@
 mod authentication;
 mod bindings;
 mod database;
+mod database_capability;
 mod deployment_status;
 mod digest;
 mod envelope;

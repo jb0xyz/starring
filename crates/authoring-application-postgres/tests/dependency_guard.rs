@@ -373,6 +373,20 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(!authority_read_migration.contains("MAX("));
     let authority_readiness = include_str!("../src/installation_authority/readiness.rs");
     for required in [
+        "FUNCTION_IDENTITY",
+        "FUNCTION_RESULT",
+        "ScopedFunctionContractV1::set(",
+        "ScopedRelationContractV1::ordinary(",
+        "begin_scoped_database_readiness(",
+        "public.starring_product_installation_authority_read_v1($1, $2, $3)",
+    ] {
+        assert!(
+            authority_readiness.contains(required),
+            "missing installation authority readiness guard: {required}"
+        );
+    }
+    let database_capability = include_str!("../src/database_capability.rs");
+    for required in [
         "pg_catalog.to_regprocedure($1)",
         "pg_catalog.pg_get_function_result(function_row.oid)",
         "function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]",
@@ -382,16 +396,19 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         "pg_catalog.has_any_column_privilege(",
         "pg_catalog.pg_auth_members",
         "membership.roleid = caller_role.oid",
-        "owner_membership.roleid = owner_role.oid",
+        "membership.roleid = owner_role.oid",
         "current_user = session_user",
         "unexpected_function_grant",
         "caller_role.rolbypassrls",
         "owner_role.rolcanlogin",
-        "public.starring_product_installation_authority_read_v1($1, $2, $3)",
+        "pg_catalog.has_schema_privilege(",
+        "owner_role.rolname, target.schema_oid, 'USAGE'",
+        "relation.relrowsecurity",
+        "relation.relforcerowsecurity",
     ] {
         assert!(
-            authority_readiness.contains(required),
-            "missing installation authority readiness guard: {required}"
+            database_capability.contains(required),
+            "missing scoped database readiness guard: {required}"
         );
     }
     let identity = include_str!("../src/product_identity/store.rs")
@@ -486,6 +503,10 @@ fn source_files_contain_no_comments() {
         ),
         ("src/bindings.rs", include_str!("../src/bindings.rs")),
         ("src/database.rs", include_str!("../src/database.rs")),
+        (
+            "src/database_capability.rs",
+            include_str!("../src/database_capability.rs"),
+        ),
         (
             "src/deployment_status.rs",
             include_str!("../src/deployment_status.rs"),
