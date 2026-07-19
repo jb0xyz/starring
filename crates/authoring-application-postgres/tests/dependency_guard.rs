@@ -106,6 +106,36 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
 }
 
 #[test]
+fn product_identity_retention_keeps_index_bounded_work_shape() {
+    let migration =
+        include_str!("../../../migrations/202607190006_prepare_product_identity_retention.sql");
+    for index in [
+        "product_auth_sessions_terminal_retention_index",
+        "product_oauth_flows_consumed_retention_index",
+        "product_oauth_flows_unconsumed_retention_index",
+    ] {
+        assert!(migration.contains(index));
+    }
+    assert!(migration.contains("WITH candidates AS MATERIALIZED"));
+    assert!(migration.contains("product_session.ctid AS row_id"));
+    assert!(migration.contains("FOR UPDATE OF product_session SKIP LOCKED"));
+    assert!(migration.contains("WITH unconsumed_candidates AS MATERIALIZED"));
+    assert!(migration.contains("consumed_candidates AS MATERIALIZED"));
+    assert_eq!(
+        migration
+            .matches("FOR UPDATE OF oauth_flow SKIP LOCKED")
+            .count(),
+        2
+    );
+    assert_eq!(migration.matches("OFFSET 0").count(), 4);
+    assert_eq!(migration.matches("ctid = ANY(").count(), 2);
+    assert!(migration.contains("session_backlog AS MATERIALIZED"));
+    assert!(migration.contains("unconsumed_flow_backlog AS MATERIALIZED"));
+    assert!(migration.contains("consumed_flow_backlog AS MATERIALIZED"));
+    assert!(!migration.contains("INNER JOIN bounded_candidates"));
+}
+
+#[test]
 fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     let authentication = include_str!("../src/authentication.rs");
     assert!(authentication.contains("digest_opaque_session_credential_v1(credential)"));
@@ -289,6 +319,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_decisions.rs",
             include_str!("postgres_product_decisions.rs"),
+        ),
+        (
+            "tests/postgres_product_retention.rs",
+            include_str!("postgres_product_retention.rs"),
         ),
         (
             "tests/postgres_product_control_e2e.rs",
