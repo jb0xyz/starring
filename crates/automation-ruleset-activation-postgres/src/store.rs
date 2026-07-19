@@ -18,6 +18,7 @@ use crate::row::{
 };
 
 const APPLYING_CONSTRAINT: &str = "activation_requests_one_applying_per_ruleset";
+const PRODUCT_CONTROL_REQUIRED: &str = "product activation requires authenticated product control";
 
 pub struct PostgresActivationRequestStore {
     pool: PgPool,
@@ -84,26 +85,16 @@ async fn database_lease(
     .map_err(backend)
 }
 
-async fn bind_product_executor(
-    connection: &mut PgConnection,
-    request: &ActivationRequest,
-) -> Result<(), ActivationStoreError> {
-    let ActivationApprovalContextV1::ProductAuthoring { context } = &request.approval_context
-    else {
-        return Ok(());
-    };
-    let bound = sqlx::query_scalar::<_, String>(
-        "SELECT set_config('starring.product_approval_context_digest', $1, TRUE)",
-    )
-    .bind(context.approval_context_digest.as_str())
-    .fetch_one(connection)
-    .await
-    .map_err(backend)?;
-    if bound == context.approval_context_digest.as_str() {
-        Ok(())
-    } else {
-        Err(backend("product activation executor binding mismatch"))
+fn require_legacy_execution(request: &ActivationRequest) -> Result<(), ActivationStoreError> {
+    if matches!(
+        &request.approval_context,
+        ActivationApprovalContextV1::ProductAuthoring { .. }
+    ) {
+        return Err(ActivationStoreError::InvalidRequest(
+            PRODUCT_CONTROL_REQUIRED.to_string(),
+        ));
     }
+    Ok(())
 }
 
 fn is_constraint(error: &sqlx::Error, name: &str) -> bool {
@@ -371,7 +362,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut tx = self.pool.begin().await.map_err(backend)?;
         sqlx::query(
             "UPDATE activation_requests SET state = 'expired' \
-             WHERE id = $1 AND state IN ('pending','approved') AND expires_at <= NOW()",
+             WHERE id = $1 AND state IN ('pending','approved') AND expires_at <= NOW() \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .execute(&mut *tx)
@@ -524,7 +516,7 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         ) {
             tx.rollback().await.map_err(backend)?;
             return Err(RejectError::Store(ActivationStoreError::InvalidRequest(
-                "product activation requires authenticated product control".to_string(),
+                PRODUCT_CONTROL_REQUIRED.to_string(),
             )));
         }
         let now = database_now(&mut tx).await?;
@@ -576,7 +568,7 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         ) {
             tx.rollback().await.map_err(backend)?;
             return Err(WithdrawError::Store(ActivationStoreError::InvalidRequest(
-                "product activation requires authenticated product control".to_string(),
+                PRODUCT_CONTROL_REQUIRED.to_string(),
             )));
         }
         let now = database_now(&mut tx).await?;
@@ -625,6 +617,10 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if let Err(error) = require_legacy_execution(&request) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let (now, lease_until) = database_lease(&mut tx, lease_seconds).await?;
         let decision = request
             .claim_apply_at(attempt_id.clone(), now, lease_until)
@@ -642,7 +638,6 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             tx.commit().await.map_err(backend)?;
             return Ok(decision_outcome(decision, request));
         }
-        bind_product_executor(&mut tx, &request).await?;
         let update = sqlx::query(
             "UPDATE activation_requests SET state = 'applying', apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
@@ -688,6 +683,10 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if let Err(error) = require_legacy_execution(&request) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let (now, lease_until) = database_lease(&mut tx, lease_seconds).await?;
         let decision = request
             .claim_resume_at(attempt_id.clone(), now, lease_until)
@@ -696,7 +695,6 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             tx.commit().await.map_err(backend)?;
             return Ok(decision_outcome(decision, request));
         }
-        bind_product_executor(&mut tx, &request).await?;
         let result = sqlx::query(
             "UPDATE activation_requests SET apply_attempt_id = $2, \
              apply_attempt_no = apply_attempt_no + 1, \
@@ -735,7 +733,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let result = sqlx::query(
             "UPDATE activation_requests SET apply_lease_until = \
              NOW() + ($3 * INTERVAL '1 second') \
-             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2",
+             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2 \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .bind(attempt_id.as_str())
@@ -758,7 +757,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             "UPDATE activation_requests SET state = 'applied', apply_attempt_id = NULL, \
              apply_lease_until = NULL, last_apply_error = NULL, applied_at = NOW(), \
              applied_by = $3, completion_kind = $4, activation_notices = $5 \
-             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2",
+             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2 \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .bind(attempt_id.as_str())
@@ -780,7 +780,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let result = sqlx::query(
             "UPDATE activation_requests SET state = 'approved', apply_attempt_id = NULL, \
              apply_lease_until = NULL, last_apply_error = $3 \
-             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2",
+             WHERE id = $1 AND state = 'applying' AND apply_attempt_id = $2 \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .bind(attempt_id.as_str())
@@ -801,6 +802,10 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if let Err(error) = require_legacy_execution(&request) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(error);
+        }
         let now = database_now(&mut tx).await?;
         if !request.supersede_at(attempt_id, reason, now) {
             tx.rollback().await.map_err(backend)?;
@@ -842,7 +847,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
     ) -> Result<bool, ActivationStoreError> {
         let result = sqlx::query(
             "UPDATE activation_requests SET state = 'expired' \
-             WHERE id = $1 AND state IN ('pending','approved') AND expires_at <= NOW()",
+             WHERE id = $1 AND state IN ('pending','approved') AND expires_at <= NOW() \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .execute(&self.pool)
@@ -863,6 +869,14 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;
+        if rows
+            .iter()
+            .any(|row| row.authority_kind == "product_authoring")
+        {
+            return Err(ActivationStoreError::InvalidRequest(
+                PRODUCT_CONTROL_REQUIRED.to_string(),
+            ));
+        }
         let mut connection = self.pool.acquire().await.map_err(backend)?;
         let mut requests = Vec::with_capacity(rows.len());
         for row in rows {
@@ -891,7 +905,8 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
             "UPDATE activation_requests SET state = 'applied', apply_attempt_id = NULL, \
              apply_lease_until = NULL, last_apply_error = NULL, applied_at = NOW(), \
              applied_by = $2, completion_kind = 'crash_recovered', activation_notices = NULL \
-             WHERE id = $1 AND state = 'applying'",
+             WHERE id = $1 AND state = 'applying' \
+             AND authority_kind = 'legacy_manual'",
         )
         .bind(request_id.as_str())
         .bind(applied_by.to_string())

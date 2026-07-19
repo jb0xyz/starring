@@ -151,15 +151,29 @@ fn digest(value: char) -> ActivationDigest {
     ActivationDigest::parse(&value.to_string().repeat(64)).unwrap()
 }
 
+fn product_control_required() -> ActivationStoreError {
+    ActivationStoreError::InvalidRequest(
+        "product activation requires authenticated product control".to_string(),
+    )
+}
+
 fn product_context(
     id: &ActivationRequestId,
     target: &RuleSetVersion,
     promotion_value: char,
 ) -> ProductApprovalContextV1 {
+    product_context_with_ttl(id, target, promotion_value, NonZeroU64::new(1_800).unwrap())
+}
+
+fn product_context_with_ttl(
+    id: &ActivationRequestId,
+    target: &RuleSetVersion,
+    promotion_value: char,
+    ttl_seconds: NonZeroU64,
+) -> ProductApprovalContextV1 {
     let binding_revision = NonZeroU64::new(3).unwrap();
     let policy_revision = NonZeroU64::new(7).unwrap();
     let required_approvals = NonZeroU32::new(1).unwrap();
-    let ttl_seconds = NonZeroU64::new(1_800).unwrap();
     let activation_target = ActivationTarget {
         guild_id: target.guild_id,
         ruleset_key: target.ruleset_key.clone(),
@@ -609,6 +623,37 @@ async fn seed_product_approval(
          AND state = 'pending' AND product_revision = 1",
     )
     .bind(id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    transaction.commit().await.unwrap();
+}
+
+async fn seed_expired_product_applying(
+    pool: &PgPool,
+    id: &ActivationRequestId,
+    context: &ProductApprovalContextV1,
+    attempt: &ApplyAttemptId,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.set_config('starring.product_approval_context_digest', $1, TRUE)",
+    )
+    .bind(context.approval_context_digest.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(bound, context.approval_context_digest.as_str());
+    let updated = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'applying', apply_attempt_id = $2, \
+         apply_attempt_no = apply_attempt_no + 1, \
+         apply_lease_until = clock_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1 AND state = 'approved'",
+    )
+    .bind(id.as_str())
+    .bind(attempt.as_str())
     .execute(&mut *transaction)
     .await
     .unwrap();
@@ -1184,8 +1229,8 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
             requests
                 .claim_apply(&id, attempt_id("product_unlinked"), 60)
                 .await
-                .unwrap(),
-            ClaimOutcome::Unlinked
+                .unwrap_err(),
+            product_control_required()
         );
         let mut wrong = product_link(&context);
         wrong.approval_context_digest = digest('e');
@@ -1231,11 +1276,14 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
         );
         assert_eq!(decision_snapshot(&first_pool, &id).await, before);
         seed_product_approval(&first_pool, &id, &context).await;
-        requests
-            .claim_apply(&id, attempt_id("product_apply"), 60)
-            .await
-            .unwrap();
-        assert_eq!(requests.list_applying(guild).await.unwrap().len(), 1);
+        assert_eq!(
+            requests
+                .claim_apply(&id, attempt_id("product_apply"), 60)
+                .await
+                .unwrap_err(),
+            product_control_required()
+        );
+        assert!(requests.list_applying(guild).await.unwrap().is_empty());
         first_pool.close().await;
     }
 
@@ -1251,7 +1299,9 @@ async fn product_request_stays_inert_until_link_and_reconnects_with_exact_eviden
         stored.approvals[0].approval_payload_digest.as_ref(),
         Some(&context.approval_payload_digest)
     );
-    assert_eq!(stored.state, ActivationRequestState::Applying);
+    assert_eq!(stored.state, ActivationRequestState::Approved);
+    assert_eq!(stored.apply_attempt_no, 0);
+    assert!(stored.apply_attempt_id.is_none());
     cleanup(&second_pool, guild).await;
 }
 
@@ -1279,22 +1329,19 @@ async fn legacy_approval_adapter_cannot_race_product_link_or_mutate_product_requ
     );
     assert!(link.is_ok());
     assert_eq!(approval.unwrap_err(), ApproveError::BoundApprovalRequired);
-    let product_control_required = ActivationStoreError::InvalidRequest(
-        "product activation requires authenticated product control".to_string(),
-    );
     assert_eq!(
         requests
             .reject(&id, UserId(30), "reject".to_string())
             .await
             .unwrap_err(),
-        RejectError::Store(product_control_required.clone())
+        RejectError::Store(product_control_required())
     );
     assert_eq!(
         requests
             .withdraw(&id, UserId(10), "withdraw".to_string())
             .await
             .unwrap_err(),
-        WithdrawError::Store(product_control_required)
+        WithdrawError::Store(product_control_required())
     );
     let stored = requests.get(&id).await.unwrap().unwrap();
     assert_eq!(stored.state, ActivationRequestState::Pending);
@@ -1394,7 +1441,7 @@ async fn database_blocks_legacy_writes_and_duplicate_requests_for_product_author
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baseline() {
+async fn legacy_product_apply_rejects_same_baseline_requests_without_mutation() {
     let pool = pool().await;
     let guild = GuildId(9_100_018);
     cleanup(&pool, guild).await;
@@ -1419,44 +1466,176 @@ async fn guarded_product_apply_supersedes_a_second_request_from_the_same_baselin
     )
     .await;
     let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+    let first_before = requests.get(&first_id).await.unwrap().unwrap();
+    let second_before = requests.get(&second_id).await.unwrap().unwrap();
 
     assert_eq!(
         service
             .apply(&first_id, attempt_id("guarded_product_a"), UserId(10))
             .await
-            .unwrap(),
-        ApplyOutcome::Activated
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
     );
-    let second = service
-        .apply(&second_id, attempt_id("guarded_product_b"), UserId(10))
+    assert_eq!(
+        service
+            .apply(&second_id, attempt_id("guarded_product_b"), UserId(10))
+            .await
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
+    );
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    assert_eq!(
+        requests.get(&first_id).await.unwrap().unwrap(),
+        first_before
+    );
+    assert_eq!(
+        requests.get(&second_id).await.unwrap().unwrap(),
+        second_before
+    );
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn legacy_product_claim_cannot_expire_or_mutate_a_due_request() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_021);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let id = request_id("legacy_product_expired");
+    let context = product_context_with_ttl(&id, &target, '7', NonZeroU64::new(1).unwrap());
+    prepare_product_promotion(&pool, &target, &context).await;
+    requests
+        .create_product(product_input(id.clone(), &target, context.clone()))
         .await
         .unwrap();
-    assert!(matches!(
-        second,
-        ApplyOutcome::Superseded {
-            reason: SupersessionReasonV1::ActiveBaselineDrift { .. }
-        }
-    ));
-    assert_eq!(rulesets.activate_calls(), 1);
+    journal_product_link(&pool, &id, &target, &context).await;
+    requests
+        .link_product(&id, product_link(&context))
+        .await
+        .unwrap();
+    seed_product_approval(&pool, &id, &context).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let before = sqlx::query_as::<_, (String, i64, Option<String>, bool)>(
+        "SELECT state, apply_attempt_no, apply_attempt_id, \
+         expires_at <= clock_timestamp() FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, "approved");
+    assert!(before.3);
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
     assert_eq!(
-        rulesets
-            .active(guild, &key())
+        requests
+            .claim_apply(&id, attempt_id("legacy_product_expired_claim"), 60)
             .await
-            .unwrap()
-            .unwrap()
-            .version,
-        first_target.version
+            .unwrap_err(),
+        product_control_required()
     );
-    let stored = requests.get(&second_id).await.unwrap().unwrap();
-    assert_eq!(stored.state, ActivationRequestState::Superseded);
-    assert_eq!(stored.approvals.len(), 1);
-    assert!(matches!(
+    assert_eq!(
         service
-            .apply(&second_id, attempt_id("guarded_product_replay"), UserId(10))
+            .apply(
+                &id,
+                attempt_id("legacy_product_expired_service"),
+                UserId(10)
+            )
             .await
-            .unwrap(),
-        ApplyOutcome::Superseded { .. }
-    ));
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
+    );
+    assert!(!requests.mark_expired(&id).await.unwrap());
+    let after = sqlx::query_as::<_, (String, i64, Option<String>, bool)>(
+        "SELECT state, apply_attempt_no, apply_attempt_id, \
+         expires_at <= clock_timestamp() FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    cleanup(&pool, guild).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn legacy_resume_and_recovery_cannot_mutate_product_applying_residue() {
+    let pool = pool().await;
+    let guild = GuildId(9_100_020);
+    cleanup(&pool, guild).await;
+    let requests = PostgresActivationRequestStore::new(pool.clone());
+    let rulesets = CountingRuleSetStore::new(pool.clone());
+    let target = publish(&rulesets, guild, 1).await;
+    let (id, context) =
+        create_approved_product(&pool, &requests, "legacy_product_residue", &target, '6').await;
+    let stale = attempt_id("legacy_product_stale");
+    seed_expired_product_applying(&pool, &id, &context, &stale).await;
+    let before = requests.get(&id).await.unwrap().unwrap();
+    let service = ActivationService::new(&requests, &rulesets, &ReadyProvider);
+
+    assert_eq!(
+        requests
+            .claim_resume(&id, attempt_id("legacy_product_resume"), 60)
+            .await
+            .unwrap_err(),
+        product_control_required()
+    );
+    assert_eq!(
+        service
+            .resume(&id, attempt_id("legacy_product_service_resume"), UserId(10))
+            .await
+            .unwrap_err(),
+        ApplyError::Store(product_control_required())
+    );
+    assert!(!requests.renew_lease(&id, &stale, 60).await.unwrap());
+    assert!(!requests
+        .complete_applied(&id, &stale, UserId(10), CompletionKind::Activated, None)
+        .await
+        .unwrap());
+    assert!(!requests
+        .release_to_approved(
+            &id,
+            &stale,
+            ApplyErrorRecord {
+                kind: ApplyFailureKind::Activation,
+                message: "legacy product residue".to_string(),
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        requests
+            .supersede_applying(
+                &id,
+                &stale,
+                SupersessionReasonV1::ActiveBaselineDrift {
+                    expected: ExpectedActiveBaselineV1::Absent,
+                    observed: ExpectedActiveBaselineV1::Absent,
+                }
+            )
+            .await
+            .unwrap_err(),
+        product_control_required()
+    );
+    assert!(!requests.bookkeep_applied(&id, UserId(10)).await.unwrap());
+    assert_eq!(
+        requests.list_applying(guild).await.unwrap_err(),
+        product_control_required()
+    );
+    assert_eq!(
+        service.recover_applying(guild).await.unwrap_err(),
+        product_control_required()
+    );
+    assert_eq!(rulesets.activate_calls(), 0);
+    assert!(rulesets.active(guild, &key()).await.unwrap().is_none());
+    assert_eq!(requests.get(&id).await.unwrap().unwrap(), before);
     cleanup(&pool, guild).await;
 }
 

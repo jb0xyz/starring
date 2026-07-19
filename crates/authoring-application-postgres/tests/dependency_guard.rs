@@ -153,7 +153,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         activation_store
             .matches("product activation requires authenticated product control")
             .count(),
-        2
+        1
     );
 }
 
