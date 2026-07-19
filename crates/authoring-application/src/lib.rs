@@ -15,12 +15,12 @@ pub use control::{
     ApplyProductPromotionV1, ApprovalPayloadDigestError, ApprovalPayloadDigestV1,
     ApproveProductPromotionV1, AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1,
     AuthorizedApproveProductV1, AuthorizedProductStatusV1, AuthorizedRejectProductV1,
-    ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1, ProductControlPortError,
-    ProductDecisionPort, ProductDecisionQueryPort, ProductIdempotencyKeyError,
-    ProductIdempotencyKeyV1, ProductMutationContextV1, ProductMutationReceiptV1,
-    ProductRejectionPort, ProductRequestIdError, ProductRequestIdV1, ProductRevisionError,
-    ProductRevisionV1, ProductStatusQueryV1, PromotionSelectorV1, RejectProductPromotionV1,
-    RejectionReasonError, RejectionReasonV1,
+    ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1, ProductCandidateErrorCodeV1,
+    ProductControlPortError, ProductDecisionPort, ProductDecisionQueryPort,
+    ProductIdempotencyKeyError, ProductIdempotencyKeyV1, ProductMutationContextV1,
+    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdError, ProductRequestIdV1,
+    ProductRevisionError, ProductRevisionV1, ProductStatusQueryV1, PromotionSelectorV1,
+    RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
 };
 pub use identity::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,

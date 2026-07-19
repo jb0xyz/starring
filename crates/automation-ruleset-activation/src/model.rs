@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use chrono::{DateTime, Duration, Utc};
@@ -104,6 +104,14 @@ pub enum SupersessionReasonV1 {
         observed_revision: NonZeroU64,
         expected_fingerprint: ApprovalBindingFingerprint,
         observed_fingerprint: Option<ApprovalBindingFingerprint>,
+    },
+    PolicyDrift {
+        expected_revision: NonZeroU64,
+        observed_revision: NonZeroU64,
+        expected_required_approvals: NonZeroU32,
+        observed_required_approvals: NonZeroU32,
+        expected_ttl_seconds: NonZeroU64,
+        observed_ttl_seconds: NonZeroU64,
     },
 }
 

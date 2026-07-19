@@ -837,6 +837,58 @@ fn product_activation_is_superseded_when_approved_binding_revision_drifted() {
 }
 
 #[test]
+fn policy_drift_reason_roundtrips_with_exact_policy_evidence() {
+    let reason = SupersessionReasonV1::PolicyDrift {
+        expected_revision: NonZeroU64::new(3).unwrap(),
+        observed_revision: NonZeroU64::new(4).unwrap(),
+        expected_required_approvals: NonZeroU32::new(2).unwrap(),
+        observed_required_approvals: NonZeroU32::new(3).unwrap(),
+        expected_ttl_seconds: NonZeroU64::new(1_800).unwrap(),
+        observed_ttl_seconds: NonZeroU64::new(900).unwrap(),
+    };
+
+    let value = serde_json::to_value(&reason).unwrap();
+
+    assert_eq!(value["reason"], "policy_drift");
+    assert_eq!(value["expected_revision"], 3);
+    assert_eq!(value["observed_revision"], 4);
+    assert_eq!(value["expected_required_approvals"], 2);
+    assert_eq!(value["observed_required_approvals"], 3);
+    assert_eq!(value["expected_ttl_seconds"], 1_800);
+    assert_eq!(value["observed_ttl_seconds"], 900);
+    assert_eq!(
+        serde_json::from_value::<SupersessionReasonV1>(value).unwrap(),
+        reason
+    );
+}
+
+#[test]
+fn policy_drift_reason_rejects_zero_and_unknown_evidence() {
+    let zero = serde_json::json!({
+        "reason": "policy_drift",
+        "expected_revision": 0,
+        "observed_revision": 4,
+        "expected_required_approvals": 2,
+        "observed_required_approvals": 3,
+        "expected_ttl_seconds": 1800,
+        "observed_ttl_seconds": 900
+    });
+    let unknown = serde_json::json!({
+        "reason": "policy_drift",
+        "expected_revision": 3,
+        "observed_revision": 4,
+        "expected_required_approvals": 2,
+        "observed_required_approvals": 3,
+        "expected_ttl_seconds": 1800,
+        "observed_ttl_seconds": 900,
+        "unexpected": true
+    });
+
+    assert!(serde_json::from_value::<SupersessionReasonV1>(zero).is_err());
+    assert!(serde_json::from_value::<SupersessionReasonV1>(unknown).is_err());
+}
+
+#[test]
 fn product_exact_active_target_is_superseded_when_binding_revision_drifted() {
     let fixture = Fixture::new(ProviderMode::ProductBindingRevisionDrift);
     let target = fixture.rulesets.publish(false);

@@ -326,6 +326,34 @@ impl ProductMutationReceiptV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProductCandidateErrorCodeV1 {
+    #[error("product target artifact is corrupt")]
+    TargetCorrupt,
+    #[error("authoritative product binding revision is unavailable")]
+    BindingRevisionUnavailable,
+    #[error("product target schema is unsupported")]
+    UnsupportedSchema,
+    #[error("product target structure is invalid")]
+    StructurallyInvalid,
+    #[error("product target hash could not be verified")]
+    HashComputationFailed,
+    #[error("product target hash does not match its content")]
+    HashMismatch,
+    #[error("product target bindings are invalid")]
+    BindingInvalid,
+    #[error("product target violates a blocking policy")]
+    BlockingPolicy,
+    #[error("product target requires unavailable capabilities")]
+    MissingCapabilities,
+    #[error("product target role hierarchy evidence is unavailable")]
+    RoleHierarchyUnavailable,
+    #[error("product target role hierarchy evidence is incomplete")]
+    RoleHierarchyIncomplete,
+    #[error("product target requires a role the bot cannot manage")]
+    RoleUnmanageable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductControlPortError {
     #[error("promotion was not found")]
@@ -346,6 +374,10 @@ pub enum ProductControlPortError {
     Expired,
     #[error("idempotency key conflicts with a different command")]
     IdempotencyConflict,
+    #[error("server-owned product candidate is invalid: {0}")]
+    InvalidServerCandidate(ProductCandidateErrorCodeV1),
+    #[error("promotion was superseded by newer server state")]
+    Superseded,
     #[error("product decision outcome is indeterminate: {0}")]
     Indeterminate(String),
     #[error("product decision backend failed: {0}")]

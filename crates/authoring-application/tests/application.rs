@@ -13,13 +13,13 @@ use authoring_application::{
     DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
     ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
     InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
-    ProductApprovalPort, ProductApprovalPreviewV1, ProductControlApplication,
-    ProductControlPortError, ProductDecisionPhaseV1, ProductDecisionPort,
-    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductIdempotencyKeyV1,
-    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdError, ProductRequestIdV1,
-    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1,
-    PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
-    ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
+    ProductApprovalPort, ProductApprovalPreviewV1, ProductCandidateErrorCodeV1,
+    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
+    ProductDecisionPort, ProductDecisionProjectionV1, ProductDecisionQueryPort,
+    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdError,
+    ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
+    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1, RejectionReasonError,
+    RejectionReasonV1, ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -459,6 +459,7 @@ fn decision_projection(phase: ProductDecisionPhaseV1) -> ProductDecisionProjecti
 struct Decisions {
     events: Arc<Mutex<Vec<&'static str>>>,
     phase: Mutex<ProductDecisionPhaseV1>,
+    apply_phase: Mutex<ProductDecisionPhaseV1>,
     apply_exact_replay: Mutex<bool>,
 }
 
@@ -548,9 +549,7 @@ impl ProductApplyPort<Evidence> for Decisions {
         assert_eq!(request.command().expected_revision.get(), 3);
         assert_eq!(request.command().idempotency_key.as_str(), "apply-key");
         Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(ProductDecisionPhaseV1::Applied {
-                exact_deployment: exact_deployment(),
-            }),
+            decision_projection(self.apply_phase.lock().unwrap().clone()),
             *self.apply_exact_replay.lock().unwrap(),
         ))
     }
@@ -601,6 +600,9 @@ fn product_fixture(
         Decisions {
             events: events.clone(),
             phase: Mutex::new(phase),
+            apply_phase: Mutex::new(ProductDecisionPhaseV1::Applied {
+                exact_deployment: exact_deployment(),
+            }),
             apply_exact_replay: Mutex::new(false),
         },
         Deployments {
@@ -796,6 +798,42 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
 }
 
 #[test]
+fn apply_surfaces_terminal_supersession_without_querying_runtime() {
+    block_on(async {
+        let (events, authentication, authority, decisions, deployments) = product_fixture(
+            ProductDecisionPhaseV1::Approved,
+            DeploymentStatusProjectionV1::NotRequested,
+        );
+        *decisions.apply_phase.lock().unwrap() = ProductDecisionPhaseV1::Superseded;
+        let error =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
+                .apply(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    ApplyProductPromotionV1 {
+                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
+                            .unwrap(),
+                        expected_revision: ProductRevisionV1::new(3).unwrap(),
+                        idempotency_key: ProductIdempotencyKeyV1::parse("apply-key").unwrap(),
+                    },
+                )
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error,
+            ProductApplicationError::Control(ProductControlPortError::Superseded)
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["authenticate_mutation", "authorize", "apply_idempotent"]
+        );
+    });
+}
+
+#[test]
 fn exact_apply_replay_may_project_live_after_runtime_verification() {
     block_on(async {
         let (events, authentication, authority, decisions, deployments) = product_fixture(
@@ -931,4 +969,69 @@ fn deployment_failure_code_is_bounded_and_cannot_leak_backend_text() {
             );
         }
     });
+}
+
+#[test]
+fn product_candidate_failures_have_bounded_stable_codes() {
+    let cases = [
+        (
+            ProductCandidateErrorCodeV1::TargetCorrupt,
+            "product target artifact is corrupt",
+        ),
+        (
+            ProductCandidateErrorCodeV1::BindingRevisionUnavailable,
+            "authoritative product binding revision is unavailable",
+        ),
+        (
+            ProductCandidateErrorCodeV1::UnsupportedSchema,
+            "product target schema is unsupported",
+        ),
+        (
+            ProductCandidateErrorCodeV1::StructurallyInvalid,
+            "product target structure is invalid",
+        ),
+        (
+            ProductCandidateErrorCodeV1::HashComputationFailed,
+            "product target hash could not be verified",
+        ),
+        (
+            ProductCandidateErrorCodeV1::HashMismatch,
+            "product target hash does not match its content",
+        ),
+        (
+            ProductCandidateErrorCodeV1::BindingInvalid,
+            "product target bindings are invalid",
+        ),
+        (
+            ProductCandidateErrorCodeV1::BlockingPolicy,
+            "product target violates a blocking policy",
+        ),
+        (
+            ProductCandidateErrorCodeV1::MissingCapabilities,
+            "product target requires unavailable capabilities",
+        ),
+        (
+            ProductCandidateErrorCodeV1::RoleHierarchyUnavailable,
+            "product target role hierarchy evidence is unavailable",
+        ),
+        (
+            ProductCandidateErrorCodeV1::RoleHierarchyIncomplete,
+            "product target role hierarchy evidence is incomplete",
+        ),
+        (
+            ProductCandidateErrorCodeV1::RoleUnmanageable,
+            "product target requires a role the bot cannot manage",
+        ),
+    ];
+    for (code, message) in cases {
+        assert_eq!(code.to_string(), message);
+        assert_eq!(
+            ProductControlPortError::InvalidServerCandidate(code).to_string(),
+            format!("server-owned product candidate is invalid: {message}")
+        );
+    }
+    assert_eq!(
+        ProductControlPortError::Superseded.to_string(),
+        "promotion was superseded by newer server state"
+    );
 }

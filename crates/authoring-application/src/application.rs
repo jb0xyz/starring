@@ -10,7 +10,7 @@ use crate::{
     AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusProjectionV1,
     DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
     MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApplyResultV1,
-    ProductApprovalPort, ProductApprovalPreviewV1, ProductDecisionPhaseV1,
+    ProductApprovalPort, ProductApprovalPreviewV1, ProductControlPortError, ProductDecisionPhaseV1,
     ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductMutationReceiptV1,
     ProductRejectionPort, ProductRequestIdV1, ProductStatusQueryV1, ProductStatusV1,
     PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
@@ -312,9 +312,12 @@ where
             ))
             .await?;
         validate_decision_projection(authorized.scope(), &promotion, receipt.projection())?;
-        let ProductDecisionPhaseV1::Applied { exact_deployment } = receipt.projection().phase()
-        else {
-            return Err(ProductApplicationError::InvalidProjection);
+        let exact_deployment = match receipt.projection().phase() {
+            ProductDecisionPhaseV1::Applied { exact_deployment } => exact_deployment,
+            ProductDecisionPhaseV1::Superseded => {
+                return Err(ProductControlPortError::Superseded.into());
+            }
+            _ => return Err(ProductApplicationError::InvalidProjection),
         };
         let status = if receipt.exact_replay() {
             self.resolve_product_status(&actor, &authorized, receipt.projection())
