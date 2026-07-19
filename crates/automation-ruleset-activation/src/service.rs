@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
 use std::future::Future;
-use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -8,19 +6,12 @@ use std::thread;
 use std::time::Duration as StdDuration;
 
 use automation_ruleset::{
-    ExpectedActiveRuleSet, GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetKey,
-    RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId, RuleSetVersionIdentity,
+    GuardedActivationOutcome, GuardedRuleSetActivation, RuleSetKey, RuleSetStore,
+    RuleSetStoreError, RuleSetVersion, RuleSetVersionId, RuleSetVersionIdentity,
 };
-use automation_ruleset_readiness::{
-    activate_if_ready, check_readiness, ActivationError, GuildCapabilities, ReadinessError,
-    RuleSetReadinessInput,
-};
+use automation_ruleset_readiness::{activate_if_ready, ActivationError, ReadinessError};
 use chrono::Duration;
-use desired_state::ResourceKey;
-use discord_model::{GuildId, Permissions, UserId};
-use resource_resolution::{
-    approval_binding_fingerprint_v1, project_required_bindings, ResourceBindingMap,
-};
+use discord_model::{GuildId, UserId};
 
 use crate::id::{ActivationDigest, ActivationRequestId, ApplyAttemptId};
 use crate::model::{
@@ -28,13 +19,16 @@ use crate::model::{
     ApplyErrorRecord, ApplyFailureKind, CompletionKind, CreateActivationRequest, ObservedActive,
     SupersessionReasonV1,
 };
+use crate::product_preflight::ProductPreflightCauseV1;
 use crate::store::{
     ActivationRequestStore, ActivationStoreError, ApproveError, ClaimOutcome, RejectError,
     WithdrawError,
 };
 use crate::{
-    ActivationApprovalContextV1, ActivationLinkStateV1, ExpectedActiveBaselineV1,
-    ProductApprovalContextV1,
+    assess_product_target_v1, check_product_readiness_v1, product_active_baseline_v1,
+    validate_product_target_v1, ActivationApprovalContextV1, ActivationEnvironment,
+    ActivationLinkStateV1, ProductApprovalContextV1, ProductPreflightErrorV1,
+    ProductReadinessAssessmentV1, ProductTargetAssessmentV1, ValidatedProductTargetV1,
 };
 
 const APPLY_LEASE_SECONDS: i64 = 60;
@@ -130,13 +124,6 @@ fn with_deadline<F: Future>(future: F, duration: StdDuration) -> Deadline<F> {
         future: Box::pin(future),
         signal,
     }
-}
-
-pub struct ActivationEnvironment {
-    pub binding_revision: Option<NonZeroU64>,
-    pub bindings: ResourceBindingMap,
-    pub guild_capabilities: GuildCapabilities,
-    pub role_permissions: BTreeMap<ResourceKey, Permissions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -556,13 +543,14 @@ where
         request: &ActivationRequest,
         context: &ProductApprovalContextV1,
     ) -> Result<ApplyOutcome, ApplyError> {
-        let artifact = match load_exact_target(self.rulesets, &request.target).await {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                self.release_known(request_id, attempt_id, &error).await?;
-                return Err(error);
-            }
-        };
+        let (artifact, validated_target) =
+            match load_exact_target(self.rulesets, &request.target).await {
+                Ok(target) => target,
+                Err(error) => {
+                    self.release_known(request_id, attempt_id, &error).await?;
+                    return Err(error);
+                }
+            };
         let active = match self
             .rulesets
             .active(request.target.guild_id, &request.target.ruleset_key)
@@ -575,23 +563,14 @@ where
                 return Err(error);
             }
         };
-        let target_is_active = active.as_ref().is_some_and(|active| {
-            active.version == request.target.version
-                && active.content_hash == request.target.content_hash
-        });
-        let observed_baseline = baseline_from_active(active.as_ref());
-        if !target_is_active && observed_baseline != context.baseline {
-            return self
-                .supersede(
-                    request_id,
-                    attempt_id,
-                    SupersessionReasonV1::ActiveBaselineDrift {
-                        expected: context.baseline.clone(),
-                        observed: observed_baseline,
-                    },
-                )
-                .await;
-        }
+        let active_identity = active.as_ref().map(RuleSetVersionIdentity::from);
+        let target_ready =
+            match assess_product_target_v1(validated_target, context, active_identity.as_ref()) {
+                ProductTargetAssessmentV1::Ready(ready) => ready,
+                ProductTargetAssessmentV1::Superseded { reason } => {
+                    return self.supersede(request_id, attempt_id, reason).await;
+                }
+            };
         let environment = match self.provider.load_fresh(&request.target).await {
             Ok(environment) => environment,
             Err(error) => {
@@ -600,38 +579,20 @@ where
                 return Err(error);
             }
         };
-        let binding_drift =
-            match product_binding_drift(request.target.guild_id, context, &environment) {
-                Ok(drift) => drift,
-                Err(error) => {
-                    let error = ApplyError::Environment(error);
-                    self.release_known(request_id, attempt_id, &error).await?;
-                    return Err(error);
-                }
-            };
-        if let Some(reason) = binding_drift {
-            return self.supersede(request_id, attempt_id, reason).await;
-        }
-        let runtime = match check_readiness(RuleSetReadinessInput {
-            artifact: &artifact,
-            bindings: &environment.bindings,
-            guild_capabilities: &environment.guild_capabilities,
-            role_permissions: &environment.role_permissions,
-        }) {
-            Ok(runtime) => runtime,
+        let ready = match check_product_readiness_v1(target_ready, &artifact, &environment) {
+            Ok(ProductReadinessAssessmentV1::Ready(ready)) => ready,
+            Ok(ProductReadinessAssessmentV1::Superseded { reason }) => {
+                return self.supersede(request_id, attempt_id, reason).await;
+            }
             Err(error) => {
-                let error = ApplyError::NotReady(Box::new(error));
+                let error = product_preflight_apply_error(error);
                 self.release_known(request_id, attempt_id, &error).await?;
                 return Err(error);
             }
         };
-        let notices = Some(
-            runtime
-                .notices
-                .into_iter()
-                .map(|notice| format!("{notice:?}"))
-                .collect(),
-        );
+        let target_is_active = ready.target_is_active();
+        let expected_active = ready.expected_active().clone();
+        let notices = Some(ready.into_activation_notices());
         if target_is_active {
             self.complete(
                 request_id,
@@ -659,7 +620,7 @@ where
                     version: request.target.version,
                     content_hash: request.target.content_hash,
                 },
-                expected_active: expected_ruleset_baseline(&context.baseline),
+                expected_active,
             })
             .await;
         match guarded {
@@ -691,7 +652,7 @@ where
                     attempt_id,
                     SupersessionReasonV1::ActiveBaselineDrift {
                         expected: context.baseline.clone(),
-                        observed: baseline_from_identity(observed_active.as_ref()),
+                        observed: product_active_baseline_v1(observed_active.as_ref()),
                     },
                 )
                 .await
@@ -817,7 +778,7 @@ fn supersession_reason(request: &ActivationRequest) -> Result<SupersessionReason
 async fn load_exact_target<R>(
     rulesets: &R,
     target: &ActivationTarget,
-) -> Result<RuleSetVersion, ApplyError>
+) -> Result<(RuleSetVersion, ValidatedProductTargetV1), ApplyError>
 where
     R: RuleSetStore,
 {
@@ -826,78 +787,20 @@ where
         .await
         .map_err(ApplyError::RuleSet)?
         .ok_or(ApplyError::TargetMissing)?;
-    if artifact.guild_id != target.guild_id
-        || artifact.ruleset_key != target.ruleset_key
-        || artifact.version != target.version
-        || artifact.content_hash != target.content_hash
-    {
-        return Err(ApplyError::TargetCorrupt);
-    }
-    Ok(artifact)
+    let validated =
+        validate_product_target_v1(target, &artifact).map_err(product_preflight_apply_error)?;
+    Ok((artifact, validated))
 }
 
-fn baseline_from_active(active: Option<&RuleSetVersion>) -> ExpectedActiveBaselineV1 {
-    match active {
-        Some(active) => ExpectedActiveBaselineV1::Exact {
-            version: active.version,
-            content_hash: active.content_hash,
-        },
-        None => ExpectedActiveBaselineV1::Absent,
-    }
-}
-
-fn baseline_from_identity(active: Option<&RuleSetVersionIdentity>) -> ExpectedActiveBaselineV1 {
-    match active {
-        Some(active) => ExpectedActiveBaselineV1::Exact {
-            version: active.version,
-            content_hash: active.content_hash,
-        },
-        None => ExpectedActiveBaselineV1::Absent,
-    }
-}
-
-fn expected_ruleset_baseline(baseline: &ExpectedActiveBaselineV1) -> ExpectedActiveRuleSet {
-    match baseline {
-        ExpectedActiveBaselineV1::Absent => ExpectedActiveRuleSet::Absent,
-        ExpectedActiveBaselineV1::Exact {
-            version,
-            content_hash,
-        } => ExpectedActiveRuleSet::Exact {
-            identity: RuleSetVersionIdentity {
-                version: *version,
-                content_hash: *content_hash,
-            },
-        },
-    }
-}
-
-fn product_binding_drift(
-    guild_id: GuildId,
-    context: &ProductApprovalContextV1,
-    environment: &ActivationEnvironment,
-) -> Result<Option<SupersessionReasonV1>, ActivationEnvironmentError> {
-    let observed_revision = environment.binding_revision.ok_or_else(|| {
-        ActivationEnvironmentError::Load(
-            "authoritative binding revision is unavailable for product activation".to_string(),
-        )
-    })?;
-    let observed_bindings =
-        project_required_bindings(&context.binding.required_bindings, &environment.bindings).ok();
-    let observed_fingerprint = observed_bindings.as_ref().and_then(|bindings| {
-        approval_binding_fingerprint_v1(guild_id, observed_revision, bindings).ok()
-    });
-    if observed_revision == context.binding.revision
-        && observed_bindings.as_ref() == Some(&context.binding.required_bindings)
-        && observed_fingerprint.as_ref() == Some(&context.binding.fingerprint)
-    {
-        Ok(None)
-    } else {
-        Ok(Some(SupersessionReasonV1::BindingDrift {
-            expected_revision: context.binding.revision,
-            observed_revision,
-            expected_fingerprint: context.binding.fingerprint.clone(),
-            observed_fingerprint,
-        }))
+fn product_preflight_apply_error(error: ProductPreflightErrorV1) -> ApplyError {
+    match error.into_cause() {
+        ProductPreflightCauseV1::TargetCorrupt => ApplyError::TargetCorrupt,
+        ProductPreflightCauseV1::BindingRevisionUnavailable => {
+            ApplyError::Environment(ActivationEnvironmentError::Load(
+                "authoritative binding revision is unavailable for product activation".to_string(),
+            ))
+        }
+        ProductPreflightCauseV1::Readiness(error) => ApplyError::NotReady(error),
     }
 }
 
