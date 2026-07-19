@@ -18,7 +18,8 @@ use authoring_application_discord::{
 };
 use authoring_application_postgres::{
     digest_opaque_session_credential_v1, PostgresAuthentication, PostgresProductDecisions,
-    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1, MIGRATOR,
+    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
+    MIGRATOR,
 };
 use authoring_promotion::{
     approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
@@ -809,6 +810,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     )
     .unwrap();
     let decisions = PostgresProductDecisions::new(pool.clone(), keyring).unwrap();
+    decisions.verify_keyring_coverage().await.unwrap();
     let deployments = UnusedDeployments;
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
@@ -877,6 +879,31 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
             .unwrap(),
         ProductStatusV1::Approved
     );
+    decisions.verify_keyring_coverage().await.unwrap();
+    let next_key_material = std::array::from_fn(|index| 97_u8.wrapping_add(index as u8));
+    let next_only = PostgresProductDecisions::new(
+        pool.clone(),
+        ProductDecisionDigestKeyringV1::new(
+            ProductDecisionDigestKeyV1::from_bytes("product-e2e-v2", next_key_material).unwrap(),
+            [],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        next_only.verify_keyring_coverage().await.unwrap_err(),
+        ProductDecisionReadinessErrorV1::IncompleteCoverage
+    );
+    let rolling = PostgresProductDecisions::new(
+        pool.clone(),
+        ProductDecisionDigestKeyringV1::new(
+            ProductDecisionDigestKeyV1::from_bytes("product-e2e-v2", next_key_material).unwrap(),
+            [ProductDecisionDigestKeyV1::from_bytes("product-e2e-v1", key_material).unwrap()],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    rolling.verify_keyring_coverage().await.unwrap();
 
     let replay_request =
         ProductRequestIdV1::parse(&format!("approve.replay.{}", suffix())).unwrap();

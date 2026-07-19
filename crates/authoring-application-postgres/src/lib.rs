@@ -24,6 +24,7 @@ pub use envelope::{
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
     ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    ProductDecisionReadinessErrorV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,
@@ -32,7 +33,9 @@ pub use product_identity::{
     ProductLogoutDispositionV1, ProductSessionRevocationReasonV1,
 };
 pub use product_retention::{
+    PostgresProductActionRetention, PostgresProductActionRetentionConfig,
     PostgresProductIdentityRetention, PostgresProductIdentityRetentionConfig,
+    ProductActionRetentionConfigError, ProductActionRetentionError, ProductActionRetentionReportV1,
     ProductIdentityRetentionConfigError, ProductIdentityRetentionError,
     ProductIdentityRetentionReportV1,
 };

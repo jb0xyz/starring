@@ -25,6 +25,28 @@ pub(crate) struct ApprovalDigests {
     pub session_subject: Vec<u8>,
 }
 
+pub(crate) struct KeyringCoverageIdentity {
+    pub key_ids: Vec<String>,
+    pub key_fingerprints: Vec<String>,
+}
+
+pub(crate) fn keyring_coverage_identity(
+    keyring: &ProductDecisionDigestKeyringV1,
+) -> KeyringCoverageIdentity {
+    KeyringCoverageIdentity {
+        key_ids: keyring
+            .keys()
+            .iter()
+            .map(|key| key.key_id().to_string())
+            .collect(),
+        key_fingerprints: keyring
+            .keys()
+            .iter()
+            .map(|key| unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[key.secret()]))
+            .collect(),
+    }
+}
+
 pub(crate) fn approval_digests(
     keyring: &ProductDecisionDigestKeyringV1,
     request: &AuthorizedApproveProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
@@ -45,16 +67,7 @@ pub(crate) fn approval_digests(
         .map(|key| keyed_digest(key, IDEMPOTENCY_DOMAIN, &idempotency_fields))
         .collect::<Vec<_>>();
     let active_idempotency = idempotency_candidates[0].clone();
-    let idempotency_candidate_key_ids = keyring
-        .keys()
-        .iter()
-        .map(|key| key.key_id().to_string())
-        .collect::<Vec<_>>();
-    let idempotency_candidate_key_fingerprints = keyring
-        .keys()
-        .iter()
-        .map(|key| unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[key.secret()]))
-        .collect::<Vec<_>>();
+    let keyring_identity = keyring_coverage_identity(keyring);
     let semantic_request = unkeyed_digest(
         SEMANTIC_REQUEST_DOMAIN,
         &[
@@ -86,8 +99,8 @@ pub(crate) fn approval_digests(
     ApprovalDigests {
         active_idempotency,
         idempotency_candidates,
-        idempotency_candidate_key_ids,
-        idempotency_candidate_key_fingerprints,
+        idempotency_candidate_key_ids: keyring_identity.key_ids,
+        idempotency_candidate_key_fingerprints: keyring_identity.key_fingerprints,
         active_key_id: keyring.active().key_id().to_string(),
         semantic_request,
         receipt_id,
@@ -234,5 +247,28 @@ mod tests {
             unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[first.secret()]),
             unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[second.secret()])
         );
+    }
+
+    #[test]
+    fn keyring_coverage_identity_preserves_secret_order_without_secret_material() {
+        let first = ProductDecisionDigestKeyV1::from_bytes(
+            "first",
+            std::array::from_fn(|index| 31_u8.wrapping_add(index as u8)),
+        )
+        .unwrap();
+        let second = ProductDecisionDigestKeyV1::from_bytes(
+            "second",
+            std::array::from_fn(|index| 97_u8.wrapping_add(index as u8)),
+        )
+        .unwrap();
+        let keyring = ProductDecisionDigestKeyringV1::new(first, [second]).unwrap();
+        let identity = keyring_coverage_identity(&keyring);
+        assert_eq!(identity.key_ids, ["first", "second"]);
+        assert_eq!(identity.key_fingerprints.len(), 2);
+        assert!(identity
+            .key_fingerprints
+            .iter()
+            .all(|fingerprint| fingerprint.len() == 64));
+        assert!(!format!("{:?}", keyring).contains(&identity.key_fingerprints[0]));
     }
 }

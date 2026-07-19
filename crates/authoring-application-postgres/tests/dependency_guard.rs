@@ -142,6 +142,50 @@ fn product_identity_retention_keeps_index_bounded_work_shape() {
 }
 
 #[test]
+fn product_action_retention_preserves_evidence_and_bounded_work_shape() {
+    let migration = include_str!(
+        "../../../migrations/202607190007_prepare_product_action_receipt_retention.sql"
+    );
+    for required in [
+        "CREATE TABLE public.product_action_receipt_audit_evidence",
+        "product_audit_events_receipt_evidence_fk",
+        "product_audit_events_principal_fk",
+        "product_action_receipt_audit_evidence_reject_mutation",
+        "product_action_receipts_approval_retention_index",
+        "product_action_aliases_receipt_retention_index",
+        "starring_purge_product_action_receipts_v1",
+        "starring_product_approval_keyring_coverage_v1",
+        "FOR UPDATE OF receipt SKIP LOCKED",
+        "batch_limit NOT BETWEEN 1 AND 1000",
+        "existing_alias_count >= 32",
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "FROM PUBLIC",
+    ] {
+        assert!(migration.contains(required), "missing {required}");
+    }
+    assert!(migration.contains("DROP CONSTRAINT product_audit_events_receipt_fk"));
+    assert!(migration.contains("completed_at + INTERVAL '168 hours'"));
+    assert!(migration.contains("replay_guaranteed_until <= retention_clock"));
+    assert!(migration
+        .contains("REVOKE ALL ON TABLE public.product_action_receipt_audit_evidence\nFROM PUBLIC"));
+    let alias_delete = migration
+        .find("DELETE FROM public.product_action_receipt_idempotency_aliases")
+        .unwrap();
+    let receipt_delete = migration
+        .find("DELETE FROM public.product_action_receipts")
+        .unwrap();
+    assert!(alias_delete < receipt_delete);
+    assert!(!migration.contains("idempotency_key TEXT"));
+    let adapter = include_str!("../src/product_retention.rs");
+    assert!(adapter.contains("PostgresProductActionRetention"));
+    assert!(adapter.contains("starring_purge_product_action_receipts_v1"));
+    assert!(adapter.contains("deleted_receipts.saturating_mul(32)"));
+    assert!(adapter.contains("transaction.commit().await.map_err(action_database_commit)?"));
+    assert!(adapter.contains("matches!(&error, sqlx::Error::Database(_))"));
+}
+
+#[test]
 fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     let authentication = include_str!("../src/authentication.rs");
     assert!(authentication.contains("digest_opaque_session_credential_v1(credential)"));
@@ -333,6 +377,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_retention.rs",
             include_str!("postgres_product_retention.rs"),
+        ),
+        (
+            "tests/postgres_product_action_retention.rs",
+            include_str!("postgres_product_action_retention.rs"),
         ),
         (
             "tests/postgres_product_control_e2e.rs",

@@ -76,6 +76,9 @@ Defaults are configuration, not constants embedded in domain logic:
 | OAuth flow lifetime | 10 minutes | Bounds login CSRF and code replay state |
 | Product session absolute lifetime | 12 hours | Bounds stolen-session lifetime |
 | Product session idle lifetime | 30 minutes | Retires abandoned admin sessions |
+| Product action replay guarantee | 7 days | Bounds receipt retention and HMAC key retirement lag |
+| Product receipt alias capacity | 32 per receipt | Bounds maintenance work across repeated key rotations |
+| Maintenance purge batch | 1,000 parent rows | Bounds one database maintenance transaction |
 | Fresh write authority age | 5 seconds | Limits Discord role-change race |
 | Read authority cache age | 30 seconds | Protects tenant data without a Discord call storm |
 | HTTP JSON body limit | 64 KiB | Bounds memory and parser work |
@@ -418,7 +421,7 @@ process can produce generation rows.
 - request digest binds every semantic input and expected precondition
 - target resource, resulting revision/state, HTTP disposition class, and
   completion timestamp
-- exact replays return the recorded semantic result
+- exact replays within the retained replay window return the recorded semantic result
 - a reused key with a different request digest returns `409`
 
 Raw idempotency keys are never stored. Promotion continues using its existing
@@ -439,6 +442,24 @@ idempotency scope, so an HTTP retry cannot create a second apply attempt.
 Decision mutation and its idempotency receipt and audit event commit in one
 transaction. An audit failure fails the decision; there is no successful
 unaudited privileged action.
+
+`product_action_receipt_audit_evidence` permanently preserves the receipt's
+scope, endpoint, request digest, target, semantic result, completion time, and
+replay-policy version without retaining an idempotency digest, HMAC key ID, or
+key-material fingerprint. The immutable audit event references this evidence.
+After the seven-day replay guarantee, a maintenance-only procedure may delete
+the live receipt and its aliases while the audit and forensic receipt evidence
+remain append-only. Purge eligibility is `now >= replay_guaranteed_until`; a
+delayed purge may extend replay opportunistically but never shortens the
+guaranteed window.
+
+The maintenance procedure processes only `product_approve_v1` receipts in this
+increment. It locks at most 1,000 parents with `SKIP LOCKED`, deletes at most 32
+aliases per parent before the parent receipt, and reports whether eligible work
+remains. A separate read-only keyring coverage probe must succeed before a
+retired HMAC key is removed. The safe rotation order is new-plus-old writers,
+old-writer drain, one full replay window, purge to an empty backlog, coverage
+probe with the proposed keyring, new-only writers, then old-secret destruction.
 
 ### Tenant-scoping additions to existing tables
 
@@ -821,6 +842,7 @@ Production uses separate credentials:
 | `starring_migrator` | deployment-only DDL and ownership handoff |
 | `starring_api` | execute product auth, session, decision, and scoped-read functions only |
 | `starring_runtime` | claim convergence, read exact active artifacts, attest, and heartbeat only |
+| `starring_maintenance` | execute bounded identity and receipt retention procedures only |
 | `starring_observer` | sanitized operational views only |
 
 Deployment revokes `PUBLIC` privileges, revokes direct DML on authority-bearing
@@ -852,6 +874,12 @@ Immutable authoring generations, authority versions, audit events, and runtime
 attestations reject update and delete through triggers owned by
 `starring_owner`. Retention is implemented by an explicit archival procedure,
 not ad hoc deletes from the production role.
+
+The API and runtime roles cannot execute retention procedures. The maintenance
+role cannot call product decision functions or directly select, insert, update,
+or delete authority-bearing tables. Each maintenance adapter sets bounded
+transaction-local statement and lock timeouts before invoking a security-definer
+procedure.
 
 Production startup fails readiness when the database migration version, grants,
 function signatures, or role capability probe do not match the binary's expected
@@ -1047,7 +1075,8 @@ Each phase is a separate reviewable commit and leaves its scoped tests green.
    - Add tenant and installation shadows to product activation rows.
 4. **Database least privilege**
    - Add guarded transition functions, RLS, immutable-row triggers, grants,
-     default privileges, and role capability tests.
+     default privileges, bounded archival procedures, keyring readiness, and
+     role capability tests.
 5. **Discord authentication and authorization**
    - Implement identify-only OAuth, opaque sessions, CSRF, exact origin, token
      revocation, and fresh guild-manager authority adapter.
@@ -1115,8 +1144,13 @@ checks remain green at every merge boundary.
   duplicate critical header, and unknown JSON field.
 - Cross-tenant known IDs and random IDs produce indistinguishable 404 responses.
 - Stable internal errors contain no SQL or Discord response details.
-- Exact idempotent replay returns the same semantic result; mismatched reuse is
-  `409`.
+- Exact idempotent replay inside the seven-day guarantee returns the same
+  semantic result; mismatched reuse is `409`.
+- Receipt purge preserves byte-stable audit and forensic evidence, deletes no
+  more than the configured batch and alias capacity, and cannot be executed by
+  API or runtime roles.
+- A retired HMAC key cannot be removed until the live-receipt coverage probe
+  succeeds for the proposed keyring and purge reports no eligible backlog.
 - Concurrency and dependency timeout exhaustion fail boundedly without process
   starvation.
 

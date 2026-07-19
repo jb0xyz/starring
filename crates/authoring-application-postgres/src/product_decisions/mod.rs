@@ -7,4 +7,4 @@ pub use config::{
     PostgresProductDecisionsConfig, ProductDecisionConfigError, ProductDecisionDigestKeyError,
     ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
 };
-pub use store::PostgresProductDecisions;
+pub use store::{PostgresProductDecisions, ProductDecisionReadinessErrorV1};
