@@ -12,6 +12,7 @@ pub(crate) struct ScopedFunctionContractV1<'a> {
     returns_set: bool,
     rows: f32,
     language: ScopedFunctionLanguageV1,
+    identity_arguments: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +38,23 @@ impl<'a> ScopedFunctionContractV1<'a> {
             returns_set: true,
             rows,
             language: ScopedFunctionLanguageV1::Sql,
+            identity_arguments: None,
+        }
+    }
+
+    pub(crate) const fn set_named(
+        identity: &'a str,
+        result: &'a str,
+        rows: f32,
+        identity_arguments: &'a str,
+    ) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: true,
+            rows,
+            language: ScopedFunctionLanguageV1::Sql,
+            identity_arguments: Some(identity_arguments),
         }
     }
 
@@ -47,6 +65,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             returns_set: false,
             rows: 0.0,
             language: ScopedFunctionLanguageV1::Sql,
+            identity_arguments: None,
         }
     }
 
@@ -57,6 +76,23 @@ impl<'a> ScopedFunctionContractV1<'a> {
             returns_set: true,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
+            identity_arguments: None,
+        }
+    }
+
+    pub(crate) const fn set_plpgsql_named(
+        identity: &'a str,
+        result: &'a str,
+        rows: f32,
+        identity_arguments: &'a str,
+    ) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: true,
+            rows,
+            language: ScopedFunctionLanguageV1::PlPgSql,
+            identity_arguments: Some(identity_arguments),
         }
     }
 }
@@ -95,6 +131,7 @@ pub(crate) enum ScopedDatabaseReadinessErrorV1 {
 pub(crate) enum ScopedDatabaseProbeModeV1 {
     ReadOnly,
     ReadWrite,
+    SerializableReadWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,6 +288,9 @@ pub(crate) async fn begin_bounded_database_probe<'a>(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
         }
         ScopedDatabaseProbeModeV1::ReadWrite => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        ScopedDatabaseProbeModeV1::SerializableReadWrite => {
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE"
+        }
     };
     sqlx::query(transaction_mode)
         .execute(&mut *transaction)
@@ -427,8 +467,11 @@ async fn load_function_capability(
            SELECT function_row.oid, function_row.proowner, function_row.proacl, \
             function_row.prosecdef, function_row.proisstrict, function_row.provolatile, \
             function_row.proparallel, function_row.proretset, function_row.prorows, \
-            function_row.proconfig, function_row.prokind, language.lanname, \
-            pg_catalog.pg_get_function_result(function_row.oid) AS function_result \
+            function_row.proconfig, function_row.prokind, function_row.proleakproof, \
+            function_row.pronargdefaults, function_row.provariadic, language.lanname, \
+            pg_catalog.pg_get_function_result(function_row.oid) AS function_result, \
+            pg_catalog.pg_get_function_identity_arguments(function_row.oid) \
+             AS function_identity_arguments \
            FROM target \
            LEFT JOIN pg_catalog.pg_proc AS function_row \
             ON function_row.oid = target.function_oid \
@@ -447,9 +490,14 @@ async fn load_function_capability(
             AND function_contract.proparallel = 'u' \
             AND function_contract.proretset = $3 \
             AND function_contract.prorows = $4 \
+            AND NOT function_contract.proleakproof \
+            AND function_contract.pronargdefaults = 0 \
+            AND function_contract.provariadic = 0 \
             AND function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[] \
             AND function_contract.lanname = $5 \
-            AND function_contract.function_result = $2, FALSE \
+            AND function_contract.function_result = $2 \
+            AND ($6::TEXT IS NULL \
+             OR function_contract.function_identity_arguments = $6), FALSE \
           ) AS metadata_valid, \
           pg_catalog.pg_get_userbyid(function_contract.proowner)::TEXT AS owner_name, \
           COALESCE(NOT EXISTS ( \
@@ -494,6 +542,7 @@ async fn load_function_capability(
     .bind(contract.returns_set)
     .bind(contract.rows)
     .bind(contract.language.database_name())
+    .bind(contract.identity_arguments)
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)

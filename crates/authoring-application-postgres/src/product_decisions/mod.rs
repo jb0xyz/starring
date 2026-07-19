@@ -1,5 +1,7 @@
 mod apply;
+mod apply_contract;
 mod apply_projection;
+mod apply_readiness;
 mod apply_sql;
 mod approve;
 mod config;

@@ -62,6 +62,9 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
 fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let approval = include_str!("../src/product_decisions/approve.rs");
     let apply = include_str!("../src/product_decisions/apply.rs");
+    let apply_contract = include_str!("../src/product_decisions/apply_contract.rs");
+    let apply_readiness = include_str!("../src/product_decisions/apply_readiness.rs");
+    let apply_sql = include_str!("../src/product_decisions/apply_sql.rs");
     let database = include_str!("../src/product_decisions/database.rs");
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
@@ -110,19 +113,81 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(approval.contains(".approval_executor"));
     assert!(readiness.contains(".approval_executor"));
     assert!(apply.contains(".apply_executor"));
+    assert!(apply_sql.contains("TARGET_ARTIFACT_QUERY"));
+    assert!(apply_sql.contains(".bind(request.actor().principal_id().as_str())"));
+    assert!(apply_sql.contains(".bind(request.session_fingerprint().as_bytes().as_slice())"));
+    assert!(apply_sql.contains(".bind(request.scope().acting_user_id().to_string())"));
+    assert!(apply_sql.contains(".fetch_all(&mut **transaction)"));
+    for relation in ["activation_requests", "automation_ruleset_versions"] {
+        assert!(
+            !apply_sql.contains(relation),
+            "raw product Apply relation in adapter: {relation}"
+        );
+        assert!(
+            !apply_contract.contains(relation),
+            "raw product Apply relation in contract: {relation}"
+        );
+    }
+    for required in [
+        "public.starring_product_apply_executor_database_identity_v1()",
+        "public.starring_product_apply_lock_v1(text,text,text,bigint",
+        "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
+        "public.starring_product_apply_finalize_v1(text,text,text,bigint",
+        "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+        "FROM public.starring_product_apply_target_artifact_v1($1, $2, $3, $4, $5, $6, $7)",
+        "LIMIT 2",
+    ] {
+        assert!(
+            apply_contract.contains(required),
+            "missing product Apply contract guard: {required}"
+        );
+    }
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 5]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 18]",
+        "ScopedFunctionContractV1::set_named(",
+        "ScopedFunctionContractV1::set_plpgsql_named(",
+        "verify_apply_executor_readiness",
+        "check_apply_executor_readiness",
+        "verify_scoped_executable_allowlist",
+        "verify_scoped_schema_trust",
+        "verify_approval_support_contract",
+        "verify_apply_support_contract",
+        "starring_product_ruleset_slot_exact_v1",
+        "runtime_serving_leases",
+        "runtime_attestations",
+        "ScopedDatabaseProbeModeV1::SerializableReadWrite",
+        "idempotency_keyring_incomplete",
+        "outcome: \"invalid_input\"",
+        "outcome: \"lock_required\"",
+    ] {
+        assert!(
+            apply_readiness.contains(required),
+            "missing product Apply readiness guard: {required}"
+        );
+    }
     assert!(readiness.contains("verify_approval_executor_readiness"));
     assert!(readiness.contains("verify_approval_boundary_readiness"));
+    assert!(readiness.contains("verify_product_decision_boundary_readiness"));
+    assert!(readiness.contains("self.check_apply_executor_readiness().await?"));
     assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
+    assert!(database_capability.contains("function_row.proleakproof"));
+    assert!(database_capability.contains("function_row.pronargdefaults"));
+    assert!(database_capability.contains("function_row.provariadic"));
+    assert!(database_capability.contains("pg_catalog.pg_get_function_identity_arguments"));
+    assert!(database_capability.contains("function_contract.function_identity_arguments = $6"));
     assert!(database_capability.contains("function_row.proname::TEXT, 9"));
     assert!(database_capability.contains("pg_catalog.has_function_privilege"));
     assert!(approval.contains("public.starring_product_approve_v1"));
     assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+    assert!(database.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE"));
     assert!(database.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
     assert!(database.contains("idle_in_transaction_session_timeout"));
     assert!(database.contains("pg_catalog.set_config('search_path', 'pg_catalog', true)"));
+    assert!(database.contains("pg_catalog.set_config('quote_all_identifiers', 'off', true)"));
     assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));
     assert!(approval.contains("request.session_fingerprint().as_bytes()"));
     assert!(!approval.contains(".bind(request.command().idempotency_key.as_str())"));
@@ -280,6 +345,69 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
             "missing product approval trigger guard: {required}"
         );
     }
+    let apply_scope_migration =
+        include_str!("../../../migrations/202607190022_scope_product_apply_execution.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_product_apply_target_artifact_v1(",
+        "CREATE FUNCTION public.starring_product_apply_keyring_coverage_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "ROWS 1",
+        "product apply relations require one non-RLS owner",
+        "relation_count <> 18",
+        "table_count <> 18",
+        "rls_disabled_count <> 18",
+        "owner_count <> 1",
+        "product apply schema is not trusted",
+        "product apply migration requires the common owner",
+        "pg_catalog.to_regrole(current_user) <> common_owner",
+        "pg_catalog.has_schema_privilege(",
+        "product apply external function contract is invalid",
+        "product apply helper function contract is invalid",
+        "product apply trigger function contract is invalid",
+        "product apply protected function overload is invalid",
+        "product apply new function already exists",
+        "pg_catalog.transaction_timestamp()",
+        "pg_catalog.octet_length(version.definition::TEXT) <= 524288",
+        "activation.authority_kind = 'product_authoring'",
+        "tenant.lifecycle_state = 'active'",
+        "installation.lifecycle_state = 'active'",
+        "principal.discord_user_id = expected_acting_discord_user_id",
+        "product_session.session_digest = expected_product_session_digest",
+        "product_session.oauth_state_digest IS NOT NULL",
+        "product_session.revoked_at IS NULL",
+        "pg_catalog.octet_length(expected_product_session_digest) = 32",
+        "LIMIT 2\n    FOR SHARE OF activation, version",
+        "receipt.endpoint_domain = 'product_apply_v1'",
+        "idempotency_keyring_incomplete",
+        "public.starring_product_ruleset_slot_exact_v1",
+        "public.starring_runtime_lock_current_authority",
+        "public.starring_runtime_current_mutation_clock()",
+        "public.runtime_serving_leases",
+        "public.runtime_attestations",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "ALTER FUNCTION %s ROWS 1",
+        "ARRAY['search_path=pg_catalog']::TEXT[]",
+        "product apply target invalid probe is unsafe",
+        "product apply target zero-row probe is unsafe",
+        "product apply keyring invalid probe is unsafe",
+        "product apply external function postcondition is invalid",
+        "product apply helper function postcondition is invalid",
+        "product apply trigger postcondition is invalid",
+        "pg_catalog.current_setting('quote_all_identifiers')",
+        "original_quote_all_identifiers",
+    ] {
+        assert!(
+            apply_scope_migration.contains(required),
+            "missing product Apply scope guard: {required}"
+        );
+    }
+    assert_eq!(apply_scope_migration.matches("\"relation\":").count(), 24);
+    assert!(!apply_scope_migration.contains("CREATE ROLE"));
+    assert!(!apply_scope_migration.contains("GRANT EXECUTE"));
+    assert!(!apply_scope_migration.contains("REVOKE ALL PRIVILEGES ON TABLE"));
     let binding_identity_migration =
         include_str!("../../../migrations/202607190009_separate_product_binding_identities.sql");
     for required in [
@@ -988,8 +1116,16 @@ fn source_files_contain_no_comments() {
             include_str!("../src/product_decisions/apply.rs"),
         ),
         (
+            "src/product_decisions/apply_contract.rs",
+            include_str!("../src/product_decisions/apply_contract.rs"),
+        ),
+        (
             "src/product_decisions/apply_projection.rs",
             include_str!("../src/product_decisions/apply_projection.rs"),
+        ),
+        (
+            "src/product_decisions/apply_readiness.rs",
+            include_str!("../src/product_decisions/apply_readiness.rs"),
         ),
         (
             "src/product_decisions/apply_sql.rs",

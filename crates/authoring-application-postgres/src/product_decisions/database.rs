@@ -38,21 +38,20 @@ pub(super) async fn configure_apply_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     config: &PostgresProductDecisionsConfig,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE")
         .execute(&mut **transaction)
         .await?;
-    sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
-        .bind(config.statement_timeout())
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("SELECT pg_catalog.set_config('lock_timeout', $1, true)")
-        .bind(config.lock_timeout())
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("SELECT pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)")
-        .bind(config.statement_timeout())
-        .execute(&mut **transaction)
-        .await?;
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $2, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true), \
+         pg_catalog.set_config('search_path', 'pg_catalog', true), \
+         pg_catalog.set_config('quote_all_identifiers', 'off', true)",
+    )
+    .bind(config.statement_timeout())
+    .bind(config.lock_timeout())
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 

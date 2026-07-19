@@ -391,7 +391,18 @@ impl PostgresProductDecisions {
         verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
     }
 
-    async fn check_approval_executor_readiness(
+    pub async fn verify_product_decision_boundary_readiness(
+        &self,
+    ) -> Result<(), ProductDecisionReadinessErrorV1> {
+        let topologies = [
+            self.check_decision_reader_readiness().await?,
+            self.check_approval_executor_readiness().await?,
+            self.check_apply_executor_readiness().await?,
+        ];
+        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
+    }
+
+    pub(super) async fn check_approval_executor_readiness(
         &self,
     ) -> Result<ScopedDatabaseTopologyV1, ProductDecisionReadinessErrorV1> {
         let timeout = self.config.statement_timeout();
@@ -467,7 +478,7 @@ impl PostgresProductDecisions {
     }
 }
 
-async fn verify_approval_support_contract(
+pub(super) async fn verify_approval_support_contract(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), ProductDecisionReadinessErrorV1> {
     let valid = sqlx::query_scalar::<_, bool>(APPROVAL_SUPPORT_CONTRACT_QUERY)
@@ -500,7 +511,9 @@ async fn check_topology(
     Ok(topology)
 }
 
-fn map_readiness(error: ScopedDatabaseReadinessErrorV1) -> ProductDecisionReadinessErrorV1 {
+pub(super) fn map_readiness(
+    error: ScopedDatabaseReadinessErrorV1,
+) -> ProductDecisionReadinessErrorV1 {
     match error {
         ScopedDatabaseReadinessErrorV1::ContractMismatch => {
             ProductDecisionReadinessErrorV1::ContractMismatch
@@ -515,7 +528,7 @@ fn map_readiness(error: ScopedDatabaseReadinessErrorV1) -> ProductDecisionReadin
     }
 }
 
-fn readiness_database(error: sqlx::Error) -> ProductDecisionReadinessErrorV1 {
+pub(super) fn readiness_database(error: sqlx::Error) -> ProductDecisionReadinessErrorV1 {
     ProductDatabaseFailureV1::classify(&error).into()
 }
 
