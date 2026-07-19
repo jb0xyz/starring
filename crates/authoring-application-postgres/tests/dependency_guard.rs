@@ -363,9 +363,25 @@ fn source_files_contain_no_comments() {
         ),
         ("src/bindings.rs", include_str!("../src/bindings.rs")),
         ("src/database.rs", include_str!("../src/database.rs")),
+        (
+            "src/deployment_status.rs",
+            include_str!("../src/deployment_status.rs"),
+        ),
         ("src/digest.rs", include_str!("../src/digest.rs")),
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
+        (
+            "src/product_decisions/apply.rs",
+            include_str!("../src/product_decisions/apply.rs"),
+        ),
+        (
+            "src/product_decisions/apply_projection.rs",
+            include_str!("../src/product_decisions/apply_projection.rs"),
+        ),
+        (
+            "src/product_decisions/apply_sql.rs",
+            include_str!("../src/product_decisions/apply_sql.rs"),
+        ),
         (
             "src/product_decisions/approve.rs",
             include_str!("../src/product_decisions/approve.rs"),
@@ -445,8 +461,52 @@ fn source_files_contain_no_comments() {
             include_str!("postgres_product_action_retention.rs"),
         ),
         (
+            "tests/postgres_product_apply.rs",
+            include_str!("postgres_product_apply.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/database_fixture.rs",
+            include_str!("postgres_product_apply/database_fixture.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/apply_support.rs",
+            include_str!("postgres_product_apply/apply_support.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/apply_semantics.rs",
+            include_str!("postgres_product_apply/apply_semantics.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/authority_drift.rs",
+            include_str!("postgres_product_apply/authority_drift.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/security_concurrency.rs",
+            include_str!("postgres_product_apply/security_concurrency.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/migration_security.rs",
+            include_str!("postgres_product_apply/migration_security.rs"),
+        ),
+        (
             "tests/postgres_product_control_e2e.rs",
             include_str!("postgres_product_control_e2e.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/support.rs",
+            include_str!("postgres_product_control_e2e/support.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/authority_history.rs",
+            include_str!("postgres_product_control_e2e/authority_history.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/approval_apply_flow.rs",
+            include_str!("postgres_product_control_e2e/approval_apply_flow.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e/deployment_status.rs",
+            include_str!("postgres_product_control_e2e/deployment_status.rs"),
         ),
     ];
     for (path, source) in sources {
