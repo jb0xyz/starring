@@ -445,6 +445,15 @@ After that window, the same raw key still derives the occupied deterministic
 promotion ID but no longer receives a retained product receipt: it returns
 `IdempotencyConflict` and can never create a second journal under that identity.
 
+`ActivationPending` is terminal for the Promote action and its admission-key
+dependency. The activation subsystem remains authoritative for its later
+approval, apply, rejection, and expiry lifecycle, and product decision reads
+derive time-based expiry from the activation row and database clock even when
+the promotion journal remains `ActivationPending`. A later journal transition
+to Expired revision four is owner maintenance compatibility, not product replay,
+and must not require a retired admission HMAC key. The production promotion
+executor never performs that late transition after a final receipt exists.
+
 ## Database capability contracts
 
 All function arguments below are positional and exact. `AccessV1` is the shared
