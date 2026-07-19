@@ -142,7 +142,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     let fixture = seed_fixture(&pool).await;
     let source_calls = Arc::new(AtomicUsize::new(0));
     let client_calls = Arc::new(AtomicUsize::new(0));
-    let authority = DiscordGuildAuthorityAdapter::new(
+    let authority = DiscordGuildAuthorityAdapter::with_clock(
         Source {
             fixture: fixture.clone(),
             calls: source_calls.clone(),
@@ -151,6 +151,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
             fixture: fixture.clone(),
             calls: client_calls.clone(),
         },
+        SubmicrosecondClock,
         DiscordAuthorityConfigV1::new(
             Duration::from_secs(2),
             Duration::from_secs(5),
@@ -241,20 +242,24 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
         ProductStatusV1::Approved
     );
     decisions.verify_keyring_coverage().await.unwrap();
-    let next_key_material = std::array::from_fn(|index| 97_u8.wrapping_add(index as u8));
-    let next_only = PostgresProductDecisions::new(
+    let unknown_only = PostgresProductDecisions::new(
         pool.clone(),
         ProductDecisionDigestKeyringV1::new(
-            ProductDecisionDigestKeyV1::from_bytes("product-e2e-v2", next_key_material).unwrap(),
+            ProductDecisionDigestKeyV1::from_bytes(
+                "product-e2e-v3",
+                std::array::from_fn(|index| 151_u8.wrapping_add(index as u8)),
+            )
+            .unwrap(),
             [],
         )
         .unwrap(),
     )
     .unwrap();
     assert_eq!(
-        next_only.verify_keyring_coverage().await.unwrap_err(),
+        unknown_only.verify_keyring_coverage().await.unwrap_err(),
         ProductDecisionReadinessErrorV1::IncompleteCoverage
     );
+    let next_key_material = std::array::from_fn(|index| 97_u8.wrapping_add(index as u8));
     let rolling = PostgresProductDecisions::new(
         pool.clone(),
         ProductDecisionDigestKeyringV1::new(
@@ -349,24 +354,35 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     assert_eq!(receipt.resulting_state, "approved");
     assert_eq!(receipt.result_code, "approval_quorum_reached");
 
-    let alias = sqlx::query_as::<_, (String, String, String, String)>(
+    let aliases = sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT idempotency_key_digest, idempotency_digest_key_id, \
          idempotency_digest_key_fingerprint, receipt_id \
          FROM public.product_action_receipt_idempotency_aliases \
-         WHERE receipt_id = $1",
+         WHERE receipt_id = $1 ORDER BY idempotency_digest_key_id",
     )
     .bind(&expected_receipt)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
+    let next_idempotency = keyed_hex(&next_key_material, IDEMPOTENCY_DOMAIN, &idempotency_fields);
+    let next_key_fingerprint =
+        unkeyed_hex(KEY_MATERIAL_FINGERPRINT_DOMAIN, &[bytes(next_key_material)]);
     assert_eq!(
-        alias,
-        (
-            expected_idempotency,
-            "product-e2e-v1".to_string(),
-            expected_key_fingerprint,
-            expected_receipt
-        )
+        aliases,
+        vec![
+            (
+                expected_idempotency,
+                "product-e2e-v1".to_string(),
+                expected_key_fingerprint,
+                expected_receipt.clone()
+            ),
+            (
+                next_idempotency,
+                "product-e2e-v2".to_string(),
+                next_key_fingerprint,
+                expected_receipt
+            )
+        ]
     );
 
     let audit = sqlx::query_as::<_, AuditRow>(
@@ -530,7 +546,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
     {
         let pool = &database.pool;
         let fixture = seed_fixture(pool).await;
-        let authority = DiscordGuildAuthorityAdapter::new(
+        let authority = DiscordGuildAuthorityAdapter::with_clock(
             Source {
                 fixture: fixture.clone(),
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -539,6 +555,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
                 fixture: fixture.clone(),
                 calls: Arc::new(AtomicUsize::new(0)),
             },
+            SubmicrosecondClock,
             DiscordAuthorityConfigV1::new(
                 Duration::from_secs(2),
                 Duration::from_secs(5),

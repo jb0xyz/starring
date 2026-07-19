@@ -245,8 +245,8 @@ fn validate_operation(
             != digests.idempotency_candidate_key_fingerprints
         || operation.idempotency_digest_key_id != digests.active_key_id
         || operation.authority_observation_digest != evidence.observation_digest()
-        || operation.authority_observed_at != evidence.observed_at()
-        || operation.authority_expires_at != evidence.expires_at()
+        || !same_postgres_timestamp(operation.authority_observed_at, evidence.observed_at())
+        || !same_postgres_timestamp(operation.authority_expires_at, evidence.expires_at())
         || operation.effective_permission_bits != evidence.effective_permissions_bits().to_string()
         || operation.guild_owner != evidence.guild_owner()
         || !is_lower_hex(&operation.product_session_binding_v1, 32)
@@ -452,4 +452,28 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn same_postgres_timestamp(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+    left.timestamp_micros() == right.timestamp_micros()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeDelta, TimeZone, Utc};
+
+    use super::same_postgres_timestamp;
+
+    #[test]
+    fn timestamp_comparison_matches_postgres_microsecond_precision() {
+        let base = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
+        assert!(same_postgres_timestamp(
+            base + TimeDelta::nanoseconds(101),
+            base + TimeDelta::nanoseconds(999)
+        ));
+        assert!(!same_postgres_timestamp(
+            base + TimeDelta::nanoseconds(999),
+            base + TimeDelta::microseconds(1)
+        ));
+    }
 }

@@ -15,7 +15,7 @@ use authoring_application::{
     ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
 };
 use authoring_application_discord::{
-    DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
+    AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
     DiscordAuthoritySourceError, DiscordBotUserIdV1, DiscordGuildApplyAuthoritySnapshotV1,
     DiscordGuildAuthorityAdapter, DiscordGuildAuthorityClient, DiscordGuildAuthoritySnapshotV1,
     DiscordRoleSnapshotV1, FreshDiscordAuthorityEvidenceV1, InstallationAuthorityRecordV1,
@@ -170,6 +170,17 @@ fn suffix() -> String {
         .unwrap()
         .as_nanos()
         .to_string()
+}
+
+#[derive(Clone, Copy)]
+struct SubmicrosecondClock;
+
+impl AuthorityClock for SubmicrosecondClock {
+    fn now(&self) -> DateTime<Utc> {
+        let now = Utc::now();
+        DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap()
+            + TimeDelta::nanoseconds(123)
+    }
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -1003,8 +1014,10 @@ async fn rotate_authority(
     rotated
 }
 
-fn authority_adapter(fixture: Fixture) -> DiscordGuildAuthorityAdapter<Source, Client> {
-    DiscordGuildAuthorityAdapter::new(
+fn authority_adapter(
+    fixture: Fixture,
+) -> DiscordGuildAuthorityAdapter<Source, Client, SubmicrosecondClock> {
+    DiscordGuildAuthorityAdapter::with_clock(
         Source {
             fixture: fixture.clone(),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -1013,6 +1026,7 @@ fn authority_adapter(fixture: Fixture) -> DiscordGuildAuthorityAdapter<Source, C
             fixture,
             calls: Arc::new(AtomicUsize::new(0)),
         },
+        SubmicrosecondClock,
         DiscordAuthorityConfigV1::new(
             Duration::from_secs(2),
             Duration::from_secs(5),
