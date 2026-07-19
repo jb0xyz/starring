@@ -3,7 +3,7 @@ use serde_json::Value;
 use sqlx::types::Json;
 
 pub(crate) const PROMOTION_COLUMNS: &str =
-    "id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, record";
+    "id, record_format_version, revision, stage, request_digest, tenant_id, installation_id, principal_id, record";
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct PromotionRow {
@@ -13,6 +13,7 @@ pub(crate) struct PromotionRow {
     pub stage: String,
     pub request_digest: String,
     pub tenant_id: String,
+    pub installation_id: String,
     pub principal_id: String,
     pub record: Json<Value>,
 }
@@ -30,6 +31,15 @@ pub(crate) fn stage_name(stage: &PromotionStageV1) -> &'static str {
     }
 }
 
+fn scope_matches_record(
+    tenant_id: &str,
+    installation_id: &str,
+    record_tenant_id: &str,
+    record_installation_id: &str,
+) -> bool {
+    tenant_id == record_tenant_id && installation_id == record_installation_id
+}
+
 pub(crate) fn decode_record(row: PromotionRow) -> Result<PromotionRecordV1, PromotionStoreError> {
     if row.record_format_version != 1 {
         return Err(backend("unsupported persisted promotion record format"));
@@ -45,7 +55,12 @@ pub(crate) fn decode_record(row: PromotionRow) -> Result<PromotionRecordV1, Prom
         || row.revision != revision
         || row.stage != stage_name(&record.stage)
         || row.request_digest != record.request_digest.as_str()
-        || row.tenant_id != record.intent.authority.tenant_id.as_str()
+        || !scope_matches_record(
+            &row.tenant_id,
+            &row.installation_id,
+            record.intent.authority.tenant_id.as_str(),
+            record.intent.authority.installation_id.as_str(),
+        )
         || row.principal_id != record.intent.authority.principal_id.as_str()
     {
         return Err(backend(
@@ -62,5 +77,27 @@ mod tests {
     #[test]
     fn stage_names_are_stable() {
         assert_eq!(stage_name(&PromotionStageV1::Prepared), "prepared");
+    }
+
+    #[test]
+    fn scalar_scope_must_exactly_match_record_authority() {
+        assert!(scope_matches_record(
+            "tenant-a",
+            "installation-a",
+            "tenant-a",
+            "installation-a"
+        ));
+        assert!(!scope_matches_record(
+            "tenant-a",
+            "installation-b",
+            "tenant-a",
+            "installation-a"
+        ));
+        assert!(!scope_matches_record(
+            "tenant-b",
+            "installation-a",
+            "tenant-a",
+            "installation-a"
+        ));
     }
 }

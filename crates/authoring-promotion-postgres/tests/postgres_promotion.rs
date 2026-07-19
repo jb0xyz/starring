@@ -26,7 +26,7 @@ use automation_ruleset_activation::{
     ActivationRequestId, ActivationRequestState, ActivationRequestStore, ActivationService,
     ActivationStoreError, ActivationTarget, ApplyAttemptId, ApplyOutcome, ApprovalBindingContextV1,
     ApprovalPolicyBindingV1, CreateProductActivationRequest, ExpectedActiveBaselineV1,
-    LinkProductActivation, LinkProductError, ProductApprovalContextV1,
+    ProductApprovalContextV1,
 };
 use automation_ruleset_activation_postgres::PostgresActivationRequestStore;
 use automation_ruleset_postgres::PostgresRuleSetStore;
@@ -116,6 +116,22 @@ fn fixed_now() -> DateTime<Utc> {
         .unwrap()
 }
 
+fn scope_hash(value: &str) -> u64 {
+    value
+        .bytes()
+        .fold(14_695_981_039_346_656_037, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
+        })
+}
+
+fn scoped_discord_id(tenant: &str, base: u64) -> u64 {
+    base + scope_hash(tenant) % 500_000_000
+}
+
+fn installation_id(tenant: &str) -> AutomationInstallationId {
+    AutomationInstallationId::parse(&format!("promotion-{tenant}")).unwrap()
+}
+
 fn context(tenant: &str) -> AuthenticatedPromotionContext {
     AuthenticatedPromotionContext {
         tenant_id: TenantId::parse(tenant).unwrap(),
@@ -123,8 +139,8 @@ fn context(tenant: &str) -> AuthenticatedPromotionContext {
         session_owner_id: PrincipalId::parse("postgres-principal").unwrap(),
         session_id: AuthoringSessionId::parse("postgres-session").unwrap(),
         session_generation: SessionGeneration::new(1).unwrap(),
-        guild_id: GuildId(9_200_001),
-        installation_id: AutomationInstallationId::parse("postgres-installation").unwrap(),
+        guild_id: GuildId(scoped_discord_id(tenant, 9_200_000_000)),
+        installation_id: installation_id(tenant),
         ruleset_key: "studyrooms".parse().unwrap(),
         requester: UserId(100),
         binding_revision: BindingRevision::new(1).unwrap(),
@@ -290,7 +306,10 @@ impl ProductApprovalEnvironmentProvider for ReadyProductEnvironment {
         request: &ResolveProductApprovalContextV1,
     ) -> Result<ProductApprovalEnvironmentV1, ProductApprovalEnvironmentError> {
         assert_eq!(request.tenant_id.as_str(), "postgres-end-to-end");
-        assert_eq!(request.installation_id.as_str(), "postgres-installation");
+        assert_eq!(
+            request.installation_id,
+            installation_id("postgres-end-to-end")
+        );
         Ok(ProductApprovalEnvironmentV1 {
             binding_revision: self.revision,
             bindings: self.bindings.clone(),
@@ -334,6 +353,82 @@ async fn pool() -> PgPool {
     pool
 }
 
+async fn seed_product_scope(pool: &PgPool, tenant: &str) {
+    let authority = context(tenant);
+    let binding_revision = NonZeroU64::new(authority.binding_revision.get()).unwrap();
+    let required_bindings = vec![ResolvedApprovalBinding::Channel {
+        key: serde_json::from_value(json!("community_hub")).unwrap(),
+        id: ChannelId(700),
+    }];
+    let binding_fingerprint =
+        approval_binding_fingerprint_v1(authority.guild_id, binding_revision, &required_bindings)
+            .unwrap();
+    let resource_bindings = json!({
+        "role_bindings": {},
+        "channel_bindings": {"community_hub": "700"}
+    });
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO product_principals (principal_id, discord_user_id) \
+         VALUES ($1, $2) ON CONFLICT (principal_id) DO NOTHING",
+    )
+    .bind(authority.principal_id.as_str())
+    .bind("920000000000000001")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO product_tenants (tenant_id, lifecycle_state, display_name) \
+         VALUES ($1, 'active', $2) ON CONFLICT (tenant_id) DO NOTHING",
+    )
+    .bind(authority.tenant_id.as_str())
+    .bind(format!("Promotion test {tenant}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO automation_installations \
+         (installation_id, tenant_id, discord_application_id, discord_guild_id, \
+          ruleset_key, lifecycle_state, current_authority_revision) \
+         VALUES ($1, $2, $3, $4, $5, 'active', 1) \
+         ON CONFLICT (installation_id) DO NOTHING",
+    )
+    .bind(authority.installation_id.as_str())
+    .bind(authority.tenant_id.as_str())
+    .bind(scoped_discord_id(tenant, 8_200_000_000).to_string())
+    .bind(authority.guild_id.to_string())
+    .bind(authority.ruleset_key.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO automation_installation_authority_versions \
+         (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
+          binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
+          authority_payload_digest, created_by_principal_id, created_by_request_digest) \
+         SELECT $1, 1, $2, 1, $3, $4, 1, 1, 3600, $5, $6, $7 \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM automation_installation_authority_versions \
+             WHERE installation_id = $1 AND revision = 1 \
+         )",
+    )
+    .bind(authority.installation_id.as_str())
+    .bind(authority.tenant_id.as_str())
+    .bind(Json(resource_bindings))
+    .bind(binding_fingerprint.as_str())
+    .bind("3".repeat(64))
+    .bind(authority.principal_id.as_str())
+    .bind("4".repeat(64))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
 fn is_check_violation(error: &sqlx::Error) -> bool {
     matches!(
         error,
@@ -349,12 +444,83 @@ async fn cleanup(pool: &PgPool, tenant: &str) {
         .unwrap();
 }
 
+async fn seed_product_approval(
+    pool: &PgPool,
+    request_id: &ActivationRequestId,
+    payload_digest: &ActivationDigest,
+    context_digest: &ActivationDigest,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+    let bound = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.set_config('starring.product_approval_gate', $1, TRUE)",
+    )
+    .bind(context_digest.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(bound, context_digest.as_str());
+    sqlx::query(
+        "INSERT INTO public.activation_request_approvals \
+         (request_id, approver_id, approved_at, approval_payload_digest) \
+         VALUES ($1, '200', pg_catalog.clock_timestamp(), $2)",
+    )
+    .bind(request_id.as_str())
+    .bind(payload_digest.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let updated = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'approved', product_revision = product_revision + 1 \
+         WHERE id = $1 AND authority_kind = 'product_authoring' \
+         AND state = 'pending' AND product_revision = 1",
+    )
+    .bind(request_id.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    transaction.commit().await.unwrap();
+}
+
 async fn cleanup_product(pool: &PgPool, tenant: &str, guild_id: GuildId) {
-    cleanup(pool, tenant).await;
     let guild_id = guild_id.to_string();
-    sqlx::query("DELETE FROM activation_requests WHERE guild_id = $1")
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.activation_request_approvals IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.activation_request_approvals \
+         DISABLE TRIGGER activation_request_approvals_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM public.activation_request_approvals AS approval \
+         USING public.activation_requests AS activation \
+         WHERE approval.request_id = activation.id AND activation.guild_id = $1",
+    )
+    .bind(&guild_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.activation_request_approvals \
+         ENABLE TRIGGER activation_request_approvals_reject_mutation",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM public.activation_requests WHERE guild_id = $1")
         .bind(&guild_id)
-        .execute(pool)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM public.authoring_promotions WHERE tenant_id = $1")
+        .bind(tenant)
+        .execute(&mut *transaction)
         .await
         .unwrap();
     for table in [
@@ -364,10 +530,11 @@ async fn cleanup_product(pool: &PgPool, tenant: &str, guild_id: GuildId) {
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE guild_id = $1"))
             .bind(&guild_id)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .unwrap();
     }
+    transaction.commit().await.unwrap();
 }
 
 async fn create_prepared(
@@ -448,7 +615,7 @@ async fn database_rejects_direct_product_link_without_promotion_journal() {
     approval_context.approval_context_digest =
         product_approval_context_digest_v1(&request_id, &target, UserId(100), &approval_context);
     let requests = PostgresActivationRequestStore::new(pool.clone());
-    let created = requests
+    let error = requests
         .create_product(CreateProductActivationRequest {
             id: request_id.clone(),
             target: target.clone(),
@@ -456,38 +623,9 @@ async fn database_rejects_direct_product_link_without_promotion_journal() {
             context: approval_context.clone(),
         })
         .await
-        .unwrap();
-    assert_eq!(created.link_state, ActivationLinkStateV1::Unlinked);
-    let authority_rewrite = sqlx::query(
-        "UPDATE activation_requests SET authority_kind = 'legacy_manual', \
-         link_state_name = 'not_required', approval_context = '{\"authority\":\"legacy_manual\"}', \
-         link_state = '{\"state\":\"not_required\"}', promotion_id = NULL, \
-         promotion_request_digest = NULL, approval_payload_digest = NULL, \
-         approval_context_digest = NULL, linked_at = NULL WHERE id = $1",
-    )
-    .bind(request_id.as_str())
-    .execute(&pool)
-    .await;
-    assert!(is_check_violation(&authority_rewrite.unwrap_err()));
-    let error = requests
-        .link_product(
-            &request_id,
-            LinkProductActivation {
-                promotion_id: approval_context.promotion_id.clone(),
-                promotion_request_digest: approval_context.promotion_request_digest.clone(),
-                approval_context_digest: approval_context.approval_context_digest.clone(),
-            },
-        )
-        .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        LinkProductError::Store(ActivationStoreError::Backend(_))
-    ));
-    assert_eq!(
-        requests.get(&request_id).await.unwrap().unwrap().link_state,
-        ActivationLinkStateV1::Unlinked
-    );
+    assert!(matches!(error, ActivationStoreError::Backend(_)));
+    assert!(requests.get(&request_id).await.unwrap().is_none());
 
     let raw_request_id = ActivationRequestId::parse("direct_linked_insert").unwrap();
     let mut raw_context = approval_context;
@@ -543,6 +681,7 @@ async fn create_reconnect_exact_replay_and_conflict_are_durable() {
     let tenant = "postgres-reconnect";
     let sealed = artifact().await;
     let first_pool = pool().await;
+    seed_product_scope(&first_pool, tenant).await;
     cleanup(&first_pool, tenant).await;
     let first_store = PostgresPromotionStore::new(first_pool.clone());
     let created = create_prepared(&first_store, tenant, "reconnect-key", &sealed).await;
@@ -583,6 +722,7 @@ async fn concurrent_create_and_publication_cas_choose_one_winner() {
     let tenant = "postgres-concurrency";
     let sealed = artifact().await;
     let pool = pool().await;
+    seed_product_scope(&pool, tenant).await;
     cleanup(&pool, tenant).await;
     let first_store = PostgresPromotionStore::new(pool.clone());
     let second_store = PostgresPromotionStore::new(pool.clone());
@@ -656,6 +796,7 @@ async fn crash_resume_reuses_publication_and_survives_reconnect() {
     let tenant = "postgres-crash-resume";
     let sealed = artifact().await;
     let first_pool = pool().await;
+    seed_product_scope(&first_pool, tenant).await;
     cleanup(&first_pool, tenant).await;
     let first_store = PostgresPromotionStore::new(first_pool.clone());
     let prepared = create_prepared(&first_store, tenant, "crash-key", &sealed).await;
@@ -746,6 +887,7 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
     let guild_id = context(tenant).guild_id;
     let sealed = artifact().await;
     let pool = pool().await;
+    seed_product_scope(&pool, tenant).await;
     cleanup_product(&pool, tenant, guild_id).await;
     let promotions = PostgresPromotionStore::new(pool.clone());
     let rulesets = PostgresRuleSetStore::new(pool.clone());
@@ -799,14 +941,25 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
     .execute(&pool)
     .await;
     assert!(is_check_violation(&identity_rewrite.unwrap_err()));
-    let approved = requests
-        .approve_bound(
-            &activation.request_id,
-            UserId(200),
-            &activation.approval_context.approval_payload_digest,
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        requests
+            .approve_bound(
+                &activation.request_id,
+                UserId(200),
+                &activation.approval_context.approval_payload_digest,
+            )
+            .await
+            .unwrap_err(),
+        automation_ruleset_activation::ApproveError::BoundApprovalRequired
+    );
+    seed_product_approval(
+        &pool,
+        &activation.request_id,
+        &activation.approval_context.approval_payload_digest,
+        &activation.approval_context.approval_context_digest,
+    )
+    .await;
+    let approved = requests.get(&activation.request_id).await.unwrap().unwrap();
     assert_eq!(approved.state, ActivationRequestState::Approved);
     let activation_service = ActivationService::new(&requests, &rulesets, &environment);
     let outcome = activation_service
@@ -839,10 +992,56 @@ async fn sealed_authoring_reaches_bound_approval_and_guarded_deployment() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+async fn installation_scope_is_persisted_and_matches_record_authority() {
+    let tenant = "postgres-installation-scope";
+    let sealed = artifact().await;
+    let pool = pool().await;
+    seed_product_scope(&pool, tenant).await;
+    cleanup(&pool, tenant).await;
+    let store = PostgresPromotionStore::new(pool.clone());
+    let prepared = create_prepared(&store, tenant, "installation-scope-key", &sealed).await;
+    let (installation_projection, record_installation): (String, String) = sqlx::query_as(
+        "SELECT installation_id, record #>> '{intent,authority,installation_id}' \
+         FROM authoring_promotions WHERE id = $1",
+    )
+    .bind(prepared.id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        installation_projection,
+        prepared.intent.authority.installation_id.as_str()
+    );
+    assert_eq!(record_installation, installation_projection);
+    assert_eq!(store.get(&prepared.id).await.unwrap().unwrap(), prepared);
+    let scalar_tamper = sqlx::query(
+        "UPDATE authoring_promotions SET installation_id = 'promotion-other-installation' \
+         WHERE id = $1",
+    )
+    .bind(prepared.id.as_str())
+    .execute(&pool)
+    .await;
+    assert!(is_check_violation(&scalar_tamper.unwrap_err()));
+    let record_tamper = sqlx::query(
+        "UPDATE authoring_promotions SET record = jsonb_set( \
+         record, '{intent,authority,installation_id}', \
+         to_jsonb('promotion-other-installation'::TEXT)) WHERE id = $1",
+    )
+    .bind(prepared.id.as_str())
+    .execute(&pool)
+    .await;
+    assert!(is_check_violation(&record_tamper.unwrap_err()));
+    assert_eq!(store.get(&prepared.id).await.unwrap().unwrap(), prepared);
+    cleanup(&pool, tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
 async fn corrupted_json_and_shadow_identity_fail_closed() {
     let tenant = "postgres-corruption";
     let sealed = artifact().await;
     let pool = pool().await;
+    seed_product_scope(&pool, tenant).await;
     cleanup(&pool, tenant).await;
     let store = PostgresPromotionStore::new(pool.clone());
     let prepared = create_prepared(&store, tenant, "corruption-key", &sealed).await;

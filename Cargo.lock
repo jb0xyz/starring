@@ -155,6 +155,7 @@ dependencies = [
  "discord-model",
  "futures",
  "getrandom 0.4.3",
+ "hmac",
  "resource-resolution",
  "serde",
  "serde_json",

@@ -10,7 +10,7 @@ fn pure_application_does_not_depend_on_postgres_adapter() {
 }
 
 #[test]
-fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_decision_stores() {
+fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_decision_stores() {
     let manifest = include_str!("../Cargo.toml");
     let regular = manifest
         .split("[dev-dependencies]")
@@ -30,7 +30,7 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_decision_st
     }
     assert!(regular.contains("authoring-application-discord"));
     let source = include_str!("../src/lib.rs");
-    assert!(!source.contains("ProductDecisionPort"));
+    assert!(source.contains("PostgresProductDecisions"));
     assert!(!source.contains("DiscordIdentityV1"));
     assert!(!source.contains("DiscordIdentityError"));
     let identity_model = include_str!("../src/product_identity/model.rs");
@@ -39,6 +39,70 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_decision_st
     assert!(identity_store.contains("identity: VerifiedDiscordIdentityV1"));
     assert!(identity_store.contains("VerifiedIdentityProjection::from_capability"));
     assert!(!identity_store.contains("pub fn from_capability"));
+}
+
+#[test]
+fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
+    let store = include_str!("../src/product_decisions/store.rs");
+    let digest = include_str!("../src/product_decisions/digest.rs");
+    let config = include_str!("../src/product_decisions/config.rs");
+    assert!(store.contains("public.starring_product_approve_v1"));
+    assert!(store.contains("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+    assert!(store.contains("FreshDiscordAuthorityEvidenceV1"));
+    assert!(store.contains("request.session_fingerprint().as_bytes()"));
+    assert!(!store.contains(".bind(request.command().idempotency_key.as_str())"));
+    assert!(digest.contains("Hmac<Sha256>"));
+    assert!(digest.contains("IDEMPOTENCY_DOMAIN"));
+    assert!(digest.contains("SEMANTIC_REQUEST_DOMAIN"));
+    assert!(digest.contains("SESSION_SUBJECT_DOMAIN"));
+    assert!(digest.contains("KEY_MATERIAL_FINGERPRINT_DOMAIN"));
+    assert!(!digest.contains("request_id().as_str()"));
+    assert!(config.contains("ConstantTimeEq"));
+    assert!(config.contains("obvious_repetition"));
+    let scope_migration =
+        include_str!("../../../migrations/202607190004_scope_product_activations.sql");
+    assert!(scope_migration.contains("authoring_promotions_product_scope_unique"));
+    assert!(scope_migration.contains("activation_requests_product_scope_identity_unique"));
+    assert!(scope_migration.contains("activation_requests_product_promotion_scope_fk"));
+    assert!(
+        scope_migration.contains("authoring promotion control-plane provisioning is incomplete")
+    );
+    assert!(scope_migration.contains("activation_request_approvals_product_parent_fk"));
+    assert!(scope_migration.contains("runtime_deployments_activation_scope_fk"));
+    let approval_migration =
+        include_str!("../../../migrations/202607190005_guard_product_approval.sql");
+    assert!(approval_migration.contains("SECURITY DEFINER"));
+    assert!(approval_migration.contains("STRICT\nSECURITY DEFINER"));
+    assert!(approval_migration.contains("SET search_path = pg_catalog"));
+    assert!(approval_migration.contains("pg_catalog.pg_advisory_xact_lock"));
+    assert!(approval_migration.contains("product_approve_v1:key-coverage"));
+    assert!(approval_migration.contains("pg_catalog.unnest(idempotency_key_digest_candidates)"));
+    assert!(approval_migration.contains("starring.product_approval_gate"));
+    assert!(approval_migration.contains("activation approvals are append-only"));
+    assert!(approval_migration.contains("FROM PUBLIC;"));
+    assert!(approval_migration.contains("public.product_action_receipts"));
+    assert!(approval_migration.contains("public.product_action_receipt_idempotency_aliases"));
+    assert!(approval_migration.contains("product_action_receipts_assert_approval_alias"));
+    assert!(approval_migration.contains("product_action_receipts_assert_approval_audit"));
+    assert!(approval_migration.contains("idempotency_keyring_incomplete"));
+    assert!(approval_migration.contains("idempotency_digest_key_fingerprint"));
+    assert!(approval_migration.contains("public.product_audit_events"));
+    assert!(approval_migration.contains("session_subject_digest"));
+    assert!(
+        approval_migration.contains("DROP CONSTRAINT product_audit_events_session_principal_fk")
+    );
+    assert!(!approval_migration.contains("idempotency_key TEXT"));
+    let decision_store = include_str!("../src/product_decisions/store.rs");
+    assert!(decision_store.contains("transaction.commit().await.map_err(database_commit)?"));
+    assert!(decision_store.contains("matches!(&error, sqlx::Error::Database(_))"));
+    let activation_store =
+        include_str!("../../automation-ruleset-activation-postgres/src/store.rs");
+    assert_eq!(
+        activation_store
+            .matches("product activation requires authenticated product control")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -173,6 +237,26 @@ fn source_files_contain_no_comments() {
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         (
+            "src/product_decisions/config.rs",
+            include_str!("../src/product_decisions/config.rs"),
+        ),
+        (
+            "src/product_decisions/digest.rs",
+            include_str!("../src/product_decisions/digest.rs"),
+        ),
+        (
+            "src/product_decisions/mod.rs",
+            include_str!("../src/product_decisions/mod.rs"),
+        ),
+        (
+            "src/product_decisions/row.rs",
+            include_str!("../src/product_decisions/row.rs"),
+        ),
+        (
+            "src/product_decisions/store.rs",
+            include_str!("../src/product_decisions/store.rs"),
+        ),
+        (
             "src/product_identity/config.rs",
             include_str!("../src/product_identity/config.rs"),
         ),
@@ -201,6 +285,14 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_identity.rs",
             include_str!("postgres_product_identity.rs"),
+        ),
+        (
+            "tests/postgres_product_decisions.rs",
+            include_str!("postgres_product_decisions.rs"),
+        ),
+        (
+            "tests/postgres_product_control_e2e.rs",
+            include_str!("postgres_product_control_e2e.rs"),
         ),
     ];
     for (path, source) in sources {

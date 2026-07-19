@@ -3,6 +3,7 @@ mod bindings;
 mod database;
 mod digest;
 mod envelope;
+mod product_decisions;
 mod product_identity;
 mod secret;
 mod snapshot;
@@ -18,6 +19,10 @@ pub use envelope::{
     build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
     SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1, SnapshotAuthenticatedDataV1,
     SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+};
+pub use product_decisions::{
+    PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
+    ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,

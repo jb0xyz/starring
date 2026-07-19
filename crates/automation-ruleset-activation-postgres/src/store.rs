@@ -391,6 +391,13 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(ApproveError::BoundApprovalRequired);
+        }
         let now = database_now(&mut tx).await?;
         if let Err(error) = request.approve_at(approver, now) {
             if error == ApprovalDecisionError::Expired {
@@ -447,6 +454,13 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(ApproveError::BoundApprovalRequired);
+        }
         let now = database_now(&mut tx).await?;
         if let Err(error) = request.approve_bound_at(approver, approval_payload_digest, now) {
             if error == ApprovalDecisionError::Expired {
@@ -504,6 +518,15 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(RejectError::Store(ActivationStoreError::InvalidRequest(
+                "product activation requires authenticated product control".to_string(),
+            )));
+        }
         let now = database_now(&mut tx).await?;
         if let Err(error) = request.reject_at(rejected_by, reason, now) {
             if error == RejectionDecisionError::Expired {
@@ -547,6 +570,15 @@ impl ActivationRequestStore for PostgresActivationRequestStore {
         let mut request = fetch_request(&mut tx, request_id, true)
             .await?
             .ok_or(ActivationStoreError::NotFound)?;
+        if matches!(
+            &request.approval_context,
+            ActivationApprovalContextV1::ProductAuthoring { .. }
+        ) {
+            tx.rollback().await.map_err(backend)?;
+            return Err(WithdrawError::Store(ActivationStoreError::InvalidRequest(
+                "product activation requires authenticated product control".to_string(),
+            )));
+        }
         let now = database_now(&mut tx).await?;
         if let Err(error) = request.withdraw_at(withdrawn_by, reason, now) {
             if error == WithdrawDecisionError::Expired {
