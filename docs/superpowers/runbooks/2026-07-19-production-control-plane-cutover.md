@@ -318,8 +318,66 @@ This is a capability and function-shape probe, not privileged-DDL attestation.
 Migration checksum verification, restricted DDL credentials, and schema-change
 audit evidence remain separate cutover requirements.
 
-Migrations 014 and 015 certify only installation-authority reads and session
-authentication reads or touches. Authorized-snapshot loading, OAuth flow and
+Migration 016 creates the authorized promotion snapshot read boundary. It binds
+the authoring session, owner principal, opaque session digest, tenant, and
+installation in one bounded read-committed, read-only transaction. The single
+joined function statement is the atomic database snapshot; the prior timeout
+configuration statement cannot pin an older view. Its materialized
+database clock rejects disabled principals and malformed, revoked, future,
+expired, or overlong product sessions before returning any row. The result is
+limited to the encrypted generation envelope and the durable metadata required
+for the existing Rust ownership, scope, fresh Discord authority, generation,
+binding, policy, authenticated-encryption, restored-snapshot, and artifact
+checks. It never returns stored CSRF or OAuth verifier digests, generation
+summaries, writer request digests, or authority creator request digests.
+
+Migration 016 requires all seven referenced identity, tenant, installation,
+authoring-session, generation, and authority-version relations to be ordinary
+non-RLS tables under one owner. It strips non-owner and hostile default
+function grants, transfers the function to that owner, and revokes `PUBLIC`
+execution in the same transaction. Grant the API role only the exact signature
+without grant option:
+
+```sql
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_authorized_snapshot_read_v1(
+        TEXT,
+        TEXT,
+        BYTEA,
+        TEXT,
+        TEXT
+    )
+TO starring_api;
+```
+
+For this slice, `starring_api` must have no table or column privilege on
+`product_principals`, `product_auth_sessions`, `product_tenants`,
+`automation_installations`, `authoring_sessions`,
+`authoring_session_generations`, or
+`automation_installation_authority_versions`. Call
+`PostgresAuthorizedPromotionSnapshots::verify_readiness` through a direct
+`starring_api` login before opening ingress. It verifies the exact function
+result and execution contract, all seven relation owners and RLS flags, ACLs,
+database and role capabilities, and an impossible-scope 31-byte-digest probe in
+a bounded read-only transaction.
+
+The snapshot function's read is the authorization linearization point. Changes
+committed before it are observed. An immutable generation that was current at
+that instant may still be promoted if a state change commits after the read and
+before the later promotion write. Closing that interval requires one atomic
+snapshot-validation and promotion-write transaction rather than row locks that
+end before decryption. PostgreSQL also cannot independently verify fresh
+Discord evidence because that evidence is an in-process capability rather than
+a database-verifiable signature. Rust remains authoritative for Discord
+permissions, evidence freshness, authority digest, decryption, and artifact
+validation. A caller that compromises the API database login and possesses a
+valid session digest can invoke this function directly, but receives only the
+encrypted envelope and its bounded metadata, never plaintext or stored CSRF or
+OAuth verifiers. The returned session digest is exactly the caller-supplied
+digest and does not reveal an additional credential.
+
+Migrations 014 through 016 certify only installation-authority reads, session
+authentication reads or touches, and authorized-snapshot reads. OAuth flow and
 session issuance or logout, promotion and publication/link persistence,
 approval and status queries, Apply artifact reads, and runtime convergence still
 contain direct SQL. Product rejection has no production persistence adapter.
@@ -407,7 +465,8 @@ retention.
 - aggregate preflight counts
 - migration duration and lock-wait metrics
 - role capability-probe results
-- authentication readiness outcome, function identities, and role names only
+- authentication and authorized-snapshot readiness outcomes, function
+  identities, and role names only
 - retention deleted counts and backlog flags
 - keyring coverage outcome and key IDs only
 - backup and restore-drill identifiers

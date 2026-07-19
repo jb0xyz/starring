@@ -300,25 +300,87 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(authentication.contains("pg_catalog.set_config("));
     assert!(!authentication.contains(".bind(credential)"));
     let snapshot = include_str!("../src/snapshot.rs");
-    assert!(snapshot.contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"));
-    assert!(snapshot.contains("CURRENT_TIMESTAMP AS database_now"));
+    assert!(snapshot.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
     assert!(snapshot.contains("evidence.installation_authority_revision().get()"));
     assert!(snapshot.contains("evidence.installation_authority_digest()"));
     assert!(snapshot.contains("actor.session_fingerprint().as_bytes()"));
-    assert!(snapshot.contains("actor_session.session_digest = $2"));
-    assert!(snapshot.contains("authoring_session.tenant_id = $3"));
-    assert!(snapshot.contains("authoring_session.installation_id = $4"));
+    assert!(snapshot.contains("actor.principal_id().as_str()"));
     assert!(snapshot.contains(".bind(scope.tenant_id().as_str())"));
     assert!(snapshot.contains(".bind(scope.installation_id().as_str())"));
-    assert!(snapshot.contains("public.authoring_sessions"));
-    assert!(snapshot.contains("public.product_principals"));
-    assert!(snapshot.contains("public.product_auth_sessions"));
-    assert!(snapshot.contains("public.product_tenants"));
-    assert!(snapshot.contains("public.automation_installations"));
-    assert!(snapshot.contains("public.authoring_session_generations"));
-    assert!(snapshot.contains("public.automation_installation_authority_versions"));
+    assert!(snapshot
+        .contains("public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)"));
+    for forbidden in [
+        "public.authoring_sessions",
+        "public.product_principals",
+        "public.product_auth_sessions",
+        "public.product_tenants",
+        "public.automation_installations",
+        "public.authoring_session_generations",
+        "public.automation_installation_authority_versions",
+    ] {
+        assert!(!snapshot.contains(forbidden));
+    }
     assert!(snapshot.contains("pg_catalog.set_config("));
+    assert!(snapshot.contains("lock_timeout"));
+    assert!(snapshot.contains("idle_in_transaction_session_timeout"));
     assert!(!snapshot.contains("map_err(|error| session_backend(error.to_string()))"));
+    let snapshot_scope_migration =
+        include_str!("../../../migrations/202607190016_scope_authorized_snapshot_reads.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_product_authorized_snapshot_read_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "WITH request_clock AS MATERIALIZED",
+        "pg_catalog.clock_timestamp()",
+        "actor_session.session_digest = expected_product_session_digest",
+        "actor_session.principal_id = principal.principal_id",
+        "pg_catalog.octet_length(actor_session.oauth_state_digest) = 32",
+        "actor_session.revoked_at IS NULL",
+        "actor_session.authenticated_at = actor_session.created_at",
+        "actor_session.last_seen_at <= request_clock.database_now",
+        "actor_session.idle_expires_at\n            <= actor_session.last_seen_at + INTERVAL '30 minutes'",
+        "actor_session.absolute_expires_at\n            <= actor_session.authenticated_at + INTERVAL '12 hours'",
+        "LEFT JOIN public.authoring_session_generations",
+        "LEFT JOIN public.automation_installation_authority_versions",
+        "relation_count <> 7",
+        "table_count <> 7",
+        "rls_disabled_count <> 7",
+        "owner_count <> 1",
+        "pg_catalog.aclexplode(COALESCE(",
+        "REVOKE ALL PRIVILEGES ON FUNCTION",
+        "ALTER FUNCTION public.starring_product_authorized_snapshot_read_v1",
+        ") FROM PUBLIC;",
+    ] {
+        assert!(
+            snapshot_scope_migration.contains(required),
+            "missing authorized snapshot scope guard: {required}"
+        );
+    }
+    for forbidden in [
+        "actor_session.csrf_digest,",
+        "actor_session.oauth_state_digest,",
+        "generation.summary",
+        "generation.writer_request_digest",
+        "authority.created_by_request_digest",
+    ] {
+        assert!(!snapshot_scope_migration.contains(forbidden));
+    }
+    let snapshot_readiness = include_str!("../src/snapshot/readiness.rs");
+    for required in [
+        "FUNCTION_IDENTITY",
+        "FUNCTION_RESULT",
+        "ScopedFunctionContractV1::set(",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 7]",
+        "ScopedRelationContractV1::ordinary_without_rls",
+        "begin_scoped_database_readiness(",
+        "public.starring_product_authorized_snapshot_read_v1(",
+        "PROBE_DIGEST: [u8; 31]",
+    ] {
+        assert!(
+            snapshot_readiness.contains(required),
+            "missing authorized snapshot readiness guard: {required}"
+        );
+    }
     let installation_authority = include_str!("../src/installation_authority.rs");
     assert!(installation_authority
         .contains("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"));

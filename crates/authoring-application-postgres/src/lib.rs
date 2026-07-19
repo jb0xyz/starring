@@ -53,8 +53,8 @@ pub use secret::{
     ProductSecretV1,
 };
 pub use snapshot::{
-    AuthorizedSnapshotConfigError, PostgresAuthorizedPromotionSnapshots,
-    PostgresAuthorizedPromotionSnapshotsConfig,
+    AuthorizedSnapshotConfigError, AuthorizedSnapshotReadinessErrorV1,
+    PostgresAuthorizedPromotionSnapshots, PostgresAuthorizedPromotionSnapshotsConfig,
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
