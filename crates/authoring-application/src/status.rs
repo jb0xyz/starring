@@ -157,6 +157,39 @@ pub enum ProductStatusV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductApplyResultV1 {
+    status: ProductStatusV1,
+    exact_replay: bool,
+    exact_deployment: ExactDeploymentSelectorV1,
+}
+
+impl ProductApplyResultV1 {
+    pub(crate) fn from_verified_application(
+        status: ProductStatusV1,
+        exact_replay: bool,
+        exact_deployment: ExactDeploymentSelectorV1,
+    ) -> Self {
+        Self {
+            status,
+            exact_replay,
+            exact_deployment,
+        }
+    }
+
+    pub fn status(&self) -> ProductStatusV1 {
+        self.status
+    }
+
+    pub fn exact_replay(&self) -> bool {
+        self.exact_replay
+    }
+
+    pub fn exact_deployment(&self) -> &ExactDeploymentSelectorV1 {
+        &self.exact_deployment
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeDeploymentQueryV1 {
     pub promotion: PromotionSelectorV1,
 }

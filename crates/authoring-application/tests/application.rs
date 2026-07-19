@@ -459,6 +459,7 @@ fn decision_projection(phase: ProductDecisionPhaseV1) -> ProductDecisionProjecti
 struct Decisions {
     events: Arc<Mutex<Vec<&'static str>>>,
     phase: Mutex<ProductDecisionPhaseV1>,
+    apply_exact_replay: Mutex<bool>,
 }
 
 impl ProductDecisionQueryPort<Evidence> for Decisions {
@@ -550,7 +551,7 @@ impl ProductApplyPort<Evidence> for Decisions {
             decision_projection(ProductDecisionPhaseV1::Applied {
                 exact_deployment: exact_deployment(),
             }),
-            false,
+            *self.apply_exact_replay.lock().unwrap(),
         ))
     }
 }
@@ -600,6 +601,7 @@ fn product_fixture(
         Decisions {
             events: events.clone(),
             phase: Mutex::new(phase),
+            apply_exact_replay: Mutex::new(false),
         },
         Deployments {
             events: events.clone(),
@@ -766,7 +768,7 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
             ProductDecisionPhaseV1::Approved,
             DeploymentStatusProjectionV1::NotRequested,
         );
-        let status =
+        let result =
             ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
                 .apply(
                     "opaque-session-token",
@@ -783,7 +785,47 @@ fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
                 )
                 .await
                 .unwrap();
-        assert_eq!(status, ProductStatusV1::RuntimePending);
+        assert_eq!(result.status(), ProductStatusV1::RuntimePending);
+        assert!(!result.exact_replay());
+        assert_eq!(result.exact_deployment(), &exact_deployment());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["authenticate_mutation", "authorize", "apply_idempotent"]
+        );
+    });
+}
+
+#[test]
+fn exact_apply_replay_may_project_live_after_runtime_verification() {
+    block_on(async {
+        let (events, authentication, authority, decisions, deployments) = product_fixture(
+            ProductDecisionPhaseV1::Approved,
+            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
+                exact_deployment(),
+                NonZeroU64::new(7).unwrap(),
+            )),
+        );
+        *decisions.apply_exact_replay.lock().unwrap() = true;
+        let result =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
+                .apply(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    ApplyProductPromotionV1 {
+                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
+                            .unwrap(),
+                        expected_revision: ProductRevisionV1::new(3).unwrap(),
+                        idempotency_key: ProductIdempotencyKeyV1::parse("apply-key").unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+        assert_eq!(result.status(), ProductStatusV1::Live);
+        assert!(result.exact_replay());
+        assert_eq!(result.exact_deployment(), &exact_deployment());
         assert_eq!(
             *events.lock().unwrap(),
             vec![

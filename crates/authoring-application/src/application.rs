@@ -9,11 +9,12 @@ use crate::{
     AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionSnapshotPort,
     AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusProjectionV1,
     DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
-    MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApprovalPort,
-    ProductApprovalPreviewV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
-    ProductDecisionQueryPort, ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1,
-    ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionPort,
-    RejectProductPromotionV1, RuntimeDeploymentQueryV1,
+    MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApplyResultV1,
+    ProductApprovalPort, ProductApprovalPreviewV1, ProductDecisionPhaseV1,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductMutationReceiptV1,
+    ProductRejectionPort, ProductRequestIdV1, ProductStatusQueryV1, ProductStatusV1,
+    PromoteOwnedSessionV1, PromotionSubmissionPort, RejectProductPromotionV1,
+    RuntimeDeploymentQueryV1,
 };
 use crate::{ApproveProductPromotionV1, AuthoringApplicationError};
 
@@ -285,7 +286,7 @@ where
         request_id: &ProductRequestIdV1,
         installation: &InstallationSelectorV1,
         command: ApplyProductPromotionV1,
-    ) -> Result<ProductStatusV1, ProductApplicationError>
+    ) -> Result<ProductApplyResultV1, ProductApplicationError>
     where
         A: MutationAuthenticationPort,
         D: ProductApplyPort<G::Evidence>,
@@ -311,8 +312,21 @@ where
             ))
             .await?;
         validate_decision_projection(authorized.scope(), &promotion, receipt.projection())?;
-        self.resolve_product_status(&actor, &authorized, receipt.projection())
-            .await
+        let ProductDecisionPhaseV1::Applied { exact_deployment } = receipt.projection().phase()
+        else {
+            return Err(ProductApplicationError::InvalidProjection);
+        };
+        let status = if receipt.exact_replay() {
+            self.resolve_product_status(&actor, &authorized, receipt.projection())
+                .await?
+        } else {
+            ProductStatusV1::RuntimePending
+        };
+        Ok(ProductApplyResultV1::from_verified_application(
+            status,
+            receipt.exact_replay(),
+            exact_deployment.clone(),
+        ))
     }
 
     pub async fn get_deployment_status(

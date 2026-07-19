@@ -36,5 +36,6 @@ pub use status::{
     AuthorizedDeploymentStatusV1, DeploymentStatusPort, DeploymentStatusPortError,
     DeploymentStatusProjectionV1, DeploymentStatusV1, ExactDeploymentSelectorError,
     ExactDeploymentSelectorV1, ExactLiveProjectionV1, ProductApplicationError,
-    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductStatusV1, RuntimeDeploymentQueryV1,
+    ProductApplyResultV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductStatusV1,
+    RuntimeDeploymentQueryV1,
 };
