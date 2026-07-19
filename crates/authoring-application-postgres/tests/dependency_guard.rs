@@ -133,6 +133,12 @@ fn product_identity_retention_keeps_index_bounded_work_shape() {
     assert!(migration.contains("unconsumed_flow_backlog AS MATERIALIZED"));
     assert!(migration.contains("consumed_flow_backlog AS MATERIALIZED"));
     assert!(!migration.contains("INNER JOIN bounded_candidates"));
+    let adapter = include_str!("../src/product_retention.rs");
+    assert!(adapter.contains("MAX_BATCH_LIMIT: u32 = 1000"));
+    assert!(adapter.contains("set_config('statement_timeout', $1, TRUE)"));
+    assert!(adapter.contains("set_config('lock_timeout', $1, TRUE)"));
+    assert!(adapter.contains("transaction.commit().await.map_err(database_commit)?"));
+    assert!(adapter.contains("matches!(&error, sqlx::Error::Database(_))"));
 }
 
 #[test]
@@ -301,6 +307,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_identity/store.rs",
             include_str!("../src/product_identity/store.rs"),
+        ),
+        (
+            "src/product_retention.rs",
+            include_str!("../src/product_retention.rs"),
         ),
         ("src/secret.rs", include_str!("../src/secret.rs")),
         ("src/snapshot.rs", include_str!("../src/snapshot.rs")),

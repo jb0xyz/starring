@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use authoring_application_postgres::MIGRATOR;
+use authoring_application_postgres::{
+    PostgresProductIdentityRetention, PostgresProductIdentityRetentionConfig,
+    ProductDatabaseFailureV1, ProductIdentityRetentionError, MIGRATOR,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
@@ -1007,5 +1010,59 @@ async fn retention_purge_preserves_stable_session_subject_audit_history() {
     assert_eq!(retained_subject, session_subject);
 
     transaction.rollback().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn retention_adapter_bounds_inputs_database_locks_and_reports_committed_work() {
+    let pool = pool().await;
+    let fixture = fixture_key("adapter");
+    let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let eligible = flow_seed(
+        &fixture,
+        "eligible",
+        now - TimeDelta::days(10) - TimeDelta::minutes(5),
+        now - TimeDelta::days(10),
+        None,
+    );
+    let mut connection = pool.acquire().await.unwrap();
+    insert_flows(&mut connection, &[eligible]).await;
+    drop(connection);
+
+    let retention = PostgresProductIdentityRetention::with_config(
+        pool.clone(),
+        PostgresProductIdentityRetentionConfig::new(
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        retention.purge(0).await.unwrap_err(),
+        ProductIdentityRetentionError::InvalidBatchLimit
+    );
+    let report = retention.purge(1).await.unwrap();
+    assert_eq!(report.deleted_sessions(), 0);
+    assert_eq!(report.deleted_oauth_flows(), 1);
+    assert!(!report.backlog_remaining());
+
+    let mut locker = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.product_auth_sessions IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *locker)
+        .await
+        .unwrap();
+    let bounded = tokio::time::timeout(Duration::from_secs(2), retention.purge(1))
+        .await
+        .expect("retention adapter exceeded its outer test deadline")
+        .unwrap_err();
+    assert_eq!(
+        bounded,
+        ProductIdentityRetentionError::Database(ProductDatabaseFailureV1::Timeout)
+    );
+    locker.rollback().await.unwrap();
     pool.close().await;
 }

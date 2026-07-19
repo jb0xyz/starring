@@ -5,6 +5,7 @@ mod digest;
 mod envelope;
 mod product_decisions;
 mod product_identity;
+mod product_retention;
 mod secret;
 mod snapshot;
 
@@ -29,6 +30,11 @@ pub use product_identity::{
     OAuthFlowIssueV1, PostgresProductIdentityConfig, PostgresProductIdentityStore,
     ProductIdentityConfigError, ProductIdentityError, ProductIdentityLifetimesV1,
     ProductLogoutDispositionV1, ProductSessionRevocationReasonV1,
+};
+pub use product_retention::{
+    PostgresProductIdentityRetention, PostgresProductIdentityRetentionConfig,
+    ProductIdentityRetentionConfigError, ProductIdentityRetentionError,
+    ProductIdentityRetentionReportV1,
 };
 pub use secret::{
     OperatingSystemSecretGenerator, ProductSecretGenerator, ProductSecretGeneratorError,
