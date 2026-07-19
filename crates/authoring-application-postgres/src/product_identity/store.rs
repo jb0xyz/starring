@@ -1,5 +1,10 @@
 use sqlx::postgres::PgPool;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64};
+#[cfg(test)]
+use std::sync::Arc;
+
 use crate::{
     OperatingSystemSecretGenerator, PostgresAuthentication, ProductSecretGenerator,
     ProductSecretGeneratorError, ProductSecretV1,
@@ -38,6 +43,12 @@ pub struct PostgresProductIdentityStore<G = OperatingSystemSecretGenerator> {
     pub(super) pools: ProductIdentityDatabasePoolsV1,
     pub(super) generator: G,
     pub(super) config: PostgresProductIdentityConfig,
+    #[cfg(test)]
+    pub(super) session_issue_commit_ack_loss_delay_millis: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(super) session_issue_close_pool_after_ack_loss: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(super) session_issue_rollback_before_ack_loss: Arc<AtomicBool>,
 }
 
 impl PostgresProductIdentityStore<OperatingSystemSecretGenerator> {
@@ -59,6 +70,12 @@ impl<G> PostgresProductIdentityStore<G> {
             pools,
             generator,
             config,
+            #[cfg(test)]
+            session_issue_commit_ack_loss_delay_millis: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            session_issue_close_pool_after_ack_loss: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            session_issue_rollback_before_ack_loss: Arc::new(AtomicBool::new(false)),
         }
     }
 

@@ -7,6 +7,8 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::Connection;
 
 const IDENTITY_LIFECYCLE_MIGRATION: i64 = 202_607_190_017;
+const SESSION_ISSUE_RECONCILIATION_MIGRATION: i64 = 202_607_190_018;
+const SESSION_ISSUE_FUNCTION: &str = "public.starring_product_session_issue_v1(bytea,text,text,timestamp with time zone,text,text,bytea,bytea,double precision,double precision)";
 const IDENTITY_LIFECYCLE_FUNCTIONS: [&str; 10] = [
     "public.starring_product_oauth_database_identity_v1()",
     "public.starring_product_session_issuer_database_identity_v1()",
@@ -173,11 +175,30 @@ async fn apply_migrations_through_016(pool: &PgPool) {
     }
 }
 
+async fn apply_migrations_through_017(pool: &PgPool) {
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.version < SESSION_ISSUE_RECONCILIATION_MIGRATION)
+    {
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
 fn identity_lifecycle_migration() -> &'static sqlx::migrate::Migration {
     MIGRATOR
         .iter()
         .find(|migration| migration.version == IDENTITY_LIFECYCLE_MIGRATION)
         .expect("identity lifecycle migration must exist")
+}
+
+fn session_issue_reconciliation_migration() -> &'static sqlx::migrate::Migration {
+    MIGRATOR
+        .iter()
+        .find(|migration| migration.version == SESSION_ISSUE_RECONCILIATION_MIGRATION)
+        .expect("session issue reconciliation migration must exist")
 }
 
 async fn assert_no_lifecycle_functions(pool: &PgPool) {
@@ -687,6 +708,270 @@ async fn identity_lifecycle_migration_rejects_rls_drift_atomically() {
     .catch_unwind()
     .await;
     drop_isolated_database(database).await;
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn session_issue_reconciliation_migration_seals_function_capability() {
+    let mut database = isolated_database("reconcile_acl").await;
+    apply_migrations_through_017(&database.pool).await;
+    let hostile_role = format!("starring_identity_hostile_{}", suffix());
+    assert_safe_identifier(&hostile_role);
+    sqlx::query(&format!(
+        "CREATE ROLE {hostile_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 0"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION {SESSION_ISSUE_FUNCTION} TO {hostile_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let definition_before = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_get_functiondef(function_row.oid) \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(definition_before.contains(
+            "locked_flow.consumed_at > issue_now OR issue_now >= locked_flow.expires_at"
+        ));
+        let hostile_execute_before = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_function_privilege($2, function_row.oid, 'EXECUTE') \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(hostile_execute_before);
+
+        sqlx::raw_sql(session_issue_reconciliation_migration().sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let relation_owner = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_get_userbyid(relation_row.relowner) \
+             FROM pg_catalog.pg_class AS relation_row \
+             WHERE relation_row.oid = pg_catalog.to_regclass('public.product_auth_sessions')",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let contract = sqlx::query_as::<
+            _,
+            (
+                String,
+                bool,
+                bool,
+                String,
+                String,
+                Option<Vec<String>>,
+                f64,
+                bool,
+                bool,
+                i64,
+                i64,
+                String,
+            ),
+        >(
+            "SELECT pg_catalog.pg_get_userbyid(function_row.proowner), \
+              function_row.prosecdef, \
+              function_row.proisstrict, \
+              function_row.provolatile::TEXT, \
+              function_row.proparallel::TEXT, \
+              function_row.proconfig, \
+              function_row.prorows::DOUBLE PRECISION, \
+              pg_catalog.has_function_privilege($2, function_row.oid, 'EXECUTE'), \
+              EXISTS ( \
+               SELECT 1 \
+               FROM pg_catalog.aclexplode(COALESCE( \
+                function_row.proacl, \
+                pg_catalog.acldefault('f', function_row.proowner) \
+               )) AS privilege \
+               WHERE privilege.grantee = 0 \
+                AND privilege.privilege_type = 'EXECUTE' \
+              ), \
+              (SELECT pg_catalog.count(*) \
+               FROM pg_catalog.aclexplode(COALESCE( \
+                function_row.proacl, \
+                pg_catalog.acldefault('f', function_row.proowner) \
+               )) AS privilege), \
+              (SELECT pg_catalog.count(*) \
+               FROM pg_catalog.aclexplode(COALESCE( \
+                function_row.proacl, \
+                pg_catalog.acldefault('f', function_row.proowner) \
+               )) AS privilege \
+               WHERE privilege.grantee <> function_row.proowner), \
+              pg_catalog.pg_get_functiondef(function_row.oid) \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(contract.0, relation_owner);
+        assert!(contract.1);
+        assert!(contract.2);
+        assert_eq!(contract.3, "v");
+        assert_eq!(contract.4, "u");
+        assert_eq!(contract.5, Some(vec!["search_path=pg_catalog".to_string()]));
+        assert_eq!(contract.6, 1.0);
+        assert!(!contract.7);
+        assert!(!contract.8);
+        assert_eq!(contract.9, 1);
+        assert_eq!(contract.10, 0);
+        assert_ne!(contract.11, definition_before);
+        let replay_lookup = contract.11.find("SELECT authentication_session.*").unwrap();
+        let new_issue_expiry_check = contract
+            .11
+            .find("IF issue_now >= locked_flow.expires_at THEN")
+            .unwrap();
+        assert!(replay_lookup < new_issue_expiry_check);
+    })
+    .catch_unwind()
+    .await;
+    database.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {hostile_role}"))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn session_issue_reconciliation_migration_rolls_back_on_owner_drift() {
+    let mut database = isolated_database("reconcile_drift").await;
+    apply_migrations_through_017(&database.pool).await;
+    let split_owner = format!("starring_identity_split_{}", suffix());
+    let hostile_role = format!("starring_identity_hostile_{}", suffix());
+    for role in [&split_owner, &hostile_role] {
+        assert_safe_identifier(role);
+        sqlx::query(&format!(
+            "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+             NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 0"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "ALTER TABLE public.product_oauth_flows OWNER TO {split_owner}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION {SESSION_ISSUE_FUNCTION} TO {hostile_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let before = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT pg_catalog.pg_get_functiondef(function_row.oid), \
+              COALESCE(function_row.proacl::TEXT, ''), \
+              pg_catalog.pg_get_userbyid(function_row.proowner) \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(before.0.contains(
+            "locked_flow.consumed_at > issue_now OR issue_now >= locked_flow.expires_at"
+        ));
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_function_privilege($2, function_row.oid, 'EXECUTE') \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap());
+
+        let mut transaction = database.pool.begin().await.unwrap();
+        let error = sqlx::raw_sql(session_issue_reconciliation_migration().sql.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .expect_err("session issue reconciliation must reject split relation owners");
+        assert!(matches!(
+            error,
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("55000")
+        ));
+        transaction.rollback().await.unwrap();
+
+        let after = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT pg_catalog.pg_get_functiondef(function_row.oid), \
+              COALESCE(function_row.proacl::TEXT, ''), \
+              pg_catalog.pg_get_userbyid(function_row.proowner) \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(after, before);
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_function_privilege($2, function_row.oid, 'EXECUTE') \
+             FROM pg_catalog.pg_proc AS function_row \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
+        )
+        .bind(SESSION_ISSUE_FUNCTION)
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap());
+        let observed_split_owner = sqlx::query_scalar::<_, String>(
+            "SELECT pg_catalog.pg_get_userbyid(relation_row.relowner) \
+             FROM pg_catalog.pg_class AS relation_row \
+             WHERE relation_row.oid = pg_catalog.to_regclass('public.product_oauth_flows')",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(observed_split_owner, split_owner);
+    })
+    .catch_unwind()
+    .await;
+    database.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+    for role in [&hostile_role, &split_owner] {
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(&mut database.administrator)
+            .await
+            .unwrap();
+    }
     if let Err(payload) = outcome {
         std::panic::resume_unwind(payload);
     }

@@ -525,6 +525,26 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(identity.contains("credential,\n            Some(csrf),"));
     assert!(identity.contains("persisted_tag.ct_eq(&expected_tag)"));
     assert!(identity.contains("ProductLogoutDispositionV1::ExactReplay"));
+    let session_issue = include_str!("../src/product_identity/session_issue.rs");
+    assert_eq!(
+        session_issue
+            .matches(".execute_session_issue_attempt(")
+            .count(),
+        2
+    );
+    for required in [
+        "Err(ProductIdentityError::CommitIndeterminate) => match self",
+        "_ => return Err(ProductIdentityError::CommitIndeterminate)",
+        "self.commit_issued_session(transaction).await?",
+        "if exact_replay {",
+        "let _ = transaction.rollback().await",
+    ] {
+        assert!(
+            session_issue.contains(required),
+            "missing bounded session issue reconciliation guard: {required}"
+        );
+    }
+    assert!(!session_issue.contains("Err(ProductIdentityError::CommitIndeterminate) => continue"));
     assert!(!identity.contains("public.product_oauth_flows"));
     assert!(!identity.contains("public.product_auth_sessions"));
     assert!(!identity.contains("public.product_principals"));
@@ -566,6 +586,57 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
             "missing product identity lifecycle guard: {required}"
         );
     }
+    let session_issue_reconciliation_migration =
+        include_str!("../../../migrations/202607190018_reconcile_product_session_issue.sql");
+    for required in [
+        "CREATE OR REPLACE FUNCTION public.starring_product_session_issue_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "locked_flow.consumed_at > existing_session.authenticated_at",
+        "existing_session.authenticated_at >= locked_flow.expires_at",
+        "existing_session.authenticated_at > issue_now",
+        "existing_session.session_digest <> new_session_digest",
+        "existing_session.csrf_digest <> new_csrf_digest",
+        "existing_session.principal_id <> canonical_principal_id",
+        "existing_session.revoked_at IS NOT NULL",
+        "existing_session.revocation_reason IS NOT NULL",
+        "pg_catalog.make_interval(secs => idle_lifetime_seconds)",
+        "pg_catalog.make_interval(secs => absolute_lifetime_seconds)",
+        "pg_catalog.aclexplode(COALESCE(",
+        "pg_catalog.acldefault('f', function_row.proowner)",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE",
+        "function_row.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]",
+    ] {
+        assert!(
+            session_issue_reconciliation_migration.contains(required),
+            "missing product session issue reconciliation guard: {required}"
+        );
+    }
+    let exact_session_lookup = session_issue_reconciliation_migration
+        .find("SELECT authentication_session.*")
+        .expect("exact session lookup");
+    let absent_session_expiry_gate = session_issue_reconciliation_migration
+        .find("IF issue_now >= locked_flow.expires_at THEN")
+        .expect("absent session expiry gate");
+    let exact_replay_outcome = session_issue_reconciliation_migration
+        .find("RETURN QUERY SELECT 'exact_replay'::TEXT")
+        .expect("exact replay outcome");
+    let exact_replay_contract =
+        &session_issue_reconciliation_migration[exact_session_lookup..exact_replay_outcome];
+    for required in [
+        "locked_flow.consumed_at > existing_session.authenticated_at",
+        "existing_session.authenticated_at >= locked_flow.expires_at",
+        "existing_session.session_digest <> new_session_digest",
+        "existing_session.csrf_digest <> new_csrf_digest",
+        "existing_session.principal_id <> canonical_principal_id",
+    ] {
+        assert!(exact_replay_contract.contains(required));
+    }
+    assert!(exact_session_lookup < exact_replay_outcome);
+    assert!(exact_replay_outcome < absent_session_expiry_gate);
+    assert!(!session_issue_reconciliation_migration
+        .contains("locked_flow.consumed_at > issue_now OR issue_now >= locked_flow.expires_at"));
     let authentication_scope_migration =
         include_str!("../../../migrations/202607190015_scope_product_authentication.sql");
     for required in [

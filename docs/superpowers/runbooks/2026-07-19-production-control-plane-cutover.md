@@ -392,6 +392,16 @@ authentication functions from migration 015 plus logout read and commit. The
 security revoker receives only security revocation. The Rust adapter requires
 four pools and routes each operation exclusively to its matching pool.
 
+Migration 018 replaces the session-issue function so an uncertain successful
+commit can be reconciled after the OAuth flow expires. It looks up the session
+already bound to the locked flow before applying the current-time expiry gate.
+Post-expiry `exact_replay` requires the identical session and CSRF digests,
+canonical principal and requested lifetimes, an unrevoked and unrevised
+session projection, valid principal data, and historical causality of
+`flow.consumed_at <= session.authenticated_at < flow.expires_at`. If no session
+exists, the database clock must still be strictly before flow expiry. This is
+proof of an earlier commit, not authority for a new issuance.
+
 Migration 017 requires `product_oauth_flows`, `product_principals`, and
 `product_auth_sessions` to be ordinary non-RLS relations under one owner. The
 three authentication functions from migration 015 must already have that same
@@ -550,6 +560,15 @@ create bounded row-lock pressure, although it cannot enumerate the identity
 tables, choose a sub-second touch interval, enlarge the current idle window, or
 extend beyond absolute session expiry.
 
+If the first session-issue commit returns an uncertain outcome, the adapter
+makes one immediate bounded reconciliation call with the same raw session and
+CSRF credentials and all other immutable inputs unchanged. It must not generate
+a new credential pair after uncertainty. Only a fully validated `issued` or
+`exact_replay` result resolves the call. Any second transaction or commit
+failure, domain rejection, collision, or malformed projection remains
+`CommitIndeterminate`; stop the authentication response and preserve redacted
+operational evidence for investigation.
+
 PostgreSQL cannot prove that the Rust-only `VerifiedDiscordIdentityV1`
 capability came from a valid Discord code exchange and identity lookup. The
 four-role split limits a stolen database credential to one operation family;
@@ -571,6 +590,13 @@ GRANT EXECUTE ON FUNCTION
     public.starring_purge_product_identity_v1(INTEGER)
 TO starring_maintenance;
 ```
+
+Migration 018 likewise removes `PUBLIC` and every named non-owner grant from
+`starring_product_session_issue_v1`, including hostile default-function grants,
+and restores the migration-017 owner and function contract. Reapply only the
+exact `starring_identity_issuer` grant shown above, then rerun issuer and
+aggregate identity readiness before reopening ingress. Do not retain a second
+issuer grantee as a rollout fallback.
 
 Migration 017 deliberately does not revoke pre-existing grants on the three
 legacy identity relations. Decision and status reads still require them at this

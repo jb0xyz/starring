@@ -50,6 +50,8 @@ The function derives `discord:<snowflake>` itself. It locks the flow before eval
 
 Exact replay requires the same flow, session digest, CSRF digest, and canonical principal. It does not advance the identity revision a second time. A different session bound to the flow is `flow_invalid_or_consumed`. A session or CSRF collision on another flow is `digest_conflict` and may generate a new secret pair. Other unique or integrity failures fail closed.
 
+Migration 018 makes commit reconciliation independent of the OAuth flow's current expiry without weakening initial issuance. The function locks the exact consumed flow and looks for its bound session before applying the current-time expiry gate. An existing session is an `exact_replay` after flow expiry only when the flow consumption preceded or equaled session authentication, session authentication occurred strictly before flow expiry, both credential digests and the canonical principal match, both requested lifetimes reproduce the persisted expiries exactly, the session remains unrevised and unrevoked, and the principal and session projections satisfy every checked invariant. A missing session still requires the database clock to remain strictly before flow expiry. Post-expiry replay therefore proves a previously committed issuance; it cannot create a session or extend the OAuth authorization window.
+
 ### Session API
 
 `starring_product_session_api_database_identity_v1()` returns the same logical database identity through a session-API-only capability.
@@ -82,13 +84,15 @@ Only exact flow state and nonce constraint collisions and exact session or CSRF 
 
 Stored state, nonce, session, CSRF, and OAuth binding digests are never returned. The logout comparison tag is session-bound and is compared in Rust with constant-time equality.
 
-Mutation commit failures remain indeterminate unless the same immutable inputs can be reconciled as an exact replay. Flow consumption is never reconciled as a successful replay because the Discord authorization code exchange sits after that boundary.
+After a session-issue commit error, the adapter makes exactly one reconciliation attempt with the same raw session and CSRF credentials and every other immutable input unchanged. It never generates another credential pair after the outcome becomes uncertain. Only a fully validated `issued` or `exact_replay` response resolves that attempt; a transaction failure, second commit error, digest conflict, domain rejection, or malformed projection preserves `CommitIndeterminate`. Flow consumption is never reconciled as a successful replay because the Discord authorization code exchange sits after that boundary.
 
 ## Readiness and rollout
 
 Readiness is capability-specific for the four request-serving pools. It verifies exact function identity, result, language, volatility, strictness, parallel safety, security-definer status, fixed search path, row estimate, owner, ACLs, relation ownership, RLS state, direct relation privileges, every table-level and column-level relation ACL grantee, direct-login role properties, and rollback-only functional probes. Aggregate readiness additionally requires four distinct role names and one exact logical database identity and database name.
 
 Migration 017 preserves pre-existing grants on the three legacy identity relations because decision and status reads are not function-scoped yet. Their presence intentionally makes the new aggregate readiness fail. A later sealing migration must revoke every non-owner table and column grant only after those remaining routes move behind exact functions. Migration 017 itself normalizes the new control-plane identity relation and all identity lifecycle, transition, and purge functions. This slice is not independently eligible for production ingress while the global relation ACL gate is red.
+
+Migration 018 replaces only the session-issue capability and repeats the migration-017 owner, function-shape, fixed-search-path, and ACL normalization. It removes `PUBLIC` and every named non-owner grant, including grants inherited from hostile function default privileges. The issuer's exact execute grant must be restored after the migration and aggregate readiness must pass before ingress resumes.
 
 The final process readiness layer must additionally compare every caller's complete `public.starring_*` executable function set against a role manifest. Component readiness alone cannot detect an unrelated extra function grant.
 
