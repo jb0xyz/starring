@@ -1,7 +1,9 @@
 use std::fmt::{Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 const HASH_LENGTH: usize = 64;
 const OPAQUE_ID_MAX_LENGTH: usize = 128;
@@ -192,12 +194,12 @@ define_opaque_id!(PrincipalId);
 define_opaque_id!(AuthoringSessionId);
 define_opaque_id!(AutomationInstallationId);
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IdempotencyKey(String);
+#[derive(Clone, PartialEq, Eq)]
+pub struct IdempotencyKey(Zeroizing<String>);
 
 impl IdempotencyKey {
     pub fn parse(value: &str) -> Result<Self, OpaqueIdError> {
-        parse_opaque_id(value).map(Self)
+        parse_opaque_id(value).map(Zeroizing::new).map(Self)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -212,6 +214,24 @@ impl IdempotencyKey {
 impl Debug for IdempotencyKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("IdempotencyKey(<redacted>)")
+    }
+}
+
+impl PartialOrd for IdempotencyKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IdempotencyKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_str().cmp(other.0.as_str())
+    }
+}
+
+impl Hash for IdempotencyKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
     }
 }
 
