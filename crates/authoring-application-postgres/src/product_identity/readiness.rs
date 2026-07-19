@@ -1,10 +1,9 @@
-use std::collections::BTreeSet;
-
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::database_capability::{
-    begin_bounded_database_probe, begin_scoped_database_readiness, ScopedDatabaseProbeModeV1,
-    ScopedDatabaseReadinessErrorV1, ScopedFunctionContractV1, ScopedRelationContractV1,
+    begin_bounded_database_probe, begin_scoped_database_readiness, load_scoped_database_topology,
+    verify_same_database_distinct_roles, ScopedDatabaseProbeModeV1, ScopedDatabaseReadinessErrorV1,
+    ScopedDatabaseTopologyV1, ScopedFunctionContractV1, ScopedRelationContractV1,
 };
 use crate::ProductDatabaseFailureV1;
 
@@ -76,13 +75,6 @@ const SECURITY_TOPOLOGY_QUERY: &str = "SELECT \
      public.starring_product_security_revoker_database_identity_v1(), \
      current_database()::TEXT, current_user::TEXT, session_user::TEXT";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProductIdentityDatabaseTopologyV1 {
-    database_identity: String,
-    database_name: String,
-    role_name: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductIdentityReadinessErrorV1 {
     #[error("product identity database contract is invalid")]
@@ -103,21 +95,7 @@ impl<G> PostgresProductIdentityStore<G> {
             self.check_session_api_readiness().await?,
             self.check_security_revoker_readiness().await?,
         ];
-        let expected_database_identity = topologies[0].database_identity.clone();
-        let expected_database_name = topologies[0].database_name.clone();
-        let mut roles = BTreeSet::new();
-        for topology in topologies {
-            if topology.database_identity != expected_database_identity
-                || topology.database_name != expected_database_name
-                || !roles.insert(topology.role_name)
-            {
-                return Err(ProductIdentityReadinessErrorV1::ContractMismatch);
-            }
-        }
-        if roles.len() != 4 {
-            return Err(ProductIdentityReadinessErrorV1::ContractMismatch);
-        }
-        Ok(())
+        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
     }
 
     pub async fn verify_oauth_flow_writer_readiness(
@@ -128,7 +106,7 @@ impl<G> PostgresProductIdentityStore<G> {
 
     async fn check_oauth_flow_writer_readiness(
         &self,
-    ) -> Result<ProductIdentityDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
+    ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
         let metadata = begin_scoped_database_readiness(
             &self.pools.oauth_flow_writer,
@@ -178,7 +156,7 @@ impl<G> PostgresProductIdentityStore<G> {
 
     async fn check_session_issuer_readiness(
         &self,
-    ) -> Result<ProductIdentityDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
+    ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
         let metadata = begin_scoped_database_readiness(
             &self.pools.session_issuer,
@@ -221,7 +199,7 @@ impl<G> PostgresProductIdentityStore<G> {
 
     async fn check_session_api_readiness(
         &self,
-    ) -> Result<ProductIdentityDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
+    ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
         let metadata = begin_scoped_database_readiness(
             &self.pools.session_api,
@@ -274,7 +252,7 @@ impl<G> PostgresProductIdentityStore<G> {
 
     async fn check_security_revoker_readiness(
         &self,
-    ) -> Result<ProductIdentityDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
+    ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
         let metadata = begin_scoped_database_readiness(
             &self.pools.security_revoker,
@@ -311,39 +289,10 @@ impl<G> PostgresProductIdentityStore<G> {
 async fn load_database_topology(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     query: &str,
-) -> Result<ProductIdentityDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
-    let (database_identity, database_name, role_name, session_role) =
-        sqlx::query_as::<_, (Option<String>, String, String, String)>(query)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(readiness_database)?;
-    let Some(database_identity) = database_identity else {
-        return Err(ProductIdentityReadinessErrorV1::ContractMismatch);
-    };
-    if !canonical_database_identity(&database_identity)
-        || database_name.is_empty()
-        || database_name.len() > 63
-        || role_name != session_role
-    {
-        return Err(ProductIdentityReadinessErrorV1::ContractMismatch);
-    }
-    Ok(ProductIdentityDatabaseTopologyV1 {
-        database_identity,
-        database_name,
-        role_name,
-    })
-}
-
-fn canonical_database_identity(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        })
-        && value != "00000000-0000-0000-0000-000000000000"
+) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
+    load_scoped_database_topology(transaction, query)
+        .await
+        .map_err(map_readiness)
 }
 
 fn map_readiness(error: ScopedDatabaseReadinessErrorV1) -> ProductIdentityReadinessErrorV1 {
@@ -383,20 +332,5 @@ mod tests {
             map_readiness(ScopedDatabaseReadinessErrorV1::ExcessCapability),
             ProductIdentityReadinessErrorV1::ExcessCapability
         );
-    }
-
-    #[test]
-    fn database_identity_requires_canonical_nonzero_uuid_text() {
-        assert!(canonical_database_identity(
-            "01234567-89ab-4def-8123-456789abcdef"
-        ));
-        for invalid in [
-            "00000000-0000-0000-0000-000000000000",
-            "01234567-89AB-4DEF-8123-456789ABCDEF",
-            "0123456789ab4def8123456789abcdef",
-            "g1234567-89ab-4def-8123-456789abcdef",
-        ] {
-            assert!(!canonical_database_identity(invalid));
-        }
     }
 }

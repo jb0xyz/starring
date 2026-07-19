@@ -703,7 +703,8 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         "starring_product_session_issuer_database_identity_v1",
         "starring_product_session_api_database_identity_v1",
         "starring_product_security_revoker_database_identity_v1",
-        "canonical_database_identity",
+        "load_scoped_database_topology",
+        "verify_same_database_distinct_roles",
         "current_database()::TEXT",
         "ScopedFunctionContractV1::set_plpgsql",
         "ScopedRelationContractV1::ordinary_without_rls",
@@ -717,6 +718,16 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         );
     }
     assert_eq!(identity_readiness.matches("&IDENTITY_RELATIONS").count(), 4);
+    for required in [
+        "canonical_database_identity",
+        "load_scoped_database_topology",
+        "verify_same_database_distinct_roles",
+    ] {
+        assert!(
+            database_capability.contains(required),
+            "missing shared database topology guard: {required}"
+        );
+    }
     for required in [
         "unexpected_relation_grant",
         "pg_catalog.pg_attribute",

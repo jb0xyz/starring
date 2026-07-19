@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Transaction};
 
@@ -93,6 +95,13 @@ pub(crate) enum ScopedDatabaseReadinessErrorV1 {
 pub(crate) enum ScopedDatabaseProbeModeV1 {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScopedDatabaseTopologyV1 {
+    pub(crate) database_identity: String,
+    pub(crate) database_name: String,
+    pub(crate) role_name: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -257,6 +266,65 @@ pub(crate) async fn begin_bounded_database_probe<'a>(
     .await
     .map_err(readiness_database)?;
     Ok(transaction)
+}
+
+pub(crate) async fn load_scoped_database_topology(
+    transaction: &mut Transaction<'_, Postgres>,
+    query: &str,
+) -> Result<ScopedDatabaseTopologyV1, ScopedDatabaseReadinessErrorV1> {
+    let (database_identity, database_name, role_name, session_role) =
+        sqlx::query_as::<_, (Option<String>, String, String, String)>(query)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(readiness_database)?;
+    let Some(database_identity) = database_identity else {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    };
+    if !canonical_database_identity(&database_identity)
+        || database_name.is_empty()
+        || database_name.len() > 63
+        || role_name != session_role
+    {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    }
+    Ok(ScopedDatabaseTopologyV1 {
+        database_identity,
+        database_name,
+        role_name,
+    })
+}
+
+pub(crate) fn verify_same_database_distinct_roles(
+    topologies: &[ScopedDatabaseTopologyV1],
+) -> Result<(), ScopedDatabaseReadinessErrorV1> {
+    let Some(expected) = topologies.first() else {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    };
+    let mut roles = BTreeSet::new();
+    for topology in topologies {
+        if topology.database_identity != expected.database_identity
+            || topology.database_name != expected.database_name
+            || !roles.insert(topology.role_name.as_str())
+        {
+            return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+        }
+    }
+    if roles.len() != topologies.len() {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    }
+    Ok(())
+}
+
+fn canonical_database_identity(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+        && value != "00000000-0000-0000-0000-000000000000"
 }
 
 async fn load_function_capability(
@@ -547,5 +615,55 @@ mod tests {
         assert!(set.returns_set);
         assert_eq!(set.language, ScopedFunctionLanguageV1::PlPgSql);
         assert_eq!(set.language.database_name(), "plpgsql");
+    }
+
+    #[test]
+    fn database_identity_requires_canonical_nonzero_uuid_text() {
+        assert!(canonical_database_identity(
+            "01234567-89ab-4def-8123-456789abcdef"
+        ));
+        for invalid in [
+            "00000000-0000-0000-0000-000000000000",
+            "01234567-89AB-4DEF-8123-456789ABCDEF",
+            "0123456789ab4def8123456789abcdef",
+            "g1234567-89ab-4def-8123-456789abcdef",
+        ] {
+            assert!(!canonical_database_identity(invalid));
+        }
+    }
+
+    #[test]
+    fn topology_requires_one_database_and_distinct_roles() {
+        let topology = |identity: &str, database: &str, role: &str| ScopedDatabaseTopologyV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            role_name: role.to_string(),
+        };
+        let identity = "01234567-89ab-4def-8123-456789abcdef";
+        assert_eq!(
+            verify_same_database_distinct_roles(&[
+                topology(identity, "starring", "reader"),
+                topology(identity, "starring", "writer"),
+            ]),
+            Ok(())
+        );
+        assert_eq!(
+            verify_same_database_distinct_roles(&[
+                topology(identity, "starring", "reader"),
+                topology(identity, "starring", "reader"),
+            ]),
+            Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
+        );
+        assert_eq!(
+            verify_same_database_distinct_roles(&[
+                topology(identity, "starring", "reader"),
+                topology(identity, "other", "writer"),
+            ]),
+            Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
+        );
+        assert_eq!(
+            verify_same_database_distinct_roles(&[]),
+            Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
+        );
     }
 }
