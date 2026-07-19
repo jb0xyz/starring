@@ -5,13 +5,12 @@ use authoring_promotion::PrincipalId;
 use chrono::{DateTime, Utc};
 use discord_model::UserId;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::types::Json;
 
 use crate::authentication::{load_active_product_session, ActiveProductSessionV1};
 use crate::{ProductSecretGenerator, ProductSessionDigestV1};
 
-use super::database::{identity_database_error, map_session_validation};
+use super::database::map_session_validation;
 use super::store::PostgresProductIdentityStore;
 use super::{CurrentProductPrincipalV1, ProductIdentityError};
 
@@ -36,9 +35,9 @@ impl<'a> VerifiedIdentityProjection<'a> {
 #[derive(sqlx::FromRow)]
 pub(super) struct PrincipalUpsertRow {
     pub(super) principal_id: String,
-    discord_user_id: String,
-    identity_revision: i64,
-    display_profile: Json<serde_json::Value>,
+    pub(super) discord_user_id: String,
+    pub(super) identity_revision: i64,
+    pub(super) display_profile: Json<serde_json::Value>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +55,7 @@ where
         credential: &str,
     ) -> Result<CurrentProductPrincipalV1, ProductIdentityError> {
         let active = load_active_product_session(
-            &self.pool,
+            &self.pools.session_api,
             self.config.lifetimes().authentication(),
             credential,
             None,
@@ -72,7 +71,7 @@ where
         csrf: &str,
     ) -> Result<CurrentProductPrincipalV1, ProductIdentityError> {
         let active = load_active_product_session(
-            &self.pool,
+            &self.pools.session_api,
             self.config.lifetimes().authentication(),
             credential,
             Some(csrf),
@@ -81,40 +80,6 @@ where
         .map_err(map_session_validation)?;
         decode_active_principal(active)
     }
-}
-
-pub(super) async fn upsert_principal(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    identity: VerifiedIdentityProjection<'_>,
-) -> Result<PrincipalUpsertRow, ProductIdentityError> {
-    let canonical_principal_id =
-        PrincipalId::parse(&format!("discord:{}", identity.discord_user_id))
-            .map_err(|_| ProductIdentityError::Invariant)?;
-    let display_profile = json!({"display_name": identity.display_name});
-    sqlx::query_as::<_, PrincipalUpsertRow>(
-        "WITH principal_clock AS MATERIALIZED ( \
-          SELECT pg_catalog.clock_timestamp() AS authenticated_at \
-         ) \
-         INSERT INTO public.product_principals AS principal_record \
-         (principal_id, discord_user_id, display_profile, last_authenticated_at, updated_at) \
-         SELECT $1, $2, $3, authenticated_at, authenticated_at FROM principal_clock \
-         ON CONFLICT (discord_user_id) DO UPDATE SET \
-         identity_revision = principal_record.identity_revision + 1, \
-         display_profile = EXCLUDED.display_profile, \
-         last_authenticated_at = GREATEST( \
-          EXCLUDED.last_authenticated_at, principal_record.updated_at + INTERVAL '1 microsecond'), \
-         updated_at = GREATEST( \
-          EXCLUDED.updated_at, principal_record.updated_at + INTERVAL '1 microsecond') \
-         WHERE NOT principal_record.disabled \
-         RETURNING principal_id, discord_user_id, identity_revision, display_profile",
-    )
-    .bind(canonical_principal_id.as_str())
-    .bind(identity.discord_user_id.to_string())
-    .bind(Json(display_profile))
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(identity_database_error)?
-    .ok_or(ProductIdentityError::PrincipalDisabled)
 }
 
 fn decode_active_principal(
@@ -145,6 +110,9 @@ pub(super) fn decode_principal(
     let discord_user_id = canonical_snowflake(&row.discord_user_id)
         .map(UserId)
         .ok_or(invalid)?;
+    if principal_id.as_str() != format!("discord:{discord_user_id}") {
+        return Err(invalid);
+    }
     let identity_revision = u64::try_from(row.identity_revision)
         .ok()
         .and_then(NonZeroU64::new)

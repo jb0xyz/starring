@@ -500,22 +500,72 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(!identity.contains(".bind(browser_nonce)"));
     assert!(!identity.contains(".bind(credential)"));
     assert!(!identity.contains(".bind(csrf)"));
-    assert!(identity.contains("oauth_state_digest"));
-    assert!(identity.contains("validate_consumed_flow"));
+    assert!(identity.contains("starring_product_oauth_flow_create_v1"));
+    assert!(identity.contains("starring_product_oauth_flow_consume_v1"));
+    assert!(identity.contains("starring_product_session_issue_v1"));
+    assert!(identity.contains("starring_product_session_logout_read_v1"));
+    assert!(identity.contains("starring_product_session_logout_commit_v1"));
+    assert!(identity.contains("starring_product_session_security_revoke_v1"));
+    assert!(identity.contains("begin_bounded_identity_transaction"));
+    assert!(identity.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"));
+    assert!(identity.contains("set_config('statement_timeout'"));
+    assert!(identity.contains("set_config('lock_timeout'"));
+    assert!(identity.contains("set_config('idle_in_transaction_session_timeout'"));
+    assert!(identity.contains("self.pools.oauth_flow_writer"));
+    assert!(identity.contains("self.pools.session_issuer"));
+    assert!(identity.contains("self.pools.session_api"));
+    assert!(identity.contains("self.pools.security_revoker"));
+    assert!(!identity.contains("validate_consumed_flow"));
+    assert!(!identity.contains("upsert_principal"));
+    assert!(!identity.contains("unique_violation"));
     assert!(authentication.contains("persisted_tag.ct_eq(&expected_tag)"));
     assert!(identity.contains("pub async fn current_principal("));
     assert!(identity.contains("credential,\n            None,"));
     assert!(identity.contains("pub async fn verify_csrf("));
     assert!(identity.contains("credential,\n            Some(csrf),"));
-    assert!(identity.contains("persisted.ct_eq(expected.as_bytes())"));
+    assert!(identity.contains("persisted_tag.ct_eq(&expected_tag)"));
     assert!(identity.contains("ProductLogoutDispositionV1::ExactReplay"));
-    assert!(identity.contains("inserted.idle_expires_at.min(inserted.absolute_expires_at)"));
-    assert!(identity.contains("public.product_oauth_flows"));
-    assert!(identity.contains("public.product_auth_sessions"));
-    assert!(identity.contains("public.product_principals"));
-    assert!(identity.contains("pg_catalog.clock_timestamp()"));
-    assert!(identity.contains("pg_catalog.make_interval("));
-    assert!(identity.contains("pg_catalog.set_config("));
+    assert!(!identity.contains("public.product_oauth_flows"));
+    assert!(!identity.contains("public.product_auth_sessions"));
+    assert!(!identity.contains("public.product_principals"));
+    assert!(!identity.contains("pg_catalog.clock_timestamp()"));
+    assert!(!identity.contains("pg_catalog.make_interval("));
+    let identity_scope_migration =
+        include_str!("../../../migrations/202607190017_scope_product_identity_lifecycle.sql");
+    for required in [
+        "CREATE TABLE public.product_control_plane_identity (",
+        "pg_catalog.gen_random_uuid()",
+        "CREATE FUNCTION public.starring_product_oauth_database_identity_v1()",
+        "CREATE FUNCTION public.starring_product_session_issuer_database_identity_v1()",
+        "CREATE FUNCTION public.starring_product_session_api_database_identity_v1()",
+        "CREATE FUNCTION public.starring_product_security_revoker_database_identity_v1()",
+        "CREATE FUNCTION public.starring_product_oauth_flow_create_v1(",
+        "CREATE FUNCTION public.starring_product_oauth_flow_consume_v1(",
+        "CREATE FUNCTION public.starring_product_session_issue_v1(",
+        "CREATE FUNCTION public.starring_product_session_logout_read_v1(",
+        "CREATE FUNCTION public.starring_product_session_logout_commit_v1(",
+        "CREATE FUNCTION public.starring_product_session_security_revoke_v1(",
+        "VOLATILE\nSTRICT\nPARALLEL UNSAFE\nSECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "FOR UPDATE",
+        "pg_catalog.clock_timestamp()",
+        "ON CONFLICT ON CONSTRAINT product_principals_discord_user_id_key",
+        "product_auth_sessions_oauth_state_unique",
+        "pg_catalog.sha256(pg_catalog.byteacat(",
+        "relation_count <> 3",
+        "rls_disabled_count <> 3",
+        "pg_catalog.aclexplode(COALESCE(",
+        "NULLIF(attribute.attacl, '{}'::ACLITEM[])",
+        "ALTER TABLE %s OWNER TO %I",
+        "starring_purge_product_identity_v1(INTEGER)",
+        "ALTER FUNCTION %s OWNER TO %I",
+        "FROM PUBLIC;",
+    ] {
+        assert!(
+            identity_scope_migration.contains(required),
+            "missing product identity lifecycle guard: {required}"
+        );
+    }
     let authentication_scope_migration =
         include_str!("../../../migrations/202607190015_scope_product_authentication.sql");
     for required in [
@@ -558,6 +608,41 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         assert!(
             authentication_readiness.contains(required),
             "missing authentication readiness guard: {required}"
+        );
+    }
+    let identity_readiness = include_str!("../src/product_identity/readiness.rs");
+    for required in [
+        "verify_oauth_flow_writer_readiness",
+        "verify_session_issuer_readiness",
+        "verify_session_api_readiness",
+        "verify_security_revoker_readiness",
+        "const IDENTITY_RELATIONS",
+        "starring_product_oauth_database_identity_v1",
+        "starring_product_session_issuer_database_identity_v1",
+        "starring_product_session_api_database_identity_v1",
+        "starring_product_security_revoker_database_identity_v1",
+        "canonical_database_identity",
+        "current_database()::TEXT",
+        "ScopedFunctionContractV1::set_plpgsql",
+        "ScopedRelationContractV1::ordinary_without_rls",
+        "begin_scoped_database_readiness(",
+        "ScopedDatabaseProbeModeV1::ReadWrite",
+        "probe.rollback()",
+    ] {
+        assert!(
+            identity_readiness.contains(required),
+            "missing product identity readiness guard: {required}"
+        );
+    }
+    assert_eq!(identity_readiness.matches("&IDENTITY_RELATIONS").count(), 4);
+    for required in [
+        "unexpected_relation_grant",
+        "pg_catalog.pg_attribute",
+        "NULLIF(attribute.attacl, '{}'::ACLITEM[])",
+    ] {
+        assert!(
+            database_capability.contains(required),
+            "missing global relation ACL guard: {required}"
         );
     }
     for (path, source) in [
@@ -722,6 +807,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_identity/principal.rs",
             include_str!("../src/product_identity/principal.rs"),
+        ),
+        (
+            "src/product_identity/readiness.rs",
+            include_str!("../src/product_identity/readiness.rs"),
         ),
         (
             "src/product_identity/session_issue.rs",

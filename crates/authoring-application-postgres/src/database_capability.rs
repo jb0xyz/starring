@@ -9,6 +9,22 @@ pub(crate) struct ScopedFunctionContractV1<'a> {
     result: &'a str,
     returns_set: bool,
     rows: f32,
+    language: ScopedFunctionLanguageV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopedFunctionLanguageV1 {
+    Sql,
+    PlPgSql,
+}
+
+impl ScopedFunctionLanguageV1 {
+    const fn database_name(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::PlPgSql => "plpgsql",
+        }
+    }
 }
 
 impl<'a> ScopedFunctionContractV1<'a> {
@@ -18,6 +34,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             result,
             returns_set: true,
             rows,
+            language: ScopedFunctionLanguageV1::Sql,
         }
     }
 
@@ -27,6 +44,17 @@ impl<'a> ScopedFunctionContractV1<'a> {
             result,
             returns_set: false,
             rows: 0.0,
+            language: ScopedFunctionLanguageV1::Sql,
+        }
+    }
+
+    pub(crate) const fn set_plpgsql(identity: &'a str, result: &'a str, rows: f32) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: true,
+            rows,
+            language: ScopedFunctionLanguageV1::PlPgSql,
         }
     }
 }
@@ -84,6 +112,7 @@ struct RelationCapabilityRow {
     owner_name: Option<String>,
     caller_has_table_privilege: bool,
     caller_has_column_privilege: bool,
+    unexpected_relation_grant: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -141,7 +170,9 @@ impl ScopedDatabaseCapabilitiesV1 {
         if require_rls_disabled {
             self.contract_valid &= row.rls_disabled;
         }
-        self.excess_capability |= row.caller_has_table_privilege || row.caller_has_column_privilege;
+        self.excess_capability |= row.caller_has_table_privilege
+            || row.caller_has_column_privilege
+            || row.unexpected_relation_grant;
         self.observe_owner(row.owner_name);
     }
 
@@ -260,7 +291,7 @@ async fn load_function_capability(
             AND function_contract.proretset = $3 \
             AND function_contract.prorows = $4 \
             AND function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[] \
-            AND function_contract.lanname = 'sql' \
+            AND function_contract.lanname = $5 \
             AND function_contract.function_result = $2, FALSE \
           ) AS metadata_valid, \
           pg_catalog.pg_get_userbyid(function_contract.proowner)::TEXT AS owner_name, \
@@ -305,6 +336,7 @@ async fn load_function_capability(
     .bind(contract.result)
     .bind(contract.returns_set)
     .bind(contract.rows)
+    .bind(contract.language.database_name())
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)
@@ -336,7 +368,33 @@ async fn load_relation_capability(
            ) AS checked_privilege(name) \
            WHERE pg_catalog.has_any_column_privilege( \
             current_user, relation.oid, checked_privilege.name) \
-          ), FALSE) AS caller_has_column_privilege \
+          ), FALSE) AS caller_has_column_privilege, \
+          COALESCE( \
+           EXISTS ( \
+            SELECT 1 \
+            FROM pg_catalog.aclexplode(COALESCE( \
+             relation.relacl, pg_catalog.acldefault('r', relation.relowner) \
+            )) AS privilege \
+            WHERE privilege.grantee <> relation.relowner \
+             AND privilege.privilege_type IN ( \
+              'SELECT', 'INSERT', 'UPDATE', 'DELETE', \
+              'TRUNCATE', 'REFERENCES', 'TRIGGER' \
+             ) \
+           ) OR EXISTS ( \
+            SELECT 1 \
+            FROM pg_catalog.pg_attribute AS attribute \
+            CROSS JOIN LATERAL pg_catalog.aclexplode( \
+             NULLIF(attribute.attacl, '{}'::ACLITEM[]) \
+            ) AS privilege \
+            WHERE attribute.attrelid = relation.oid \
+             AND attribute.attnum > 0 \
+             AND NOT attribute.attisdropped \
+             AND privilege.grantee <> relation.relowner \
+             AND privilege.privilege_type IN ( \
+              'SELECT', 'INSERT', 'UPDATE', 'REFERENCES' \
+             ) \
+           ), TRUE \
+          ) AS unexpected_relation_grant \
          FROM target \
          LEFT JOIN pg_catalog.pg_class AS relation \
           ON relation.oid = target.relation_oid",
@@ -471,5 +529,23 @@ mod tests {
             divergent.verify(),
             Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
         );
+    }
+
+    #[test]
+    fn function_contracts_default_to_sql() {
+        let set = ScopedFunctionContractV1::set("public.read_v1(text)", "SETOF text", 1.0);
+        let scalar = ScopedFunctionContractV1::scalar("public.write_v1(text)", "text");
+
+        assert_eq!(set.language, ScopedFunctionLanguageV1::Sql);
+        assert_eq!(scalar.language, ScopedFunctionLanguageV1::Sql);
+        assert_eq!(set.language.database_name(), "sql");
+    }
+
+    #[test]
+    fn function_contracts_can_require_plpgsql() {
+        let set = ScopedFunctionContractV1::set_plpgsql("public.read_v1(text)", "SETOF text", 1.0);
+        assert!(set.returns_set);
+        assert_eq!(set.language, ScopedFunctionLanguageV1::PlPgSql);
+        assert_eq!(set.language.database_name(), "plpgsql");
     }
 }

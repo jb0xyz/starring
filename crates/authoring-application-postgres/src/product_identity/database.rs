@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Transaction};
 
 use crate::authentication::SessionValidationError;
@@ -6,23 +7,23 @@ use crate::ProductDatabaseFailureV1;
 
 use super::{OAuthFlowError, ProductIdentityError};
 
-pub(super) async fn set_statement_timeout(
-    transaction: &mut Transaction<'_, Postgres>,
-    timeout: String,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_catalog.set_config('statement_timeout', $1, true)")
-        .bind(timeout)
-        .execute(&mut **transaction)
+pub(super) async fn begin_bounded_identity_transaction<'a>(
+    pool: &'a PgPool,
+    timeout: &str,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE")
+        .execute(&mut *transaction)
         .await?;
-    Ok(())
-}
-
-pub(super) async fn database_time(
-    transaction: &mut Transaction<'_, Postgres>,
-) -> Result<DateTime<Utc>, sqlx::Error> {
-    sqlx::query_scalar("SELECT pg_catalog.clock_timestamp()")
-        .fetch_one(&mut **transaction)
-        .await
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+         pg_catalog.set_config('lock_timeout', $1, true), \
+         pg_catalog.set_config('idle_in_transaction_session_timeout', $1, true)",
+    )
+    .bind(timeout)
+    .execute(&mut *transaction)
+    .await?;
+    Ok(transaction)
 }
 
 pub(super) fn map_session_validation(error: SessionValidationError) -> ProductIdentityError {
@@ -47,29 +48,4 @@ pub(super) fn identity_database_error(error: sqlx::Error) -> ProductIdentityErro
 pub(super) fn remaining_seconds(now: DateTime<Utc>, expires_at: DateTime<Utc>) -> Option<u32> {
     let seconds = (expires_at - now).num_seconds();
     u32::try_from(seconds).ok().filter(|seconds| *seconds != 0)
-}
-
-pub(super) fn unique_violation(error: &sqlx::Error) -> bool {
-    matches!(
-        error,
-        sqlx::Error::Database(database) if database.code().as_deref() == Some("23505")
-    )
-}
-
-fn constraint_name(error: &sqlx::Error) -> Option<&str> {
-    match error {
-        sqlx::Error::Database(database) => database.constraint(),
-        _ => None,
-    }
-}
-
-pub(super) fn oauth_flow_constraint(error: &sqlx::Error) -> bool {
-    matches!(
-        constraint_name(error),
-        Some(
-            "product_auth_sessions_oauth_state_unique"
-                | "product_auth_sessions_oauth_state_fk"
-                | "product_auth_sessions_oauth_binding_valid"
-        )
-    )
 }

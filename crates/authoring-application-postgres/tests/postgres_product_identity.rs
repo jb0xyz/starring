@@ -8,9 +8,9 @@ use authoring_application::{
 use authoring_application_postgres::{
     digest_opaque_session_credential_v1, PostgresAuthentication, PostgresAuthenticationConfig,
     PostgresProductIdentityConfig, PostgresProductIdentityStore, ProductDatabaseFailureV1,
-    ProductIdentityError, ProductIdentityLifetimesV1, ProductLogoutDispositionV1,
-    ProductSecretGenerator, ProductSecretGeneratorError, ProductSessionRevocationReasonV1,
-    MIGRATOR,
+    ProductIdentityDatabasePoolsV1, ProductIdentityError, ProductIdentityLifetimesV1,
+    ProductLogoutDispositionV1, ProductSecretGenerator, ProductSecretGeneratorError,
+    ProductSessionRevocationReasonV1, MIGRATOR,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -130,7 +130,11 @@ fn production_store(
         ["/".to_string(), "/app".to_string()],
     )
     .unwrap();
-    PostgresProductIdentityStore::new(pool, DeterministicGenerator::new(seed), config)
+    PostgresProductIdentityStore::new(
+        ProductIdentityDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone(), pool),
+        DeterministicGenerator::new(seed),
+        config,
+    )
 }
 
 fn configurable_store(
@@ -142,7 +146,11 @@ fn configurable_store(
 ) -> PostgresProductIdentityStore<DeterministicGenerator> {
     let config =
         PostgresProductIdentityConfig::new(redirect_uri, allowed_return_paths, lifetimes).unwrap();
-    PostgresProductIdentityStore::new(pool, DeterministicGenerator::new(seed), config)
+    PostgresProductIdentityStore::new(
+        ProductIdentityDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone(), pool),
+        DeterministicGenerator::new(seed),
+        config,
+    )
 }
 
 fn unique_user_id() -> UserId {
@@ -966,6 +974,15 @@ async fn postgres_session_issuance_projects_touches_verifies_and_revokes() {
     .await
     .unwrap();
     assert_eq!(revocation_reason, "user_logout");
+    assert_eq!(
+        store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await,
+        Err(ProductIdentityError::Revoked)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1095,11 +1112,24 @@ async fn postgres_database_time_expires_oauth_and_idle_sessions() {
         blocked_current.await.unwrap(),
         Err(ProductIdentityError::Expired)
     ));
-    session_store
-        .revoke_session(
-            &session,
-            ProductSessionRevocationReasonV1::SecurityRevocation,
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        session_store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await
+            .unwrap(),
+        ProductLogoutDispositionV1::Revoked
+    );
+    assert_eq!(
+        session_store
+            .revoke_session(
+                &session,
+                ProductSessionRevocationReasonV1::SecurityRevocation,
+            )
+            .await
+            .unwrap(),
+        ProductLogoutDispositionV1::ExactReplay
+    );
 }

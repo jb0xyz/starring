@@ -11,7 +11,8 @@ use super::super::principal::VerifiedIdentityProjection;
 use super::super::store::PostgresProductIdentityStore;
 use super::super::{ConsumedOAuthFlowV1, PostgresProductIdentityConfig, ProductIdentityError};
 use crate::{
-    ProductIdentityLifetimesV1, ProductSecretGenerator, ProductSecretGeneratorError, MIGRATOR,
+    ProductIdentityDatabasePoolsV1, ProductIdentityLifetimesV1, ProductSecretGenerator,
+    ProductSecretGeneratorError, MIGRATOR,
 };
 
 #[derive(Clone)]
@@ -148,7 +149,12 @@ async fn private_issuer_core_persists_only_an_opaque_verified_projection() {
     .unwrap();
     let seed = unique_user_id().0;
     let store = PostgresProductIdentityStore::new(
-        shadow_pool,
+        ProductIdentityDatabasePoolsV1::new(
+            shadow_pool.clone(),
+            shadow_pool.clone(),
+            shadow_pool.clone(),
+            shadow_pool,
+        ),
         DeterministicGenerator {
             counter: Arc::new(AtomicU64::new(seed)),
         },
@@ -181,6 +187,45 @@ async fn private_issuer_core_persists_only_an_opaque_verified_projection() {
     .await
     .unwrap();
     assert_eq!(invalid_principal_count, 0);
+    let mismatched_user_id = unique_user_id();
+    let mismatched_principal_id = format!("legacy:{mismatched_user_id}");
+    sqlx::query(
+        "INSERT INTO public.product_principals \
+             (principal_id, discord_user_id, display_profile) \
+             VALUES ($1, $2, '{\"display_name\":\"Legacy Mapping\"}'::JSONB)",
+    )
+    .bind(&mismatched_principal_id)
+    .bind(mismatched_user_id.to_string())
+    .execute(&setup_pool)
+    .await
+    .unwrap();
+    let mismatched_flow = consumed_flow(&store).await;
+    let mismatched_state_digest = mismatched_flow.state_digest.clone();
+    assert!(matches!(
+        store
+            .issue_product_session_core(
+                mismatched_flow,
+                VerifiedIdentityProjection {
+                    discord_user_id: mismatched_user_id,
+                    display_name: "Canonical Mapping",
+                },
+            )
+            .await,
+        Err(ProductIdentityError::Invariant)
+    ));
+    let mismatched_state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT principal.identity_revision, \
+             (SELECT COUNT(*) FROM public.product_auth_sessions AS authentication_session \
+              WHERE authentication_session.oauth_state_digest = $2) \
+             FROM public.product_principals AS principal \
+             WHERE principal.principal_id = $1",
+    )
+    .bind(&mismatched_principal_id)
+    .bind(mismatched_state_digest.as_bytes().as_slice())
+    .fetch_one(&setup_pool)
+    .await
+    .unwrap();
+    assert_eq!(mismatched_state, (1, 0));
     let raced_flow = consumed_flow(&store).await;
     let raced_flow_copy = copy_consumed_flow(&raced_flow);
     let left_user_id = unique_user_id();
@@ -201,11 +246,11 @@ async fn private_issuer_core_persists_only_an_opaque_verified_projection() {
             },
         )
     );
-    assert!(matches!(
-        (left, right),
+    match (left, right) {
         (Ok(_), Err(ProductIdentityError::FlowInvalidOrConsumed))
-            | (Err(ProductIdentityError::FlowInvalidOrConsumed), Ok(_))
-    ));
+        | (Err(ProductIdentityError::FlowInvalidOrConsumed), Ok(_)) => {}
+        outcome => panic!("unexpected session issue race outcome: {outcome:?}"),
+    }
     let raced_principal_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM public.product_principals \
          WHERE discord_user_id = ANY($1::TEXT[])",

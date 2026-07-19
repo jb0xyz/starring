@@ -38,8 +38,9 @@ pub use product_decisions::{
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,
     OAuthFlowIssueV1, PostgresProductIdentityConfig, PostgresProductIdentityStore,
-    ProductIdentityConfigError, ProductIdentityError, ProductIdentityLifetimesV1,
-    ProductLogoutDispositionV1, ProductSessionRevocationReasonV1,
+    ProductIdentityConfigError, ProductIdentityDatabasePoolsV1, ProductIdentityError,
+    ProductIdentityLifetimesV1, ProductIdentityReadinessErrorV1, ProductLogoutDispositionV1,
+    ProductSessionRevocationReasonV1,
 };
 pub use product_retention::{
     PostgresProductActionRetention, PostgresProductActionRetentionConfig,

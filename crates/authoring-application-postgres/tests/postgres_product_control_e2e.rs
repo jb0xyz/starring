@@ -5,4 +5,5 @@ include!("postgres_product_control_e2e/installation_authority.rs");
 include!("postgres_product_control_e2e/installation_authority_security.rs");
 include!("postgres_product_control_e2e/authentication_security.rs");
 include!("postgres_product_control_e2e/authentication_migration_security.rs");
+include!("postgres_product_control_e2e/product_identity_security.rs");
 include!("postgres_product_control_e2e/deployment_status.rs");

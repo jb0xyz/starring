@@ -1,33 +1,42 @@
 use authoring_application_discord::VerifiedDiscordIdentityV1;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
+use sqlx::types::Json;
 
 use crate::digest::digest_opaque_session_credential_v1;
 use crate::ProductSecretGenerator;
 
 use super::database::{
-    database_time, identity_database_error, oauth_flow_constraint, remaining_seconds,
-    set_statement_timeout, unique_violation,
+    begin_bounded_identity_transaction, identity_database_error, remaining_seconds,
 };
-use super::principal::{decode_principal, upsert_principal, VerifiedIdentityProjection};
+use super::principal::{decode_principal, PrincipalUpsertRow, VerifiedIdentityProjection};
 use super::store::{PostgresProductIdentityStore, SECRET_INSERT_ATTEMPTS};
-use super::{
-    ConsumedOAuthFlowV1, IssuedProductSessionV1, PostgresProductIdentityConfig,
-    ProductIdentityError,
-};
+use super::{ConsumedOAuthFlowV1, IssuedProductSessionV1, ProductIdentityError};
+
+const ISSUE_SESSION_QUERY: &str = "SELECT * FROM public.starring_product_session_issue_v1(\
+     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 #[derive(sqlx::FromRow)]
-struct ConsumedOAuthFlowValidationRow {
-    redirect_uri: String,
-    return_path: String,
-    consumed_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
+struct SessionIssueRow {
+    outcome_code: String,
+    principal_id: Option<String>,
+    discord_user_id: Option<String>,
+    identity_revision: Option<i64>,
+    display_profile: Option<Json<Value>>,
+    idle_expires_at: Option<DateTime<Utc>>,
+    absolute_expires_at: Option<DateTime<Utc>>,
+    database_now: Option<DateTime<Utc>>,
 }
 
-#[derive(sqlx::FromRow)]
-struct SessionInsertRow {
-    idle_expires_at: DateTime<Utc>,
-    absolute_expires_at: DateTime<Utc>,
-    database_now: DateTime<Utc>,
+impl SessionIssueRow {
+    fn failure_projection_is_empty(&self) -> bool {
+        self.principal_id.is_none()
+            && self.discord_user_id.is_none()
+            && self.identity_revision.is_none()
+            && self.display_profile.is_none()
+            && self.idle_expires_at.is_none()
+            && self.absolute_expires_at.is_none()
+    }
 }
 
 impl<G> PostgresProductIdentityStore<G>
@@ -65,67 +74,26 @@ where
             {
                 continue;
             }
-            let mut transaction = self.pool.begin().await.map_err(identity_database_error)?;
-            set_statement_timeout(
-                &mut transaction,
-                self.config.lifetimes().authentication().statement_timeout(),
-            )
-            .await
-            .map_err(identity_database_error)?;
-            if let Err(error) =
-                validate_consumed_flow(&mut transaction, &consumed_flow, &self.config).await
-            {
-                transaction
-                    .rollback()
+            let timeout = self.config.lifetimes().authentication().statement_timeout();
+            let mut transaction =
+                begin_bounded_identity_transaction(&self.pools.session_issuer, timeout.as_str())
                     .await
                     .map_err(identity_database_error)?;
-                return Err(error);
-            }
-            let principal = match upsert_principal(&mut transaction, identity).await {
-                Ok(principal) => principal,
-                Err(error) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(identity_database_error)?;
-                    return Err(error);
-                }
-            };
-            let inserted = sqlx::query_as::<_, SessionInsertRow>(
-                "WITH issue_clock AS (SELECT pg_catalog.clock_timestamp() AS issued_at) \
-                 INSERT INTO public.product_auth_sessions \
-                 (session_digest, principal_id, csrf_digest, oauth_state_digest, \
-                  authenticated_at, created_at, last_seen_at, idle_expires_at, \
-                  absolute_expires_at) \
-                 SELECT $1, $2, $3, $4, issued_at, issued_at, issued_at, \
-                  issued_at + pg_catalog.make_interval(secs => $5::DOUBLE PRECISION), \
-                  issued_at + pg_catalog.make_interval(secs => $6::DOUBLE PRECISION) FROM issue_clock \
-                 RETURNING idle_expires_at, absolute_expires_at, created_at AS database_now",
-            )
-            .bind(session_digest.as_bytes().as_slice())
-            .bind(&principal.principal_id)
-            .bind(csrf_digest.as_bytes().as_slice())
-            .bind(consumed_flow.state_digest.as_bytes().as_slice())
-            .bind(self.config.lifetimes().session_idle().as_secs_f64())
-            .bind(self.config.lifetimes().session_absolute().as_secs_f64())
-            .fetch_one(&mut *transaction)
-            .await;
-            let inserted = match inserted {
-                Ok(inserted) => inserted,
-                Err(error) if oauth_flow_constraint(&error) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(identity_database_error)?;
-                    return Err(ProductIdentityError::FlowInvalidOrConsumed);
-                }
-                Err(error) if unique_violation(&error) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(identity_database_error)?;
-                    continue;
-                }
+            let row = sqlx::query_as::<_, SessionIssueRow>(ISSUE_SESSION_QUERY)
+                .bind(consumed_flow.state_digest.as_bytes().as_slice())
+                .bind(&consumed_flow.redirect_uri)
+                .bind(&consumed_flow.return_path)
+                .bind(consumed_flow.consumed_at)
+                .bind(identity.discord_user_id.to_string())
+                .bind(identity.display_name)
+                .bind(session_digest.as_bytes().as_slice())
+                .bind(csrf_digest.as_bytes().as_slice())
+                .bind(self.config.lifetimes().session_idle().as_secs_f64())
+                .bind(self.config.lifetimes().session_absolute().as_secs_f64())
+                .fetch_one(&mut *transaction)
+                .await;
+            let row = match row {
+                Ok(row) => row,
                 Err(error) => {
                     let failure = identity_database_error(error);
                     transaction
@@ -135,75 +103,159 @@ where
                     return Err(failure);
                 }
             };
-            let principal = match decode_principal(
-                principal,
-                session_digest,
-                inserted.absolute_expires_at,
-                ProductIdentityError::Invariant,
-            ) {
-                Ok(principal) => principal,
-                Err(error) => {
+            match row.outcome_code.as_str() {
+                "issued" | "exact_replay" => {
+                    let exact_replay = row.outcome_code == "exact_replay";
+                    let Some(principal_id) = row.principal_id else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(discord_user_id) = row.discord_user_id else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(identity_revision) = row.identity_revision else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(display_profile) = row.display_profile else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(idle_expires_at) = row.idle_expires_at else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(absolute_expires_at) = row.absolute_expires_at else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let Some(database_now) = row.database_now else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    let principal = match decode_principal(
+                        PrincipalUpsertRow {
+                            principal_id,
+                            discord_user_id,
+                            identity_revision,
+                            display_profile,
+                        },
+                        session_digest,
+                        absolute_expires_at,
+                        ProductIdentityError::Invariant,
+                    ) {
+                        Ok(principal) => principal,
+                        Err(error) => {
+                            transaction
+                                .rollback()
+                                .await
+                                .map_err(identity_database_error)?;
+                            return Err(error);
+                        }
+                    };
+                    if principal.discord_user_id() != identity.discord_user_id
+                        || (!exact_replay && principal.display_name() != identity.display_name)
+                        || idle_expires_at > absolute_expires_at
+                    {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    }
+                    let Some(max_age_seconds) = remaining_seconds(database_now, idle_expires_at)
+                    else {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    };
+                    if max_age_seconds > 1_800 {
+                        transaction
+                            .rollback()
+                            .await
+                            .map_err(identity_database_error)?;
+                        return Err(ProductIdentityError::Invariant);
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|_| ProductIdentityError::CommitIndeterminate)?;
+                    return Ok(IssuedProductSessionV1 {
+                        principal,
+                        session,
+                        csrf,
+                        return_path: consumed_flow.return_path,
+                        max_age_seconds,
+                    });
+                }
+                "digest_conflict" => {
+                    let valid_shape =
+                        row.failure_projection_is_empty() && row.database_now.is_some();
                     transaction
                         .rollback()
                         .await
                         .map_err(identity_database_error)?;
-                    return Err(error);
+                    if !valid_shape {
+                        return Err(ProductIdentityError::Invariant);
+                    }
                 }
-            };
-            let cookie_expires_at = inserted.idle_expires_at.min(inserted.absolute_expires_at);
-            let Some(max_age_seconds) = remaining_seconds(inserted.database_now, cookie_expires_at)
-            else {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(identity_database_error)?;
-                return Err(ProductIdentityError::Invariant);
-            };
-            transaction
-                .commit()
-                .await
-                .map_err(|_| ProductIdentityError::CommitIndeterminate)?;
-            return Ok(IssuedProductSessionV1 {
-                principal,
-                session,
-                csrf,
-                return_path: consumed_flow.return_path,
-                max_age_seconds,
-            });
+                "flow_invalid_or_consumed" => {
+                    let valid_shape = row.failure_projection_is_empty();
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(identity_database_error)?;
+                    return if valid_shape {
+                        Err(ProductIdentityError::FlowInvalidOrConsumed)
+                    } else {
+                        Err(ProductIdentityError::Invariant)
+                    };
+                }
+                "principal_disabled" => {
+                    let valid_shape = row.failure_projection_is_empty();
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(identity_database_error)?;
+                    return if valid_shape {
+                        Err(ProductIdentityError::PrincipalDisabled)
+                    } else {
+                        Err(ProductIdentityError::Invariant)
+                    };
+                }
+                _ => {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(identity_database_error)?;
+                    return Err(ProductIdentityError::Invariant);
+                }
+            }
         }
         Err(ProductIdentityError::SecretGeneration)
     }
-}
-
-async fn validate_consumed_flow(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    consumed_flow: &ConsumedOAuthFlowV1,
-    config: &PostgresProductIdentityConfig,
-) -> Result<(), ProductIdentityError> {
-    let persisted = sqlx::query_as::<_, ConsumedOAuthFlowValidationRow>(
-        "SELECT redirect_uri, return_path, consumed_at, expires_at \
-         FROM public.product_oauth_flows WHERE state_digest = $1 \
-         AND terminal_result_code = 'callback_claimed' \
-         AND expires_at <= created_at + INTERVAL '10 minutes' \
-         AND NOT EXISTS (SELECT 1 FROM public.product_auth_sessions \
-          WHERE oauth_state_digest = $1) FOR SHARE",
-    )
-    .bind(consumed_flow.state_digest.as_bytes().as_slice())
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(identity_database_error)?
-    .ok_or(ProductIdentityError::FlowInvalidOrConsumed)?;
-    let database_now = database_time(transaction)
-        .await
-        .map_err(identity_database_error)?;
-    if persisted.redirect_uri != consumed_flow.redirect_uri
-        || persisted.redirect_uri != config.redirect_uri()
-        || persisted.return_path != consumed_flow.return_path
-        || !config.allows_return_path(&persisted.return_path)
-        || persisted.consumed_at != consumed_flow.consumed_at
-        || database_now >= persisted.expires_at
-    {
-        return Err(ProductIdentityError::FlowInvalidOrConsumed);
-    }
-    Ok(())
 }

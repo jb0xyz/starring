@@ -9,12 +9,11 @@ use authoring_application::{
 use authoring_promotion::PrincipalId;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use sqlx::types::Json;
 use subtle::ConstantTimeEq;
 
-use crate::digest::digest_opaque_session_credential_v1;
+use crate::digest::{csrf_comparison_tag_v1, digest_opaque_session_credential_v1};
 use crate::{ProductDatabaseFailureV1, ProductSessionDigestV1};
 
 pub use readiness::AuthenticationReadinessErrorV1;
@@ -174,7 +173,7 @@ impl AuthenticationRow {
                     .ok_or(SessionValidationError::Invariant)?
                     .try_into()
                     .map_err(|_| SessionValidationError::Invariant)?;
-                let expected_tag = csrf_comparison_tag(
+                let expected_tag = csrf_comparison_tag_v1(
                     session_fingerprint.as_bytes(),
                     expected_csrf_digest.as_bytes(),
                 );
@@ -230,13 +229,6 @@ impl AuthenticationRow {
 enum SessionProofModeV1<'a> {
     SessionOnly,
     Mutation(&'a ProductSessionDigestV1),
-}
-
-fn csrf_comparison_tag(session_digest: &[u8; 32], csrf_digest: &[u8; 32]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(session_digest);
-    digest.update(csrf_digest);
-    digest.finalize().into()
 }
 
 #[derive(Clone)]
@@ -495,7 +487,7 @@ mod tests {
     fn mutation_row(csrf_digest: &ProductSessionDigestV1) -> AuthenticationRow {
         let mut row = row();
         row.csrf_comparison_tag =
-            Some(csrf_comparison_tag(fingerprint().as_bytes(), csrf_digest.as_bytes()).to_vec());
+            Some(csrf_comparison_tag_v1(fingerprint().as_bytes(), csrf_digest.as_bytes()).to_vec());
         row
     }
 

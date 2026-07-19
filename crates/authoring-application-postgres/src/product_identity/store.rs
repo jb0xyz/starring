@@ -10,22 +10,53 @@ use super::PostgresProductIdentityConfig;
 pub(super) const SECRET_INSERT_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
+pub struct ProductIdentityDatabasePoolsV1 {
+    pub(super) oauth_flow_writer: PgPool,
+    pub(super) session_issuer: PgPool,
+    pub(super) session_api: PgPool,
+    pub(super) security_revoker: PgPool,
+}
+
+impl ProductIdentityDatabasePoolsV1 {
+    pub fn new(
+        oauth_flow_writer: PgPool,
+        session_issuer: PgPool,
+        session_api: PgPool,
+        security_revoker: PgPool,
+    ) -> Self {
+        Self {
+            oauth_flow_writer,
+            session_issuer,
+            session_api,
+            security_revoker,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PostgresProductIdentityStore<G = OperatingSystemSecretGenerator> {
-    pub(super) pool: PgPool,
+    pub(super) pools: ProductIdentityDatabasePoolsV1,
     pub(super) generator: G,
     pub(super) config: PostgresProductIdentityConfig,
 }
 
 impl PostgresProductIdentityStore<OperatingSystemSecretGenerator> {
-    pub fn production(pool: PgPool, config: PostgresProductIdentityConfig) -> Self {
-        Self::new(pool, OperatingSystemSecretGenerator, config)
+    pub fn production(
+        pools: ProductIdentityDatabasePoolsV1,
+        config: PostgresProductIdentityConfig,
+    ) -> Self {
+        Self::new(pools, OperatingSystemSecretGenerator, config)
     }
 }
 
 impl<G> PostgresProductIdentityStore<G> {
-    pub fn new(pool: PgPool, generator: G, config: PostgresProductIdentityConfig) -> Self {
+    pub fn new(
+        pools: ProductIdentityDatabasePoolsV1,
+        generator: G,
+        config: PostgresProductIdentityConfig,
+    ) -> Self {
         Self {
-            pool,
+            pools,
             generator,
             config,
         }
@@ -33,7 +64,7 @@ impl<G> PostgresProductIdentityStore<G> {
 
     pub fn authentication(&self) -> PostgresAuthentication {
         PostgresAuthentication::with_config(
-            self.pool.clone(),
+            self.pools.session_api.clone(),
             self.config.lifetimes().authentication(),
         )
     }
