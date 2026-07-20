@@ -429,34 +429,43 @@ workspace and PostgreSQL gates are green, the installed plist replacements are
 complete, and the staging limitation above is accepted.
 
 ```bash
-git fetch --prune origin
-test -z "$(git status --porcelain)"
-test -n "$STARRING_APPROVED_RELEASE_REVISION"
-printf '%s\n' "$STARRING_APPROVED_RELEASE_REVISION" \
-  | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
-APPROVED_SHA="$(git rev-parse --verify "${STARRING_APPROVED_RELEASE_REVISION}^{commit}")"
-test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
-git merge-base --is-ancestor "$APPROVED_SHA" origin/main
-BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/starring-api-build.XXXXXX")"
-CARGO_TARGET_DIR="$BUILD_ROOT/target" \
-  cargo build --locked --release -p starring-api
-SOURCE_BINARY="$BUILD_ROOT/target/release/starring-api"
-SOURCE_SHA256="$(/usr/bin/shasum -a 256 "$SOURCE_BINARY" | /usr/bin/awk '{print $1}')"
-mkdir -p "$HOME/.local/libexec" "$HOME/Library/LaunchAgents" \
-  "$HOME/Library/Logs/starring-api"
-chmod 700 "$HOME/.local/libexec" "$HOME/Library/Logs/starring-api"
-install -m 500 "$SOURCE_BINARY" \
-  "$HOME/.local/libexec/starring-api"
-INSTALLED_SHA256="$(/usr/bin/shasum -a 256 \
-  "$HOME/.local/libexec/starring-api" | /usr/bin/awk '{print $1}')"
-test "$SOURCE_SHA256" = "$INSTALLED_SHA256"
-printf 'revision=%s\nbinary_sha256=%s\n' "$APPROVED_SHA" "$INSTALLED_SHA256"
-install -m 600 ops/macos/local.starring.api.staging.plist \
-  "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
-plutil -lint "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
-rm -rf "$BUILD_ROOT"
-unset STARRING_APPROVED_RELEASE_REVISION INSTALLED_SHA256 SOURCE_SHA256 \
-  SOURCE_BINARY BUILD_ROOT APPROVED_SHA
+(
+  set -euo pipefail
+  BUILD_ROOT=""
+  cleanup_starring_api_build() {
+    if test -n "$BUILD_ROOT"
+    then
+      rm -rf "$BUILD_ROOT"
+    fi
+  }
+  trap cleanup_starring_api_build EXIT
+  git fetch --prune origin
+  test -z "$(git status --porcelain)"
+  test -n "$STARRING_APPROVED_RELEASE_REVISION"
+  printf '%s\n' "$STARRING_APPROVED_RELEASE_REVISION" \
+    | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+  APPROVED_SHA="$(git rev-parse --verify "${STARRING_APPROVED_RELEASE_REVISION}^{commit}")"
+  test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+  git merge-base --is-ancestor "$APPROVED_SHA" origin/main
+  BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/starring-api-build.XXXXXX")"
+  CARGO_TARGET_DIR="$BUILD_ROOT/target" \
+    cargo build --locked --release -p starring-api
+  SOURCE_BINARY="$BUILD_ROOT/target/release/starring-api"
+  SOURCE_SHA256="$(/usr/bin/shasum -a 256 "$SOURCE_BINARY" | /usr/bin/awk '{print $1}')"
+  mkdir -p "$HOME/.local/libexec" "$HOME/Library/LaunchAgents" \
+    "$HOME/Library/Logs/starring-api"
+  chmod 700 "$HOME/.local/libexec" "$HOME/Library/Logs/starring-api"
+  install -m 500 "$SOURCE_BINARY" \
+    "$HOME/.local/libexec/starring-api"
+  INSTALLED_SHA256="$(/usr/bin/shasum -a 256 \
+    "$HOME/.local/libexec/starring-api" | /usr/bin/awk '{print $1}')"
+  test "$SOURCE_SHA256" = "$INSTALLED_SHA256"
+  printf 'revision=%s\nbinary_sha256=%s\n' "$APPROVED_SHA" "$INSTALLED_SHA256"
+  install -m 600 ops/macos/local.starring.api.staging.plist \
+    "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+  plutil -lint "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+) || exit 1
+unset STARRING_APPROVED_RELEASE_REVISION
 ```
 
 Set `STARRING_APPROVED_RELEASE_REVISION` from the independently approved change
@@ -464,9 +473,12 @@ record, never by reading the target checkout immediately before installation.
 The exact clean `HEAD` must equal that immutable 40-character revision and be
 reachable from fetched `origin/main`. The fresh target directory prevents an
 older local artifact from being mistaken for the build, and the recorded
-source and installed SHA-256 values must match. Preserve the printed revision
-and digest in the staging release evidence, then clear the approved-revision
-environment variable after installation.
+source and installed SHA-256 values must match. The fail-fast subshell removes
+its fresh build directory on success or failure and exits the operator shell
+before any later launch command after a failed guard, build, install, digest,
+or plist check. Preserve the printed revision and digest in the staging release
+evidence, then clear the approved-revision environment variable after
+installation.
 
 Edit only the installed plist. Replace `https://api.example.com`,
 `REPLACE_WITH_DISCORD_APPLICATION_ID`, and
