@@ -21,7 +21,8 @@ pub use authentication::{
 };
 pub use database::ProductDatabaseFailureV1;
 pub use deployment_status::{
-    PostgresProductDeploymentStatuses, PostgresProductDeploymentStatusesConfig,
+    PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
+    PostgresProductDeploymentStatusesConfig, ProductDeploymentOperationalStatusReadinessErrorV2,
     ProductDeploymentStatusConfigError, ProductDeploymentStatusReadinessErrorV1,
 };
 pub use digest::{

@@ -10,3 +10,4 @@ include!("postgres_product_control_e2e/product_decision_security.rs");
 include!("postgres_product_control_e2e/product_decision_reader_security.rs");
 include!("postgres_product_control_e2e/product_apply_security.rs");
 include!("postgres_product_control_e2e/deployment_status.rs");
+include!("postgres_product_control_e2e/deployment_operational_status.rs");

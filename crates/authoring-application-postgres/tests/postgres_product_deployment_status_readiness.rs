@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application_postgres::{
-    PostgresProductDeploymentStatuses, ProductDeploymentStatusReadinessErrorV1, MIGRATOR,
+    PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
+    ProductDeploymentOperationalStatusReadinessErrorV2, ProductDeploymentStatusReadinessErrorV1,
+    MIGRATOR,
 };
 use futures::FutureExt;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
@@ -12,6 +14,10 @@ use sqlx::Connection;
 const STATUS_IDENTITY_FUNCTION: &str =
     "public.starring_product_deployment_status_reader_database_identity_v1()";
 const STATUS_READ_FUNCTION: &str = "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
+const OPERATIONAL_STATUS_IDENTITY_FUNCTION: &str =
+    "public.starring_product_deployment_status_reader_database_identity_v2()";
+const OPERATIONAL_STATUS_CORE_FUNCTION: &str = "public.starring_product_deployment_status_read_core_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
+const OPERATIONAL_STATUS_READ_FUNCTION: &str = "public.starring_product_deployment_status_read_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
 const UNEXPECTED_FUNCTION: &str = "public.validate_runtime_deployment_projection()";
 const CANONICAL_HELPER: &str = "public.starring_canonical_json_v1(JSONB)";
 
@@ -31,9 +37,12 @@ const RELATIONS: [&str; 13] = [
     "runtime_serving_leases",
 ];
 
-const OWNED_FUNCTIONS: [&str; 15] = [
+const OWNED_FUNCTIONS: [&str; 18] = [
     STATUS_IDENTITY_FUNCTION,
     STATUS_READ_FUNCTION,
+    OPERATIONAL_STATUS_IDENTITY_FUNCTION,
+    OPERATIONAL_STATUS_CORE_FUNCTION,
+    OPERATIONAL_STATUS_READ_FUNCTION,
     "public.validate_runtime_deployment_projection()",
     "public.validate_runtime_convergence_attempt_projection()",
     "public.enforce_runtime_deployment_policy_shadow()",
@@ -61,8 +70,10 @@ struct StatusReadinessFixture {
     database: StatusReadinessDatabase,
     owner_role: String,
     reader_role: String,
+    operational_reader_role: String,
     attacker_role: String,
     reader_pool: PgPool,
+    operational_reader_pool: PgPool,
 }
 
 #[derive(Clone, Copy)]
@@ -406,14 +417,27 @@ impl StatusReadinessFixture {
         let role_suffix = suffix();
         let owner_role = format!("status_owner_{role_suffix}");
         let reader_role = format!("status_reader_{role_suffix}");
+        let operational_reader_role = format!("status_operational_{role_suffix}");
         let attacker_role = format!("status_attacker_{role_suffix}");
-        for role in [&owner_role, &reader_role, &attacker_role] {
+        for role in [
+            &owner_role,
+            &reader_role,
+            &operational_reader_role,
+            &attacker_role,
+        ] {
             assert_safe_identifier(role);
         }
         let reader_password = database_role_password();
-        let password_literal =
+        let reader_password_literal =
             sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
                 .bind(&reader_password)
+                .fetch_one(&database.owner_pool)
+                .await
+                .unwrap();
+        let operational_reader_password = database_role_password();
+        let operational_reader_password_literal =
+            sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
+                .bind(&operational_reader_password)
                 .fetch_one(&database.owner_pool)
                 .await
                 .unwrap();
@@ -425,9 +449,17 @@ impl StatusReadinessFixture {
         .await
         .unwrap();
         sqlx::query(&format!(
-            "CREATE ROLE {reader_role} LOGIN PASSWORD {password_literal} \
+            "CREATE ROLE {reader_role} LOGIN PASSWORD {reader_password_literal} \
              NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
              NOBYPASSRLS CONNECTION LIMIT 4"
+        ))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "CREATE ROLE {operational_reader_role} LOGIN \
+             PASSWORD {operational_reader_password_literal} NOSUPERUSER NOCREATEDB \
+             NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4"
         ))
         .execute(&mut database.administrator)
         .await
@@ -465,14 +497,22 @@ impl StatusReadinessFixture {
             .await
             .unwrap();
         sqlx::query(&format!(
-            "GRANT CONNECT ON DATABASE {} TO {reader_role}",
-            database.name
+            "GRANT CONNECT ON DATABASE {} TO {reader_role}, {operational_reader_role}",
+            database.name,
         ))
         .execute(&database.owner_pool)
         .await
         .unwrap();
         sqlx::query(&format!(
-            "GRANT USAGE ON SCHEMA public TO {owner_role}, {reader_role}"
+            "GRANT USAGE ON SCHEMA public TO {owner_role}, {reader_role}, \
+             {operational_reader_role}"
+        ))
+        .execute(&database.owner_pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION {OPERATIONAL_STATUS_IDENTITY_FUNCTION}, \
+             {OPERATIONAL_STATUS_READ_FUNCTION} TO {operational_reader_role}"
         ))
         .execute(&database.owner_pool)
         .await
@@ -496,17 +536,35 @@ impl StatusReadinessFixture {
             )
             .await
             .unwrap();
+        let operational_reader_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                database_url()
+                    .parse::<PgConnectOptions>()
+                    .unwrap()
+                    .database(&database.name)
+                    .username(&operational_reader_role)
+                    .password(&operational_reader_password),
+            )
+            .await
+            .unwrap();
         Self {
             database,
             owner_role,
             reader_role,
+            operational_reader_role,
             attacker_role,
             reader_pool,
+            operational_reader_pool,
         }
     }
 
     fn statuses(&self) -> PostgresProductDeploymentStatuses {
         PostgresProductDeploymentStatuses::new(self.reader_pool.clone())
+    }
+
+    fn operational_statuses(&self) -> PostgresProductDeploymentOperationalStatusesV2 {
+        PostgresProductDeploymentOperationalStatusesV2::new(self.operational_reader_pool.clone())
     }
 
     async fn execute_owner(&self, statement: &str) {
@@ -534,6 +592,7 @@ impl StatusReadinessFixture {
 
     async fn close(self) {
         self.reader_pool.close().await;
+        self.operational_reader_pool.close().await;
         self.database.owner_pool.close().await;
         let mut administrator = self.database.administrator;
         sqlx::query(&format!(
@@ -543,7 +602,12 @@ impl StatusReadinessFixture {
         .execute(&mut administrator)
         .await
         .unwrap();
-        for role in [self.reader_role, self.attacker_role, self.owner_role] {
+        for role in [
+            self.reader_role,
+            self.operational_reader_role,
+            self.attacker_role,
+            self.owner_role,
+        ] {
             assert_safe_identifier(&role);
             sqlx::query(&format!("DROP ROLE {role}"))
                 .execute(&mut administrator)
@@ -699,4 +763,359 @@ async fn status_readiness_rejects_persisted_contract_drift() {
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn status_readiness_rejects_invalid_database_topology() {
     exercise_cases("topology", &[ReadinessDrift::InvalidTopologyIdentity]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn operational_status_readiness_enforces_a_separate_exact_capability() {
+    let fixture = StatusReadinessFixture::new("operational").await;
+    let outcome = AssertUnwindSafe(async {
+        fixture.statuses().verify_readiness().await.unwrap();
+        fixture
+            .operational_statuses()
+            .verify_readiness()
+            .await
+            .unwrap();
+
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION {OPERATIONAL_STATUS_READ_FUNCTION} FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::CapabilityMissing)
+        );
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION {OPERATIONAL_STATUS_READ_FUNCTION} TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION {STATUS_READ_FUNCTION} TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION {STATUS_READ_FUNCTION} FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION {OPERATIONAL_STATUS_READ_FUNCTION} TO {}",
+                fixture.reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.statuses().verify_readiness().await,
+            Err(ProductDeploymentStatusReadinessErrorV1::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION {OPERATIONAL_STATUS_READ_FUNCTION} FROM {}",
+                fixture.reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION {OPERATIONAL_STATUS_CORE_FUNCTION} TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION {OPERATIONAL_STATUS_CORE_FUNCTION} FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(&format!(
+                "GRANT SELECT ON TABLE public.runtime_deployments TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE SELECT ON TABLE public.runtime_deployments FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        fixture
+            .operational_statuses()
+            .verify_readiness()
+            .await
+            .unwrap();
+        fixture.statuses().verify_readiness().await.unwrap();
+
+        let core_error = sqlx::query(
+            "SELECT * FROM public.starring_product_deployment_status_read_core_v2(\
+                '', '', '', '', '', '', '', '', ''::bytea)",
+        )
+        .execute(&fixture.operational_reader_pool)
+        .await
+        .expect_err("operational status reader must not execute the private core");
+        assert!(matches!(
+            core_error,
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("42501")
+        ));
+        let v1_cross_error = sqlx::query(&format!("SELECT {STATUS_IDENTITY_FUNCTION}"))
+            .execute(&fixture.operational_reader_pool)
+            .await
+            .expect_err("operational status reader must not execute the V1 identity");
+        assert!(matches!(
+            v1_cross_error,
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("42501")
+        ));
+        let v2_cross_error = sqlx::query(&format!("SELECT {OPERATIONAL_STATUS_IDENTITY_FUNCTION}"))
+            .execute(&fixture.reader_pool)
+            .await
+            .expect_err("V1 status reader must not execute the operational identity");
+        assert!(matches!(
+            v2_cross_error,
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("42501")
+        ));
+    })
+    .catch_unwind()
+    .await;
+    fixture.close().await;
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn operational_status_readiness_rejects_support_and_global_capability_drift() {
+    let fixture = StatusReadinessFixture::new("ophardening").await;
+    let outcome = AssertUnwindSafe(async {
+        fixture
+            .operational_statuses()
+            .verify_readiness()
+            .await
+            .unwrap();
+
+        fixture
+            .execute_owner(&format!("ALTER FUNCTION {CANONICAL_HELPER} VOLATILE"))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ContractMismatch)
+        );
+        fixture
+            .execute_owner(&format!("ALTER FUNCTION {CANONICAL_HELPER} IMMUTABLE"))
+            .await;
+
+        fixture
+            .execute_owner(
+                "ALTER FUNCTION public.validate_runtime_deployment_projection() \
+                 SECURITY INVOKER",
+            )
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ContractMismatch)
+        );
+        fixture
+            .execute_owner(
+                "ALTER FUNCTION public.validate_runtime_deployment_projection() \
+                 SECURITY DEFINER",
+            )
+            .await;
+
+        fixture
+            .execute_owner(
+                "ALTER FUNCTION public.validate_runtime_deployment_projection() RESET ALL",
+            )
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ContractMismatch)
+        );
+        fixture
+            .execute_owner(
+                "ALTER FUNCTION public.validate_runtime_deployment_projection() \
+                 SET search_path = pg_catalog",
+            )
+            .await;
+        fixture
+            .operational_statuses()
+            .verify_readiness()
+            .await
+            .unwrap();
+
+        fixture.execute_owner("CREATE SCHEMA status_shadow").await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT USAGE ON SCHEMA status_shadow TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE USAGE ON SCHEMA status_shadow FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT CREATE ON SCHEMA status_shadow TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE CREATE ON SCHEMA status_shadow FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner("CREATE TABLE status_shadow.secret(value INTEGER, hidden INTEGER)")
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT SELECT ON TABLE status_shadow.secret TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE SELECT ON TABLE status_shadow.secret FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT SELECT (hidden) ON TABLE status_shadow.secret TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE SELECT (hidden) ON TABLE status_shadow.secret FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner("CREATE SEQUENCE status_shadow.secret_sequence")
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT USAGE ON SEQUENCE status_shadow.secret_sequence TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE USAGE ON SEQUENCE status_shadow.secret_sequence FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(
+                "CREATE FUNCTION status_shadow.escape() RETURNS INTEGER LANGUAGE sql \
+                 VOLATILE STRICT SECURITY DEFINER SET search_path = pg_catalog \
+                 AS 'SELECT 1'",
+            )
+            .await;
+        fixture
+            .execute_owner("REVOKE ALL ON FUNCTION status_shadow.escape() FROM PUBLIC")
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION status_shadow.escape() TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION status_shadow.escape() FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(
+                "CREATE FUNCTION status_shadow.starring_escape() RETURNS INTEGER \
+                 LANGUAGE sql VOLATILE STRICT SET search_path = pg_catalog AS 'SELECT 1'",
+            )
+            .await;
+        fixture
+            .execute_owner("REVOKE ALL ON FUNCTION status_shadow.starring_escape() FROM PUBLIC")
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION status_shadow.starring_escape() TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION status_shadow.starring_escape() FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        fixture
+            .operational_statuses()
+            .verify_readiness()
+            .await
+            .unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fixture.close().await;
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }

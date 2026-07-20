@@ -1199,6 +1199,30 @@ fn source_files_contain_no_comments() {
             "src/deployment_status/row.rs",
             include_str!("../src/deployment_status/row.rs"),
         ),
+        (
+            "src/deployment_status/operational/contract.rs",
+            include_str!("../src/deployment_status/operational/contract.rs"),
+        ),
+        (
+            "src/deployment_status/operational/mod.rs",
+            include_str!("../src/deployment_status/operational/mod.rs"),
+        ),
+        (
+            "src/deployment_status/operational/projection.rs",
+            include_str!("../src/deployment_status/operational/projection.rs"),
+        ),
+        (
+            "src/deployment_status/operational/query.rs",
+            include_str!("../src/deployment_status/operational/query.rs"),
+        ),
+        (
+            "src/deployment_status/operational/readiness.rs",
+            include_str!("../src/deployment_status/operational/readiness.rs"),
+        ),
+        (
+            "src/deployment_status/operational/row.rs",
+            include_str!("../src/deployment_status/operational/row.rs"),
+        ),
         ("src/digest.rs", include_str!("../src/digest.rs")),
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
         (

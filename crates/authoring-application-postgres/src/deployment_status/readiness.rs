@@ -34,7 +34,7 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 13] = [
 ];
 const PROBE_SESSION_DIGEST: [u8; 31] = [113_u8; 31];
 const PROBE_IDENTITY: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-const SUPPORT_CONTRACT_QUERY: &str = r#"
+pub(super) const SUPPORT_CONTRACT_QUERY: &str = r#"
 WITH common_owner AS (
     SELECT relation.relowner AS owner_oid
     FROM pg_catalog.pg_class AS relation

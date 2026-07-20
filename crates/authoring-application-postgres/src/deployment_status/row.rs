@@ -88,7 +88,11 @@ pub(super) fn select_exact_evidence(
 }
 
 impl ProductDeploymentStatusRow {
-    fn sensitive_evidence_is_empty(&self) -> bool {
+    pub(super) fn request_outcome(&self) -> &str {
+        &self.request_outcome
+    }
+
+    pub(super) fn sensitive_evidence_is_empty(&self) -> bool {
         self.deployment_projection.is_none()
             && self.activation_projection.is_none()
             && self.promotion_projection.is_none()
