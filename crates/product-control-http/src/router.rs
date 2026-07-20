@@ -34,7 +34,6 @@ struct HttpState<F> {
     facade: Arc<F>,
     config: HttpBoundaryConfig,
     in_flight: Arc<Semaphore>,
-    readiness_in_flight: Arc<Semaphore>,
     readiness_gate: crate::ProductApiReadinessGate,
     oauth_start_budget: Arc<OAuthStartBudget>,
 }
@@ -45,7 +44,6 @@ impl<F> Clone for HttpState<F> {
             facade: Arc::clone(&self.facade),
             config: self.config.clone(),
             in_flight: Arc::clone(&self.in_flight),
-            readiness_in_flight: Arc::clone(&self.readiness_in_flight),
             readiness_gate: self.readiness_gate.clone(),
             oauth_start_budget: Arc::clone(&self.oauth_start_budget),
         }
@@ -134,7 +132,6 @@ fn http_state<F>(
     HttpState {
         facade,
         in_flight: Arc::new(Semaphore::new(config.max_in_flight())),
-        readiness_in_flight: Arc::new(Semaphore::new(1)),
         readiness_gate,
         oauth_start_budget: Arc::new(OAuthStartBudget::new(config.oauth_start_budget())),
         config,
@@ -749,14 +746,7 @@ where
             &request_id,
         );
     }
-    match state.facade.readiness().await {
-        Ok(()) if state.readiness_gate.is_ready() => StatusCode::OK.into_response(),
-        Ok(()) => map_facade(
-            FacadeError::new(FacadeErrorCode::DependencyUnavailable),
-            &request_id,
-        ),
-        Err(error) => map_facade(error, &request_id),
-    }
+    StatusCode::OK.into_response()
 }
 
 async fn not_found(Extension(request_id): Extension<RequestId>) -> Response {

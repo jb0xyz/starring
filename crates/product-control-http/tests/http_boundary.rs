@@ -42,10 +42,7 @@ struct FakeFacade {
     readiness_calls: AtomicUsize,
     promote_calls: AtomicUsize,
     fail_me: AtomicUsize,
-    panic_ready: AtomicUsize,
-    block_readiness: AtomicUsize,
-    readiness_entered: Notify,
-    readiness_release: Notify,
+    panic_me: AtomicUsize,
     disallowed_return: AtomicUsize,
     invalid_client_id: AtomicUsize,
     invalid_callback_url: AtomicUsize,
@@ -161,6 +158,7 @@ impl ProductControlFacade for FakeFacade {
         &self,
         credential: &SessionCredential,
     ) -> Result<CurrentPrincipal, FacadeError> {
+        assert_eq!(self.panic_me.load(Ordering::SeqCst), 0);
         if self.fail_me.load(Ordering::SeqCst) > 0 {
             return Err(FacadeError::new(FacadeErrorCode::Internal));
         }
@@ -303,11 +301,6 @@ impl ProductControlFacade for FakeFacade {
 
     async fn readiness(&self) -> Result<(), FacadeError> {
         self.readiness_calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(self.panic_ready.load(Ordering::SeqCst), 0);
-        if self.block_readiness.load(Ordering::SeqCst) != 0 {
-            self.readiness_entered.notify_one();
-            self.readiness_release.notified().await;
-        }
         Ok(())
     }
 }
@@ -943,7 +936,7 @@ async fn liveness_remains_available_when_business_capacity_is_exhausted() {
 }
 
 #[tokio::test]
-async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_calls() {
+async fn readiness_gate_blocks_business_routes_before_facade_or_capacity() {
     let facade = Arc::new(FakeFacade::default());
     let gate = ProductApiReadinessGate::initially_unready();
     let lease = gate.claim().unwrap();
@@ -962,6 +955,30 @@ async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_ca
     assert!(body_text(response).await.contains("dependency_unavailable"));
     assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
 
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start?return_to=%2Fapp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(response).await.contains("dependency_unavailable"));
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
     lease.mark_ready();
     let response = app
         .clone()
@@ -973,7 +990,19 @@ async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_ca
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start?return_to=%2Fapp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 1);
 
     lease.mark_unready();
     let response = app
@@ -985,30 +1014,42 @@ async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_ca
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn readiness_gate_rechecks_after_an_in_flight_dependency_probe() {
+async fn readiness_endpoint_is_an_atomic_gate_read_without_facade_amplification() {
     let facade = Arc::new(FakeFacade::default());
-    facade.block_readiness.store(1, Ordering::SeqCst);
     let gate = ProductApiReadinessGate::initially_unready();
     let lease = gate.claim().unwrap();
     lease.mark_ready();
     let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
-    let probe = tokio::spawn(
-        app.oneshot(
+
+    for _ in 0..16 {
+        let response = app
+            .clone()
+            .oneshot(
+                request_builder("GET", "/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    lease.mark_unready();
+    let response = app
+        .oneshot(
             request_builder("GET", "/health/ready")
                 .body(Body::empty())
                 .unwrap(),
-        ),
-    );
-    facade.readiness_entered.notified().await;
-    lease.mark_unready();
-    facade.readiness_release.notify_one();
-    let response = probe.await.unwrap().unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1824,10 +1865,11 @@ async fn logout_clears_session_and_csrf_cookies() {
 #[tokio::test]
 async fn panic_and_wrong_method_have_redacted_problem_responses() {
     let facade = Arc::new(FakeFacade::default());
-    facade.panic_ready.store(1, Ordering::SeqCst);
+    facade.panic_me.store(1, Ordering::SeqCst);
     let response = app(facade)
         .oneshot(
-            request_builder("GET", "/health/ready")
+            request_builder("GET", "/v1/me")
+                .header("cookie", format!("__Host-starring_session={SESSION}"))
                 .body(Body::empty())
                 .unwrap(),
         )

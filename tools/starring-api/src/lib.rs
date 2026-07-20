@@ -41,7 +41,7 @@ pub use secret::{
     ResolvedProductionSecretsV1, SecretResolutionErrorV1,
 };
 pub use server::{
-    serve_verified_loopback, LoopbackServeErrorV1, LoopbackServeReportV1,
-    LoopbackServerConfigErrorV1, LoopbackServerConfigInputV1, LoopbackServerConfigV1,
-    MAX_GRACEFUL_DRAIN_TIMEOUT,
+    serve_verified_loopback, serve_verified_loopback_with_runtime_readiness, LoopbackServeErrorV1,
+    LoopbackServeReportV1, LoopbackServerConfigErrorV1, LoopbackServerConfigInputV1,
+    LoopbackServerConfigV1, MAX_GRACEFUL_DRAIN_TIMEOUT,
 };

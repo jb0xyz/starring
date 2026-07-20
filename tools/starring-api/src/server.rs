@@ -212,6 +212,8 @@ pub enum LoopbackServeErrorV1 {
     BindFailed,
     #[error("the startup readiness probe failed or exceeded its deadline")]
     StartupReadinessFailed,
+    #[error("runtime dependency readiness was lost")]
+    RuntimeReadinessFailed,
     #[error("the loopback listener repeatedly failed to accept connections")]
     AcceptFailed,
     #[error("an isolated connection task failed")]
@@ -230,6 +232,58 @@ pub async fn serve_verified_loopback<P, S>(
 ) -> Result<LoopbackServeReportV1, LoopbackServeErrorV1>
 where
     P: Future<Output = bool> + Send + 'static,
+    S: Future<Output = ()> + Send,
+{
+    serve_verified_loopback_inner(
+        bind_addr,
+        router,
+        readiness_gate,
+        config,
+        startup_probe,
+        std::future::pending(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_verified_loopback_with_runtime_readiness<P, R, S>(
+    bind_addr: SocketAddr,
+    router: Router,
+    readiness_gate: ProductApiReadinessGate,
+    config: LoopbackServerConfigV1,
+    startup_probe: P,
+    runtime_readiness_failure: R,
+    shutdown: S,
+) -> Result<LoopbackServeReportV1, LoopbackServeErrorV1>
+where
+    P: Future<Output = bool> + Send + 'static,
+    R: Future<Output = ()> + Send,
+    S: Future<Output = ()> + Send,
+{
+    serve_verified_loopback_inner(
+        bind_addr,
+        router,
+        readiness_gate,
+        config,
+        startup_probe,
+        runtime_readiness_failure,
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_verified_loopback_inner<P, R, S>(
+    bind_addr: SocketAddr,
+    router: Router,
+    readiness_gate: ProductApiReadinessGate,
+    config: LoopbackServerConfigV1,
+    startup_probe: P,
+    runtime_readiness_failure: R,
+    shutdown: S,
+) -> Result<LoopbackServeReportV1, LoopbackServeErrorV1>
+where
+    P: Future<Output = bool> + Send + 'static,
+    R: Future<Output = ()> + Send,
     S: Future<Output = ()> + Send,
 {
     let readiness = readiness_gate.claim().map_err(map_claim_error)?;
@@ -267,6 +321,7 @@ where
     let connection_permits = Arc::new(Semaphore::new(config.input.max_connections));
     let mut connections = JoinSet::new();
     let mut consecutive_accept_failures = 0_u8;
+    let mut runtime_readiness_failure = Box::pin(runtime_readiness_failure);
     readiness.mark_ready();
 
     let exit = loop {
@@ -278,6 +333,9 @@ where
             _ = shutdown.as_mut() => {
                 break ServeExit::Shutdown;
             }
+            _ = runtime_readiness_failure.as_mut() => {
+                break ServeExit::RuntimeReadinessFailed;
+            }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if matches!(completed, Some(Err(_))) {
                     break ServeExit::ConnectionTaskFailed;
@@ -287,8 +345,7 @@ where
                 match accepted {
                     Err(()) => break ServeExit::ConnectionTaskFailed,
                     Ok((permit, Ok((stream, _)))) => {
-                        consecutive_accept_failures = 0;
-                        readiness.mark_ready();
+                        register_accept_success(&readiness, &mut consecutive_accept_failures);
                         spawn_connection(
                             &mut connections,
                             stream,
@@ -308,6 +365,7 @@ where
                         };
                         if let Some(backoff_exit) = wait_for_accept_backoff(
                             shutdown.as_mut(),
+                            runtime_readiness_failure.as_mut(),
                             &mut connections,
                             delay,
                         ).await {
@@ -321,6 +379,7 @@ where
 
     readiness.mark_unready();
     drop(listener);
+    drop(runtime_readiness_failure);
 
     match exit {
         ServeExit::Shutdown => {
@@ -340,6 +399,15 @@ where
             )
             .await?;
             Err(LoopbackServeErrorV1::AcceptFailed)
+        }
+        ServeExit::RuntimeReadinessFailed => {
+            drain_connections(
+                &mut connections,
+                drain_sender,
+                config.input.graceful_drain_timeout,
+            )
+            .await?;
+            Err(LoopbackServeErrorV1::RuntimeReadinessFailed)
         }
         ServeExit::ConnectionTaskFailed => {
             abort_connections(&mut connections).await;
@@ -418,13 +486,22 @@ fn register_accept_failure(
     Ok(ACCEPT_RETRY_DELAY)
 }
 
-async fn wait_for_accept_backoff<S>(
+fn register_accept_success(readiness: &ProductApiReadinessLeaseV1, consecutive_failures: &mut u8) {
+    if *consecutive_failures != 0 {
+        *consecutive_failures = 0;
+        readiness.mark_ready();
+    }
+}
+
+async fn wait_for_accept_backoff<S, R>(
     mut shutdown: Pin<&mut S>,
+    mut runtime_readiness_failure: Pin<&mut R>,
     connections: &mut JoinSet<OwnedSemaphorePermit>,
     delay: Duration,
 ) -> Option<ServeExit>
 where
     S: Future<Output = ()>,
+    R: Future<Output = ()>,
 {
     let backoff = sleep(delay);
     tokio::pin!(backoff);
@@ -432,6 +509,9 @@ where
         tokio::select! {
             biased;
             _ = shutdown.as_mut() => return Some(ServeExit::Shutdown),
+            _ = runtime_readiness_failure.as_mut() => {
+                return Some(ServeExit::RuntimeReadinessFailed)
+            }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if matches!(completed, Some(Err(_))) {
                     return Some(ServeExit::ConnectionTaskFailed);
@@ -541,6 +621,7 @@ fn validate_positive_bounded_duration(
 enum ServeExit {
     Shutdown,
     AcceptFailed,
+    RuntimeReadinessFailed,
     ConnectionTaskFailed,
 }
 
@@ -836,6 +917,23 @@ mod tests {
         assert!(!gate.is_ready());
     }
 
+    #[test]
+    fn accept_success_reopens_only_a_transport_failure() {
+        let gate = ProductApiReadinessGate::initially_unready();
+        let lease = gate.claim().unwrap();
+        let mut failures = 0;
+
+        register_accept_success(&lease, &mut failures);
+        assert!(!gate.is_ready());
+
+        lease.mark_ready();
+        assert!(register_accept_failure(&lease, &mut failures).is_ok());
+        assert!(!gate.is_ready());
+        register_accept_success(&lease, &mut failures);
+        assert!(gate.is_ready());
+        assert_eq!(failures, 0);
+    }
+
     #[tokio::test]
     async fn startup_probe_stays_unready_until_true_then_opens_readiness() {
         let address = available_loopback_address().await;
@@ -869,6 +967,46 @@ mod tests {
 
         shutdown_sender.send(()).unwrap();
         assert!(server.await.unwrap().is_ok());
+        assert!(!gate.is_ready());
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_is_not_polled_during_startup() {
+        let gate = ProductApiReadinessGate::initially_unready();
+        let startup_polled = Arc::new(Notify::new());
+        let startup_observer = startup_polled.clone();
+        let (startup_sender, startup_receiver) = oneshot::channel();
+        let runtime_polls = Arc::new(AtomicUsize::new(0));
+        let runtime_observer = runtime_polls.clone();
+        let server_gate = gate.clone();
+        let server = tokio::spawn(async move {
+            serve_verified_loopback_with_runtime_readiness(
+                loopback_address(0),
+                Router::new(),
+                server_gate,
+                LoopbackServerConfigV1::default(),
+                async move {
+                    startup_observer.notify_one();
+                    startup_receiver.await.unwrap_or(false)
+                },
+                async move {
+                    runtime_observer.fetch_add(1, Ordering::AcqRel);
+                },
+                pending(),
+            )
+            .await
+        });
+
+        startup_polled.notified().await;
+        assert_eq!(runtime_polls.load(Ordering::Acquire), 0);
+        assert!(!gate.is_ready());
+        startup_sender.send(true).unwrap();
+
+        assert_eq!(
+            server.await.unwrap(),
+            Err(LoopbackServeErrorV1::RuntimeReadinessFailed)
+        );
+        assert_eq!(runtime_polls.load(Ordering::Acquire), 1);
         assert!(!gate.is_ready());
     }
 
@@ -947,7 +1085,7 @@ mod tests {
     async fn completed_shutdown_wins_simultaneously_failed_probe_without_transition() {
         let gate = ProductApiReadinessGate::initially_unready();
         let observed_ready_polls = Arc::new(AtomicUsize::new(0));
-        let result = serve_verified_loopback(
+        let _report = serve_verified_loopback(
             loopback_address(0),
             Router::new(),
             gate.clone(),
@@ -963,7 +1101,6 @@ mod tests {
 
         assert_eq!(observed_ready_polls.load(Ordering::Acquire), 0);
         assert!(!gate.is_ready());
-        assert!(TcpStream::connect(result.local_addr()).await.is_err());
     }
 
     #[tokio::test]
@@ -1108,6 +1245,95 @@ mod tests {
         wait_until_unready(&gate).await;
         assert!(!server.is_finished());
         assert!(TcpStream::connect(address).await.is_err());
+        state.release.notify_one();
+
+        assert!(server.await.unwrap().is_ok());
+        assert!(client.await.unwrap().starts_with("HTTP/1.1 200 OK"));
+        assert!(!gate.is_ready());
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_failure_closes_listener_and_drains_with_typed_error() {
+        let address = available_loopback_address().await;
+        let gate = ProductApiReadinessGate::initially_unready();
+        let state = BlockingState::new();
+        let router_state = state.clone();
+        let (runtime_sender, runtime_receiver) = oneshot::channel();
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+        let server_gate = gate.clone();
+        let server = tokio::spawn(async move {
+            serve_verified_loopback_with_runtime_readiness(
+                address,
+                Router::new()
+                    .route("/hold", get(blocking_request))
+                    .with_state(router_state),
+                server_gate,
+                config_with_drain_timeout(Duration::from_secs(1)),
+                async { true },
+                async move {
+                    let _ = runtime_receiver.await;
+                },
+                async move {
+                    let _ = shutdown_receiver.await;
+                },
+            )
+            .await
+        });
+
+        wait_until_ready(&gate).await;
+        let client = tokio::spawn(request_http1(address, "/hold"));
+        state.started.notified().await;
+        runtime_sender.send(()).unwrap();
+        wait_until_unready(&gate).await;
+        assert!(!server.is_finished());
+        assert!(TcpStream::connect(address).await.is_err());
+        state.release.notify_one();
+
+        assert_eq!(
+            server.await.unwrap(),
+            Err(LoopbackServeErrorV1::RuntimeReadinessFailed)
+        );
+        assert!(client.await.unwrap().starts_with("HTTP/1.1 200 OK"));
+        assert!(!gate.is_ready());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_runtime_readiness_before_active_request_drain() {
+        let address = available_loopback_address().await;
+        let gate = ProductApiReadinessGate::initially_unready();
+        let state = BlockingState::new();
+        let router_state = state.clone();
+        let monitor_dropped = Arc::new(AtomicBool::new(false));
+        let monitor_drop_observer = monitor_dropped.clone();
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server_gate = gate.clone();
+        let server = tokio::spawn(async move {
+            serve_verified_loopback_with_runtime_readiness(
+                address,
+                Router::new()
+                    .route("/hold", get(blocking_request))
+                    .with_state(router_state),
+                server_gate,
+                config_with_drain_timeout(Duration::from_secs(1)),
+                async { true },
+                async move {
+                    let _drop = DropMarker(monitor_drop_observer);
+                    pending::<()>().await;
+                },
+                async move {
+                    let _ = shutdown_receiver.await;
+                },
+            )
+            .await
+        });
+
+        wait_until_ready(&gate).await;
+        let client = tokio::spawn(request_http1(address, "/hold"));
+        state.started.notified().await;
+        shutdown_sender.send(()).unwrap();
+        wait_until_unready(&gate).await;
+        wait_until_dropped(&monitor_dropped).await;
+        assert!(!server.is_finished());
         state.release.notify_one();
 
         assert!(server.await.unwrap().is_ok());

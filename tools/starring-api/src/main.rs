@@ -1,17 +1,24 @@
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io::Write;
 use std::task::Poll;
+use std::time::Duration;
 
 use product_control_http::{
     product_control_router_with_operational_v2_and_readiness_gate, ProductApiReadinessGate,
     ProductControlFacade,
 };
 use starring_api::{
-    compose_production_service_v1, resolve_production_secrets_v1, serve_verified_loopback,
-    ComposedProductionServiceV1, DatabaseRoleV1, LoopbackServeErrorV1, LoopbackServerConfigV1,
-    ProductionCompositionErrorV1, ProductionConfigV1, ProductionReadinessPhaseV1,
+    compose_production_service_v1, resolve_production_secrets_v1,
+    serve_verified_loopback_with_runtime_readiness, ComposedProductionServiceV1, DatabaseRoleV1,
+    LoopbackServeErrorV1, LoopbackServerConfigV1, ProductionCompositionErrorV1, ProductionConfigV1,
+    ProductionReadinessPhaseV1,
 };
 use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
+
+const RUNTIME_READINESS_INTERVAL: Duration = Duration::from_secs(30);
+const RUNTIME_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     install_panic_hook();
@@ -98,12 +105,22 @@ async fn serve(
     );
     let startup_facade = facade.clone();
     let startup_probe = async move { startup_facade.readiness().await.is_ok() };
-    let server_result = serve_verified_loopback(
+    let runtime_facade = facade.clone();
+    let runtime_readiness_failure = monitor_runtime_readiness(
+        move || {
+            let runtime_facade = runtime_facade.clone();
+            async move { runtime_facade.readiness().await.is_ok() }
+        },
+        || sleep(RUNTIME_READINESS_INTERVAL),
+        RUNTIME_READINESS_TIMEOUT,
+    );
+    let server_result = serve_verified_loopback_with_runtime_readiness(
         bind_addr,
         router,
         readiness_gate,
         LoopbackServerConfigV1::production_default(),
         startup_probe,
+        runtime_readiness_failure,
         shutdown.wait(),
     )
     .await;
@@ -116,6 +133,36 @@ async fn serve(
         Ok(_) => ExitStatusV1::CleanShutdown,
         Err(error) => classify_server_error(error),
     }
+}
+
+async fn monitor_runtime_readiness<P, PF, W, WF>(mut probe: P, mut wait: W, probe_timeout: Duration)
+where
+    P: FnMut() -> PF,
+    PF: Future<Output = bool> + Send + 'static,
+    W: FnMut() -> WF,
+    WF: Future<Output = ()>,
+{
+    loop {
+        wait().await;
+        if !run_runtime_readiness_probe(probe(), probe_timeout).await {
+            return;
+        }
+    }
+}
+
+async fn run_runtime_readiness_probe<P>(probe: P, probe_timeout: Duration) -> bool
+where
+    P: Future<Output = bool> + Send + 'static,
+{
+    let mut probes = JoinSet::new();
+    probes.spawn(probe);
+    let outcome = timeout(probe_timeout, probes.join_next()).await;
+    let ready = matches!(outcome, Ok(Some(Ok(true))));
+    if !ready {
+        probes.abort_all();
+        while probes.join_next().await.is_some() {}
+    }
+    ready
 }
 
 struct ShutdownSignalsV1 {
@@ -177,6 +224,7 @@ enum ExitStatusV1 {
     ServerBindRejected,
     ServerBindFailed,
     ServerStartupReadinessFailed,
+    ServerRuntimeReadinessFailed,
     ServerAcceptFailed,
     ServerConnectionFailed,
     ServerDrainTimedOut,
@@ -212,6 +260,7 @@ impl ExitStatusV1 {
             Self::ServerBindRejected => "server_bind_rejected",
             Self::ServerBindFailed => "server_bind_failed",
             Self::ServerStartupReadinessFailed => "server_startup_readiness_failed",
+            Self::ServerRuntimeReadinessFailed => "server_runtime_readiness_failed",
             Self::ServerAcceptFailed => "server_accept_failed",
             Self::ServerConnectionFailed => "server_connection_failed",
             Self::ServerDrainTimedOut => "server_drain_timed_out",
@@ -277,6 +326,7 @@ fn classify_server_error(error: LoopbackServeErrorV1) -> ExitStatusV1 {
         LoopbackServeErrorV1::NonLoopbackBindAddress => ExitStatusV1::ServerBindRejected,
         LoopbackServeErrorV1::BindFailed => ExitStatusV1::ServerBindFailed,
         LoopbackServeErrorV1::StartupReadinessFailed => ExitStatusV1::ServerStartupReadinessFailed,
+        LoopbackServeErrorV1::RuntimeReadinessFailed => ExitStatusV1::ServerRuntimeReadinessFailed,
         LoopbackServeErrorV1::AcceptFailed => ExitStatusV1::ServerAcceptFailed,
         LoopbackServeErrorV1::ConnectionTaskFailed => ExitStatusV1::ServerConnectionFailed,
         LoopbackServeErrorV1::DrainTimedOut => ExitStatusV1::ServerDrainTimedOut,
@@ -329,6 +379,9 @@ fn emit_status(status: ExitStatusV1) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -367,5 +420,47 @@ mod tests {
             classify_server_error(LoopbackServeErrorV1::DrainTimedOut),
             ExitStatusV1::ServerDrainTimedOut
         );
+        assert_eq!(
+            classify_server_error(LoopbackServeErrorV1::RuntimeReadinessFailed),
+            ExitStatusV1::ServerRuntimeReadinessFailed
+        );
+        assert_eq!(
+            ExitStatusV1::ServerRuntimeReadinessFailed.code(),
+            "server_runtime_readiness_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_contains_false_panic_and_timeout() {
+        assert!(
+            run_runtime_readiness_probe(std::future::ready(true), Duration::from_secs(1)).await
+        );
+        assert!(
+            !run_runtime_readiness_probe(std::future::ready(false), Duration::from_secs(1)).await
+        );
+        assert!(
+            !run_runtime_readiness_probe(
+                async { panic!("runtime readiness panic") },
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert!(!run_runtime_readiness_probe(std::future::pending::<bool>(), Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn runtime_monitor_stops_on_the_first_failed_probe() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        monitor_runtime_readiness(
+            move || {
+                let call = observed_calls.fetch_add(1, Ordering::AcqRel);
+                std::future::ready(call == 0)
+            },
+            || std::future::ready(()),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

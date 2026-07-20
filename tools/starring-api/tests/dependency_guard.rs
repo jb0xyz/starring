@@ -377,7 +377,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
         "product_control_router_with_operational_v2_and_readiness_gate",
         "ProductApiReadinessGate",
         "initially_unready",
-        "serve_verified_loopback",
+        "serve_verified_loopback_with_runtime_readiness",
     ] {
         assert!(contains_identifier(main, required), "main.rs: {required}");
     }
@@ -385,6 +385,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
         "product_control_router",
         "product_control_router_with_readiness_gate",
         "product_control_router_with_operational_v2",
+        "serve_verified_loopback",
     ] {
         assert!(
             !contains_identifier(main, forbidden),
