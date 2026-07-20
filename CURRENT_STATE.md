@@ -434,7 +434,7 @@ in-flight legacy activation.
   prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
   authoring cohort did not run a live Discord integration.
 - **Current product-slot checkpoint**: the exact clean-database PostgreSQL CI
-  sequence passed all nine packages and 123 tests. Focused product Apply passed
+  sequence passed all nine packages and 209 tests. Focused product Apply passed
   34/34, including both advisory-lock race orders and final-pointer transaction
   semantics. The isolated `interaction-smoke` suite passed 24/24.
 
