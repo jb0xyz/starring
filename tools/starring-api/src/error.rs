@@ -25,8 +25,9 @@ pub fn map_authentication_error(error: AuthenticationError) -> FacadeError {
 
 pub fn map_fresh_authority_error(error: FreshGuildAuthorityError) -> FacadeError {
     let code = match error {
-        FreshGuildAuthorityError::InstallationNotFound => FacadeErrorCode::NotFound,
-        FreshGuildAuthorityError::Forbidden => FacadeErrorCode::Forbidden,
+        FreshGuildAuthorityError::InstallationNotFound | FreshGuildAuthorityError::Forbidden => {
+            FacadeErrorCode::NotFound
+        }
         FreshGuildAuthorityError::Stale => FacadeErrorCode::DependencyTimeout,
         FreshGuildAuthorityError::ScopeMismatch => FacadeErrorCode::Internal,
         FreshGuildAuthorityError::Backend(_) => FacadeErrorCode::DependencyUnavailable,
@@ -275,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn authentication_and_authority_errors_keep_closed_security_semantics() {
+    fn authentication_and_installation_authority_errors_keep_closed_security_semantics() {
         for error in [
             AuthenticationError::InvalidCredential,
             AuthenticationError::Expired,
@@ -296,11 +297,32 @@ mod tests {
             ))),
             FacadeErrorCode::DependencyTimeout
         );
+        for error in [
+            FreshGuildAuthorityError::InstallationNotFound,
+            FreshGuildAuthorityError::Forbidden,
+        ] {
+            assert_eq!(
+                code(map_fresh_authority_error(error)),
+                FacadeErrorCode::NotFound
+            );
+        }
         assert_eq!(
-            code(map_fresh_authority_error(
-                FreshGuildAuthorityError::InstallationNotFound,
+            code(map_authoring_application_error(
+                AuthoringApplicationError::FreshAuthority(FreshGuildAuthorityError::Forbidden),
             )),
             FacadeErrorCode::NotFound
+        );
+        assert_eq!(
+            code(map_product_application_error(
+                ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Forbidden),
+            )),
+            FacadeErrorCode::NotFound
+        );
+        assert_eq!(
+            code(map_product_control_error(
+                ProductControlPortError::SelfApprovalForbidden,
+            )),
+            FacadeErrorCode::Forbidden
         );
         assert_eq!(
             code(map_fresh_authority_error(
