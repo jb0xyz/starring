@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 authoring-application = { path = "../../crates/authoring-application" }
 authoring-application-discord = { path = "../../crates/authoring-application-discord" }
 authoring-application-postgres = { path = "../../crates/authoring-application-postgres" }

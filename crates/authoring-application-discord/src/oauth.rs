@@ -298,6 +298,14 @@ impl DiscordOAuthClient {
         Ok(Self { http, config })
     }
 
+    pub fn client_id(&self) -> DiscordApplicationIdV1 {
+        self.config.client_id()
+    }
+
+    pub fn redirect_uri(&self) -> &str {
+        self.config.redirect_uri()
+    }
+
     pub fn authorization_url(&self, state: &DiscordOAuthStateV1) -> Url {
         let mut url = self.config.endpoints.authorization.clone();
         url.query_pairs_mut()
