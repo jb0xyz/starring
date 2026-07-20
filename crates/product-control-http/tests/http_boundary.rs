@@ -36,6 +36,8 @@ const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 #[derive(Default)]
 struct FakeFacade {
+    oauth_start_calls: AtomicUsize,
+    fail_oauth_start: AtomicUsize,
     verify_calls: AtomicUsize,
     readiness_calls: AtomicUsize,
     promote_calls: AtomicUsize,
@@ -110,6 +112,10 @@ impl ProductControlFacade for FakeFacade {
         &self,
         _command: OAuthStartCommand,
     ) -> Result<OAuthStartResult, FacadeError> {
+        self.oauth_start_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_oauth_start.load(Ordering::SeqCst) != 0 {
+            return Err(FacadeError::new(FacadeErrorCode::Internal));
+        }
         let client_id = if self.invalid_client_id.load(Ordering::SeqCst) == 0 {
             "123456789012345678"
         } else {
@@ -1337,6 +1343,119 @@ async fn oauth_start_sets_a_host_only_secure_cookie() {
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Lax"));
     assert!(!cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn oauth_start_budget_is_shared_by_router_clones() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = app(Arc::clone(&facade));
+    for _ in 0..10 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    let response = router
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    assert!(response.headers().contains_key("retry-after"));
+    assert!(!response.headers().contains_key("location"));
+    assert!(!response.headers().contains_key("set-cookie"));
+    let body = body_text(response).await;
+    assert!(body.contains("oauth_start_rate_limited"));
+    assert!(body.contains("\"retryable\":true"));
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn malformed_oauth_starts_do_not_consume_the_budget() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = app(Arc::clone(&facade));
+    for _ in 0..20 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start?return_to=%2Fadmin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for _ in 0..10 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn admitted_oauth_start_failures_are_not_refunded() {
+    let facade = Arc::new(FakeFacade::default());
+    facade.fail_oauth_start.store(1, Ordering::SeqCst);
+    let router = app(Arc::clone(&facade));
+    let response = router
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    facade.fail_oauth_start.store(0, Ordering::SeqCst);
+
+    for _ in 0..9 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+    let response = router
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
 }
 
 #[tokio::test]

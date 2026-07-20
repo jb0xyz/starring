@@ -1,3 +1,4 @@
+mod abuse_budget;
 mod boundary;
 mod response_validation;
 
@@ -21,6 +22,7 @@ use crate::{
     HttpBoundaryConfig, OAuthCallbackCommand, OAuthStartCommand, ProductControlFacade,
     ProductControlOperationalFacadeV2, PromoteCommand, RejectCommand, SessionCredential,
 };
+use abuse_budget::{OAuthStartAdmission, OAuthStartBudget};
 use boundary::*;
 use response_validation::{
     valid_apply_view, valid_approval_view, valid_current_principal, valid_decision_view,
@@ -34,6 +36,7 @@ struct HttpState<F> {
     in_flight: Arc<Semaphore>,
     readiness_in_flight: Arc<Semaphore>,
     readiness_gate: crate::ProductApiReadinessGate,
+    oauth_start_budget: Arc<OAuthStartBudget>,
 }
 
 impl<F> Clone for HttpState<F> {
@@ -44,6 +47,7 @@ impl<F> Clone for HttpState<F> {
             in_flight: Arc::clone(&self.in_flight),
             readiness_in_flight: Arc::clone(&self.readiness_in_flight),
             readiness_gate: self.readiness_gate.clone(),
+            oauth_start_budget: Arc::clone(&self.oauth_start_budget),
         }
     }
 }
@@ -132,6 +136,7 @@ fn http_state<F>(
         in_flight: Arc::new(Semaphore::new(config.max_in_flight())),
         readiness_in_flight: Arc::new(Semaphore::new(1)),
         readiness_gate,
+        oauth_start_budget: Arc::new(OAuthStartBudget::new(config.oauth_start_budget())),
         config,
     }
 }
@@ -211,6 +216,15 @@ where
     {
         return malformed_query(&request_id);
     }
+    match state.oauth_start_budget.try_acquire() {
+        OAuthStartAdmission::Admitted => {}
+        OAuthStartAdmission::Rejected {
+            retry_after_seconds,
+        } => return oauth_start_rate_limited(retry_after_seconds, &request_id),
+        OAuthStartAdmission::Unavailable => {
+            return map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id)
+        }
+    }
     match state
         .facade
         .oauth_start(OAuthStartCommand { return_to })
@@ -256,6 +270,20 @@ where
         }
         Err(error) => map_facade(error, &request_id),
     }
+}
+
+fn oauth_start_rate_limited(retry_after_seconds: u64, request_id: &RequestId) -> Response {
+    let mut response = problem(
+        StatusCode::TOO_MANY_REQUESTS,
+        "oauth_start_rate_limited",
+        "OAuth sign-in is temporarily rate limited.",
+        true,
+        request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 
 async fn oauth_callback<F>(
