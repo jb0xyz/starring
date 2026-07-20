@@ -6,6 +6,12 @@ fn authority_snapshot_readiness_migration_has_closed_security_contracts() {
     assert!(!MIGRATION.contains("--"));
     assert!(!MIGRATION.contains("/*"));
     assert_eq!(MIGRATION.matches("CREATE FUNCTION public.").count(), 3);
+    assert!(MIGRATION.starts_with(
+        "SET LOCAL lock_timeout = '5s';\nSET LOCAL statement_timeout = '30s';\nSET LOCAL search_path = pg_catalog;\n"
+    ));
+    assert!(MIGRATION.contains(
+        "LOCK TABLE\n    public.product_control_plane_identity,\n    public.product_principals,\n    public.product_auth_sessions,\n    public.product_tenants,\n    public.automation_installations,\n    public.automation_installation_authority_versions,\n    public.authoring_sessions,\n    public.authoring_session_generations\nIN ACCESS SHARE MODE;"
+    ));
     for required in [
         "starring_product_installation_authority_reader_database_identity_v1",
         "starring_product_authorized_snapshot_reader_database_identity_v1",

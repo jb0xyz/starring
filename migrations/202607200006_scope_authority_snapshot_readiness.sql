@@ -1,3 +1,18 @@
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '30s';
+SET LOCAL search_path = pg_catalog;
+
+LOCK TABLE
+    public.product_control_plane_identity,
+    public.product_principals,
+    public.product_auth_sessions,
+    public.product_tenants,
+    public.automation_installations,
+    public.automation_installation_authority_versions,
+    public.authoring_sessions,
+    public.authoring_session_generations
+IN ACCESS SHARE MODE;
+
 DO $preflight$
 DECLARE
     common_owner OID;
