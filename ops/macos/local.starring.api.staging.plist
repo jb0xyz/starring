@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>local.starring.api</string>
+    <string>local.starring.api.staging</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/jungbogeon/.local/libexec/starring-api</string>
@@ -43,39 +43,39 @@
         <key>STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS</key>
         <string>15000</string>
         <key>STARRING_API_OAUTH_FLOW_WRITER_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.oauth-flow-writer</string>
+        <string>keychain:starring-api.staging:database.oauth-flow-writer</string>
         <key>STARRING_API_SESSION_ISSUER_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.session-issuer</string>
+        <string>keychain:starring-api.staging:database.session-issuer</string>
         <key>STARRING_API_SESSION_API_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.session-api</string>
+        <string>keychain:starring-api.staging:database.session-api</string>
         <key>STARRING_API_SECURITY_REVOKER_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.security-revoker</string>
+        <string>keychain:starring-api.staging:database.security-revoker</string>
         <key>STARRING_API_INSTALLATION_AUTHORITY_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.installation-authority-reader</string>
+        <string>keychain:starring-api.staging:database.installation-authority-reader</string>
         <key>STARRING_API_AUTHORIZED_SNAPSHOT_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.authorized-snapshot-reader</string>
+        <string>keychain:starring-api.staging:database.authorized-snapshot-reader</string>
         <key>STARRING_API_PROMOTION_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.promotion-executor</string>
+        <string>keychain:starring-api.staging:database.promotion-executor</string>
         <key>STARRING_API_DECISION_READER_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.decision-reader</string>
+        <string>keychain:starring-api.staging:database.decision-reader</string>
         <key>STARRING_API_APPROVAL_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.approval-executor</string>
+        <string>keychain:starring-api.staging:database.approval-executor</string>
         <key>STARRING_API_REJECTION_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.rejection-executor</string>
+        <string>keychain:starring-api.staging:database.rejection-executor</string>
         <key>STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.apply-executor</string>
+        <string>keychain:starring-api.staging:database.apply-executor</string>
         <key>STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.deployment-status-reader</string>
+        <string>keychain:starring-api.staging:database.deployment-status-reader</string>
         <key>STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:database.operational-deployment-status-reader</string>
+        <string>keychain:starring-api.staging:database.operational-deployment-status-reader</string>
         <key>STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:discord.oauth-client-secret</string>
+        <string>keychain:starring-api.staging:discord.oauth-client-secret</string>
         <key>STARRING_API_DISCORD_BOT_TOKEN_REFERENCE</key>
-        <string>keychain:starring-api.production:discord.bot-token</string>
+        <string>keychain:starring-api.staging:discord.bot-token</string>
         <key>STARRING_API_PRODUCT_ACTION_KEYRING_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:keyring.product-action</string>
+        <string>keychain:starring-api.staging:keyring.product-action</string>
         <key>STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE</key>
-        <string>keychain:starring-api.production:keyring.snapshot-envelope</string>
+        <string>keychain:starring-api.staging:keyring.snapshot-envelope</string>
     </dict>
     <key>KeepAlive</key>
     <dict>
