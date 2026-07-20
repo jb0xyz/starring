@@ -4,11 +4,10 @@ fn database_role_password() -> String {
     lower_hex(&material)
 }
 
-async fn database_role_login_pool(
-    database_name: &str,
-    role: &str,
-    password: &str,
-) -> PgPool {
+const INSTALLATION_AUTHORITY_DATABASE_IDENTITY_FUNCTION: &str =
+    "public.starring_product_installation_authority_reader_database_identity_v1()";
+
+async fn database_role_login_pool(database_name: &str, role: &str, password: &str) -> PgPool {
     assert!(
         !role.is_empty()
             && role.len() <= 63
@@ -60,9 +59,7 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
             role.len() <= 63
                 && role
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'_')
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         );
     }
     sqlx::query(&format!(
@@ -72,17 +69,13 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
     .execute(&database.pool)
     .await
     .unwrap();
-    for (role, password) in [
-        (&api_role, &api_password),
-        (&denied_role, &denied_password),
-    ] {
-        let password_literal = sqlx::query_scalar::<_, String>(
-            "SELECT pg_catalog.quote_literal($1)",
-        )
-        .bind(password)
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
+    for (role, password) in [(&api_role, &api_password), (&denied_role, &denied_password)] {
+        let password_literal =
+            sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
+                .bind(password)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
         sqlx::query(&format!(
             "CREATE ROLE {role} LOGIN PASSWORD {password_literal} \
              NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
@@ -93,6 +86,7 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
         .unwrap();
     }
     for relation in [
+        "product_control_plane_identity",
         "product_principals",
         "product_auth_sessions",
         "product_tenants",
@@ -114,8 +108,22 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
     .await
     .unwrap();
     sqlx::query(&format!(
+        "ALTER FUNCTION {INSTALLATION_AUTHORITY_DATABASE_IDENTITY_FUNCTION} \
+         OWNER TO {owner_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
         "REVOKE ALL ON DATABASE {} FROM PUBLIC",
         database.name
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         {INSTALLATION_AUTHORITY_DATABASE_IDENTITY_FUNCTION} TO {api_role}"
     ))
     .execute(&database.pool)
     .await
@@ -146,19 +154,31 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
     .await
     .unwrap();
     let api_pool = database_role_login_pool(&database.name, &api_role, &api_password).await;
-    let denied_pool = database_role_login_pool(&database.name, &denied_role, &denied_password).await;
+    let denied_pool =
+        database_role_login_pool(&database.name, &denied_role, &denied_password).await;
     let outcome = std::panic::AssertUnwindSafe(async {
-        let role_identity = sqlx::query_as::<_, (String, String)>(
-            "SELECT current_user::TEXT, session_user::TEXT",
-        )
-        .fetch_one(&api_pool)
-        .await
-        .unwrap();
+        let role_identity =
+            sqlx::query_as::<_, (String, String)>("SELECT current_user::TEXT, session_user::TEXT")
+                .fetch_one(&api_pool)
+                .await
+                .unwrap();
         assert_eq!(role_identity.0, api_role);
         assert_eq!(role_identity.0, role_identity.1);
 
         let source = PostgresInstallationAuthoritySource::new(api_pool.clone());
         source.verify_readiness().await.unwrap();
+        let topology = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT \
+             public.starring_product_installation_authority_reader_database_identity_v1(), \
+             current_database()::TEXT, current_user::TEXT, session_user::TEXT",
+        )
+        .fetch_one(&api_pool)
+        .await
+        .unwrap();
+        assert_eq!(topology.1, database.name);
+        assert_eq!(topology.2, api_role);
+        assert_eq!(topology.2, topology.3);
+        assert_eq!(topology.0.len(), 36);
 
         let client_calls = Arc::new(AtomicUsize::new(0));
         let decision_calls = Arc::new(AtomicUsize::new(0));
@@ -170,11 +190,8 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
                 ),
             ),
         };
-        let authority = postgres_authority_adapter(
-            api_pool.clone(),
-            fixture.clone(),
-            client_calls.clone(),
-        );
+        let authority =
+            postgres_authority_adapter(api_pool.clone(), fixture.clone(), client_calls.clone());
         let decisions = CapturingPreviewDecisions {
             fixture: fixture.clone(),
             calls: decision_calls.clone(),
@@ -225,6 +242,7 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
 
         let direct_privilege_count = sqlx::query_scalar::<_, i64>(
             "WITH relations(name) AS (VALUES \
+              ('public.product_control_plane_identity'), \
               ('public.product_principals'), \
               ('public.product_auth_sessions'), \
               ('public.product_tenants'), \
@@ -245,6 +263,7 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
         assert_eq!(direct_privilege_count, 0);
         let column_privilege_count = sqlx::query_scalar::<_, i64>(
             "WITH relations(name) AS (VALUES \
+              ('public.product_control_plane_identity'), \
               ('public.product_principals'), \
               ('public.product_auth_sessions'), \
               ('public.product_tenants'), \
@@ -492,6 +511,54 @@ async fn installation_authority_read_is_exactly_scoped_for_a_non_owner_role() {
         .await
         .unwrap();
 
+        sqlx::query(&format!(
+            "ALTER FUNCTION {INSTALLATION_AUTHORITY_DATABASE_IDENTITY_FUNCTION} \
+             SECURITY INVOKER"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source.verify_readiness().await,
+            Err(InstallationAuthorityReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::query(&format!(
+            "ALTER FUNCTION {INSTALLATION_AUTHORITY_DATABASE_IDENTITY_FUNCTION} \
+             SECURITY DEFINER"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION \
+             public.starring_product_installation_authority_reader_database_identity_v1() \
+             RETURNS TEXT LANGUAGE sql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER \
+             SET search_path = pg_catalog AS $function$ \
+             SELECT '00000000-0000-0000-0000-000000000000'::TEXT \
+             $function$",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source.verify_readiness().await,
+            Err(InstallationAuthorityReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION \
+             public.starring_product_installation_authority_reader_database_identity_v1() \
+             RETURNS TEXT LANGUAGE sql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER \
+             SET search_path = pg_catalog AS $function$ \
+             SELECT identity.database_identity::TEXT \
+             FROM public.product_control_plane_identity AS identity \
+             WHERE identity.singleton \
+             $function$",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
         sqlx::query(
             "GRANT EXECUTE ON FUNCTION \
              public.starring_product_installation_authority_read_v1( \
@@ -635,9 +702,7 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
             role.len() <= 63
                 && role
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'_')
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         );
     }
     sqlx::query(&format!(
@@ -654,12 +719,11 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
     .execute(&database.pool)
     .await
     .unwrap();
-    let password_literal =
-        sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
-            .bind(&migrator_password)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+    let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
+        .bind(&migrator_password)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
     sqlx::query(&format!(
         "CREATE ROLE {migrator_role} LOGIN PASSWORD {password_literal} \
          NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
@@ -706,19 +770,14 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
     .execute(&database.pool)
     .await
     .unwrap();
-    let migrator_pool = database_role_login_pool(
-        &database.name,
-        &migrator_role,
-        &migrator_password,
-    )
-    .await;
+    let migrator_pool =
+        database_role_login_pool(&database.name, &migrator_role, &migrator_password).await;
     let outcome = std::panic::AssertUnwindSafe(async {
-        let identity = sqlx::query_as::<_, (String, String)>(
-            "SELECT current_user::TEXT, session_user::TEXT",
-        )
-        .fetch_one(&migrator_pool)
-        .await
-        .unwrap();
+        let identity =
+            sqlx::query_as::<_, (String, String)>("SELECT current_user::TEXT, session_user::TEXT")
+                .fetch_one(&migrator_pool)
+                .await
+                .unwrap();
         assert_eq!(identity, (migrator_role.clone(), migrator_role.clone()));
         let migration = MIGRATOR
             .iter()
@@ -751,10 +810,7 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(
-            function_contract,
-            (owner_role.clone(), true, false, false)
-        );
+        assert_eq!(function_contract, (owner_role.clone(), true, false, false));
         let unexpected_grants = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
              FROM pg_catalog.pg_proc AS function_row \
@@ -779,12 +835,10 @@ async fn installation_authority_read_migration_strips_hostile_default_grants() {
         .execute(&mut database.administrator)
         .await
         .unwrap();
-    sqlx::query(&format!(
-        "REVOKE {owner_role} FROM {migrator_role}"
-    ))
-    .execute(&mut database.administrator)
-    .await
-    .unwrap();
+    sqlx::query(&format!("REVOKE {owner_role} FROM {migrator_role}"))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
     for role in [&hostile_role, &migrator_role, &owner_role] {
         sqlx::query(&format!("DROP ROLE {role}"))
             .execute(&mut database.administrator)

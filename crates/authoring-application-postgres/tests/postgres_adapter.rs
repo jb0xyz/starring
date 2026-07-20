@@ -13,8 +13,7 @@ use authoring_application::{
 };
 use authoring_application_postgres::{
     build_snapshot_authenticated_data_v1, digest_opaque_session_credential_v1,
-    EncryptedSnapshotEnvelopeV1, PostgresAuthentication, PostgresAuthorizedPromotionSnapshots,
-    SnapshotAuthenticatedDataInputV1, SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+    PostgresAuthentication, PostgresAuthorizedPromotionSnapshots, SnapshotAuthenticatedDataInputV1,
     SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
     MIGRATOR, XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
 };
@@ -78,22 +77,6 @@ impl LlmClient for ScriptedClient {
             .unwrap()
             .take()
             .ok_or_else(|| LlmError::Client("unexpected model call".to_string()))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PassthroughCipher;
-
-impl SnapshotEnvelopeCipher for PassthroughCipher {
-    async fn decrypt(
-        &self,
-        envelope: &EncryptedSnapshotEnvelopeV1,
-        authenticated_data: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, SnapshotEnvelopeCipherError> {
-        if authenticated_data.is_empty() {
-            return Err(SnapshotEnvelopeCipherError::AuthenticationFailed);
-        }
-        Ok(Zeroizing::new(envelope.ciphertext().to_vec()))
     }
 }
 
