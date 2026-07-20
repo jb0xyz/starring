@@ -35,12 +35,215 @@ guild or advertise production Live automation.
   credentials are separate secret references. They are never passed as
   command-line literals or committed.
 
+The reviewed staging role manifest uses these exact direct-login role names:
+
+| Capability | Role |
+| --- | --- |
+| OAuth flow writer | `starring_identity_oauth` |
+| Session issuer | `starring_identity_issuer` |
+| Session API | `starring_identity_session` |
+| Security revoker | `starring_identity_security` |
+| Installation-authority reader | `starring_installation_authority_reader` |
+| Authorized-snapshot reader | `starring_authorized_snapshot_reader` |
+| Promotion executor | `starring_promotion_executor` |
+| Decision reader | `starring_decision_reader` |
+| Approval executor | `starring_decision_approval` |
+| Rejection executor | `starring_decision_rejection` |
+| Apply executor | `starring_decision_apply` |
+| Deployment-status reader | `starring_deployment_status_reader` |
+| Operational-status reader | `starring_operational_deployment_status_reader` |
+
+### Staging database role bootstrap
+
+The executable thirteen-role manifests are
+`ops/postgres/staging-api-role-bootstrap.sql` and
+`ops/postgres/staging-api-role-enable.sql`. The component grant snippets later
+in this runbook explain individual contracts; they are not substitutes for
+these manifests. Both files are restricted to a dedicated disposable staging
+PostgreSQL cluster and database. The database name must contain a `staging`
+segment after `starring`, and the session must independently name the same
+database through `starring.expected_staging_database`. The session must also
+match the PostgreSQL control-system identifier from the reviewed infrastructure
+inventory through `starring.expected_staging_system_identifier`. Record the
+host, port, database, administrator, and system identifier in that inventory
+before the maintenance window. Never derive the expected identifier from the
+target as part of either execution command. Never run either manifest on a
+shared cluster, a production database, or a customer-data clone. The local
+Homebrew PostgreSQL cluster inspected on 2026-07-20 is ineligible because it
+contains shared test databases and accepts trusted local and loopback clients.
+
+`starring_owner` must exist before the first application migration, and every
+application relation and capability function must be created by that owner.
+Create it once from an interactive cluster-administrator session without a
+password, grant the migrator only the temporary membership needed to `SET ROLE
+starring_owner`, apply migrations under that role, and revoke the membership
+afterward. The post-migration manifest verifies the owner and function
+ownership; it does not guess at or silently repair an incorrect ownership
+history.
+
+```sql
+CREATE ROLE starring_owner
+    NOLOGIN
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    NOINHERIT
+    NOREPLICATION
+    NOBYPASSRLS
+    CONNECTION LIMIT 0;
+```
+
+Before touching roles, stop the API, tunnel, migration process, schedulers, and
+every other database client. Isolate the dedicated cluster at the network
+boundary. Configure `pg_hba.conf` so a reviewed administrator rule and one
+first-match application rule cover only the exact staging database, the
+thirteen exact request roles, and the exact application source address. Use
+`scram-sha-256` for local and network password authentication and `hostssl` for
+network traffic. Put explicit reject rules after those allow rules for every
+other database, role, and source path. `trust`, `peer`, and `ident` are not
+permitted paths for a request role. Reload the configuration, inspect
+`pg_hba_file_rules` for parse errors, order, database, role list, source address,
+and authentication method, then prove an unlisted role and an unlisted source
+cannot connect. Any ambiguous or broader earlier match stops the procedure.
+
+After every migration and migration-specific preflight is green, run the
+bootstrap manifest as the dedicated staging cluster administrator.
+`ON_ERROR_STOP` is mandatory. The file sets transaction-local lock, statement,
+idle-transaction, and search-path bounds. Its first transaction commits a
+fail-closed quarantine before function validation: all managed roles become
+`NOLOGIN`, their passwords and settings are cleared, memberships are removed,
+and direct database, schema, relation, column, sequence, routine, parameter,
+and default privileges are reconciled. The second transaction drains every
+client session in the dedicated cluster, rejects prepared transactions,
+verifies the owner and all 43 functions, grants the exact runtime capabilities,
+and leaves all request roles quarantined as `NOLOGIN` with null passwords. If
+the second transaction fails, the first transaction remains committed; keep
+staging offline and repair the contract before rerunning it.
+
+```bash
+STAGING_DATABASE=starring_staging
+STAGING_DATABASE_HOST=replace_with_staging_database_host
+STAGING_DATABASE_PORT=5432
+STAGING_CLUSTER_ADMIN=replace_with_staging_cluster_admin
+STAGING_SYSTEM_IDENTIFIER=replace_with_reviewed_staging_system_identifier
+PGOPTIONS="-c starring.expected_staging_database=$STAGING_DATABASE -c starring.expected_staging_system_identifier=$STAGING_SYSTEM_IDENTIFIER" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 --password \
+    --host "$STAGING_DATABASE_HOST" --port "$STAGING_DATABASE_PORT" \
+    --dbname "$STAGING_DATABASE" --username "$STAGING_CLUSTER_ADMIN" \
+    --file ops/postgres/staging-api-role-bootstrap.sql
+unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
+  STAGING_DATABASE_PORT STAGING_DATABASE_HOST STAGING_DATABASE
+```
+
+The bootstrap creates any missing request roles but does not enable login. It
+also removes legacy `starring_api` capabilities and grants exactly database
+`CONNECT`, `public` schema `USAGE`, and the 43 reviewed function identities.
+Every rerun is fail-closed: it returns all thirteen request roles to quarantine
+and clears every password before validating capabilities. PostgreSQL preserves
+some database, schema, and object grants issued by an alternate grantor when a
+cluster administrator performs an ordinary revoke. The manifest detects the
+remaining effective or public capability and stops after quarantine instead of
+claiming automatic repair. Inspect the affected catalog ACL with `aclexplode`,
+identify the recorded grantor, and use a separately reviewed transaction that
+sets the local role to that grantor, revokes the exact privilege with `CASCADE`,
+and resets the role. Review downstream revocation impact before execution, do
+not use object-dropping shortcuts, and rerun the full bootstrap afterward.
+
+Next prove `SHOW password_encryption` returns `scram-sha-256`. While the API,
+tunnel, and all other clients remain stopped, assign thirteen distinct,
+password-manager-generated values in the same interactive administrator
+`psql` session. Use the client-side prompt commands below; each command prompts
+twice and keeps the secret out of SQL text, arguments, shell history, logs, and
+this repository. The roles remain `NOLOGIN` throughout this operation.
+
+```text
+\password starring_identity_oauth
+\password starring_identity_issuer
+\password starring_identity_session
+\password starring_identity_security
+\password starring_installation_authority_reader
+\password starring_authorized_snapshot_reader
+\password starring_promotion_executor
+\password starring_decision_reader
+\password starring_decision_approval
+\password starring_decision_rejection
+\password starring_decision_apply
+\password starring_deployment_status_reader
+\password starring_operational_deployment_status_reader
+```
+
+Do not use `ALTER ROLE ... PASSWORD '...'`, reuse a value between roles, put a
+password-bearing database URL in an argument, or generate a SQL file containing
+secrets. Verify only the aggregate result without printing hashes: all thirteen
+rows must report `scram_passwords = 13`.
+
+```sql
+SELECT pg_catalog.count(*) FILTER (
+    WHERE role.rolpassword LIKE 'SCRAM-SHA-256$%'
+) AS scram_passwords
+FROM pg_catalog.pg_authid AS role
+WHERE role.rolname IN (
+    'starring_identity_oauth',
+    'starring_identity_issuer',
+    'starring_identity_session',
+    'starring_identity_security',
+    'starring_installation_authority_reader',
+    'starring_authorized_snapshot_reader',
+    'starring_promotion_executor',
+    'starring_decision_reader',
+    'starring_decision_approval',
+    'starring_decision_rejection',
+    'starring_decision_apply',
+    'starring_deployment_status_reader',
+    'starring_operational_deployment_status_reader'
+);
+```
+
+Run the enable manifest with the same independently reviewed target values. It
+is the only manifest that changes request roles to `LOGIN`. It refuses to do so
+unless every role has a SCRAM verifier, no sessions or prepared transactions
+exist, role attributes and memberships are exact, no managed or public
+parameter ACL remains, no request role owns an object, no request role can
+connect to another database, and the exact schema, relation, function, and
+default-privilege contract is intact.
+
+```bash
+STAGING_DATABASE=starring_staging
+STAGING_DATABASE_HOST=replace_with_staging_database_host
+STAGING_DATABASE_PORT=5432
+STAGING_CLUSTER_ADMIN=replace_with_staging_cluster_admin
+STAGING_SYSTEM_IDENTIFIER=replace_with_reviewed_staging_system_identifier
+PGOPTIONS="-c starring.expected_staging_database=$STAGING_DATABASE -c starring.expected_staging_system_identifier=$STAGING_SYSTEM_IDENTIFIER" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 --password \
+    --host "$STAGING_DATABASE_HOST" --port "$STAGING_DATABASE_PORT" \
+    --dbname "$STAGING_DATABASE" --username "$STAGING_CLUSTER_ADMIN" \
+    --file ops/postgres/staging-api-role-enable.sql
+unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
+  STAGING_DATABASE_PORT STAGING_DATABASE_HOST STAGING_DATABASE
+```
+
+After enable succeeds, prove a wrong password fails and every request role is
+denied on a different database before provisioning the thirteen distinct
+database URLs through the prompt-only Keychain flow. Do not restore the API,
+tunnel, or external ingress before those negative probes and aggregate API
+readiness are green. A manifest failure or any unexpected capability keeps the
+roles quarantined and staging ingress closed. This procedure remains a staging
+rehearsal and does not make the current slice production-ready.
+
+These staging manifests enforce the application capability surface they
+enumerate; they are not a complete PostgreSQL language sandbox. A production
+credential bootstrap must additionally inventory and close large-object,
+language, type, foreign-data-wrapper, foreign-server, and tablespace ownership
+and ACLs, then prove that inventory in an automated isolated-cluster gate.
+
 ## Starring API launch contract
 
 The reviewed macOS LaunchAgent template is
-`ops/macos/local.starring.api.plist`. It contains non-secret configuration and
-Keychain references only. It does not contain database URLs, OAuth secrets, bot
-tokens, key material, Cloudflare credentials, or customer identifiers.
+`ops/macos/local.starring.api.staging.plist`. It is staging-only and contains
+non-secret configuration and staging Keychain references. It does not contain
+database URLs, OAuth secrets, bot tokens, key material, Cloudflare credentials,
+or customer identifiers. There is intentionally no production LaunchAgent
+template while Codex or any other untrusted workload shares this macOS login.
 
 The template assumes a release binary installed at
 `/Users/jungbogeon/.local/libexec/starring-api`, a user LaunchAgent running in
@@ -78,7 +281,7 @@ not a DNS-only operation.
 ### Exact secret-reference environment
 
 Secret-reference values use exactly `keychain:<service>:<account>` or
-`env:<UPPERCASE_NAME>`. The macOS production template uses Keychain. The 13
+`env:<UPPERCASE_NAME>`. The macOS staging template uses Keychain. The 13
 database references and the four other purpose references must all be unique;
 configuration rejects any alias.
 
@@ -102,7 +305,7 @@ configuration rejects any alias.
 | `STARRING_API_PRODUCT_ACTION_KEYRING_SECRET_REFERENCE` | Product action digest creation and verification | `keyring.product-action` |
 | `STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE` | Authorized snapshot encryption and decryption | `keyring.snapshot-envelope` |
 
-The template Keychain service is `starring-api.production`. Each database item
+The template Keychain service is `starring-api.staging`. Each database item
 contains one complete PostgreSQL URL for its capability login. All thirteen
 URLs must identify the same database but authenticate as thirteen distinct
 roles with no role membership. Local loopback or Unix-socket connections may
@@ -110,6 +313,31 @@ disable TLS. A remote database URL must use full certificate and hostname
 verification. PostgreSQL startup `options` are rejected. Use a distinct random
 password for every login even though secret-reference uniqueness is the
 enforced startup boundary.
+
+The URL parser accepts only `postgres` or `postgresql`, an explicit lowercase
+role matching `[a-z][a-z0-9_]{0,62}`, an explicit 24 through 512 character
+password containing only `A-Z`, `a-z`, `0-9`, `_`, `-`, `.`, `~`, one lowercase
+database identifier under the same rule, one explicit nonzero port, and one
+required `sslmode`. Percent escapes, fragments, duplicate parameters, unknown
+parameters, startup `options`, and omitted authority fields are rejected. The
+only query parameters are `sslmode`, an absolute Unix-socket `host`, `port`,
+and an absolute `sslrootcert`. Socket URLs use the literal authority
+`localhost`, `sslmode=disable`, no root certificate, and an explicit query
+port. Remote TCP uses `sslmode=verify-full`; loopback TCP may disable TLS. These
+are non-secret shape examples and the password marker must be replaced:
+
+```text
+postgresql://starring_identity_oauth:REPLACE_WITH_32_RANDOM_URLSAFE_CHARS@127.0.0.1:5432/starring_staging?sslmode=disable
+postgresql://starring_identity_oauth:REPLACE_WITH_32_RANDOM_URLSAFE_CHARS@localhost/starring_staging?host=/private/tmp&port=5432&sslmode=disable
+postgresql://starring_identity_oauth:REPLACE_WITH_32_RANDOM_URLSAFE_CHARS@db.staging.example:5432/starring_staging?sslmode=verify-full&sslrootcert=/absolute/path/to/ca.pem
+```
+
+Startup rejects ambient `PGAPPNAME`, `PGDATABASE`, `PGHOST`, `PGHOSTADDR`,
+`PGOPTIONS`, `PGPASSFILE`, `PGPASSWORD`, `PGPORT`, `PGSSLCERT`, `PGSSLKEY`,
+`PGSSLMODE`, `PGSSLROOTCERT`, and `PGUSER`. Connection construction sets every
+accepted field explicitly and deliberately bypasses `.pgpass`; do not depend
+on an operator shell, service environment, or home-directory password file to
+complete a URL.
 
 OAuth client secret and bot token items contain their exact provider values.
 Each keyring item contains one compact JSON object with version `1`, one active
@@ -133,7 +361,7 @@ account. The final `-w` causes `/usr/bin/security` to prompt instead of placing
 the value in the command line. Never use `-A` and never enable shell tracing.
 
 ```bash
-SERVICE=starring-api.production
+SERVICE=starring-api.staging
 for ACCOUNT in \
   database.oauth-flow-writer \
   database.session-issuer \
@@ -163,7 +391,7 @@ three-second lookup timeout, excessive output, invalid UTF-8, malformed secret,
 or locked Keychain is a startup failure.
 
 ```bash
-SERVICE=starring-api.production
+SERVICE=starring-api.staging
 for ACCOUNT in \
   database.oauth-flow-writer database.session-issuer database.session-api \
   database.security-revoker database.installation-authority-reader \
@@ -187,8 +415,12 @@ prompt. If any prompt appears, leave ingress disabled and correct the item's
 access policy. The current adapter invokes the signed system
 `/usr/bin/security` binary, so the macOS account itself is the process-isolation
 boundary: any untrusted process running as that user is already in the secret
-threat boundary. Keep the service account dedicated and do not work around a
-prompt with broad cross-user Keychain access.
+threat boundary. This home server also runs Codex under the same account, so it
+is not a production secret boundary. Use only disposable staging credentials
+here. A production cutover requires a dedicated OS account or an independently
+isolated secret broker, with Codex and every other untrusted workload outside
+that boundary. Do not work around a prompt with broad cross-user Keychain
+access.
 
 ### Binary and LaunchAgent installation
 
@@ -197,15 +429,44 @@ workspace and PostgreSQL gates are green, the installed plist replacements are
 complete, and the staging limitation above is accepted.
 
 ```bash
+git fetch --prune origin
+test -z "$(git status --porcelain)"
+test -n "$STARRING_APPROVED_RELEASE_REVISION"
+printf '%s\n' "$STARRING_APPROVED_RELEASE_REVISION" \
+  | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+APPROVED_SHA="$(git rev-parse --verify "${STARRING_APPROVED_RELEASE_REVISION}^{commit}")"
+test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+git merge-base --is-ancestor "$APPROVED_SHA" origin/main
+BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/starring-api-build.XXXXXX")"
+CARGO_TARGET_DIR="$BUILD_ROOT/target" \
+  cargo build --locked --release -p starring-api
+SOURCE_BINARY="$BUILD_ROOT/target/release/starring-api"
+SOURCE_SHA256="$(/usr/bin/shasum -a 256 "$SOURCE_BINARY" | /usr/bin/awk '{print $1}')"
 mkdir -p "$HOME/.local/libexec" "$HOME/Library/LaunchAgents" \
   "$HOME/Library/Logs/starring-api"
 chmod 700 "$HOME/.local/libexec" "$HOME/Library/Logs/starring-api"
-install -m 500 target/release/starring-api \
+install -m 500 "$SOURCE_BINARY" \
   "$HOME/.local/libexec/starring-api"
-install -m 600 ops/macos/local.starring.api.plist \
-  "$HOME/Library/LaunchAgents/local.starring.api.plist"
-plutil -lint "$HOME/Library/LaunchAgents/local.starring.api.plist"
+INSTALLED_SHA256="$(/usr/bin/shasum -a 256 \
+  "$HOME/.local/libexec/starring-api" | /usr/bin/awk '{print $1}')"
+test "$SOURCE_SHA256" = "$INSTALLED_SHA256"
+printf 'revision=%s\nbinary_sha256=%s\n' "$APPROVED_SHA" "$INSTALLED_SHA256"
+install -m 600 ops/macos/local.starring.api.staging.plist \
+  "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+plutil -lint "$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+rm -rf "$BUILD_ROOT"
+unset STARRING_APPROVED_RELEASE_REVISION INSTALLED_SHA256 SOURCE_SHA256 \
+  SOURCE_BINARY BUILD_ROOT APPROVED_SHA
 ```
+
+Set `STARRING_APPROVED_RELEASE_REVISION` from the independently approved change
+record, never by reading the target checkout immediately before installation.
+The exact clean `HEAD` must equal that immutable 40-character revision and be
+reachable from fetched `origin/main`. The fresh target directory prevents an
+older local artifact from being mistaken for the build, and the recorded
+source and installed SHA-256 values must match. Preserve the printed revision
+and digest in the staging release evidence, then clear the approved-revision
+environment variable after installation.
 
 Edit only the installed plist. Replace `https://api.example.com`,
 `REPLACE_WITH_DISCORD_APPLICATION_ID`, and
@@ -214,7 +475,7 @@ callback, tunnel hostname, and release evidence all agree. Leave every secret
 as a Keychain reference.
 
 ```bash
-INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.plist"
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
 if /usr/bin/grep -Eq 'REPLACE_WITH_|api\.example\.com' "$INSTALLED"
 then
   echo "starring-api plist still contains placeholders" >&2
@@ -228,9 +489,9 @@ Keep public ingress disabled, then load the user LaunchAgent:
 
 ```bash
 DOMAIN="gui/$(id -u)"
-INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.plist"
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
 launchctl bootstrap "$DOMAIN" "$INSTALLED"
-launchctl print "$DOMAIN/local.starring.api"
+launchctl print "$DOMAIN/local.starring.api.staging"
 ```
 
 The plist restarts nonzero exits with a 30-second throttle. A clean exit is not
@@ -253,8 +514,10 @@ Startup is deliberately fail-closed and ordered:
 4. Build the facade and run aggregate database capability readiness with a
    45-second composition deadline. This verifies one database, thirteen
    distinct direct-login roles, exact executable allowlists, relation and
-   schema denial, installation authority, snapshot encryption-key coverage,
-   action-key coverage, decision paths, and both deployment-status readers.
+   schema denial, absence of explicit parameter privileges and per-role
+   database settings, installation authority, snapshot encryption-key
+   coverage, action-key coverage, decision paths, and both deployment-status
+   readers.
 5. Bind only `127.0.0.1:<configured-port>`.
 6. While the listener is bound but the readiness gate is still closed, run the
    facade readiness probe again with the server's 10-second startup deadline.
@@ -297,15 +560,49 @@ unset PORT PUBLIC_HOST
 
 The listener must be exactly `127.0.0.1`, never `*`, `0.0.0.0`, a LAN address,
 or a public address. Liveness proves only that the process event loop responds.
-Readiness first checks the atomic server lease, then re-runs facade readiness;
-it returns 503 `dependency_unavailable` when either gate is closed.
+Readiness reads only the atomic server lease and never runs a database probe in
+the request path. A single background supervisor runs aggregate thirteen-role
+readiness every 30 seconds with a ten-second deadline and no overlap. The first
+error, timeout, or panic closes business admission, removes the listener, drains
+accepted work, and exits with `server_runtime_readiness_failed`. The maximum
+scheduled detection window is 40 seconds. `/health/ready` and every non-health
+route return 503 `dependency_unavailable` while the lease is closed.
+
+Before promoting a release candidate, rehearse this 13-role probe under the
+expected concurrent request load and database latency with the intended pool
+limit. Record probe duration, query volume, pool occupancy, request latency,
+false readiness exits, restart time, and database saturation. Confirm that a
+probe can acquire every required connection without starving business work.
+Until that evidence defines an operational margin and alert threshold, the
+template pool size and 30/10-second schedule are staging defaults rather than a
+production SLO.
 
 Cloudflare Tunnel is a separate service and may be enabled only after local
 readiness is green. Route it to the loopback address, keep its credentials in
 its own secret store, and do not add Cloudflare credentials or forwarded-header
-trust to the Starring API plist. Cloudflare Access can protect a staging edge,
-but it does not replace product OAuth, session, CSRF, tenant, installation, or
-fresh Discord authority checks.
+trust to the Starring API plist. A staging edge requires Cloudflare Access in
+front of every routed product path and an edge rate rule for
+`/oauth/discord/start` before the tunnel is enabled. Route only
+`/oauth/discord/*`, `/v1/*`, and `/v2/*`; `/health/live` and `/health/ready`
+remain loopback-only and must not have a public tunnel rule. Deep readiness is
+database-intensive and is not a public probe. The exact edge threshold must be
+derived from the disposable-user load rehearsal and remain below the bounded
+database-pool capacity. Access and the edge rule are compensating staging
+controls, not product authorization, and do not replace OAuth, session, CSRF,
+tenant, installation, or fresh Discord authority checks. Public production
+ingress remains prohibited until actor/session fairness controls complement the
+process-wide OAuth-start fuse, identity retention runs through a monitored
+scheduler, readiness load and restart SLOs are proven, the production runtime
+worker exists, and the secret boundary is isolated from Codex.
+
+The OAuth callback query carries short-lived `code` and `state` credentials.
+Before enabling the tunnel, configure Cloudflare and every origin-side access
+log to omit query strings for `/oauth/discord/callback` or redact those fields
+before persistence. Restrict log access, define bounded rotation and deletion,
+send one synthetic failed callback, and inspect every edge, tunnel, and origin
+log sink to prove neither value was retained. A path-only request log is
+sufficient; callback query material must never enter release evidence or an
+incident ticket.
 
 ### Shutdown and stable-failure handling
 
@@ -319,7 +616,7 @@ running.
 
 ```bash
 DOMAIN="gui/$(id -u)"
-launchctl bootout "$DOMAIN/local.starring.api"
+launchctl bootout "$DOMAIN/local.starring.api.staging"
 ```
 
 Failure handling is intentionally closed:
@@ -327,7 +624,9 @@ Failure handling is intentionally closed:
 - Invalid configuration or secret resolution exits before database composition
   or bind.
 - Database connection, topology, ACL, function, key coverage, or deep-readiness
-  drift keeps ingress closed and closes connected pools.
+  drift keeps ingress closed and closes connected pools. Runtime deep-readiness
+  loss is terminal on its first observed error, timeout, or panic; launchd may
+  attempt a fresh composition only after its 30-second throttle.
 - The first listener accept error immediately removes readiness. Accept retries
   use a cancellable one-second backoff; five consecutive errors terminate with
   a redacted stable failure.
@@ -354,8 +653,9 @@ lease path remain unavailable.
 5. Confirm every product-authored promotion is provisioned into exactly one
    active tenant installation with the same tenant, guild, and RuleSet key.
 6. Estimate table and index size and schedule a maintenance window for the
-   table locks, synchronous index builds, and artifact rewrite in migrations
-   004, 006, 007, 012, and 013.
+   table locks, synchronous index builds, artifact rewrite, authority-snapshot
+   key-coverage scan, and runtime-attempt preflight in migrations 004, 006,
+   007, 012, 013, `202607200003`, and `202607200006`.
 7. Run all migration preflight queries from a read-only transaction and save
    only aggregate counts.
 
@@ -480,12 +780,55 @@ WHERE version.guild_id IS NULL
     OR version.content_hash IS DISTINCT FROM shadow.target_hash
 GROUP BY shadow.source
 ORDER BY shadow.source;
+
+SELECT
+    (SELECT pg_catalog.count(*)
+     FROM public.runtime_attestations) AS retained_attestations,
+    (SELECT pg_catalog.count(*)
+     FROM public.runtime_serving_leases) AS retained_serving_leases,
+    (SELECT pg_catalog.count(*)
+     FROM public.runtime_deployments AS deployment
+     WHERE deployment.phase <> 'requested'
+        OR deployment.revision <> 1
+        OR deployment.controller_id IS NOT NULL
+        OR deployment.controller_fencing_token IS NOT NULL
+        OR deployment.controller_acquired_at IS NOT NULL
+        OR deployment.controller_lease_expires_at IS NOT NULL
+        OR deployment.last_fencing_token IS NOT NULL
+        OR deployment.next_retry_at IS NOT NULL
+        OR deployment.last_stable_error_code IS NOT NULL
+        OR deployment.live_attestation_id IS NOT NULL
+        OR deployment.live_at IS NOT NULL
+        OR deployment.blocked_at IS NOT NULL
+        OR deployment.superseded_at IS NOT NULL
+        OR deployment.cancelled_at IS NOT NULL
+        OR deployment.snapshot -> 'controller_lease'
+            IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'last_fencing_token'
+            IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'preflight' IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'drain' IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'activation' IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'panel_certificate'
+            IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'gateway_ready'
+            IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'live' IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'last_live_recovery'
+            IS DISTINCT FROM 'null'::JSONB
+        OR deployment.snapshot -> 'last_runtime_failure'
+            IS DISTINCT FROM 'null'::JSONB) AS non_pristine_deployments;
 ```
 
 Every control-plane failure count, `ruleset_artifact_shape_failures`, and every
-returned shadow mismatch count must be zero. Record the artifact row, table-size,
-and largest-definition values for the migration rehearsal. A nonzero failure
-count stops the cutover; do not weaken or skip the migration constraints.
+returned shadow mismatch count must be zero. The three runtime-attempt counts
+must also be zero before migration `202607200003`. Record the artifact row,
+table-size, and largest-definition values for the migration rehearsal. A
+nonzero failure count stops the cutover; do not weaken or skip the migration
+constraints. Migration `202607200003` intentionally has no inference or
+backfill path for retained runtime history. Preserve the database and design a
+separate reviewed forward migration, or restore a verified pristine rehearsal
+database; never delete production evidence merely to satisfy this preflight.
 
 ## Migration sequence
 
@@ -496,11 +839,17 @@ count stops the cutover; do not weaken or skip the migration constraints.
    path, then restart from a fresh transaction.
 4. Run schema, function-signature, ownership, grant, default-privilege, RLS,
    and direct-DML denial probes.
-5. Apply the reviewed role manifest and exact function grants. Run aggregate
-   product-identity readiness using four distinct direct-login pools.
-6. Start only the API readiness process. It must verify the configured approval
-   HMAC keyring covers all live approval receipts.
-7. Start maintenance and runtime readiness processes separately.
+5. Apply `ops/postgres/staging-api-role-bootstrap.sql` with the exact
+   `ON_ERROR_STOP` and staging acknowledgement procedure above, assign all
+   thirteen distinct passwords through prompt-only `\password`, then apply
+   `ops/postgres/staging-api-role-enable.sql`. Complete the negative
+   authentication probes before running aggregate product API readiness with
+   thirteen distinct direct-login pools against one logical database.
+6. Start only the API readiness process. It must verify product-action receipt
+   key coverage, snapshot-envelope key coverage, every exact executable
+   allowlist, and both deployment-status readers.
+7. Start the monitored identity-retention scheduler separately. Do not start a
+   runtime worker until its independent production contract exists.
 8. Re-enable ingress only after every least-privilege probe is green.
 
 Migration 004 deliberately takes strong locks and fails when legacy promotions
@@ -508,6 +857,31 @@ cannot be scoped to provisioned installations. Migrations 006 and 007 build
 bounded retention indexes synchronously. Migration 007 is forward-only after
 its first successful receipt purge because live replay receipts may no longer
 exist; rollback then requires backup restore or a forward fix.
+
+Migration `202607200003` takes access-exclusive locks on the three runtime
+relations and has five-second lock and thirty-second statement bounds. It adds
+durable convergence-attempt identity only to a pristine runtime history. The
+preflight counts above are its cutover gate; a nonzero result requires a
+separately reviewed forward migration rather than an inferred backfill.
+
+Migration `202607200004` preserves the V1 deployment-status signature and role,
+creates an owner-only one-read core plus the V2 identity and status projection,
+and seals public routine execution and routine defaults. Reapply only the exact
+V1 and V2 reader grants in the manifest below, then run both readiness probes.
+
+Migration `202607200005` validates every historical rejection state, adds the
+durable rejection reason and receipt evidence, and seals the rejection
+executor behind its identity, key-coverage, and reject functions. It also
+normalizes routine defaults, so apply the exact rejection grant set before
+aggregate readiness.
+
+Migration `202607200006` must run inside one transaction. It uses five-second
+lock and thirty-second statement bounds, holds access-share locks on its eight
+authority and snapshot relations, scans all generation encryption-key IDs, and
+seals the two database-identity functions plus snapshot key coverage. Rehearse
+the full generation scan at production-like scale. More than eight historical
+snapshot keys, an uncovered key, a hostile schema grant, or an unrelated user
+routine with `PUBLIC EXECUTE` fails the migration closed.
 
 Migration 012 adds and materializes a stored canonical RuleSet hash for every
 published artifact, validates the full artifact table, and checks every
@@ -562,20 +936,23 @@ of the owner role.
 
 If `starring_owner` does not own the `public` schema, the role bootstrap must
 grant it schema usage so the security-definer body can resolve its fully
-qualified relations after `PUBLIC` privileges are revoked. It must grant
-`starring_api` schema usage and execution of only the exact versioned signature
-without grant option:
+qualified relations after `PUBLIC` privileges are revoked. It must grant the
+dedicated `starring_installation_authority_reader` role schema usage and only
+the two exact versioned signatures without grant option:
 
 ```sql
 GRANT USAGE ON SCHEMA public TO starring_owner;
-GRANT USAGE ON SCHEMA public TO starring_api;
+GRANT USAGE ON SCHEMA public TO starring_installation_authority_reader;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_installation_authority_reader_database_identity_v1()
+TO starring_installation_authority_reader;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_installation_authority_read_v1(TEXT, TEXT, BYTEA)
-TO starring_api;
+TO starring_installation_authority_reader;
 ```
 
-For this slice, `starring_api` must have no `SELECT`, `INSERT`, `UPDATE`,
-`DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER` privilege on
+For this slice, `starring_installation_authority_reader` must have no `SELECT`,
+`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER` privilege on
 `product_principals`, `product_auth_sessions`, `product_tenants`,
 `automation_installations`, or
 `automation_installation_authority_versions`. It must also lack database
@@ -667,10 +1044,15 @@ Migration 016 requires all seven referenced identity, tenant, installation,
 authoring-session, generation, and authority-version relations to be ordinary
 non-RLS tables under one owner. It strips non-owner and hostile default
 function grants, transfers the function to that owner, and revokes `PUBLIC`
-execution in the same transaction. Grant the API role only the exact signature
-without grant option:
+execution in the same transaction. Migration `202607200006` adds the topology
+and key-coverage functions. Grant the dedicated snapshot role only these exact
+signatures without grant option:
 
 ```sql
+GRANT USAGE ON SCHEMA public TO starring_authorized_snapshot_reader;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_authorized_snapshot_reader_database_identity_v1()
+TO starring_authorized_snapshot_reader;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_authorized_snapshot_read_v1(
         TEXT,
@@ -679,16 +1061,20 @@ GRANT EXECUTE ON FUNCTION
         TEXT,
         TEXT
     )
-TO starring_api;
+TO starring_authorized_snapshot_reader;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_authorized_snapshot_key_coverage_v1(TEXT[])
+TO starring_authorized_snapshot_reader;
 ```
 
-For this slice, `starring_api` must have no table or column privilege on
+For this slice, `starring_authorized_snapshot_reader` must have no table or
+column privilege on
 `product_principals`, `product_auth_sessions`, `product_tenants`,
 `automation_installations`, `authoring_sessions`,
 `authoring_session_generations`, or
 `automation_installation_authority_versions`. Call
 `PostgresAuthorizedPromotionSnapshots::verify_readiness` through a direct
-`starring_api` login before opening ingress. It verifies the exact function
+`starring_authorized_snapshot_reader` login before opening ingress. It verifies the exact function
 result and execution contract, all seven relation owners and RLS flags, ACLs,
 database and role capabilities, and an impossible-scope 31-byte-digest probe in
 a bounded read-only transaction.
@@ -933,14 +1319,14 @@ function, apply a separate sealing migration that revokes every non-owner table
 and column grant, then require aggregate identity readiness to turn green. Do
 not reclassify the red readiness result as a warning.
 
-Migrations 014 through 018 and 021 through 022 cover installation-authority reads,
-authentication reads and touches, authorized-snapshot reads, the complete
-request-serving OAuth and session lifecycle, product-decision reads, and Apply.
-Approval writes are function-scoped by migrations 019 and 020. Promotion and
-publication/link persistence, deployment-status reads, and runtime convergence
-still contain direct SQL. Product rejection has no production persistence
-adapter. Whole-service execute-only readiness remains a future gate, and direct
-table grants are not a valid workaround.
+Migrations 014 through 022 and `202607200001` through `202607200006` now scope
+installation-authority reads, authentication, authorized-snapshot reads,
+promotion, decision reads, approval, rejection, Apply, and both deployment
+status projections behind exact functions. The application composition uses
+thirteen distinct direct-login pools and aggregate execute-only readiness.
+Runtime convergence mutation remains a separate worker capability and is not
+part of the API process. Direct table grants are not a valid workaround for any
+request-serving role.
 
 ## Product decision capability boundaries
 
@@ -1247,8 +1633,9 @@ The three grant sets above are complete component credentials for decision
 reads, approval, and Apply. The Apply readiness path uses its own coverage
 function and never depends on the approval credential having run first. Do not
 start the whole product service or open ingress from this component manifest
-alone. Promotion/publication, deployment-status, rejection, runtime, final
-relation ACL sealing, and whole-process executable inventory remain mandatory.
+alone. Apply the remaining capability manifest below, seal relation ACLs, and
+require aggregate whole-process readiness. Runtime mutation remains a separate
+worker boundary.
 
 `PostgresProductDecisions::verify_approval_executor_readiness` verifies the
 enumerated approval function, owner, role, 16-relation, internal trigger,
@@ -1273,6 +1660,74 @@ security-invoker helpers, or schema privileges outside `public`. Those remain
 mandatory inputs to the final whole-process schema, object, and executable
 manifest. Green product-decision components are never evidence that those wider
 capabilities are absent.
+
+## Promotion, rejection, and status capability grants
+
+The remaining four request roles are
+`starring_promotion_executor`, `starring_decision_rejection`,
+`starring_deployment_status_reader`, and
+`starring_operational_deployment_status_reader`. Apply only the exact function
+identities below after migrations `202607200002`, `202607200004`, and
+`202607200005`. The block fails if an expected function is missing. It does not
+create roles or credentials.
+
+```sql
+GRANT USAGE ON SCHEMA public TO
+    starring_promotion_executor,
+    starring_decision_rejection,
+    starring_deployment_status_reader,
+    starring_operational_deployment_status_reader;
+
+DO $grants$
+DECLARE
+    entry RECORD;
+BEGIN
+    FOR entry IN
+        SELECT manifest.role_name, manifest.function_identity
+        FROM (
+            VALUES
+                ('starring_promotion_executor', 'public.starring_product_promotion_executor_database_identity_v1()'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,jsonb,text,text,text[],text[],text[],text,text,text,text)'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_publish_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_approval_environment_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_activation_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text,jsonb)'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,jsonb,text,text,text[],text[],text[],text,text,text,text)'),
+                ('starring_promotion_executor', 'public.starring_product_promotion_keyring_coverage_v1(text[],text[])'),
+                ('starring_decision_rejection', 'public.starring_product_rejection_executor_database_identity_v1()'),
+                ('starring_decision_rejection', 'public.starring_product_rejection_keyring_coverage_v1(text[],text[])'),
+                ('starring_decision_rejection', 'public.starring_product_reject_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text)'),
+                ('starring_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v1()'),
+                ('starring_deployment_status_reader', 'public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)'),
+                ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v2()'),
+                ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)')
+        ) AS manifest(role_name, function_identity)
+        ORDER BY manifest.role_name, manifest.function_identity
+    LOOP
+        IF pg_catalog.to_regprocedure(entry.function_identity) IS NULL THEN
+            RAISE EXCEPTION 'starring API capability function is unavailable'
+                USING ERRCODE = '55000';
+        END IF;
+        EXECUTE pg_catalog.format(
+            'GRANT EXECUTE ON FUNCTION %s TO %I',
+            entry.function_identity,
+            entry.role_name
+        );
+    END LOOP;
+END;
+$grants$;
+```
+
+The complete thirteen direct-login roles are the four identity roles, the
+installation-authority reader, the authorized-snapshot reader, the promotion
+executor, the decision reader, approval executor, rejection executor, Apply
+executor, and the two status readers. Every role needs database `CONNECT` and
+schema `USAGE`; no role may have database `CREATE` or `TEMPORARY`, schema
+`CREATE`, relation or sequence privilege, role membership, grant option, or an
+executable user function outside its exact readiness allowlist. Revoke legacy
+`starring_api` grants rather than keeping them during rollout. The service may
+listen only after `PostgresProductApiReadiness::verify_readiness` proves one
+logical database and thirteen distinct direct-login identities.
 
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
@@ -1408,10 +1863,10 @@ recovery procedure.
 - If API or runtime capability probes fail, keep ingress closed. Owner
   credentials are not an emergency application fallback.
 - For an API-only rollback, disable the public tunnel first, boot out
-  `local.starring.api`, restore the previously verified binary and installed
-  non-secret plist, restore only still-valid Keychain entries, bootstrap the
-  job, and require local liveness plus deep readiness before reopening staging
-  ingress.
+  `local.starring.api.staging`, restore the previously verified binary and
+  installed non-secret plist, restore only still-valid Keychain entries,
+  bootstrap the job, and require local liveness plus deep readiness before
+  reopening staging ingress.
 - A prior API binary must not be started against a schema or function manifest
   it does not recognize. When migrations are forward-only or receipt retention
   has run, use a forward fix or verified database restore rather than forcing

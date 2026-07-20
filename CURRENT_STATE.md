@@ -176,8 +176,9 @@ request digest. The stable promotion milestone is named `ActivationLinked`
 rather than implying the linked activation is still awaiting approval. Runtime
 failure metadata crosses the new observation boundary only through a closed
 public-code enum, while the older string-bearing public projections remain
-source compatible. Serving-lease expiry remains internal validation evidence in
-the V1 HTTP response.
+source compatible. The V1 HTTP wire retains its serving-lease expiry field for
+compatibility. V2 exposes bounded timestamps only for exact disconnected,
+expired, or fresh serving evidence.
 
 The additive deployment operational-status V2 boundary preserves the V1 SQL
 signature, result and evidence shapes, HTTP wire response, and grant surface
@@ -225,12 +226,22 @@ session, promotion, approval, rejection, Apply, product status, deployment
 status, and health. It enforces exact Host and Origin, strict JSON, bounded
 bodies and concurrency, deadlines, panic isolation, double-submit CSRF,
 host-only Secure cookies, idempotency-key validation, no-store responses, and
-closed response validation. `tools/starring-api` now supplies the closed
+closed response validation. OAuth start has a process-wide bounded admission
+budget, and installation-scoped authority failures conceal whether a guessed
+installation exists. `tools/starring-api` now supplies the closed
 production-facade bridge, validated environment and Keychain configuration,
 thirteen independently credentialed PostgreSQL pools, aggregate and post-bind
-deep readiness, and a bounded loopback-only HTTP process. That process is a
-runnable staging control plane; it is not evidence of production Live because
-the separate runtime worker and trusted authoring writer remain absent.
+deep readiness, and a bounded loopback-only HTTP process. Database connection
+material is complete and explicit; ambient PostgreSQL variables and `.pgpass`
+cannot fill missing authority or transport fields. Runtime readiness is
+supervised outside the request path; its first error, timeout, or panic closes
+business admission and the listener before graceful drain. Explicit parameter
+privileges and per-role database settings are treated as excess capability, so
+server-side privilege drift also closes admission. The checked-in
+LaunchAgent and exact thirteen-role bootstrap are deliberately staging-only.
+That process is a runnable staging control plane; it is not evidence of
+production Live because the separate runtime worker, trusted authoring writer,
+isolated production secret account, and retention scheduler remain absent.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -462,13 +473,17 @@ Stated as capabilities (durable across the phase numbering):
   session snapshots, promotion, approval, Apply, and exact status projection.
 - Hardened product HTTP transport contract with exact-origin checks, secure
   cookie and CSRF boundaries, strict payload parsing, resource limits, stable
-  response validation, and no raw authority-bearing fields.
+  response validation, bounded OAuth-start admission, non-enumerating
+  installation authority, and no raw authority-bearing fields.
 - Runnable loopback product-control composition with process-only configuration,
   environment or macOS Keychain secret references, thirteen distinct bounded
   database pools, aggregate capability readiness, bind-time deep revalidation,
-  atomic single-owner readiness, bounded HTTP admission and drain, and bounded
-  concurrent pool shutdown. Stable process failures expose only closed status,
-  role, and readiness-phase codes.
+  explicit database credential provenance, atomic single-owner readiness,
+  periodic parameter-ACL and role-setting drift detection, bounded HTTP
+  admission and drain, and bounded concurrent pool shutdown. Stable process
+  failures expose only closed status, role, and readiness-phase codes. A
+  staging-only PostgreSQL manifest reconciles the thirteen exact capability
+  roles and fails closed on unexpected privileges or topology.
 - Discord identify-only OAuth exchange and fresh bot-observed guild manager
   evidence with bounded write and read lifetimes.
 - PostgreSQL product identity, OAuth flow, opaque session and CSRF storage,
@@ -601,8 +616,11 @@ Stated as capabilities (durable across the phase numbering):
   authentication read/touch slices and all three product-decision slices now
   have isolated non-owner, direct-DML denial tests and executable readiness
   probes. The API composition invokes their complete aggregate readiness;
-  declarative production credential bootstrap and a restored-environment
-  whole-process drill are still release blockers.
+  the checked-in reconciliation manifest is limited to a disposable staging
+  cluster. A separately reviewed production credential bootstrap covering the
+  remaining PostgreSQL catalog ACL surfaces, an automated isolated-cluster
+  manifest gate, and a restored-environment whole-process drill are still
+  release blockers.
 - A production `tools/starring-runtime` worker that performs the actual Discord
   drain, hydration, panel reconciliation, gateway start, attestation, and
   heartbeat loop. The durable state machine is implemented, but no production

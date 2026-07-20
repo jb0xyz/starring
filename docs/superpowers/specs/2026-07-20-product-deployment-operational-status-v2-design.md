@@ -176,10 +176,9 @@ The increment is complete only when automated tests prove:
 
 ## Remaining production work
 
-`product-control-http` is still a transport library. A production facade and
-`tools/starring-api` composition root must map the pure application observation
-into this DTO, construct distinct database pools for every capability, verify
-all readiness contracts before listening, bind only to loopback, and implement
-graceful shutdown. Runtime recovery remains a separate authenticated mutation
-capability and must never accept a failure ID or attempt identity from this
-status response.
+This section records the baseline at design acceptance. The production facade
+and `tools/starring-api` composition root were subsequently implemented with
+distinct database pools, aggregate readiness, loopback binding, and graceful
+shutdown. `CURRENT_STATE.md` is authoritative for implementation status.
+Runtime recovery remains a separate authenticated mutation capability and must
+never accept a failure ID or attempt identity from this status response.
