@@ -591,6 +591,16 @@ async fn identity_lifecycle_migration_seals_new_capabilities_and_preserves_legac
             .execute(&database.pool)
             .await
             .unwrap();
+        sqlx::query("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "REVOKE CREATE ON SCHEMA public FROM {owner_role}, {migrator_role}"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
         sqlx::query(&format!(
             "GRANT CONNECT ON DATABASE {} TO {oauth_role}, {issuer_role}, \
              {session_role}, {security_role}",
