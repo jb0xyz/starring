@@ -11,6 +11,7 @@ mod query;
 mod reader_contract;
 mod reader_readiness;
 mod readiness;
+mod reject;
 mod row;
 mod store;
 
@@ -21,4 +22,5 @@ pub use crate::product_action_digest::{
 };
 pub use config::{PostgresProductDecisionsConfig, ProductDecisionConfigError};
 pub use readiness::ProductDecisionReadinessErrorV1;
+pub use reject::PostgresProductRejections;
 pub use store::{PostgresProductDecisions, ProductDecisionDatabasePoolsV1};

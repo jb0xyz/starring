@@ -45,9 +45,9 @@ pub use product_action_digest::{
     ProductActionDigestKeyringV1,
 };
 pub use product_decisions::{
-    PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
-    ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1,
-    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
+    PostgresProductDecisions, PostgresProductDecisionsConfig, PostgresProductRejections,
+    ProductDecisionConfigError, ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError,
+    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,

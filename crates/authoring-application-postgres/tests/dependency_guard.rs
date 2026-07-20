@@ -524,6 +524,72 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
 }
 
 #[test]
+fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
+    let rejection = include_str!("../src/product_decisions/reject.rs");
+    let digest = include_str!("../src/product_decisions/digest.rs");
+    let store = include_str!("../src/product_decisions/store.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductRejections",
+        "rejection_executor: PgPool",
+        "pub fn new(",
+        "pub fn with_config(",
+        "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
+        "CapabilityV1::Reject",
+        "public.starring_product_reject_v1(",
+        ".bind(\"reject\")",
+        ".bind(request.command().reason.as_str())",
+        "configure_mutation_transaction(&mut transaction, &self.config)",
+        "database_commit(error, \"product rejection commit outcome is unavailable\")",
+        "SELECT outcome, resulting_revision, resulting_state, exact_replay, guild_id",
+        "$28, $29)",
+    ] {
+        assert!(
+            rejection.contains(required),
+            "missing rejection guard: {required}"
+        );
+    }
+    for scope_binding in [
+        "evidence.tenant_id() != request.scope().tenant_id()",
+        "evidence.installation_id() != request.scope().installation_id()",
+        "evidence.guild_id() != request.scope().guild_id()",
+        "evidence.acting_user_id() != request.scope().acting_user_id()",
+    ] {
+        assert!(rejection.contains(scope_binding));
+    }
+    assert!(!rejection.contains(".bind(request.command().idempotency_key.as_str())"));
+    assert!(!rejection.contains("activation_requests"));
+    let rejection_production = rejection.split("#[cfg(test)]").next().unwrap_or(rejection);
+    assert_eq!(
+        rejection_production
+            .matches("request.command().reason.as_str()")
+            .count(),
+        1
+    );
+    let digest_production = digest.split("#[cfg(test)]").next().unwrap_or(digest);
+    for domain in [
+        "starring.product.rejection.idempotency.v1",
+        "starring.product.rejection.request.v1",
+        "starring.product.rejection.receipt.v1",
+        "starring.product.rejection.audit.v1",
+        "starring.product.rejection.digest-key-fingerprint.v1",
+    ] {
+        assert!(digest_production.contains(domain));
+    }
+    assert_eq!(
+        digest_production
+            .matches("material.reason.as_bytes()")
+            .count(),
+        1
+    );
+    assert!(digest_production.contains("b\"product_reject_v1\".as_slice()"));
+    assert!(!store.contains("rejection_executor"));
+    assert!(module.contains("pub use reject::PostgresProductRejections"));
+    assert!(library.contains("PostgresProductRejections"));
+}
+
+#[test]
 fn product_identity_retention_keeps_index_bounded_work_shape() {
     let migration =
         include_str!("../../../migrations/202607190006_prepare_product_identity_retention.sql");
@@ -1308,6 +1374,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_decisions/reader_readiness.rs",
             include_str!("../src/product_decisions/reader_readiness.rs"),
+        ),
+        (
+            "src/product_decisions/reject.rs",
+            include_str!("../src/product_decisions/reject.rs"),
         ),
         (
             "src/product_decisions/readiness.rs",
