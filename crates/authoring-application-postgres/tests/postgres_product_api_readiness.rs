@@ -623,6 +623,38 @@ async fn product_api_readiness_enforces_thirteen_isolated_database_capabilities(
         .await
         .unwrap();
 
+        sqlx::query(&format!(
+            "GRANT SET ON PARAMETER session_replication_role TO {}",
+            roles[OAUTH_FLOW_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let parameter_excess = verify_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+        )
+        .await;
+        assert!(matches!(
+            parameter_excess,
+            Err(ProductApiReadinessErrorV1::Identity(
+                ProductIdentityReadinessErrorV1::ExcessCapability
+            ))
+        ));
+        sqlx::query(&format!(
+            "REVOKE SET ON PARAMETER session_replication_role FROM {}",
+            roles[OAUTH_FLOW_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        verify_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+        )
+        .await
+        .unwrap();
+
         for pool in primary_pools {
             pool.close().await;
         }
