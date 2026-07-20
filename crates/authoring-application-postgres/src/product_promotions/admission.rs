@@ -2,7 +2,10 @@ use std::fmt::{Debug, Formatter};
 
 use authoring_application::AuthorizedPromotionAccessV1;
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
-use authoring_promotion::{AuthoringSessionId, PreparedPromotionPlanV1, SessionGeneration};
+use authoring_promotion::{
+    AuthoringSessionId, PreparedPromotionPlanV1, PromotionRecordV1, PromotionStageV1,
+    SessionGeneration,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -186,6 +189,67 @@ pub(super) fn prepare_product_promotion_admission_v1(
     Ok(PreparedProductPromotionAdmissionV1 { payload, digest })
 }
 
+pub(super) fn prepare_legacy_product_promotion_admission_v1(
+    keyring: &ProductActionDigestKeyringV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access_args: &ProductPromotionAccessArgsV1,
+    record: &PromotionRecordV1,
+    digests: &ProductPromotionDigestsV1,
+) -> Result<PreparedProductPromotionAdmissionV1, ProductPromotionAdmissionErrorV1> {
+    validate_legacy_projection_v1(context, access_args, record, digests)?;
+    let candidate_revision =
+        bounded_positive_i64_string(record.intent.evidence.candidate_revision)?;
+    let policy_revision =
+        bounded_positive_i64_string(record.intent.authority.policy.revision.get())?;
+    let payload = ProductPromotionAdmissionPayloadV1 {
+        endpoint_domain: ENDPOINT_DOMAIN.to_string(),
+        product_request_id: context.product_request_id.clone(),
+        tenant_id: access_args.expected_tenant_id.clone(),
+        installation_id: access_args.expected_installation_id.clone(),
+        principal_id: access_args.expected_principal_id.clone(),
+        authoring_session_id: context.authoring_session_id.as_str().to_string(),
+        generation: context.generation.get().to_string(),
+        candidate_revision,
+        candidate_hash: record
+            .intent
+            .evidence
+            .candidate_ruleset_hash
+            .as_str()
+            .to_string(),
+        promotion_id: record.id.as_str().to_string(),
+        promotion_request_digest: record.request_digest.as_str().to_string(),
+        session_subject_digest: encode_lower_hex(&digests.session_subject),
+        idempotency_key_digest: digests.active_idempotency.clone(),
+        idempotency_digest_key_id: digests.active_key_id.clone(),
+        idempotency_digest_key_fingerprint: digests.active_key_fingerprint.clone(),
+        semantic_request_digest: digests.semantic_request.clone(),
+        receipt_id: digests.receipt_id.clone(),
+        audit_event_id: digests.audit_event_id.clone(),
+        discord_application_id: access_args.expected_discord_application_id.clone(),
+        guild_id: access_args.expected_guild_id.clone(),
+        acting_user_id: access_args.expected_acting_user_id.clone(),
+        capability: access_args.expected_capability.clone(),
+        authority_revision: access_args.observed_current_authority_revision.to_string(),
+        authority_payload_digest: access_args
+            .observed_current_authority_payload_digest
+            .clone(),
+        authority_observation_digest: access_args.authority_observation_digest.clone(),
+        authority_observed_at: canonical_timestamp(access_args.authority_observed_at),
+        authority_expires_at: canonical_timestamp(access_args.authority_expires_at),
+        effective_permission_bits: access_args.effective_permission_bits.clone(),
+        guild_owner: access_args.guild_owner,
+        binding_fingerprint: record
+            .intent
+            .evidence
+            .context_fingerprint
+            .as_str()
+            .to_string(),
+        policy_revision,
+    };
+    let digest = sign_payload_v1(keyring, &payload)?;
+    Ok(PreparedProductPromotionAdmissionV1 { payload, digest })
+}
+
 pub(super) fn validate_product_promotion_admission_v1(
     keyring: &ProductActionDigestKeyringV1,
     evidence: &ProductPromotionAdmissionEvidenceV1,
@@ -230,6 +294,41 @@ fn validate_plan_projection_v1(
 ) -> Result<(), ProductPromotionAdmissionErrorV1> {
     let authority = &plan.intent.authority;
     if plan.promotion_id != digests.promotion_id
+        || authority.tenant_id.as_str() != access_args.expected_tenant_id
+        || authority.installation_id.as_str() != access_args.expected_installation_id
+        || authority.principal_id.as_str() != access_args.expected_principal_id
+        || authority.session_owner_id != authority.principal_id
+        || authority.session_id != context.authoring_session_id
+        || authority.session_generation != context.generation
+        || authority.guild_id.to_string() != access_args.expected_guild_id
+        || authority.requester.to_string() != access_args.expected_acting_user_id
+        || access_args.expected_capability != "promote"
+        || access_args.expected_product_session_digest.len() != 32
+        || digests.session_subject.len() != 32
+        || digests.idempotency_candidates.is_empty()
+        || digests.idempotency_candidates.len() > 8
+        || digests.idempotency_candidates.len() != digests.idempotency_candidate_key_ids.len()
+        || digests.idempotency_candidates.len()
+            != digests.idempotency_candidate_key_fingerprints.len()
+    {
+        return Err(ProductPromotionAdmissionErrorV1::ProjectionMismatch);
+    }
+    Ok(())
+}
+
+fn validate_legacy_projection_v1(
+    context: &ProductPromotionAdmissionContextV1,
+    access_args: &ProductPromotionAccessArgsV1,
+    record: &PromotionRecordV1,
+    digests: &ProductPromotionDigestsV1,
+) -> Result<(), ProductPromotionAdmissionErrorV1> {
+    record
+        .validate()
+        .map_err(|_| ProductPromotionAdmissionErrorV1::ProjectionMismatch)?;
+    let authority = &record.intent.authority;
+    if record.id != digests.promotion_id
+        || record.revision.get() != 3
+        || !matches!(record.stage, PromotionStageV1::ActivationPending { .. })
         || authority.tenant_id.as_str() != access_args.expected_tenant_id
         || authority.installation_id.as_str() != access_args.expected_installation_id
         || authority.principal_id.as_str() != access_args.expected_principal_id

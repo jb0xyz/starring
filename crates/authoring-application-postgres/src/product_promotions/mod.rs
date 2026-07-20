@@ -14,6 +14,8 @@ mod prepare;
 #[allow(dead_code)]
 mod publication;
 #[allow(dead_code)]
+mod repair;
+#[allow(dead_code)]
 mod replay;
 #[allow(dead_code)]
 mod row;

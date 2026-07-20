@@ -118,6 +118,11 @@ pub(crate) enum ProductPromotionActivationStageV1 {
     FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
 }
 
+pub(crate) enum ProductPromotionLegacyRepairStageV1 {
+    Finalized(Box<ProductPromotionFinalReplayV1>),
+    FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
+}
+
 impl Debug for ProductPromotionActivationStageV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -127,6 +132,21 @@ impl Debug for ProductPromotionActivationStageV1 {
                 .finish(),
             Self::FinalReplayRequired(value) => formatter
                 .debug_tuple("ProductPromotionActivationStageV1::FinalReplayRequired")
+                .field(value)
+                .finish(),
+        }
+    }
+}
+
+impl Debug for ProductPromotionLegacyRepairStageV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Finalized(value) => formatter
+                .debug_tuple("ProductPromotionLegacyRepairStageV1::Finalized")
+                .field(value)
+                .finish(),
+            Self::FinalReplayRequired(value) => formatter
+                .debug_tuple("ProductPromotionLegacyRepairStageV1::FinalReplayRequired")
                 .field(value)
                 .finish(),
         }
@@ -583,6 +603,21 @@ pub(super) fn validate_product_promotion_admitted_for_access_v1(
     )
 }
 
+pub(super) fn validate_product_promotion_legacy_for_access_v1(
+    legacy: &ProductPromotionLegacyRepairV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access: &ProductPromotionAccessArgsV1,
+    digests: &ProductPromotionDigestsV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    validate_legacy_repair_record_v1(
+        &legacy.record,
+        legacy.database_now,
+        context,
+        access,
+        digests,
+    )
+}
+
 pub(super) fn decode_product_promotion_publication_v1(
     row: ProductPromotionPublicationRowV1,
     admitted: &ProductPromotionAdmittedStageV1,
@@ -690,6 +725,257 @@ pub(super) fn decode_product_promotion_activation_link_v1(
         }
         _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
     }
+}
+
+pub(super) fn decode_product_promotion_repair_link_v1(
+    row: ProductPromotionActivationLinkRowV1,
+    keyring: &ProductActionDigestKeyringV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access: &ProductPromotionAccessArgsV1,
+    digests: &ProductPromotionDigestsV1,
+    legacy: &ProductPromotionLegacyRepairV1,
+    prepared_admission: &PreparedProductPromotionAdmissionV1,
+) -> Result<ProductPromotionLegacyRepairStageV1, AuthorizedPromotionSubmissionErrorV1> {
+    match row.outcome_code.as_str() {
+        "recovered" => validate_legacy_repair_success_v1(
+            row,
+            keyring,
+            context,
+            access,
+            digests,
+            legacy,
+            prepared_admission,
+        )
+        .map(|value| ProductPromotionLegacyRepairStageV1::Finalized(Box::new(value))),
+        "final_replay_required" => validate_legacy_repair_final_replay_signal_v1(
+            row, keyring, context, access, digests, legacy,
+        )
+        .map(|value| ProductPromotionLegacyRepairStageV1::FinalReplayRequired(Box::new(value))),
+        "not_found" => {
+            require_activation_link_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::NotFound)
+        }
+        "idempotency_conflict" => {
+            require_activation_link_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict)
+        }
+        "access_denied" => {
+            require_activation_link_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        }
+        "scope_mismatch" => {
+            require_activation_link_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        }
+        "persistence_corrupt" => {
+            require_activation_link_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+        _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+    }
+}
+
+fn validate_legacy_repair_success_v1(
+    row: ProductPromotionActivationLinkRowV1,
+    keyring: &ProductActionDigestKeyringV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access: &ProductPromotionAccessArgsV1,
+    digests: &ProductPromotionDigestsV1,
+    legacy: &ProductPromotionLegacyRepairV1,
+    prepared_admission: &PreparedProductPromotionAdmissionV1,
+) -> Result<ProductPromotionFinalReplayV1, AuthorizedPromotionSubmissionErrorV1> {
+    let activation = decode_bounded_v1::<ProductPromotionActivationProjectionV1>(
+        row.activation_projection,
+        MAX_TARGET_ARTIFACT_BYTES,
+    )?;
+    let receipt = decode_bounded_v1(row.receipt_projection, MAX_RECEIPT_BYTES)?;
+    let audit_evidence =
+        decode_bounded_v1(row.audit_evidence_projection, MAX_AUDIT_EVIDENCE_BYTES)?;
+    let validation = ProductPromotionValidationContextV1 {
+        keyring,
+        context,
+        access,
+        digests,
+    };
+    let admitted = decode_admitted_v1(
+        row.promotion_record,
+        row.admission_evidence,
+        row.admission_digest,
+        row.database_now,
+        &validation,
+    )?;
+    if admitted.admission.payload != prepared_admission.payload
+        || !constant_time_text_eq(&admitted.admission_digest, &prepared_admission.digest)
+        || admitted.admission.admitted_at != admitted.database_now
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    validate_legacy_repair_activation_projection_v1(
+        legacy,
+        &activation,
+        &admitted.record,
+        admitted.database_now,
+    )?;
+    validate_new_recovery_receipt_v1(&admitted.record, &receipt, admitted.database_now)?;
+    validate_final_projection_v1(&admitted, &receipt, &audit_evidence)?;
+    require_recovery_result_v1(&receipt)?;
+    Ok(ProductPromotionFinalReplayV1 {
+        admitted,
+        receipt,
+        audit_evidence,
+    })
+}
+
+fn validate_new_recovery_receipt_v1(
+    record: &PromotionRecordV1,
+    receipt: &ProductPromotionReceiptProjectionV1,
+    database_now: DateTime<Utc>,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    let exact = match &record.stage {
+        PromotionStageV1::ActivationPending { .. } => {
+            record.revision.get() == 3
+                && receipt.resulting_state == "activation_pending"
+                && receipt.resulting_revision == Some(3)
+                && receipt.completed_at == database_now
+        }
+        PromotionStageV1::Expired { .. } => {
+            record.revision.get() == 4
+                && record.updated_at == database_now
+                && receipt.resulting_state == "expired"
+                && receipt.resulting_revision == Some(4)
+                && receipt.completed_at == database_now
+        }
+        PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => false,
+    };
+    if exact {
+        Ok(())
+    } else {
+        Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+    }
+}
+
+fn validate_legacy_repair_final_replay_signal_v1(
+    row: ProductPromotionActivationLinkRowV1,
+    keyring: &ProductActionDigestKeyringV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access: &ProductPromotionAccessArgsV1,
+    digests: &ProductPromotionDigestsV1,
+    legacy: &ProductPromotionLegacyRepairV1,
+) -> Result<ProductPromotionAdmittedStageV1, AuthorizedPromotionSubmissionErrorV1> {
+    if row.activation_projection.is_some()
+        || row.receipt_projection.is_some()
+        || row.audit_evidence_projection.is_some()
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let validation = ProductPromotionValidationContextV1 {
+        keyring,
+        context,
+        access,
+        digests,
+    };
+    let admitted = decode_admitted_v1(
+        row.promotion_record,
+        row.admission_evidence,
+        row.admission_digest,
+        row.database_now,
+        &validation,
+    )?;
+    validate_legacy_final_replay_record_v1(&legacy.record, &admitted.record, row.database_now)?;
+    Ok(admitted)
+}
+
+fn validate_legacy_repair_activation_projection_v1(
+    legacy: &ProductPromotionLegacyRepairV1,
+    projection: &ProductPromotionActivationProjectionV1,
+    persisted: &PromotionRecordV1,
+    database_now: DateTime<Utc>,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    if projection.format_version != 1
+        || legacy.database_now > database_now
+        || legacy.record.updated_at > database_now
+        || persisted.updated_at > database_now
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    projection
+        .request
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let transition = plan_activation_link_v1(&legacy.record)
+        .and_then(|plan| plan.complete(&legacy.record, &projection.request, database_now))
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let expected = match transition {
+        LinkedActivationTransitionV1::Linked { expected_record } => expected_record,
+        LinkedActivationTransitionV1::Expired {
+            expected_record, ..
+        } => expected_record,
+    };
+    validate_exact_planned_record_v1(&expected, persisted)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let activation = match &persisted.stage {
+        PromotionStageV1::ActivationPending { activation, .. }
+        | PromotionStageV1::Expired { activation, .. } => activation,
+        PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => {
+            return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+    };
+    if projection.disposition != activation.disposition {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_legacy_final_replay_record_v1(
+    legacy: &PromotionRecordV1,
+    final_record: &PromotionRecordV1,
+    database_now: DateTime<Utc>,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    legacy
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    final_record
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let PromotionStageV1::ActivationPending {
+        publication: legacy_publication,
+        activation: legacy_activation,
+    } = &legacy.stage
+    else {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    };
+    let exact_stage = match &final_record.stage {
+        PromotionStageV1::ActivationPending { .. } => final_record == legacy,
+        PromotionStageV1::Expired {
+            publication,
+            activation,
+        } => {
+            final_record.revision.get() == 4
+                && publication == legacy_publication
+                && activation.request_id == legacy_activation.request_id
+                && activation.target == legacy_activation.target
+                && activation.requester == legacy_activation.requester
+                && activation.required_approvals == legacy_activation.required_approvals
+                && activation.observed_active == legacy_activation.observed_active
+                && activation.created_at == legacy_activation.created_at
+                && activation.expires_at == legacy_activation.expires_at
+                && activation.disposition == PendingActivationDispositionV1::Reused
+                && activation.request_state_at_journal == ActivationRequestState::Expired
+                && activation.approval_context == legacy_activation.approval_context
+        }
+        PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => false,
+    };
+    if !exact_stage
+        || legacy.id != final_record.id
+        || legacy.request_digest != final_record.request_digest
+        || legacy.intent != final_record.intent
+        || legacy.created_at != final_record.created_at
+        || final_record.updated_at < legacy.updated_at
+        || final_record.updated_at > database_now
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(())
 }
 
 fn validate_activation_final_replay_signal_v1(
@@ -837,6 +1123,16 @@ fn require_normal_activation_result_v1(
     receipt: &ProductPromotionReceiptProjectionV1,
 ) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
     if receipt.result_code == "promotion_created" {
+        Ok(())
+    } else {
+        Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+    }
+}
+
+fn require_recovery_result_v1(
+    receipt: &ProductPromotionReceiptProjectionV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    if receipt.result_code == "promotion_recovered" {
         Ok(())
     } else {
         Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
@@ -1568,6 +1864,7 @@ fn validate_final_projection_v1(
             receipt.resulting_revision,
             receipt.completed_at,
             admitted.record.updated_at,
+            receipt.result_code.as_str(),
         )
         || !valid_result_code
         || receipt.http_disposition_class != 2
@@ -1642,16 +1939,37 @@ fn receipt_matches_journal_identity(
     receipt_revision: Option<i64>,
     receipt_completed_at: DateTime<Utc>,
     current_updated_at: DateTime<Utc>,
+    result_code: &str,
 ) -> bool {
-    match (
-        current_state,
-        current_revision,
-        receipt_state,
-        receipt_revision,
-    ) {
-        ("activation_pending", 3, "activation_pending", Some(3))
-        | ("expired", 3, "expired", Some(3)) => receipt_completed_at == current_updated_at,
-        ("expired", 4, "activation_pending", Some(3)) => receipt_completed_at <= current_updated_at,
+    match result_code {
+        "promotion_created" => match (
+            current_state,
+            current_revision,
+            receipt_state,
+            receipt_revision,
+        ) {
+            ("activation_pending", 3, "activation_pending", Some(3))
+            | ("expired", 3, "expired", Some(3)) => receipt_completed_at == current_updated_at,
+            ("expired", 4, "activation_pending", Some(3)) => {
+                receipt_completed_at <= current_updated_at
+            }
+            _ => false,
+        },
+        "promotion_recovered" => match (
+            current_state,
+            current_revision,
+            receipt_state,
+            receipt_revision,
+        ) {
+            ("activation_pending", 3, "activation_pending", Some(3)) => {
+                receipt_completed_at >= current_updated_at
+            }
+            ("expired", 4, "expired", Some(4)) => receipt_completed_at == current_updated_at,
+            ("expired", 4, "activation_pending", Some(3)) => {
+                receipt_completed_at <= current_updated_at
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1796,6 +2114,7 @@ mod tests {
     use discord_model::ChannelId;
     use serde_json::json;
 
+    use super::super::admission::prepare_legacy_product_promotion_admission_v1;
     use super::super::prepare::postgres_tests::prepared_decoder_stage;
     use super::*;
 
@@ -1855,6 +2174,335 @@ mod tests {
             receipt_projection: None,
             audit_evidence_projection: None,
             database_now: database_now(),
+        }
+    }
+
+    fn decoder_keyring() -> ProductActionDigestKeyringV1 {
+        let active = crate::product_action_digest::ProductActionDigestKeyV1::from_bytes(
+            "active-v2",
+            std::array::from_fn(|index| 7_u8.wrapping_add(index as u8)),
+        )
+        .unwrap();
+        let retired = crate::product_action_digest::ProductActionDigestKeyV1::from_bytes(
+            "retired-v1",
+            std::array::from_fn(|index| 113_u8.wrapping_add(index as u8)),
+        )
+        .unwrap();
+        ProductActionDigestKeyringV1::new(active, [retired]).unwrap()
+    }
+
+    fn decoder_access(admitted: &ProductPromotionAdmittedStageV1) -> ProductPromotionAccessArgsV1 {
+        let payload = &admitted.admission.payload;
+        ProductPromotionAccessArgsV1 {
+            expected_tenant_id: payload.tenant_id.clone(),
+            expected_installation_id: payload.installation_id.clone(),
+            expected_principal_id: payload.principal_id.clone(),
+            expected_product_session_digest: vec![17; 32],
+            expected_acting_user_id: payload.acting_user_id.clone(),
+            expected_discord_application_id: payload.discord_application_id.clone(),
+            expected_guild_id: payload.guild_id.clone(),
+            expected_capability: payload.capability.clone(),
+            observed_current_authority_revision: 1,
+            observed_current_authority_payload_digest: "5".repeat(64),
+            authority_observation_digest: "7".repeat(64),
+            authority_observed_at: admitted.database_now - Duration::milliseconds(100),
+            authority_expires_at: admitted.database_now + Duration::seconds(4),
+            effective_permission_bits: Permissions::MANAGE_GUILD.bits().to_string(),
+            guild_owner: false,
+        }
+    }
+
+    fn decoder_context(
+        admitted: &ProductPromotionAdmittedStageV1,
+    ) -> ProductPromotionAdmissionContextV1 {
+        ProductPromotionAdmissionContextV1 {
+            product_request_id: admitted.admission.payload.product_request_id.clone(),
+            authoring_session_id: admitted.record.intent.authority.session_id.clone(),
+            generation: admitted.record.intent.authority.session_generation,
+        }
+    }
+
+    fn decoder_digests(admitted: &ProductPromotionAdmittedStageV1) -> ProductPromotionDigestsV1 {
+        let payload = &admitted.admission.payload;
+        ProductPromotionDigestsV1 {
+            promotion_id: admitted.record.id.clone(),
+            active_idempotency: payload.idempotency_key_digest.clone(),
+            idempotency_candidates: vec![payload.idempotency_key_digest.clone()],
+            idempotency_candidate_key_ids: vec![payload.idempotency_digest_key_id.clone()],
+            idempotency_candidate_key_fingerprints: vec![payload
+                .idempotency_digest_key_fingerprint
+                .clone()],
+            active_key_id: payload.idempotency_digest_key_id.clone(),
+            active_key_fingerprint: payload.idempotency_digest_key_fingerprint.clone(),
+            semantic_request: payload.semantic_request_digest.clone(),
+            receipt_id: payload.receipt_id.clone(),
+            audit_event_id: payload.audit_event_id.clone(),
+            session_subject: vec![17; 32],
+        }
+    }
+
+    struct RepairDecoderCase {
+        keyring: ProductActionDigestKeyringV1,
+        access: ProductPromotionAccessArgsV1,
+        context: ProductPromotionAdmissionContextV1,
+        digests: ProductPromotionDigestsV1,
+        legacy: ProductPromotionLegacyRepairV1,
+        prepared: PreparedProductPromotionAdmissionV1,
+        promotion_record: Value,
+        admission_evidence: Value,
+        activation_projection: Value,
+        receipt_projection: Value,
+        audit_evidence_projection: Value,
+        database_now: DateTime<Utc>,
+    }
+
+    impl RepairDecoderCase {
+        fn row(&self, outcome_code: &str) -> ProductPromotionActivationLinkRowV1 {
+            ProductPromotionActivationLinkRowV1 {
+                outcome_code: outcome_code.to_string(),
+                promotion_record: Some(Json(self.promotion_record.clone())),
+                admission_evidence: Some(Json(self.admission_evidence.clone())),
+                admission_digest: Some(self.prepared.digest.clone()),
+                activation_projection: Some(Json(self.activation_projection.clone())),
+                receipt_projection: Some(Json(self.receipt_projection.clone())),
+                audit_evidence_projection: Some(Json(self.audit_evidence_projection.clone())),
+                database_now: self.database_now,
+            }
+        }
+
+        fn final_replay_row(&self) -> ProductPromotionActivationLinkRowV1 {
+            let mut row = self.row("final_replay_required");
+            row.activation_projection = None;
+            row.receipt_projection = None;
+            row.audit_evidence_projection = None;
+            row
+        }
+
+        fn decode(
+            &self,
+            row: ProductPromotionActivationLinkRowV1,
+        ) -> Result<ProductPromotionLegacyRepairStageV1, AuthorizedPromotionSubmissionErrorV1>
+        {
+            decode_product_promotion_repair_link_v1(
+                row,
+                &self.keyring,
+                &self.context,
+                &self.access,
+                &self.digests,
+                &self.legacy,
+                &self.prepared,
+            )
+        }
+    }
+
+    async fn repair_decoder_case(expire_directly: bool) -> RepairDecoderCase {
+        let prepared_at = database_now();
+        let admitted = prepared_decoder_stage(prepared_at).await;
+        let publication_plan = plan_ruleset_publication_v1(&admitted.record).unwrap();
+        let publication_request = publication_plan.request();
+        let artifact = PublishedAuthoringRuleSetV1 {
+            guild_id: publication_request.guild_id,
+            ruleset_key: publication_request.ruleset_key,
+            version: RuleSetVersionId::FIRST,
+            schema_version: admitted.record.intent.registry_schema_version,
+            definition: publication_request.definition,
+            content_hash: admitted.record.intent.expected_registry_content_hash,
+            created_by: publication_request.created_by,
+        };
+        let published_at = prepared_at + Duration::seconds(1);
+        let published = publication_plan
+            .complete(
+                &admitted.record,
+                PublicationPortOutcomeV1::Created(artifact),
+                published_at,
+            )
+            .unwrap()
+            .expected_record;
+        let environment_request = plan_approval_environment_v1(&published).unwrap().request();
+        let binding_revision =
+            std::num::NonZeroU64::new(environment_request.binding_revision.get()).unwrap();
+        let required_bindings = environment_request
+            .required_channel_bindings
+            .iter()
+            .map(|key| ResolvedApprovalBinding::Channel {
+                key: ResourceKey(key.clone()),
+                id: ChannelId(700),
+            })
+            .collect::<Vec<_>>();
+        let binding = ApprovalBindingContextV1 {
+            revision: binding_revision,
+            fingerprint: approval_binding_fingerprint_v1(
+                environment_request.target.guild_id,
+                binding_revision,
+                &required_bindings,
+            )
+            .unwrap(),
+            required_bindings,
+        };
+        let proposal = plan_pending_activation_v1(
+            &published,
+            ResolvedProductApprovalContextV1 {
+                binding,
+                baseline: ExpectedActiveBaselineV1::Absent,
+            },
+        )
+        .unwrap();
+        let activation_created_at = prepared_at + Duration::seconds(2);
+        let mut request =
+            ActivationRequest::create_product(proposal.request().create, activation_created_at)
+                .unwrap();
+        let pending = match proposal
+            .complete(
+                &published,
+                &PendingActivationReceiptV1 {
+                    request: request.clone(),
+                    disposition: PendingActivationDispositionV1::Created,
+                },
+                activation_created_at,
+            )
+            .unwrap()
+        {
+            PendingActivationTransitionV1::ActivationPending {
+                expected_record, ..
+            } => expected_record,
+            PendingActivationTransitionV1::Expired { .. }
+            | PendingActivationTransitionV1::RefreshJournal => {
+                panic!("expected activation-pending transition")
+            }
+        };
+        let legacy = ProductPromotionLegacyRepairV1 {
+            record: pending.clone(),
+            database_now: activation_created_at,
+        };
+        let recovery_at = if expire_directly {
+            request.expires_at + Duration::seconds(1)
+        } else {
+            activation_created_at + Duration::seconds(1)
+        };
+        let link_plan = plan_activation_link_v1(&pending).unwrap();
+        if expire_directly {
+            assert!(request.expire_if_due(recovery_at));
+        } else {
+            let link = link_plan.request();
+            request
+                .link_product_at(
+                    &link.link.promotion_id,
+                    &link.link.promotion_request_digest,
+                    &link.link.approval_context_digest,
+                    recovery_at,
+                )
+                .unwrap();
+        }
+        let final_record = match link_plan.complete(&pending, &request, recovery_at).unwrap() {
+            LinkedActivationTransitionV1::Linked { expected_record }
+            | LinkedActivationTransitionV1::Expired {
+                expected_record, ..
+            } => *expected_record,
+        };
+        let final_disposition = match &final_record.stage {
+            PromotionStageV1::ActivationPending { activation, .. }
+            | PromotionStageV1::Expired { activation, .. } => activation.disposition,
+            PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => {
+                panic!("expected final promotion")
+            }
+        };
+        let keyring = decoder_keyring();
+        let mut access = decoder_access(&admitted);
+        access.authority_observed_at = recovery_at - Duration::milliseconds(100);
+        access.authority_expires_at = recovery_at + Duration::seconds(4);
+        let mut context = decoder_context(&admitted);
+        context.product_request_id = "repair-request".to_string();
+        let digests = decoder_digests(&admitted);
+        let prepared = prepare_legacy_product_promotion_admission_v1(
+            &keyring,
+            &context,
+            &access,
+            &legacy.record,
+            &digests,
+        )
+        .unwrap();
+        let evidence = ProductPromotionAdmissionEvidenceV1 {
+            format_version: 1,
+            payload: prepared.payload.clone(),
+            admitted_at: recovery_at,
+        };
+        let state = stage_name(&final_record.stage);
+        let revision = i64::try_from(final_record.revision.get()).unwrap();
+        let payload = &prepared.payload;
+        let receipt_projection = json!({
+            "format_version": 1,
+            "receipt_id": payload.receipt_id,
+            "tenant_id": payload.tenant_id,
+            "installation_id": payload.installation_id,
+            "principal_id": payload.principal_id,
+            "endpoint_domain": PROMOTION_ENDPOINT,
+            "idempotency_key_digest": payload.idempotency_key_digest,
+            "idempotency_digest_key_id": payload.idempotency_digest_key_id,
+            "idempotency_digest_key_fingerprint": payload.idempotency_digest_key_fingerprint,
+            "request_digest": payload.semantic_request_digest,
+            "target_resource_type": PROMOTION_TARGET,
+            "target_resource_id": payload.promotion_id,
+            "resulting_revision": revision,
+            "resulting_state": state,
+            "result_code": "promotion_recovered",
+            "http_disposition_class": 2,
+            "completed_at": recovery_at,
+        });
+        let (active_baseline_version, active_baseline_hash) =
+            active_baseline(&final_record).unwrap();
+        let audit_evidence_projection = json!({
+            "format_version": 1,
+            "event_id": payload.audit_event_id,
+            "receipt_id": payload.receipt_id,
+            "tenant_id": payload.tenant_id,
+            "installation_id": payload.installation_id,
+            "principal_id": payload.principal_id,
+            "session_subject_digest": payload.session_subject_digest,
+            "action": PROMOTION_ACTION,
+            "target_resource_type": PROMOTION_TARGET,
+            "target_resource_id": payload.promotion_id,
+            "request_id": payload.product_request_id,
+            "authority_observation_digest": payload.authority_observation_digest,
+            "effective_permission_bits": payload.effective_permission_bits,
+            "authority_observed_at": payload.authority_observed_at,
+            "installation_authority_revision": payload.authority_revision.parse::<i64>().unwrap(),
+            "expected_generation": payload.generation.parse::<i64>().unwrap(),
+            "actual_generation": payload.generation.parse::<i64>().unwrap(),
+            "payload_digest": payload.promotion_request_digest,
+            "binding_fingerprint": payload.binding_fingerprint,
+            "policy_revision": payload.policy_revision.parse::<i64>().unwrap(),
+            "active_baseline_version": active_baseline_version,
+            "active_baseline_hash": active_baseline_hash,
+            "resulting_state": state,
+            "result_code": "promotion_recovered",
+            "dependency_latency_classes": {},
+            "occurred_at": recovery_at,
+            "endpoint_domain": PROMOTION_ENDPOINT,
+            "request_digest": payload.semantic_request_digest,
+            "resulting_revision": revision,
+            "http_disposition_class": 2,
+            "completed_at": recovery_at,
+            "evidence_version": 1,
+            "replay_policy_version": 1,
+            "replay_guaranteed_until": recovery_at + REPLAY_RETENTION,
+        });
+        RepairDecoderCase {
+            keyring,
+            access,
+            context,
+            digests,
+            legacy,
+            prepared,
+            promotion_record: serde_json::to_value(final_record).unwrap(),
+            admission_evidence: serde_json::to_value(evidence).unwrap(),
+            activation_projection: json!({
+                "format_version": 1,
+                "disposition": final_disposition,
+                "request": request,
+            }),
+            receipt_projection,
+            audit_evidence_projection,
+            database_now: recovery_at,
         }
     }
 
@@ -2227,6 +2875,221 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repair_decoder_maps_only_known_null_error_shapes() {
+        let admitted = prepared_decoder_stage(database_now()).await;
+        let keyring = decoder_keyring();
+        let access = decoder_access(&admitted);
+        let context = decoder_context(&admitted);
+        let digests = decoder_digests(&admitted);
+        let legacy = ProductPromotionLegacyRepairV1 {
+            record: admitted.record.clone(),
+            database_now: admitted.database_now,
+        };
+        let prepared = PreparedProductPromotionAdmissionV1 {
+            payload: admitted.admission.payload.clone(),
+            digest: admitted.admission_digest.clone(),
+        };
+        for (outcome, expected) in [
+            ("not_found", AuthorizedPromotionSubmissionErrorV1::NotFound),
+            (
+                "idempotency_conflict",
+                AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict,
+            ),
+            (
+                "access_denied",
+                AuthorizedPromotionSubmissionErrorV1::Forbidden,
+            ),
+            (
+                "scope_mismatch",
+                AuthorizedPromotionSubmissionErrorV1::ScopeMismatch,
+            ),
+            (
+                "persistence_corrupt",
+                AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt,
+            ),
+        ] {
+            assert_eq!(
+                decode_product_promotion_repair_link_v1(
+                    activation_link_row(outcome),
+                    &keyring,
+                    &context,
+                    &access,
+                    &digests,
+                    &legacy,
+                    &prepared,
+                )
+                .unwrap_err(),
+                expected
+            );
+        }
+        let mut non_null = activation_link_row("access_denied");
+        non_null.admission_digest = Some("ab".repeat(32));
+        assert_eq!(
+            decode_product_promotion_repair_link_v1(
+                non_null, &keyring, &context, &access, &digests, &legacy, &prepared,
+            )
+            .unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+        assert_eq!(
+            decode_product_promotion_repair_link_v1(
+                activation_link_row("unexpected"),
+                &keyring,
+                &context,
+                &access,
+                &digests,
+                &legacy,
+                &prepared,
+            )
+            .unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_decoder_accepts_only_exact_pending_and_direct_expired_results() {
+        let pending = repair_decoder_case(false).await;
+        let pending_result = pending.decode(pending.row("recovered")).unwrap();
+        let ProductPromotionLegacyRepairStageV1::Finalized(pending_final) = pending_result else {
+            panic!("expected finalized recovery")
+        };
+        assert_eq!(pending_final.receipt.result_code, "promotion_recovered");
+        assert_eq!(pending_final.receipt.resulting_state, "activation_pending");
+        assert_eq!(pending_final.receipt.resulting_revision, Some(3));
+        assert_eq!(pending_final.receipt.completed_at, pending.database_now);
+        assert!(matches!(
+            pending_final.admitted.record.stage,
+            PromotionStageV1::ActivationPending { .. }
+        ));
+
+        let expired = repair_decoder_case(true).await;
+        let expired_result = expired.decode(expired.row("recovered")).unwrap();
+        let ProductPromotionLegacyRepairStageV1::Finalized(expired_final) = expired_result else {
+            panic!("expected finalized recovery")
+        };
+        assert_eq!(expired_final.receipt.result_code, "promotion_recovered");
+        assert_eq!(expired_final.receipt.resulting_state, "expired");
+        assert_eq!(expired_final.receipt.resulting_revision, Some(4));
+        assert_eq!(expired_final.receipt.completed_at, expired.database_now);
+        assert_eq!(expired_final.admitted.record.revision.get(), 4);
+        assert!(matches!(
+            expired_final.admitted.record.stage,
+            PromotionStageV1::Expired { .. }
+        ));
+
+        let mut historical_pending = expired.row("recovered");
+        historical_pending.receipt_projection.as_mut().unwrap().0["resulting_state"] =
+            json!("activation_pending");
+        historical_pending.receipt_projection.as_mut().unwrap().0["resulting_revision"] = json!(3);
+        historical_pending
+            .audit_evidence_projection
+            .as_mut()
+            .unwrap()
+            .0["resulting_state"] = json!("activation_pending");
+        historical_pending
+            .audit_evidence_projection
+            .as_mut()
+            .unwrap()
+            .0["resulting_revision"] = json!(3);
+        assert_eq!(
+            expired.decode(historical_pending).unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_decoder_rejects_admission_activation_receipt_and_audit_tampering() {
+        let case = repair_decoder_case(false).await;
+        let assert_corrupt = |row| {
+            assert_eq!(
+                case.decode(row).unwrap_err(),
+                AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+            );
+        };
+
+        let mut digest = case.row("recovered");
+        digest.admission_digest = Some("ab".repeat(32));
+        assert_corrupt(digest);
+
+        let mut admission = case.row("recovered");
+        admission.admission_evidence.as_mut().unwrap().0["payload"]["guild_owner"] = json!(true);
+        assert_corrupt(admission);
+
+        let mut disposition = case.row("recovered");
+        disposition.activation_projection.as_mut().unwrap().0["disposition"] = json!("reused");
+        assert_corrupt(disposition);
+
+        let mut request = case.row("recovered");
+        request.activation_projection.as_mut().unwrap().0["request"]["requester"] = json!(9999);
+        assert_corrupt(request);
+
+        for (field, value) in [
+            ("resulting_state", json!("expired")),
+            ("resulting_revision", json!(4)),
+            ("result_code", json!("promotion_created")),
+        ] {
+            let mut receipt = case.row("recovered");
+            receipt.receipt_projection.as_mut().unwrap().0[field] = value;
+            assert_corrupt(receipt);
+        }
+
+        for (field, value) in [
+            ("resulting_state", json!("expired")),
+            ("resulting_revision", json!(4)),
+            ("result_code", json!("promotion_created")),
+        ] {
+            let mut audit = case.row("recovered");
+            audit.audit_evidence_projection.as_mut().unwrap().0[field] = value;
+            assert_corrupt(audit);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_final_replay_signal_is_exact_and_defers_final_truth() {
+        let case = repair_decoder_case(false).await;
+        let result = case.decode(case.final_replay_row()).unwrap();
+        let ProductPromotionLegacyRepairStageV1::FinalReplayRequired(admitted) = result else {
+            panic!("expected final replay signal")
+        };
+        assert_eq!(admitted.record, case.legacy.record);
+
+        let expired = repair_decoder_case(true).await;
+        let expired_result = expired.decode(expired.final_replay_row()).unwrap();
+        let ProductPromotionLegacyRepairStageV1::FinalReplayRequired(expired_admitted) =
+            expired_result
+        else {
+            panic!("expected expired final replay signal")
+        };
+        assert_eq!(expired_admitted.record.revision.get(), 4);
+        assert!(matches!(
+            expired_admitted.record.stage,
+            PromotionStageV1::Expired { .. }
+        ));
+
+        let mut record_tamper = case.final_replay_row();
+        record_tamper.promotion_record.as_mut().unwrap().0["revision"] = json!(4);
+        assert_eq!(
+            case.decode(record_tamper).unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+
+        let mut admission_tamper = case.final_replay_row();
+        admission_tamper.admission_evidence.as_mut().unwrap().0["payload"]["guild_owner"] =
+            json!(true);
+        assert_eq!(
+            case.decode(admission_tamper).unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+
+        let mut leaked_projection = case.final_replay_row();
+        leaked_projection.activation_projection = Some(Json(case.activation_projection.clone()));
+        assert_eq!(
+            case.decode(leaked_projection).unwrap_err(),
+            AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+        );
+    }
+
     #[test]
     fn bounded_decoder_rejects_unknown_fields_and_oversized_values() {
         let unknown = Json(json!({
@@ -2351,12 +3214,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(require_normal_activation_result_v1(&receipt), Ok(()));
+        assert_eq!(
+            require_recovery_result_v1(&receipt),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        );
         let mut recovery_receipt = receipt.clone();
         recovery_receipt.result_code = "promotion_recovered".to_string();
         assert_eq!(
             require_normal_activation_result_v1(&recovery_receipt),
             Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
         );
+        assert_eq!(require_recovery_result_v1(&recovery_receipt), Ok(()));
         let audit = json!({
             "format_version": 1,
             "event_id": "fa".repeat(32),
@@ -2440,6 +3308,7 @@ mod tests {
             Some(3),
             activation_time,
             activation_time,
+            "promotion_created",
         ));
         assert!(receipt_matches_journal_identity(
             "expired",
@@ -2448,6 +3317,7 @@ mod tests {
             Some(3),
             expired_time,
             expired_time,
+            "promotion_created",
         ));
         assert!(receipt_matches_journal_identity(
             "expired",
@@ -2456,6 +3326,7 @@ mod tests {
             Some(3),
             activation_time,
             expired_time,
+            "promotion_created",
         ));
         assert!(!receipt_matches_journal_identity(
             "expired",
@@ -2464,6 +3335,7 @@ mod tests {
             Some(4),
             expired_time,
             expired_time,
+            "promotion_created",
         ));
         assert!(!receipt_matches_journal_identity(
             "expired",
@@ -2472,6 +3344,25 @@ mod tests {
             Some(3),
             expired_time,
             activation_time,
+            "promotion_created",
+        ));
+        assert!(receipt_matches_journal_identity(
+            "activation_pending",
+            3,
+            "activation_pending",
+            Some(3),
+            expired_time,
+            activation_time,
+            "promotion_recovered",
+        ));
+        assert!(receipt_matches_journal_identity(
+            "expired",
+            4,
+            "expired",
+            Some(4),
+            expired_time,
+            expired_time,
+            "promotion_recovered",
         ));
     }
 
