@@ -417,3 +417,36 @@ impl RuntimeDeploymentStatusV1 {
         self.desired_target_digest.as_str()
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeServingFreshnessV2 {
+    NotExpected,
+    AttestationMissing,
+    LeaseMissing,
+    IdentityMismatch,
+    Disconnected,
+    Expired,
+    Fresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeServingObservationV2 {
+    pub freshness: RuntimeServingFreshnessV2,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeAttestationObservationV2 {
+    pub deployment_revision: DeploymentRevision,
+    pub convergence_attempt: NonZeroU32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDeploymentStatusV2 {
+    pub status: RuntimeDeploymentStatusV1,
+    pub convergence_attempt: RuntimeConvergenceAttemptV1,
+    pub last_failure_attempt: Option<NonZeroU32>,
+    pub attestation: Option<RuntimeAttestationObservationV2>,
+    pub serving: RuntimeServingObservationV2,
+}
