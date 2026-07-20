@@ -27,10 +27,14 @@ pub use identity::{
     AuthenticationClaimsV1, AuthenticationError, AuthenticationPort, MutationAuthenticationPort,
 };
 pub use promotion::{
-    AuthoringApplicationError, AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
-    AuthorizedPromotionSnapshotV1, OwnedPreviewReadyArtifactV1, OwnedSessionLoadError,
-    PromoteOwnedSessionV1, PromotionAuthorityError, PromotionSubmissionDispositionV1,
-    PromotionSubmissionPort, PromotionSubmissionV1, ResolvedPromotionAuthorityV1,
+    AuthoringApplicationError, AuthorizedPromotionAccessV1, AuthorizedPromotionBackendFailureV1,
+    AuthorizedPromotionSnapshotError, AuthorizedPromotionSnapshotPort,
+    AuthorizedPromotionSnapshotV1, AuthorizedPromotionSubmissionErrorV1,
+    AuthorizedPromotionSubmissionPort, AuthorizedPromotionSubmissionV1,
+    OwnedPreviewReadyArtifactV1, OwnedSessionLoadError, ProductPromotionIdempotencyKeyError,
+    ProductPromotionIdempotencyKeyV1, PromoteOwnedSessionV1, PromotionAuthorityError,
+    PromotionSubmissionDispositionV1, PromotionSubmissionPort, PromotionSubmissionV1,
+    ResolvedPromotionAuthorityV1,
 };
 pub use status::{
     AuthorizedDeploymentStatusV1, DeploymentStatusPort, DeploymentStatusPortError,

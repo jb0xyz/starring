@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 use automation_ruleset::{RuleSetContentHash, RuleSetSchemaVersion, RuleSetVersionId};
 use automation_ruleset_activation::ActivationDigest;
 
-use crate::id::{AuthoringHash, IdempotencyScopeDigest, PromotionRequestDigest};
-use crate::model::{
-    AuthenticatedPromotionContext, ProductApprovalPayloadV1, PromotionIntentV1, PublicationRecordV1,
+use crate::id::{
+    AuthoringHash, IdempotencyScopeDigest, PrincipalId, PromotionRequestDigest, TenantId,
 };
+use crate::model::{ProductApprovalPayloadV1, PromotionIntentV1, PublicationRecordV1};
 use crate::{IdempotencyKey, PromotionId};
 
 const IDEMPOTENCY_SCOPE_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.scope.v1\0";
@@ -16,25 +16,46 @@ const PROMOTION_REQUEST_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.reques
 const ACTIVATION_REQUEST_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.activation_request.v1\0";
 const APPROVAL_PAYLOAD_DOMAIN_V1: &[u8] = b"starring.authoring_promotion.approval_payload.v1\0";
 
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct IdempotencyScopeProjectionV1<'a> {
-    tenant_id: &'a str,
-    principal_id: &'a str,
-    idempotency_key: &'a str,
-}
-
 pub(crate) fn idempotency_scope_digest_v1(
-    context: &AuthenticatedPromotionContext,
+    tenant_id: &TenantId,
+    principal_id: &PrincipalId,
     key: &IdempotencyKey,
 ) -> Result<IdempotencyScopeDigest, DigestError> {
-    let projection = IdempotencyScopeProjectionV1 {
-        tenant_id: context.tenant_id.as_str(),
-        principal_id: context.principal_id.as_str(),
-        idempotency_key: key.as_str(),
-    };
-    canonical_digest(IDEMPOTENCY_SCOPE_DOMAIN_V1, &projection)
-        .and_then(|value| IdempotencyScopeDigest::parse(&value).map_err(DigestError::Identity))
+    idempotency_scope_digest_from_secret_v1(tenant_id, principal_id, key.as_str())
+}
+
+pub(crate) fn idempotency_scope_digest_from_secret_v1(
+    tenant_id: &TenantId,
+    principal_id: &PrincipalId,
+    secret: &str,
+) -> Result<IdempotencyScopeDigest, DigestError> {
+    IdempotencyKey::validate_secret(secret).map_err(DigestError::IdempotencyIdentity)?;
+    let fields = [
+        b"{\"idempotency_key\":\"".as_slice(),
+        secret.as_bytes(),
+        b"\",\"principal_id\":\"".as_slice(),
+        principal_id.as_str().as_bytes(),
+        b"\",\"tenant_id\":\"".as_slice(),
+        tenant_id.as_str().as_bytes(),
+        b"\"}".as_slice(),
+    ];
+    let encoded_length = fields
+        .iter()
+        .try_fold(0_usize, |total, field| total.checked_add(field.len()));
+    let encoded_length = encoded_length.ok_or_else(|| {
+        DigestError::Serialize("promotion digest input length overflow".to_string())
+    })?;
+    let mut hasher = Sha256::new();
+    update_length_framed(&mut hasher, IDEMPOTENCY_SCOPE_DOMAIN_V1);
+    hasher.update(
+        u64::try_from(encoded_length)
+            .map_err(|_| DigestError::Serialize("promotion digest input is too long".to_string()))?
+            .to_be_bytes(),
+    );
+    for field in fields {
+        hasher.update(field);
+    }
+    IdempotencyScopeDigest::parse(&to_lower_hex(&hasher.finalize())).map_err(DigestError::Identity)
 }
 
 pub(crate) fn promotion_request_digest_v1(
@@ -127,6 +148,8 @@ pub enum DigestError {
     Serialize(String),
     #[error("promotion digest identity is invalid: {0}")]
     Identity(crate::PromotionIdError),
+    #[error("promotion idempotency identity is invalid: {0}")]
+    IdempotencyIdentity(crate::OpaqueIdError),
     #[error("activation digest identity is invalid: {0}")]
     ActivationIdentity(String),
 }

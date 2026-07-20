@@ -471,6 +471,16 @@ Stated as capabilities (durable across the phase numbering):
   positive preview/status path, every caller input, malformed identities,
   bounded lock waits, denied DML/DDL and unrelated execution, metadata and ACL
   drift, hostile inherited grants, and atomic migration failure.
+- Authenticated PostgreSQL promotion execution through eight versioned,
+  fixed-search-path functions and one dedicated non-owner credential. Prepare,
+  inactive publication, approval-environment resolution, activation linking,
+  final receipt/audit evidence, replay, and exact legacy repair are bound to the
+  current product session and fresh guild authority. The adapter readiness
+  contract covers 18 permanent relations, 20 required triggers, 18 trigger
+  helpers, the exact constraint and concurrency-arbiter index set, a full
+  retained-key scan, and rollback-only denial probes. Restricted-role tests run
+  a normal high-level promotion and exact replay plus a progressed legacy repair
+  while direct relation and internal-helper access remain denied.
 - Payload-bound product approval and serializable atomic Apply with one
   pointer/decision/deployment/receipt/audit commit, exact idempotent replay,
   durable drift supersession, and redacted indeterminate-commit handling. The
@@ -540,17 +550,18 @@ Stated as capabilities (durable across the phase numbering):
 - A production implementation of the HTTP `ProductControlFacade` and a runnable
   `tools/starring-api` composition root. The hardened router is not yet bound to
   the application and adapters.
-- Three remaining production adapters: an approval-environment provider,
-  authenticated snapshot envelope cipher, and atomic product-rejection adapter.
+- Two remaining production adapters: an authenticated snapshot envelope cipher
+  and atomic product-rejection adapter. Approval-environment resolution now runs
+  inside the authenticated promotion executor.
   `GET /v1/me` now has an independent session-only projection without relaxing
   mutation CSRF checks. Installation authority, authentication read/touch,
   authorized snapshots, request-serving OAuth and session lifecycle, product
   decision reads, and approval execution are independently least-privilege
   composable, but no production composition root invokes their aggregate
-  readiness contracts. Promotion persistence and its publication/link ports,
-  deployment-status reads, and runtime convergence still retain direct SQL.
-  The complete API and runtime processes therefore cannot yet use final
-  execute-only roles. Product rejection has no production persistence adapter.
+  readiness contracts. OAuth issuance and revocation plus runtime convergence
+  writes still retain direct SQL. The complete API and runtime processes
+  therefore cannot yet use final execute-only roles. Product rejection has no
+  production persistence adapter.
 - Least-privilege PostgreSQL deployment roles, restrictive default privileges,
   row policies, and whole-process capability probes. Installation-authority and
   authentication read/touch slices and all three product-decision slices now
@@ -666,12 +677,11 @@ the authoring and execution boundary is reliable.
 
 The immediate sequence is:
 
-1. Scope the remaining API-side direct SQL for promotion and publication/link
-   persistence and deployment status. Then add declarative owner/API bootstrap,
-   restrictive defaults, and one complete non-owner process probe while keeping
-   the runtime role separate.
-2. Implement the approval-environment, rejection, and snapshot-crypto adapters
-   with cross-scope, replay, contention, corruption, and secret-redaction tests.
+1. Implement the rejection and snapshot-crypto adapters with cross-scope,
+   replay, contention, corruption, key-rotation, and secret-redaction tests.
+2. Add declarative owner/API bootstrap, restrictive defaults, aggregate
+   same-database and distinct-role readiness, and one complete non-owner process
+   probe while keeping the runtime role separate.
 3. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry

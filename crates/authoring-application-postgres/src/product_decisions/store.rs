@@ -1,8 +1,8 @@
 use sqlx::postgres::PgPool;
 
-use super::config::{
-    PostgresProductDecisionsConfig, ProductDecisionConfigError, ProductDecisionDigestKeyringV1,
-};
+use crate::product_action_digest::ProductActionDigestKeyringV1;
+
+use super::config::{PostgresProductDecisionsConfig, ProductDecisionConfigError};
 
 #[derive(Clone)]
 pub struct ProductDecisionDatabasePoolsV1 {
@@ -30,7 +30,7 @@ pub struct PostgresProductDecisions {
 impl PostgresProductDecisions {
     pub fn new(
         pools: ProductDecisionDatabasePoolsV1,
-        keyring: ProductDecisionDigestKeyringV1,
+        keyring: ProductActionDigestKeyringV1,
     ) -> Result<Self, ProductDecisionConfigError> {
         Ok(Self {
             pools,

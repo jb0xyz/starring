@@ -259,6 +259,61 @@ fn bytes(value: impl AsRef<[u8]>) -> Vec<u8> {
     value.as_ref().to_vec()
 }
 
+async fn insert_activation_pending_promotion(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    request_digest: &str,
+    tenant_id: &str,
+    installation_id: &str,
+    principal_id: &str,
+    record: &Value,
+) {
+    let mut prepared = record.clone();
+    prepared["revision"] = json!(1);
+    prepared["stage"] = json!({"state": "prepared"});
+    prepared["updated_at"] = prepared["created_at"].clone();
+    let mut published = record.clone();
+    published["revision"] = json!(2);
+    published["stage"] = json!({
+        "state": "published",
+        "publication": record["stage"]["publication"].clone()
+    });
+    published["updated_at"] = published["created_at"].clone();
+    sqlx::query(
+        "INSERT INTO public.authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, \
+          installation_id, principal_id, record) \
+         VALUES ($1, 1, 1, 'prepared', $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(request_digest)
+    .bind(tenant_id)
+    .bind(installation_id)
+    .bind(principal_id)
+    .bind(Json(&prepared))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 2, stage = 'published', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(&published))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(record))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+}
+
 #[derive(Clone)]
 struct Fixture {
     tenant_id: TenantId,
@@ -714,21 +769,17 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .execute(&mut *transaction)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO public.authoring_promotions \
-         (id, record_format_version, revision, stage, request_digest, tenant_id, \
-          installation_id, principal_id, record) \
-         VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5, $6)",
+    let persisted_record = serde_json::to_value(&record).unwrap();
+    insert_activation_pending_promotion(
+        &mut transaction,
+        promotion_id.as_str(),
+        promotion_request_digest.as_str(),
+        tenant_id.as_str(),
+        installation_id.as_str(),
+        requester_principal.as_str(),
+        &persisted_record,
     )
-    .bind(promotion_id.as_str())
-    .bind(promotion_request_digest.as_str())
-    .bind(tenant_id.as_str())
-    .bind(installation_id.as_str())
-    .bind(requester_principal.as_str())
-    .bind(Json(&record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO public.activation_requests \
          (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \

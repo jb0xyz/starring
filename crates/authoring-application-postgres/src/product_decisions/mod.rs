@@ -14,9 +14,11 @@ mod readiness;
 mod row;
 mod store;
 
-pub use config::{
-    PostgresProductDecisionsConfig, ProductDecisionConfigError, ProductDecisionDigestKeyError,
-    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+pub use crate::product_action_digest::{
+    ProductActionDigestKeyError as ProductDecisionDigestKeyError,
+    ProductActionDigestKeyV1 as ProductDecisionDigestKeyV1,
+    ProductActionDigestKeyringV1 as ProductDecisionDigestKeyringV1,
 };
+pub use config::{PostgresProductDecisionsConfig, ProductDecisionConfigError};
 pub use readiness::ProductDecisionReadinessErrorV1;
 pub use store::{PostgresProductDecisions, ProductDecisionDatabasePoolsV1};

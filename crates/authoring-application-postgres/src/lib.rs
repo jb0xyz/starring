@@ -6,8 +6,10 @@ mod deployment_status;
 mod digest;
 mod envelope;
 mod installation_authority;
+mod product_action_digest;
 mod product_decisions;
 mod product_identity;
+mod product_promotions;
 mod product_retention;
 mod secret;
 mod snapshot;
@@ -33,6 +35,10 @@ pub use installation_authority::{
     InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,
     PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
 };
+pub use product_action_digest::{
+    ProductActionDigestKeyError, ProductActionDigestKeyV1, ProductActionDigestKeyringError,
+    ProductActionDigestKeyringV1,
+};
 pub use product_decisions::{
     PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
     ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1,
@@ -44,6 +50,10 @@ pub use product_identity::{
     ProductIdentityConfigError, ProductIdentityDatabasePoolsV1, ProductIdentityError,
     ProductIdentityLifetimesV1, ProductIdentityReadinessErrorV1, ProductLogoutDispositionV1,
     ProductSessionRevocationReasonV1,
+};
+pub use product_promotions::{
+    PostgresProductPromotions, PostgresProductPromotionsConfig, ProductPromotionConfigError,
+    ProductPromotionReadinessErrorV1,
 };
 pub use product_retention::{
     PostgresProductActionRetention, PostgresProductActionRetentionConfig,

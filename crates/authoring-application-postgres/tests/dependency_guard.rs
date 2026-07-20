@@ -68,6 +68,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let database = include_str!("../src/product_decisions/database.rs");
     let digest = include_str!("../src/product_decisions/digest.rs");
     let config = include_str!("../src/product_decisions/config.rs");
+    let action_digest = include_str!("../src/product_action_digest.rs");
     let query = include_str!("../src/product_decisions/query.rs");
     let reader_contract = include_str!("../src/product_decisions/reader_contract.rs");
     let reader_readiness = include_str!("../src/product_decisions/reader_readiness.rs");
@@ -191,14 +192,19 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(approval.contains("FreshDiscordAuthorityEvidenceV1"));
     assert!(approval.contains("request.session_fingerprint().as_bytes()"));
     assert!(!approval.contains(".bind(request.command().idempotency_key.as_str())"));
-    assert!(digest.contains("Hmac<Sha256>"));
+    assert!(action_digest.contains("Hmac<Sha256>"));
     assert!(digest.contains("IDEMPOTENCY_DOMAIN"));
     assert!(digest.contains("SEMANTIC_REQUEST_DOMAIN"));
     assert!(digest.contains("SESSION_SUBJECT_DOMAIN"));
     assert!(digest.contains("KEY_MATERIAL_FINGERPRINT_DOMAIN"));
     assert!(!digest.contains("request_id().as_str()"));
-    assert!(config.contains("ConstantTimeEq"));
-    assert!(config.contains("obvious_repetition"));
+    assert!(action_digest.contains("ConstantTimeEq"));
+    assert!(action_digest.contains("obvious_repetition"));
+    assert!(action_digest.contains("Zeroizing<[u8; 32]>"));
+    assert!(action_digest.contains("MAX_DIGEST_KEYS: usize = 8"));
+    let production_config = config.split("#[cfg(test)]").next().unwrap_or(config);
+    assert!(production_config.contains("ProductDecisionConfigError"));
+    assert!(!production_config.contains("InvalidKeyring"));
     let scope_migration =
         include_str!("../../../migrations/202607190004_scope_product_activations.sql");
     assert!(scope_migration.contains("authoring_promotions_product_scope_unique"));
@@ -1204,6 +1210,10 @@ fn source_files_contain_no_comments() {
             include_str!("../src/installation_authority/readiness.rs"),
         ),
         ("src/lib.rs", include_str!("../src/lib.rs")),
+        (
+            "src/product_action_digest.rs",
+            include_str!("../src/product_action_digest.rs"),
+        ),
         (
             "src/product_decisions/apply.rs",
             include_str!("../src/product_decisions/apply.rs"),

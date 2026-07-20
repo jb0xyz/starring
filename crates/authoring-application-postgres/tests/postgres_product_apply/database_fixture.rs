@@ -98,6 +98,60 @@ fn digest(seed: &str) -> String {
     output
 }
 
+async fn insert_activation_pending_promotion(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: &str,
+    request_digest: &str,
+    tenant_id: &str,
+    installation_id: &str,
+    principal_id: &str,
+    record: &Value,
+) {
+    let mut prepared = record.clone();
+    prepared["revision"] = json!(1);
+    prepared["stage"] = json!({"state": "prepared"});
+    prepared["updated_at"] = prepared["created_at"].clone();
+    let mut published = record.clone();
+    published["revision"] = json!(2);
+    published["stage"] = json!({
+        "state": "published",
+        "publication": record["stage"]["publication"].clone()
+    });
+    published["updated_at"] = published["created_at"].clone();
+    sqlx::query(
+        "INSERT INTO public.authoring_promotions \
+         (id, record_format_version, revision, stage, request_digest, tenant_id, installation_id, \
+          principal_id, record) VALUES ($1, 1, 1, 'prepared', $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(request_digest)
+    .bind(tenant_id)
+    .bind(installation_id)
+    .bind(principal_id)
+    .bind(Json(&prepared))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 2, stage = 'published', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(&published))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', record = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(Json(record))
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+}
+
 const TEST_DECISION_KEY_V1_ID: &str = "product-e2e-v1";
 const TEST_DECISION_KEY_V2_ID: &str = "product-e2e-v2";
 
@@ -474,6 +528,13 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         },
         "stage": {
             "state": "activation_pending",
+            "publication": {
+                "version": 1,
+                "schema_version": 1,
+                "content_hash": target_content_hash,
+                "disposition": "created",
+                "registry_created_by": requester.user_id
+            },
             "activation": {
                 "request_id": activation_id,
                 "target": {
@@ -484,12 +545,16 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
                 },
                 "requester": requester.user_id,
                 "required_approvals": 1,
+                "observed_active": null,
                 "created_at": created_at,
                 "expires_at": expires_at,
+                "disposition": "created",
                 "request_state_at_journal": "pending",
                 "approval_context": context
             }
-        }
+        },
+        "created_at": created_at,
+        "updated_at": linked_at
     });
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -601,19 +666,16 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .execute(&mut *transaction)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO public.authoring_promotions \
-         (id, record_format_version, revision, stage, request_digest, tenant_id, principal_id, \
-          record) VALUES ($1, 1, 3, 'activation_pending', $2, $3, $4, $5)",
+    insert_activation_pending_promotion(
+        &mut transaction,
+        &promotion_id,
+        &promotion_request_digest,
+        &tenant_id,
+        &installation_id,
+        &requester.principal_id,
+        &promotion_record,
     )
-    .bind(&promotion_id)
-    .bind(&promotion_request_digest)
-    .bind(&tenant_id)
-    .bind(&requester.principal_id)
-    .bind(Json(&promotion_record))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    .await;
     sqlx::query(
         "INSERT INTO public.activation_requests \
          (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \

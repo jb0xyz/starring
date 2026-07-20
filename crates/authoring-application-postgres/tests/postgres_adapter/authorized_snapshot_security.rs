@@ -306,25 +306,38 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
             guild_id: fixture.guild_id,
             user_id: fixture.user_id,
         };
-        let promotions = PromotionCapture;
+        let promotions = PromotionCapture {
+            captured: Mutex::new(None),
+        };
         let application =
             AuthoringApplication::new(&authentication, &guild_authority, &snapshots, &promotions);
         let promoted = application
             .promote_owned_session(
                 &fixture.credential,
                 &fixture.csrf,
+                &ProductRequestIdV1::parse("snapshot-security-positive").unwrap(),
                 &InstallationSelectorV1::new(fixture.installation_id.clone()),
                 PromoteOwnedSessionV1 {
-                    idempotency_key: IdempotencyKey::parse("snapshot-security-positive").unwrap(),
+                    idempotency_key: ProductPromotionIdempotencyKeyV1::parse(
+                        "snapshot-security-positive",
+                    )
+                    .unwrap(),
                     session_id: fixture.session_id.clone(),
                     expected_generation: SessionGeneration::new(1).unwrap(),
                 },
             )
             .await
-            .unwrap();
-        assert_eq!(promoted.0, fixture.tenant_id.as_str());
-        assert_eq!(promoted.1, fixture.candidate_revision);
-        assert_eq!(promoted.2, fixture.binding_fingerprint);
+            .unwrap_err();
+        assert_eq!(
+            promoted,
+            authoring_application::AuthoringApplicationError::AuthorizedPromotion(
+                AuthorizedPromotionSubmissionErrorV1::Indeterminate
+            )
+        );
+        let captured = promotions.captured.lock().unwrap().take().unwrap();
+        assert_eq!(captured.0, fixture.tenant_id.as_str());
+        assert_eq!(captured.1, fixture.candidate_revision);
+        assert_eq!(captured.2, fixture.binding_fingerprint);
 
         for (session_id, principal_id, digest, tenant_id, installation_id) in [
             (
@@ -461,9 +474,13 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
             .promote_owned_session(
                 &fixture.credential,
                 &fixture.csrf,
+                &ProductRequestIdV1::parse("snapshot-security-revoked").unwrap(),
                 &InstallationSelectorV1::new(fixture.installation_id.clone()),
                 PromoteOwnedSessionV1 {
-                    idempotency_key: IdempotencyKey::parse("snapshot-security-revoked").unwrap(),
+                    idempotency_key: ProductPromotionIdempotencyKeyV1::parse(
+                        "snapshot-security-revoked",
+                    )
+                    .unwrap(),
                     session_id: fixture.session_id.clone(),
                     expected_generation: SessionGeneration::new(1).unwrap(),
                 },
