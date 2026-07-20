@@ -3103,6 +3103,7 @@ dependencies = [
  "chrono",
  "discord-model",
  "product-control-http",
+ "serde_json",
 ]
 
 [[package]]

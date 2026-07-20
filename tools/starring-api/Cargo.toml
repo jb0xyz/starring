@@ -14,3 +14,4 @@ product-control-http = { path = "../../crates/product-control-http" }
 
 [dev-dependencies]
 discord-model = { path = "../../crates/discord-model" }
+serde_json = { workspace = true }

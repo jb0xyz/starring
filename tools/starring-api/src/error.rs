@@ -39,9 +39,8 @@ pub fn map_product_control_error(error: ProductControlPortError) -> FacadeError 
         ProductControlPortError::NotFound | ProductControlPortError::ScopeMismatch => {
             FacadeErrorCode::NotFound
         }
-        ProductControlPortError::RevisionConflict | ProductControlPortError::PayloadMismatch => {
-            FacadeErrorCode::StalePayload
-        }
+        ProductControlPortError::RevisionConflict => FacadeErrorCode::InvalidState,
+        ProductControlPortError::PayloadMismatch => FacadeErrorCode::StalePayload,
         ProductControlPortError::InvalidState
         | ProductControlPortError::DuplicateDecision
         | ProductControlPortError::Expired => FacadeErrorCode::InvalidState,
@@ -328,15 +327,18 @@ mod tests {
                 FacadeErrorCode::NotFound
             );
         }
-        for error in [
-            ProductControlPortError::RevisionConflict,
-            ProductControlPortError::PayloadMismatch,
-        ] {
-            assert_eq!(
-                code(map_product_control_error(error)),
-                FacadeErrorCode::StalePayload
-            );
-        }
+        assert_eq!(
+            code(map_product_control_error(
+                ProductControlPortError::RevisionConflict,
+            )),
+            FacadeErrorCode::InvalidState
+        );
+        assert_eq!(
+            code(map_product_control_error(
+                ProductControlPortError::PayloadMismatch,
+            )),
+            FacadeErrorCode::StalePayload
+        );
         assert_eq!(
             code(map_product_control_error(
                 ProductControlPortError::IdempotencyConflict,
