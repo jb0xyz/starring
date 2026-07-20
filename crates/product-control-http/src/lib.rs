@@ -2,6 +2,7 @@ mod config;
 mod dto;
 mod error;
 mod facade;
+mod readiness;
 mod router;
 mod secret;
 
@@ -21,7 +22,12 @@ pub use facade::{
     ProductControlOperationalFacadeV2, ProductRequestId, ProductRequestIdParseError,
     PromoteCommand, RejectCommand,
 };
-pub use router::{product_control_router, product_control_router_with_operational_v2};
+pub use readiness::ProductApiReadinessGate;
+pub use router::{
+    product_control_router, product_control_router_with_operational_v2,
+    product_control_router_with_operational_v2_and_readiness_gate,
+    product_control_router_with_readiness_gate,
+};
 pub use secret::{
     CsrfSecret, IdempotencyKey, IdempotencyKeyParseError, OAuthCode, OAuthState, SecretParseError,
     SessionCredential,

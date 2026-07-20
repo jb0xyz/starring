@@ -8,7 +8,8 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use product_control_http::{
-    product_control_router, product_control_router_with_operational_v2, ApplyCommand, ApplyView,
+    product_control_router, product_control_router_with_operational_v2,
+    product_control_router_with_operational_v2_and_readiness_gate, ApplyCommand, ApplyView,
     ApprovalPreviewView, CsrfSecret, CurrentPrincipal, CurrentPrincipalView, DecisionCommand,
     DecisionView, DeploymentAttestationViewV2, DeploymentFailureViewV2,
     DeploymentOperationalStateV2, DeploymentOperationalViewV2, DeploymentOperatorActionV2,
@@ -16,9 +17,9 @@ use product_control_http::{
     DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2, DeploymentState,
     DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode, HttpBoundaryConfig,
     IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
-    ProductControlFacade, ProductControlOperationalFacadeV2, ProductRequestId, ProductState,
-    PromoteCommand, PromotionView, RejectCommand, RuntimeDeploymentOperationalViewV2,
-    SafeApprovalSummary, SessionCredential,
+    ProductApiReadinessGate, ProductControlFacade, ProductControlOperationalFacadeV2,
+    ProductRequestId, ProductState, PromoteCommand, PromotionView, RejectCommand,
+    RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -36,9 +37,13 @@ const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 #[derive(Default)]
 struct FakeFacade {
     verify_calls: AtomicUsize,
+    readiness_calls: AtomicUsize,
     promote_calls: AtomicUsize,
     fail_me: AtomicUsize,
     panic_ready: AtomicUsize,
+    block_readiness: AtomicUsize,
+    readiness_entered: Notify,
+    readiness_release: Notify,
     disallowed_return: AtomicUsize,
     invalid_client_id: AtomicUsize,
     invalid_callback_url: AtomicUsize,
@@ -291,7 +296,12 @@ impl ProductControlFacade for FakeFacade {
     }
 
     async fn readiness(&self) -> Result<(), FacadeError> {
+        self.readiness_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(self.panic_ready.load(Ordering::SeqCst), 0);
+        if self.block_readiness.load(Ordering::SeqCst) != 0 {
+            self.readiness_entered.notify_one();
+            self.readiness_release.notified().await;
+        }
         Ok(())
     }
 }
@@ -352,6 +362,24 @@ fn operational_app_with_timeout(
     product_control_router_with_operational_v2(
         facade,
         HttpBoundaryConfig::new(ORIGIN, 1_024, 8, request_timeout, ["/app".to_string()]).unwrap(),
+    )
+}
+
+fn operational_app_with_gate(
+    facade: Arc<FakeFacade>,
+    readiness_gate: ProductApiReadinessGate,
+) -> axum::Router {
+    product_control_router_with_operational_v2_and_readiness_gate(
+        facade,
+        HttpBoundaryConfig::new(
+            ORIGIN,
+            1_024,
+            8,
+            Duration::from_secs(2),
+            ["/app".to_string()],
+        )
+        .unwrap(),
+        readiness_gate,
     )
 }
 
@@ -906,6 +934,73 @@ async fn liveness_remains_available_when_business_capacity_is_exhausted() {
 
     facade.promote_release.notify_one();
     assert_eq!(work.await.unwrap().unwrap().status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_calls() {
+    let facade = Arc::new(FakeFacade::default());
+    let gate = ProductApiReadinessGate::initially_unready();
+    let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(response).await.contains("dependency_unavailable"));
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    gate.mark_ready();
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
+
+    gate.mark_unready();
+    let response = app
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn readiness_gate_rechecks_after_an_in_flight_dependency_probe() {
+    let facade = Arc::new(FakeFacade::default());
+    facade.block_readiness.store(1, Ordering::SeqCst);
+    let gate = ProductApiReadinessGate::initially_unready();
+    gate.mark_ready();
+    let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
+    let probe = tokio::spawn(
+        app.oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    facade.readiness_entered.notified().await;
+    gate.mark_unready();
+    facade.readiness_release.notify_one();
+    let response = probe.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

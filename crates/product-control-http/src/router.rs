@@ -33,6 +33,7 @@ struct HttpState<F> {
     config: HttpBoundaryConfig,
     in_flight: Arc<Semaphore>,
     readiness_in_flight: Arc<Semaphore>,
+    readiness_gate: crate::ProductApiReadinessGate,
 }
 
 impl<F> Clone for HttpState<F> {
@@ -42,6 +43,7 @@ impl<F> Clone for HttpState<F> {
             config: self.config.clone(),
             in_flight: Arc::clone(&self.in_flight),
             readiness_in_flight: Arc::clone(&self.readiness_in_flight),
+            readiness_gate: self.readiness_gate.clone(),
         }
     }
 }
@@ -71,7 +73,22 @@ pub fn product_control_router<F>(facade: Arc<F>, config: HttpBoundaryConfig) -> 
 where
     F: ProductControlFacade,
 {
-    let state = http_state(facade, config);
+    product_control_router_with_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlFacade,
+{
+    let state = http_state(facade, config, readiness_gate);
     finish_product_control_router(product_control_routes::<F>(), state)
 }
 
@@ -82,7 +99,22 @@ pub fn product_control_router_with_operational_v2<F>(
 where
     F: ProductControlOperationalFacadeV2,
 {
-    let state = http_state(facade, config);
+    product_control_router_with_operational_v2_and_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_operational_v2_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    let state = http_state(facade, config, readiness_gate);
     let routes = product_control_routes::<F>().route(
         "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
         get(deployment_operational_v2::<F>),
@@ -90,11 +122,16 @@ where
     finish_product_control_router(routes, state)
 }
 
-fn http_state<F>(facade: Arc<F>, config: HttpBoundaryConfig) -> HttpState<F> {
+fn http_state<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> HttpState<F> {
     HttpState {
         facade,
         in_flight: Arc::new(Semaphore::new(config.max_in_flight())),
         readiness_in_flight: Arc::new(Semaphore::new(1)),
+        readiness_gate,
         config,
     }
 }
@@ -678,8 +715,18 @@ async fn readiness<F>(
 where
     F: ProductControlFacade,
 {
+    if !state.readiness_gate.is_ready() {
+        return map_facade(
+            FacadeError::new(FacadeErrorCode::DependencyUnavailable),
+            &request_id,
+        );
+    }
     match state.facade.readiness().await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) if state.readiness_gate.is_ready() => StatusCode::OK.into_response(),
+        Ok(()) => map_facade(
+            FacadeError::new(FacadeErrorCode::DependencyUnavailable),
+            &request_id,
+        ),
         Err(error) => map_facade(error, &request_id),
     }
 }
