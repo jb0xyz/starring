@@ -1003,11 +1003,12 @@ async fn product_status_reader_denies_enumeration_and_inactive_session_state() {
         .unwrap();
     sqlx::query(
         "UPDATE public.product_auth_sessions \
-         SET authenticated_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
-             created_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
-             last_seen_at = pg_catalog.clock_timestamp() - INTERVAL '90 minutes', \
-             idle_expires_at = pg_catalog.clock_timestamp() - INTERVAL '80 minutes', \
-             absolute_expires_at = pg_catalog.clock_timestamp() - INTERVAL '60 minutes' \
+         SET authenticated_at = observation.captured_at - INTERVAL '2 hours', \
+             created_at = observation.captured_at - INTERVAL '2 hours', \
+             last_seen_at = observation.captured_at - INTERVAL '90 minutes', \
+             idle_expires_at = observation.captured_at - INTERVAL '80 minutes', \
+             absolute_expires_at = observation.captured_at - INTERVAL '60 minutes' \
+         FROM (SELECT pg_catalog.clock_timestamp() AS captured_at) AS observation \
          WHERE session_digest = $1",
     )
     .bind(request.product_session_digest.as_slice())
