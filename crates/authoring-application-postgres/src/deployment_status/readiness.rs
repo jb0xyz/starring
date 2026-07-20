@@ -3,6 +3,7 @@ use crate::database_capability::{
     verify_scoped_executable_allowlist, verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1,
     ScopedFunctionContractV1, ScopedRelationContractV1,
 };
+use crate::runtime_convergence_readiness::RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY;
 use crate::ProductDatabaseFailureV1;
 
 use super::contract::{
@@ -56,6 +57,8 @@ WITH common_owner AS (
     VALUES
         ('validate_runtime_deployment_projection',
             'public.validate_runtime_deployment_projection()'),
+        ('validate_runtime_convergence_attempt_projection',
+            'public.validate_runtime_convergence_attempt_projection()'),
         ('enforce_runtime_deployment_policy_shadow',
             'public.enforce_runtime_deployment_policy_shadow()'),
         ('guard_runtime_ruleset_artifact_transition',
@@ -64,6 +67,8 @@ WITH common_owner AS (
             'public.reject_runtime_deployment_delete()'),
         ('validate_runtime_attestation_projection',
             'public.validate_runtime_attestation_projection()'),
+        ('validate_runtime_attestation_attempt_projection',
+            'public.validate_runtime_attestation_attempt_projection()'),
         ('reject_immutable_product_row',
             'public.reject_immutable_product_row()'),
         ('validate_runtime_serving_lease_transition',
@@ -77,7 +82,7 @@ WITH common_owner AS (
         ('starring_ruleset_content_hash_v1',
             'public.starring_ruleset_content_hash_v1(bigint,jsonb)')
 ), support_function_identity_contract AS (
-    SELECT (SELECT pg_catalog.count(*) FROM expected_support_functions) = 11
+    SELECT (SELECT pg_catalog.count(*) FROM expected_support_functions) = 13
         AND NOT EXISTS (
             SELECT 1
             FROM expected_support_functions AS expected
@@ -124,9 +129,17 @@ WITH common_owner AS (
             'public.validate_runtime_deployment_projection()',
             'CREATE TRIGGER runtime_deployments_validate_projection BEFORE INSERT OR UPDATE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_deployment_projection()',
             FALSE, TRUE, TRUE, TRUE),
+        ('public.runtime_deployments',
+            'public.validate_runtime_convergence_attempt_projection()',
+            'CREATE TRIGGER runtime_deployments_validate_convergence_attempt BEFORE INSERT OR UPDATE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_convergence_attempt_projection()',
+            FALSE, TRUE, TRUE, TRUE),
         ('public.runtime_attestations',
             'public.validate_runtime_attestation_projection()',
             'CREATE TRIGGER runtime_attestations_validate_projection BEFORE INSERT ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_attestation_projection()',
+            FALSE, TRUE, TRUE, TRUE),
+        ('public.runtime_attestations',
+            'public.validate_runtime_attestation_attempt_projection()',
+            'CREATE TRIGGER runtime_attestations_validate_convergence_attempt BEFORE INSERT ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_attestation_attempt_projection()',
             FALSE, TRUE, TRUE, TRUE),
         ('public.runtime_attestations',
             'public.reject_immutable_product_row()',
@@ -185,8 +198,8 @@ WITH common_owner AS (
             pg_catalog.to_regclass('public.automation_ruleset_versions')
         )
 ), trigger_manifest AS (
-    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 10
-        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 10
+    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 12
+        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 12
         AND NOT EXISTS (
             SELECT 1
             FROM expected_triggers AS expected
@@ -201,7 +214,7 @@ WITH common_owner AS (
                 OR actual.trigger_oid IS NULL
         ) AS valid
 ), support_function_contract AS (
-    SELECT pg_catalog.count(*) = 10
+    SELECT pg_catalog.count(*) = 12
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -350,7 +363,12 @@ impl PostgresProductDeploymentStatuses {
             .fetch_one(&mut *transaction)
             .await
             .map_err(readiness_database)?;
-        if !support_valid {
+        let attempt_schema_valid =
+            sqlx::query_scalar::<_, bool>(RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(readiness_database)?;
+        if !support_valid || !attempt_schema_valid {
             transaction.rollback().await.map_err(readiness_database)?;
             return Err(ProductDeploymentStatusReadinessErrorV1::ContractMismatch);
         }
@@ -404,7 +422,7 @@ mod tests {
         assert_eq!(FUNCTIONS.len(), 2);
         assert_eq!(RELATIONS.len(), 13);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 31);
-        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 10"));
+        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 12"));
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub fn project_runtime_deployment_status_v1(
         evidence.deployment_projection,
         "deployment evidence envelope",
     )?
-    .decode()?;
+    .decode_legacy_evidence()?;
     validate_expected_deployment(expectation, &deployment)?;
     let installation = decode_optional_envelope::<InstallationEvidenceRow>(
         evidence.installation_projection,
@@ -165,7 +165,7 @@ pub fn project_runtime_deployment_status_v1(
         evidence.attestation_projection,
         "attestation evidence envelope",
     )?
-    .map(AttestationRow::decode)
+    .map(AttestationRow::decode_legacy_evidence)
     .transpose()?;
     let serving = decode_optional_envelope::<ServingLeaseRow>(
         evidence.serving_projection,

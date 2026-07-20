@@ -777,6 +777,57 @@ already present in a successful resource view never enter errors.
 - connected/serving state, heartbeat time, and lease expiry
 - revision CAS and no customer-controlled fields
 
+The durable convergence attempt is independent from controller fencing and
+serving-lease epochs. A newly enqueued Requested deployment has attempt zero.
+The first controller claim starts attempt one. An exact claim replay and a
+same-controller renewal of a still-live lease preserve the attempt. A claim
+after lease expiry or after a retryable failure starts the next attempt. A
+retryable or blocked failure records the exact current attempt and releases the
+controller lease atomically. Live recovery itself preserves the completed
+attempt; the later execution claim starts the next one.
+
+Blocked recovery is not a worker claim followed by a separate resume. The
+operator path compares the exact blocked failure ID, failure attempt, deployment
+revision, and current authority, then atomically starts the next attempt, issues
+a higher fencing token, installs a bounded controller lease, and changes the
+condition from Blocked to Ready. Generic and next-work claims continue to reject
+Blocked. An exact operator-request replay returns the installed attempt and
+fence; a stale failure observation conflicts. The external operations API must
+authenticate the operator and commit its actor, request ID, bounded reason, and
+audit event around this store capability before exposing it.
+
+`runtime_deployments.convergence_attempt_no` stores the current attempt and
+`last_failure_attempt_no` binds retained failure evidence. The latter is null
+until a failure and otherwise remains between one and the current attempt.
+`runtime_attestations.convergence_attempt_no` is immutable, unique per
+deployment attempt, and must equal the deployment attempt at insertion. Its
+existing digest still binds the exact deployment revision and fencing token;
+the attempt projection is additionally protected by the immutable row and the
+deployment-locked insertion trigger.
+
+The database row is authoritative for the version-1 attestation attempt. An
+export containing only the version-1 record and digest cannot independently
+prove that scalar. Any portable audit or cross-system attestation contract must
+use a future record-and-digest version that includes the attempt rather than
+silently changing version 1.
+
+The attempt migration accepts only pristine Requested revision-one legacy rows
+without a lease, fencing history, execution evidence, attestation, or serving
+lease. It assigns those rows attempt zero. It rejects every ambiguous legacy
+execution rather than inferring an attempt from a fencing token. Runtime writers
+must be quiesced for the bounded migration. Product apply executors and product
+status readers must also be stopped because their old readiness manifests reject
+the new triggers while the new manifests reject the old schema. The migration,
+runtime writers, apply executors, and status readers therefore use a coordinated
+pre-launch cutover rather than a rolling mixed-version deployment. All three
+roles restart with the attempt-aware binary before claims or product traffic
+resume.
+
+Apply and status readiness verify the exact attempt column types, nullability,
+default, validated checks, attestation uniqueness constraint, and backing unique
+index in addition to the trigger and routine manifests. A missing default or
+weakened attempt constraint keeps the role unready before it accepts traffic.
+
 The desired-target digest remains version 1 for this increment. It already
 binds the immutable installation-authority revision, whose referenced row binds
 policy revision, quorum, TTL, and resource bindings. `policy_revision` remains

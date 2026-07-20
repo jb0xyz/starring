@@ -27,7 +27,7 @@ const PRODUCT_DECISION_BOUNDARY_RELATIONS: [&str; 20] = [
     "runtime_serving_leases",
     "runtime_attestations",
 ];
-const PRODUCT_APPLY_SUPPORT_FUNCTIONS: [&str; 10] = [
+const PRODUCT_APPLY_SUPPORT_FUNCTIONS: [&str; 11] = [
     "public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_authority_projection_v1(text,text,text,text,bytea,text,text,text,text,bigint,text,timestamp with time zone,timestamp with time zone,text,boolean,text)",
     "public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)",
@@ -38,6 +38,7 @@ const PRODUCT_APPLY_SUPPORT_FUNCTIONS: [&str; 10] = [
     "public.guard_runtime_ruleset_artifact_transition()",
     "public.reject_runtime_deployment_delete()",
     "public.validate_runtime_deployment_projection()",
+    "public.validate_runtime_convergence_attempt_projection()",
 ];
 
 fn incomplete_apply_security_keyring() -> ProductDecisionDigestKeyringV1 {
@@ -467,6 +468,25 @@ async fn product_apply_executor_is_exactly_scoped_replay_safe_and_fail_closed() 
         sqlx::query(
             "ALTER TABLE public.runtime_deployments \
              ENABLE TRIGGER runtime_deployments_policy_shadow_guard",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "ALTER TABLE public.runtime_deployments \
+             ALTER COLUMN convergence_attempt_no DROP DEFAULT",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            decisions.verify_apply_executor_readiness().await,
+            Err(ProductDecisionReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::query(
+            "ALTER TABLE public.runtime_deployments \
+             ALTER COLUMN convergence_attempt_no SET DEFAULT 0",
         )
         .execute(&database.pool)
         .await

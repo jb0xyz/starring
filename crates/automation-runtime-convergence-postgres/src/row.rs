@@ -8,7 +8,10 @@ use serde_json::Value;
 use sqlx::types::Json;
 
 use crate::digest::{desired_target_digest, live_attestation_digest};
-use crate::model::{AttestationIdV1, AttestationRecordV1, LiveMetadataV1, RuntimeDigestV1};
+use crate::model::{
+    AttestationIdV1, AttestationRecordV1, LiveMetadataV1, RuntimeConvergenceAttemptV1,
+    RuntimeDigestV1,
+};
 use crate::RuntimeConvergenceStoreError;
 
 pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installation_id, \
@@ -17,8 +20,9 @@ pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installat
     desired_target_digest, runtime_generation, previous_runtime, requested_at, \
     snapshot_format_version, snapshot, revision, phase, controller_id, \
     controller_fencing_token, controller_acquired_at, controller_lease_expires_at, \
-    last_fencing_token, next_retry_at, last_stable_error_code, live_attestation_id, live_at, \
-    blocked_at, superseded_at, cancelled_at, created_at, updated_at";
+    last_fencing_token, convergence_attempt_no, last_failure_attempt_no, next_retry_at, \
+    last_stable_error_code, live_attestation_id, live_at, blocked_at, superseded_at, \
+    cancelled_at, created_at, updated_at";
 
 #[derive(sqlx::FromRow, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +52,10 @@ pub(crate) struct DeploymentRow {
     pub controller_acquired_at: Option<DateTime<Utc>>,
     pub controller_lease_expires_at: Option<DateTime<Utc>>,
     pub last_fencing_token: Option<i64>,
+    #[serde(default)]
+    pub convergence_attempt_no: Option<i64>,
+    #[serde(default)]
+    pub last_failure_attempt_no: Option<i64>,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub last_stable_error_code: Option<String>,
     pub live_attestation_id: Option<String>,
@@ -64,10 +72,36 @@ pub(crate) struct PersistedDeployment {
     pub installation_authority_revision: u64,
     pub desired_target_digest: RuntimeDigestV1,
     pub live_attestation_id: Option<AttestationIdV1>,
+    pub convergence_attempt: Option<RuntimeConvergenceAttemptV1>,
+    pub last_failure_attempt: Option<std::num::NonZeroU32>,
+}
+
+impl PersistedDeployment {
+    pub fn exact_convergence_attempt(
+        &self,
+    ) -> Result<RuntimeConvergenceAttemptV1, RuntimeConvergenceStoreError> {
+        self.convergence_attempt
+            .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime convergence attempt evidence",
+            ))
+    }
 }
 
 impl DeploymentRow {
     pub fn decode(self) -> Result<PersistedDeployment, RuntimeConvergenceStoreError> {
+        self.decode_inner(true)
+    }
+
+    pub fn decode_legacy_evidence(
+        self,
+    ) -> Result<PersistedDeployment, RuntimeConvergenceStoreError> {
+        self.decode_inner(false)
+    }
+
+    fn decode_inner(
+        self,
+        require_attempt_evidence: bool,
+    ) -> Result<PersistedDeployment, RuntimeConvergenceStoreError> {
         if self.snapshot_format_version != 1 {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "unsupported deployment snapshot format",
@@ -87,6 +121,31 @@ impl DeploymentRow {
             .live_attestation_id
             .map(AttestationIdV1::parse)
             .transpose()?;
+        let convergence_attempt = self
+            .convergence_attempt_no
+            .map(runtime_attempt)
+            .transpose()?;
+        let last_failure_attempt = self
+            .last_failure_attempt_no
+            .map(|value| positive_u32(value, "runtime failure attempt"))
+            .transpose()?;
+        if require_attempt_evidence && convergence_attempt.is_none() {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime convergence attempt",
+            ));
+        }
+        if let Some(attempt) = convergence_attempt {
+            validate_attempt_projection(
+                &snapshot,
+                attempt,
+                last_failure_attempt,
+                live_attestation_id.as_ref(),
+            )?;
+        } else if last_failure_attempt.is_some() {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "legacy runtime failure attempt",
+            ));
+        }
         let expected_previous = snapshot
             .previous_runtime
             .as_ref()
@@ -145,6 +204,8 @@ impl DeploymentRow {
             installation_authority_revision: authority_revision,
             desired_target_digest: persisted_desired_target_digest,
             live_attestation_id,
+            convergence_attempt,
+            last_failure_attempt,
         })
     }
 }
@@ -225,7 +286,7 @@ impl DeploymentProjection {
 }
 
 pub(crate) const ATTESTATION_COLUMNS: &str = "attestation_id, attestation_digest, deployment_id, \
-    deployment_revision, tenant_id, installation_id, promotion_id, activation_request_id, \
+    deployment_revision, convergence_attempt_no, tenant_id, installation_id, promotion_id, activation_request_id, \
     guild_id, ruleset_key, target_version, target_content_hash, binding_revision, \
     binding_fingerprint, runtime_generation, controller_fencing_token, process_instance_id, \
     runtime_build_revision, panel_certificate_id, panel_report_digest, gateway_shard_id, \
@@ -238,6 +299,8 @@ pub(crate) struct AttestationRow {
     pub attestation_digest: String,
     pub deployment_id: String,
     pub deployment_revision: i64,
+    #[serde(default)]
+    pub convergence_attempt_no: Option<i64>,
     pub tenant_id: String,
     pub installation_id: String,
     pub promotion_id: String,
@@ -271,10 +334,24 @@ pub(crate) struct PersistedAttestation {
     pub installation_id: String,
     pub promotion_id: String,
     pub activation_request_id: String,
+    pub convergence_attempt: Option<std::num::NonZeroU32>,
 }
 
 impl AttestationRow {
     pub fn decode(self) -> Result<PersistedAttestation, RuntimeConvergenceStoreError> {
+        self.decode_inner(true)
+    }
+
+    pub fn decode_legacy_evidence(
+        self,
+    ) -> Result<PersistedAttestation, RuntimeConvergenceStoreError> {
+        self.decode_inner(false)
+    }
+
+    fn decode_inner(
+        self,
+        require_attempt_evidence: bool,
+    ) -> Result<PersistedAttestation, RuntimeConvergenceStoreError> {
         if self.record_format_version != 1 || self.attestation_id != self.attestation_digest {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "attestation format or digest",
@@ -286,6 +363,15 @@ impl AttestationRow {
                 RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
             })?;
         let live = &record.live;
+        let convergence_attempt = self
+            .convergence_attempt_no
+            .map(|value| positive_u32(value, "runtime attestation attempt"))
+            .transpose()?;
+        if require_attempt_evidence && convergence_attempt.is_none() {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime attestation attempt",
+            ));
+        }
         let target = &live.target;
         let recomputed_id =
             AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
@@ -328,6 +414,7 @@ impl AttestationRow {
             installation_id: self.installation_id,
             promotion_id: self.promotion_id,
             activation_request_id: self.activation_request_id,
+            convergence_attempt,
         })
     }
 }
@@ -408,6 +495,78 @@ pub(crate) fn gateway_ready_kind_name(
         automation_runtime_convergence::GatewayReadyKindV1::DiscordReady => "discord_ready",
         automation_runtime_convergence::GatewayReadyKindV1::DiscordResumed => "discord_resumed",
     }
+}
+
+fn validate_attempt_projection(
+    snapshot: &RuntimeDeploymentSnapshotV1,
+    convergence_attempt: RuntimeConvergenceAttemptV1,
+    last_failure_attempt: Option<std::num::NonZeroU32>,
+    live_attestation_id: Option<&AttestationIdV1>,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    let snapshot_failure_attempt = match snapshot.last_runtime_failure.as_ref() {
+        Some(RuntimeFailureDispositionV1::Retryable { attempt, .. }) => Some(*attempt),
+        Some(RuntimeFailureDispositionV1::Blocked { .. }) => last_failure_attempt,
+        None => None,
+    };
+    let failure_projection_valid = match snapshot.last_runtime_failure.as_ref() {
+        Some(RuntimeFailureDispositionV1::Retryable { .. }) => {
+            snapshot_failure_attempt == last_failure_attempt
+        }
+        Some(RuntimeFailureDispositionV1::Blocked { .. }) => last_failure_attempt.is_some(),
+        None => last_failure_attempt.is_none(),
+    };
+    if !failure_projection_valid
+        || last_failure_attempt.is_some_and(|attempt| attempt.get() > convergence_attempt.get())
+    {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "runtime failure attempt projection",
+        ));
+    }
+    if convergence_attempt.get() == 0 {
+        let pristine = snapshot.revision.get() == 1
+            && matches!(snapshot.phase, RuntimeDeploymentPhaseV1::Requested)
+            && snapshot.controller_lease.is_none()
+            && snapshot.last_fencing_token.is_none()
+            && snapshot.preflight.is_none()
+            && snapshot.drain.is_none()
+            && snapshot.activation.is_none()
+            && snapshot.panel_certificate.is_none()
+            && snapshot.gateway_ready.is_none()
+            && snapshot.live.is_none()
+            && snapshot.last_live_recovery.is_none()
+            && snapshot.last_runtime_failure.is_none()
+            && live_attestation_id.is_none();
+        if !pristine {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "pending runtime convergence attempt",
+            ));
+        }
+    } else if snapshot.last_fencing_token.is_none() {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "started runtime convergence attempt",
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_attempt(
+    value: i64,
+) -> Result<RuntimeConvergenceAttemptV1, RuntimeConvergenceStoreError> {
+    u32::try_from(value)
+        .map(RuntimeConvergenceAttemptV1::new)
+        .map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidPersistedState("runtime convergence attempt")
+        })
+}
+
+fn positive_u32(
+    value: i64,
+    field: &'static str,
+) -> Result<std::num::NonZeroU32, RuntimeConvergenceStoreError> {
+    u32::try_from(value)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(field))
 }
 
 pub(crate) fn runtime_i64(value: u64) -> Result<i64, RuntimeConvergenceStoreError> {

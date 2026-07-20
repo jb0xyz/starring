@@ -31,14 +31,16 @@ const RELATIONS: [&str; 13] = [
     "runtime_serving_leases",
 ];
 
-const OWNED_FUNCTIONS: [&str; 13] = [
+const OWNED_FUNCTIONS: [&str; 15] = [
     STATUS_IDENTITY_FUNCTION,
     STATUS_READ_FUNCTION,
     "public.validate_runtime_deployment_projection()",
+    "public.validate_runtime_convergence_attempt_projection()",
     "public.enforce_runtime_deployment_policy_shadow()",
     "public.guard_runtime_ruleset_artifact_transition()",
     "public.reject_runtime_deployment_delete()",
     "public.validate_runtime_attestation_projection()",
+    "public.validate_runtime_attestation_attempt_projection()",
     "public.reject_immutable_product_row()",
     "public.validate_runtime_serving_lease_transition()",
     "public.reject_runtime_serving_lease_delete()",
@@ -76,6 +78,9 @@ enum ReadinessDrift {
     RowLevelSecurity,
     DisabledTrigger,
     HelperVolatility,
+    AttemptDefault,
+    AttemptCheck,
+    AttestationAttemptUnique,
     InvalidTopologyIdentity,
 }
 
@@ -93,6 +98,9 @@ impl ReadinessDrift {
             Self::RowLevelSecurity => "row level security drift",
             Self::DisabledTrigger => "disabled trigger",
             Self::HelperVolatility => "digest helper volatility drift",
+            Self::AttemptDefault => "runtime attempt default drift",
+            Self::AttemptCheck => "runtime attempt check drift",
+            Self::AttestationAttemptUnique => "runtime attestation attempt uniqueness drift",
             Self::InvalidTopologyIdentity => "invalid topology identity",
         }
     }
@@ -110,6 +118,9 @@ impl ReadinessDrift {
             | Self::RowLevelSecurity
             | Self::DisabledTrigger
             | Self::HelperVolatility
+            | Self::AttemptDefault
+            | Self::AttemptCheck
+            | Self::AttestationAttemptUnique
             | Self::InvalidTopologyIdentity => {
                 ProductDeploymentStatusReadinessErrorV1::ContractMismatch
             }
@@ -231,6 +242,30 @@ impl ReadinessDrift {
                     .execute_owner(&format!("ALTER FUNCTION {CANONICAL_HELPER} VOLATILE"))
                     .await;
             }
+            Self::AttemptDefault => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_deployments \
+                         ALTER COLUMN convergence_attempt_no DROP DEFAULT",
+                    )
+                    .await;
+            }
+            Self::AttemptCheck => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_deployments DROP CONSTRAINT \
+                         runtime_deployments_convergence_attempt_valid",
+                    )
+                    .await;
+            }
+            Self::AttestationAttemptUnique => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_attestations DROP CONSTRAINT \
+                         runtime_attestations_deployment_attempt_unique",
+                    )
+                    .await;
+            }
             Self::InvalidTopologyIdentity => {
                 fixture
                     .execute_owner(
@@ -317,6 +352,34 @@ impl ReadinessDrift {
             Self::HelperVolatility => {
                 fixture
                     .execute_owner(&format!("ALTER FUNCTION {CANONICAL_HELPER} IMMUTABLE"))
+                    .await;
+            }
+            Self::AttemptDefault => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_deployments \
+                         ALTER COLUMN convergence_attempt_no SET DEFAULT 0",
+                    )
+                    .await;
+            }
+            Self::AttemptCheck => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_deployments ADD CONSTRAINT \
+                         runtime_deployments_convergence_attempt_valid CHECK ( \
+                         convergence_attempt_no BETWEEN 0 AND 4294967295 AND ( \
+                         last_failure_attempt_no IS NULL OR last_failure_attempt_no \
+                         BETWEEN 1 AND convergence_attempt_no))",
+                    )
+                    .await;
+            }
+            Self::AttestationAttemptUnique => {
+                fixture
+                    .execute_owner(
+                        "ALTER TABLE public.runtime_attestations ADD CONSTRAINT \
+                         runtime_attestations_deployment_attempt_unique UNIQUE ( \
+                         deployment_id, convergence_attempt_no)",
+                    )
                     .await;
             }
             Self::InvalidTopologyIdentity => {
@@ -624,6 +687,9 @@ async fn status_readiness_rejects_persisted_contract_drift() {
             ReadinessDrift::RowLevelSecurity,
             ReadinessDrift::DisabledTrigger,
             ReadinessDrift::HelperVolatility,
+            ReadinessDrift::AttemptDefault,
+            ReadinessDrift::AttemptCheck,
+            ReadinessDrift::AttestationAttemptUnique,
         ],
     )
     .await;

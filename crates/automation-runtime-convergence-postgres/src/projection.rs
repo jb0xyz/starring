@@ -33,6 +33,7 @@ pub(crate) fn project_status(
     evidence: StatusProjectionEvidence,
 ) -> Result<RuntimeDeploymentStatusV1, RuntimeConvergenceStoreError> {
     let snapshot = evidence.persisted.deployment.snapshot();
+    let convergence_attempt = evidence.persisted.convergence_attempt;
     if snapshot.identity.tenant_id != scope.tenant_id
         || snapshot.identity.installation_id != scope.installation_id
         || snapshot.identity.deployment_id != scope.deployment_id
@@ -114,7 +115,8 @@ pub(crate) fn project_status(
         ));
     };
     let identity = &snapshot.identity;
-    if attestation.id != expected_attestation_id
+    if convergence_attempt != attestation.convergence_attempt.map(Into::into)
+        || attestation.id != expected_attestation_id
         || attestation.deployment_id != identity.deployment_id.as_str()
         || attestation.tenant_id != identity.tenant_id.as_str()
         || attestation.installation_id != identity.installation_id.as_str()

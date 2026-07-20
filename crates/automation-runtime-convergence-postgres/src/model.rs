@@ -14,6 +14,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::RuntimeConvergenceStoreError;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeConvergenceAttemptV1(u32);
+
+impl RuntimeConvergenceAttemptV1 {
+    pub const fn pending() -> Self {
+        Self(0)
+    }
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub const fn started(self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.0)
+    }
+
+    pub const fn checked_next(self) -> Option<NonZeroU32> {
+        match self.0.checked_add(1) {
+            Some(value) => NonZeroU32::new(value),
+            None => None,
+        }
+    }
+}
+
+impl From<NonZeroU32> for RuntimeConvergenceAttemptV1 {
+    fn from(value: NonZeroU32) -> Self {
+        Self(value.get())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostgresRuntimeConvergenceConfigV1 {
     pub maximum_controller_lease: Duration,
@@ -109,12 +144,46 @@ pub struct ClaimNextDeploymentV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverBlockedDeploymentV1 {
+    pub scope: RuntimeDeploymentScopeV1,
+    pub expected_revision: DeploymentRevision,
+    pub expected_failure_id: RuntimeFailureId,
+    pub expected_failure_attempt: NonZeroU32,
+    pub controller_id: ControllerId,
+    pub lease_for: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimReceiptV1 {
     pub snapshot: RuntimeDeploymentSnapshotV1,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimExecutionReceiptV1 {
+    pub snapshot: RuntimeDeploymentSnapshotV1,
+    pub controller_id: ControllerId,
+    pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
+    pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl From<ClaimExecutionReceiptV1> for ClaimReceiptV1 {
+    fn from(value: ClaimExecutionReceiptV1) -> Self {
+        Self {
+            snapshot: value.snapshot,
+            controller_id: value.controller_id,
+            fencing_token: value.fencing_token,
+            convergence_attempt: value.convergence_attempt,
+            acquired_at: value.acquired_at,
+            expires_at: value.expires_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

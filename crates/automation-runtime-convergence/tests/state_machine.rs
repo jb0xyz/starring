@@ -6,11 +6,11 @@ use automation_runtime_convergence::{
     CommandGuardV1, ControllerId, DeploymentId, DrainAttestationV1, FencingToken,
     GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1, LiveLossKindV1,
     PanelCertificateId, PanelCertificateV1, PanelIneligibilityV1, PreflightAttestationV1,
-    ProcessInstanceId, PromotionId, RecoverLiveRequestV1, RuntimeDeployment,
-    RuntimeDeploymentError, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1,
-    RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
-    RuntimeFailureV1, RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1,
-    TenantId, TransitionOutcomeV1,
+    ProcessInstanceId, PromotionId, RecoverBlockedRequestV1, RecoverLiveRequestV1,
+    RuntimeDeployment, RuntimeDeploymentError, RuntimeDeploymentIdentityV1,
+    RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1,
+    RuntimeFailureId, RuntimeFailureKindV1, RuntimeFailureV1, RuntimeGeneration,
+    RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId, TransitionOutcomeV1,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use discord_model::GuildId;
@@ -756,6 +756,18 @@ fn retryable_and_blocked_failures_require_explicit_resume() {
         fixture.deployment.phase(),
         RuntimeDeploymentPhaseV1::RuntimePending { .. }
     ));
+    assert!(fixture.deployment.controller_lease().is_none());
+    fixture.token = FencingToken::new(11).unwrap();
+    fixture
+        .deployment
+        .acquire_lease(LeaseRequestV1 {
+            expected_revision: fixture.deployment.revision(),
+            controller_id: fixture.controller.clone(),
+            fencing_token: fixture.token,
+            now: at(60),
+            expires_at: at(3_600),
+        })
+        .unwrap();
     fixture
         .deployment
         .resume_runtime_pending(&fixture.guard(60))
@@ -781,6 +793,29 @@ fn retryable_and_blocked_failures_require_explicit_resume() {
             condition: automation_runtime_convergence::RuntimePendingConditionV1::Blocked { .. }
         }
     ));
+    assert!(fixture.deployment.controller_lease().is_none());
+    let blocked_revision = fixture.deployment.revision();
+    let blocked_recovery = RecoverBlockedRequestV1 {
+        expected_revision: blocked_revision,
+        expected_failure_id: RuntimeFailureId::parse("failure-2").unwrap(),
+        controller_id: fixture.controller.clone(),
+        fencing_token: FencingToken::new(12).unwrap(),
+        now: at(63),
+        expires_at: at(3_600),
+    };
+    assert!(matches!(
+        fixture.deployment.acquire_lease(LeaseRequestV1 {
+            expected_revision: blocked_revision,
+            controller_id: fixture.controller.clone(),
+            fencing_token: FencingToken::new(12).unwrap(),
+            now: at(63),
+            expires_at: at(3_600),
+        }),
+        Err(RuntimeDeploymentError::InvalidTransition {
+            operation: "acquire_lease",
+            ..
+        })
+    ));
     let blocked_retry = RuntimeFailureV1 {
         failure_id: RuntimeFailureId::parse("failure-3").unwrap(),
         kind: RuntimeFailureKindV1::EnvironmentUnavailable,
@@ -795,7 +830,27 @@ fn retryable_and_blocked_failures_require_explicit_resume() {
             NonZeroU32::new(2).unwrap(),
             at(70),
         ),
-        Err(RuntimeDeploymentError::InvalidTransition { .. })
+        Err(RuntimeDeploymentError::LeaseRequired)
+    ));
+    assert!(matches!(
+        fixture
+            .deployment
+            .recover_blocked(blocked_recovery.clone())
+            .unwrap(),
+        TransitionOutcomeV1::Applied { .. }
+    ));
+    assert!(matches!(
+        fixture.deployment.phase(),
+        RuntimeDeploymentPhaseV1::RuntimePending {
+            condition: automation_runtime_convergence::RuntimePendingConditionV1::Ready
+        }
+    ));
+    assert!(matches!(
+        fixture
+            .deployment
+            .recover_blocked(blocked_recovery)
+            .unwrap(),
+        TransitionOutcomeV1::Replayed { .. }
     ));
 }
 

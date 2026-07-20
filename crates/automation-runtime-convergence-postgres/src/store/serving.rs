@@ -18,6 +18,8 @@ use crate::row::{
 };
 use crate::{PostgresRuntimeConvergence, RuntimeConvergenceStoreError};
 
+use super::DeploymentExecutionProjection;
+
 impl PostgresRuntimeConvergence {
     pub async fn certify_live(
         &self,
@@ -66,6 +68,10 @@ impl PostgresRuntimeConvergence {
         let outcome = persisted
             .deployment
             .certify_live(&guard, request.gateway_ready, now)?;
+        let convergence_attempt = persisted.exact_convergence_attempt()?;
+        let attestation_attempt = convergence_attempt.started().ok_or(
+            RuntimeConvergenceStoreError::InvalidPersistedState("Live runtime convergence attempt"),
+        )?;
         let snapshot = persisted.deployment.snapshot();
         let live =
             snapshot
@@ -96,11 +102,13 @@ impl PostgresRuntimeConvergence {
                     &attestation_id,
                     &record,
                     &snapshot,
+                    attestation_attempt,
                 )
                 .await?;
             }
-            (TransitionOutcomeV1::Replayed { .. }, Some(existing)) if existing.record == record => {
-            }
+            (TransitionOutcomeV1::Replayed { .. }, Some(existing))
+                if existing.record == record
+                    && existing.convergence_attempt == Some(attestation_attempt) => {}
             (TransitionOutcomeV1::Applied { .. }, Some(_))
             | (TransitionOutcomeV1::Replayed { .. }, None)
             | (TransitionOutcomeV1::Replayed { .. }, Some(_)) => {
@@ -216,7 +224,11 @@ impl PostgresRuntimeConvergence {
                 &request.scope,
                 request.expected_revision.get(),
                 &persisted.deployment,
-                Some(attestation_id.as_str()),
+                DeploymentExecutionProjection {
+                    live_attestation_id: Some(attestation_id.as_str()),
+                    convergence_attempt,
+                    last_failure_attempt: persisted.last_failure_attempt,
+                },
                 now,
             )
             .await?;
@@ -430,7 +442,11 @@ impl PostgresRuntimeConvergence {
             &request.identity.scope,
             request.expected_deployment_revision.get(),
             &persisted.deployment,
-            None,
+            DeploymentExecutionProjection {
+                live_attestation_id: None,
+                convergence_attempt: persisted.exact_convergence_attempt()?,
+                last_failure_attempt: persisted.last_failure_attempt,
+            },
             now,
         )
         .await?;
@@ -603,7 +619,13 @@ impl PostgresRuntimeConvergence {
             Self::load_attestation(transaction, &request.scope, &attestation_id, false)
                 .await?
                 .ok_or(RuntimeConvergenceStoreError::AttestationConflict)?;
-        if attestation.record != record {
+        let convergence_attempt = persisted
+            .exact_convergence_attempt()?
+            .started()
+            .ok_or(RuntimeConvergenceStoreError::AttestationConflict)?;
+        if attestation.record != record
+            || attestation.convergence_attempt != Some(convergence_attempt)
+        {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
         let exact_serving = serving.tenant_id == request.scope.tenant_id.as_str()
@@ -659,22 +681,24 @@ impl PostgresRuntimeConvergence {
         attestation_id: &AttestationIdV1,
         record: &AttestationRecordV1,
         snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
+        convergence_attempt: std::num::NonZeroU32,
     ) -> Result<(), RuntimeConvergenceStoreError> {
         let live = &record.live;
         sqlx::query(
             "INSERT INTO public.runtime_attestations (attestation_id, attestation_digest, deployment_id, \
-             deployment_revision, tenant_id, installation_id, promotion_id, activation_request_id, \
+             deployment_revision, convergence_attempt_no, tenant_id, installation_id, promotion_id, activation_request_id, \
              guild_id, ruleset_key, target_version, target_content_hash, binding_revision, \
              binding_fingerprint, runtime_generation, controller_fencing_token, \
              process_instance_id, runtime_build_revision, panel_certificate_id, \
              panel_report_digest, gateway_shard_id, gateway_ready_kind, gateway_ready_at, \
              certified_at, record_format_version, record, created_at) \
              VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, $19, $20, $21, $22, $23, 1, $24, $23)",
+                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 1, $25, $24)",
         )
         .bind(attestation_id.as_str())
         .bind(scope.deployment_id.as_str())
         .bind(runtime_i64(record.deployment_revision.get())?)
+        .bind(i64::from(convergence_attempt.get()))
         .bind(scope.tenant_id.as_str())
         .bind(scope.installation_id.as_str())
         .bind(snapshot.identity.promotion_id.as_str())

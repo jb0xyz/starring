@@ -6,19 +6,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use automation_ruleset::{RuleSetContentHash, RuleSetVersionId};
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
-    ControllerId, DeploymentId, DrainAttestationV1, GatewayReadyAttestationV1, GatewayReadyKindV1,
-    InstallationId, PanelCertificateId, PanelCertificateV1, PreflightAttestationV1,
-    ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
-    RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
+    ControllerId, ControllerLeaseV1, DeploymentId, DrainAttestationV1, FencingToken,
+    GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, PanelCertificateId,
+    PanelCertificateV1, PreflightAttestationV1, ProcessInstanceId, PromotionId,
+    RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeGeneration,
+    RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_convergence_postgres::{
     prepare_requested_deployment_v1, ClaimDeploymentV1, ClaimNextDeploymentV1,
     DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
-    PostgresRuntimeConvergenceConfigV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
-    RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1,
-    SubmitLiveAttestationV1, MIGRATOR,
+    PostgresRuntimeConvergenceConfigV1, RecoverBlockedDeploymentV1, RecoverStaleLiveV1,
+    RuntimeBuildRevisionV1, RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
+    SubmitDeploymentMutationV1, SubmitLiveAttestationV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use discord_model::GuildId;
@@ -48,5 +49,6 @@ const ROTATED_BINDING_FINGERPRINT: &str =
 
 include!("postgres_convergence/migration_acl.rs");
 include!("postgres_convergence/binding_authority.rs");
+include!("postgres_convergence/convergence_attempt.rs");
 include!("postgres_convergence/lifecycle.rs");
 include!("postgres_convergence/support.rs");

@@ -11,6 +11,7 @@ mod product_decisions;
 mod product_identity;
 mod product_promotions;
 mod product_retention;
+mod runtime_convergence_readiness;
 mod secret;
 mod snapshot;
 

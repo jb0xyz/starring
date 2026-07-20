@@ -34,8 +34,10 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/prepare.rs"),
         include_str!("../src/projection.rs"),
         include_str!("../src/row.rs"),
+        include_str!("../src/store/attempt.rs"),
         include_str!("../src/store/deployment.rs"),
         include_str!("../src/store/mod.rs"),
+        include_str!("../src/store/operator.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
     ];
@@ -106,6 +108,42 @@ fn runtime_authority_rotation_preserves_historical_identity_and_current_binding(
     assert!(!migration.contains("current_authority_row.policy_revision"));
     assert!(!migration.contains("current_authority_row.required_approvals"));
     assert!(!migration.contains("current_authority_row.activation_ttl_seconds"));
+}
+
+#[test]
+fn convergence_attempt_migration_is_bounded_private_and_fail_closed() {
+    let migration =
+        include_str!("../../../migrations/202607200003_persist_runtime_convergence_attempts.sql");
+    assert!(migration.contains("SET LOCAL lock_timeout = '5s'"));
+    assert!(migration.contains("SET LOCAL statement_timeout = '30s'"));
+    assert!(migration.contains("IN ACCESS EXCLUSIVE MODE"));
+    assert!(migration.contains("legacy runtime execution history cannot be inferred safely"));
+    assert!(migration.contains("convergence_attempt_no BIGINT NOT NULL DEFAULT 0"));
+    assert!(migration.contains("last_failure_attempt_no BIGINT"));
+    assert!(migration.contains("convergence_attempt_no BETWEEN 0 AND 4294967295"));
+    assert!(migration.contains("convergence_attempt_no BETWEEN 1 AND 4294967295"));
+    assert!(migration.contains("runtime_attestations_deployment_attempt_unique"));
+    for function in [
+        "validate_runtime_convergence_attempt_projection",
+        "validate_runtime_attestation_attempt_projection",
+    ] {
+        assert!(migration.contains(&format!("CREATE FUNCTION public.{function}()")));
+        assert!(migration.contains(&format!(
+            "REVOKE ALL ON FUNCTION public.{function}() FROM PUBLIC"
+        )));
+    }
+    assert_eq!(
+        migration.matches("SECURITY DEFINER").count(),
+        migration.matches("SET search_path = pg_catalog").count()
+    );
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT "));
+    assert!(!migration.contains("last_fencing_token AS convergence_attempt"));
+    for line in migration.lines() {
+        let line = line.trim_start();
+        assert!(!line.starts_with("--"));
+        assert!(!line.starts_with("/*"));
+    }
 }
 
 #[test]
