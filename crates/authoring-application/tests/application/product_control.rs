@@ -238,6 +238,48 @@ struct ObservationDeployments {
     status: DeploymentStatusObservationV1,
 }
 
+struct OperationalDecisions {
+    status: ProductDecisionObservationV1,
+}
+
+impl ProductDecisionObservationPort<Evidence> for OperationalDecisions {
+    async fn load_approval_preview_observation(
+        &self,
+        _request: AuthorizedApprovalPreviewV1<'_, Evidence>,
+    ) -> Result<ProductApprovalPreviewObservationV1, ProductControlPortError> {
+        panic!("preview is not used by the operational fixture")
+    }
+
+    async fn load_product_status_observation(
+        &self,
+        _request: AuthorizedProductStatusV1<'_, Evidence>,
+    ) -> Result<ProductDecisionObservationV1, ProductControlPortError> {
+        Ok(self.status.clone())
+    }
+}
+
+struct OperationalDeployments {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    status: DeploymentOperationalObservationV2,
+}
+
+impl DeploymentOperationalStatusPortV2<Evidence> for OperationalDeployments {
+    async fn load_exact_deployment_operational_status_v2(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, Evidence>,
+    ) -> Result<DeploymentOperationalObservationV2, DeploymentStatusPortError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push("deployment_operational_v2");
+        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
+        assert_eq!(request.scope().installation_id().as_str(), "installation-2");
+        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
+        assert_eq!(request.exact_deployment(), &exact_deployment());
+        Ok(self.status.clone())
+    }
+}
+
 impl DeploymentStatusObservationPort<Evidence> for ObservationDeployments {
     async fn load_exact_deployment_observation(
         &self,
@@ -245,6 +287,78 @@ impl DeploymentStatusObservationPort<Evidence> for ObservationDeployments {
     ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
         Ok(self.status.clone())
     }
+}
+
+#[test]
+fn operational_status_v2_uses_only_the_server_derived_exact_deployment() {
+    block_on(async {
+        let decision_observed_at = UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+        let runtime_observed_at = decision_observed_at + Duration::from_secs(1);
+        let decisions = OperationalDecisions {
+            status: ProductDecisionObservationV1::from_server_projection(
+                decision_projection(ProductDecisionPhaseV1::Applied {
+                    exact_deployment: exact_deployment(),
+                }),
+                decision_observed_at,
+            ),
+        };
+        let runtime = DeploymentOperationalObservationV2::from_server_projection(
+            DeploymentStatusObservationV1::from_server_projection(
+                DeploymentStatusProjectionV1::Pending,
+                runtime_observed_at,
+                None,
+                None,
+            )
+            .unwrap(),
+            DeploymentOperationalProjectionV2 {
+                phase: DeploymentConvergencePhaseV2::Requested,
+                current_attempt: 0,
+                last_failure_attempt: None,
+                retry: None,
+                operator_action: None,
+                attestation: None,
+                serving: DeploymentServingFreshnessV2::NotExpected,
+            },
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let deployments = OperationalDeployments {
+            events: events.clone(),
+            status: runtime,
+        };
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let application =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+        let result = application
+            .get_deployment_operational_status_v2(
+                "opaque-session-token",
+                &installation(),
+                RuntimeDeploymentQueryV1 {
+                    promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status(),
+            &authoring_application::DeploymentStatusV1::Pending
+        );
+        assert_eq!(result.decision_observed_at(), decision_observed_at);
+        let deployment = result.deployment().unwrap();
+        assert_eq!(deployment.observed_at(), runtime_observed_at);
+        assert_eq!(deployment.current_attempt(), 0);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["authenticate", "authorize", "deployment_operational_v2"]
+        );
+    });
 }
 
 async fn exact_preview_observation(

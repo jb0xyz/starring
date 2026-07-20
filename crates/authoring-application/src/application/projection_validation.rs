@@ -2,9 +2,9 @@ use authoring_promotion::approval_payload_digest_v1;
 
 use crate::status::validate_exact_live;
 use crate::{
-    DeploymentStatusObservationV1, DeploymentStatusProjectionV1, DeploymentStatusV1,
-    ProductApplicationError, ProductApprovalPreviewObservationV1, ProductApprovalPreviewV1,
-    ProductDecisionPhaseV1,
+    DeploymentOperationalObservationV2, DeploymentStatusObservationV1,
+    DeploymentStatusProjectionV1, DeploymentStatusV1, ProductApplicationError,
+    ProductApprovalPreviewObservationV1, ProductApprovalPreviewV1, ProductDecisionPhaseV1,
 };
 
 pub(super) fn validate_approval_phase(
@@ -124,4 +124,12 @@ pub(super) fn validate_runtime_observation(
         return Err(ProductApplicationError::InvalidProjection);
     }
     validate_runtime_projection(expected, observation.projection())
+}
+
+pub(super) fn validate_runtime_operational_observation(
+    expected: &crate::ExactDeploymentSelectorV1,
+    decision_observed_at: std::time::SystemTime,
+    observation: &DeploymentOperationalObservationV2,
+) -> Result<(), ProductApplicationError> {
+    validate_runtime_observation(expected, decision_observed_at, observation.base())
 }

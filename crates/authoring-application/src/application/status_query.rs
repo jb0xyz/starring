@@ -1,16 +1,18 @@
 use super::projection_validation::{
-    deployment_status, validate_runtime_observation, validate_runtime_projection,
+    deployment_status, validate_runtime_observation, validate_runtime_operational_observation,
+    validate_runtime_projection,
 };
 use super::ProductControlApplication;
 use crate::status::{map_non_applied_status, validate_decision_projection, validate_exact_live};
 use crate::{
     AuthenticatedActorV1, AuthenticationPort, AuthorizedDeploymentStatusV1,
     AuthorizedInstallationV1, AuthorizedProductStatusV1, CapabilityV1,
-    DeploymentStatusObservationPort, DeploymentStatusPort, DeploymentStatusV1,
-    FreshGuildAuthorityPort, InstallationSelectorV1, ProductApplicationError,
+    DeploymentOperationalStatusPortV2, DeploymentStatusObservationPort, DeploymentStatusPort,
+    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1, ProductApplicationError,
     ProductDecisionObservationPort, ProductDecisionObservationV1, ProductDecisionPhaseV1,
-    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductDeploymentStatusObservationV1,
-    ProductStatusObservationV1, ProductStatusQueryV1, ProductStatusV1, RuntimeDeploymentQueryV1,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductDeploymentOperationalStatusV2,
+    ProductDeploymentStatusObservationV1, ProductStatusObservationV1, ProductStatusQueryV1,
+    ProductStatusV1, RuntimeDeploymentQueryV1,
 };
 
 impl<A, G, D, R> ProductControlApplication<'_, A, G, D, R>
@@ -162,6 +164,65 @@ where
         let status = deployment_status(exact_deployment, runtime.projection().clone())?;
         Ok(
             ProductDeploymentStatusObservationV1::from_verified_application(
+                status,
+                decision.projection().clone(),
+                decision.observed_at(),
+                Some(runtime),
+            ),
+        )
+    }
+
+    pub async fn get_deployment_operational_status_v2(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+        query: RuntimeDeploymentQueryV1,
+    ) -> Result<ProductDeploymentOperationalStatusV2, ProductApplicationError>
+    where
+        D: ProductDecisionObservationPort<G::Evidence>,
+        R: DeploymentOperationalStatusPortV2<G::Evidence>,
+    {
+        let (actor, authorized) = self
+            .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
+            .await?;
+        let decision = self
+            .decisions
+            .load_product_status_observation(AuthorizedProductStatusV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                &query.promotion,
+            ))
+            .await?;
+        validate_decision_projection(authorized.scope(), &query.promotion, decision.projection())?;
+        let ProductDecisionPhaseV1::Applied { exact_deployment } = decision.projection().phase()
+        else {
+            return Ok(
+                ProductDeploymentOperationalStatusV2::from_verified_application(
+                    DeploymentStatusV1::NotApplicable,
+                    decision.projection().clone(),
+                    decision.observed_at(),
+                    None,
+                ),
+            );
+        };
+        let runtime = self
+            .deployments
+            .load_exact_deployment_operational_status_v2(AuthorizedDeploymentStatusV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                exact_deployment,
+            ))
+            .await?;
+        validate_runtime_operational_observation(
+            exact_deployment,
+            decision.observed_at(),
+            &runtime,
+        )?;
+        let status = deployment_status(exact_deployment, runtime.base().projection().clone())?;
+        Ok(
+            ProductDeploymentOperationalStatusV2::from_verified_application(
                 status,
                 decision.projection().clone(),
                 decision.observed_at(),
