@@ -486,3 +486,7 @@ BEGIN
     END IF;
 END;
 $postflight$;
+
+RESET statement_timeout;
+RESET lock_timeout;
+RESET search_path;
