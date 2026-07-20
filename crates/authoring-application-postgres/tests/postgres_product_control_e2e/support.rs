@@ -14,7 +14,7 @@ use authoring_application::{
     ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
     ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductIdempotencyKeyV1,
     ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
-    PromotionSelectorV1,
+    PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1,
 };
 use authoring_application_discord::{
     AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -27,9 +27,9 @@ use authoring_application_postgres::{
     digest_opaque_session_credential_v1, AuthenticationReadinessErrorV1,
     InstallationAuthorityReadinessErrorV1, PostgresAuthentication, PostgresAuthenticationConfig,
     PostgresInstallationAuthoritySource, PostgresInstallationAuthoritySourceConfig,
-    PostgresProductDecisions, PostgresProductDeploymentStatuses, ProductDecisionDatabasePoolsV1,
-    ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
-    MIGRATOR,
+    PostgresProductDecisions, PostgresProductDeploymentStatuses, PostgresProductRejections,
+    ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use authoring_promotion::{
     approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
@@ -336,6 +336,13 @@ struct Fixture {
 }
 
 async fn seed_fixture(pool: &PgPool) -> Fixture {
+    seed_fixture_with_required_approvals(pool, NonZeroU32::new(1).unwrap()).await
+}
+
+async fn seed_fixture_with_required_approvals(
+    pool: &PgPool,
+    required_approvals: NonZeroU32,
+) -> Fixture {
     let suffix = suffix();
     let numeric_tail = suffix[suffix.len().saturating_sub(8)..]
         .parse::<u64>()
@@ -390,7 +397,6 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         authority_binding_fingerprint.as_str(),
         approval_binding_fingerprint.as_str()
     );
-    let required_approvals = NonZeroU32::new(1).unwrap();
     let ttl_seconds = NonZeroU64::new(3_600).unwrap();
     let policy_revision = NonZeroU64::new(1).unwrap();
     let definition = serde_json::from_value(json!({
@@ -697,12 +703,13 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
          (installation_id, revision, tenant_id, binding_revision, resource_bindings, \
           binding_fingerprint, policy_revision, required_approvals, activation_ttl_seconds, \
           authority_payload_digest, created_by_principal_id, created_by_request_digest) \
-         VALUES ($1, 1, $2, 1, $3, $4, 1, 1, 3600, $5, $6, $7)",
+         VALUES ($1, 1, $2, 1, $3, $4, 1, $5, 3600, $6, $7, $8)",
     )
     .bind(installation_id.as_str())
     .bind(tenant_id.as_str())
     .bind(Json(&stored_resource_bindings))
     .bind(authority_binding_fingerprint.as_str())
+    .bind(i32::try_from(required_approvals.get()).unwrap())
     .bind(&authority_digest)
     .bind(requester_principal.as_str())
     .bind(sha256_hex(&format!("authority-request:{suffix}")))
@@ -784,17 +791,18 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
         "INSERT INTO public.activation_requests \
          (id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \
           required_approvals, state, created_at, expires_at, authority_kind, link_state_name, \
-          approval_context, link_state, promotion_id, promotion_request_digest, \
-          approval_payload_digest, approval_context_digest, linked_at, tenant_id, \
-          installation_id, product_revision) \
-         VALUES ($1, $2, $3, 1, $4, $5, 1, 'pending', $6, $7, \
-          'product_authoring', 'linked', $8, $9, $10, $11, $12, $13, $14, $15, $16, 1)",
+         approval_context, link_state, promotion_id, promotion_request_digest, \
+         approval_payload_digest, approval_context_digest, linked_at, tenant_id, \
+         installation_id, product_revision) \
+         VALUES ($1, $2, $3, 1, $4, $5, $6, 'pending', $7, $8, \
+          'product_authoring', 'linked', $9, $10, $11, $12, $13, $14, $15, $16, $17, 1)",
     )
     .bind(&activation_id)
     .bind(guild_id.to_string())
     .bind(ruleset_key.as_str())
     .bind(ruleset_content_hash.to_hex())
     .bind(requester_user.to_string())
+    .bind(i32::try_from(required_approvals.get()).unwrap())
     .bind(activation_created_at)
     .bind(activation_expires_at)
     .bind(Json(json!({
@@ -1109,6 +1117,13 @@ fn product_decisions(pool: &PgPool) -> PostgresProductDecisions {
 
 fn product_decision_pools(pool: &PgPool) -> ProductDecisionDatabasePoolsV1 {
     ProductDecisionDatabasePoolsV1::new(pool.clone(), pool.clone(), pool.clone())
+}
+
+fn product_rejections(
+    pool: &PgPool,
+    keyring: ProductDecisionDigestKeyringV1,
+) -> PostgresProductRejections {
+    PostgresProductRejections::new(pool.clone(), keyring).unwrap()
 }
 
 async fn approve_fixture(pool: &PgPool, fixture: &Fixture, decisions: &PostgresProductDecisions) {
