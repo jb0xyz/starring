@@ -7,6 +7,14 @@ the production control plane. It does not authorize production cutover until
 the database-role, RLS, capability-probe, HTTP composition, and
 runtime Live gates in the accepted design are implemented and green.
 
+The current `starring-api` slice is a staging control plane. It can authenticate
+product users and carry promotion, approval, rejection, Apply, and status
+requests through the verified control boundary. The production runtime worker,
+gateway convergence, serving heartbeat, and Live recovery drills are not yet a
+deployable production unit. Apply may therefore reach `runtime_pending`; it
+must never be represented as Live. Do not connect this slice to a customer
+guild or advertise production Live automation.
+
 ## Required operators and credentials
 
 - `starring_migrator` performs schema migration and ownership handoff.
@@ -15,10 +23,326 @@ runtime Live gates in the accepted design are implemented and green.
 - Product identity uses four distinct direct-login credentials: the OAuth flow
   writer, session issuer, session API, and security revoker. Do not reuse one
   login or pool for more than one of these capabilities.
+- The API process uses thirteen distinct direct-login database credentials in
+  total. The remaining capabilities are installation-authority read,
+  authorized-snapshot read, promotion execution, decision read, approval
+  execution, rejection execution, Apply execution, deployment-status read, and
+  operational-deployment-status read. All thirteen connect to one logical
+  database under different roles and are checked as one topology before the
+  process becomes ready.
 - `starring_owner` is `NOLOGIN` and is never used by an application process.
 - Migration, API, the four product-identity roles, runtime, and maintenance
   credentials are separate secret references. They are never passed as
   command-line literals or committed.
+
+## Starring API launch contract
+
+The reviewed macOS LaunchAgent template is
+`ops/macos/local.starring.api.plist`. It contains non-secret configuration and
+Keychain references only. It does not contain database URLs, OAuth secrets, bot
+tokens, key material, Cloudflare credentials, or customer identifiers.
+
+The template assumes a release binary installed at
+`/Users/jungbogeon/.local/libexec/starring-api`, a user LaunchAgent running in
+the same GUI login session as the Keychain items, and a log directory at
+`/Users/jungbogeon/Library/Logs/starring-api`. Do not convert it to a system
+LaunchDaemon without designing and validating a separate non-login secret
+store.
+
+### Exact non-secret environment
+
+Every variable below is required. There are no implicit process-environment
+defaults.
+
+| Variable | Required contract | Template value |
+| --- | --- | --- |
+| `STARRING_API_BIND_PORT` | Integer 1024 through 65535; the process always binds IPv4 loopback regardless of host configuration | `18080` |
+| `STARRING_API_PUBLIC_ORIGIN` | Canonical lowercase HTTPS domain origin with no explicit port, path, query, fragment, user information, or IP literal | `https://api.example.com` |
+| `STARRING_API_OAUTH_RETURN_PATHS_JSON` | JSON array of 1 through 64 unique bounded local paths | `["/","/app"]` |
+| `STARRING_API_OAUTH_DEFAULT_RETURN_PATH` | Exact member of the return-path array | `/app` |
+| `STARRING_API_DATABASE_MAX_CONNECTIONS` | 1 through 4 per role; the template ceiling is 26 connections across 13 pools | `2` |
+| `STARRING_API_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS` | 100 through 5000 milliseconds | `2000` |
+| `STARRING_API_DATABASE_IDLE_TIMEOUT_SECONDS` | 30 through 600 seconds | `120` |
+| `STARRING_API_DATABASE_MAX_LIFETIME_SECONDS` | 60 through 3600 seconds and strictly greater than idle timeout | `900` |
+| `STARRING_API_DISCORD_APPLICATION_ID` | Actual nonzero Discord application ID; replace the template marker in the installed copy | required replacement |
+| `STARRING_API_DISCORD_BOT_USER_ID` | Actual nonzero bot user ID for that application; replace the template marker in the installed copy | required replacement |
+| `STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS` | 1 through 5000 milliseconds | `3000` |
+| `STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS` | 1 through 5000 milliseconds | `3000` |
+| `STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS` | 1 through 30000 milliseconds | `15000` |
+
+The OAuth callback registered with Discord must be exactly the configured
+public origin plus `/oauth/discord/callback`. The public TLS endpoint and Host
+must agree with this origin. An origin change is an OAuth configuration change,
+not a DNS-only operation.
+
+### Exact secret-reference environment
+
+Secret-reference values use exactly `keychain:<service>:<account>` or
+`env:<UPPERCASE_NAME>`. The macOS production template uses Keychain. The 13
+database references and the four other purpose references must all be unique;
+configuration rejects any alias.
+
+| Variable | Capability | Template Keychain account |
+| --- | --- | --- |
+| `STARRING_API_OAUTH_FLOW_WRITER_DATABASE_SECRET_REFERENCE` | OAuth flow create and consume | `database.oauth-flow-writer` |
+| `STARRING_API_SESSION_ISSUER_DATABASE_SECRET_REFERENCE` | Session issue | `database.session-issuer` |
+| `STARRING_API_SESSION_API_DATABASE_SECRET_REFERENCE` | Session read, touch, and logout | `database.session-api` |
+| `STARRING_API_SECURITY_REVOKER_DATABASE_SECRET_REFERENCE` | Security revocation | `database.security-revoker` |
+| `STARRING_API_INSTALLATION_AUTHORITY_DATABASE_SECRET_REFERENCE` | Installation-authority read | `database.installation-authority-reader` |
+| `STARRING_API_AUTHORIZED_SNAPSHOT_DATABASE_SECRET_REFERENCE` | Authorized encrypted generation snapshot read | `database.authorized-snapshot-reader` |
+| `STARRING_API_PROMOTION_EXECUTOR_DATABASE_SECRET_REFERENCE` | Promotion publication and link | `database.promotion-executor` |
+| `STARRING_API_DECISION_READER_DATABASE_SECRET_REFERENCE` | Approval preview and product decision read | `database.decision-reader` |
+| `STARRING_API_APPROVAL_EXECUTOR_DATABASE_SECRET_REFERENCE` | Approval execution | `database.approval-executor` |
+| `STARRING_API_REJECTION_EXECUTOR_DATABASE_SECRET_REFERENCE` | Rejection execution | `database.rejection-executor` |
+| `STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE` | Apply execution | `database.apply-executor` |
+| `STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE` | Deployment status V1 read | `database.deployment-status-reader` |
+| `STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE` | Operational deployment status V2 read | `database.operational-deployment-status-reader` |
+| `STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE` | Discord OAuth token exchange | `discord.oauth-client-secret` |
+| `STARRING_API_DISCORD_BOT_TOKEN_REFERENCE` | Fresh Discord guild-authority queries | `discord.bot-token` |
+| `STARRING_API_PRODUCT_ACTION_KEYRING_SECRET_REFERENCE` | Product action digest creation and verification | `keyring.product-action` |
+| `STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE` | Authorized snapshot encryption and decryption | `keyring.snapshot-envelope` |
+
+The template Keychain service is `starring-api.production`. Each database item
+contains one complete PostgreSQL URL for its capability login. All thirteen
+URLs must identify the same database but authenticate as thirteen distinct
+roles with no role membership. Local loopback or Unix-socket connections may
+disable TLS. A remote database URL must use full certificate and hostname
+verification. PostgreSQL startup `options` are rejected. Use a distinct random
+password for every login even though secret-reference uniqueness is the
+enforced startup boundary.
+
+OAuth client secret and bot token items contain their exact provider values.
+Each keyring item contains one compact JSON object with version `1`, one active
+key, and zero through seven retired keys. Every material value is canonical
+Base64 for exactly 32 cryptographically random bytes. Key IDs are immutable and
+unique inside a keyring. Product-action and snapshot-envelope key material must
+also be different across purposes. The structural shape is:
+
+```json
+{"version":1,"active":{"id":"replace-active-id","material":"replace-with-canonical-base64-of-32-random-bytes"},"retired":[]}
+```
+
+The shown material is deliberately invalid placeholder text. Generate real
+material outside the repository and never paste it into a command argument,
+shell history, plist, log, issue, or operational evidence.
+
+### Keychain provisioning and preflight
+
+Use Keychain Access or the following prompt-only pattern from the service GUI
+account. The final `-w` causes `/usr/bin/security` to prompt instead of placing
+the value in the command line. Never use `-A` and never enable shell tracing.
+
+```bash
+SERVICE=starring-api.production
+for ACCOUNT in \
+  database.oauth-flow-writer \
+  database.session-issuer \
+  database.session-api \
+  database.security-revoker \
+  database.installation-authority-reader \
+  database.authorized-snapshot-reader \
+  database.promotion-executor \
+  database.decision-reader \
+  database.approval-executor \
+  database.rejection-executor \
+  database.apply-executor \
+  database.deployment-status-reader \
+  database.operational-deployment-status-reader \
+  discord.oauth-client-secret \
+  discord.bot-token \
+  keyring.product-action \
+  keyring.snapshot-envelope
+do
+  /usr/bin/security add-generic-password -U -s "$SERVICE" -a "$ACCOUNT" -w || exit 1
+done
+unset ACCOUNT SERVICE
+```
+
+Verify lookup access without printing values. A Keychain prompt, missing item,
+three-second lookup timeout, excessive output, invalid UTF-8, malformed secret,
+or locked Keychain is a startup failure.
+
+```bash
+SERVICE=starring-api.production
+for ACCOUNT in \
+  database.oauth-flow-writer database.session-issuer database.session-api \
+  database.security-revoker database.installation-authority-reader \
+  database.authorized-snapshot-reader database.promotion-executor \
+  database.decision-reader database.approval-executor \
+  database.rejection-executor database.apply-executor \
+  database.deployment-status-reader \
+  database.operational-deployment-status-reader \
+  discord.oauth-client-secret discord.bot-token \
+  keyring.product-action keyring.snapshot-envelope
+do
+  /usr/bin/security find-generic-password -s "$SERVICE" -a "$ACCOUNT" -w \
+    >/dev/null || exit 1
+done
+unset ACCOUNT SERVICE
+```
+
+Before enabling ingress, log out and back in or reboot the staging host and
+prove that launchd can resolve every item without an interactive Keychain
+prompt. If any prompt appears, leave ingress disabled and correct the item's
+access policy. The current adapter invokes the signed system
+`/usr/bin/security` binary, so the macOS account itself is the process-isolation
+boundary: any untrusted process running as that user is already in the secret
+threat boundary. Keep the service account dedicated and do not work around a
+prompt with broad cross-user Keychain access.
+
+### Binary and LaunchAgent installation
+
+Do not bootstrap the template until the release binary target exists, all
+workspace and PostgreSQL gates are green, the installed plist replacements are
+complete, and the staging limitation above is accepted.
+
+```bash
+mkdir -p "$HOME/.local/libexec" "$HOME/Library/LaunchAgents" \
+  "$HOME/Library/Logs/starring-api"
+chmod 700 "$HOME/.local/libexec" "$HOME/Library/Logs/starring-api"
+install -m 500 target/release/starring-api \
+  "$HOME/.local/libexec/starring-api"
+install -m 600 ops/macos/local.starring.api.plist \
+  "$HOME/Library/LaunchAgents/local.starring.api.plist"
+plutil -lint "$HOME/Library/LaunchAgents/local.starring.api.plist"
+```
+
+Edit only the installed plist. Replace `https://api.example.com`,
+`REPLACE_WITH_DISCORD_APPLICATION_ID`, and
+`REPLACE_WITH_DISCORD_BOT_USER_ID`. Verify that its public origin, Discord
+callback, tunnel hostname, and release evidence all agree. Leave every secret
+as a Keychain reference.
+
+```bash
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.plist"
+if /usr/bin/grep -Eq 'REPLACE_WITH_|api\.example\.com' "$INSTALLED"
+then
+  echo "starring-api plist still contains placeholders" >&2
+  exit 1
+fi
+plutil -lint "$INSTALLED"
+test -x "$HOME/.local/libexec/starring-api"
+```
+
+Keep public ingress disabled, then load the user LaunchAgent:
+
+```bash
+DOMAIN="gui/$(id -u)"
+INSTALLED="$HOME/Library/LaunchAgents/local.starring.api.plist"
+launchctl bootstrap "$DOMAIN" "$INSTALLED"
+launchctl print "$DOMAIN/local.starring.api"
+```
+
+The plist restarts nonzero exits with a 30-second throttle. A clean exit is not
+restarted automatically. Its 90-second launchd exit deadline covers the normal
+15-second HTTP drain and 15-second concurrent database-pool close, plus bounded
+startup cancellation while a registered signal waits for an in-progress
+Keychain or aggregate-readiness phase to finish and release resources. The
+service umask is `077`; the log directory and installed plist must remain
+readable only by the service account.
+
+### Startup and deep-readiness proof
+
+Startup is deliberately fail-closed and ordered:
+
+1. Parse every required non-secret value and all 17 unique secret references.
+2. Resolve Keychain items and validate database URL, OAuth secret, bot token,
+   both keyring payloads, and cross-purpose key-material separation.
+3. Connect all thirteen bounded pools. On partial failure, begin closing every
+   pool that connected and stop.
+4. Build the facade and run aggregate database capability readiness with a
+   45-second composition deadline. This verifies one database, thirteen
+   distinct direct-login roles, exact executable allowlists, relation and
+   schema denial, installation authority, snapshot encryption-key coverage,
+   action-key coverage, decision paths, and both deployment-status readers.
+5. Bind only `127.0.0.1:<configured-port>`.
+6. While the listener is bound but the readiness gate is still closed, run the
+   facade readiness probe again with the server's 10-second startup deadline.
+   False, panic, timeout, or shutdown returns a stable typed failure without a
+   ready pulse.
+7. Open readiness only after the post-bind probe succeeds. A single atomic
+   lease owns readiness for the lifetime of the server.
+
+The HTTP server defaults are 512 accepted connections, a ten-second HTTP/1
+header deadline, 64 HTTP/1 headers, 64 KiB HTTP/1 buffer, 64 concurrent HTTP/2
+streams per connection, 16 KiB HTTP/2 header list, 64 KiB HTTP/2 send buffer,
+30-second idle HTTP/2 ping, ten-second ping acknowledgement deadline, and a
+15-second graceful drain. These are code-owned validated production defaults,
+not environment overrides.
+
+The connection semaphore bounds memory and file descriptors; it is not a
+same-host admission identity. A process that can run under the service account
+can deliberately retain loopback HTTP/2 connections and exhaust availability.
+Run no untrusted workload under that account, monitor listener and descriptor
+occupancy, and treat same-user code execution as host compromise. If the host
+later becomes multi-tenant, introduce an authenticated local proxy or
+OS-enforced process boundary and re-run the availability threat model before
+production use.
+
+Verify the local listener and both health boundaries using the configured
+public Host. Do not record response bodies.
+
+```bash
+PORT=18080
+PUBLIC_HOST=api.example.com
+/usr/sbin/lsof -nP -iTCP:"$PORT" -sTCP:LISTEN
+/usr/bin/curl --fail --silent --show-error \
+  --header "Host: $PUBLIC_HOST" \
+  "http://127.0.0.1:$PORT/health/live" >/dev/null
+/usr/bin/curl --fail --silent --show-error \
+  --header "Host: $PUBLIC_HOST" \
+  "http://127.0.0.1:$PORT/health/ready" >/dev/null
+unset PORT PUBLIC_HOST
+```
+
+The listener must be exactly `127.0.0.1`, never `*`, `0.0.0.0`, a LAN address,
+or a public address. Liveness proves only that the process event loop responds.
+Readiness first checks the atomic server lease, then re-runs facade readiness;
+it returns 503 `dependency_unavailable` when either gate is closed.
+
+Cloudflare Tunnel is a separate service and may be enabled only after local
+readiness is green. Route it to the loopback address, keep its credentials in
+its own secret store, and do not add Cloudflare credentials or forwarded-header
+trust to the Starring API plist. Cloudflare Access can protect a staging edge,
+but it does not replace product OAuth, session, CSRF, tenant, installation, or
+fresh Discord authority checks.
+
+### Shutdown and stable-failure handling
+
+A controlled SIGTERM or launchd bootout closes the readiness lease and listener
+before draining active HTTP/1 and HTTP/2 work. HTTP drain is bounded to 15
+seconds; connections still pending at the deadline are aborted and joined.
+Only after the server returns should the process close all thirteen database
+pools concurrently, with a separate 15-second deadline. A pool-close timeout is
+a stable redacted shutdown failure, not permission to leave another instance
+running.
+
+```bash
+DOMAIN="gui/$(id -u)"
+launchctl bootout "$DOMAIN/local.starring.api"
+```
+
+Failure handling is intentionally closed:
+
+- Invalid configuration or secret resolution exits before database composition
+  or bind.
+- Database connection, topology, ACL, function, key coverage, or deep-readiness
+  drift keeps ingress closed and closes connected pools.
+- The first listener accept error immediately removes readiness. Accept retries
+  use a cancellable one-second backoff; five consecutive errors terminate with
+  a redacted stable failure.
+- A competing server cannot claim or clear the active server's readiness gate.
+- Repeated launchd failures indicate a stable fault. Boot out the job, preserve
+  only redacted exit metadata, fix the cause, rerun preflight, and bootstrap it
+  again. Do not let launchd retry indefinitely during database migration or
+  credential repair.
+- Never substitute owner, migrator, runtime, maintenance, or another capability
+  credential to make readiness green.
+
+Do not enable the public tunnel until local readiness, a staging OAuth flow, and
+a disposable-guild authority check are green. Current staging evidence is not
+production Live evidence because the production runtime worker and serving
+lease path remain unavailable.
 
 ## Preflight
 
@@ -1004,6 +1328,73 @@ limit is approached. Receipt evidence deliberately excludes HMAC digests, key
 IDs, and fingerprints so archived audit integrity does not extend secret
 retention.
 
+## API credential and snapshot-key rotation
+
+All secrets are resolved at process startup. Updating a Keychain item does not
+change the running process; every rotation requires a controlled API restart
+and the complete startup and post-bind readiness sequence.
+
+### Database capability credentials
+
+Rotate one capability login at a time. Preserve the exact role's grants and
+direct-login restrictions, change only that role's credential, update only its
+matching Keychain account, then restart the single API process. The service is
+not eligible for ingress until aggregate readiness again proves one logical
+database and thirteen distinct roles. Never copy one database URL into a second
+account as a temporary fallback. Revoke the old credential only after the new
+process has passed local readiness and the old process has exited.
+
+If the database is remote, rotation evidence must also prove `verify-full`
+certificate and hostname validation. Do not add PostgreSQL startup options or
+weaken transport validation to recover from a rotation error.
+
+### Discord OAuth client secret and bot token
+
+Coordinate OAuth client-secret rotation with the exact configured callback.
+Stop new OAuth starts, allow or invalidate the short in-flight flow window,
+replace the `discord.oauth-client-secret` Keychain item, and restart. Run a
+staging OAuth start and callback without retaining authorization codes, OAuth
+tokens, cookies, state, or nonce values.
+
+Rotate the Discord bot token by replacing only `discord.bot-token`, restarting,
+and proving fresh manager authority against a disposable staging guild. A
+failed Discord query keeps protected product operations unavailable; it is not
+a reason to extend authority evidence lifetimes. Revoke the superseded provider
+credential after the new process is green.
+
+### Snapshot-envelope keyring
+
+Snapshot-envelope rotation differs from ordinary credential rotation because
+persisted encrypted generations retain their encryption key ID.
+
+1. Generate a new random 32-byte key with a new immutable ID.
+2. Replace the Keychain payload with the new key active and every still-needed
+   old key retired.
+3. Restart the API and require aggregate readiness to pass snapshot key-ID
+   coverage for all retained encrypted generations.
+4. Keep the old key while any retained generation references it. There is no
+   authorization to delete rows or invent a new envelope merely to make
+   coverage green.
+5. Remove an old key only after an accepted bounded re-encryption or retention
+   path proves no persisted envelope references it, then restart and rerun
+   readiness.
+
+The keyring holds at most eight total keys. Stop rotation before the limit is
+reached and design the missing re-encryption or retention operation; never drop
+an old key and accept unreadable snapshots. Snapshot material must never equal
+any product-action key material.
+
+### Rotation rollback
+
+Keep the prior installed binary, non-secret plist, and still-valid old key
+material through the rollout soak. If a new credential or keyring fails before
+provider revocation or old-key destruction, boot out the process, restore the
+previous Keychain payload using a prompt-only path, restore the previous binary
+if necessary, and rerun every readiness gate. If the old provider credential
+was revoked or old encryption material was destroyed, do not fabricate a
+rollback; use a forward credential fix or a verified backup and documented
+recovery procedure.
+
 ## Failure and rollback
 
 - Before any receipt purge, rollback is binary and migration rollback to the
@@ -1016,6 +1407,18 @@ retention.
   idempotency key until status and receipt probes resolve the outcome.
 - If API or runtime capability probes fail, keep ingress closed. Owner
   credentials are not an emergency application fallback.
+- For an API-only rollback, disable the public tunnel first, boot out
+  `local.starring.api`, restore the previously verified binary and installed
+  non-secret plist, restore only still-valid Keychain entries, bootstrap the
+  job, and require local liveness plus deep readiness before reopening staging
+  ingress.
+- A prior API binary must not be started against a schema or function manifest
+  it does not recognize. When migrations are forward-only or receipt retention
+  has run, use a forward fix or verified database restore rather than forcing
+  an old binary through red capability probes.
+- No rollback in the current slice can produce production Live. RuntimePending
+  remains the terminal honest product state until the production runtime
+  worker, attestation, serving-lease, fencing, and recovery release gates pass.
 
 ## Evidence to retain
 
@@ -1028,6 +1431,9 @@ retention.
   only
 - retention deleted counts and backlog flags
 - keyring coverage outcome and key IDs only
+- launchd label, installed binary digest, non-secret plist digest, local
+  listener address, liveness/readiness status codes, and stable redacted exit
+  classification
 - backup and restore-drill identifiers
 
 Do not retain credentials, raw OAuth state, cookies, session or CSRF digests,

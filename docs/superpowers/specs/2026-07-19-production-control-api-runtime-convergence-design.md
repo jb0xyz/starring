@@ -665,6 +665,13 @@ runtime observation must also preserve typed phase, attempt, retry scheduling or
 operator-action requirement, and current attestation identities so the facade
 does not issue direct database reads or an extra status query.
 
+Compatibility addendum, 2026-07-20: the later accepted operational-status V2
+contract supersedes the V1 omission sentence above. V1 retains its already
+published byte-compatible `serving_lease_expires_at` field. V2 exposes bounded
+lease times only for exact disconnected, expired, or fresh identity states and
+redacts mismatch evidence. Controller, process, fencing, attestation, failure,
+build, shard, panel, and credential identities remain excluded from both wires.
+
 ### Health
 
 ```text
