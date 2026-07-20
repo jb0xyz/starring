@@ -318,6 +318,10 @@ impl<'a, E> AuthorizedPromotionSubmissionV1<'a, E> {
     pub fn into_input(self) -> StartPromotionV1 {
         self.input
     }
+
+    pub fn into_access_and_input(self) -> (AuthorizedPromotionAccessV1<'a, E>, StartPromotionV1) {
+        (self.access, self.input)
+    }
 }
 
 impl<E> Debug for AuthorizedPromotionSubmissionV1<'_, E> {

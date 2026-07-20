@@ -1,5 +1,6 @@
 use authoring_application::{
-    AuthorizedPromotionSubmissionErrorV1, AuthorizedPromotionSubmissionV1,
+    AuthorizedPromotionAccessV1, AuthorizedPromotionSubmissionErrorV1,
+    AuthorizedPromotionSubmissionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use authoring_promotion::{plan_start_promotion_v1, PreparedPromotionPlanV1};
@@ -36,15 +37,22 @@ const PREPARE_SQL: &str =
      $31, $32, $33, $34, $35) LIMIT 2";
 
 impl PostgresProductPromotions {
-    pub(crate) async fn prepare_authorized_promotion_stage_v1(
+    pub(crate) async fn prepare_authorized_promotion_stage_v1<'a>(
         &self,
-        request: AuthorizedPromotionSubmissionV1<'_, FreshDiscordAuthorityEvidenceV1>,
-    ) -> Result<ProductPromotionPrepareStageV1, AuthorizedPromotionSubmissionErrorV1> {
+        request: AuthorizedPromotionSubmissionV1<'a, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<
+        (
+            AuthorizedPromotionAccessV1<'a, FreshDiscordAuthorityEvidenceV1>,
+            ProductPromotionPrepareStageV1,
+        ),
+        AuthorizedPromotionSubmissionErrorV1,
+    > {
         let access_args = validate_product_promotion_submission_v1(&request)?;
         let context = product_promotion_admission_context_v1(request.access());
         let digests = promotion_digests_v1(self.config.keyring(), request.access())
             .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)?;
-        let plan = plan_start_promotion_v1(request.into_input())
+        let (access, input) = request.into_access_and_input();
+        let plan = plan_start_promotion_v1(input)
             .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)?;
         let admission = prepare_product_promotion_admission_v1(
             self.config.keyring(),
@@ -65,7 +73,7 @@ impl PostgresProductPromotions {
                 &serialized,
             )
             .await?;
-        match stage {
+        let stage = match stage {
             ProductPromotionPrepareStageV1::FinalReplayRequired(_) => {
                 match self
                     .execute_replay_stage_v1(&access_args, &context, &digests)
@@ -82,7 +90,8 @@ impl PostgresProductPromotions {
                 }
             }
             stage => Ok(stage),
-        }
+        }?;
+        Ok((access, stage))
     }
 
     async fn execute_prepare_stage_v1(
