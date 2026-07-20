@@ -1,0 +1,16 @@
+[package]
+name = "starring-api"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+authoring-application = { path = "../../crates/authoring-application" }
+authoring-application-discord = { path = "../../crates/authoring-application-discord" }
+authoring-application-postgres = { path = "../../crates/authoring-application-postgres" }
+authoring-promotion = { path = "../../crates/authoring-promotion" }
+automation-ruleset = { path = "../../crates/automation-ruleset" }
+chrono = "0.4"
+product-control-http = { path = "../../crates/product-control-http" }
+
+[dev-dependencies]
+discord-model = { path = "../../crates/discord-model" }
