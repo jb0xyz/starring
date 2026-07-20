@@ -15,13 +15,16 @@ use authoring_application_postgres::{
     build_snapshot_authenticated_data_v1, digest_opaque_session_credential_v1,
     EncryptedSnapshotEnvelopeV1, PostgresAuthentication, PostgresAuthorizedPromotionSnapshots,
     SnapshotAuthenticatedDataInputV1, SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
-    MIGRATOR,
+    SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
+    MIGRATOR, XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
 };
 use authoring_promotion::{
     AuthoringSessionId, AutomationInstallationId, PrincipalId, SessionGeneration, TenantId,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, TimeDelta, Utc};
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, ResourceBindingMap,
@@ -92,6 +95,21 @@ impl SnapshotEnvelopeCipher for PassthroughCipher {
         }
         Ok(Zeroizing::new(envelope.ciphertext().to_vec()))
     }
+}
+
+const SNAPSHOT_TEST_KEY_ID: &str = "keychain:test-authoring-v1";
+
+fn snapshot_test_key_material() -> [u8; 32] {
+    std::array::from_fn(|index| 47_u8.wrapping_add((index as u8).wrapping_mul(19)))
+}
+
+fn snapshot_test_cipher() -> XChaCha20Poly1305SnapshotEnvelopeCipherV1 {
+    let key = SnapshotEnvelopeKeyV1::new(
+        SNAPSHOT_TEST_KEY_ID,
+        Zeroizing::new(snapshot_test_key_material()),
+    )
+    .unwrap();
+    XChaCha20Poly1305SnapshotEnvelopeCipherV1::new(SnapshotEnvelopeKeyringV1::new(key, []).unwrap())
 }
 
 #[derive(Clone)]
@@ -436,10 +454,22 @@ async fn insert_product_fixture(pool: &PgPool) -> ProductFixture {
             generation: SessionGeneration::new(1).unwrap(),
             snapshot_schema_version: snapshot.schema_version,
             binding_fingerprint: &binding_fingerprint,
-            encryption_key_id: "keychain:test-authoring-v1",
-            encryption_suite: "xchacha20_poly1305",
-            encryption_suite_version: 1,
+            encryption_key_id: SNAPSHOT_TEST_KEY_ID,
+            encryption_suite: XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1,
+            encryption_suite_version: XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
         })
+        .unwrap();
+    let mut nonce = [0_u8; 24];
+    getrandom::fill(&mut nonce).unwrap();
+    let snapshot_cipher = XChaCha20Poly1305::new(&Key::from(snapshot_test_key_material()));
+    let ciphertext = snapshot_cipher
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: &plaintext,
+                aad: authenticated_data.as_bytes(),
+            },
+        )
         .unwrap();
     let receipt = DesignSession::restore_intent_recipe(
         ScriptedClient {
@@ -530,10 +560,10 @@ async fn insert_product_fixture(pool: &PgPool) -> ProductFixture {
     .bind(tenant_id.as_str())
     .bind(installation_id.as_str())
     .bind(i64::from(snapshot.schema_version))
-    .bind(plaintext)
-    .bind(vec![7_u8; 24])
-    .bind("keychain:test-authoring-v1")
-    .bind("xchacha20_poly1305")
+    .bind(ciphertext)
+    .bind(nonce.as_slice())
+    .bind(SNAPSHOT_TEST_KEY_ID)
+    .bind(XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1)
     .bind(authenticated_data.digest_hex())
     .bind(Json(&stored_bindings))
     .bind(binding_fingerprint.as_str())
@@ -633,7 +663,7 @@ async fn postgres_atomic_snapshot_rehydrates_only_the_exact_authorized_generatio
         guild_id: fixture.guild_id,
         user_id: fixture.user_id,
     };
-    let snapshots = PostgresAuthorizedPromotionSnapshots::new(shadow_pool, PassthroughCipher);
+    let snapshots = PostgresAuthorizedPromotionSnapshots::new(shadow_pool, snapshot_test_cipher());
     let promotions = PromotionCapture {
         captured: Mutex::new(None),
     };

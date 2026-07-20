@@ -7,6 +7,15 @@ use resource_resolution::ResourceBindingFingerprint;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+mod xchacha;
+
+pub use xchacha::{
+    SnapshotEnvelopeKeyError, SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringError,
+    SnapshotEnvelopeKeyringV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
+    XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1,
+    XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
+};
+
 const AUTHENTICATED_DATA_DOMAIN_V1: &[u8] = b"starring.authoring.snapshot_envelope.v1\0";
 const MIN_CIPHERTEXT_BYTES: usize = 16;
 const MAX_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -226,14 +235,7 @@ fn validate_header(
     encryption_suite: &str,
     encryption_suite_version: u16,
 ) -> Result<(), SnapshotAuthenticatedDataError> {
-    if encryption_key_id.is_empty()
-        || encryption_key_id.len() > 128
-        || !encryption_key_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'/' | b'-')
-        })
-    {
-        return Err(SnapshotAuthenticatedDataError::InvalidKeyId);
-    }
+    validate_key_id(encryption_key_id)?;
     if encryption_suite.is_empty()
         || encryption_suite.len() > 64
         || !encryption_suite
@@ -248,6 +250,18 @@ fn validate_header(
     }
     if encryption_suite_version == 0 || encryption_suite_version > i16::MAX as u16 {
         return Err(SnapshotAuthenticatedDataError::InvalidSuiteVersion);
+    }
+    Ok(())
+}
+
+fn validate_key_id(encryption_key_id: &str) -> Result<(), SnapshotAuthenticatedDataError> {
+    if encryption_key_id.is_empty()
+        || encryption_key_id.len() > 128
+        || !encryption_key_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'/' | b'-')
+        })
+    {
+        return Err(SnapshotAuthenticatedDataError::InvalidKeyId);
     }
     Ok(())
 }
@@ -310,24 +324,96 @@ mod tests {
 
     #[test]
     fn authenticated_data_changes_for_every_authority_field() {
-        let base = authenticated_data();
-        let tenant_id = TenantId::parse("tenant-2").unwrap();
-        let installation_id = AutomationInstallationId::parse("installation-1").unwrap();
-        let session_id = AuthoringSessionId::parse("session-1").unwrap();
-        let binding_fingerprint = ResourceBindingFingerprint::parse(&"a".repeat(64)).unwrap();
-        let changed = build_snapshot_authenticated_data_v1(SnapshotAuthenticatedDataInputV1 {
-            tenant_id: &tenant_id,
-            installation_id: &installation_id,
-            session_id: &session_id,
-            generation: SessionGeneration::new(1).unwrap(),
-            snapshot_schema_version: 8,
-            binding_fingerprint: &binding_fingerprint,
-            encryption_key_id: "keychain:authoring-v1",
-            encryption_suite: "xchacha20_poly1305",
-            encryption_suite_version: 1,
-        })
-        .unwrap();
-        assert_ne!(base.digest_hex(), changed.digest_hex());
+        #[derive(Clone, Copy)]
+        struct Input<'a> {
+            tenant: &'a str,
+            installation: &'a str,
+            session: &'a str,
+            generation: u64,
+            schema_version: u32,
+            fingerprint: char,
+            key_id: &'a str,
+            suite: &'a str,
+            suite_version: u16,
+        }
+
+        impl Input<'_> {
+            fn digest(self) -> String {
+                let tenant_id = TenantId::parse(self.tenant).unwrap();
+                let installation_id = AutomationInstallationId::parse(self.installation).unwrap();
+                let session_id = AuthoringSessionId::parse(self.session).unwrap();
+                let binding_fingerprint =
+                    ResourceBindingFingerprint::parse(&self.fingerprint.to_string().repeat(64))
+                        .unwrap();
+                build_snapshot_authenticated_data_v1(SnapshotAuthenticatedDataInputV1 {
+                    tenant_id: &tenant_id,
+                    installation_id: &installation_id,
+                    session_id: &session_id,
+                    generation: SessionGeneration::new(self.generation).unwrap(),
+                    snapshot_schema_version: self.schema_version,
+                    binding_fingerprint: &binding_fingerprint,
+                    encryption_key_id: self.key_id,
+                    encryption_suite: self.suite,
+                    encryption_suite_version: self.suite_version,
+                })
+                .unwrap()
+                .digest_hex()
+                .to_string()
+            }
+        }
+
+        let baseline = Input {
+            tenant: "tenant-1",
+            installation: "installation-1",
+            session: "session-1",
+            generation: 1,
+            schema_version: 8,
+            fingerprint: 'a',
+            key_id: "keychain:authoring-v1",
+            suite: "xchacha20_poly1305",
+            suite_version: 1,
+        };
+        let base = baseline.digest();
+        let changed = [
+            Input {
+                tenant: "tenant-2",
+                ..baseline
+            },
+            Input {
+                installation: "installation-2",
+                ..baseline
+            },
+            Input {
+                session: "session-2",
+                ..baseline
+            },
+            Input {
+                generation: 2,
+                ..baseline
+            },
+            Input {
+                schema_version: 9,
+                ..baseline
+            },
+            Input {
+                fingerprint: 'b',
+                ..baseline
+            },
+            Input {
+                key_id: "keychain:authoring-v2",
+                ..baseline
+            },
+            Input {
+                suite: "xchacha20_poly1305_alt",
+                ..baseline
+            },
+            Input {
+                suite_version: 2,
+                ..baseline
+            },
+        ]
+        .map(Input::digest);
+        assert!(changed.iter().all(|digest| digest != &base));
     }
 
     #[test]

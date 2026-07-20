@@ -31,7 +31,10 @@ pub use digest::{
 pub use envelope::{
     build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
     SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1, SnapshotAuthenticatedDataV1,
-    SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+    SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError, SnapshotEnvelopeKeyError,
+    SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringError, SnapshotEnvelopeKeyringV1,
+    XChaCha20Poly1305SnapshotEnvelopeCipherV1, XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1,
+    XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
 };
 pub use installation_authority::{
     InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,

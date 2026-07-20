@@ -10,6 +10,25 @@ fn pure_application_does_not_depend_on_postgres_adapter() {
 }
 
 #[test]
+fn snapshot_cipher_keeps_audited_crypto_and_secret_memory_boundaries() {
+    let manifest = include_str!("../Cargo.toml");
+    let cipher = include_str!("../src/envelope/xchacha.rs");
+    assert!(manifest.contains(
+        "chacha20poly1305 = { version = \"0.11\", default-features = false, features = [\"alloc\", \"zeroize\"] }"
+    ));
+    assert!(cipher.contains("secret: Zeroizing<[u8; 32]>"));
+    assert!(cipher.contains("keys: Arc<[SnapshotEnvelopeKeyV1]>"));
+    assert!(cipher.contains("AeadInOut"));
+    assert!(cipher.contains("decrypt_in_place"));
+    assert!(cipher.contains("let cipher_key: &Key = key.secret().into()"));
+    assert!(cipher.contains("ConstantTimeEq"));
+    assert!(cipher.contains("MAX_SNAPSHOT_ENVELOPE_KEYS: usize = 8"));
+    assert!(cipher.contains("XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1: usize = 24"));
+    assert!(!cipher.contains("impl Clone for SnapshotEnvelopeKeyV1"));
+    assert!(!cipher.contains("Key::from(*key.secret())"));
+}
+
+#[test]
 fn shared_migrators_watch_the_root_migration_history() {
     for build_script in [
         include_str!("../build.rs"),
