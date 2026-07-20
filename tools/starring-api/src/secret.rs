@@ -154,7 +154,9 @@ impl EnvironmentSecretReaderV1 for ProcessEnvironmentSecretReaderV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeychainSecretReadErrorV1 {
     Unavailable,
+    #[cfg(any(target_os = "macos", test))]
     Timeout,
+    #[cfg(any(target_os = "macos", test))]
     OutputTooLarge,
 }
 
@@ -811,7 +813,9 @@ fn zeroizing_utf8(
 fn map_keychain_error(error: KeychainSecretReadErrorV1) -> SecretResolutionErrorV1 {
     match error {
         KeychainSecretReadErrorV1::Unavailable => SecretResolutionErrorV1::KeychainUnavailable,
+        #[cfg(any(target_os = "macos", test))]
         KeychainSecretReadErrorV1::Timeout => SecretResolutionErrorV1::KeychainTimeout,
+        #[cfg(any(target_os = "macos", test))]
         KeychainSecretReadErrorV1::OutputTooLarge => SecretResolutionErrorV1::TooLarge,
     }
 }
