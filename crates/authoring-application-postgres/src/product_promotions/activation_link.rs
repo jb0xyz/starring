@@ -12,8 +12,8 @@ use super::authorization::{product_promotion_access_args_v1, ProductPromotionAcc
 use super::digest::{promotion_digests_v1, ProductPromotionDigestsV1};
 use super::row::{
     decode_product_promotion_activation_link_v1, validate_product_promotion_admitted_for_access_v1,
-    ProductPromotionActivationLinkRowV1, ProductPromotionApprovalEnvironmentStageV1,
-    ProductPromotionFinalReplayV1,
+    ProductPromotionActivationLinkRowV1, ProductPromotionActivationStageV1,
+    ProductPromotionApprovalEnvironmentStageV1,
 };
 use super::store::PostgresProductPromotions;
 use super::transaction::{
@@ -35,7 +35,7 @@ impl PostgresProductPromotions {
         &self,
         access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
         environment: ProductPromotionApprovalEnvironmentStageV1,
-    ) -> Result<ProductPromotionFinalReplayV1, AuthorizedPromotionSubmissionErrorV1> {
+    ) -> Result<ProductPromotionActivationStageV1, AuthorizedPromotionSubmissionErrorV1> {
         let access_args = product_promotion_access_args_v1(access)?;
         let context = product_promotion_admission_context_v1(access);
         let digests = promotion_digests_v1(self.config.keyring(), access)
@@ -76,7 +76,7 @@ impl PostgresProductPromotions {
         environment: ProductPromotionApprovalEnvironmentStageV1,
         proposal: &PendingActivationProposalV1,
         serialized: &Json<Value>,
-    ) -> Result<ProductPromotionFinalReplayV1, AuthorizedPromotionSubmissionErrorV1> {
+    ) -> Result<ProductPromotionActivationStageV1, AuthorizedPromotionSubmissionErrorV1> {
         let expected_revision = i64::try_from(environment.admitted.record.revision.get())
             .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
         let mut retries = 0_u8;

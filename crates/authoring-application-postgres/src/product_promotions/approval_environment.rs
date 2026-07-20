@@ -18,7 +18,7 @@ use super::transaction::{
 };
 
 const APPROVAL_ENVIRONMENT_SQL: &str =
-    "SELECT outcome_code, historical_binding_revision, historical_resource_bindings, \
+    "SELECT outcome_code, promotion_record, historical_binding_revision, historical_resource_bindings, \
      historical_binding_fingerprint, active_version, active_content_hash, \
      target_artifact_projection, database_now \
      FROM public.starring_product_promotion_approval_environment_v1(\
@@ -181,6 +181,7 @@ mod tests {
         }
         assert!(!APPROVAL_ENVIRONMENT_SQL.contains("$20"));
         for projection in [
+            "promotion_record",
             "historical_binding_revision",
             "historical_resource_bindings",
             "historical_binding_fingerprint",

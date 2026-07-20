@@ -104,9 +104,57 @@ fn promotion_migration_is_fail_closed_and_scoped() {
     ));
     assert!(!migration.contains("--"));
     assert!(!migration.contains("/*"));
+    let publish_body = migration
+        .split("CREATE FUNCTION public.starring_product_promotion_publish_v1(")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    for required in [
+        "starring_product_promotion_authorize_current_v1",
+        "FOR UPDATE",
+        "INSERT INTO public.automation_ruleset_versions",
+        "UPDATE public.automation_ruleset_heads",
+        "UPDATE public.authoring_promotions",
+        "starring_ruleset_content_hash_v1",
+        "'published_exact'",
+        "'final_exact'",
+    ] {
+        assert!(
+            publish_body.contains(required),
+            "missing publish guard: {required}"
+        );
+    }
+    assert!(!publish_body.contains("automation_ruleset_activations.active_version"));
+
+    let environment_body = migration
+        .split("CREATE FUNCTION public.starring_product_promotion_approval_environment_v1(")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    for required in [
+        "starring_product_promotion_authorize_current_v1",
+        "promotion_record JSONB",
+        "historical_resource_bindings",
+        "historical_binding_fingerprint",
+        "automation_ruleset_activations",
+        "starring_product_ruleset_slot_exact_v1",
+        "target_artifact_projection",
+        "RETURN QUERY SELECT 'resolved'",
+    ] {
+        assert!(
+            environment_body.contains(required),
+            "missing approval-environment guard: {required}"
+        );
+    }
+    assert!(!environment_body.contains("INSERT INTO"));
+    assert!(!environment_body.contains("UPDATE public."));
+    assert!(!environment_body.contains("DELETE FROM"));
+
     for function in [
-        "starring_product_promotion_publish_v1",
-        "starring_product_promotion_approval_environment_v1",
         "starring_product_promotion_activation_link_v1",
         "starring_product_promotion_repair_link_v1",
     ] {

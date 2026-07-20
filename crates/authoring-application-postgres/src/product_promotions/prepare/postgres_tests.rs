@@ -3,11 +3,13 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
 
 use authoring_promotion::{
-    plan_start_promotion_v1, ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId,
-    AutomationInstallationId, BindingRevision, IdempotencyKey, PolicyRevision,
-    PreparedPromotionPlanV1, PrincipalId, PromotionRecordV1, SessionGeneration, StartPromotionV1,
-    TenantId,
+    plan_pending_activation_v1, plan_start_promotion_v1, ApprovalPolicyV1,
+    AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId, BindingRevision,
+    IdempotencyKey, PendingActivationDispositionV1, PendingActivationReceiptV1,
+    PendingActivationTransitionV1, PolicyRevision, PreparedPromotionPlanV1, PrincipalId,
+    PromotionRecordV1, SessionGeneration, StartPromotionV1, TenantId,
 };
+use automation_ruleset_activation::ActivationRequest;
 use chrono::{DateTime, TimeDelta, Utc};
 use design_harness::{
     BurstOutcome, DesignSession, LlmClient, LlmError, LlmResponse, Message, PreviewReadyArtifactV1,
@@ -17,6 +19,7 @@ use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, Permissions, UserId};
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
+use sqlx::Postgres;
 use sqlx::{Connection, Executor};
 
 use super::SerializedProductPromotionPrepareV1;
@@ -32,7 +35,10 @@ use crate::product_promotions::admission::{
 use crate::product_promotions::authorization::ProductPromotionAccessArgsV1;
 use crate::product_promotions::digest::{promotion_action_ids_v1, ProductPromotionDigestsV1};
 use crate::product_promotions::row::{
-    ProductPromotionAdmittedStageV1, ProductPromotionPrepareStageV1, ProductPromotionReplayStageV1,
+    decode_product_promotion_approval_environment_v1, decode_product_promotion_publication_v1,
+    ProductPromotionAdmittedStageV1, ProductPromotionApprovalEnvironmentRowV1,
+    ProductPromotionPrepareStageV1, ProductPromotionPublicationRowV1,
+    ProductPromotionReplayStageV1,
 };
 use crate::product_promotions::store::PostgresProductPromotions;
 use crate::MIGRATOR;
@@ -44,6 +50,7 @@ const KEY_MATERIAL_FINGERPRINT_DOMAIN: &[u8] =
     b"starring.product.promotion.digest-key-fingerprint.v1";
 const SESSION_DIGEST: [u8; 32] = [0x11; 32];
 const SHORT_SESSION_DIGEST: [u8; 32] = [0x55; 32];
+const DRIFT_SESSION_DIGEST: [u8; 32] = [0x99; 32];
 
 #[derive(Clone)]
 struct ScriptedClient {
@@ -107,12 +114,16 @@ async fn preview_ready_artifact() -> PreviewReadyArtifactV1 {
 }
 
 fn promotion_context() -> AuthenticatedPromotionContext {
+    promotion_context_at_generation(1)
+}
+
+fn promotion_context_at_generation(generation: u64) -> AuthenticatedPromotionContext {
     AuthenticatedPromotionContext {
         tenant_id: TenantId::parse("tenant").unwrap(),
         principal_id: PrincipalId::parse("principal").unwrap(),
         session_owner_id: PrincipalId::parse("principal").unwrap(),
         session_id: AuthoringSessionId::parse("authoring").unwrap(),
-        session_generation: SessionGeneration::new(1).unwrap(),
+        session_generation: SessionGeneration::new(generation).unwrap(),
         guild_id: GuildId(3001),
         installation_id: AutomationInstallationId::parse("installation").unwrap(),
         ruleset_key: "ruleset".parse().unwrap(),
@@ -127,9 +138,17 @@ fn promotion_context() -> AuthenticatedPromotionContext {
 }
 
 fn promotion_plan(secret: &str, artifact: PreviewReadyArtifactV1) -> PreparedPromotionPlanV1 {
+    promotion_plan_at_generation(secret, artifact, 1)
+}
+
+fn promotion_plan_at_generation(
+    secret: &str,
+    artifact: PreviewReadyArtifactV1,
+    generation: u64,
+) -> PreparedPromotionPlanV1 {
     plan_start_promotion_v1(StartPromotionV1 {
         idempotency_key: IdempotencyKey::parse(secret).unwrap(),
-        context: promotion_context(),
+        context: promotion_context_at_generation(generation),
         artifact,
     })
     .unwrap()
@@ -171,11 +190,14 @@ fn access_args(
     }
 }
 
-fn admission_context(request_id: &str) -> ProductPromotionAdmissionContextV1 {
+fn admission_context(
+    request_id: &str,
+    generation: SessionGeneration,
+) -> ProductPromotionAdmissionContextV1 {
     ProductPromotionAdmissionContextV1 {
         product_request_id: request_id.to_string(),
         authoring_session_id: AuthoringSessionId::parse("authoring").unwrap(),
-        generation: SessionGeneration::new(1).unwrap(),
+        generation,
     }
 }
 
@@ -207,7 +229,12 @@ fn promotion_digests(
             b"installation".as_slice(),
             b"principal".as_slice(),
             b"authoring".as_slice(),
-            b"1".as_slice(),
+            plan.intent
+                .authority
+                .session_generation
+                .get()
+                .to_string()
+                .as_bytes(),
             plan.promotion_id.as_str().as_bytes(),
         ],
     );
@@ -259,7 +286,7 @@ impl PreparedCase {
         session_digest: &[u8; 32],
     ) -> Self {
         let access = access_args(database_now, session_digest);
-        let context = admission_context(request_id);
+        let context = admission_context(request_id, plan.intent.authority.session_generation);
         let digests = promotion_digests(keyring, &plan, secret, session_digest);
         let admission =
             prepare_product_promotion_admission_v1(keyring, &context, &access, &plan, &digests)
@@ -520,6 +547,38 @@ async fn seed_short_lived_session(pool: &PgPool) {
     transaction.commit().await.unwrap();
 }
 
+async fn seed_drift_session(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO public.product_oauth_flows \
+         (state_digest, browser_nonce_digest, redirect_uri, return_path, created_at, expires_at, \
+          consumed_at, terminal_result_code) \
+         VALUES ($1, $2, 'https://starring.example/oauth/discord/callback', '/', \
+          CURRENT_TIMESTAMP - INTERVAL '1 minute', CURRENT_TIMESTAMP + INTERVAL '5 minutes', \
+          CURRENT_TIMESTAMP - INTERVAL '1 second', 'callback_claimed')",
+    )
+    .bind([0xaa_u8; 32].as_slice())
+    .bind([0xbb_u8; 32].as_slice())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.product_auth_sessions \
+         (session_digest, principal_id, csrf_digest, oauth_state_digest, authenticated_at, \
+          created_at, last_seen_at, idle_expires_at, absolute_expires_at) \
+         SELECT $1, 'principal', $2, $3, captured_at, captured_at, captured_at, \
+          captured_at + INTERVAL '20 minutes', captured_at + INTERVAL '1 hour' \
+         FROM (SELECT pg_catalog.clock_timestamp() AS captured_at) AS clock",
+    )
+    .bind(DRIFT_SESSION_DIGEST.as_slice())
+    .bind([0xcc_u8; 32].as_slice())
+    .bind([0xaa_u8; 32].as_slice())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
 async fn advance_authoring_head(pool: &PgPool) {
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -583,6 +642,23 @@ fn validate_prepare_stage(
         ProductPromotionPrepareStageV1::PartialExact(admitted) => {
             validate_admitted(&admitted, case);
             "partial_exact"
+        }
+        ProductPromotionPrepareStageV1::FinalReplayRequired(_)
+        | ProductPromotionPrepareStageV1::FinalExact(_) => {
+            panic!("prepared promotion unexpectedly reached a final state")
+        }
+    }
+}
+
+fn admitted_prepare_stage(
+    stage: ProductPromotionPrepareStageV1,
+    case: &PreparedCase,
+) -> ProductPromotionAdmittedStageV1 {
+    match stage {
+        ProductPromotionPrepareStageV1::Created(admitted)
+        | ProductPromotionPrepareStageV1::PartialExact(admitted) => {
+            validate_admitted(&admitted, case);
+            *admitted
         }
         ProductPromotionPrepareStageV1::FinalReplayRequired(_)
         | ProductPromotionPrepareStageV1::FinalExact(_) => {
@@ -659,6 +735,144 @@ async fn direct_prepare_with_candidates(
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+async fn direct_publish<'executor, ExecutorType>(
+    executor: ExecutorType,
+    access: &ProductPromotionAccessArgsV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+) -> ProductPromotionPublicationRowV1
+where
+    ExecutorType: Executor<'executor, Database = Postgres>,
+{
+    sqlx::query_as::<_, ProductPromotionPublicationRowV1>(
+        "SELECT outcome_code, publication_projection, promotion_record, database_now \
+         FROM public.starring_product_promotion_publish_v1(\
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+         $16, $17, $18, $19)",
+    )
+    .bind(&access.expected_tenant_id)
+    .bind(&access.expected_installation_id)
+    .bind(&access.expected_principal_id)
+    .bind(&access.expected_product_session_digest)
+    .bind(&access.expected_acting_user_id)
+    .bind(&access.expected_discord_application_id)
+    .bind(&access.expected_guild_id)
+    .bind(&access.expected_capability)
+    .bind(access.observed_current_authority_revision)
+    .bind(&access.observed_current_authority_payload_digest)
+    .bind(&access.authority_observation_digest)
+    .bind(access.authority_observed_at)
+    .bind(access.authority_expires_at)
+    .bind(&access.effective_permission_bits)
+    .bind(access.guild_owner)
+    .bind(admitted.record.id.as_str())
+    .bind(i64::try_from(admitted.record.revision.get()).unwrap())
+    .bind(admitted.record.request_digest.as_str())
+    .bind(&admitted.admission_digest)
+    .fetch_one(executor)
+    .await
+    .unwrap()
+}
+
+async fn direct_approval_environment<'executor, ExecutorType>(
+    executor: ExecutorType,
+    access: &ProductPromotionAccessArgsV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+) -> ProductPromotionApprovalEnvironmentRowV1
+where
+    ExecutorType: Executor<'executor, Database = Postgres>,
+{
+    sqlx::query_as::<_, ProductPromotionApprovalEnvironmentRowV1>(
+        "SELECT outcome_code, promotion_record, historical_binding_revision, historical_resource_bindings, \
+         historical_binding_fingerprint, active_version, active_content_hash, \
+         target_artifact_projection, database_now \
+         FROM public.starring_product_promotion_approval_environment_v1(\
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+         $16, $17, $18, $19)",
+    )
+    .bind(&access.expected_tenant_id)
+    .bind(&access.expected_installation_id)
+    .bind(&access.expected_principal_id)
+    .bind(&access.expected_product_session_digest)
+    .bind(&access.expected_acting_user_id)
+    .bind(&access.expected_discord_application_id)
+    .bind(&access.expected_guild_id)
+    .bind(&access.expected_capability)
+    .bind(access.observed_current_authority_revision)
+    .bind(&access.observed_current_authority_payload_digest)
+    .bind(&access.authority_observation_digest)
+    .bind(access.authority_observed_at)
+    .bind(access.authority_expires_at)
+    .bind(&access.effective_permission_bits)
+    .bind(access.guild_owner)
+    .bind(admitted.record.id.as_str())
+    .bind(i64::try_from(admitted.record.revision.get()).unwrap())
+    .bind(admitted.record.request_digest.as_str())
+    .bind(&admitted.admission_digest)
+    .fetch_one(executor)
+    .await
+    .unwrap()
+}
+
+async fn await_publish_lock_wait(pool: &PgPool) {
+    for _ in 0..200 {
+        let waiting = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_stat_activity \
+             WHERE datname = pg_catalog.current_database() \
+               AND pid <> pg_catalog.pg_backend_pid() \
+               AND state = 'active' \
+               AND wait_event_type = 'Lock' \
+               AND query LIKE '%starring_product_promotion_publish_v1%' \
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("publish did not enter a lock wait");
+}
+
+async fn install_ruleset_head_insert_delay(pool: &PgPool) {
+    sqlx::raw_sql(
+        r#"
+        CREATE FUNCTION public.starring_test_delay_ruleset_head_insert()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+            PERFORM pg_catalog.pg_sleep(0.35);
+            RETURN NEW;
+        END;
+        $function$;
+
+        CREATE TRIGGER automation_ruleset_heads_test_insert_delay
+        BEFORE INSERT ON public.automation_ruleset_heads
+        FOR EACH ROW
+        EXECUTE FUNCTION public.starring_test_delay_ruleset_head_insert();
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn remove_ruleset_head_insert_delay(pool: &PgPool) {
+    sqlx::raw_sql(
+        r#"
+        DROP TRIGGER automation_ruleset_heads_test_insert_delay
+        ON public.automation_ruleset_heads;
+        DROP FUNCTION public.starring_test_delay_ruleset_head_insert();
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn install_malformed_prepare_projection(pool: &PgPool) {
@@ -1042,6 +1256,471 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     .await
     .unwrap();
     assert_eq!(active_second_write_count, 0);
+
+    let publication_plan = promotion_plan("adapter-publication-key", artifact.clone());
+    let publication_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let publication_case = PreparedCase::new(
+        &ring,
+        publication_plan,
+        "adapter-publication-key",
+        "request-publication",
+        publication_now,
+        &SESSION_DIGEST,
+    );
+    let first_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &publication_case.access,
+                &publication_case.context,
+                &publication_case.digests,
+                &publication_case.plan,
+                &publication_case.admission,
+                &publication_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &publication_case,
+    );
+
+    install_ruleset_head_insert_delay(&pool).await;
+    let expiry_probe_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut expiry_probe_access = access_args(expiry_probe_now, &SESSION_DIGEST);
+    expiry_probe_access.authority_expires_at = expiry_probe_now + TimeDelta::milliseconds(200);
+    let expiry_probe = direct_publish(&pool, &expiry_probe_access, &first_prepared).await;
+    assert_eq!(expiry_probe.outcome_code, "access_denied");
+    assert!(expiry_probe.publication_projection.is_none());
+    assert!(expiry_probe.promotion_record.is_none());
+    remove_ruleset_head_insert_delay(&pool).await;
+    let denied_write_state = sqlx::query_as::<_, (i64, i64, String, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT stage FROM public.authoring_promotions WHERE id = $1), \
+         (SELECT revision FROM public.authoring_promotions WHERE id = $1)",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(denied_write_state, (0, 0, "prepared".to_string(), 1));
+
+    let invalid_digest_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let invalid_digest_access = access_args(invalid_digest_access_now, &SESSION_DIGEST);
+    let invalid_digest_stage = ProductPromotionAdmittedStageV1 {
+        record: first_prepared.record.clone(),
+        admission: first_prepared.admission.clone(),
+        admission_digest: "0".repeat(64),
+        database_now: first_prepared.database_now,
+    };
+    let invalid_digest = direct_publish(&pool, &invalid_digest_access, &invalid_digest_stage).await;
+    assert_eq!(invalid_digest.outcome_code, "persistence_corrupt");
+    assert!(invalid_digest.publication_projection.is_none());
+    assert!(invalid_digest.promotion_record.is_none());
+    let premature_environment =
+        direct_approval_environment(&pool, &invalid_digest_access, &first_prepared).await;
+    assert_eq!(premature_environment.outcome_code, "persistence_corrupt");
+    assert!(premature_environment.promotion_record.is_none());
+    assert!(premature_environment.historical_binding_revision.is_none());
+    assert!(premature_environment.historical_resource_bindings.is_none());
+    assert!(premature_environment
+        .historical_binding_fingerprint
+        .is_none());
+    assert!(premature_environment.active_version.is_none());
+    assert!(premature_environment.active_content_hash.is_none());
+    assert!(premature_environment.target_artifact_projection.is_none());
+    let rejected_write_state = sqlx::query_as::<_, (i64, i64, String, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT stage FROM public.authoring_promotions WHERE id = $1), \
+         (SELECT revision FROM public.authoring_promotions WHERE id = $1)",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected_write_state, (0, 0, "prepared".to_string(), 1));
+
+    let mut collision_transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_versions \
+         DROP CONSTRAINT arv_content_integrity",
+    )
+    .execute(&mut *collision_transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_heads \
+         (guild_id, ruleset_key, next_version) VALUES ('3001', 'ruleset', 2)",
+    )
+    .execute(&mut *collision_transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_versions \
+         (guild_id, ruleset_key, version, schema_version, definition, content_hash, created_by) \
+         VALUES ('3001', 'ruleset', 1, 1, \
+          pg_catalog.jsonb_build_object('version', 1, 'panels', '[]'::JSONB, \
+           'modals', '[]'::JSONB, 'rules', '[]'::JSONB), $1, '1001')",
+    )
+    .bind(
+        publication_case
+            .plan
+            .intent
+            .expected_registry_content_hash
+            .to_string(),
+    )
+    .execute(&mut *collision_transaction)
+    .await
+    .unwrap();
+    let collision_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *collision_transaction)
+            .await
+            .unwrap();
+    let collision_access = access_args(collision_access_now, &SESSION_DIGEST);
+    let collision = direct_publish(
+        &mut *collision_transaction,
+        &collision_access,
+        &first_prepared,
+    )
+    .await;
+    assert_eq!(collision.outcome_code, "persistence_corrupt");
+    assert!(collision.publication_projection.is_none());
+    assert!(collision.promotion_record.is_none());
+    let collision_state = sqlx::query_as::<_, (i64, i64, String, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT stage FROM public.authoring_promotions WHERE id = $1), \
+         (SELECT revision FROM public.authoring_promotions WHERE id = $1)",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .fetch_one(&mut *collision_transaction)
+    .await
+    .unwrap();
+    assert_eq!(collision_state, (1, 1, "prepared".to_string(), 1));
+    collision_transaction.rollback().await.unwrap();
+    let collision_rollback_state = sqlx::query_as::<_, (i64, i64, String, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT stage FROM public.authoring_promotions WHERE id = $1), \
+         (SELECT revision FROM public.authoring_promotions WHERE id = $1)",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(collision_rollback_state, (0, 0, "prepared".to_string(), 1));
+
+    seed_drift_session(&pool).await;
+    let drift_plan = promotion_plan("adapter-session-drift-key", artifact.clone());
+    let drift_now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let drift_case = PreparedCase::new(
+        &ring,
+        drift_plan,
+        "adapter-session-drift-key",
+        "request-session-drift",
+        drift_now,
+        &DRIFT_SESSION_DIGEST,
+    );
+    let drift_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &drift_case.access,
+                &drift_case.context,
+                &drift_case.digests,
+                &drift_case.plan,
+                &drift_case.admission,
+                &drift_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &drift_case,
+    );
+    let mut session_drift_transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE public.product_auth_sessions \
+         SET revoked_at = GREATEST(pg_catalog.clock_timestamp(), last_seen_at), \
+             revocation_reason = 'security_revocation' \
+         WHERE session_digest = $1",
+    )
+    .bind(DRIFT_SESSION_DIGEST.as_slice())
+    .execute(&mut *session_drift_transaction)
+    .await
+    .unwrap();
+    let drift_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let drift_access = access_args(drift_access_now, &DRIFT_SESSION_DIGEST);
+    let drift_publish = direct_publish(&pool, &drift_access, &drift_prepared);
+    let release_drift = async {
+        await_publish_lock_wait(&pool).await;
+        session_drift_transaction.commit().await.unwrap();
+    };
+    let (drift_publish, ()) = tokio::join!(drift_publish, release_drift);
+    assert_eq!(drift_publish.outcome_code, "access_denied");
+    assert!(drift_publish.publication_projection.is_none());
+    assert!(drift_publish.promotion_record.is_none());
+    let drift_write_state = sqlx::query_as::<_, (i64, i64, String, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT stage FROM public.authoring_promotions WHERE id = $1), \
+         (SELECT revision FROM public.authoring_promotions WHERE id = $1)",
+    )
+    .bind(drift_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(drift_write_state, (0, 0, "prepared".to_string(), 1));
+
+    let second_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &publication_case.access,
+                &publication_case.context,
+                &publication_case.digests,
+                &publication_case.plan,
+                &publication_case.admission,
+                &publication_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &publication_case,
+    );
+    let publish_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let publish_access = access_args(publish_access_now, &SESSION_DIGEST);
+    let first_publish = direct_publish(&pool, &publish_access, &first_prepared);
+    let second_publish = direct_publish(&pool, &publish_access, &second_prepared);
+    let (first_publish, second_publish) = tokio::join!(first_publish, second_publish);
+    let mut publication_outcomes = vec![
+        first_publish.outcome_code.clone(),
+        second_publish.outcome_code.clone(),
+    ];
+    publication_outcomes.sort();
+    assert_eq!(publication_outcomes, vec!["created", "published_exact"]);
+    let first_published =
+        decode_product_promotion_publication_v1(first_publish, &first_prepared).unwrap();
+    let second_published =
+        decode_product_promotion_publication_v1(second_publish, &second_prepared).unwrap();
+    assert_eq!(first_published.record, second_published.record);
+    assert!(!first_published.final_replay_required);
+    let published = ProductPromotionAdmittedStageV1 {
+        record: first_published.record,
+        admission: first_prepared.admission,
+        admission_digest: first_prepared.admission_digest,
+        database_now: first_published.database_now,
+    };
+    let publication_registry_state = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_heads), \
+         (SELECT next_version FROM public.automation_ruleset_heads \
+          WHERE guild_id = '3001' AND ruleset_key = 'ruleset'), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(publication_registry_state, (1, 2, 1, 0));
+
+    let exact_publish_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let exact_publish_access = access_args(exact_publish_access_now, &SESSION_DIGEST);
+    let exact_publish = direct_publish(&pool, &exact_publish_access, &published).await;
+    assert_eq!(exact_publish.outcome_code, "published_exact");
+    decode_product_promotion_publication_v1(exact_publish, &published).unwrap();
+
+    let environment_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let environment_access = access_args(environment_access_now, &SESSION_DIGEST);
+    let absent_environment =
+        direct_approval_environment(&pool, &environment_access, &published).await;
+    assert_eq!(absent_environment.outcome_code, "resolved");
+    assert!(absent_environment.active_version.is_none());
+    assert!(absent_environment.active_content_hash.is_none());
+    let absent_environment =
+        decode_product_promotion_approval_environment_v1(absent_environment, &published).unwrap();
+    assert_eq!(
+        absent_environment.target_artifact.content_hash,
+        publication_case.plan.intent.expected_registry_content_hash
+    );
+
+    let mut corrupt_pointer_transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         DISABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
+    .execute(&mut *corrupt_pointer_transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_activations \
+         (guild_id, ruleset_key, active_version) VALUES ('3001', 'ruleset', 1)",
+    )
+    .execute(&mut *corrupt_pointer_transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.automation_ruleset_activations \
+         ENABLE TRIGGER automation_ruleset_activations_assert_product_slot",
+    )
+    .execute(&mut *corrupt_pointer_transaction)
+    .await
+    .unwrap();
+    let corrupt_pointer_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *corrupt_pointer_transaction)
+            .await
+            .unwrap();
+    let corrupt_pointer_access = access_args(corrupt_pointer_access_now, &SESSION_DIGEST);
+    let corrupt_pointer = direct_approval_environment(
+        &mut *corrupt_pointer_transaction,
+        &corrupt_pointer_access,
+        &published,
+    )
+    .await;
+    assert_eq!(corrupt_pointer.outcome_code, "persistence_corrupt");
+    assert!(corrupt_pointer.promotion_record.is_none());
+    assert!(corrupt_pointer.historical_binding_revision.is_none());
+    assert!(corrupt_pointer.historical_resource_bindings.is_none());
+    assert!(corrupt_pointer.historical_binding_fingerprint.is_none());
+    assert!(corrupt_pointer.active_version.is_none());
+    assert!(corrupt_pointer.active_content_hash.is_none());
+    assert!(corrupt_pointer.target_artifact_projection.is_none());
+    corrupt_pointer_transaction.rollback().await.unwrap();
+
+    let pending_plan =
+        plan_pending_activation_v1(&published.record, absent_environment.resolved.clone()).unwrap();
+    let activation = ActivationRequest::create_product(
+        pending_plan.request().create,
+        absent_environment.database_now,
+    )
+    .unwrap();
+    let final_record = match pending_plan
+        .complete(
+            &published.record,
+            &PendingActivationReceiptV1 {
+                request: activation,
+                disposition: PendingActivationDispositionV1::Created,
+            },
+            absent_environment.database_now,
+        )
+        .unwrap()
+    {
+        PendingActivationTransitionV1::ActivationPending {
+            expected_record, ..
+        } => expected_record,
+        PendingActivationTransitionV1::Expired { .. }
+        | PendingActivationTransitionV1::RefreshJournal => {
+            panic!("expected activation-pending transition")
+        }
+    };
+    let final_record_json = serde_json::to_value(&final_record).unwrap();
+    let finalized_count = sqlx::query(
+        "UPDATE public.authoring_promotions \
+         SET revision = 3, stage = 'activation_pending', \
+             record = record || pg_catalog.jsonb_build_object( \
+                 'revision', 3, 'stage', $2::JSONB, 'updated_at', $3::TEXT \
+             ) \
+         WHERE id = $1 AND revision = 2 AND stage = 'published'",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .bind(sqlx::types::Json(&final_record_json["stage"]))
+    .bind(final_record_json["updated_at"].as_str().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(finalized_count, 1);
+    let final_publish_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let final_publish_access = access_args(final_publish_access_now, &SESSION_DIGEST);
+    let final_publish = direct_publish(&pool, &final_publish_access, &published).await;
+    assert_eq!(final_publish.outcome_code, "final_exact");
+    assert!(final_publish.promotion_record.is_some());
+    let final_publish = decode_product_promotion_publication_v1(final_publish, &published).unwrap();
+    assert!(final_publish.final_replay_required);
+    assert_eq!(final_publish.record, final_record);
+
+    let reused_plan = promotion_plan("adapter-publication-reused-key", artifact.clone());
+    let reused_now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let reused_case = PreparedCase::new(
+        &ring,
+        reused_plan,
+        "adapter-publication-reused-key",
+        "request-publication-reused",
+        reused_now,
+        &SESSION_DIGEST,
+    );
+    let reused_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &reused_case.access,
+                &reused_case.context,
+                &reused_case.digests,
+                &reused_case.plan,
+                &reused_case.admission,
+                &reused_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &reused_case,
+    );
+    let reused_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let reused_access = access_args(reused_access_now, &SESSION_DIGEST);
+    let reused = direct_publish(&pool, &reused_access, &reused_prepared).await;
+    assert_eq!(reused.outcome_code, "reused");
+    decode_product_promotion_publication_v1(reused, &reused_prepared).unwrap();
+    let reused_registry_state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+         (SELECT next_version FROM public.automation_ruleset_heads \
+          WHERE guild_id = '3001' AND ruleset_key = 'ruleset'), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_versions)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reused_registry_state, (2, 1));
 
     seed_short_lived_session(&pool).await;
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
