@@ -176,8 +176,29 @@ request digest. The stable promotion milestone is named `ActivationLinked`
 rather than implying the linked activation is still awaiting approval. Runtime
 failure metadata crosses the new observation boundary only through a closed
 public-code enum, while the older string-bearing public projections remain
-source compatible. Serving-lease expiry is internal validation evidence and is
-not an HTTP response field.
+source compatible. Serving-lease expiry remains internal validation evidence in
+the V1 HTTP response.
+
+The additive deployment operational-status V2 boundary preserves the V1 SQL
+signature, result and evidence shapes, HTTP wire response, and grant surface
+while exposing bounded convergence detail through a separate capability. The
+internal V1 runtime reason precedence is hardened so exact-identity mismatch is
+classified before disconnect or expiry and mismatched timestamps cannot affect
+the reason code; its HTTP projection remains Pending. An owner-only SQL core
+reads the original status evidence plus deployment, failure, and attestation
+attempt numbers in one query; V1 and V2 are projections over that core. A
+separate V2 reader readiness contract permits only its dedicated
+database-identity and V2 status functions and rejects V1, core, every user
+relation or sequence capability, DML, DDL, and unrelated executable access.
+The pure application reports closed convergence phases, retry waiting or due state,
+blocked recovery or authority-restoration action, exact attestation attempt, and
+seven closed serving-freshness states. Wrong identity evidence is redacted, and
+controller IDs, fencing tokens, failure IDs and messages, process identities,
+build revisions, shard IDs, and panel digests never cross the product boundary.
+The hardened HTTP library exposes this only through the separate
+`ProductControlOperationalFacadeV2` router at
+`GET /v2/installations/{installation_id}/promotions/{promotion_id}/deployment`;
+the existing router continues to return 404 for that path.
 
 A provisioned product installation exclusively owns its `(guild, RuleSet key)`
 slot. Legacy and generic direct activation attempts plus installation takeover
@@ -694,31 +715,27 @@ The immediate sequence is:
 2. Add declarative owner/API bootstrap, restrictive defaults, aggregate
    same-database and distinct-role readiness, and one complete non-owner process
    probe while keeping the runtime role separate.
-3. Extend the runtime observation with typed phase, attempt, retry or operator
-   action, and attestation identities, and compose the current decision state
-   for promotion responses without exposing leases or adding direct database
-   reads in the facade.
-4. Bridge the existing hardened router to `ProductControlApplication` through a
+3. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry
    labels, and readiness that fails before accepting traffic. Normalize
    inaccessible Discord membership and unknown installation IDs without turning
    a valid member's insufficient permission into a false 404.
-5. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+4. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
    restrictive grants/default privileges; row policies; direct-DML denial; and
    a CI-tested positive/negative capability matrix.
-6. Build `tools/starring-runtime` with its separate DB role and bot credential,
+5. Build `tools/starring-runtime` with its separate DB role and bot credential,
    then prove Requested through exact Live and Live-loss recovery against a real
    Discord test guild.
-7. Connect a trusted server-side harness writer so only validated and simulated
+6. Connect a trusted server-side harness writer so only validated and simulated
    Luna output can advance encrypted `PreviewReady` generations.
-8. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+7. Preserve the passing clean-source cohort and failed diagnostic cohorts as
    separate immutable evidence, then measure queueing, concurrency, saturation,
    soak recovery, and worker high availability before setting a commercial SLO.
-9. Add typed multi-turn preference accumulation and the typed-planner handoff
+8. Add typed multi-turn preference accumulation and the typed-planner handoff
    while preserving the same deterministic candidate gates and no-deploy model
    boundary.
-10. Add whole-plan deterministic preflight, compensation, reconciliation, and
+9. Add whole-plan deterministic preflight, compensation, reconciliation, and
    uncertain-external-effect replay before expanding the recipe catalog or
    beginning the separate `StatefulSpec` runtime arc.
 
