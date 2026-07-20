@@ -1,4 +1,4 @@
-use super::projection_validation::validate_approval_phase;
+use super::projection_validation::{validate_approval_phase, validate_rejection_phase};
 use super::ProductControlApplication;
 use crate::status::validate_decision_projection;
 use crate::{
@@ -83,6 +83,7 @@ where
             ))
             .await?;
         validate_decision_projection(authorized.scope(), &promotion, receipt.projection())?;
+        validate_rejection_phase(receipt.projection().phase())?;
         Ok(receipt)
     }
 

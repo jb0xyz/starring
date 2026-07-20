@@ -20,6 +20,16 @@ pub(super) fn validate_approval_phase(
     }
 }
 
+pub(super) fn validate_rejection_phase(
+    phase: &ProductDecisionPhaseV1,
+) -> Result<(), ProductApplicationError> {
+    if matches!(phase, ProductDecisionPhaseV1::Rejected) {
+        Ok(())
+    } else {
+        Err(ProductApplicationError::InvalidProjection)
+    }
+}
+
 pub(super) fn validate_preview(
     scope: &crate::AuthorizedInstallationScopeV1,
     promotion: &crate::PromotionSelectorV1,
