@@ -1,9 +1,20 @@
+mod composition;
+mod config;
 mod error;
 mod facade;
 mod input;
 mod projection;
+mod secret;
 mod server;
 
+pub use composition::{
+    compose_production_service_v1, ComposedProductionServiceV1, ProductionCompositionErrorV1,
+    ProductionDatabasePoolShutdownErrorV1, ProductionDatabasePoolShutdownV1,
+    ProductionReadinessPhaseV1,
+};
+pub use config::{
+    DatabaseRoleV1, ProductionConfigErrorV1, ProductionConfigV1, ProductionConfigurationFieldV1,
+};
 pub use error::{
     map_authentication_error, map_authoring_application_error, map_database_failure,
     map_discord_oauth_error, map_fresh_authority_error, map_oauth_flow_error,
@@ -25,7 +36,12 @@ pub use projection::{
     project_deployment, project_deployment_operational_v2, project_oauth_callback,
     project_oauth_start, project_product_status, project_promotion,
 };
+pub use secret::{
+    resolve_production_secrets_v1, KeyringPayloadErrorV1, ProductionSecretResolutionErrorV1,
+    ResolvedProductionSecretsV1, SecretResolutionErrorV1,
+};
 pub use server::{
     serve_verified_loopback, LoopbackServeErrorV1, LoopbackServeReportV1,
+    LoopbackServerConfigErrorV1, LoopbackServerConfigInputV1, LoopbackServerConfigV1,
     MAX_GRACEFUL_DRAIN_TIMEOUT,
 };

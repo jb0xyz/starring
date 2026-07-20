@@ -11,14 +11,22 @@ authoring-application-postgres = { path = "../../crates/authoring-application-po
 authoring-promotion = { path = "../../crates/authoring-promotion" }
 automation-ruleset = { path = "../../crates/automation-ruleset" }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+base64 = "0.22"
 chrono = "0.4"
-hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio", "service"] }
 product-control-http = { path = "../../crates/product-control-http" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+twilight-http = "0.17"
+url = "2"
+zeroize = "1"
 
 [dev-dependencies]
 discord-model = { path = "../../crates/discord-model" }
-serde_json = { workspace = true }
+hyper = { version = "1", default-features = false, features = ["client"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }

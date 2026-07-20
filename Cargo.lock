@@ -3112,15 +3112,21 @@ dependencies = [
  "authoring-promotion",
  "automation-ruleset",
  "axum",
+ "base64",
  "chrono",
  "discord-model",
  "hyper",
  "hyper-util",
  "product-control-http",
+ "serde",
  "serde_json",
+ "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tower",
+ "twilight-http",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
