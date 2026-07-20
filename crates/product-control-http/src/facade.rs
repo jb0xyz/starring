@@ -3,8 +3,9 @@ use std::fmt::{Debug, Formatter};
 use uuid::Uuid;
 
 use crate::{
-    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView, DeploymentView,
-    FacadeError, OAuthCode, OAuthState, ProductState, PromotionView, SessionCredential,
+    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView,
+    DeploymentOperationalViewV2, DeploymentView, FacadeError, OAuthCode, OAuthState, ProductState,
+    PromotionView, SessionCredential,
 };
 
 const RESOURCE_ID_MAX_BYTES: usize = 128;
@@ -272,6 +273,16 @@ pub trait ProductControlFacade: Send + Sync + 'static {
     ) -> Result<DeploymentView, FacadeError>;
 
     async fn readiness(&self) -> Result<(), FacadeError>;
+}
+
+#[async_trait::async_trait]
+pub trait ProductControlOperationalFacadeV2: ProductControlFacade {
+    async fn deployment_operational_v2(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+        promotion_id: &str,
+    ) -> Result<DeploymentOperationalViewV2, FacadeError>;
 }
 
 pub(crate) fn validate_scoped_path(installation_id: &str, promotion_id: &str) -> bool {

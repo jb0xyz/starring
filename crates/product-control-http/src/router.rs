@@ -19,12 +19,13 @@ use crate::facade::{is_live_exact_replay, validate_scoped_path};
 use crate::{
     ApplyCommand, CurrentPrincipalView, DecisionCommand, FacadeError, FacadeErrorCode,
     HttpBoundaryConfig, OAuthCallbackCommand, OAuthStartCommand, ProductControlFacade,
-    PromoteCommand, RejectCommand, SessionCredential,
+    ProductControlOperationalFacadeV2, PromoteCommand, RejectCommand, SessionCredential,
 };
 use boundary::*;
 use response_validation::{
     valid_apply_view, valid_approval_view, valid_current_principal, valid_decision_view,
-    valid_deployment_view, valid_preview_view, valid_promotion_view, valid_rejection_view,
+    valid_deployment_operational_view_v2, valid_deployment_view, valid_preview_view,
+    valid_promotion_view, valid_rejection_view,
 };
 
 struct HttpState<F> {
@@ -70,12 +71,38 @@ pub fn product_control_router<F>(facade: Arc<F>, config: HttpBoundaryConfig) -> 
 where
     F: ProductControlFacade,
 {
-    let state = HttpState {
+    let state = http_state(facade, config);
+    finish_product_control_router(product_control_routes::<F>(), state)
+}
+
+pub fn product_control_router_with_operational_v2<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    let state = http_state(facade, config);
+    let routes = product_control_routes::<F>().route(
+        "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
+        get(deployment_operational_v2::<F>),
+    );
+    finish_product_control_router(routes, state)
+}
+
+fn http_state<F>(facade: Arc<F>, config: HttpBoundaryConfig) -> HttpState<F> {
+    HttpState {
         facade,
         in_flight: Arc::new(Semaphore::new(config.max_in_flight())),
         readiness_in_flight: Arc::new(Semaphore::new(1)),
         config,
-    };
+    }
+}
+
+fn product_control_routes<F>() -> Router<HttpState<F>>
+where
+    F: ProductControlFacade,
+{
     Router::new()
         .route("/oauth/discord/start", get(oauth_start::<F>))
         .route("/oauth/discord/callback", get(oauth_callback::<F>))
@@ -113,6 +140,13 @@ where
         .route("/health/ready", get(readiness::<F>))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
+}
+
+fn finish_product_control_router<F>(routes: Router<HttpState<F>>, state: HttpState<F>) -> Router
+where
+    F: ProductControlFacade,
+{
+    routes
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(state.config.body_limit()))
         .layer(middleware::from_fn_with_state(
@@ -595,6 +629,37 @@ where
         .await
     {
         Ok(view) if valid_deployment_view(&view, &installation_id, &promotion_id) => {
+            Json(view).into_response()
+        }
+        Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),
+        Err(error) => map_facade(error, &request_id),
+    }
+}
+
+async fn deployment_operational_v2<F>(
+    State(state): State<HttpState<F>>,
+    Extension(request_id): Extension<RequestId>,
+    Path((installation_id, promotion_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    let credential = match session_credential(&headers, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !validate_scoped_path(&installation_id, &promotion_id) {
+        return invalid_input(&request_id);
+    }
+    match state
+        .facade
+        .deployment_operational_v2(&credential, &installation_id, &promotion_id)
+        .await
+    {
+        Ok(view)
+            if valid_deployment_operational_view_v2(&view, &installation_id, &promotion_id) =>
+        {
             Json(view).into_response()
         }
         Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),
