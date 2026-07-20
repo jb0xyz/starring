@@ -1080,14 +1080,32 @@ async fn corrupted_json_and_shadow_identity_fail_closed() {
     cleanup(&pool, tenant).await;
     let store = PostgresPromotionStore::new(pool.clone());
     let prepared = create_prepared(&store, tenant, "corruption-key", &sealed).await;
-    sqlx::query(
+    let guarded_tamper = sqlx::query(
         "UPDATE authoring_promotions SET record = jsonb_set(record, '{unexpected}', '1') \
          WHERE id = $1",
     )
     .bind(prepared.id.as_str())
     .execute(&pool)
+    .await;
+    assert!(is_check_violation(&guarded_tamper.unwrap_err()));
+    let mut corruption = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE authoring_promotions SET record = jsonb_set(record, '{unexpected}', '1') \
+         WHERE id = $1",
+    )
+    .bind(prepared.id.as_str())
+    .execute(&mut *corruption)
     .await
     .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = origin")
+        .execute(&mut *corruption)
+        .await
+        .unwrap();
+    corruption.commit().await.unwrap();
     assert!(matches!(
         store.get(&prepared.id).await,
         Err(PromotionStoreError::Backend(_))
