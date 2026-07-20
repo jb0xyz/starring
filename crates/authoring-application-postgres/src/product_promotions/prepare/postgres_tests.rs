@@ -27,7 +27,7 @@ use crate::product_action_digest::{
 };
 use crate::product_promotions::admission::{
     prepare_product_promotion_admission_v1, PreparedProductPromotionAdmissionV1,
-    ProductPromotionAdmissionContextV1,
+    ProductPromotionAdmissionContextV1, ProductPromotionAdmissionEvidenceV1,
 };
 use crate::product_promotions::authorization::ProductPromotionAccessArgsV1;
 use crate::product_promotions::digest::{promotion_action_ids_v1, ProductPromotionDigestsV1};
@@ -273,6 +273,33 @@ impl PreparedCase {
             admission,
             serialized,
         }
+    }
+}
+
+pub(in crate::product_promotions) async fn prepared_decoder_stage(
+    database_now: DateTime<Utc>,
+) -> ProductPromotionAdmittedStageV1 {
+    let keyring = keyring();
+    let secret = "decoder-adversarial-key";
+    let plan = promotion_plan(secret, preview_ready_artifact().await);
+    let case = PreparedCase::new(
+        &keyring,
+        plan,
+        secret,
+        "decoder-adversarial-request",
+        database_now,
+        &SESSION_DIGEST,
+    );
+    let record = PromotionRecordV1::prepared(case.plan.materialize(database_now).unwrap()).unwrap();
+    ProductPromotionAdmittedStageV1 {
+        record,
+        admission: ProductPromotionAdmissionEvidenceV1 {
+            format_version: 1,
+            payload: case.admission.payload,
+            admitted_at: database_now,
+        },
+        admission_digest: case.admission.digest,
+        database_now,
     }
 }
 

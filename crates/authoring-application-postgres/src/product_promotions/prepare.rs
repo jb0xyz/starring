@@ -295,4 +295,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod postgres_tests;
+pub(super) mod postgres_tests;

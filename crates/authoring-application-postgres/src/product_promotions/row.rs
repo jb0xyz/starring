@@ -1,16 +1,29 @@
 use std::fmt::{Debug, Formatter};
 
 use authoring_application::AuthorizedPromotionSubmissionErrorV1;
-use authoring_promotion::{PreparedPromotionPlanV1, PromotionRecordV1, PromotionStageV1};
-use automation_ruleset_activation::ExpectedActiveBaselineV1;
+use authoring_promotion::{
+    plan_approval_environment_v1, plan_ruleset_publication_v1, validate_exact_planned_record_v1,
+    PreparedPromotionPlanV1, PromotionRecordV1, PromotionRevision, PromotionStageV1,
+    PublicationDispositionV1, PublicationPortOutcomeV1, PublicationRecordV1,
+    PublishedAuthoringRuleSetV1, ResolvedProductApprovalContextV1,
+};
+use automation_ruleset::{content_hash, RuleSetVersion, RuleSetVersionId};
+use automation_ruleset_activation::{
+    validate_product_target_v1, ApprovalBindingContextV1, ExpectedActiveBaselineV1,
+};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use desired_state::ResourceKey;
 use discord_model::Permissions;
+use resource_resolution::{
+    approval_binding_fingerprint_v1, resource_binding_fingerprint_v2, ResolvedApprovalBinding,
+};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::types::Json;
 use subtle::ConstantTimeEq;
 
+use crate::bindings::decode_resource_bindings;
 use crate::product_action_digest::ProductActionDigestKeyringV1;
 
 use super::admission::{
@@ -22,6 +35,9 @@ use super::digest::{promotion_action_ids_v1, ProductPromotionDigestsV1};
 
 const MAX_PROMOTION_RECORD_BYTES: usize = 8_388_608;
 const MAX_ADMISSION_BYTES: usize = 32_768;
+const MAX_RESOURCE_BINDINGS_BYTES: usize = 262_144;
+const MAX_RULESET_DEFINITION_BYTES: usize = 524_288;
+const MAX_TARGET_ARTIFACT_BYTES: usize = 1_048_576;
 const MAX_RECEIPT_BYTES: usize = 65_536;
 const MAX_AUDIT_EVIDENCE_BYTES: usize = 65_536;
 const PROMOTION_ENDPOINT: &str = "product_promote_v1";
@@ -50,11 +66,80 @@ pub(super) struct ProductPromotionPrepareRowV1 {
     pub database_now: DateTime<Utc>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(super) struct ProductPromotionPublicationRowV1 {
+    pub outcome_code: String,
+    pub publication_projection: Option<Json<Value>>,
+    pub promotion_record: Option<Json<Value>>,
+    pub database_now: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+pub(super) struct ProductPromotionApprovalEnvironmentRowV1 {
+    pub outcome_code: String,
+    pub historical_binding_revision: Option<i64>,
+    pub historical_resource_bindings: Option<Json<Value>>,
+    pub historical_binding_fingerprint: Option<String>,
+    pub active_version: Option<i64>,
+    pub active_content_hash: Option<String>,
+    pub target_artifact_projection: Option<Json<Value>>,
+    pub database_now: DateTime<Utc>,
+}
+
 pub(crate) struct ProductPromotionAdmittedStageV1 {
     pub(crate) record: PromotionRecordV1,
     pub(crate) admission: ProductPromotionAdmissionEvidenceV1,
     pub(crate) admission_digest: String,
     pub(crate) database_now: DateTime<Utc>,
+}
+
+pub(crate) enum ProductPromotionPublishStageV1 {
+    Published(Box<ProductPromotionAdmittedStageV1>),
+    FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
+}
+
+impl Debug for ProductPromotionPublishStageV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Published(value) => formatter
+                .debug_tuple("ProductPromotionPublishStageV1::Published")
+                .field(value)
+                .finish(),
+            Self::FinalReplayRequired(value) => formatter
+                .debug_tuple("ProductPromotionPublishStageV1::FinalReplayRequired")
+                .field(value)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct ProductPromotionApprovalEnvironmentStageV1 {
+    pub(crate) admitted: ProductPromotionAdmittedStageV1,
+    pub(crate) resolved: ResolvedProductApprovalContextV1,
+    pub(crate) target_artifact: RuleSetVersion,
+}
+
+pub(super) struct ProductPromotionPublicationDecodedV1 {
+    pub(super) record: PromotionRecordV1,
+    pub(super) database_now: DateTime<Utc>,
+    pub(super) final_replay_required: bool,
+}
+
+pub(super) struct ProductPromotionApprovalEnvironmentDecodedV1 {
+    pub(super) resolved: ResolvedProductApprovalContextV1,
+    pub(super) target_artifact: RuleSetVersion,
+    pub(super) database_now: DateTime<Utc>,
+}
+
+impl Debug for ProductPromotionApprovalEnvironmentStageV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductPromotionApprovalEnvironmentStageV1")
+            .field("admitted", &self.admitted)
+            .field("resolved", &self.resolved)
+            .field("target_artifact", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Debug for ProductPromotionAdmittedStageV1 {
@@ -223,6 +308,21 @@ pub(crate) struct ProductPromotionAuditEvidenceProjectionV1 {
 #[serde(deny_unknown_fields)]
 struct ProductPromotionDependencyLatencyClassesV1 {}
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductPromotionPublicationProjectionV1 {
+    format_version: u16,
+    disposition: PublicationDispositionV1,
+    artifact: RuleSetVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductPromotionTargetArtifactProjectionV1 {
+    format_version: u16,
+    artifact: RuleSetVersion,
+}
+
 pub(super) fn decode_product_promotion_replay_v1(
     row: ProductPromotionReplayRowV1,
     keyring: &ProductActionDigestKeyringV1,
@@ -300,10 +400,22 @@ pub(super) fn decode_product_promotion_replay_v1(
                 }),
             ))
         }
-        "idempotency_conflict" => Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict),
-        "access_denied" => Err(AuthorizedPromotionSubmissionErrorV1::Forbidden),
-        "scope_mismatch" => Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch),
-        "persistence_corrupt" => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+        "idempotency_conflict" => {
+            require_all_absent(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict)
+        }
+        "access_denied" => {
+            require_all_absent(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        }
+        "scope_mismatch" => {
+            require_all_absent(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        }
+        "persistence_corrupt" => {
+            require_all_absent(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
         _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
     }
 }
@@ -376,14 +488,451 @@ pub(super) fn decode_product_promotion_prepare_v1(
                 _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
             }
         }
-        "idempotency_conflict" => Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict),
-        "generation_mismatch" => Err(AuthorizedPromotionSubmissionErrorV1::GenerationMismatch),
-        "access_denied" => Err(AuthorizedPromotionSubmissionErrorV1::Forbidden),
-        "scope_mismatch" => Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch),
-        "invalid_candidate" => Err(AuthorizedPromotionSubmissionErrorV1::InvalidCandidate),
-        "persistence_corrupt" => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+        "idempotency_conflict" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict)
+        }
+        "generation_mismatch" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::GenerationMismatch)
+        }
+        "access_denied" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        }
+        "scope_mismatch" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        }
+        "invalid_candidate" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)
+        }
+        "persistence_corrupt" => {
+            require_prepare_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
         _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
     }
+}
+
+pub(super) fn validate_product_promotion_admitted_for_access_v1(
+    admitted: &ProductPromotionAdmittedStageV1,
+    keyring: &ProductActionDigestKeyringV1,
+    context: &ProductPromotionAdmissionContextV1,
+    access: &ProductPromotionAccessArgsV1,
+    digests: &ProductPromotionDigestsV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    validate_product_promotion_admission_v1(
+        keyring,
+        &admitted.admission,
+        &admitted.admission_digest,
+    )
+    .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    validate_admitted_projection_v1(
+        &admitted.record,
+        &admitted.admission,
+        admitted.database_now,
+        keyring,
+        context,
+        access,
+        digests,
+    )
+}
+
+pub(super) fn decode_product_promotion_publication_v1(
+    row: ProductPromotionPublicationRowV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+) -> Result<ProductPromotionPublicationDecodedV1, AuthorizedPromotionSubmissionErrorV1> {
+    match row.outcome_code.as_str() {
+        "created" | "reused" | "published_exact" | "final_exact" => {
+            let projection =
+                decode_bounded_v1(row.publication_projection, MAX_TARGET_ARTIFACT_BYTES)?;
+            let persisted = decode_bounded_v1(row.promotion_record, MAX_PROMOTION_RECORD_BYTES)?;
+            validate_publication_success_v1(
+                row.outcome_code.as_str(),
+                &projection,
+                &persisted,
+                row.database_now,
+                &admitted.record,
+            )?;
+            Ok(ProductPromotionPublicationDecodedV1 {
+                final_replay_required: row.outcome_code == "final_exact",
+                record: persisted,
+                database_now: row.database_now,
+            })
+        }
+        "access_denied" => {
+            require_publication_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        }
+        "scope_mismatch" => {
+            require_publication_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        }
+        "persistence_corrupt" => {
+            require_publication_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+        _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+    }
+}
+
+pub(super) fn decode_product_promotion_approval_environment_v1(
+    row: ProductPromotionApprovalEnvironmentRowV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+) -> Result<ProductPromotionApprovalEnvironmentDecodedV1, AuthorizedPromotionSubmissionErrorV1> {
+    match row.outcome_code.as_str() {
+        "resolved" => validate_approval_environment_success_v1(row, &admitted.record),
+        "access_denied" => {
+            require_approval_environment_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        }
+        "scope_mismatch" => {
+            require_approval_environment_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        }
+        "persistence_corrupt" => {
+            require_approval_environment_absent_v1(&row)?;
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+        _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+    }
+}
+
+fn validate_publication_success_v1(
+    outcome_code: &str,
+    projection: &ProductPromotionPublicationProjectionV1,
+    persisted: &PromotionRecordV1,
+    database_now: DateTime<Utc>,
+    admitted: &PromotionRecordV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    admitted
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    persisted
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if projection.format_version != 1
+        || admitted.updated_at > database_now
+        || persisted.updated_at > database_now
+        || persisted.updated_at < admitted.updated_at
+        || (matches!(outcome_code, "created" | "reused")
+            && admitted.stage != PromotionStageV1::Prepared)
+        || (outcome_code == "created"
+            && projection.disposition != PublicationDispositionV1::Created)
+        || (outcome_code == "reused" && projection.disposition != PublicationDispositionV1::Reused)
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let prepared = publication_planning_basis_v1(admitted)?;
+    let proposal = plan_ruleset_publication_v1(&prepared)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    validate_ruleset_artifact_v1(&proposal.request(), &projection.artifact)?;
+    let artifact = PublishedAuthoringRuleSetV1 {
+        guild_id: projection.artifact.guild_id,
+        ruleset_key: projection.artifact.ruleset_key.clone(),
+        version: projection.artifact.version,
+        schema_version: projection.artifact.schema_version,
+        definition: projection.artifact.definition.clone(),
+        content_hash: projection.artifact.content_hash,
+        created_by: projection.artifact.created_by,
+    };
+    let port_outcome = match projection.disposition {
+        PublicationDispositionV1::Created => PublicationPortOutcomeV1::Created(artifact),
+        PublicationDispositionV1::Reused => PublicationPortOutcomeV1::Reused(artifact),
+    };
+    let transition = proposal
+        .complete(&prepared, port_outcome, persisted.updated_at)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    match outcome_code {
+        "created" | "reused" | "published_exact" => {
+            validate_exact_planned_record_v1(&transition.expected_record, persisted)
+                .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+            if matches!(&admitted.stage, PromotionStageV1::Published { .. })
+                && admitted != persisted
+            {
+                return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+            }
+            if matches!(outcome_code, "created" | "reused") && persisted.updated_at != database_now
+            {
+                return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+            }
+        }
+        "final_exact" => {
+            let publication = final_publication_v1(persisted)?;
+            if publication != &transition.publication
+                || persisted.id != prepared.id
+                || persisted.request_digest != prepared.request_digest
+                || persisted.intent != prepared.intent
+                || persisted.created_at != prepared.created_at
+            {
+                return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+            }
+            if is_final_stage(&admitted.stage) && admitted != persisted {
+                return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+            }
+        }
+        _ => return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+    }
+    Ok(())
+}
+
+fn validate_approval_environment_success_v1(
+    row: ProductPromotionApprovalEnvironmentRowV1,
+    admitted: &PromotionRecordV1,
+) -> Result<ProductPromotionApprovalEnvironmentDecodedV1, AuthorizedPromotionSubmissionErrorV1> {
+    admitted
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if admitted.updated_at > row.database_now {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let published = approval_environment_planning_basis_v1(admitted)?;
+    let plan = plan_approval_environment_v1(&published)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let request = plan.request();
+    let historical_binding_revision = row
+        .historical_binding_revision
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if historical_binding_revision.get() != request.binding_revision.get() {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let historical_bindings_value = bounded_json_value_v1(
+        row.historical_resource_bindings,
+        MAX_RESOURCE_BINDINGS_BYTES,
+    )?;
+    let historical_bindings = decode_resource_bindings(historical_bindings_value)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let historical_binding_fingerprint = row
+        .historical_binding_fingerprint
+        .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if resource_binding_fingerprint_v2(&historical_bindings).as_str()
+        != historical_binding_fingerprint
+        || request.context_fingerprint.as_str() != historical_binding_fingerprint
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let required_bindings = request
+        .required_channel_bindings
+        .iter()
+        .map(|key| {
+            let key = ResourceKey(key.clone());
+            historical_bindings
+                .channel_bindings
+                .get(&key)
+                .copied()
+                .map(|id| ResolvedApprovalBinding::Channel { key, id })
+                .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let approval_fingerprint = approval_binding_fingerprint_v1(
+        request.target.guild_id,
+        historical_binding_revision,
+        &required_bindings,
+    )
+    .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let binding = ApprovalBindingContextV1 {
+        revision: historical_binding_revision,
+        required_bindings,
+        fingerprint: approval_fingerprint,
+    };
+    if !binding.validate(request.target.guild_id) {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let baseline = decode_active_baseline_v1(row.active_version, row.active_content_hash)?;
+    let target_projection = decode_bounded_v1::<ProductPromotionTargetArtifactProjectionV1>(
+        row.target_artifact_projection,
+        MAX_TARGET_ARTIFACT_BYTES,
+    )?;
+    if target_projection.format_version != 1 {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    validate_target_artifact_v1(&published, &request.target, &target_projection.artifact)?;
+    Ok(ProductPromotionApprovalEnvironmentDecodedV1 {
+        resolved: ResolvedProductApprovalContextV1 { binding, baseline },
+        target_artifact: target_projection.artifact,
+        database_now: row.database_now,
+    })
+}
+
+fn publication_planning_basis_v1(
+    record: &PromotionRecordV1,
+) -> Result<PromotionRecordV1, AuthorizedPromotionSubmissionErrorV1> {
+    match &record.stage {
+        PromotionStageV1::Prepared => Ok(record.clone()),
+        PromotionStageV1::Published { .. }
+        | PromotionStageV1::ActivationPending { .. }
+        | PromotionStageV1::Expired { .. } => {
+            let prepared = PromotionRecordV1 {
+                id: record.id.clone(),
+                revision: PromotionRevision::FIRST,
+                request_digest: record.request_digest.clone(),
+                intent: record.intent.clone(),
+                stage: PromotionStageV1::Prepared,
+                created_at: record.created_at,
+                updated_at: record.created_at,
+            };
+            prepared
+                .validate()
+                .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+            Ok(prepared)
+        }
+    }
+}
+
+fn approval_environment_planning_basis_v1(
+    record: &PromotionRecordV1,
+) -> Result<PromotionRecordV1, AuthorizedPromotionSubmissionErrorV1> {
+    let publication = match &record.stage {
+        PromotionStageV1::Published { publication }
+        | PromotionStageV1::ActivationPending { publication, .. }
+        | PromotionStageV1::Expired { publication, .. } => publication.clone(),
+        PromotionStageV1::Prepared => {
+            return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+    };
+    let published = PromotionRecordV1 {
+        id: record.id.clone(),
+        revision: PromotionRevision::new(2)
+            .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?,
+        request_digest: record.request_digest.clone(),
+        intent: record.intent.clone(),
+        stage: PromotionStageV1::Published { publication },
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    };
+    published
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    Ok(published)
+}
+
+fn final_publication_v1(
+    record: &PromotionRecordV1,
+) -> Result<&PublicationRecordV1, AuthorizedPromotionSubmissionErrorV1> {
+    match &record.stage {
+        PromotionStageV1::ActivationPending { publication, .. }
+        | PromotionStageV1::Expired { publication, .. } => Ok(publication),
+        PromotionStageV1::Prepared | PromotionStageV1::Published { .. } => {
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+    }
+}
+
+fn validate_ruleset_artifact_v1(
+    expected: &authoring_promotion::PublishAuthoringRuleSetV1,
+    artifact: &RuleSetVersion,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    let encoded_definition = serde_json::to_vec(&artifact.definition)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let computed = content_hash(artifact.schema_version, &artifact.definition)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if encoded_definition.len() > MAX_RULESET_DEFINITION_BYTES
+        || artifact.guild_id != expected.guild_id
+        || artifact.created_by.0 == 0
+        || artifact.ruleset_key != expected.ruleset_key
+        || artifact.definition != expected.definition
+        || artifact.content_hash != computed
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_target_artifact_v1(
+    published: &PromotionRecordV1,
+    target: &automation_ruleset_activation::ActivationTarget,
+    artifact: &RuleSetVersion,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    validate_product_target_v1(target, artifact)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let publication = match &published.stage {
+        PromotionStageV1::Published { publication } => publication,
+        PromotionStageV1::Prepared
+        | PromotionStageV1::ActivationPending { .. }
+        | PromotionStageV1::Expired { .. } => {
+            return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+    };
+    let encoded_definition = serde_json::to_vec(&artifact.definition)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let computed = content_hash(artifact.schema_version, &artifact.definition)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if encoded_definition.len() > MAX_RULESET_DEFINITION_BYTES
+        || artifact.created_by.0 == 0
+        || artifact.schema_version != publication.schema_version
+        || artifact.content_hash != publication.content_hash
+        || artifact.created_by != publication.registry_created_by
+        || artifact.definition != published.intent.definition
+        || computed != artifact.content_hash
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(())
+}
+
+fn decode_active_baseline_v1(
+    active_version: Option<i64>,
+    active_content_hash: Option<String>,
+) -> Result<ExpectedActiveBaselineV1, AuthorizedPromotionSubmissionErrorV1> {
+    match (active_version, active_content_hash) {
+        (None, None) => Ok(ExpectedActiveBaselineV1::Absent),
+        (Some(version), Some(content_hash)) => {
+            let version = u32::try_from(version)
+                .ok()
+                .and_then(|value| RuleSetVersionId::new(value).ok())
+                .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+            let content_hash = automation_ruleset::RuleSetContentHash::parse_hex(&content_hash)
+                .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+            Ok(ExpectedActiveBaselineV1::Exact {
+                version,
+                content_hash,
+            })
+        }
+        _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
+    }
+}
+
+fn require_publication_absent_v1(
+    row: &ProductPromotionPublicationRowV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    if row.publication_projection.is_none() && row.promotion_record.is_none() {
+        Ok(())
+    } else {
+        Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+    }
+}
+
+fn require_approval_environment_absent_v1(
+    row: &ProductPromotionApprovalEnvironmentRowV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    if row.historical_binding_revision.is_none()
+        && row.historical_resource_bindings.is_none()
+        && row.historical_binding_fingerprint.is_none()
+        && row.active_version.is_none()
+        && row.active_content_hash.is_none()
+        && row.target_artifact_projection.is_none()
+    {
+        Ok(())
+    } else {
+        Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+    }
+}
+
+fn bounded_json_value_v1(
+    value: Option<Json<Value>>,
+    maximum: usize,
+) -> Result<Value, AuthorizedPromotionSubmissionErrorV1> {
+    let value = value.ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    let encoded = serde_json::to_vec(&value.0)
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if encoded.len() > maximum {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(value.0)
 }
 
 fn decode_admitted_v1(
@@ -726,6 +1275,19 @@ fn require_all_absent(
     }
 }
 
+fn require_prepare_absent_v1(
+    row: &ProductPromotionPrepareRowV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    if row.promotion_record.is_some()
+        || row.admission_evidence.is_some()
+        || row.admission_digest.is_some()
+    {
+        Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+    } else {
+        Ok(())
+    }
+}
+
 fn decode_bounded_v1<T: DeserializeOwned>(
     value: Option<Json<Value>>,
     maximum: usize,
@@ -811,8 +1373,15 @@ fn same_postgres_timestamp(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use authoring_promotion::{
+        plan_pending_activation_v1, PendingActivationDispositionV1, PendingActivationReceiptV1,
+        PendingActivationTransitionV1,
+    };
+    use automation_ruleset_activation::ActivationRequest;
+    use discord_model::ChannelId;
     use serde_json::json;
 
+    use super::super::prepare::postgres_tests::prepared_decoder_stage;
     use super::*;
 
     fn database_now() -> DateTime<Utc> {
@@ -833,6 +1402,46 @@ mod tests {
         }
     }
 
+    fn publication_row(
+        outcome_code: &str,
+        publication_projection: Option<Json<Value>>,
+        promotion_record: Option<Json<Value>>,
+        database_now: DateTime<Utc>,
+    ) -> ProductPromotionPublicationRowV1 {
+        ProductPromotionPublicationRowV1 {
+            outcome_code: outcome_code.to_string(),
+            publication_projection,
+            promotion_record,
+            database_now,
+        }
+    }
+
+    fn approval_environment_row(outcome_code: &str) -> ProductPromotionApprovalEnvironmentRowV1 {
+        ProductPromotionApprovalEnvironmentRowV1 {
+            outcome_code: outcome_code.to_string(),
+            historical_binding_revision: None,
+            historical_resource_bindings: None,
+            historical_binding_fingerprint: None,
+            active_version: None,
+            active_content_hash: None,
+            target_artifact_projection: None,
+            database_now: database_now(),
+        }
+    }
+
+    fn admitted_with_record(
+        admitted: &ProductPromotionAdmittedStageV1,
+        record: PromotionRecordV1,
+        database_now: DateTime<Utc>,
+    ) -> ProductPromotionAdmittedStageV1 {
+        ProductPromotionAdmittedStageV1 {
+            record,
+            admission: admitted.admission.clone(),
+            admission_digest: admitted.admission_digest.clone(),
+            database_now,
+        }
+    }
+
     #[test]
     fn missing_requires_every_optional_projection_to_be_absent() {
         assert_eq!(require_all_absent(&missing_row()), Ok(()));
@@ -842,6 +1451,200 @@ mod tests {
             require_all_absent(&corrupt),
             Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
         );
+    }
+
+    #[test]
+    fn prepare_error_requires_every_optional_projection_to_be_absent() {
+        let mut row = ProductPromotionPrepareRowV1 {
+            outcome_code: "access_denied".to_string(),
+            promotion_record: None,
+            admission_evidence: None,
+            admission_digest: None,
+            database_now: database_now(),
+        };
+        assert_eq!(require_prepare_absent_v1(&row), Ok(()));
+        row.promotion_record = Some(Json(json!({})));
+        assert_eq!(
+            require_prepare_absent_v1(&row),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_and_approval_decoders_reject_adversarial_outcomes_and_bounds() {
+        let admitted = prepared_decoder_stage(database_now()).await;
+        assert!(matches!(
+            decode_product_promotion_publication_v1(
+                publication_row("access_denied", None, None, database_now()),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
+        ));
+        assert!(matches!(
+            decode_product_promotion_publication_v1(
+                publication_row(
+                    "access_denied",
+                    Some(Json(json!({"format_version": 1}))),
+                    None,
+                    database_now(),
+                ),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+
+        assert!(matches!(
+            decode_product_promotion_approval_environment_v1(
+                approval_environment_row("scope_mismatch"),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch)
+        ));
+        let mut approval_with_projection = approval_environment_row("scope_mismatch");
+        approval_with_projection.historical_resource_bindings = Some(Json(json!({})));
+        assert!(matches!(
+            decode_product_promotion_approval_environment_v1(approval_with_projection, &admitted,),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+
+        assert!(matches!(
+            decode_product_promotion_publication_v1(
+                publication_row("unexpected", None, None, database_now()),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+        assert!(matches!(
+            decode_product_promotion_approval_environment_v1(
+                approval_environment_row("unexpected"),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+
+        let oversized = Json(json!({"padding": "x".repeat(MAX_TARGET_ARTIFACT_BYTES + 1)}));
+        assert!(matches!(
+            decode_product_promotion_publication_v1(
+                publication_row("created", Some(oversized), None, database_now()),
+                &admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_exact_rejects_a_timestamp_regression_from_the_admitted_record() {
+        let admitted = prepared_decoder_stage(database_now()).await;
+        let publication_plan = plan_ruleset_publication_v1(&admitted.record).unwrap();
+        let request = publication_plan.request();
+        let artifact = RuleSetVersion {
+            guild_id: request.guild_id,
+            ruleset_key: request.ruleset_key,
+            version: RuleSetVersionId::FIRST,
+            schema_version: admitted.record.intent.registry_schema_version,
+            definition: request.definition,
+            content_hash: admitted.record.intent.expected_registry_content_hash,
+            created_by: request.created_by,
+        };
+        let early_publication_time = database_now() + Duration::seconds(1);
+        let activation_time = database_now() + Duration::seconds(2);
+        let late_publication_time = database_now() + Duration::seconds(3);
+        let result_time = database_now() + Duration::seconds(4);
+        let published_early = publication_plan
+            .complete(
+                &admitted.record,
+                PublicationPortOutcomeV1::Created(PublishedAuthoringRuleSetV1::from(
+                    artifact.clone(),
+                )),
+                early_publication_time,
+            )
+            .unwrap()
+            .expected_record;
+        let published_late = publication_plan
+            .complete(
+                &admitted.record,
+                PublicationPortOutcomeV1::Created(PublishedAuthoringRuleSetV1::from(
+                    artifact.clone(),
+                )),
+                late_publication_time,
+            )
+            .unwrap()
+            .expected_record;
+        let environment_request = plan_approval_environment_v1(&published_early)
+            .unwrap()
+            .request();
+        let binding_revision =
+            std::num::NonZeroU64::new(environment_request.binding_revision.get()).unwrap();
+        let required_bindings = environment_request
+            .required_channel_bindings
+            .iter()
+            .map(|key| ResolvedApprovalBinding::Channel {
+                key: ResourceKey(key.clone()),
+                id: ChannelId(700),
+            })
+            .collect::<Vec<_>>();
+        let binding = ApprovalBindingContextV1 {
+            revision: binding_revision,
+            fingerprint: approval_binding_fingerprint_v1(
+                environment_request.target.guild_id,
+                binding_revision,
+                &required_bindings,
+            )
+            .unwrap(),
+            required_bindings,
+        };
+        let pending_plan = plan_pending_activation_v1(
+            &published_early,
+            ResolvedProductApprovalContextV1 {
+                binding,
+                baseline: ExpectedActiveBaselineV1::Absent,
+            },
+        )
+        .unwrap();
+        let activation =
+            ActivationRequest::create_product(pending_plan.request().create, activation_time)
+                .unwrap();
+        let pending = match pending_plan
+            .complete(
+                &published_early,
+                &PendingActivationReceiptV1 {
+                    request: activation,
+                    disposition: PendingActivationDispositionV1::Created,
+                },
+                activation_time,
+            )
+            .unwrap()
+        {
+            PendingActivationTransitionV1::ActivationPending {
+                expected_record, ..
+            } => expected_record,
+            PendingActivationTransitionV1::Expired { .. }
+            | PendingActivationTransitionV1::RefreshJournal => {
+                panic!("expected activation-pending transition")
+            }
+        };
+        let projection = || {
+            Some(Json(json!({
+                "format_version": 1,
+                "disposition": "created",
+                "artifact": artifact.clone(),
+            })))
+        };
+        let persisted = || Some(Json(serde_json::to_value(&pending).unwrap()));
+        let early_admitted = admitted_with_record(&admitted, published_early, result_time);
+        assert!(decode_product_promotion_publication_v1(
+            publication_row("final_exact", projection(), persisted(), result_time),
+            &early_admitted,
+        )
+        .is_ok());
+        let late_admitted = admitted_with_record(&admitted, published_late, result_time);
+        assert!(matches!(
+            decode_product_promotion_publication_v1(
+                publication_row("final_exact", projection(), persisted(), result_time),
+                &late_admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
     }
 
     #[test]
@@ -860,6 +1663,83 @@ mod tests {
             decode_bounded_v1::<Value>(Some(oversized), 32),
             Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
         ));
+    }
+
+    #[test]
+    fn publication_and_target_artifact_envelopes_have_exact_versioned_shapes() {
+        let definition = json!({
+            "version": 1,
+            "panels": [],
+            "modals": [],
+            "rules": []
+        });
+        let typed_definition = serde_json::from_value(definition.clone()).unwrap();
+        let hash = content_hash(
+            automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION,
+            &typed_definition,
+        )
+        .unwrap()
+        .to_hex();
+        let artifact = json!({
+            "guild_id": "7",
+            "ruleset_key": "studyrooms",
+            "version": 1,
+            "schema_version": 1,
+            "definition": definition,
+            "content_hash": hash,
+            "created_by": "9"
+        });
+        let publication = decode_bounded_v1::<ProductPromotionPublicationProjectionV1>(
+            Some(Json(json!({
+                "format_version": 1,
+                "disposition": "created",
+                "artifact": artifact.clone()
+            }))),
+            MAX_TARGET_ARTIFACT_BYTES,
+        )
+        .unwrap();
+        let target = decode_bounded_v1::<ProductPromotionTargetArtifactProjectionV1>(
+            Some(Json(json!({
+                "format_version": 1,
+                "artifact": artifact.clone()
+            }))),
+            MAX_TARGET_ARTIFACT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(publication.format_version, 1);
+        assert_eq!(publication.artifact, target.artifact);
+        assert!(matches!(
+            decode_bounded_v1::<ProductPromotionTargetArtifactProjectionV1>(
+                Some(Json(json!({
+                    "format_version": 1,
+                    "artifact": artifact,
+                    "active": false
+                }))),
+                MAX_TARGET_ARTIFACT_BYTES,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+    }
+
+    #[test]
+    fn active_baseline_requires_a_canonical_nullable_pair() {
+        assert_eq!(
+            decode_active_baseline_v1(None, None),
+            Ok(ExpectedActiveBaselineV1::Absent)
+        );
+        let exact = decode_active_baseline_v1(Some(3), Some("ab".repeat(32))).unwrap();
+        assert_eq!(
+            exact,
+            ExpectedActiveBaselineV1::Exact {
+                version: RuleSetVersionId::new(3).unwrap(),
+                content_hash: automation_ruleset::RuleSetContentHash::parse_hex(&"ab".repeat(32))
+                    .unwrap()
+            }
+        );
+        assert!(decode_active_baseline_v1(Some(3), None).is_err());
+        assert!(decode_active_baseline_v1(None, Some("ab".repeat(32))).is_err());
+        assert!(decode_active_baseline_v1(Some(0), Some("ab".repeat(32))).is_err());
+        assert!(decode_active_baseline_v1(Some(1), Some("AB".repeat(32))).is_err());
     }
 
     #[test]
