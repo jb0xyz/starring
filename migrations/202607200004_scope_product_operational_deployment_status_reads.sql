@@ -1139,6 +1139,11 @@ DECLARE
     function_oid OID;
     grantee OID;
     grantee_name NAME;
+    default_grantee_clause TEXT;
+    default_schema_name NAME;
+    routine_identity TEXT;
+    unexpected_routine_identity TEXT;
+    user_schema_name NAME;
     function_identity_count BIGINT;
     invalid_function_count BIGINT;
     probe_count BIGINT;
@@ -1156,6 +1161,88 @@ BEGIN
         RAISE EXCEPTION 'product operational deployment status owner changed during migration'
             USING ERRCODE = '55000';
     END IF;
+
+    EXECUTE pg_catalog.format(
+        'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC',
+        common_owner_name
+    );
+
+    FOR user_schema_name IN
+        SELECT namespace.nspname
+        FROM pg_catalog.pg_namespace AS namespace
+        WHERE namespace.nspname <> 'information_schema'
+            AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+        ORDER BY namespace.nspname
+    LOOP
+        EXECUTE pg_catalog.format(
+            'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC',
+            common_owner_name,
+            user_schema_name
+        );
+    END LOOP;
+
+    FOR default_schema_name, grantee IN
+        SELECT namespace.nspname, privilege.grantee
+        FROM pg_catalog.pg_default_acl AS default_acl
+        CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS privilege
+        LEFT JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = default_acl.defaclnamespace
+        WHERE default_acl.defaclrole = common_owner
+            AND default_acl.defaclobjtype = 'f'
+            AND privilege.grantee <> common_owner
+            AND (
+                default_acl.defaclnamespace = 0
+                OR (
+                    namespace.nspname <> 'information_schema'
+                    AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+                )
+            )
+        ORDER BY namespace.nspname NULLS FIRST, privilege.grantee
+    LOOP
+        default_grantee_clause := CASE
+            WHEN grantee = 0 THEN 'PUBLIC'
+            ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(grantee))
+        END;
+        IF default_grantee_clause IS NULL THEN
+            RAISE EXCEPTION 'user routine default grantee is unavailable'
+                USING ERRCODE = '55000';
+        END IF;
+        IF default_schema_name IS NULL THEN
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON FUNCTIONS FROM %s',
+                common_owner_name,
+                default_grantee_clause
+            );
+        ELSE
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL PRIVILEGES ON FUNCTIONS FROM %s',
+                common_owner_name,
+                default_schema_name,
+                default_grantee_clause
+            );
+        END IF;
+    END LOOP;
+
+    FOR routine_identity IN
+        SELECT pg_catalog.format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            function_row.proname,
+            pg_catalog.pg_get_function_identity_arguments(function_row.oid)
+        )
+        FROM pg_catalog.pg_proc AS function_row
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = function_row.pronamespace
+        WHERE namespace.nspname <> 'information_schema'
+            AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+            AND function_row.prokind IN ('f', 'p')
+        ORDER BY namespace.nspname, function_row.proname, function_row.oid
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON ROUTINE %s FROM PUBLIC CASCADE',
+            routine_identity
+        );
+    END LOOP;
 
     FOR expected_signature IN
         SELECT expected.signature
@@ -1205,6 +1292,53 @@ BEGIN
             );
         END LOOP;
     END LOOP;
+
+    SELECT pg_catalog.min(pg_catalog.format(
+        '%I.%I(%s)',
+        namespace.nspname,
+        function_row.proname,
+        pg_catalog.pg_get_function_identity_arguments(function_row.oid)
+    ))
+    INTO unexpected_routine_identity
+        FROM pg_catalog.pg_proc AS function_row
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = function_row.pronamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+            function_row.proacl,
+            pg_catalog.acldefault('f', function_row.proowner)
+        )) AS privilege
+        WHERE namespace.nspname <> 'information_schema'
+            AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+            AND function_row.prokind IN ('f', 'p')
+            AND privilege.grantee = 0
+            AND privilege.privilege_type = 'EXECUTE';
+    IF unexpected_routine_identity IS NOT NULL THEN
+        RAISE EXCEPTION 'user routine public execution is not sealed: %',
+            unexpected_routine_identity
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_default_acl AS default_acl
+        CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS privilege
+        LEFT JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = default_acl.defaclnamespace
+        WHERE default_acl.defaclrole = common_owner
+            AND default_acl.defaclobjtype = 'f'
+            AND (
+                default_acl.defaclnamespace = 0
+                OR (
+                    namespace.nspname <> 'information_schema'
+                    AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+                )
+            )
+            AND privilege.grantee <> common_owner
+            AND privilege.privilege_type = 'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'user routine execution defaults are not sealed'
+            USING ERRCODE = '55000';
+    END IF;
 
     SELECT pg_catalog.count(*)
     INTO function_identity_count

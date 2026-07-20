@@ -1083,6 +1083,42 @@ async fn operational_status_readiness_rejects_support_and_global_capability_drif
 
         fixture
             .execute_owner(
+                "CREATE FUNCTION status_shadow.plain_escape() RETURNS INTEGER LANGUAGE sql \
+                 VOLATILE STRICT SET search_path = pg_catalog AS 'SELECT 1'",
+            )
+            .await;
+        fixture
+            .execute_owner("REVOKE ALL ON FUNCTION status_shadow.plain_escape() FROM PUBLIC")
+            .await;
+        fixture
+            .execute_owner("GRANT EXECUTE ON FUNCTION status_shadow.plain_escape() TO PUBLIC")
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner("REVOKE EXECUTE ON FUNCTION status_shadow.plain_escape() FROM PUBLIC")
+            .await;
+        fixture
+            .execute_owner(&format!(
+                "GRANT EXECUTE ON FUNCTION status_shadow.plain_escape() TO {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+        assert_eq!(
+            fixture.operational_statuses().verify_readiness().await,
+            Err(ProductDeploymentOperationalStatusReadinessErrorV2::ExcessCapability)
+        );
+        fixture
+            .execute_owner(&format!(
+                "REVOKE EXECUTE ON FUNCTION status_shadow.plain_escape() FROM {}",
+                fixture.operational_reader_role
+            ))
+            .await;
+
+        fixture
+            .execute_owner(
                 "CREATE FUNCTION status_shadow.starring_escape() RETURNS INTEGER \
                  LANGUAGE sql VOLATILE STRICT SET search_path = pg_catalog AS 'SELECT 1'",
             )

@@ -328,6 +328,11 @@ fn operational_status_migration_preserves_v1_and_isolates_the_single_query_core(
     assert!(migration.contains("CREATE OR REPLACE FUNCTION"));
     assert!(migration.contains(OPERATIONAL_STATUS_IDENTITY_FUNCTION));
     assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE"));
+    assert!(migration.contains("REVOKE ALL PRIVILEGES ON ROUTINE %s FROM PUBLIC CASCADE"));
+    assert!(migration
+        .contains("ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"));
+    assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTIONS FROM %s"));
+    assert!(migration.contains("user routine execution defaults are not sealed"));
     assert!(migration.contains("privilege.grantee <> common_owner"));
     assert!(migration.contains("function_row.proconfig\n            IS DISTINCT FROM ARRAY['search_path=pg_catalog']::TEXT[]"));
     assert!(!migration.contains("CREATE ROLE"));
@@ -436,6 +441,20 @@ async fn operational_migration_preserves_v1_acl_and_strips_new_function_defaults
         .await?;
         assert!(legacy_v1_execute);
         assert!(!legacy_v2_execute);
+        sqlx::query(
+            "CREATE FUNCTION public.operational_plain_invoker_probe() RETURNS INTEGER \
+             LANGUAGE sql VOLATILE STRICT SET search_path = pg_catalog AS 'SELECT 1'",
+        )
+        .execute(&database.pool)
+        .await?;
+        let hostile_plain_execute = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_function_privilege( \
+             $1, 'public.operational_plain_invoker_probe()', 'EXECUTE')",
+        )
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(!hostile_plain_execute);
         Ok::<_, sqlx::Error>(())
     }
     .await;

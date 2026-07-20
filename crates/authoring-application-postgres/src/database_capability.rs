@@ -471,10 +471,6 @@ WITH expected_functions AS (
     INNER JOIN user_schemas AS namespace
         ON namespace.oid = function_row.pronamespace
     WHERE function_row.prokind IN ('f', 'p')
-        AND (
-            function_row.prosecdef
-            OR pg_catalog.left(function_row.proname::TEXT, 9) = 'starring_'
-        )
         AND pg_catalog.has_function_privilege(
             current_user,
             function_row.oid,
@@ -899,11 +895,12 @@ mod tests {
             "has_any_column_privilege",
             "has_sequence_privilege",
             "has_function_privilege",
-            "function_row.prosecdef",
-            "'starring_'",
+            "function_row.prokind IN ('f', 'p')",
         ] {
             assert!(GLOBAL_USER_OBJECT_DENY_QUERY.contains(required));
         }
+        assert!(!GLOBAL_USER_OBJECT_DENY_QUERY.contains("function_row.prosecdef"));
+        assert!(!GLOBAL_USER_OBJECT_DENY_QUERY.contains("'starring_'"));
     }
 
     #[test]
