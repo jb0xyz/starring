@@ -170,6 +170,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "verify_apply_executor_readiness",
         "check_apply_executor_readiness",
         "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
         "verify_scoped_schema_trust",
         "verify_approval_support_contract",
         "verify_apply_support_contract",
@@ -192,6 +193,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(readiness.contains("self.check_apply_executor_readiness().await?"));
     assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
+    assert!(readiness.contains("verify_scoped_global_user_object_deny"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
     assert!(database_capability.contains("function_row.proleakproof"));
@@ -270,6 +272,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "check_decision_reader_readiness",
         "begin_scoped_database_readiness(",
         "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
         "verify_scoped_schema_trust",
         "load_scoped_database_topology",
         "public.starring_product_decision_read_v1(",
@@ -631,6 +634,55 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
     assert!(!store.contains("rejection_executor"));
     assert!(module.contains("pub use reject::PostgresProductRejections"));
     assert!(library.contains("PostgresProductRejections"));
+}
+
+#[test]
+fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
+    let facade = include_str!("../src/product_decisions/facade.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductControl",
+        "decisions: PostgresProductDecisions",
+        "rejections: PostgresProductRejections",
+        "decision_pools: ProductDecisionDatabasePoolsV1",
+        "rejection_executor: PgPool",
+        "PostgresProductDecisionsConfig::production(keyring)?",
+        "PostgresProductDecisions::with_config(decision_pools, config.clone())",
+        "PostgresProductRejections::with_config(rejection_executor, config)",
+        "ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductApprovalPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductApplyPort<FreshDiscordAuthorityEvidenceV1>",
+        "self.decisions.check_decision_reader_readiness().await?",
+        "self.decisions.check_approval_executor_readiness().await?",
+        ".check_product_rejection_readiness()",
+        "self.decisions.check_apply_executor_readiness().await?",
+        "verify_same_database_distinct_roles(&topologies)",
+    ] {
+        assert!(
+            facade.contains(required),
+            "missing product control facade guard: {required}"
+        );
+    }
+    assert_eq!(facade.matches("async fn load_").count(), 4);
+    assert_eq!(facade.matches("async fn approve_payload_bound").count(), 1);
+    assert_eq!(facade.matches("async fn reject_payload_bound").count(), 1);
+    assert_eq!(facade.matches("async fn apply_idempotent").count(), 1);
+    for forbidden in [
+        "from_parts",
+        "pub fn decisions(",
+        "pub fn rejections(",
+        "impl ProductDecisionPort<",
+    ] {
+        assert!(
+            !facade.contains(forbidden),
+            "forbidden product control facade surface: {forbidden}"
+        );
+    }
+    assert!(module.contains("pub use facade::PostgresProductControl"));
+    assert!(library.contains("PostgresProductControl"));
 }
 
 #[test]
