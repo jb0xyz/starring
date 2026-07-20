@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex};
 use authoring_promotion::{
     plan_pending_activation_v1, plan_start_promotion_v1, ApprovalPolicyV1,
     AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId, BindingRevision,
-    IdempotencyKey, PendingActivationDispositionV1, PendingActivationReceiptV1,
-    PendingActivationTransitionV1, PolicyRevision, PreparedPromotionPlanV1, PrincipalId,
-    PromotionRecordV1, SessionGeneration, StartPromotionV1, TenantId,
+    IdempotencyKey, PendingActivationProposalV1, PolicyRevision, PreparedPromotionPlanV1,
+    PrincipalId, PromotionRecordV1, SessionGeneration, StartPromotionV1, TenantId,
 };
 use automation_ruleset_activation::ActivationRequest;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -35,13 +34,17 @@ use crate::product_promotions::admission::{
 use crate::product_promotions::authorization::ProductPromotionAccessArgsV1;
 use crate::product_promotions::digest::{promotion_action_ids_v1, ProductPromotionDigestsV1};
 use crate::product_promotions::row::{
-    decode_product_promotion_approval_environment_v1, decode_product_promotion_publication_v1,
-    ProductPromotionAdmittedStageV1, ProductPromotionApprovalEnvironmentRowV1,
-    ProductPromotionPrepareStageV1, ProductPromotionPublicationRowV1,
-    ProductPromotionReplayStageV1,
+    decode_product_promotion_activation_link_v1, decode_product_promotion_approval_environment_v1,
+    decode_product_promotion_publication_v1, ProductPromotionActivationLinkRowV1,
+    ProductPromotionActivationStageV1, ProductPromotionAdmittedStageV1,
+    ProductPromotionApprovalEnvironmentDecodedV1, ProductPromotionApprovalEnvironmentRowV1,
+    ProductPromotionApprovalEnvironmentStageV1, ProductPromotionPrepareStageV1,
+    ProductPromotionPublicationRowV1, ProductPromotionReplayStageV1,
 };
 use crate::product_promotions::store::PostgresProductPromotions;
 use crate::MIGRATOR;
+
+mod orchestrator_e2e;
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.promotion.idempotency.v1";
 const SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.promotion.request.v1";
@@ -132,7 +135,7 @@ fn promotion_context_at_generation(generation: u64) -> AuthenticatedPromotionCon
         policy: ApprovalPolicyV1 {
             revision: PolicyRevision::new(1).unwrap(),
             required_approvals: NonZeroU32::new(1).unwrap(),
-            ttl_seconds: NonZeroU64::new(3600).unwrap(),
+            ttl_seconds: NonZeroU64::new(3).unwrap(),
         },
     }
 }
@@ -815,7 +818,203 @@ where
     .unwrap()
 }
 
-async fn await_publish_lock_wait(pool: &PgPool) {
+async fn direct_activation_link<'executor, ExecutorType>(
+    executor: ExecutorType,
+    access: &ProductPromotionAccessArgsV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+    proposal: &PendingActivationProposalV1,
+) -> ProductPromotionActivationLinkRowV1
+where
+    ExecutorType: Executor<'executor, Database = Postgres>,
+{
+    try_direct_activation_link(executor, access, admitted, proposal)
+        .await
+        .unwrap()
+}
+
+async fn try_direct_activation_link<'executor, ExecutorType>(
+    executor: ExecutorType,
+    access: &ProductPromotionAccessArgsV1,
+    admitted: &ProductPromotionAdmittedStageV1,
+    proposal: &PendingActivationProposalV1,
+) -> Result<ProductPromotionActivationLinkRowV1, sqlx::Error>
+where
+    ExecutorType: Executor<'executor, Database = Postgres>,
+{
+    let envelope = json!({"format_version": 1, "proposal": proposal});
+    sqlx::query_as::<_, ProductPromotionActivationLinkRowV1>(
+        "SELECT outcome_code, promotion_record, admission_evidence, admission_digest, \
+         activation_projection, receipt_projection, audit_evidence_projection, database_now \
+         FROM public.starring_product_promotion_activation_link_v1(\
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+         $16, $17, $18, $19, $20)",
+    )
+    .bind(&access.expected_tenant_id)
+    .bind(&access.expected_installation_id)
+    .bind(&access.expected_principal_id)
+    .bind(&access.expected_product_session_digest)
+    .bind(&access.expected_acting_user_id)
+    .bind(&access.expected_discord_application_id)
+    .bind(&access.expected_guild_id)
+    .bind(&access.expected_capability)
+    .bind(access.observed_current_authority_revision)
+    .bind(&access.observed_current_authority_payload_digest)
+    .bind(&access.authority_observation_digest)
+    .bind(access.authority_observed_at)
+    .bind(access.authority_expires_at)
+    .bind(&access.effective_permission_bits)
+    .bind(access.guild_owner)
+    .bind(admitted.record.id.as_str())
+    .bind(i64::try_from(admitted.record.revision.get()).unwrap())
+    .bind(admitted.record.request_digest.as_str())
+    .bind(&admitted.admission_digest)
+    .bind(sqlx::types::Json(envelope))
+    .fetch_one(executor)
+    .await
+}
+
+async fn insert_unlinked_activation(pool: &PgPool, request: &ActivationRequest) {
+    let approval_context = serde_json::to_value(&request.approval_context).unwrap();
+    let context = approval_context.get("context").unwrap();
+    let observed_version = request
+        .observed_active
+        .as_ref()
+        .map(|observed| i64::from(observed.version.get()));
+    let observed_hash = request
+        .observed_active
+        .as_ref()
+        .map(|observed| observed.content_hash.to_hex());
+    sqlx::query(
+        "INSERT INTO public.activation_requests (\
+         id, guild_id, ruleset_key, target_version, target_content_hash, requester_id, \
+         required_approvals, state, created_at, expires_at, observed_active_version, \
+         observed_active_hash, authority_kind, link_state_name, approval_context, \
+         link_state, promotion_id, promotion_request_digest, approval_payload_digest, \
+         approval_context_digest) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11, \
+         'product_authoring', 'unlinked', $12, $13, $14, $15, $16, $17)",
+    )
+    .bind(request.id.as_str())
+    .bind(request.target.guild_id.to_string())
+    .bind(request.target.ruleset_key.as_str())
+    .bind(i64::from(request.target.version.get()))
+    .bind(request.target.content_hash.to_hex())
+    .bind(request.requester.to_string())
+    .bind(i32::try_from(request.required_approvals).unwrap())
+    .bind(request.created_at)
+    .bind(request.expires_at)
+    .bind(observed_version)
+    .bind(observed_hash)
+    .bind(sqlx::types::Json(&approval_context))
+    .bind(sqlx::types::Json(
+        serde_json::to_value(&request.link_state).unwrap(),
+    ))
+    .bind(context["promotion_id"].as_str().unwrap())
+    .bind(context["promotion_request_digest"].as_str().unwrap())
+    .bind(context["approval_payload_digest"].as_str().unwrap())
+    .bind(context["approval_context_digest"].as_str().unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn install_exact_applied_pointer(pool: &PgPool, promotion_id: &str) -> (i64, String) {
+    let mut transaction = pool.begin().await.unwrap();
+    let activation = sqlx::query_as::<_, (String, i64, String)>(
+        "SELECT id, target_version, target_content_hash \
+         FROM public.activation_requests WHERE promotion_id = $1",
+    )
+    .bind(promotion_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    let mutation_clock =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE public.activation_requests DISABLE TRIGGER USER; \
+         ALTER TABLE public.runtime_deployments DISABLE TRIGGER USER",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let applied = sqlx::query(
+        "UPDATE public.activation_requests \
+         SET state = 'applied', applied_at = $2, applied_by = requester_id, \
+             completion_kind = 'activated', activation_notices = '[]'::JSONB \
+         WHERE id = $1 AND state = 'pending' AND link_state_name = 'linked'",
+    )
+    .bind(&activation.0)
+    .bind(mutation_clock)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(applied.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO public.runtime_deployments ( \
+         deployment_id, tenant_id, installation_id, promotion_id, activation_request_id, \
+         installation_authority_revision, guild_id, ruleset_key, target_version, \
+         target_content_hash, binding_revision, binding_fingerprint, desired_target_digest, \
+         runtime_generation, requested_at, snapshot_format_version, snapshot, revision, phase, \
+         policy_revision, created_at, updated_at) \
+         SELECT $1, 'tenant', 'installation', $2, $3, 1, '3001', 'ruleset', $4, $5, \
+          1, authority.binding_fingerprint, pg_catalog.repeat('d', 64), 1, $6, 1, \
+          pg_catalog.jsonb_build_object('fixture', pg_catalog.repeat('x', 64)), \
+          1, 'requested', authority.policy_revision, $6, $6 \
+         FROM public.automation_installation_authority_versions AS authority \
+         WHERE authority.tenant_id = 'tenant' AND authority.installation_id = 'installation' \
+           AND authority.revision = 1",
+    )
+    .bind(format!("race-deployment-{}", &promotion_id[..16]))
+    .bind(promotion_id)
+    .bind(&activation.0)
+    .bind(activation.1)
+    .bind(&activation.2)
+    .bind(mutation_clock)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE public.runtime_deployments ENABLE TRIGGER USER; \
+         ALTER TABLE public.activation_requests ENABLE TRIGGER USER",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_ruleset_activations \
+         (guild_id, ruleset_key, active_version) VALUES ('3001', 'ruleset', $1)",
+    )
+    .bind(activation.1)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let exact = sqlx::query_scalar::<_, bool>(
+        "SELECT public.starring_product_ruleset_slot_exact_v1( \
+         'tenant', 'installation', '3001', 'ruleset', $1) \
+         AND version.content_hash = public.starring_ruleset_content_hash_v1( \
+          version.schema_version, version.definition) \
+         AND version.canonical_content_hash = version.content_hash \
+         FROM public.automation_ruleset_versions AS version \
+         WHERE version.guild_id = '3001' AND version.ruleset_key = 'ruleset' \
+           AND version.version = $1",
+    )
+    .bind(activation.1)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(exact);
+    (activation.1, activation.2)
+}
+
+async fn await_stage_lock_wait(pool: &PgPool, function_name: &str) {
     for _ in 0..200 {
         let waiting = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS ( \
@@ -824,9 +1023,10 @@ async fn await_publish_lock_wait(pool: &PgPool) {
                AND pid <> pg_catalog.pg_backend_pid() \
                AND state = 'active' \
                AND wait_event_type = 'Lock' \
-               AND query LIKE '%starring_product_promotion_publish_v1%' \
+               AND query LIKE '%' || $1 || '%' \
              )",
         )
+        .bind(function_name)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -835,7 +1035,7 @@ async fn await_publish_lock_wait(pool: &PgPool) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("publish did not enter a lock wait");
+    panic!("promotion stage did not enter a lock wait");
 }
 
 async fn install_ruleset_head_insert_delay(pool: &PgPool) {
@@ -1473,7 +1673,7 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     let drift_access = access_args(drift_access_now, &DRIFT_SESSION_DIGEST);
     let drift_publish = direct_publish(&pool, &drift_access, &drift_prepared);
     let release_drift = async {
-        await_publish_lock_wait(&pool).await;
+        await_stage_lock_wait(&pool, "starring_product_promotion_publish_v1").await;
         session_drift_transaction.commit().await.unwrap();
     };
     let (drift_publish, ()) = tokio::join!(drift_publish, release_drift);
@@ -1570,8 +1770,18 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     assert!(absent_environment.active_content_hash.is_none());
     let absent_environment =
         decode_product_promotion_approval_environment_v1(absent_environment, &published).unwrap();
+    let (resolved, target_artifact, environment_database_now) = match absent_environment {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+            resolved,
+            target_artifact,
+            database_now,
+        } => (resolved, target_artifact, database_now),
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected resolved approval environment")
+        }
+    };
     assert_eq!(
-        absent_environment.target_artifact.content_hash,
+        target_artifact.content_hash,
         publication_case.plan.intent.expected_registry_content_hash
     );
 
@@ -1619,49 +1829,150 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     assert!(corrupt_pointer.target_artifact_projection.is_none());
     corrupt_pointer_transaction.rollback().await.unwrap();
 
-    let pending_plan =
-        plan_pending_activation_v1(&published.record, absent_environment.resolved.clone()).unwrap();
-    let activation = ActivationRequest::create_product(
-        pending_plan.request().create,
-        absent_environment.database_now,
+    let pending_plan = plan_pending_activation_v1(&published.record, resolved.clone()).unwrap();
+    let activation_environment = ProductPromotionApprovalEnvironmentStageV1 {
+        admitted: ProductPromotionAdmittedStageV1 {
+            record: published.record.clone(),
+            admission: published.admission.clone(),
+            admission_digest: published.admission_digest.clone(),
+            database_now: environment_database_now,
+        },
+        resolved,
+        target_artifact: *target_artifact,
+    };
+    let activation_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let activation_access = access_args(activation_access_now, &SESSION_DIGEST);
+    let created_activation =
+        direct_activation_link(&pool, &activation_access, &published, &pending_plan).await;
+    assert_eq!(created_activation.outcome_code, "created");
+    let finalized = decode_product_promotion_activation_link_v1(
+        created_activation,
+        &ring,
+        &publication_case.context,
+        &activation_access,
+        &publication_case.digests,
+        &activation_environment,
+        &pending_plan,
     )
     .unwrap();
-    let final_record = match pending_plan
-        .complete(
-            &published.record,
-            &PendingActivationReceiptV1 {
-                request: activation,
-                disposition: PendingActivationDispositionV1::Created,
-            },
-            absent_environment.database_now,
-        )
-        .unwrap()
-    {
-        PendingActivationTransitionV1::ActivationPending {
-            expected_record, ..
-        } => expected_record,
-        PendingActivationTransitionV1::Expired { .. }
-        | PendingActivationTransitionV1::RefreshJournal => {
-            panic!("expected activation-pending transition")
+    let final_record = match finalized {
+        ProductPromotionActivationStageV1::Finalized(finalized) => finalized.admitted.record,
+        ProductPromotionActivationStageV1::FinalReplayRequired(_) => {
+            panic!("expected created activation finalization")
+        }
+        ProductPromotionActivationStageV1::ApprovalEnvironmentChanged => {
+            panic!("expected stable created activation environment")
         }
     };
-    let final_record_json = serde_json::to_value(&final_record).unwrap();
-    let finalized_count = sqlx::query(
-        "UPDATE public.authoring_promotions \
-         SET revision = 3, stage = 'activation_pending', \
-             record = record || pg_catalog.jsonb_build_object( \
-                 'revision', 3, 'stage', $2::JSONB, 'updated_at', $3::TEXT \
-             ) \
-         WHERE id = $1 AND revision = 2 AND stage = 'published'",
+    let durable_activation_state = sqlx::query_as::<_, (String, String, i64, i64, i64, i64, i64)>(
+        "SELECT activation.state, activation.link_state_name, \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_idempotency_aliases \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE action = 'promotion.promote'), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations) \
+         FROM public.activation_requests AS activation \
+         WHERE activation.promotion_id = $1",
     )
     .bind(publication_case.plan.promotion_id.as_str())
-    .bind(sqlx::types::Json(&final_record_json["stage"]))
-    .bind(final_record_json["updated_at"].as_str().unwrap())
-    .execute(&pool)
+    .fetch_one(&pool)
     .await
-    .unwrap()
-    .rows_affected();
-    assert_eq!(finalized_count, 1);
+    .unwrap();
+    assert_eq!(
+        durable_activation_state,
+        ("pending".to_string(), "linked".to_string(), 1, 1, 1, 1, 0)
+    );
+    let mut final_environment_lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM public.authoring_promotions WHERE id = $1 FOR UPDATE")
+        .bind(publication_case.plan.promotion_id.as_str())
+        .fetch_one(&mut *final_environment_lock)
+        .await
+        .unwrap();
+    let final_expiry_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut final_expiry_access = access_args(final_expiry_now, &SESSION_DIGEST);
+    final_expiry_access.authority_expires_at = final_expiry_now + TimeDelta::milliseconds(500);
+    let final_expiry_probe = direct_approval_environment(&pool, &final_expiry_access, &published);
+    let release_final_environment = async {
+        await_stage_lock_wait(&pool, "starring_product_promotion_approval_environment_v1").await;
+        tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+        final_environment_lock.commit().await.unwrap();
+    };
+    let (final_expiry_probe, ()) = tokio::join!(final_expiry_probe, release_final_environment);
+    assert_eq!(final_expiry_probe.outcome_code, "access_denied");
+    assert!(final_expiry_probe.promotion_record.is_none());
+    assert!(final_expiry_probe.historical_binding_revision.is_none());
+    assert!(final_expiry_probe.historical_resource_bindings.is_none());
+    assert!(final_expiry_probe.historical_binding_fingerprint.is_none());
+    assert!(final_expiry_probe.active_version.is_none());
+    assert!(final_expiry_probe.active_content_hash.is_none());
+    assert!(final_expiry_probe.target_artifact_projection.is_none());
+    let final_expiry_write_state = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        "SELECT promotion.stage, promotion.revision, \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE receipt_id = $2) \
+         FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(publication_case.plan.promotion_id.as_str())
+    .bind(&publication_case.admission.payload.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        final_expiry_write_state,
+        ("activation_pending".to_string(), 3, 1, 1)
+    );
+    let replay_signal_access_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let replay_signal_access = access_args(replay_signal_access_now, &SESSION_DIGEST);
+    let replay_signal =
+        direct_activation_link(&pool, &replay_signal_access, &published, &pending_plan).await;
+    assert_eq!(replay_signal.outcome_code, "final_replay_required");
+    assert!(replay_signal.promotion_record.is_some());
+    assert!(replay_signal.admission_evidence.is_some());
+    assert!(replay_signal.admission_digest.is_some());
+    assert!(replay_signal.activation_projection.is_none());
+    assert!(replay_signal.receipt_projection.is_none());
+    assert!(replay_signal.audit_evidence_projection.is_none());
+    assert!(matches!(
+        decode_product_promotion_activation_link_v1(
+            replay_signal,
+            &ring,
+            &publication_case.context,
+            &replay_signal_access,
+            &publication_case.digests,
+            &activation_environment,
+            &pending_plan,
+        )
+        .unwrap(),
+        ProductPromotionActivationStageV1::FinalReplayRequired(_)
+    ));
+    let final_environment =
+        direct_approval_environment(&pool, &replay_signal_access, &published).await;
+    assert_eq!(final_environment.outcome_code, "final_replay_required");
+    assert!(final_environment.promotion_record.is_some());
+    assert!(final_environment.historical_binding_revision.is_none());
+    assert!(final_environment.historical_resource_bindings.is_none());
+    assert!(final_environment.historical_binding_fingerprint.is_none());
+    assert!(final_environment.active_version.is_none());
+    assert!(final_environment.active_content_hash.is_none());
+    assert!(final_environment.target_artifact_projection.is_none());
     let final_publish_access_now =
         sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
             .fetch_one(&pool)
@@ -1710,7 +2021,14 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     let reused_access = access_args(reused_access_now, &SESSION_DIGEST);
     let reused = direct_publish(&pool, &reused_access, &reused_prepared).await;
     assert_eq!(reused.outcome_code, "reused");
-    decode_product_promotion_publication_v1(reused, &reused_prepared).unwrap();
+    let reused_publication =
+        decode_product_promotion_publication_v1(reused, &reused_prepared).unwrap();
+    let reused_published = ProductPromotionAdmittedStageV1 {
+        record: reused_publication.record,
+        admission: reused_prepared.admission,
+        admission_digest: reused_prepared.admission_digest,
+        database_now: reused_publication.database_now,
+    };
     let reused_registry_state = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
          (SELECT next_version FROM public.automation_ruleset_heads \
@@ -1721,6 +2039,864 @@ async fn real_adapter_converges_and_rolls_back_malformed_decode() {
     .await
     .unwrap();
     assert_eq!(reused_registry_state, (2, 1));
+
+    let reused_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let reused_environment_access = access_args(reused_environment_now, &SESSION_DIGEST);
+    let reused_environment =
+        direct_approval_environment(&pool, &reused_environment_access, &reused_published).await;
+    let reused_environment =
+        decode_product_promotion_approval_environment_v1(reused_environment, &reused_published)
+            .unwrap();
+    let (reused_resolved, reused_target, reused_database_now) = match reused_environment {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+            resolved,
+            target_artifact,
+            database_now,
+        } => (resolved, target_artifact, database_now),
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected reusable approval environment")
+        }
+    };
+    let reused_pending =
+        plan_pending_activation_v1(&reused_published.record, reused_resolved.clone()).unwrap();
+    let reusable_request =
+        ActivationRequest::create_product(reused_pending.request().create, reused_database_now)
+            .unwrap();
+    insert_unlinked_activation(&pool, &reusable_request).await;
+    let reused_activation_environment = ProductPromotionApprovalEnvironmentStageV1 {
+        admitted: ProductPromotionAdmittedStageV1 {
+            record: reused_published.record.clone(),
+            admission: reused_published.admission.clone(),
+            admission_digest: reused_published.admission_digest.clone(),
+            database_now: reused_database_now,
+        },
+        resolved: reused_resolved,
+        target_artifact: *reused_target,
+    };
+    let reused_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let reused_activation_access = access_args(reused_activation_now, &SESSION_DIGEST);
+    let reused_activation = direct_activation_link(
+        &pool,
+        &reused_activation_access,
+        &reused_published,
+        &reused_pending,
+    )
+    .await;
+    assert_eq!(reused_activation.outcome_code, "reused");
+    assert!(matches!(
+        decode_product_promotion_activation_link_v1(
+            reused_activation,
+            &ring,
+            &reused_case.context,
+            &reused_activation_access,
+            &reused_case.digests,
+            &reused_activation_environment,
+            &reused_pending,
+        )
+        .unwrap(),
+        ProductPromotionActivationStageV1::Finalized(_)
+    ));
+    let reused_final_state = sqlx::query_as::<_, (String, String, i64, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, activation.link_state_name, \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_idempotency_aliases \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE action = 'promotion.promote'), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations) \
+         FROM public.authoring_promotions AS promotion \
+         INNER JOIN public.activation_requests AS activation \
+          ON activation.promotion_id = promotion.id \
+         WHERE promotion.id = $1",
+    )
+    .bind(reused_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reused_final_state,
+        (
+            "activation_pending".to_string(),
+            "linked".to_string(),
+            2,
+            2,
+            2,
+            2,
+            0,
+        )
+    );
+
+    let direct_expired_plan = promotion_plan("adapter-direct-expired-key", artifact.clone());
+    let direct_expired_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let direct_expired_case = PreparedCase::new(
+        &ring,
+        direct_expired_plan,
+        "adapter-direct-expired-key",
+        "request-direct-expired",
+        direct_expired_now,
+        &SESSION_DIGEST,
+    );
+    let direct_expired_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &direct_expired_case.access,
+                &direct_expired_case.context,
+                &direct_expired_case.digests,
+                &direct_expired_case.plan,
+                &direct_expired_case.admission,
+                &direct_expired_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &direct_expired_case,
+    );
+    let direct_expired_publish_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let direct_expired_publish_access = access_args(direct_expired_publish_now, &SESSION_DIGEST);
+    let direct_expired_publication = direct_publish(
+        &pool,
+        &direct_expired_publish_access,
+        &direct_expired_prepared,
+    )
+    .await;
+    assert_eq!(direct_expired_publication.outcome_code, "reused");
+    let direct_expired_publication = decode_product_promotion_publication_v1(
+        direct_expired_publication,
+        &direct_expired_prepared,
+    )
+    .unwrap();
+    let direct_expired_published = ProductPromotionAdmittedStageV1 {
+        record: direct_expired_publication.record,
+        admission: direct_expired_prepared.admission,
+        admission_digest: direct_expired_prepared.admission_digest,
+        database_now: direct_expired_publication.database_now,
+    };
+    let direct_expired_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let direct_expired_environment_access =
+        access_args(direct_expired_environment_now, &SESSION_DIGEST);
+    let direct_expired_environment = direct_approval_environment(
+        &pool,
+        &direct_expired_environment_access,
+        &direct_expired_published,
+    )
+    .await;
+    let direct_expired_environment = decode_product_promotion_approval_environment_v1(
+        direct_expired_environment,
+        &direct_expired_published,
+    )
+    .unwrap();
+    let (expired_resolved, expired_target, expired_database_now) = match direct_expired_environment
+    {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+            resolved,
+            target_artifact,
+            database_now,
+        } => (resolved, target_artifact, database_now),
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected expirable approval environment")
+        }
+    };
+    let direct_expired_pending =
+        plan_pending_activation_v1(&direct_expired_published.record, expired_resolved.clone())
+            .unwrap();
+    let expirable_request = ActivationRequest::create_product(
+        direct_expired_pending.request().create,
+        expired_database_now,
+    )
+    .unwrap();
+    insert_unlinked_activation(&pool, &expirable_request).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3_100)).await;
+    let direct_expired_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let direct_expired_activation_access =
+        access_args(direct_expired_activation_now, &SESSION_DIGEST);
+    let direct_expired_activation_environment = ProductPromotionApprovalEnvironmentStageV1 {
+        admitted: ProductPromotionAdmittedStageV1 {
+            record: direct_expired_published.record.clone(),
+            admission: direct_expired_published.admission.clone(),
+            admission_digest: direct_expired_published.admission_digest.clone(),
+            database_now: expired_database_now,
+        },
+        resolved: expired_resolved,
+        target_artifact: *expired_target,
+    };
+    let direct_expired_activation = direct_activation_link(
+        &pool,
+        &direct_expired_activation_access,
+        &direct_expired_published,
+        &direct_expired_pending,
+    )
+    .await;
+    assert_eq!(direct_expired_activation.outcome_code, "reused");
+    let direct_expired_final = decode_product_promotion_activation_link_v1(
+        direct_expired_activation,
+        &ring,
+        &direct_expired_case.context,
+        &direct_expired_activation_access,
+        &direct_expired_case.digests,
+        &direct_expired_activation_environment,
+        &direct_expired_pending,
+    )
+    .unwrap();
+    let direct_expired_record = match direct_expired_final {
+        ProductPromotionActivationStageV1::Finalized(finalized) => finalized.admitted.record,
+        ProductPromotionActivationStageV1::FinalReplayRequired(_) => {
+            panic!("expected direct expired finalization")
+        }
+        ProductPromotionActivationStageV1::ApprovalEnvironmentChanged => {
+            panic!("expected stable direct expired activation environment")
+        }
+    };
+    assert!(matches!(
+        direct_expired_record.stage,
+        authoring_promotion::PromotionStageV1::Expired { .. }
+    ));
+    let direct_expired_state = sqlx::query_as::<_, (String, String, String, i64, i64)>(
+        "SELECT promotion.stage, activation.state, activation.link_state_name, \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE endpoint_domain = 'product_promote_v1'), \
+         (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations) \
+         FROM public.authoring_promotions AS promotion \
+         INNER JOIN public.activation_requests AS activation \
+          ON activation.promotion_id = promotion.id \
+         WHERE promotion.id = $1",
+    )
+    .bind(direct_expired_case.plan.promotion_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        direct_expired_state,
+        (
+            "expired".to_string(),
+            "expired".to_string(),
+            "unlinked".to_string(),
+            3,
+            0,
+        )
+    );
+
+    let collision_plan = promotion_plan("adapter-activation-collision-key", artifact.clone());
+    let collision_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let collision_case = PreparedCase::new(
+        &ring,
+        collision_plan,
+        "adapter-activation-collision-key",
+        "request-activation-collision",
+        collision_now,
+        &SESSION_DIGEST,
+    );
+    let collision_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &collision_case.access,
+                &collision_case.context,
+                &collision_case.digests,
+                &collision_case.plan,
+                &collision_case.admission,
+                &collision_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &collision_case,
+    );
+    let collision_publish_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let collision_publish_access = access_args(collision_publish_now, &SESSION_DIGEST);
+    let collision_publication =
+        direct_publish(&pool, &collision_publish_access, &collision_prepared).await;
+    let collision_publication =
+        decode_product_promotion_publication_v1(collision_publication, &collision_prepared)
+            .unwrap();
+    let collision_published = ProductPromotionAdmittedStageV1 {
+        record: collision_publication.record,
+        admission: collision_prepared.admission,
+        admission_digest: collision_prepared.admission_digest,
+        database_now: collision_publication.database_now,
+    };
+    let collision_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let collision_environment_access = access_args(collision_environment_now, &SESSION_DIGEST);
+    let collision_environment =
+        direct_approval_environment(&pool, &collision_environment_access, &collision_published)
+            .await;
+    let collision_environment = decode_product_promotion_approval_environment_v1(
+        collision_environment,
+        &collision_published,
+    )
+    .unwrap();
+    let collision_resolved = match collision_environment {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved { resolved, .. } => resolved,
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected collision approval environment")
+        }
+    };
+    let collision_pending =
+        plan_pending_activation_v1(&collision_published.record, collision_resolved).unwrap();
+    let mut projection_transaction = pool.begin().await.unwrap();
+    let projection_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&mut *projection_transaction)
+            .await
+            .unwrap();
+    let projection_access = access_args(projection_now, &SESSION_DIGEST);
+    let collision_projection = direct_activation_link(
+        &mut *projection_transaction,
+        &projection_access,
+        &collision_published,
+        &collision_pending,
+    )
+    .await;
+    assert_eq!(collision_projection.outcome_code, "created");
+    projection_transaction.rollback().await.unwrap();
+    let promotion_projection = collision_projection.promotion_record.unwrap();
+    let admission_projection = collision_projection.admission_evidence.unwrap();
+    let activation_projection = collision_projection.activation_projection.unwrap();
+    let receipt_projection = collision_projection.receipt_projection.unwrap();
+    let audit_projection = collision_projection.audit_evidence_projection.unwrap();
+    let collision_seed_outcome = sqlx::query_scalar::<_, String>(
+        "SELECT outcome_code \
+         FROM public.starring_product_promotion_finalize_receipt_v1($1, $2, $3, $4, $5)",
+    )
+    .bind(&admission_projection)
+    .bind(&promotion_projection)
+    .bind(&activation_projection)
+    .bind(&receipt_projection)
+    .bind(&audit_projection)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(collision_seed_outcome, "created");
+    let collision_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let collision_activation_access = access_args(collision_activation_now, &SESSION_DIGEST);
+    let collision_error = match try_direct_activation_link(
+        &pool,
+        &collision_activation_access,
+        &collision_published,
+        &collision_pending,
+    )
+    .await
+    {
+        Ok(_) => panic!("receipt, alias, and audit collisions must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        &collision_error,
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("23514")
+    ));
+    let collision_state = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, \
+         (SELECT pg_catalog.count(*) FROM public.activation_requests \
+          WHERE promotion_id = promotion.id), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_idempotency_aliases \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+          WHERE receipt_id = $2) \
+         FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(collision_case.plan.promotion_id.as_str())
+    .bind(&collision_case.admission.payload.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(collision_state, ("published".to_string(), 0, 1, 1, 1, 1));
+    let collision_pointer_count = sqlx::query_scalar::<_, i64>(
+        "SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(collision_pointer_count, 0);
+
+    let concurrent_plan = promotion_plan("adapter-activation-concurrent-key", artifact.clone());
+    let concurrent_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let concurrent_case = PreparedCase::new(
+        &ring,
+        concurrent_plan,
+        "adapter-activation-concurrent-key",
+        "request-activation-concurrent",
+        concurrent_now,
+        &SESSION_DIGEST,
+    );
+    let concurrent_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &concurrent_case.access,
+                &concurrent_case.context,
+                &concurrent_case.digests,
+                &concurrent_case.plan,
+                &concurrent_case.admission,
+                &concurrent_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &concurrent_case,
+    );
+    let concurrent_publish_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let concurrent_publish_access = access_args(concurrent_publish_now, &SESSION_DIGEST);
+    let concurrent_publication =
+        direct_publish(&pool, &concurrent_publish_access, &concurrent_prepared).await;
+    let concurrent_publication =
+        decode_product_promotion_publication_v1(concurrent_publication, &concurrent_prepared)
+            .unwrap();
+    let concurrent_published = ProductPromotionAdmittedStageV1 {
+        record: concurrent_publication.record,
+        admission: concurrent_prepared.admission,
+        admission_digest: concurrent_prepared.admission_digest,
+        database_now: concurrent_publication.database_now,
+    };
+    let concurrent_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let concurrent_environment_access = access_args(concurrent_environment_now, &SESSION_DIGEST);
+    let concurrent_environment =
+        direct_approval_environment(&pool, &concurrent_environment_access, &concurrent_published)
+            .await;
+    let concurrent_environment = decode_product_promotion_approval_environment_v1(
+        concurrent_environment,
+        &concurrent_published,
+    )
+    .unwrap();
+    let concurrent_resolved = match concurrent_environment {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved { resolved, .. } => resolved,
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected concurrent approval environment")
+        }
+    };
+    let concurrent_pending =
+        plan_pending_activation_v1(&concurrent_published.record, concurrent_resolved).unwrap();
+    let concurrent_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let concurrent_activation_access = access_args(concurrent_activation_now, &SESSION_DIGEST);
+    let (concurrent_first, concurrent_second) = tokio::join!(
+        direct_activation_link(
+            &pool,
+            &concurrent_activation_access,
+            &concurrent_published,
+            &concurrent_pending,
+        ),
+        direct_activation_link(
+            &pool,
+            &concurrent_activation_access,
+            &concurrent_published,
+            &concurrent_pending,
+        )
+    );
+    let mut concurrent_outcomes = [
+        concurrent_first.outcome_code.as_str(),
+        concurrent_second.outcome_code.as_str(),
+    ];
+    concurrent_outcomes.sort_unstable();
+    assert_eq!(concurrent_outcomes, ["created", "final_replay_required"]);
+    let concurrent_state = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, \
+             (SELECT pg_catalog.count(*) FROM public.activation_requests \
+              WHERE promotion_id = promotion.id), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipt_idempotency_aliases \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations) \
+             FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(concurrent_case.plan.promotion_id.as_str())
+    .bind(&concurrent_case.admission.payload.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        concurrent_state,
+        ("activation_pending".to_string(), 1, 1, 1, 1, 1, 0)
+    );
+
+    let environment_race_plan =
+        promotion_plan("adapter-approval-environment-race-key", artifact.clone());
+    let environment_race_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let environment_race_case = PreparedCase::new(
+        &ring,
+        environment_race_plan,
+        "adapter-approval-environment-race-key",
+        "request-approval-environment-race",
+        environment_race_now,
+        &SESSION_DIGEST,
+    );
+    let environment_race_prepared = admitted_prepare_stage(
+        adapter
+            .execute_prepare_stage_v1(
+                &environment_race_case.access,
+                &environment_race_case.context,
+                &environment_race_case.digests,
+                &environment_race_case.plan,
+                &environment_race_case.admission,
+                &environment_race_case.serialized,
+            )
+            .await
+            .unwrap(),
+        &environment_race_case,
+    );
+    let environment_race_publish_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let environment_race_publish_access =
+        access_args(environment_race_publish_now, &SESSION_DIGEST);
+    let environment_race_publication = direct_publish(
+        &pool,
+        &environment_race_publish_access,
+        &environment_race_prepared,
+    )
+    .await;
+    let environment_race_publication = decode_product_promotion_publication_v1(
+        environment_race_publication,
+        &environment_race_prepared,
+    )
+    .unwrap();
+    let environment_race_published = ProductPromotionAdmittedStageV1 {
+        record: environment_race_publication.record,
+        admission: environment_race_prepared.admission,
+        admission_digest: environment_race_prepared.admission_digest,
+        database_now: environment_race_publication.database_now,
+    };
+    let old_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let old_environment_access = access_args(old_environment_now, &SESSION_DIGEST);
+    let old_environment =
+        direct_approval_environment(&pool, &old_environment_access, &environment_race_published)
+            .await;
+    assert!(old_environment.active_version.is_none());
+    assert!(old_environment.active_content_hash.is_none());
+    let old_environment = decode_product_promotion_approval_environment_v1(
+        old_environment,
+        &environment_race_published,
+    )
+    .unwrap();
+    let (old_resolved, old_target, old_database_now) = match old_environment {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+            resolved,
+            target_artifact,
+            database_now,
+        } => (resolved, target_artifact, database_now),
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected initial race approval environment")
+        }
+    };
+    let old_pending =
+        plan_pending_activation_v1(&environment_race_published.record, old_resolved.clone())
+            .unwrap();
+    let old_activation_environment = ProductPromotionApprovalEnvironmentStageV1 {
+        admitted: ProductPromotionAdmittedStageV1 {
+            record: environment_race_published.record.clone(),
+            admission: environment_race_published.admission.clone(),
+            admission_digest: environment_race_published.admission_digest.clone(),
+            database_now: old_database_now,
+        },
+        resolved: old_resolved,
+        target_artifact: *old_target,
+    };
+    let (active_version, active_content_hash) =
+        install_exact_applied_pointer(&pool, concurrent_case.plan.promotion_id.as_str()).await;
+    let mut changed_environment_lock = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT active_version FROM public.automation_ruleset_activations \
+         WHERE guild_id = '3001' AND ruleset_key = 'ruleset' FOR UPDATE",
+    )
+    .fetch_one(&mut *changed_environment_lock)
+    .await
+    .unwrap();
+    let changed_expiry_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut changed_expiry_access = access_args(changed_expiry_now, &SESSION_DIGEST);
+    changed_expiry_access.authority_expires_at = changed_expiry_now + TimeDelta::milliseconds(500);
+    let changed_expiry_probe = direct_activation_link(
+        &pool,
+        &changed_expiry_access,
+        &environment_race_published,
+        &old_pending,
+    );
+    let release_changed_environment = async {
+        await_stage_lock_wait(&pool, "starring_product_promotion_activation_link_v1").await;
+        tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+        changed_environment_lock.commit().await.unwrap();
+    };
+    let (changed_expiry_probe, ()) =
+        tokio::join!(changed_expiry_probe, release_changed_environment);
+    assert_eq!(changed_expiry_probe.outcome_code, "access_denied");
+    assert!(changed_expiry_probe.promotion_record.is_none());
+    assert!(changed_expiry_probe.admission_evidence.is_none());
+    assert!(changed_expiry_probe.admission_digest.is_none());
+    assert!(changed_expiry_probe.activation_projection.is_none());
+    assert!(changed_expiry_probe.receipt_projection.is_none());
+    assert!(changed_expiry_probe.audit_evidence_projection.is_none());
+    let changed_expiry_write_state = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, promotion.revision, \
+         (SELECT pg_catalog.count(*) FROM public.activation_requests \
+          WHERE promotion_id = promotion.id), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE receipt_id = $2) \
+         FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(environment_race_case.plan.promotion_id.as_str())
+    .bind(&environment_race_case.admission.payload.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        changed_expiry_write_state,
+        ("published".to_string(), 2, 0, 0, 0)
+    );
+    let stale_environment_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let stale_environment_activation_access =
+        access_args(stale_environment_activation_now, &SESSION_DIGEST);
+    let stale_environment_signal = direct_activation_link(
+        &pool,
+        &stale_environment_activation_access,
+        &environment_race_published,
+        &old_pending,
+    )
+    .await;
+    assert_eq!(
+        stale_environment_signal.outcome_code,
+        "approval_environment_changed"
+    );
+    assert!(stale_environment_signal.promotion_record.is_none());
+    assert!(stale_environment_signal.admission_evidence.is_none());
+    assert!(stale_environment_signal.admission_digest.is_none());
+    assert!(stale_environment_signal.activation_projection.is_none());
+    assert!(stale_environment_signal.receipt_projection.is_none());
+    assert!(stale_environment_signal.audit_evidence_projection.is_none());
+    assert!(matches!(
+        decode_product_promotion_activation_link_v1(
+            stale_environment_signal,
+            &ring,
+            &environment_race_case.context,
+            &stale_environment_activation_access,
+            &environment_race_case.digests,
+            &old_activation_environment,
+            &old_pending,
+        )
+        .unwrap(),
+        ProductPromotionActivationStageV1::ApprovalEnvironmentChanged
+    ));
+    let mut polluted_environment_signal = direct_activation_link(
+        &pool,
+        &stale_environment_activation_access,
+        &environment_race_published,
+        &old_pending,
+    )
+    .await;
+    polluted_environment_signal.promotion_record =
+        Some(sqlx::types::Json(json!({"unexpected": true})));
+    assert_eq!(
+        decode_product_promotion_activation_link_v1(
+            polluted_environment_signal,
+            &ring,
+            &environment_race_case.context,
+            &stale_environment_activation_access,
+            &environment_race_case.digests,
+            &old_activation_environment,
+            &old_pending,
+        )
+        .unwrap_err(),
+        authoring_application::AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+    );
+    let stale_environment_state = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, \
+         (SELECT pg_catalog.count(*) FROM public.activation_requests \
+          WHERE promotion_id = promotion.id), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+          WHERE receipt_id = $2), \
+         (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+          WHERE receipt_id = $2) \
+         FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(environment_race_case.plan.promotion_id.as_str())
+    .bind(&environment_race_case.admission.payload.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stale_environment_state,
+        ("published".to_string(), 0, 0, 0, 0)
+    );
+    let refreshed_environment_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let refreshed_environment_access = access_args(refreshed_environment_now, &SESSION_DIGEST);
+    let refreshed_environment = direct_approval_environment(
+        &pool,
+        &refreshed_environment_access,
+        &environment_race_published,
+    )
+    .await;
+    assert_eq!(refreshed_environment.active_version, Some(active_version));
+    assert_eq!(
+        refreshed_environment.active_content_hash.as_deref(),
+        Some(active_content_hash.as_str())
+    );
+    let refreshed_environment = decode_product_promotion_approval_environment_v1(
+        refreshed_environment,
+        &environment_race_published,
+    )
+    .unwrap();
+    let (refreshed_resolved, refreshed_target, refreshed_database_now) = match refreshed_environment
+    {
+        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+            resolved,
+            target_artifact,
+            database_now,
+        } => (resolved, target_artifact, database_now),
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired { .. } => {
+            panic!("expected refreshed race approval environment")
+        }
+    };
+    let refreshed_pending = plan_pending_activation_v1(
+        &environment_race_published.record,
+        refreshed_resolved.clone(),
+    )
+    .unwrap();
+    let refreshed_activation_environment = ProductPromotionApprovalEnvironmentStageV1 {
+        admitted: ProductPromotionAdmittedStageV1 {
+            record: environment_race_published.record.clone(),
+            admission: environment_race_published.admission.clone(),
+            admission_digest: environment_race_published.admission_digest.clone(),
+            database_now: refreshed_database_now,
+        },
+        resolved: refreshed_resolved,
+        target_artifact: *refreshed_target,
+    };
+    let refreshed_activation_now =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let refreshed_activation_access = access_args(refreshed_activation_now, &SESSION_DIGEST);
+    let refreshed_activation = direct_activation_link(
+        &pool,
+        &refreshed_activation_access,
+        &environment_race_published,
+        &refreshed_pending,
+    )
+    .await;
+    assert_eq!(refreshed_activation.outcome_code, "created");
+    assert!(matches!(
+        decode_product_promotion_activation_link_v1(
+            refreshed_activation,
+            &ring,
+            &environment_race_case.context,
+            &refreshed_activation_access,
+            &environment_race_case.digests,
+            &refreshed_activation_environment,
+            &refreshed_pending,
+        )
+        .unwrap(),
+        ProductPromotionActivationStageV1::Finalized(_)
+    ));
+    let refreshed_environment_state = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        "SELECT promotion.stage, \
+             (SELECT pg_catalog.count(*) FROM public.activation_requests \
+              WHERE promotion_id = promotion.id), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipts \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_audit_events \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.product_action_receipt_audit_evidence \
+              WHERE receipt_id = $2), \
+             (SELECT pg_catalog.count(*) FROM public.automation_ruleset_activations \
+              WHERE guild_id = '3001' AND ruleset_key = 'ruleset' \
+                AND active_version = $3) \
+             FROM public.authoring_promotions AS promotion WHERE promotion.id = $1",
+    )
+    .bind(environment_race_case.plan.promotion_id.as_str())
+    .bind(&environment_race_case.admission.payload.receipt_id)
+    .bind(active_version)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        refreshed_environment_state,
+        ("activation_pending".to_string(), 1, 1, 1, 1, 1)
+    );
 
     seed_short_lived_session(&pool).await;
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;

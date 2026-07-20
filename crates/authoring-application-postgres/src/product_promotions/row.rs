@@ -109,13 +109,22 @@ pub(crate) struct ProductPromotionAdmittedStageV1 {
 }
 
 pub(crate) enum ProductPromotionPublishStageV1 {
-    Published(Box<ProductPromotionAdmittedStageV1>),
+    Published {
+        admitted: Box<ProductPromotionAdmittedStageV1>,
+        advanced: bool,
+    },
+    FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
+}
+
+pub(crate) enum ProductPromotionApprovalEnvironmentOutcomeV1 {
+    Resolved(Box<ProductPromotionApprovalEnvironmentStageV1>),
     FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
 }
 
 pub(crate) enum ProductPromotionActivationStageV1 {
     Finalized(Box<ProductPromotionFinalReplayV1>),
     FinalReplayRequired(Box<ProductPromotionAdmittedStageV1>),
+    ApprovalEnvironmentChanged,
 }
 
 pub(crate) enum ProductPromotionLegacyRepairStageV1 {
@@ -134,6 +143,9 @@ impl Debug for ProductPromotionActivationStageV1 {
                 .debug_tuple("ProductPromotionActivationStageV1::FinalReplayRequired")
                 .field(value)
                 .finish(),
+            Self::ApprovalEnvironmentChanged => {
+                formatter.write_str("ProductPromotionActivationStageV1::ApprovalEnvironmentChanged")
+            }
         }
     }
 }
@@ -156,9 +168,10 @@ impl Debug for ProductPromotionLegacyRepairStageV1 {
 impl Debug for ProductPromotionPublishStageV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Published(value) => formatter
-                .debug_tuple("ProductPromotionPublishStageV1::Published")
-                .field(value)
+            Self::Published { admitted, advanced } => formatter
+                .debug_struct("ProductPromotionPublishStageV1::Published")
+                .field("admitted", admitted)
+                .field("advanced", advanced)
                 .finish(),
             Self::FinalReplayRequired(value) => formatter
                 .debug_tuple("ProductPromotionPublishStageV1::FinalReplayRequired")
@@ -178,12 +191,19 @@ pub(super) struct ProductPromotionPublicationDecodedV1 {
     pub(super) record: PromotionRecordV1,
     pub(super) database_now: DateTime<Utc>,
     pub(super) final_replay_required: bool,
+    pub(super) advanced: bool,
 }
 
-pub(super) struct ProductPromotionApprovalEnvironmentDecodedV1 {
-    pub(super) resolved: ResolvedProductApprovalContextV1,
-    pub(super) target_artifact: RuleSetVersion,
-    pub(super) database_now: DateTime<Utc>,
+pub(super) enum ProductPromotionApprovalEnvironmentDecodedV1 {
+    Resolved {
+        resolved: ResolvedProductApprovalContextV1,
+        target_artifact: Box<RuleSetVersion>,
+        database_now: DateTime<Utc>,
+    },
+    FinalReplayRequired {
+        record: Box<PromotionRecordV1>,
+        database_now: DateTime<Utc>,
+    },
 }
 
 impl Debug for ProductPromotionApprovalEnvironmentStageV1 {
@@ -636,6 +656,7 @@ pub(super) fn decode_product_promotion_publication_v1(
             )?;
             Ok(ProductPromotionPublicationDecodedV1 {
                 final_replay_required: row.outcome_code == "final_exact",
+                advanced: matches!(row.outcome_code.as_str(), "created" | "reused"),
                 record: persisted,
                 database_now: row.database_now,
             })
@@ -662,6 +683,9 @@ pub(super) fn decode_product_promotion_approval_environment_v1(
 ) -> Result<ProductPromotionApprovalEnvironmentDecodedV1, AuthorizedPromotionSubmissionErrorV1> {
     match row.outcome_code.as_str() {
         "resolved" => validate_approval_environment_success_v1(row, &admitted.record),
+        "final_replay_required" => {
+            validate_approval_environment_final_replay_signal_v1(row, &admitted.record)
+        }
         "access_denied" => {
             require_approval_environment_absent_v1(&row)?;
             Err(AuthorizedPromotionSubmissionErrorV1::Forbidden)
@@ -707,6 +731,10 @@ pub(super) fn decode_product_promotion_activation_link_v1(
             environment,
         )
         .map(|value| ProductPromotionActivationStageV1::FinalReplayRequired(Box::new(value))),
+        "approval_environment_changed" => {
+            validate_approval_environment_changed_signal_v1(&row, environment)?;
+            Ok(ProductPromotionActivationStageV1::ApprovalEnvironmentChanged)
+        }
         "idempotency_conflict" => {
             require_activation_link_absent_v1(&row)?;
             Err(AuthorizedPromotionSubmissionErrorV1::IdempotencyConflict)
@@ -725,6 +753,21 @@ pub(super) fn decode_product_promotion_activation_link_v1(
         }
         _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
     }
+}
+
+fn validate_approval_environment_changed_signal_v1(
+    row: &ProductPromotionActivationLinkRowV1,
+    environment: &ProductPromotionApprovalEnvironmentStageV1,
+) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    require_activation_link_absent_v1(row)?;
+    if postgres_timestamp_micros(row.database_now)
+        < postgres_timestamp_micros(environment.admitted.database_now)
+        || postgres_timestamp_micros(row.database_now)
+            < postgres_timestamp_micros(environment.admitted.record.updated_at)
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(())
 }
 
 pub(super) fn decode_product_promotion_repair_link_v1(
@@ -1445,11 +1488,34 @@ fn validate_approval_environment_success_v1(
         return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
     }
     validate_target_artifact_v1(&published, &request.target, &target_projection.artifact)?;
-    Ok(ProductPromotionApprovalEnvironmentDecodedV1 {
+    Ok(ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
         resolved: ResolvedProductApprovalContextV1 { binding, baseline },
-        target_artifact: target_projection.artifact,
+        target_artifact: Box::new(target_projection.artifact),
         database_now: row.database_now,
     })
+}
+
+fn validate_approval_environment_final_replay_signal_v1(
+    row: ProductPromotionApprovalEnvironmentRowV1,
+    published: &PromotionRecordV1,
+) -> Result<ProductPromotionApprovalEnvironmentDecodedV1, AuthorizedPromotionSubmissionErrorV1> {
+    if row.historical_binding_revision.is_some()
+        || row.historical_resource_bindings.is_some()
+        || row.historical_binding_fingerprint.is_some()
+        || row.active_version.is_some()
+        || row.active_content_hash.is_some()
+        || row.target_artifact_projection.is_some()
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let record = decode_bounded_v1(row.promotion_record, MAX_PROMOTION_RECORD_BYTES)?;
+    validate_final_replay_signal_record_v1(published, &record, row.database_now)?;
+    Ok(
+        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired {
+            record: Box::new(record),
+            database_now: row.database_now,
+        },
+    )
 }
 
 fn publication_planning_basis_v1(
@@ -2709,16 +2775,57 @@ mod tests {
         };
         let persisted = || Some(Json(serde_json::to_value(&pending).unwrap()));
         let early_admitted = admitted_with_record(&admitted, published_early, result_time);
-        assert!(decode_product_promotion_publication_v1(
+        let final_publication = decode_product_promotion_publication_v1(
             publication_row("final_exact", projection(), persisted(), result_time),
             &early_admitted,
         )
-        .is_ok());
+        .unwrap();
+        assert!(final_publication.final_replay_required);
+        assert!(!final_publication.advanced);
+        let created_publication = decode_product_promotion_publication_v1(
+            publication_row(
+                "created",
+                projection(),
+                Some(Json(serde_json::to_value(&early_admitted.record).unwrap())),
+                early_publication_time,
+            ),
+            &admitted,
+        )
+        .unwrap();
+        assert!(created_publication.advanced);
         let late_admitted = admitted_with_record(&admitted, published_late, result_time);
         assert!(matches!(
             decode_product_promotion_publication_v1(
                 publication_row("final_exact", projection(), persisted(), result_time),
                 &late_admitted,
+            ),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+        let mut final_environment = approval_environment_row("final_replay_required");
+        final_environment.promotion_record = persisted();
+        final_environment.database_now = result_time;
+        let decoded =
+            decode_product_promotion_approval_environment_v1(final_environment, &early_admitted)
+                .unwrap();
+        assert!(matches!(
+            decoded,
+            ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired {
+                record,
+                database_now,
+            } if *record == pending && database_now == result_time
+        ));
+        let mut polluted_environment = approval_environment_row("final_replay_required");
+        polluted_environment.promotion_record = persisted();
+        polluted_environment.active_version = Some(1);
+        polluted_environment.database_now = result_time;
+        assert!(matches!(
+            decode_product_promotion_approval_environment_v1(polluted_environment, &early_admitted,),
+            Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        ));
+        assert!(matches!(
+            decode_product_promotion_approval_environment_v1(
+                approval_environment_row("final_replay_required"),
+                &early_admitted,
             ),
             Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
         ));

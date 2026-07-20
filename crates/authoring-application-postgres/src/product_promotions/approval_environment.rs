@@ -9,6 +9,7 @@ use super::digest::{promotion_digests_v1, ProductPromotionDigestsV1};
 use super::row::{
     decode_product_promotion_approval_environment_v1,
     validate_product_promotion_admitted_for_access_v1, ProductPromotionAdmittedStageV1,
+    ProductPromotionApprovalEnvironmentDecodedV1, ProductPromotionApprovalEnvironmentOutcomeV1,
     ProductPromotionApprovalEnvironmentRowV1, ProductPromotionApprovalEnvironmentStageV1,
 };
 use super::store::PostgresProductPromotions;
@@ -30,7 +31,7 @@ impl PostgresProductPromotions {
         &self,
         access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
         admitted: ProductPromotionAdmittedStageV1,
-    ) -> Result<ProductPromotionApprovalEnvironmentStageV1, AuthorizedPromotionSubmissionErrorV1>
+    ) -> Result<ProductPromotionApprovalEnvironmentOutcomeV1, AuthorizedPromotionSubmissionErrorV1>
     {
         let access_args = product_promotion_access_args_v1(access)?;
         let context = product_promotion_admission_context_v1(access);
@@ -53,7 +54,7 @@ impl PostgresProductPromotions {
         context: &ProductPromotionAdmissionContextV1,
         digests: &ProductPromotionDigestsV1,
         admitted: ProductPromotionAdmittedStageV1,
-    ) -> Result<ProductPromotionApprovalEnvironmentStageV1, AuthorizedPromotionSubmissionErrorV1>
+    ) -> Result<ProductPromotionApprovalEnvironmentOutcomeV1, AuthorizedPromotionSubmissionErrorV1>
     {
         let expected_revision = i64::try_from(admitted.record.revision.get())
             .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
@@ -143,16 +144,34 @@ impl PostgresProductPromotions {
             };
             match transaction.commit().await {
                 Ok(()) => {
-                    let admitted = ProductPromotionAdmittedStageV1 {
-                        record: admitted.record,
-                        admission: admitted.admission,
-                        admission_digest: admitted.admission_digest,
-                        database_now: decoded.database_now,
-                    };
-                    return Ok(ProductPromotionApprovalEnvironmentStageV1 {
-                        admitted,
-                        resolved: decoded.resolved,
-                        target_artifact: decoded.target_artifact,
+                    return Ok(match decoded {
+                        ProductPromotionApprovalEnvironmentDecodedV1::Resolved {
+                            resolved,
+                            target_artifact,
+                            database_now,
+                        } => ProductPromotionApprovalEnvironmentOutcomeV1::Resolved(Box::new(
+                            ProductPromotionApprovalEnvironmentStageV1 {
+                                admitted: ProductPromotionAdmittedStageV1 {
+                                    record: admitted.record,
+                                    admission: admitted.admission,
+                                    admission_digest: admitted.admission_digest,
+                                    database_now,
+                                },
+                                resolved,
+                                target_artifact: *target_artifact,
+                            },
+                        )),
+                        ProductPromotionApprovalEnvironmentDecodedV1::FinalReplayRequired {
+                            record,
+                            database_now,
+                        } => ProductPromotionApprovalEnvironmentOutcomeV1::FinalReplayRequired(
+                            Box::new(ProductPromotionAdmittedStageV1 {
+                                record: *record,
+                                admission: admitted.admission,
+                                admission_digest: admitted.admission_digest,
+                                database_now,
+                            }),
+                        ),
                     });
                 }
                 Err(error) => {

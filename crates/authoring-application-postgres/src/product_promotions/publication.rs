@@ -137,7 +137,7 @@ impl PostgresProductPromotions {
             };
             match transaction.commit().await {
                 Ok(()) => {
-                    let advanced = ProductPromotionAdmittedStageV1 {
+                    let published = ProductPromotionAdmittedStageV1 {
                         record: decoded.record,
                         admission: admitted.admission,
                         admission_digest: admitted.admission_digest,
@@ -145,12 +145,13 @@ impl PostgresProductPromotions {
                     };
                     return if decoded.final_replay_required {
                         Ok(ProductPromotionPublishStageV1::FinalReplayRequired(
-                            Box::new(advanced),
+                            Box::new(published),
                         ))
                     } else {
-                        Ok(ProductPromotionPublishStageV1::Published(Box::new(
-                            advanced,
-                        )))
+                        Ok(ProductPromotionPublishStageV1::Published {
+                            admitted: Box::new(published),
+                            advanced: decoded.advanced,
+                        })
                     };
                 }
                 Err(error) => {

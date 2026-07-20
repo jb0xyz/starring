@@ -638,6 +638,7 @@ Arguments after `AccessV1` are identical to Publish. It returns:
 ```sql
 TABLE(
     outcome_code TEXT,
+    promotion_record JSONB,
     historical_binding_revision BIGINT,
     historical_resource_bindings JSONB,
     historical_binding_fingerprint TEXT,
@@ -652,6 +653,13 @@ It authenticates current access, then reads only the admitted historical
 authority, exact immutable target, and current active baseline. `active_version`
 and `active_content_hash` are both null or both non-null. Rust recomputes the
 resource and approval-binding fingerprints and rejects any mismatch.
+
+`resolved` returns the exact Published promotion and every environment
+projection. If a concurrent request has already finalized the same promotion,
+`final_replay_required` returns only the exact final promotion record and leaves
+every environment projection null. Rust validates that final record against the
+admitted Published record, commits the read transaction, and performs exactly
+one Replay call to validate the immutable receipt and audit evidence.
 
 ### Activation and link
 
@@ -692,8 +700,18 @@ ActivationPending or Expired, performs the exact guarded link only after the
 ActivationPending journal is visible in the transaction, and inserts final
 receipt, aliases, audit, and audit evidence. All rows commit or none do.
 
-An already-linked exact activation and final receipt returns `final_exact`.
-There is no normal-path follow-up link call.
+An already-linked exact activation and final receipt returns
+`final_replay_required` with the exact promotion and admission projections and
+null activation, receipt, and audit projections. Rust validates the concurrent
+final transition and performs exactly one Replay call to establish final receipt
+and audit truth. There is no normal-path follow-up link call.
+
+If the active RuleSet pointer changes after approval-environment resolution but
+before activation-link locking, the pointer remains valid durable state rather
+than corruption. The function returns `approval_environment_changed` with every
+optional projection null and no write. Rust resolves the environment and derives
+the proposal once more. A second change within the same request returns the
+stable retryable backend class; refresh is bounded and never loops.
 
 ### Legacy activation-link repair
 

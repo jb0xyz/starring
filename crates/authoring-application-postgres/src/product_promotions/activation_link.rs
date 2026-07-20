@@ -34,7 +34,7 @@ impl PostgresProductPromotions {
     pub(crate) async fn link_authorized_promotion_activation_stage_v1(
         &self,
         access: &AuthorizedPromotionAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
-        environment: ProductPromotionApprovalEnvironmentStageV1,
+        environment: &ProductPromotionApprovalEnvironmentStageV1,
     ) -> Result<ProductPromotionActivationStageV1, AuthorizedPromotionSubmissionErrorV1> {
         let access_args = product_promotion_access_args_v1(access)?;
         let context = product_promotion_admission_context_v1(access);
@@ -73,7 +73,7 @@ impl PostgresProductPromotions {
         access: &ProductPromotionAccessArgsV1,
         context: &ProductPromotionAdmissionContextV1,
         digests: &ProductPromotionDigestsV1,
-        environment: ProductPromotionApprovalEnvironmentStageV1,
+        environment: &ProductPromotionApprovalEnvironmentStageV1,
         proposal: &PendingActivationProposalV1,
         serialized: &Json<Value>,
     ) -> Result<ProductPromotionActivationStageV1, AuthorizedPromotionSubmissionErrorV1> {
@@ -156,7 +156,7 @@ impl PostgresProductPromotions {
                 context,
                 access,
                 digests,
-                &environment,
+                environment,
                 proposal,
             ) {
                 Ok(decoded) => decoded,

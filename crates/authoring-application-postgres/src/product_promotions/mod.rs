@@ -9,6 +9,7 @@ mod authorization;
 mod config;
 #[allow(dead_code)]
 mod digest;
+mod orchestrator;
 #[allow(dead_code)]
 mod prepare;
 #[allow(dead_code)]

@@ -4,6 +4,13 @@ use sqlx::Connection;
 
 const PROMOTION_MIGRATION: i64 = 202_607_200_002;
 
+fn suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
 fn database_url() -> String {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
         .expect("STARRING_TEST_DATABASE_URL required for ignored PostgreSQL tests");
@@ -154,21 +161,61 @@ fn promotion_migration_is_fail_closed_and_scoped() {
     assert!(!environment_body.contains("UPDATE public."));
     assert!(!environment_body.contains("DELETE FROM"));
 
-    for function in [
-        "starring_product_promotion_activation_link_v1",
-        "starring_product_promotion_repair_link_v1",
+    let activation_body = migration
+        .split("CREATE FUNCTION public.starring_product_promotion_activation_link_v1(")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    for required in [
+        "starring_product_promotion_authorize_current_v1",
+        "FOR UPDATE",
+        "INSERT INTO public.activation_requests",
+        "UPDATE public.authoring_promotions",
+        "starring_product_promotion_finalize_receipt_v1",
+        "'final_replay_required'",
+        "calculated_active_content_hash",
+        "'approval_environment_changed'",
     ] {
-        let body = migration
-            .split(&format!("CREATE FUNCTION public.{function}("))
-            .nth(1)
-            .unwrap()
-            .split("$function$;")
-            .next()
-            .unwrap();
-        assert!(body.contains("RETURN QUERY SELECT 'persistence_corrupt'"));
-        assert!(!body.contains("INSERT INTO"));
-        assert!(!body.contains("UPDATE public."));
-        assert!(!body.contains("DELETE FROM"));
+        assert!(
+            activation_body.contains(required),
+            "missing activation guard: {required}"
+        );
+    }
+    assert!(!activation_body.contains("UPDATE public.automation_ruleset_activations"));
+    assert!(!activation_body.contains("DELETE FROM"));
+
+    let repair_body = migration
+        .split("CREATE FUNCTION public.starring_product_promotion_repair_link_v1(")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    assert!(repair_body.contains("RETURN QUERY SELECT 'persistence_corrupt'"));
+    assert!(!repair_body.contains("INSERT INTO"));
+    assert!(!repair_body.contains("UPDATE public."));
+    assert!(!repair_body.contains("DELETE FROM"));
+
+    for helper in [
+        "public.enforce_authoring_promotion_scope()",
+        "public.enforce_authoring_promotion_product_admission()",
+        "public.enforce_authoring_promotion_product_transition()",
+        "public.reject_ruleset_artifact_mutation()",
+        "public.enforce_product_activation_journal_link()",
+        "public.enforce_product_activation_scope()",
+        "public.guard_legacy_activation_product_slot()",
+        "public.guard_product_ruleset_artifact_transition()",
+        "public.assert_product_approval_receipt_alias()",
+        "public.assert_product_approval_receipt_audit()",
+        "public.enforce_product_action_receipt_retention()",
+        "public.enforce_product_action_receipt_alias_capacity()",
+        "public.enforce_product_action_receipt_alias_retention()",
+        "public.capture_product_action_receipt_audit_evidence()",
+        "public.reject_immutable_product_approval_row()",
+    ] {
+        assert!(migration.contains(&format!("'{helper}'")));
     }
 }
 
@@ -176,7 +223,15 @@ fn promotion_migration_is_fail_closed_and_scoped() {
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn promotion_migration_applies_fresh_and_collision_rolls_back_without_residue() {
     let name = "starring_promotion_migration_test";
-    let (administrator, pool) = temporary_database(name).await;
+    let (mut administrator, pool) = temporary_database(name).await;
+    let hostile_role = format!("starring_promotion_hostile_{}", suffix());
+    sqlx::query(&format!(
+        "CREATE ROLE {hostile_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOINHERIT NOREPLICATION NOBYPASSRLS"
+    ))
+    .execute(&mut administrator)
+    .await
+    .unwrap();
     let outcome = async {
         for migration in MIGRATOR
             .iter()
@@ -234,11 +289,126 @@ async fn promotion_migration_applies_fresh_and_collision_rolls_back_without_resi
         sqlx::query("DROP FUNCTION public.starring_product_promotion_replay_v1(TEXT)")
             .execute(&pool)
             .await?;
+        sqlx::query(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public \
+             GRANT EXECUTE ON FUNCTIONS TO {hostile_role}"
+        ))
+        .execute(&pool)
+        .await?;
+        let mut transaction = pool.begin().await?;
+        let error = sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .expect_err("hostile default privileges must fail the migration preflight");
+        transaction.rollback().await?;
+        assert!(matches!(
+            error,
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("55000")
+        ));
+        let preflight_residue = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT \
+             (SELECT pg_catalog.count(*) FROM information_schema.columns \
+              WHERE table_schema = 'public' AND table_name = 'authoring_promotions' \
+                AND column_name LIKE 'product_admission%'), \
+             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc AS function_row \
+              INNER JOIN pg_catalog.pg_namespace AS namespace \
+                ON namespace.oid = function_row.pronamespace \
+              WHERE namespace.nspname = 'public' \
+                AND function_row.proname LIKE 'starring_product_promotion_%')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(preflight_residue, (0, 0));
+        sqlx::query(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public \
+             REVOKE EXECUTE ON FUNCTIONS FROM {hostile_role}"
+        ))
+        .execute(&pool)
+        .await?;
+        let trigger_helpers = [
+            "public.enforce_authoring_promotion_scope()",
+            "public.reject_ruleset_artifact_mutation()",
+            "public.enforce_product_activation_journal_link()",
+            "public.enforce_product_activation_scope()",
+            "public.guard_legacy_activation_product_slot()",
+            "public.guard_product_ruleset_artifact_transition()",
+            "public.assert_product_approval_receipt_alias()",
+            "public.assert_product_approval_receipt_audit()",
+            "public.enforce_product_action_receipt_retention()",
+            "public.enforce_product_action_receipt_alias_capacity()",
+            "public.enforce_product_action_receipt_alias_retention()",
+            "public.capture_product_action_receipt_audit_evidence()",
+            "public.reject_immutable_product_approval_row()",
+            "public.starring_canonical_json_v1(jsonb)",
+            "public.starring_ruleset_content_hash_v1(bigint,jsonb)",
+            "public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)",
+        ];
+        for function in trigger_helpers {
+            sqlx::query(&format!(
+                "GRANT EXECUTE ON FUNCTION {function} TO {hostile_role} WITH GRANT OPTION"
+            ))
+            .execute(&pool)
+            .await?;
+        }
         let mut transaction = pool.begin().await?;
         sqlx::raw_sql(migration.sql.as_ref())
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
+
+        let protected_trigger_helpers = vec![
+            "public.enforce_authoring_promotion_scope()".to_string(),
+            "public.enforce_authoring_promotion_product_admission()".to_string(),
+            "public.enforce_authoring_promotion_product_transition()".to_string(),
+            "public.reject_ruleset_artifact_mutation()".to_string(),
+            "public.enforce_product_activation_journal_link()".to_string(),
+            "public.enforce_product_activation_scope()".to_string(),
+            "public.guard_legacy_activation_product_slot()".to_string(),
+            "public.guard_product_ruleset_artifact_transition()".to_string(),
+            "public.assert_product_approval_receipt_alias()".to_string(),
+            "public.assert_product_approval_receipt_audit()".to_string(),
+            "public.enforce_product_action_receipt_retention()".to_string(),
+            "public.enforce_product_action_receipt_alias_capacity()".to_string(),
+            "public.enforce_product_action_receipt_alias_retention()".to_string(),
+            "public.capture_product_action_receipt_audit_evidence()".to_string(),
+            "public.reject_immutable_product_approval_row()".to_string(),
+            "public.starring_canonical_json_v1(jsonb)".to_string(),
+            "public.starring_ruleset_content_hash_v1(bigint,jsonb)".to_string(),
+            "public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)".to_string(),
+        ];
+        let helper_count = sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) FROM pg_catalog.unnest($1::TEXT[]) AS expected(identity) \
+             WHERE pg_catalog.to_regprocedure(expected.identity) IS NOT NULL",
+        )
+        .bind(&protected_trigger_helpers)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(helper_count, 18);
+        let leaked_acl_count = sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM pg_catalog.unnest($1::TEXT[]) AS expected(identity) \
+             INNER JOIN pg_catalog.pg_proc AS function_row \
+               ON function_row.oid = pg_catalog.to_regprocedure(expected.identity) \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE( \
+              function_row.proacl, pg_catalog.acldefault('f', function_row.proowner) \
+             )) AS privilege \
+             WHERE privilege.grantee <> function_row.proowner",
+        )
+        .bind(&protected_trigger_helpers)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(leaked_acl_count, 0);
+        let hostile_execute_count = sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM pg_catalog.unnest($1::TEXT[]) AS expected(identity) \
+             WHERE pg_catalog.has_function_privilege( \
+              $2, pg_catalog.to_regprocedure(expected.identity), 'EXECUTE')",
+        )
+        .bind(&protected_trigger_helpers)
+        .bind(&hostile_role)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(hostile_execute_count, 0);
 
         let hostile_outcome = sqlx::query_scalar::<_, String>(
             "SELECT outcome_code \
@@ -435,6 +605,14 @@ async fn promotion_migration_applies_fresh_and_collision_rolls_back_without_resi
         Ok::<_, sqlx::Error>(())
     }
     .await;
+    let cleanup = sqlx::query(&format!("DROP OWNED BY {hostile_role}"))
+        .execute(&pool)
+        .await;
+    let role_cleanup = sqlx::query(&format!("DROP ROLE {hostile_role}"))
+        .execute(&mut administrator)
+        .await;
     drop_temporary_database(administrator, pool, name).await;
+    cleanup.unwrap();
+    role_cleanup.unwrap();
     outcome.unwrap();
 }

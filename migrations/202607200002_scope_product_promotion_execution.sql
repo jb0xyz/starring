@@ -2041,6 +2041,84 @@ BEGIN
         RETURN;
     END IF;
 
+    IF promotion_row.stage IN ('activation_pending', 'expired') THEN
+        final_clock := pg_catalog.clock_timestamp();
+        IF authority_observed_at > final_clock
+            OR final_clock >= authority_expires_at
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_principals AS principal
+                WHERE principal.principal_id = expected_principal_id
+                    AND NOT principal.disabled
+                    AND principal.discord_user_id = expected_acting_user_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_auth_sessions AS product_session
+                WHERE product_session.session_digest
+                        = expected_product_session_digest
+                    AND product_session.principal_id = expected_principal_id
+                    AND product_session.oauth_state_digest IS NOT NULL
+                    AND product_session.revoked_at IS NULL
+                    AND product_session.revocation_reason IS NULL
+                    AND final_clock < product_session.idle_expires_at
+                    AND final_clock < product_session.absolute_expires_at
+            )
+        THEN
+            RETURN QUERY SELECT 'access_denied',
+                NULL::JSONB,
+                NULL::BIGINT,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::BIGINT,
+                NULL::TEXT,
+                NULL::JSONB,
+                final_clock;
+            RETURN;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.automation_installations AS installation
+            INNER JOIN public.automation_installation_authority_versions AS authority
+                ON authority.tenant_id = installation.tenant_id
+                AND authority.installation_id = installation.installation_id
+                AND authority.revision = installation.current_authority_revision
+            WHERE installation.tenant_id = expected_tenant_id
+                AND installation.installation_id = expected_installation_id
+                AND installation.lifecycle_state = 'active'
+                AND installation.discord_application_id
+                    = expected_discord_application_id
+                AND installation.discord_guild_id = expected_guild_id
+                AND installation.ruleset_key
+                    = intent_document #>> '{authority,ruleset_key}'
+                AND installation.current_authority_revision
+                    = observed_current_authority_revision
+                AND authority.authority_payload_digest
+                    = observed_current_authority_payload_digest
+        ) THEN
+            RETURN QUERY SELECT 'scope_mismatch',
+                NULL::JSONB,
+                NULL::BIGINT,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::BIGINT,
+                NULL::TEXT,
+                NULL::JSONB,
+                final_clock;
+            RETURN;
+        END IF;
+        RETURN QUERY SELECT 'final_replay_required',
+            promotion_row.record,
+            NULL::BIGINT,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::BIGINT,
+            NULL::TEXT,
+            NULL::JSONB,
+            final_clock;
+        RETURN;
+    END IF;
+
     SELECT generation.*
     INTO generation_row
     FROM public.authoring_session_generations AS generation
@@ -2378,15 +2456,1607 @@ PARALLEL UNSAFE
 ROWS 1
 SET search_path = pg_catalog
 AS $function$
+DECLARE
+    access_result RECORD;
+    finalize_result RECORD;
+    promotion_row public.authoring_promotions%ROWTYPE;
+    authority_row public.automation_installation_authority_versions%ROWTYPE;
+    head_row public.automation_ruleset_heads%ROWTYPE;
+    target_version_row public.automation_ruleset_versions%ROWTYPE;
+    pointer_row public.automation_ruleset_activations%ROWTYPE;
+    active_version_row public.automation_ruleset_versions%ROWTYPE;
+    activation_row public.activation_requests%ROWTYPE;
+    admission_payload JSONB;
+    intent_document JSONB;
+    publication_document JSONB;
+    proposal_document JSONB;
+    context_document JSONB;
+    expected_bindings JSONB;
+    expected_baseline JSONB;
+    expected_target JSONB;
+    activation_request_document JSONB;
+    activation_projection_document JSONB;
+    journal_activation_document JSONB;
+    persisted_record JSONB;
+    receipt_document JSONB;
+    audit_document JSONB;
+    payload_document JSONB;
+    hash_document JSONB;
+    digest_input BYTEA;
+    field_bytes BYTEA;
+    domain_bytes BYTEA;
+    calculated_request_id TEXT;
+    calculated_policy_digest TEXT;
+    calculated_binding_fingerprint TEXT;
+    calculated_payload_digest TEXT;
+    calculated_context_digest TEXT;
+    calculated_content_hash TEXT;
+    calculated_active_content_hash TEXT;
+    activation_disposition TEXT;
+    next_stage TEXT;
+    mutation_clock TIMESTAMPTZ;
+    created_clock TIMESTAMPTZ;
+    expires_clock TIMESTAMPTZ;
+    admitted_clock TIMESTAMPTZ;
+    observed_clock TIMESTAMPTZ;
+    admission_expires_clock TIMESTAMPTZ;
+    policy_revision_value BIGINT;
+    binding_revision_value BIGINT;
+    required_approvals_value BIGINT;
+    ttl_seconds_value BIGINT;
+    target_version_value BIGINT;
+    schema_version_value BIGINT;
+    authority_revision_value BIGINT;
+    generation_value BIGINT;
+    permission_value NUMERIC;
+    activation_count BIGINT;
+    final_projection_count BIGINT;
+    binding_value JSONB;
 BEGIN
-    RETURN QUERY SELECT 'persistence_corrupt',
-        NULL::JSONB,
-        NULL::JSONB,
-        NULL::TEXT,
-        NULL::JSONB,
-        NULL::JSONB,
-        NULL::JSONB,
-        pg_catalog.clock_timestamp();
+    SELECT *
+    INTO access_result
+    FROM public.starring_product_promotion_authorize_current_v1(
+        expected_tenant_id,
+        expected_installation_id,
+        expected_principal_id,
+        expected_product_session_digest,
+        expected_acting_user_id,
+        expected_discord_application_id,
+        expected_guild_id,
+        expected_capability,
+        observed_current_authority_revision,
+        observed_current_authority_payload_digest,
+        authority_observation_digest,
+        authority_observed_at,
+        authority_expires_at,
+        effective_permission_bits,
+        guild_owner
+    );
+    IF access_result.outcome_code <> 'authorized' THEN
+        RETURN QUERY SELECT access_result.outcome_code,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    IF expected_promotion_id !~ '^[0-9a-f]{64}$'
+        OR expected_promotion_revision NOT BETWEEN 1 AND 9223372036854775807
+        OR expected_promotion_request_digest !~ '^[0-9a-f]{64}$'
+        OR expected_admission_digest !~ '^[0-9a-f]{64}$'
+        OR pg_catalog.jsonb_typeof(activation_proposal) IS DISTINCT FROM 'object'
+        OR pg_catalog.octet_length(activation_proposal::TEXT) > 1048576
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(activation_proposal) AS key(name)
+        ) <> 2
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(activation_proposal) AS key(name)
+            WHERE key.name NOT IN ('format_version', 'proposal')
+        )
+        OR activation_proposal ->> 'format_version' IS DISTINCT FROM '1'
+        OR pg_catalog.jsonb_typeof(activation_proposal -> 'proposal')
+            IS DISTINCT FROM 'object'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+    proposal_document := activation_proposal -> 'proposal';
+    IF (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(proposal_document) AS key(name)
+        ) <> 7
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(proposal_document) AS key(name)
+            WHERE key.name NOT IN (
+                'promotion_id', 'promotion_request_digest', 'expected_revision',
+                'request_id', 'target', 'requester', 'approval_context'
+            )
+        )
+        OR proposal_document ->> 'promotion_id'
+            IS DISTINCT FROM expected_promotion_id
+        OR proposal_document ->> 'promotion_request_digest'
+            IS DISTINCT FROM expected_promotion_request_digest
+        OR proposal_document ->> 'expected_revision'
+            IS DISTINCT FROM expected_promotion_revision::TEXT
+        OR (proposal_document ->> 'request_id' ~ '^[A-Za-z0-9_-]{1,64}$')
+            IS DISTINCT FROM TRUE
+        OR pg_catalog.jsonb_typeof(proposal_document -> 'target')
+            IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(proposal_document -> 'approval_context')
+            IS DISTINCT FROM 'object'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    SELECT promotion.*
+    INTO promotion_row
+    FROM public.authoring_promotions AS promotion
+    WHERE promotion.id = expected_promotion_id
+    FOR UPDATE;
+    access_result.database_now := pg_catalog.clock_timestamp();
+    IF promotion_row.id IS NULL
+        OR promotion_row.tenant_id IS DISTINCT FROM expected_tenant_id
+        OR promotion_row.installation_id IS DISTINCT FROM expected_installation_id
+        OR promotion_row.principal_id IS DISTINCT FROM expected_principal_id
+    THEN
+        RETURN QUERY SELECT 'scope_mismatch',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    intent_document := promotion_row.record -> 'intent';
+    publication_document := promotion_row.record #> '{stage,publication}';
+    IF promotion_row.record_format_version <> 1
+        OR promotion_row.request_digest
+            IS DISTINCT FROM expected_promotion_request_digest
+        OR promotion_row.product_admission_format_version <> 1
+        OR promotion_row.product_admission_digest
+            IS DISTINCT FROM expected_admission_digest
+        OR promotion_row.product_admission IS NULL
+        OR pg_catalog.jsonb_typeof(promotion_row.record) IS DISTINCT FROM 'object'
+        OR pg_catalog.octet_length(promotion_row.record::TEXT) > 8388608
+        OR pg_catalog.jsonb_typeof(intent_document) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(promotion_row.record -> 'stage')
+            IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(publication_document) IS DISTINCT FROM 'object'
+        OR promotion_row.record ->> 'id' IS DISTINCT FROM promotion_row.id
+        OR promotion_row.record ->> 'revision'
+            IS DISTINCT FROM promotion_row.revision::TEXT
+        OR promotion_row.record ->> 'request_digest'
+            IS DISTINCT FROM promotion_row.request_digest
+        OR promotion_row.record #>> '{stage,state}'
+            IS DISTINCT FROM promotion_row.stage
+        OR promotion_row.record #>> '{intent,authority,tenant_id}'
+            IS DISTINCT FROM expected_tenant_id
+        OR promotion_row.record #>> '{intent,authority,installation_id}'
+            IS DISTINCT FROM expected_installation_id
+        OR promotion_row.record #>> '{intent,authority,principal_id}'
+            IS DISTINCT FROM expected_principal_id
+        OR promotion_row.record #>> '{intent,authority,session_owner_id}'
+            IS DISTINCT FROM expected_principal_id
+        OR promotion_row.record #>> '{intent,authority,guild_id}'
+            IS DISTINCT FROM expected_guild_id
+        OR promotion_row.record #>> '{intent,authority,requester}'
+            IS DISTINCT FROM expected_acting_user_id
+        OR promotion_row.record #>> '{intent,authority,ruleset_key}'
+            !~ '^[A-Za-z0-9_-]{1,64}$'
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(promotion_row.record) AS key(name)
+        ) <> 7
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(promotion_row.record) AS key(name)
+            WHERE key.name NOT IN (
+                'id', 'revision', 'request_digest', 'intent', 'stage',
+                'created_at', 'updated_at'
+            )
+        )
+        OR pg_catalog.jsonb_typeof(promotion_row.product_admission)
+            IS DISTINCT FROM 'object'
+        OR pg_catalog.octet_length(promotion_row.product_admission::TEXT) > 32768
+        OR promotion_row.product_admission ->> 'format_version' IS DISTINCT FROM '1'
+        OR pg_catalog.jsonb_typeof(promotion_row.product_admission -> 'payload')
+            IS DISTINCT FROM 'object'
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(promotion_row.product_admission) AS key(name)
+        ) <> 3
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(promotion_row.product_admission) AS key(name)
+            WHERE key.name NOT IN ('format_version', 'payload', 'admitted_at')
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    admission_payload := promotion_row.product_admission -> 'payload';
+    IF (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(admission_payload) AS key(name)
+        ) <> 31
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(admission_payload) AS key(name)
+            WHERE key.name NOT IN (
+                'endpoint_domain', 'product_request_id', 'tenant_id',
+                'installation_id', 'principal_id', 'authoring_session_id',
+                'generation', 'candidate_revision', 'candidate_hash',
+                'promotion_id', 'promotion_request_digest', 'session_subject_digest',
+                'idempotency_key_digest', 'idempotency_digest_key_id',
+                'idempotency_digest_key_fingerprint', 'semantic_request_digest',
+                'receipt_id', 'audit_event_id', 'discord_application_id', 'guild_id',
+                'acting_user_id', 'capability', 'authority_revision',
+                'authority_payload_digest', 'authority_observation_digest',
+                'authority_observed_at', 'authority_expires_at',
+                'effective_permission_bits', 'guild_owner', 'binding_fingerprint',
+                'policy_revision'
+            )
+        )
+        OR admission_payload ->> 'endpoint_domain'
+            IS DISTINCT FROM 'product_promote_v1'
+        OR admission_payload ->> 'tenant_id' IS DISTINCT FROM expected_tenant_id
+        OR admission_payload ->> 'installation_id'
+            IS DISTINCT FROM expected_installation_id
+        OR admission_payload ->> 'principal_id'
+            IS DISTINCT FROM expected_principal_id
+        OR admission_payload ->> 'promotion_id'
+            IS DISTINCT FROM expected_promotion_id
+        OR admission_payload ->> 'promotion_request_digest'
+            IS DISTINCT FROM expected_promotion_request_digest
+        OR admission_payload ->> 'discord_application_id'
+            IS DISTINCT FROM expected_discord_application_id
+        OR admission_payload ->> 'guild_id' IS DISTINCT FROM expected_guild_id
+        OR admission_payload ->> 'acting_user_id'
+            IS DISTINCT FROM expected_acting_user_id
+        OR admission_payload ->> 'capability' IS DISTINCT FROM 'promote'
+        OR admission_payload ->> 'authoring_session_id'
+            IS DISTINCT FROM intent_document #>> '{authority,session_id}'
+        OR admission_payload ->> 'generation'
+            IS DISTINCT FROM intent_document #>> '{authority,session_generation}'
+        OR admission_payload ->> 'candidate_revision'
+            IS DISTINCT FROM intent_document #>> '{evidence,candidate_revision}'
+        OR admission_payload ->> 'candidate_hash'
+            IS DISTINCT FROM intent_document #>> '{evidence,candidate_ruleset_hash}'
+        OR admission_payload ->> 'binding_fingerprint'
+            IS DISTINCT FROM intent_document #>> '{evidence,context_fingerprint}'
+        OR admission_payload ->> 'policy_revision'
+            IS DISTINCT FROM intent_document #>> '{authority,policy,revision}'
+        OR (admission_payload ->> 'product_request_id'
+            ~ '^[A-Za-z0-9_.:-]{1,128}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'session_subject_digest'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'idempotency_key_digest'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'idempotency_digest_key_id'
+            ~ '^[A-Za-z0-9_.:-]{1,64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'idempotency_digest_key_fingerprint'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'semantic_request_digest'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'receipt_id' ~ '^[0-9a-f]{64}$')
+            IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'audit_event_id' ~ '^[0-9a-f]{64}$')
+            IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'authority_revision'
+            ~ '^[1-9][0-9]{0,18}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'authority_payload_digest'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'authority_observation_digest'
+            ~ '^[0-9a-f]{64}$') IS DISTINCT FROM TRUE
+        OR (admission_payload ->> 'effective_permission_bits'
+            ~ '^(0|[1-9][0-9]{0,19})$') IS DISTINCT FROM TRUE
+        OR pg_catalog.jsonb_typeof(admission_payload -> 'guild_owner')
+            IS DISTINCT FROM 'boolean'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    BEGIN
+        admitted_clock := (
+            promotion_row.product_admission ->> 'admitted_at'
+        )::TIMESTAMPTZ;
+        observed_clock := (
+            admission_payload ->> 'authority_observed_at'
+        )::TIMESTAMPTZ;
+        admission_expires_clock := (
+            admission_payload ->> 'authority_expires_at'
+        )::TIMESTAMPTZ;
+        authority_revision_value := (
+            admission_payload ->> 'authority_revision'
+        )::BIGINT;
+        generation_value := (admission_payload ->> 'generation')::BIGINT;
+        permission_value := (
+            admission_payload ->> 'effective_permission_bits'
+        )::NUMERIC;
+    EXCEPTION
+        WHEN invalid_text_representation
+            OR numeric_value_out_of_range
+            OR datetime_field_overflow
+        THEN
+            RETURN QUERY SELECT 'persistence_corrupt',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                access_result.database_now;
+            RETURN;
+    END;
+    IF admitted_clock > access_result.database_now
+        OR observed_clock > admitted_clock
+        OR admitted_clock >= admission_expires_clock
+        OR admission_expires_clock > observed_clock + INTERVAL '5 seconds'
+        OR authority_revision_value NOT BETWEEN 1 AND 9223372036854775807
+        OR generation_value NOT BETWEEN 1 AND 9223372036854775807
+        OR permission_value > 18446744073709551615
+        OR NOT (
+            (admission_payload ->> 'guild_owner')::BOOLEAN
+            OR pg_catalog.mod(permission_value, 16) >= 8
+            OR pg_catalog.mod(permission_value, 64) >= 32
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    IF promotion_row.stage IN ('activation_pending', 'expired') THEN
+        SELECT pg_catalog.count(*)
+        INTO final_projection_count
+        FROM public.product_action_receipts AS receipt
+        INNER JOIN public.product_action_receipt_idempotency_aliases AS alias
+            ON alias.tenant_id = receipt.tenant_id
+            AND alias.installation_id = receipt.installation_id
+            AND alias.principal_id = receipt.principal_id
+            AND alias.endpoint_domain = receipt.endpoint_domain
+            AND alias.idempotency_key_digest = receipt.idempotency_key_digest
+            AND alias.idempotency_digest_key_id = receipt.idempotency_digest_key_id
+            AND alias.idempotency_digest_key_fingerprint
+                = receipt.idempotency_digest_key_fingerprint
+            AND alias.receipt_id = receipt.receipt_id
+        INNER JOIN public.product_audit_events AS audit
+            ON audit.event_id = admission_payload ->> 'audit_event_id'
+            AND audit.receipt_id = receipt.receipt_id
+            AND audit.tenant_id = receipt.tenant_id
+            AND audit.installation_id = receipt.installation_id
+            AND audit.principal_id = receipt.principal_id
+        INNER JOIN public.product_action_receipt_audit_evidence AS evidence
+            ON evidence.event_id = audit.event_id
+            AND evidence.receipt_id = receipt.receipt_id
+        WHERE receipt.receipt_id = admission_payload ->> 'receipt_id'
+            AND receipt.tenant_id = expected_tenant_id
+            AND receipt.installation_id = expected_installation_id
+            AND receipt.principal_id = expected_principal_id
+            AND receipt.endpoint_domain = 'product_promote_v1'
+            AND receipt.request_digest
+                = admission_payload ->> 'semantic_request_digest'
+            AND receipt.target_resource_type = 'authoring_promotion'
+            AND receipt.target_resource_id = promotion_row.id
+            AND receipt.resulting_revision = 3
+            AND (
+                promotion_row.stage = 'activation_pending'
+                    AND promotion_row.revision = 3
+                    AND receipt.resulting_state = 'activation_pending'
+                OR promotion_row.stage = 'expired'
+                    AND promotion_row.revision = 3
+                    AND receipt.resulting_state = 'expired'
+                OR promotion_row.stage = 'expired'
+                    AND promotion_row.revision = 4
+                    AND receipt.resulting_state = 'activation_pending'
+            )
+            AND receipt.result_code IN ('promotion_created', 'promotion_recovered')
+            AND receipt.http_disposition_class = 2
+            AND audit.action = 'promotion.promote'
+            AND audit.request_id = admission_payload ->> 'product_request_id'
+            AND pg_catalog.encode(audit.session_subject_digest, 'hex')
+                = admission_payload ->> 'session_subject_digest'
+            AND audit.authority_observation_digest
+                = admission_payload ->> 'authority_observation_digest'
+            AND audit.effective_permission_bits = permission_value
+            AND audit.installation_authority_revision = authority_revision_value
+            AND audit.expected_generation = generation_value
+            AND audit.actual_generation = generation_value
+            AND audit.payload_digest = promotion_row.request_digest
+            AND audit.binding_fingerprint
+                = admission_payload ->> 'binding_fingerprint'
+            AND audit.policy_revision::TEXT
+                = admission_payload ->> 'policy_revision'
+            AND audit.resulting_state = receipt.resulting_state
+            AND audit.result_code = receipt.result_code
+            AND audit.dependency_latency_classes = '{}'::JSONB
+            AND audit.occurred_at = receipt.completed_at
+            AND evidence.endpoint_domain = receipt.endpoint_domain
+            AND evidence.action = audit.action
+            AND evidence.request_digest = receipt.request_digest
+            AND evidence.target_resource_type = receipt.target_resource_type
+            AND evidence.target_resource_id = receipt.target_resource_id
+            AND evidence.resulting_revision = receipt.resulting_revision
+            AND evidence.resulting_state = receipt.resulting_state
+            AND evidence.result_code = receipt.result_code
+            AND evidence.http_disposition_class = receipt.http_disposition_class
+            AND evidence.completed_at = receipt.completed_at
+            AND evidence.evidence_version = 1
+            AND evidence.replay_policy_version = 1
+            AND evidence.replay_guaranteed_until
+                = receipt.completed_at + INTERVAL '168 hours';
+        IF final_projection_count <> 1
+            OR promotion_row.revision NOT IN (3, 4)
+            OR promotion_row.stage = 'activation_pending' AND promotion_row.revision <> 3
+        THEN
+            RETURN QUERY SELECT 'persistence_corrupt',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                access_result.database_now;
+            RETURN;
+        END IF;
+        mutation_clock := pg_catalog.clock_timestamp();
+        IF authority_observed_at > mutation_clock
+            OR mutation_clock >= authority_expires_at
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_principals AS principal
+                WHERE principal.principal_id = expected_principal_id
+                    AND NOT principal.disabled
+                    AND principal.discord_user_id = expected_acting_user_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_auth_sessions AS product_session
+                WHERE product_session.session_digest = expected_product_session_digest
+                    AND product_session.principal_id = expected_principal_id
+                    AND product_session.oauth_state_digest IS NOT NULL
+                    AND product_session.revoked_at IS NULL
+                    AND product_session.revocation_reason IS NULL
+                    AND mutation_clock < product_session.idle_expires_at
+                    AND mutation_clock < product_session.absolute_expires_at
+            )
+        THEN
+            RETURN QUERY SELECT 'access_denied',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.automation_installations AS installation
+            INNER JOIN public.automation_installation_authority_versions AS authority
+                ON authority.tenant_id = installation.tenant_id
+                AND authority.installation_id = installation.installation_id
+                AND authority.revision = installation.current_authority_revision
+            WHERE installation.tenant_id = expected_tenant_id
+                AND installation.installation_id = expected_installation_id
+                AND installation.lifecycle_state = 'active'
+                AND installation.discord_application_id
+                    = expected_discord_application_id
+                AND installation.discord_guild_id = expected_guild_id
+                AND installation.ruleset_key
+                    = intent_document #>> '{authority,ruleset_key}'
+                AND installation.current_authority_revision
+                    = observed_current_authority_revision
+                AND authority.authority_payload_digest
+                    = observed_current_authority_payload_digest
+        ) THEN
+            RETURN QUERY SELECT 'scope_mismatch',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        RETURN QUERY SELECT 'final_replay_required',
+            promotion_row.record,
+            promotion_row.product_admission,
+            promotion_row.product_admission_digest,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            mutation_clock;
+        RETURN;
+    END IF;
+
+    IF promotion_row.stage <> 'published'
+        OR promotion_row.revision <> 2
+        OR expected_promotion_revision <> 2
+        OR admitted_clock IS DISTINCT FROM (
+            promotion_row.record ->> 'created_at'
+        )::TIMESTAMPTZ
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(promotion_row.record -> 'stage') AS key(name)
+        ) <> 2
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(promotion_row.record -> 'stage') AS key(name)
+            WHERE key.name NOT IN ('state', 'publication')
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    context_document := proposal_document -> 'approval_context';
+    expected_target := pg_catalog.jsonb_build_object(
+        'guild_id', expected_guild_id,
+        'ruleset_key', intent_document #>> '{authority,ruleset_key}',
+        'version', publication_document -> 'version',
+        'content_hash', publication_document -> 'content_hash'
+    );
+    IF (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(proposal_document -> 'target') AS key(name)
+        ) <> 4
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(proposal_document -> 'target') AS key(name)
+            WHERE key.name NOT IN ('guild_id', 'ruleset_key', 'version', 'content_hash')
+        )
+        OR proposal_document -> 'target' IS DISTINCT FROM expected_target
+        OR proposal_document ->> 'requester' IS DISTINCT FROM expected_acting_user_id
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(context_document) AS key(name)
+        ) <> 7
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(context_document) AS key(name)
+            WHERE key.name NOT IN (
+                'promotion_id', 'promotion_request_digest',
+                'approval_payload_digest', 'approval_context_digest',
+                'binding', 'baseline', 'policy'
+            )
+        )
+        OR context_document ->> 'promotion_id' IS DISTINCT FROM expected_promotion_id
+        OR context_document ->> 'promotion_request_digest'
+            IS DISTINCT FROM expected_promotion_request_digest
+        OR (context_document ->> 'approval_payload_digest' ~ '^[0-9a-f]{64}$')
+            IS DISTINCT FROM TRUE
+        OR (context_document ->> 'approval_context_digest' ~ '^[0-9a-f]{64}$')
+            IS DISTINCT FROM TRUE
+        OR pg_catalog.jsonb_typeof(context_document -> 'binding')
+            IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(context_document -> 'baseline')
+            IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(context_document -> 'policy')
+            IS DISTINCT FROM 'object'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    BEGIN
+        target_version_value := (publication_document ->> 'version')::BIGINT;
+        schema_version_value := (publication_document ->> 'schema_version')::BIGINT;
+        binding_revision_value := (
+            context_document #>> '{binding,revision}'
+        )::BIGINT;
+        policy_revision_value := (
+            context_document #>> '{policy,revision}'
+        )::BIGINT;
+        required_approvals_value := (
+            context_document #>> '{policy,required_approvals}'
+        )::BIGINT;
+        ttl_seconds_value := (
+            context_document #>> '{policy,ttl_seconds}'
+        )::BIGINT;
+    EXCEPTION
+        WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+            RETURN QUERY SELECT 'persistence_corrupt',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                access_result.database_now;
+            RETURN;
+    END;
+    IF target_version_value NOT BETWEEN 1 AND 4294967295
+        OR schema_version_value NOT BETWEEN 1 AND 4294967295
+        OR binding_revision_value NOT BETWEEN 1 AND 9223372036854775807
+        OR policy_revision_value NOT BETWEEN 1 AND 9223372036854775807
+        OR required_approvals_value NOT BETWEEN 1 AND 4294967295
+        OR ttl_seconds_value NOT BETWEEN 1 AND 9223372036854775807
+        OR context_document #>> '{binding,revision}'
+            IS DISTINCT FROM intent_document #>> '{authority,binding_revision}'
+        OR context_document #>> '{policy,revision}'
+            IS DISTINCT FROM intent_document #>> '{authority,policy,revision}'
+        OR context_document #>> '{policy,required_approvals}'
+            IS DISTINCT FROM intent_document #>> '{authority,policy,required_approvals}'
+        OR context_document #>> '{policy,ttl_seconds}'
+            IS DISTINCT FROM intent_document #>> '{authority,policy,ttl_seconds}'
+        OR context_document #>> '{policy,revision}'
+            IS DISTINCT FROM admission_payload ->> 'policy_revision'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    SELECT authority.*
+    INTO authority_row
+    FROM public.automation_installation_authority_versions AS authority
+    WHERE authority.tenant_id = expected_tenant_id
+        AND authority.installation_id = expected_installation_id
+        AND authority.revision = authority_revision_value;
+    IF authority_row.installation_id IS NULL
+        OR authority_row.authority_payload_digest
+            IS DISTINCT FROM admission_payload ->> 'authority_payload_digest'
+        OR authority_row.binding_revision IS DISTINCT FROM binding_revision_value
+        OR authority_row.policy_revision IS DISTINCT FROM policy_revision_value
+        OR authority_row.required_approvals::BIGINT
+            IS DISTINCT FROM required_approvals_value
+        OR authority_row.activation_ttl_seconds
+            IS DISTINCT FROM ttl_seconds_value
+        OR authority_row.binding_fingerprint
+            IS DISTINCT FROM admission_payload ->> 'binding_fingerprint'
+        OR pg_catalog.octet_length(authority_row.resource_bindings::TEXT) > 262144
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(
+        pg_catalog.jsonb_agg(
+            pg_catalog.jsonb_build_object(
+                'kind', 'channel',
+                'key', required.key,
+                'id', (authority_row.resource_bindings -> 'channel_bindings')
+                    -> required.key
+            ) ORDER BY required.ordinal
+        ),
+        '[]'::JSONB
+    )
+    INTO expected_bindings
+    FROM pg_catalog.jsonb_array_elements_text(
+        intent_document #> '{evidence,external_channel_bindings}'
+    ) WITH ORDINALITY AS required(key, ordinal);
+    IF pg_catalog.jsonb_typeof(
+            intent_document #> '{evidence,external_channel_bindings}'
+        ) IS DISTINCT FROM 'array'
+        OR pg_catalog.jsonb_typeof(context_document #> '{binding,required_bindings}')
+            IS DISTINCT FROM 'array'
+        OR context_document #> '{binding,required_bindings}'
+            IS DISTINCT FROM expected_bindings
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_array_elements(expected_bindings)
+                AS binding(value)
+            WHERE binding.value -> 'id' IS NULL
+                OR pg_catalog.jsonb_typeof(binding.value -> 'id') <> 'string'
+                OR (binding.value ->> 'key' ~ '^[A-Za-z0-9_-]{1,64}$')
+                    IS DISTINCT FROM TRUE
+                OR (binding.value ->> 'id' ~ '^[1-9][0-9]{0,19}$')
+                    IS DISTINCT FROM TRUE
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    domain_bytes := pg_catalog.convert_to(
+        'starring.activation.approval_binding.v1', 'UTF8'
+    ) || pg_catalog.decode('00', 'hex');
+    digest_input := pg_catalog.int8send(pg_catalog.octet_length(domain_bytes))
+        || domain_bytes;
+    field_bytes := pg_catalog.convert_to(expected_guild_id, 'UTF8');
+    digest_input := digest_input
+        || pg_catalog.int8send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    field_bytes := pg_catalog.int8send(binding_revision_value);
+    digest_input := digest_input
+        || pg_catalog.int8send(pg_catalog.octet_length(field_bytes)) || field_bytes;
+    FOR binding_value IN
+        SELECT binding.value
+        FROM pg_catalog.jsonb_array_elements(expected_bindings) AS binding(value)
+    LOOP
+        FOR field_bytes IN
+            SELECT pg_catalog.convert_to(field.value, 'UTF8')
+            FROM pg_catalog.unnest(ARRAY[
+                binding_value ->> 'kind',
+                binding_value ->> 'key',
+                binding_value ->> 'id'
+            ]) AS field(value)
+        LOOP
+            digest_input := digest_input
+                || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+                || field_bytes;
+        END LOOP;
+    END LOOP;
+    calculated_binding_fingerprint := pg_catalog.encode(
+        pg_catalog.sha256(digest_input), 'hex'
+    );
+    IF calculated_binding_fingerprint
+        IS DISTINCT FROM context_document #>> '{binding,fingerprint}'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    SELECT head.*
+    INTO head_row
+    FROM public.automation_ruleset_heads AS head
+    WHERE head.guild_id = expected_guild_id
+        AND head.ruleset_key = intent_document #>> '{authority,ruleset_key}'
+    FOR SHARE;
+    SELECT version.*
+    INTO target_version_row
+    FROM public.automation_ruleset_versions AS version
+    WHERE version.guild_id = expected_guild_id
+        AND version.ruleset_key = intent_document #>> '{authority,ruleset_key}'
+        AND version.version = target_version_value;
+    SELECT activation.*
+    INTO pointer_row
+    FROM public.automation_ruleset_activations AS activation
+    WHERE activation.guild_id = expected_guild_id
+        AND activation.ruleset_key = intent_document #>> '{authority,ruleset_key}'
+    FOR SHARE;
+    IF pointer_row.guild_id IS NOT NULL THEN
+        SELECT version.*
+        INTO active_version_row
+        FROM public.automation_ruleset_versions AS version
+        WHERE version.guild_id = pointer_row.guild_id
+            AND version.ruleset_key = pointer_row.ruleset_key
+            AND version.version = pointer_row.active_version;
+        calculated_active_content_hash := public.starring_ruleset_content_hash_v1(
+            active_version_row.schema_version,
+            active_version_row.definition
+        );
+    END IF;
+    calculated_content_hash := public.starring_ruleset_content_hash_v1(
+        schema_version_value,
+        intent_document -> 'definition'
+    );
+    IF head_row.guild_id IS NULL
+        OR target_version_row.guild_id IS NULL
+        OR target_version_row.schema_version IS DISTINCT FROM schema_version_value
+        OR target_version_row.definition IS DISTINCT FROM intent_document -> 'definition'
+        OR target_version_row.content_hash IS DISTINCT FROM calculated_content_hash
+        OR target_version_row.canonical_content_hash
+            IS DISTINCT FROM calculated_content_hash
+        OR target_version_row.content_hash
+            IS DISTINCT FROM publication_document ->> 'content_hash'
+        OR pointer_row.guild_id IS NOT NULL AND (
+            active_version_row.guild_id IS NULL
+            OR active_version_row.content_hash IS NULL
+            OR active_version_row.content_hash
+                IS DISTINCT FROM calculated_active_content_hash
+            OR active_version_row.canonical_content_hash
+                IS DISTINCT FROM calculated_active_content_hash
+            OR NOT public.starring_product_ruleset_slot_exact_v1(
+                expected_tenant_id,
+                expected_installation_id,
+                expected_guild_id,
+                intent_document #>> '{authority,ruleset_key}',
+                pointer_row.active_version
+            )
+            OR (CASE
+                WHEN active_version_row.created_by ~ '^[1-9][0-9]{0,19}$'
+                    THEN active_version_row.created_by::NUMERIC
+                        <= 18446744073709551615
+                ELSE FALSE
+            END) IS DISTINCT FROM TRUE
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    expected_baseline := CASE
+        WHEN pointer_row.guild_id IS NULL
+            THEN pg_catalog.jsonb_build_object('state', 'absent')
+        ELSE pg_catalog.jsonb_build_object(
+            'state', 'exact',
+            'version', active_version_row.version,
+            'content_hash', active_version_row.content_hash
+        )
+    END;
+    IF context_document -> 'baseline' IS DISTINCT FROM expected_baseline THEN
+        mutation_clock := pg_catalog.clock_timestamp();
+        IF authority_observed_at > mutation_clock
+            OR mutation_clock >= authority_expires_at
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_principals AS principal
+                WHERE principal.principal_id = expected_principal_id
+                    AND NOT principal.disabled
+                    AND principal.discord_user_id = expected_acting_user_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.product_auth_sessions AS product_session
+                WHERE product_session.session_digest = expected_product_session_digest
+                    AND product_session.principal_id = expected_principal_id
+                    AND product_session.oauth_state_digest IS NOT NULL
+                    AND product_session.revoked_at IS NULL
+                    AND product_session.revocation_reason IS NULL
+                    AND mutation_clock < product_session.idle_expires_at
+                    AND mutation_clock < product_session.absolute_expires_at
+            )
+        THEN
+            RETURN QUERY SELECT 'access_denied',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.automation_installations AS installation
+            INNER JOIN public.automation_installation_authority_versions AS authority
+                ON authority.tenant_id = installation.tenant_id
+                AND authority.installation_id = installation.installation_id
+                AND authority.revision = installation.current_authority_revision
+            WHERE installation.tenant_id = expected_tenant_id
+                AND installation.installation_id = expected_installation_id
+                AND installation.lifecycle_state = 'active'
+                AND installation.discord_application_id
+                    = expected_discord_application_id
+                AND installation.discord_guild_id = expected_guild_id
+                AND installation.ruleset_key
+                    = intent_document #>> '{authority,ruleset_key}'
+                AND installation.current_authority_revision
+                    = observed_current_authority_revision
+                AND authority.authority_payload_digest
+                    = observed_current_authority_payload_digest
+        ) THEN
+            RETURN QUERY SELECT 'scope_mismatch',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        RETURN QUERY SELECT 'approval_environment_changed',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            mutation_clock;
+        RETURN;
+    END IF;
+
+    domain_bytes := pg_catalog.convert_to(
+        'starring.activation.approval_policy.v1', 'UTF8'
+    ) || pg_catalog.decode('00', 'hex');
+    digest_input := pg_catalog.int8send(pg_catalog.octet_length(domain_bytes))
+        || domain_bytes;
+    FOR field_bytes IN
+        SELECT field.value
+        FROM pg_catalog.unnest(ARRAY[
+            pg_catalog.int8send(policy_revision_value),
+            pg_catalog.int4send(required_approvals_value::INTEGER),
+            pg_catalog.int8send(ttl_seconds_value)
+        ]) AS field(value)
+    LOOP
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+    END LOOP;
+    calculated_policy_digest := pg_catalog.encode(
+        pg_catalog.sha256(digest_input), 'hex'
+    );
+    IF calculated_policy_digest
+        IS DISTINCT FROM context_document #>> '{policy,digest}'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    hash_document := pg_catalog.jsonb_build_object(
+        'promotion_id', expected_promotion_id,
+        'promotion_request_digest', expected_promotion_request_digest,
+        'version', publication_document -> 'version',
+        'schema_version', publication_document -> 'schema_version',
+        'content_hash', publication_document -> 'content_hash'
+    );
+    domain_bytes := pg_catalog.convert_to(
+        'starring.authoring_promotion.activation_request.v1', 'UTF8'
+    ) || pg_catalog.decode('00', 'hex');
+    field_bytes := pg_catalog.convert_to(
+        public.starring_canonical_json_v1(hash_document), 'UTF8'
+    );
+    calculated_request_id := pg_catalog.encode(
+        pg_catalog.sha256(
+            pg_catalog.int8send(pg_catalog.octet_length(domain_bytes))
+            || domain_bytes
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes
+        ),
+        'hex'
+    );
+    IF calculated_request_id IS DISTINCT FROM proposal_document ->> 'request_id' THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    payload_document := pg_catalog.jsonb_build_object(
+        'format_version', 1,
+        'promotion_id', expected_promotion_id,
+        'promotion_request_digest', expected_promotion_request_digest,
+        'authority', intent_document -> 'authority',
+        'evidence', intent_document -> 'evidence',
+        'definition', intent_document -> 'definition',
+        'preview', intent_document -> 'preview',
+        'publication', publication_document,
+        'target', expected_target,
+        'binding', context_document -> 'binding',
+        'baseline', context_document -> 'baseline',
+        'policy', context_document -> 'policy'
+    );
+    domain_bytes := pg_catalog.convert_to(
+        'starring.authoring_promotion.approval_payload.v1', 'UTF8'
+    ) || pg_catalog.decode('00', 'hex');
+    field_bytes := pg_catalog.convert_to(
+        public.starring_canonical_json_v1(payload_document), 'UTF8'
+    );
+    calculated_payload_digest := pg_catalog.encode(
+        pg_catalog.sha256(
+            pg_catalog.int8send(pg_catalog.octet_length(domain_bytes))
+            || domain_bytes
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes
+        ),
+        'hex'
+    );
+    IF calculated_payload_digest
+        IS DISTINCT FROM context_document ->> 'approval_payload_digest'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    domain_bytes := pg_catalog.convert_to(
+        'starring.activation.approval_context.v1', 'UTF8'
+    ) || pg_catalog.decode('00', 'hex');
+    digest_input := pg_catalog.int8send(pg_catalog.octet_length(domain_bytes))
+        || domain_bytes;
+    FOR field_bytes IN
+        SELECT field.value
+        FROM pg_catalog.unnest(ARRAY[
+            pg_catalog.convert_to(proposal_document ->> 'request_id', 'UTF8'),
+            pg_catalog.convert_to(expected_guild_id, 'UTF8'),
+            pg_catalog.convert_to(intent_document #>> '{authority,ruleset_key}', 'UTF8'),
+            pg_catalog.int4send(target_version_value::INTEGER),
+            pg_catalog.convert_to(publication_document ->> 'content_hash', 'UTF8'),
+            pg_catalog.convert_to(expected_acting_user_id, 'UTF8'),
+            pg_catalog.convert_to(expected_promotion_id, 'UTF8'),
+            pg_catalog.convert_to(expected_promotion_request_digest, 'UTF8'),
+            pg_catalog.convert_to(calculated_payload_digest, 'UTF8'),
+            pg_catalog.int8send(binding_revision_value),
+            pg_catalog.convert_to(calculated_binding_fingerprint, 'UTF8')
+        ]) AS field(value)
+    LOOP
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+    END LOOP;
+    FOR binding_value IN
+        SELECT binding.value
+        FROM pg_catalog.jsonb_array_elements(expected_bindings) AS binding(value)
+    LOOP
+        FOR field_bytes IN
+            SELECT pg_catalog.convert_to(field.value, 'UTF8')
+            FROM pg_catalog.unnest(ARRAY[
+                binding_value ->> 'kind',
+                binding_value ->> 'key',
+                binding_value ->> 'id'
+            ]) AS field(value)
+        LOOP
+            digest_input := digest_input
+                || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+                || field_bytes;
+        END LOOP;
+    END LOOP;
+    IF expected_baseline ->> 'state' = 'absent' THEN
+        field_bytes := pg_catalog.convert_to('absent', 'UTF8');
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+    ELSE
+        field_bytes := pg_catalog.convert_to('exact', 'UTF8');
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+        field_bytes := pg_catalog.int4send(active_version_row.version::INTEGER);
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+        field_bytes := pg_catalog.convert_to(active_version_row.content_hash, 'UTF8');
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+    END IF;
+    FOR field_bytes IN
+        SELECT field.value
+        FROM pg_catalog.unnest(ARRAY[
+            pg_catalog.int8send(policy_revision_value),
+            pg_catalog.int4send(required_approvals_value::INTEGER),
+            pg_catalog.int8send(ttl_seconds_value),
+            pg_catalog.convert_to(calculated_policy_digest, 'UTF8')
+        ]) AS field(value)
+    LOOP
+        digest_input := digest_input
+            || pg_catalog.int8send(pg_catalog.octet_length(field_bytes))
+            || field_bytes;
+    END LOOP;
+    calculated_context_digest := pg_catalog.encode(
+        pg_catalog.sha256(digest_input), 'hex'
+    );
+    IF calculated_context_digest
+        IS DISTINCT FROM context_document ->> 'approval_context_digest'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            access_result.database_now;
+        RETURN;
+    END IF;
+
+    SELECT activation.*
+    INTO activation_row
+    FROM public.activation_requests AS activation
+    WHERE activation.id = proposal_document ->> 'request_id'
+    FOR UPDATE;
+    mutation_clock := pg_catalog.clock_timestamp();
+    IF authority_observed_at > mutation_clock
+        OR mutation_clock >= authority_expires_at
+        OR NOT EXISTS (
+            SELECT 1
+            FROM public.product_principals AS principal
+            WHERE principal.principal_id = expected_principal_id
+                AND NOT principal.disabled
+                AND principal.discord_user_id = expected_acting_user_id
+        )
+        OR NOT EXISTS (
+            SELECT 1
+            FROM public.product_auth_sessions AS product_session
+            WHERE product_session.session_digest = expected_product_session_digest
+                AND product_session.principal_id = expected_principal_id
+                AND product_session.oauth_state_digest IS NOT NULL
+                AND product_session.revoked_at IS NULL
+                AND product_session.revocation_reason IS NULL
+                AND mutation_clock < product_session.idle_expires_at
+                AND mutation_clock < product_session.absolute_expires_at
+        )
+    THEN
+        RETURN QUERY SELECT 'access_denied',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            mutation_clock;
+        RETURN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.automation_installations AS installation
+        INNER JOIN public.automation_installation_authority_versions AS authority
+            ON authority.tenant_id = installation.tenant_id
+            AND authority.installation_id = installation.installation_id
+            AND authority.revision = installation.current_authority_revision
+        WHERE installation.tenant_id = expected_tenant_id
+            AND installation.installation_id = expected_installation_id
+            AND installation.lifecycle_state = 'active'
+            AND installation.discord_application_id
+                = expected_discord_application_id
+            AND installation.discord_guild_id = expected_guild_id
+            AND installation.ruleset_key
+                = intent_document #>> '{authority,ruleset_key}'
+            AND installation.current_authority_revision
+                = observed_current_authority_revision
+            AND authority.authority_payload_digest
+                = observed_current_authority_payload_digest
+    ) THEN
+        RETURN QUERY SELECT 'scope_mismatch',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            mutation_clock;
+        RETURN;
+    END IF;
+
+    IF activation_row.id IS NULL THEN
+        SELECT pg_catalog.count(*)
+        INTO activation_count
+        FROM public.activation_requests AS activation
+        WHERE activation.promotion_id = expected_promotion_id;
+        IF activation_count <> 0 THEN
+            RETURN QUERY SELECT 'persistence_corrupt',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        created_clock := mutation_clock;
+        expires_clock := mutation_clock + ttl_seconds_value * INTERVAL '1 second';
+        INSERT INTO public.activation_requests (
+            id, guild_id, ruleset_key, target_version, target_content_hash,
+            requester_id, required_approvals, state, created_at, expires_at,
+            observed_active_version, observed_active_hash, authority_kind,
+            link_state_name, approval_context, link_state, promotion_id,
+            promotion_request_digest, approval_payload_digest,
+            approval_context_digest
+        ) VALUES (
+            proposal_document ->> 'request_id',
+            expected_guild_id,
+            intent_document #>> '{authority,ruleset_key}',
+            target_version_value,
+            publication_document ->> 'content_hash',
+            expected_acting_user_id,
+            required_approvals_value::INTEGER,
+            'pending',
+            created_clock,
+            expires_clock,
+            CASE WHEN pointer_row.guild_id IS NULL THEN NULL ELSE active_version_row.version END,
+            CASE WHEN pointer_row.guild_id IS NULL THEN NULL ELSE active_version_row.content_hash END,
+            'product_authoring',
+            'unlinked',
+            pg_catalog.jsonb_build_object(
+                'authority', 'product_authoring',
+                'context', context_document
+            ),
+            pg_catalog.jsonb_build_object('state', 'unlinked'),
+            expected_promotion_id,
+            expected_promotion_request_digest,
+            calculated_payload_digest,
+            calculated_context_digest
+        );
+        activation_disposition := 'created';
+        next_stage := 'activation_pending';
+    ELSE
+        SELECT pg_catalog.count(*)
+        INTO activation_count
+        FROM public.activation_request_approvals AS approval
+        WHERE approval.request_id = activation_row.id;
+        IF activation_count <> 0
+            OR activation_row.authority_kind <> 'product_authoring'
+            OR activation_row.tenant_id IS DISTINCT FROM expected_tenant_id
+            OR activation_row.installation_id IS DISTINCT FROM expected_installation_id
+            OR activation_row.promotion_id IS DISTINCT FROM expected_promotion_id
+            OR activation_row.promotion_request_digest
+                IS DISTINCT FROM expected_promotion_request_digest
+            OR activation_row.id IS DISTINCT FROM proposal_document ->> 'request_id'
+            OR activation_row.guild_id IS DISTINCT FROM expected_guild_id
+            OR activation_row.ruleset_key
+                IS DISTINCT FROM intent_document #>> '{authority,ruleset_key}'
+            OR activation_row.target_version IS DISTINCT FROM target_version_value
+            OR activation_row.target_content_hash
+                IS DISTINCT FROM publication_document ->> 'content_hash'
+            OR activation_row.requester_id IS DISTINCT FROM expected_acting_user_id
+            OR activation_row.required_approvals::BIGINT
+                IS DISTINCT FROM required_approvals_value
+            OR activation_row.approval_context IS DISTINCT FROM
+                pg_catalog.jsonb_build_object(
+                    'authority', 'product_authoring',
+                    'context', context_document
+                )
+            OR activation_row.approval_payload_digest
+                IS DISTINCT FROM calculated_payload_digest
+            OR activation_row.approval_context_digest
+                IS DISTINCT FROM calculated_context_digest
+            OR activation_row.link_state_name <> 'unlinked'
+            OR activation_row.link_state IS DISTINCT FROM
+                pg_catalog.jsonb_build_object('state', 'unlinked')
+            OR activation_row.linked_at IS NOT NULL
+            OR activation_row.state NOT IN ('pending', 'expired')
+            OR activation_row.apply_attempt_id IS NOT NULL
+            OR activation_row.apply_attempt_no <> 0
+            OR activation_row.apply_lease_until IS NOT NULL
+            OR activation_row.last_apply_error IS NOT NULL
+            OR activation_row.applied_at IS NOT NULL
+            OR activation_row.applied_by IS NOT NULL
+            OR activation_row.completion_kind IS NOT NULL
+            OR activation_row.activation_notices IS NOT NULL
+            OR activation_row.rejected_at IS NOT NULL
+            OR activation_row.rejected_by IS NOT NULL
+            OR activation_row.rejection_reason IS NOT NULL
+            OR activation_row.termination IS NOT NULL
+            OR activation_row.created_at < (
+                promotion_row.record ->> 'updated_at'
+            )::TIMESTAMPTZ
+            OR activation_row.expires_at IS DISTINCT FROM
+                activation_row.created_at + ttl_seconds_value * INTERVAL '1 second'
+            OR activation_row.observed_active_version IS DISTINCT FROM
+                (CASE
+                    WHEN pointer_row.guild_id IS NULL THEN NULL::BIGINT
+                    ELSE active_version_row.version
+                END)
+            OR activation_row.observed_active_hash IS DISTINCT FROM
+                (CASE
+                    WHEN pointer_row.guild_id IS NULL THEN NULL::TEXT
+                    ELSE active_version_row.content_hash
+                END)
+        THEN
+            RETURN QUERY SELECT 'persistence_corrupt',
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::TEXT,
+                NULL::JSONB,
+                NULL::JSONB,
+                NULL::JSONB,
+                mutation_clock;
+            RETURN;
+        END IF;
+        created_clock := activation_row.created_at;
+        expires_clock := activation_row.expires_at;
+        activation_disposition := 'reused';
+        IF activation_row.state = 'expired'
+            OR activation_row.expires_at <= mutation_clock
+        THEN
+            next_stage := 'expired';
+            IF activation_row.state = 'pending' THEN
+                UPDATE public.activation_requests AS activation
+                SET state = 'expired'
+                WHERE activation.id = activation_row.id
+                    AND activation.state = 'pending'
+                    AND activation.link_state_name = 'unlinked';
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'product promotion activation expiry failed'
+                        USING ERRCODE = '40001';
+                END IF;
+            END IF;
+        ELSE
+            next_stage := 'activation_pending';
+        END IF;
+    END IF;
+
+    journal_activation_document := pg_catalog.jsonb_build_object(
+        'request_id', proposal_document ->> 'request_id',
+        'target', expected_target,
+        'requester', expected_acting_user_id,
+        'required_approvals', required_approvals_value,
+        'observed_active', CASE
+            WHEN pointer_row.guild_id IS NULL THEN NULL::JSONB
+            ELSE pg_catalog.jsonb_build_object(
+                'version', active_version_row.version,
+                'content_hash', active_version_row.content_hash
+            )
+        END,
+        'created_at', created_clock,
+        'expires_at', expires_clock,
+        'disposition', activation_disposition,
+        'request_state_at_journal', CASE
+            WHEN next_stage = 'expired' THEN 'expired'
+            ELSE 'pending'
+        END,
+        'approval_context', context_document
+    );
+    persisted_record := promotion_row.record || pg_catalog.jsonb_build_object(
+        'revision', 3,
+        'stage', pg_catalog.jsonb_build_object(
+            'state', next_stage,
+            'publication', publication_document,
+            'activation', journal_activation_document
+        ),
+        'updated_at', mutation_clock
+    );
+    IF pg_catalog.octet_length(persisted_record::TEXT) > 8388608 THEN
+        RETURN QUERY SELECT 'persistence_corrupt',
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::TEXT,
+            NULL::JSONB,
+            NULL::JSONB,
+            NULL::JSONB,
+            mutation_clock;
+        RETURN;
+    END IF;
+    UPDATE public.authoring_promotions AS promotion
+    SET revision = 3,
+        stage = next_stage,
+        record = persisted_record
+    WHERE promotion.id = promotion_row.id
+        AND promotion.revision = 2
+        AND promotion.stage = 'published';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'product promotion activation journal advance failed'
+            USING ERRCODE = '40001';
+    END IF;
+
+    IF next_stage = 'activation_pending' THEN
+        UPDATE public.activation_requests AS activation
+        SET link_state_name = 'linked',
+            link_state = pg_catalog.jsonb_build_object(
+                'state', 'linked',
+                'linked_at', mutation_clock
+            ),
+            linked_at = mutation_clock
+        WHERE activation.id = proposal_document ->> 'request_id'
+            AND activation.state = 'pending'
+            AND activation.link_state_name = 'unlinked'
+            AND activation.expires_at > mutation_clock;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'product promotion activation link failed'
+                USING ERRCODE = '40001';
+        END IF;
+    END IF;
+    SELECT activation.*
+    INTO activation_row
+    FROM public.activation_requests AS activation
+    WHERE activation.id = proposal_document ->> 'request_id';
+    activation_request_document := pg_catalog.jsonb_build_object(
+        'id', activation_row.id,
+        'target', pg_catalog.jsonb_build_object(
+            'guild_id', activation_row.guild_id,
+            'ruleset_key', activation_row.ruleset_key,
+            'version', activation_row.target_version,
+            'content_hash', activation_row.target_content_hash
+        ),
+        'requester', activation_row.requester_id,
+        'required_approvals', activation_row.required_approvals,
+        'approval_context', activation_row.approval_context,
+        'link_state', activation_row.link_state,
+        'approvals', '[]'::JSONB,
+        'state', activation_row.state,
+        'rejection', NULL,
+        'apply_attempt_id', NULL,
+        'apply_attempt_no', activation_row.apply_attempt_no,
+        'apply_lease_until', NULL,
+        'last_apply_error', NULL,
+        'observed_active', CASE
+            WHEN activation_row.observed_active_version IS NULL THEN NULL::JSONB
+            ELSE pg_catalog.jsonb_build_object(
+                'version', activation_row.observed_active_version,
+                'content_hash', activation_row.observed_active_hash
+            )
+        END,
+        'completion', NULL,
+        'termination', NULL,
+        'created_at', activation_row.created_at,
+        'expires_at', activation_row.expires_at
+    );
+    activation_projection_document := pg_catalog.jsonb_build_object(
+        'format_version', 1,
+        'disposition', activation_disposition,
+        'request', activation_request_document
+    );
+    receipt_document := pg_catalog.jsonb_build_object(
+        'format_version', 1,
+        'receipt_id', admission_payload ->> 'receipt_id',
+        'tenant_id', expected_tenant_id,
+        'installation_id', expected_installation_id,
+        'principal_id', expected_principal_id,
+        'endpoint_domain', 'product_promote_v1',
+        'idempotency_key_digest', admission_payload ->> 'idempotency_key_digest',
+        'idempotency_digest_key_id', admission_payload ->> 'idempotency_digest_key_id',
+        'idempotency_digest_key_fingerprint',
+            admission_payload ->> 'idempotency_digest_key_fingerprint',
+        'request_digest', admission_payload ->> 'semantic_request_digest',
+        'target_resource_type', 'authoring_promotion',
+        'target_resource_id', expected_promotion_id,
+        'resulting_revision', 3,
+        'resulting_state', next_stage,
+        'result_code', 'promotion_created',
+        'http_disposition_class', 2,
+        'completed_at', mutation_clock
+    );
+    audit_document := pg_catalog.jsonb_build_object(
+        'format_version', 1,
+        'event_id', admission_payload ->> 'audit_event_id',
+        'receipt_id', admission_payload ->> 'receipt_id',
+        'tenant_id', expected_tenant_id,
+        'installation_id', expected_installation_id,
+        'principal_id', expected_principal_id,
+        'session_subject_digest', admission_payload ->> 'session_subject_digest',
+        'action', 'promotion.promote',
+        'target_resource_type', 'authoring_promotion',
+        'target_resource_id', expected_promotion_id,
+        'request_id', admission_payload ->> 'product_request_id',
+        'authority_observation_digest',
+            admission_payload ->> 'authority_observation_digest',
+        'effective_permission_bits', admission_payload ->> 'effective_permission_bits',
+        'authority_observed_at', admission_payload -> 'authority_observed_at',
+        'installation_authority_revision', authority_revision_value,
+        'expected_generation', generation_value,
+        'actual_generation', generation_value,
+        'payload_digest', expected_promotion_request_digest,
+        'binding_fingerprint', admission_payload ->> 'binding_fingerprint',
+        'policy_revision', policy_revision_value,
+        'active_baseline_version', CASE
+            WHEN pointer_row.guild_id IS NULL THEN NULL::BIGINT
+            ELSE active_version_row.version
+        END,
+        'active_baseline_hash', CASE
+            WHEN pointer_row.guild_id IS NULL THEN NULL::TEXT
+            ELSE active_version_row.content_hash
+        END,
+        'resulting_state', next_stage,
+        'result_code', 'promotion_created',
+        'dependency_latency_classes', '{}'::JSONB,
+        'occurred_at', mutation_clock,
+        'endpoint_domain', 'product_promote_v1',
+        'request_digest', admission_payload ->> 'semantic_request_digest',
+        'resulting_revision', 3,
+        'http_disposition_class', 2,
+        'completed_at', mutation_clock,
+        'evidence_version', 1,
+        'replay_policy_version', 1,
+        'replay_guaranteed_until', mutation_clock + INTERVAL '168 hours'
+    );
+    IF pg_catalog.octet_length(activation_projection_document::TEXT) > 1048576
+        OR pg_catalog.octet_length(receipt_document::TEXT) > 65536
+        OR pg_catalog.octet_length(audit_document::TEXT) > 65536
+    THEN
+        RAISE EXCEPTION 'product promotion activation projection is too large'
+            USING ERRCODE = '23514';
+    END IF;
+    SELECT *
+    INTO finalize_result
+    FROM public.starring_product_promotion_finalize_receipt_v1(
+        promotion_row.product_admission,
+        persisted_record,
+        activation_projection_document,
+        receipt_document,
+        audit_document
+    );
+    IF finalize_result.outcome_code <> 'created' THEN
+        RAISE EXCEPTION 'product promotion receipt finalization failed: %',
+            finalize_result.outcome_code
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN QUERY SELECT activation_disposition,
+        persisted_record,
+        promotion_row.product_admission,
+        promotion_row.product_admission_digest,
+        activation_projection_document,
+        receipt_document,
+        audit_document,
+        mutation_clock;
 END;
 $function$;
 
@@ -3600,17 +5270,472 @@ PARALLEL UNSAFE
 ROWS 1
 SET search_path = pg_catalog
 AS $function$
+DECLARE
+    admission_payload JSONB;
+    activation_request JSONB;
+    completed_clock TIMESTAMPTZ;
+    authority_clock TIMESTAMPTZ;
+    replay_until TIMESTAMPTZ;
+    resulting_revision_value BIGINT;
+    authority_revision_value BIGINT;
+    generation_value BIGINT;
+    permission_value NUMERIC;
+    evidence_count BIGINT;
 BEGIN
-    IF pg_catalog.jsonb_typeof(admission_projection) <> 'object'
-        OR pg_catalog.jsonb_typeof(promotion_projection) <> 'object'
-        OR pg_catalog.jsonb_typeof(activation_projection) <> 'object'
-        OR pg_catalog.jsonb_typeof(receipt_projection) <> 'object'
-        OR pg_catalog.jsonb_typeof(audit_projection) <> 'object'
+    IF pg_catalog.jsonb_typeof(admission_projection) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(promotion_projection) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(activation_projection) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(receipt_projection) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(audit_projection) IS DISTINCT FROM 'object'
+        OR pg_catalog.octet_length(admission_projection::TEXT) > 32768
+        OR pg_catalog.octet_length(promotion_projection::TEXT) > 8388608
+        OR pg_catalog.octet_length(activation_projection::TEXT) > 1048576
+        OR pg_catalog.octet_length(receipt_projection::TEXT) > 65536
+        OR pg_catalog.octet_length(audit_projection::TEXT) > 65536
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(admission_projection) AS key(name)
+        ) <> 3
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(admission_projection) AS key(name)
+            WHERE key.name NOT IN ('format_version', 'payload', 'admitted_at')
+        )
+        OR admission_projection ->> 'format_version' IS DISTINCT FROM '1'
+        OR pg_catalog.jsonb_typeof(admission_projection -> 'payload')
+            IS DISTINCT FROM 'object'
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(promotion_projection) AS key(name)
+        ) <> 7
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(promotion_projection) AS key(name)
+            WHERE key.name NOT IN (
+                'id', 'revision', 'request_digest', 'intent', 'stage',
+                'created_at', 'updated_at'
+            )
+        )
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(activation_projection) AS key(name)
+        ) <> 3
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(activation_projection) AS key(name)
+            WHERE key.name NOT IN ('format_version', 'disposition', 'request')
+        )
+        OR activation_projection ->> 'format_version' IS DISTINCT FROM '1'
+        OR activation_projection ->> 'disposition' NOT IN ('created', 'reused')
+        OR pg_catalog.jsonb_typeof(activation_projection -> 'request')
+            IS DISTINCT FROM 'object'
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(receipt_projection) AS key(name)
+        ) <> 17
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(receipt_projection) AS key(name)
+            WHERE key.name NOT IN (
+                'format_version', 'receipt_id', 'tenant_id', 'installation_id',
+                'principal_id', 'endpoint_domain', 'idempotency_key_digest',
+                'idempotency_digest_key_id',
+                'idempotency_digest_key_fingerprint', 'request_digest',
+                'target_resource_type', 'target_resource_id',
+                'resulting_revision', 'resulting_state', 'result_code',
+                'http_disposition_class', 'completed_at'
+            )
+        )
+        OR receipt_projection ->> 'format_version' IS DISTINCT FROM '1'
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(audit_projection) AS key(name)
+        ) <> 34
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(audit_projection) AS key(name)
+            WHERE key.name NOT IN (
+                'format_version', 'event_id', 'receipt_id', 'tenant_id',
+                'installation_id', 'principal_id', 'session_subject_digest',
+                'action', 'target_resource_type', 'target_resource_id',
+                'request_id', 'authority_observation_digest',
+                'effective_permission_bits', 'authority_observed_at',
+                'installation_authority_revision', 'expected_generation',
+                'actual_generation', 'payload_digest', 'binding_fingerprint',
+                'policy_revision', 'active_baseline_version',
+                'active_baseline_hash', 'resulting_state', 'result_code',
+                'dependency_latency_classes', 'occurred_at', 'endpoint_domain',
+                'request_digest', 'resulting_revision',
+                'http_disposition_class', 'completed_at', 'evidence_version',
+                'replay_policy_version', 'replay_guaranteed_until'
+            )
+        )
+        OR audit_projection ->> 'format_version' IS DISTINCT FROM '1'
     THEN
         RETURN QUERY SELECT 'persistence_corrupt';
         RETURN;
     END IF;
-    RETURN QUERY SELECT 'persistence_corrupt';
+
+    admission_payload := admission_projection -> 'payload';
+    activation_request := activation_projection -> 'request';
+    IF (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(admission_payload) AS key(name)
+        ) <> 31
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(admission_payload) AS key(name)
+            WHERE key.name NOT IN (
+                'endpoint_domain', 'product_request_id', 'tenant_id',
+                'installation_id', 'principal_id', 'authoring_session_id',
+                'generation', 'candidate_revision', 'candidate_hash',
+                'promotion_id', 'promotion_request_digest', 'session_subject_digest',
+                'idempotency_key_digest', 'idempotency_digest_key_id',
+                'idempotency_digest_key_fingerprint', 'semantic_request_digest',
+                'receipt_id', 'audit_event_id', 'discord_application_id', 'guild_id',
+                'acting_user_id', 'capability', 'authority_revision',
+                'authority_payload_digest', 'authority_observation_digest',
+                'authority_observed_at', 'authority_expires_at',
+                'effective_permission_bits', 'guild_owner', 'binding_fingerprint',
+                'policy_revision'
+            )
+        )
+        OR (
+            SELECT pg_catalog.count(*)
+            FROM pg_catalog.jsonb_object_keys(activation_request) AS key(name)
+        ) <> 18
+        OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.jsonb_object_keys(activation_request) AS key(name)
+            WHERE key.name NOT IN (
+                'id', 'target', 'requester', 'required_approvals',
+                'approval_context', 'link_state', 'approvals', 'state',
+                'rejection', 'apply_attempt_id', 'apply_attempt_no',
+                'apply_lease_until', 'last_apply_error', 'observed_active',
+                'completion', 'termination', 'created_at', 'expires_at'
+            )
+        )
+        OR admission_payload ->> 'endpoint_domain'
+            IS DISTINCT FROM 'product_promote_v1'
+        OR promotion_projection ->> 'id'
+            IS DISTINCT FROM admission_payload ->> 'promotion_id'
+        OR promotion_projection ->> 'request_digest'
+            IS DISTINCT FROM admission_payload ->> 'promotion_request_digest'
+        OR promotion_projection ->> 'revision' IS DISTINCT FROM '3'
+        OR promotion_projection #>> '{stage,state}'
+            NOT IN ('activation_pending', 'expired')
+        OR activation_request ->> 'id'
+            IS DISTINCT FROM promotion_projection #>> '{stage,activation,request_id}'
+        OR activation_request -> 'target'
+            IS DISTINCT FROM promotion_projection #> '{stage,activation,target}'
+        OR activation_request ->> 'requester'
+            IS DISTINCT FROM promotion_projection #>> '{stage,activation,requester}'
+        OR activation_request ->> 'required_approvals'
+            IS DISTINCT FROM promotion_projection
+                #>> '{stage,activation,required_approvals}'
+        OR activation_request -> 'approval_context' #>> '{authority}'
+            IS DISTINCT FROM 'product_authoring'
+        OR activation_request #> '{approval_context,context}'
+            IS DISTINCT FROM promotion_projection
+                #> '{stage,activation,approval_context}'
+        OR activation_request ->> 'state'
+            IS DISTINCT FROM promotion_projection
+                #>> '{stage,activation,request_state_at_journal}'
+        OR activation_request ->> 'created_at'
+            IS DISTINCT FROM promotion_projection #>> '{stage,activation,created_at}'
+        OR activation_request ->> 'expires_at'
+            IS DISTINCT FROM promotion_projection #>> '{stage,activation,expires_at}'
+        OR activation_request -> 'approvals' IS DISTINCT FROM '[]'::JSONB
+        OR activation_request -> 'rejection' IS DISTINCT FROM 'null'::JSONB
+        OR activation_request -> 'apply_attempt_id' IS DISTINCT FROM 'null'::JSONB
+        OR activation_request ->> 'apply_attempt_no' IS DISTINCT FROM '0'
+        OR activation_request -> 'apply_lease_until' IS DISTINCT FROM 'null'::JSONB
+        OR activation_request -> 'last_apply_error' IS DISTINCT FROM 'null'::JSONB
+        OR activation_request -> 'completion' IS DISTINCT FROM 'null'::JSONB
+        OR activation_request -> 'termination' IS DISTINCT FROM 'null'::JSONB
+        OR admission_payload ->> 'receipt_id'
+            IS DISTINCT FROM receipt_projection ->> 'receipt_id'
+        OR admission_payload ->> 'audit_event_id'
+            IS DISTINCT FROM audit_projection ->> 'event_id'
+        OR receipt_projection ->> 'receipt_id'
+            IS DISTINCT FROM audit_projection ->> 'receipt_id'
+        OR admission_payload ->> 'tenant_id'
+            IS DISTINCT FROM receipt_projection ->> 'tenant_id'
+        OR admission_payload ->> 'installation_id'
+            IS DISTINCT FROM receipt_projection ->> 'installation_id'
+        OR admission_payload ->> 'principal_id'
+            IS DISTINCT FROM receipt_projection ->> 'principal_id'
+        OR receipt_projection ->> 'tenant_id'
+            IS DISTINCT FROM audit_projection ->> 'tenant_id'
+        OR receipt_projection ->> 'installation_id'
+            IS DISTINCT FROM audit_projection ->> 'installation_id'
+        OR receipt_projection ->> 'principal_id'
+            IS DISTINCT FROM audit_projection ->> 'principal_id'
+        OR receipt_projection ->> 'endpoint_domain'
+            IS DISTINCT FROM 'product_promote_v1'
+        OR receipt_projection ->> 'idempotency_key_digest'
+            IS DISTINCT FROM admission_payload ->> 'idempotency_key_digest'
+        OR receipt_projection ->> 'idempotency_digest_key_id'
+            IS DISTINCT FROM admission_payload ->> 'idempotency_digest_key_id'
+        OR receipt_projection ->> 'idempotency_digest_key_fingerprint'
+            IS DISTINCT FROM admission_payload
+                ->> 'idempotency_digest_key_fingerprint'
+        OR receipt_projection ->> 'request_digest'
+            IS DISTINCT FROM admission_payload ->> 'semantic_request_digest'
+        OR receipt_projection ->> 'target_resource_type'
+            IS DISTINCT FROM 'authoring_promotion'
+        OR receipt_projection ->> 'target_resource_id'
+            IS DISTINCT FROM promotion_projection ->> 'id'
+        OR receipt_projection ->> 'resulting_revision' IS DISTINCT FROM '3'
+        OR receipt_projection ->> 'resulting_state'
+            IS DISTINCT FROM promotion_projection #>> '{stage,state}'
+        OR receipt_projection ->> 'result_code'
+            IS DISTINCT FROM 'promotion_created'
+        OR receipt_projection ->> 'http_disposition_class' IS DISTINCT FROM '2'
+        OR audit_projection ->> 'session_subject_digest'
+            IS DISTINCT FROM admission_payload ->> 'session_subject_digest'
+        OR audit_projection ->> 'action' IS DISTINCT FROM 'promotion.promote'
+        OR audit_projection ->> 'target_resource_type'
+            IS DISTINCT FROM 'authoring_promotion'
+        OR audit_projection ->> 'target_resource_id'
+            IS DISTINCT FROM promotion_projection ->> 'id'
+        OR audit_projection ->> 'request_id'
+            IS DISTINCT FROM admission_payload ->> 'product_request_id'
+        OR audit_projection ->> 'authority_observation_digest'
+            IS DISTINCT FROM admission_payload ->> 'authority_observation_digest'
+        OR audit_projection ->> 'effective_permission_bits'
+            IS DISTINCT FROM admission_payload ->> 'effective_permission_bits'
+        OR audit_projection ->> 'authority_observed_at'
+            IS DISTINCT FROM admission_payload ->> 'authority_observed_at'
+        OR audit_projection ->> 'installation_authority_revision'
+            IS DISTINCT FROM admission_payload ->> 'authority_revision'
+        OR audit_projection ->> 'expected_generation'
+            IS DISTINCT FROM admission_payload ->> 'generation'
+        OR audit_projection ->> 'actual_generation'
+            IS DISTINCT FROM admission_payload ->> 'generation'
+        OR audit_projection ->> 'payload_digest'
+            IS DISTINCT FROM promotion_projection ->> 'request_digest'
+        OR audit_projection ->> 'binding_fingerprint'
+            IS DISTINCT FROM admission_payload ->> 'binding_fingerprint'
+        OR audit_projection ->> 'policy_revision'
+            IS DISTINCT FROM admission_payload ->> 'policy_revision'
+        OR activation_request -> 'observed_active' = 'null'::JSONB
+            AND (
+                audit_projection -> 'active_baseline_version'
+                    IS DISTINCT FROM 'null'::JSONB
+                OR audit_projection -> 'active_baseline_hash'
+                    IS DISTINCT FROM 'null'::JSONB
+            )
+        OR activation_request -> 'observed_active' <> 'null'::JSONB
+            AND (
+                audit_projection -> 'active_baseline_version'
+                    IS DISTINCT FROM activation_request
+                        #> '{observed_active,version}'
+                OR audit_projection -> 'active_baseline_hash'
+                    IS DISTINCT FROM activation_request
+                        #> '{observed_active,content_hash}'
+            )
+        OR audit_projection ->> 'resulting_state'
+            IS DISTINCT FROM receipt_projection ->> 'resulting_state'
+        OR audit_projection ->> 'result_code'
+            IS DISTINCT FROM receipt_projection ->> 'result_code'
+        OR audit_projection -> 'dependency_latency_classes'
+            IS DISTINCT FROM '{}'::JSONB
+        OR audit_projection ->> 'endpoint_domain'
+            IS DISTINCT FROM receipt_projection ->> 'endpoint_domain'
+        OR audit_projection ->> 'request_digest'
+            IS DISTINCT FROM receipt_projection ->> 'request_digest'
+        OR audit_projection -> 'resulting_revision'
+            IS DISTINCT FROM receipt_projection -> 'resulting_revision'
+        OR audit_projection ->> 'http_disposition_class'
+            IS DISTINCT FROM receipt_projection ->> 'http_disposition_class'
+        OR audit_projection ->> 'completed_at'
+            IS DISTINCT FROM receipt_projection ->> 'completed_at'
+        OR audit_projection ->> 'occurred_at'
+            IS DISTINCT FROM receipt_projection ->> 'completed_at'
+        OR audit_projection ->> 'evidence_version' IS DISTINCT FROM '1'
+        OR audit_projection ->> 'replay_policy_version' IS DISTINCT FROM '1'
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt';
+        RETURN;
+    END IF;
+
+    BEGIN
+        completed_clock := (receipt_projection ->> 'completed_at')::TIMESTAMPTZ;
+        authority_clock := (audit_projection ->> 'authority_observed_at')::TIMESTAMPTZ;
+        replay_until := (audit_projection ->> 'replay_guaranteed_until')::TIMESTAMPTZ;
+        resulting_revision_value := (
+            receipt_projection ->> 'resulting_revision'
+        )::BIGINT;
+        authority_revision_value := (
+            audit_projection ->> 'installation_authority_revision'
+        )::BIGINT;
+        generation_value := (audit_projection ->> 'expected_generation')::BIGINT;
+        permission_value := (
+            audit_projection ->> 'effective_permission_bits'
+        )::NUMERIC;
+    EXCEPTION
+        WHEN invalid_text_representation
+            OR numeric_value_out_of_range
+            OR datetime_field_overflow
+        THEN
+            RETURN QUERY SELECT 'persistence_corrupt';
+            RETURN;
+    END;
+
+    IF completed_clock IS DISTINCT FROM (
+            promotion_projection ->> 'updated_at'
+        )::TIMESTAMPTZ
+        OR authority_clock > completed_clock
+        OR replay_until IS DISTINCT FROM completed_clock + INTERVAL '168 hours'
+        OR resulting_revision_value <> 3
+        OR authority_revision_value NOT BETWEEN 1 AND 9223372036854775807
+        OR generation_value NOT BETWEEN 1 AND 9223372036854775807
+        OR permission_value < 0
+        OR permission_value > 18446744073709551615
+        OR EXISTS (
+            SELECT 1
+            FROM public.product_action_receipts AS receipt
+            WHERE receipt.receipt_id = receipt_projection ->> 'receipt_id'
+                OR receipt.endpoint_domain = 'product_promote_v1'
+                    AND receipt.target_resource_type = 'authoring_promotion'
+                    AND receipt.target_resource_id = promotion_projection ->> 'id'
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM public.product_action_receipt_idempotency_aliases AS alias
+            WHERE alias.tenant_id = receipt_projection ->> 'tenant_id'
+                AND alias.installation_id = receipt_projection ->> 'installation_id'
+                AND alias.principal_id = receipt_projection ->> 'principal_id'
+                AND alias.endpoint_domain = 'product_promote_v1'
+                AND alias.idempotency_key_digest
+                    = receipt_projection ->> 'idempotency_key_digest'
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM public.product_audit_events AS audit
+            WHERE audit.event_id = audit_projection ->> 'event_id'
+                OR audit.receipt_id = receipt_projection ->> 'receipt_id'
+                OR audit.tenant_id = receipt_projection ->> 'tenant_id'
+                    AND audit.request_id = audit_projection ->> 'request_id'
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM public.product_action_receipt_audit_evidence AS evidence
+            WHERE evidence.event_id = audit_projection ->> 'event_id'
+                OR evidence.receipt_id = receipt_projection ->> 'receipt_id'
+        )
+    THEN
+        RETURN QUERY SELECT 'persistence_corrupt';
+        RETURN;
+    END IF;
+
+    INSERT INTO public.product_action_receipts (
+        receipt_id, tenant_id, installation_id, principal_id, endpoint_domain,
+        idempotency_key_digest, idempotency_digest_key_id,
+        idempotency_digest_key_fingerprint, request_digest,
+        target_resource_type, target_resource_id, resulting_revision,
+        resulting_state, result_code, http_disposition_class, completed_at
+    ) VALUES (
+        receipt_projection ->> 'receipt_id',
+        receipt_projection ->> 'tenant_id',
+        receipt_projection ->> 'installation_id',
+        receipt_projection ->> 'principal_id',
+        receipt_projection ->> 'endpoint_domain',
+        receipt_projection ->> 'idempotency_key_digest',
+        receipt_projection ->> 'idempotency_digest_key_id',
+        receipt_projection ->> 'idempotency_digest_key_fingerprint',
+        receipt_projection ->> 'request_digest',
+        receipt_projection ->> 'target_resource_type',
+        receipt_projection ->> 'target_resource_id',
+        resulting_revision_value,
+        receipt_projection ->> 'resulting_state',
+        receipt_projection ->> 'result_code',
+        (receipt_projection ->> 'http_disposition_class')::SMALLINT,
+        completed_clock
+    );
+
+    INSERT INTO public.product_action_receipt_idempotency_aliases (
+        tenant_id, installation_id, principal_id, endpoint_domain,
+        idempotency_key_digest, idempotency_digest_key_id,
+        idempotency_digest_key_fingerprint, receipt_id, created_at
+    ) VALUES (
+        receipt_projection ->> 'tenant_id',
+        receipt_projection ->> 'installation_id',
+        receipt_projection ->> 'principal_id',
+        receipt_projection ->> 'endpoint_domain',
+        receipt_projection ->> 'idempotency_key_digest',
+        receipt_projection ->> 'idempotency_digest_key_id',
+        receipt_projection ->> 'idempotency_digest_key_fingerprint',
+        receipt_projection ->> 'receipt_id',
+        completed_clock
+    );
+
+    INSERT INTO public.product_audit_events (
+        event_id, tenant_id, installation_id, principal_id,
+        session_subject_digest, action, target_resource_type,
+        target_resource_id, request_id, receipt_id,
+        authority_observation_digest, effective_permission_bits,
+        authority_observed_at, installation_authority_revision,
+        expected_generation, actual_generation, payload_digest,
+        binding_fingerprint, policy_revision, active_baseline_version,
+        active_baseline_hash, resulting_state, result_code,
+        dependency_latency_classes, occurred_at
+    ) VALUES (
+        audit_projection ->> 'event_id',
+        audit_projection ->> 'tenant_id',
+        audit_projection ->> 'installation_id',
+        audit_projection ->> 'principal_id',
+        pg_catalog.decode(audit_projection ->> 'session_subject_digest', 'hex'),
+        audit_projection ->> 'action',
+        audit_projection ->> 'target_resource_type',
+        audit_projection ->> 'target_resource_id',
+        audit_projection ->> 'request_id',
+        audit_projection ->> 'receipt_id',
+        audit_projection ->> 'authority_observation_digest',
+        permission_value,
+        authority_clock,
+        authority_revision_value,
+        generation_value,
+        generation_value,
+        audit_projection ->> 'payload_digest',
+        audit_projection ->> 'binding_fingerprint',
+        (audit_projection ->> 'policy_revision')::BIGINT,
+        (audit_projection ->> 'active_baseline_version')::BIGINT,
+        audit_projection ->> 'active_baseline_hash',
+        audit_projection ->> 'resulting_state',
+        audit_projection ->> 'result_code',
+        audit_projection -> 'dependency_latency_classes',
+        completed_clock
+    );
+
+    SELECT pg_catalog.count(*)
+    INTO evidence_count
+    FROM public.product_action_receipt_audit_evidence AS evidence
+    WHERE evidence.receipt_id = receipt_projection ->> 'receipt_id'
+        AND evidence.event_id = audit_projection ->> 'event_id'
+        AND evidence.tenant_id = receipt_projection ->> 'tenant_id'
+        AND evidence.installation_id = receipt_projection ->> 'installation_id'
+        AND evidence.principal_id = receipt_projection ->> 'principal_id'
+        AND evidence.endpoint_domain = 'product_promote_v1'
+        AND evidence.action = 'promotion.promote'
+        AND evidence.request_digest = receipt_projection ->> 'request_digest'
+        AND evidence.target_resource_type = 'authoring_promotion'
+        AND evidence.target_resource_id = promotion_projection ->> 'id'
+        AND evidence.resulting_revision = 3
+        AND evidence.resulting_state = receipt_projection ->> 'resulting_state'
+        AND evidence.result_code = 'promotion_created'
+        AND evidence.http_disposition_class = 2
+        AND evidence.completed_at = completed_clock
+        AND evidence.evidence_version = 1
+        AND evidence.replay_policy_version = 1
+        AND evidence.replay_guaranteed_until = replay_until;
+    IF evidence_count <> 1 THEN
+        RAISE EXCEPTION 'product promotion receipt finalization is incomplete'
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN QUERY SELECT 'created';
 END;
 $function$;
 
@@ -6150,8 +8275,24 @@ DECLARE
     unexpected_grantee OID;
     unexpected_grantee_name NAME;
     protected_signatures TEXT[] := ARRAY[
+        'public.enforce_authoring_promotion_scope()',
         'public.enforce_authoring_promotion_product_admission()',
         'public.enforce_authoring_promotion_product_transition()',
+        'public.reject_ruleset_artifact_mutation()',
+        'public.enforce_product_activation_journal_link()',
+        'public.enforce_product_activation_scope()',
+        'public.guard_legacy_activation_product_slot()',
+        'public.guard_product_ruleset_artifact_transition()',
+        'public.assert_product_approval_receipt_alias()',
+        'public.assert_product_approval_receipt_audit()',
+        'public.enforce_product_action_receipt_retention()',
+        'public.enforce_product_action_receipt_alias_capacity()',
+        'public.enforce_product_action_receipt_alias_retention()',
+        'public.capture_product_action_receipt_audit_evidence()',
+        'public.reject_immutable_product_approval_row()',
+        'public.starring_canonical_json_v1(jsonb)',
+        'public.starring_ruleset_content_hash_v1(bigint,jsonb)',
+        'public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)',
         'public.starring_product_promotion_executor_database_identity_v1()',
         'public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])',
         'public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,jsonb,text,text,text[],text[],text[],text,text,text,text)',
