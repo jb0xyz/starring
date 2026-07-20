@@ -58,13 +58,42 @@ fn direct_dependency_names() -> Vec<String> {
 }
 
 #[test]
-fn edge_mapping_package_has_no_infrastructure_or_raw_store_dependency() {
+fn direct_dependencies_are_closed_to_reviewed_architecture_inputs() {
     let dependencies = direct_dependency_names();
-    for forbidden in ["sqlx", "twilight", "axum", "tower", "reqwest"] {
-        assert!(!dependencies.iter().any(|dependency| {
-            dependency == forbidden || dependency.starts_with(&format!("{forbidden}-"))
-        }));
+    for dependency in dependencies {
+        assert!(
+            matches!(
+                dependency.as_str(),
+                "async-trait"
+                    | "authoring-application"
+                    | "authoring-application-discord"
+                    | "authoring-application-postgres"
+                    | "authoring-promotion"
+                    | "automation-ruleset"
+                    | "axum"
+                    | "base64"
+                    | "chrono"
+                    | "discord-model"
+                    | "hyper"
+                    | "hyper-util"
+                    | "product-control-http"
+                    | "serde"
+                    | "serde_json"
+                    | "sqlx"
+                    | "thiserror"
+                    | "tokio"
+                    | "tower"
+                    | "twilight-http"
+                    | "url"
+                    | "zeroize"
+            ),
+            "unreviewed direct dependency: {dependency}"
+        );
     }
+}
+
+#[test]
+fn pure_edge_modules_have_no_infrastructure_or_raw_store_dependency() {
     let sources = source_files();
     for name in ["input.rs", "error.rs", "projection.rs"] {
         let source = source_named(&sources, name);
@@ -96,8 +125,46 @@ fn package_is_registered_once_and_source_modules_are_classified() {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(matches!(
             name,
-            "lib.rs" | "input.rs" | "error.rs" | "projection.rs" | "facade.rs"
+            "lib.rs"
+                | "input.rs"
+                | "error.rs"
+                | "projection.rs"
+                | "facade.rs"
+                | "secret.rs"
+                | "config.rs"
+                | "composition.rs"
+                | "server.rs"
+                | "main.rs"
         ));
+    }
+}
+
+#[test]
+fn infrastructure_dependencies_remain_confined_to_composition_and_server() {
+    let sources = source_files();
+    for name in [
+        "input.rs",
+        "error.rs",
+        "projection.rs",
+        "facade.rs",
+        "secret.rs",
+    ] {
+        let Some((_, source)) = sources
+            .iter()
+            .find(|(path, _)| path.file_name().is_some_and(|file_name| file_name == name))
+        else {
+            continue;
+        };
+        for forbidden in [
+            "sqlx::",
+            "twilight_http::",
+            "axum::",
+            "hyper::",
+            "hyper_util::",
+            "tokio::net::TcpListener",
+        ] {
+            assert!(!source.contains(forbidden), "{name}: {forbidden}");
+        }
     }
 }
 

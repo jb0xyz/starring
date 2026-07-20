@@ -10,9 +10,14 @@ authoring-application-discord = { path = "../../crates/authoring-application-dis
 authoring-application-postgres = { path = "../../crates/authoring-application-postgres" }
 authoring-promotion = { path = "../../crates/authoring-promotion" }
 automation-ruleset = { path = "../../crates/automation-ruleset" }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
 chrono = "0.4"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 product-control-http = { path = "../../crates/product-control-http" }
 thiserror.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 discord-model = { path = "../../crates/discord-model" }
