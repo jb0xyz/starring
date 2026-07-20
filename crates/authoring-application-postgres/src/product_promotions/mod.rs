@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod activation_link;
+#[allow(dead_code)]
 mod admission;
 #[allow(dead_code)]
 mod approval_environment;
