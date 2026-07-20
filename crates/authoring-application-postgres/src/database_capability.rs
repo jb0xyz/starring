@@ -175,6 +175,7 @@ struct RoleCapabilityRow {
     caller_role_excessive: bool,
     caller_is_owner_member: bool,
     caller_has_explicit_parameter_privilege: bool,
+    caller_has_role_setting: bool,
 }
 
 struct ScopedDatabaseCapabilitiesV1 {
@@ -233,7 +234,8 @@ impl ScopedDatabaseCapabilitiesV1 {
             || row.caller_has_role_membership
             || row.caller_role_excessive
             || row.caller_is_owner_member
-            || row.caller_has_explicit_parameter_privilege;
+            || row.caller_has_explicit_parameter_privilege
+            || row.caller_has_role_setting;
     }
 
     fn verify(self) -> Result<(), ScopedDatabaseReadinessErrorV1> {
@@ -807,7 +809,12 @@ async fn load_role_capability(
            FROM pg_catalog.pg_parameter_acl AS parameter_acl \
            CROSS JOIN LATERAL pg_catalog.aclexplode(parameter_acl.paracl) AS privilege \
            WHERE privilege.grantee = 0 OR privilege.grantee = caller_role.oid \
-          ), TRUE) AS caller_has_explicit_parameter_privilege \
+          ), TRUE) AS caller_has_explicit_parameter_privilege, \
+          COALESCE(EXISTS ( \
+           SELECT 1 \
+           FROM pg_catalog.pg_db_role_setting AS role_setting \
+           WHERE role_setting.setrole = caller_role.oid \
+          ), TRUE) AS caller_has_role_setting \
          FROM target \
          LEFT JOIN caller_role ON TRUE \
          LEFT JOIN owner_role ON TRUE",
