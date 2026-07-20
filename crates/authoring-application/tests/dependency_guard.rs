@@ -303,11 +303,17 @@ fn source() -> String {
     [
         include_str!("../src/lib.rs"),
         include_str!("../src/application.rs"),
+        include_str!("../src/application/approval_query.rs"),
+        include_str!("../src/application/decision_mutation.rs"),
+        include_str!("../src/application/projection_validation.rs"),
+        include_str!("../src/application/promotion_flow.rs"),
+        include_str!("../src/application/status_query.rs"),
         include_str!("../src/authority.rs"),
         include_str!("../src/control.rs"),
         include_str!("../src/identity.rs"),
         include_str!("../src/promotion.rs"),
         include_str!("../src/status.rs"),
+        include_str!("../src/status/runtime.rs"),
     ]
     .join("\n")
 }
