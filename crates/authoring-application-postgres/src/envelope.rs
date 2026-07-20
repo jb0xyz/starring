@@ -223,6 +223,10 @@ pub enum SnapshotEnvelopeCipherError {
 
 #[allow(async_fn_in_trait)]
 pub trait SnapshotEnvelopeCipher {
+    fn configured_encryption_key_ids(&self) -> Option<Vec<&str>> {
+        None
+    }
+
     async fn decrypt(
         &self,
         envelope: &EncryptedSnapshotEnvelopeV1,

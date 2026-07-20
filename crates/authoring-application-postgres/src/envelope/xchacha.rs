@@ -144,6 +144,16 @@ impl Debug for XChaCha20Poly1305SnapshotEnvelopeCipherV1 {
 }
 
 impl SnapshotEnvelopeCipher for XChaCha20Poly1305SnapshotEnvelopeCipherV1 {
+    fn configured_encryption_key_ids(&self) -> Option<Vec<&str>> {
+        Some(
+            self.keyring
+                .keys
+                .iter()
+                .map(SnapshotEnvelopeKeyV1::key_id)
+                .collect(),
+        )
+    }
+
     async fn decrypt(
         &self,
         envelope: &EncryptedSnapshotEnvelopeV1,
@@ -257,6 +267,10 @@ mod tests {
         assert!(!ring.supports_key_id("missing"));
         assert_eq!(format!("{ring:?}"), "SnapshotEnvelopeKeyringV1(<redacted>)");
         let cipher = XChaCha20Poly1305SnapshotEnvelopeCipherV1::new(ring);
+        assert_eq!(
+            cipher.configured_encryption_key_ids(),
+            Some(vec!["active-v2", "retired-v1"])
+        );
         assert_eq!(
             format!("{cipher:?}"),
             "XChaCha20Poly1305SnapshotEnvelopeCipherV1(<redacted>)"
