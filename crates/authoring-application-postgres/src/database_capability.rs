@@ -174,6 +174,8 @@ struct RoleCapabilityRow {
     caller_has_role_membership: bool,
     caller_role_excessive: bool,
     caller_is_owner_member: bool,
+    caller_has_explicit_parameter_privilege: bool,
+    caller_has_role_setting: bool,
 }
 
 struct ScopedDatabaseCapabilitiesV1 {
@@ -231,7 +233,9 @@ impl ScopedDatabaseCapabilitiesV1 {
             || row.caller_schema_create
             || row.caller_has_role_membership
             || row.caller_role_excessive
-            || row.caller_is_owner_member;
+            || row.caller_is_owner_member
+            || row.caller_has_explicit_parameter_privilege
+            || row.caller_has_role_setting;
     }
 
     fn verify(self) -> Result<(), ScopedDatabaseReadinessErrorV1> {
@@ -371,6 +375,136 @@ pub(crate) async fn verify_scoped_executable_allowlist(
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)?;
+    if !exact {
+        return Err(ScopedDatabaseReadinessErrorV1::ExcessCapability);
+    }
+    Ok(())
+}
+
+const GLOBAL_USER_OBJECT_DENY_QUERY: &str = r#"
+WITH expected_functions AS (
+    SELECT pg_catalog.to_regprocedure(item.identity) AS function_oid
+    FROM pg_catalog.unnest($1::TEXT[]) AS item(identity)
+), user_schemas AS (
+    SELECT namespace.oid, namespace.nspname
+    FROM pg_catalog.pg_namespace AS namespace
+    WHERE namespace.nspname <> 'information_schema'
+        AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+), unexpected_schema_capability AS (
+    SELECT 1
+    FROM user_schemas AS namespace
+    WHERE pg_catalog.has_schema_privilege(
+            current_user,
+            namespace.oid,
+            'CREATE'
+        )
+        OR (
+            namespace.nspname <> 'public'
+            AND pg_catalog.has_schema_privilege(
+                current_user,
+                namespace.oid,
+                'USAGE'
+            )
+        )
+    LIMIT 1
+), unexpected_relation_capability AS (
+    SELECT 1
+    FROM pg_catalog.pg_class AS relation
+    INNER JOIN user_schemas AS namespace
+        ON namespace.oid = relation.relnamespace
+    WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+        AND (
+            (
+                relation.relkind = 'S'
+                AND EXISTS (
+                    SELECT 1
+                    FROM (
+                        VALUES ('USAGE'), ('SELECT'), ('UPDATE')
+                    ) AS checked_privilege(name)
+                    WHERE pg_catalog.has_sequence_privilege(
+                        current_user,
+                        relation.oid,
+                        checked_privilege.name
+                    )
+                )
+            )
+            OR (
+                relation.relkind <> 'S'
+                AND EXISTS (
+                    SELECT 1
+                    FROM (
+                        VALUES
+                            ('SELECT'),
+                            ('INSERT'),
+                            ('UPDATE'),
+                            ('DELETE'),
+                            ('TRUNCATE'),
+                            ('REFERENCES'),
+                            ('TRIGGER')
+                    ) AS checked_privilege(name)
+                    WHERE pg_catalog.has_table_privilege(
+                        current_user,
+                        relation.oid,
+                        checked_privilege.name
+                    )
+                )
+            )
+            OR (
+                relation.relkind <> 'S'
+                AND EXISTS (
+                    SELECT 1
+                    FROM (
+                        VALUES
+                            ('SELECT'),
+                            ('INSERT'),
+                            ('UPDATE'),
+                            ('REFERENCES')
+                    ) AS checked_privilege(name)
+                    WHERE pg_catalog.has_any_column_privilege(
+                        current_user,
+                        relation.oid,
+                        checked_privilege.name
+                    )
+                )
+            )
+        )
+    LIMIT 1
+), unexpected_function_capability AS (
+    SELECT 1
+    FROM pg_catalog.pg_proc AS function_row
+    INNER JOIN user_schemas AS namespace
+        ON namespace.oid = function_row.pronamespace
+    WHERE function_row.prokind IN ('f', 'p')
+        AND pg_catalog.has_function_privilege(
+            current_user,
+            function_row.oid,
+            'EXECUTE'
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM expected_functions AS expected
+            WHERE expected.function_oid = function_row.oid
+        )
+    LIMIT 1
+)
+SELECT NOT EXISTS (SELECT 1 FROM unexpected_schema_capability)
+    AND NOT EXISTS (SELECT 1 FROM unexpected_relation_capability)
+    AND NOT EXISTS (SELECT 1 FROM unexpected_function_capability)
+"#;
+
+pub(crate) async fn verify_scoped_global_user_object_deny(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected: &[ScopedFunctionContractV1<'_>],
+) -> Result<(), ScopedDatabaseReadinessErrorV1> {
+    let identities = expected
+        .iter()
+        .map(|contract| contract.identity)
+        .collect::<Vec<_>>();
+    let exact = sqlx::query_scalar::<_, bool>(GLOBAL_USER_OBJECT_DENY_QUERY)
+        .bind(&identities)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(readiness_database)?;
     if !exact {
         return Err(ScopedDatabaseReadinessErrorV1::ExcessCapability);
     }
@@ -669,7 +803,18 @@ async fn load_role_capability(
           ) AS caller_role_excessive, \
           COALESCE(pg_catalog.pg_has_role( \
            current_user, owner_role.rolname, 'MEMBER'), TRUE) \
-           AS caller_is_owner_member \
+           AS caller_is_owner_member, \
+          COALESCE(EXISTS ( \
+           SELECT 1 \
+           FROM pg_catalog.pg_parameter_acl AS parameter_acl \
+           CROSS JOIN LATERAL pg_catalog.aclexplode(parameter_acl.paracl) AS privilege \
+           WHERE privilege.grantee = 0 OR privilege.grantee = caller_role.oid \
+          ), TRUE) AS caller_has_explicit_parameter_privilege, \
+          COALESCE(EXISTS ( \
+           SELECT 1 \
+           FROM pg_catalog.pg_db_role_setting AS role_setting \
+           WHERE role_setting.setrole = caller_role.oid \
+          ), TRUE) AS caller_has_role_setting \
          FROM target \
          LEFT JOIN caller_role ON TRUE \
          LEFT JOIN owner_role ON TRUE",
@@ -755,6 +900,22 @@ mod tests {
         assert!(set.returns_set);
         assert_eq!(set.language, ScopedFunctionLanguageV1::PlPgSql);
         assert_eq!(set.language.database_name(), "plpgsql");
+    }
+
+    #[test]
+    fn global_user_object_deny_covers_every_user_capability_class() {
+        for required in [
+            "has_schema_privilege",
+            "has_table_privilege",
+            "has_any_column_privilege",
+            "has_sequence_privilege",
+            "has_function_privilege",
+            "function_row.prokind IN ('f', 'p')",
+        ] {
+            assert!(GLOBAL_USER_OBJECT_DENY_QUERY.contains(required));
+        }
+        assert!(!GLOBAL_USER_OBJECT_DENY_QUERY.contains("function_row.prosecdef"));
+        assert!(!GLOBAL_USER_OBJECT_DENY_QUERY.contains("'starring_'"));
     }
 
     #[test]

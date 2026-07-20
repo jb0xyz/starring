@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use automation_runtime_convergence::{PromotionId, RuntimeDeploymentPhaseV1};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -5,7 +7,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::artifact::{runtime_target_artifact_is_valid, RuntimeTargetArtifactRow};
-use crate::model::{RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1, RuntimeDigestV1};
+use crate::model::{
+    RuntimeAttestationObservationV2, RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1,
+    RuntimeDeploymentStatusV1, RuntimeDeploymentStatusV2, RuntimeDigestV1,
+    RuntimeServingFreshnessV2, RuntimeServingObservationV2,
+};
 use crate::projection::{project_status, CurrentAuthorityOutcome, StatusProjectionEvidence};
 use crate::row::{AttestationRow, DeploymentRow, PersistedDeployment, ServingLeaseRow};
 use crate::RuntimeConvergenceStoreError;
@@ -76,6 +82,88 @@ pub struct RuntimeDeploymentStatusEvidenceV1 {
     pub serving_projection: Option<Value>,
 }
 
+pub struct RuntimeDeploymentStatusEvidenceV2 {
+    pub evidence: RuntimeDeploymentStatusEvidenceV1,
+    pub deployment_convergence_attempt_no: i64,
+    pub deployment_last_failure_attempt_no: Option<i64>,
+    pub attestation_convergence_attempt_no: Option<i64>,
+}
+
+pub fn project_runtime_deployment_status_v2(
+    expectation: &RuntimeDeploymentStatusExpectationV1,
+    observed_at: DateTime<Utc>,
+    mut evidence: RuntimeDeploymentStatusEvidenceV2,
+) -> Result<RuntimeDeploymentStatusV2, RuntimeConvergenceStoreError> {
+    let convergence_attempt = runtime_attempt(
+        evidence.deployment_convergence_attempt_no,
+        "runtime convergence attempt evidence",
+    )?;
+    let last_failure_attempt = evidence
+        .deployment_last_failure_attempt_no
+        .map(|value| positive_attempt(value, "runtime failure attempt evidence"))
+        .transpose()?;
+    let attestation_attempt = evidence
+        .attestation_convergence_attempt_no
+        .map(|value| positive_attempt(value, "runtime attestation attempt evidence"))
+        .transpose()?;
+    if evidence.evidence.attestation_projection.is_some() != attestation_attempt.is_some() {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "runtime attestation attempt presence",
+        ));
+    }
+    attach_attempt_evidence(
+        &mut evidence.evidence.deployment_projection,
+        convergence_attempt,
+        last_failure_attempt,
+    )?;
+    if let (Some(projection), Some(attempt)) = (
+        evidence.evidence.attestation_projection.as_mut(),
+        attestation_attempt,
+    ) {
+        attach_attestation_attempt_evidence(projection, attempt)?;
+    }
+    let serving_projection = evidence.evidence.serving_projection.clone();
+    let status = project_runtime_deployment_status_v1(expectation, observed_at, evidence.evidence)?;
+    let phase_live = matches!(status.snapshot.phase, RuntimeDeploymentPhaseV1::Live);
+    if !phase_live && attestation_attempt.is_some()
+        || attestation_attempt.is_some_and(|attempt| convergence_attempt.started() != Some(attempt))
+    {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "runtime attestation attempt binding",
+        ));
+    }
+    let freshness = serving_freshness(&status)?;
+    let attestation = match freshness {
+        RuntimeServingFreshnessV2::LeaseMissing
+        | RuntimeServingFreshnessV2::IdentityMismatch
+        | RuntimeServingFreshnessV2::Disconnected
+        | RuntimeServingFreshnessV2::Expired
+        | RuntimeServingFreshnessV2::Fresh => Some(RuntimeAttestationObservationV2 {
+            deployment_revision: status.snapshot.revision,
+            convergence_attempt: attestation_attempt.ok_or(
+                RuntimeConvergenceStoreError::InvalidPersistedState(
+                    "runtime attestation attempt observation",
+                ),
+            )?,
+        }),
+        RuntimeServingFreshnessV2::NotExpected | RuntimeServingFreshnessV2::AttestationMissing => {
+            None
+        }
+    };
+    let serving_times = serving_times(&status, freshness, serving_projection)?;
+    Ok(RuntimeDeploymentStatusV2 {
+        status,
+        convergence_attempt,
+        last_failure_attempt,
+        attestation,
+        serving: RuntimeServingObservationV2 {
+            freshness,
+            last_heartbeat_at: serving_times.last_heartbeat_at,
+            expires_at: serving_times.expires_at,
+        },
+    })
+}
+
 pub fn project_runtime_deployment_status_v1(
     expectation: &RuntimeDeploymentStatusExpectationV1,
     observed_at: DateTime<Utc>,
@@ -85,7 +173,7 @@ pub fn project_runtime_deployment_status_v1(
         evidence.deployment_projection,
         "deployment evidence envelope",
     )?
-    .decode()?;
+    .decode_legacy_evidence()?;
     validate_expected_deployment(expectation, &deployment)?;
     let installation = decode_optional_envelope::<InstallationEvidenceRow>(
         evidence.installation_projection,
@@ -165,7 +253,7 @@ pub fn project_runtime_deployment_status_v1(
         evidence.attestation_projection,
         "attestation evidence envelope",
     )?
-    .map(AttestationRow::decode)
+    .map(AttestationRow::decode_legacy_evidence)
     .transpose()?;
     let serving = decode_optional_envelope::<ServingLeaseRow>(
         evidence.serving_projection,
@@ -181,6 +269,166 @@ pub fn project_runtime_deployment_status_v1(
             serving,
         },
     )
+}
+
+fn runtime_attempt(
+    value: i64,
+    error: &'static str,
+) -> Result<RuntimeConvergenceAttemptV1, RuntimeConvergenceStoreError> {
+    let value = u32::try_from(value)
+        .map_err(|_| RuntimeConvergenceStoreError::InvalidPersistedState(error))?;
+    Ok(RuntimeConvergenceAttemptV1::new(value))
+}
+
+fn positive_attempt(
+    value: i64,
+    error: &'static str,
+) -> Result<NonZeroU32, RuntimeConvergenceStoreError> {
+    let value = u32::try_from(value)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(error))?;
+    Ok(value)
+}
+
+fn attach_attempt_evidence(
+    projection: &mut Value,
+    convergence_attempt: RuntimeConvergenceAttemptV1,
+    last_failure_attempt: Option<NonZeroU32>,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    let row = evidence_row(projection, "deployment attempt evidence envelope")?;
+    if row.contains_key("convergence_attempt_no") || row.contains_key("last_failure_attempt_no") {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "deployment attempt evidence fields",
+        ));
+    }
+    insert_attempt(
+        row,
+        "convergence_attempt_no",
+        i64::from(convergence_attempt.get()),
+        "deployment convergence attempt evidence",
+    )?;
+    if let Some(attempt) = last_failure_attempt {
+        insert_attempt(
+            row,
+            "last_failure_attempt_no",
+            i64::from(attempt.get()),
+            "deployment failure attempt evidence",
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_attestation_attempt_evidence(
+    projection: &mut Value,
+    attempt: NonZeroU32,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    let row = evidence_row(projection, "attestation attempt evidence envelope")?;
+    if row.contains_key("convergence_attempt_no") {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "attestation attempt evidence fields",
+        ));
+    }
+    insert_attempt(
+        row,
+        "convergence_attempt_no",
+        i64::from(attempt.get()),
+        "attestation convergence attempt evidence",
+    )
+}
+
+fn evidence_row<'a>(
+    projection: &'a mut Value,
+    error: &'static str,
+) -> Result<&'a mut serde_json::Map<String, Value>, RuntimeConvergenceStoreError> {
+    projection
+        .as_object_mut()
+        .and_then(|envelope| envelope.get_mut("row"))
+        .and_then(Value::as_object_mut)
+        .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(error))
+}
+
+fn insert_attempt(
+    row: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    value: i64,
+    error: &'static str,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    if row.insert(key.to_string(), Value::from(value)).is_some() {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(error));
+    }
+    Ok(())
+}
+
+fn serving_freshness(
+    status: &RuntimeDeploymentStatusV1,
+) -> Result<RuntimeServingFreshnessV2, RuntimeConvergenceStoreError> {
+    let freshness = match status.reason_code {
+        "live" => RuntimeServingFreshnessV2::Fresh,
+        "live_attestation_missing" => RuntimeServingFreshnessV2::AttestationMissing,
+        "serving_lease_missing" => RuntimeServingFreshnessV2::LeaseMissing,
+        "serving_identity_mismatch" => RuntimeServingFreshnessV2::IdentityMismatch,
+        "gateway_not_serving" => RuntimeServingFreshnessV2::Disconnected,
+        "serving_lease_expired" => RuntimeServingFreshnessV2::Expired,
+        _ => RuntimeServingFreshnessV2::NotExpected,
+    };
+    match (freshness, &status.live) {
+        (RuntimeServingFreshnessV2::Fresh, Some(_)) => Ok(freshness),
+        (RuntimeServingFreshnessV2::Fresh, None) | (_, Some(_)) => {
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime serving freshness projection",
+            ))
+        }
+        _ => Ok(freshness),
+    }
+}
+
+struct ServingTimesV2 {
+    last_heartbeat_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+fn serving_times(
+    status: &RuntimeDeploymentStatusV1,
+    freshness: RuntimeServingFreshnessV2,
+    projection: Option<Value>,
+) -> Result<ServingTimesV2, RuntimeConvergenceStoreError> {
+    match freshness {
+        RuntimeServingFreshnessV2::Fresh => {
+            let live =
+                status
+                    .live
+                    .as_ref()
+                    .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(
+                        "fresh runtime serving observation",
+                    ))?;
+            Ok(ServingTimesV2 {
+                last_heartbeat_at: Some(live.last_heartbeat_at),
+                expires_at: Some(live.expires_at),
+            })
+        }
+        RuntimeServingFreshnessV2::Disconnected | RuntimeServingFreshnessV2::Expired => {
+            let serving = decode_optional_envelope::<ServingLeaseRow>(
+                projection,
+                "serving freshness evidence envelope",
+            )?
+            .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "serving freshness evidence",
+            ))?;
+            serving.validate()?;
+            Ok(ServingTimesV2 {
+                last_heartbeat_at: Some(serving.last_heartbeat_at),
+                expires_at: Some(serving.expires_at),
+            })
+        }
+        RuntimeServingFreshnessV2::NotExpected
+        | RuntimeServingFreshnessV2::AttestationMissing
+        | RuntimeServingFreshnessV2::LeaseMissing
+        | RuntimeServingFreshnessV2::IdentityMismatch => Ok(ServingTimesV2 {
+            last_heartbeat_at: None,
+            expires_at: None,
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -494,12 +742,13 @@ mod tests {
 
     use super::{
         canonical_snowflake, decode_envelope, parse_positive_i64,
-        project_runtime_deployment_status_v1, RuntimeDeploymentStatusEvidenceV1,
+        project_runtime_deployment_status_v1, project_runtime_deployment_status_v2,
+        RuntimeDeploymentStatusEvidenceV1, RuntimeDeploymentStatusEvidenceV2,
         RuntimeDeploymentStatusExpectationV1,
     };
     use crate::{
         prepare_requested_deployment_v1, DeploymentAvailabilityV1, EnqueueDeploymentV1,
-        RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
+        RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, RuntimeServingFreshnessV2,
     };
 
     #[derive(Deserialize, PartialEq, Eq)]
@@ -777,6 +1026,106 @@ mod tests {
         assert_eq!(status.reason_code, "convergence_in_progress");
         assert_eq!(status.observed_at, observed_at);
         assert!(status.live.is_none());
+    }
+
+    #[test]
+    fn operational_evidence_accepts_only_exact_pristine_attempt_zero() {
+        let (expectation, evidence, observed_at) = pending_fixture();
+        let status = project_runtime_deployment_status_v2(
+            &expectation,
+            observed_at,
+            RuntimeDeploymentStatusEvidenceV2 {
+                evidence,
+                deployment_convergence_attempt_no: 0,
+                deployment_last_failure_attempt_no: None,
+                attestation_convergence_attempt_no: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(status.convergence_attempt.get(), 0);
+        assert_eq!(status.last_failure_attempt, None);
+        assert_eq!(status.attestation, None);
+        assert_eq!(
+            status.serving.freshness,
+            RuntimeServingFreshnessV2::NotExpected
+        );
+        assert_eq!(status.serving.last_heartbeat_at, None);
+        assert_eq!(status.serving.expires_at, None);
+        assert_eq!(
+            status.status.availability,
+            DeploymentAvailabilityV1::RuntimePending
+        );
+    }
+
+    #[test]
+    fn operational_attempt_scalars_fail_closed() {
+        for current in [-1, i64::from(u32::MAX) + 1] {
+            let (expectation, evidence, observed_at) = pending_fixture();
+            assert!(matches!(
+                project_runtime_deployment_status_v2(
+                    &expectation,
+                    observed_at,
+                    RuntimeDeploymentStatusEvidenceV2 {
+                        evidence,
+                        deployment_convergence_attempt_no: current,
+                        deployment_last_failure_attempt_no: None,
+                        attestation_convergence_attempt_no: None,
+                    },
+                ),
+                Err(RuntimeConvergenceStoreError::InvalidPersistedState(_))
+            ));
+        }
+        let (expectation, evidence, observed_at) = pending_fixture();
+        assert!(matches!(
+            project_runtime_deployment_status_v2(
+                &expectation,
+                observed_at,
+                RuntimeDeploymentStatusEvidenceV2 {
+                    evidence,
+                    deployment_convergence_attempt_no: 0,
+                    deployment_last_failure_attempt_no: Some(1),
+                    attestation_convergence_attempt_no: None,
+                },
+            ),
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(_))
+        ));
+        let (expectation, evidence, observed_at) = pending_fixture();
+        assert!(matches!(
+            project_runtime_deployment_status_v2(
+                &expectation,
+                observed_at,
+                RuntimeDeploymentStatusEvidenceV2 {
+                    evidence,
+                    deployment_convergence_attempt_no: 0,
+                    deployment_last_failure_attempt_no: None,
+                    attestation_convergence_attempt_no: Some(1),
+                },
+            ),
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime attestation attempt presence"
+            ))
+        ));
+    }
+
+    #[test]
+    fn operational_evidence_rejects_attempt_fields_inside_the_v1_payload() {
+        let (expectation, mut evidence, observed_at) = pending_fixture();
+        evidence.deployment_projection["row"]["convergence_attempt_no"] = json!(0);
+        assert!(matches!(
+            project_runtime_deployment_status_v2(
+                &expectation,
+                observed_at,
+                RuntimeDeploymentStatusEvidenceV2 {
+                    evidence,
+                    deployment_convergence_attempt_no: 0,
+                    deployment_last_failure_attempt_no: None,
+                    attestation_convergence_attempt_no: None,
+                },
+            ),
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "deployment attempt evidence fields"
+            ))
+        ));
     }
 
     #[test]

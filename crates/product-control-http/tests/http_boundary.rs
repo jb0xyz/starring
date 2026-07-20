@@ -8,12 +8,18 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use product_control_http::{
-    product_control_router, ApplyCommand, ApplyView, ApprovalPreviewView, CsrfSecret,
-    CurrentPrincipal, CurrentPrincipalView, DecisionCommand, DecisionView, DeploymentState,
+    product_control_router, product_control_router_with_operational_v2,
+    product_control_router_with_operational_v2_and_readiness_gate, ApplyCommand, ApplyView,
+    ApprovalPreviewView, CsrfSecret, CurrentPrincipal, CurrentPrincipalView, DecisionCommand,
+    DecisionView, DeploymentAttestationViewV2, DeploymentFailureViewV2,
+    DeploymentOperationalStateV2, DeploymentOperationalViewV2, DeploymentOperatorActionV2,
+    DeploymentRetryStateV2, DeploymentRetryViewV2, DeploymentRuntimePhaseV2,
+    DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2, DeploymentState,
     DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode, HttpBoundaryConfig,
     IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
-    ProductControlFacade, ProductRequestId, ProductState, PromoteCommand, PromotionView,
-    RejectCommand, SafeApprovalSummary, SessionCredential,
+    ProductApiReadinessGate, ProductControlFacade, ProductControlOperationalFacadeV2,
+    ProductRequestId, ProductState, PromoteCommand, PromotionView, RejectCommand,
+    RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -30,10 +36,13 @@ const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 #[derive(Default)]
 struct FakeFacade {
+    oauth_start_calls: AtomicUsize,
+    fail_oauth_start: AtomicUsize,
     verify_calls: AtomicUsize,
+    readiness_calls: AtomicUsize,
     promote_calls: AtomicUsize,
     fail_me: AtomicUsize,
-    panic_ready: AtomicUsize,
+    panic_me: AtomicUsize,
     disallowed_return: AtomicUsize,
     invalid_client_id: AtomicUsize,
     invalid_callback_url: AtomicUsize,
@@ -43,6 +52,12 @@ struct FakeFacade {
     promote_entered: Notify,
     promote_release: Notify,
     mutation_request_ids: Mutex<Vec<(String, String)>>,
+    operational_calls: AtomicUsize,
+    operational_fail: AtomicUsize,
+    block_operational: AtomicUsize,
+    operational_entered: Notify,
+    operational_release: Notify,
+    operational_response: Mutex<Option<DeploymentOperationalViewV2>>,
 }
 
 impl FakeFacade {
@@ -94,6 +109,10 @@ impl ProductControlFacade for FakeFacade {
         &self,
         _command: OAuthStartCommand,
     ) -> Result<OAuthStartResult, FacadeError> {
+        self.oauth_start_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_oauth_start.load(Ordering::SeqCst) != 0 {
+            return Err(FacadeError::new(FacadeErrorCode::Internal));
+        }
         let client_id = if self.invalid_client_id.load(Ordering::SeqCst) == 0 {
             "123456789012345678"
         } else {
@@ -139,6 +158,7 @@ impl ProductControlFacade for FakeFacade {
         &self,
         credential: &SessionCredential,
     ) -> Result<CurrentPrincipal, FacadeError> {
+        assert_eq!(self.panic_me.load(Ordering::SeqCst), 0);
         if self.fail_me.load(Ordering::SeqCst) > 0 {
             return Err(FacadeError::new(FacadeErrorCode::Internal));
         }
@@ -280,8 +300,35 @@ impl ProductControlFacade for FakeFacade {
     }
 
     async fn readiness(&self) -> Result<(), FacadeError> {
-        assert_eq!(self.panic_ready.load(Ordering::SeqCst), 0);
+        self.readiness_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ProductControlOperationalFacadeV2 for FakeFacade {
+    async fn deployment_operational_v2(
+        &self,
+        _credential: &SessionCredential,
+        _installation_id: &str,
+        _promotion_id: &str,
+    ) -> Result<DeploymentOperationalViewV2, FacadeError> {
+        self.operational_calls.fetch_add(1, Ordering::SeqCst);
+        match self.operational_fail.load(Ordering::SeqCst) {
+            1 => return Err(FacadeError::new(FacadeErrorCode::DependencyUnavailable)),
+            2 => return Err(FacadeError::new(FacadeErrorCode::DependencyTimeout)),
+            _ => {}
+        }
+        if self.block_operational.load(Ordering::SeqCst) != 0 {
+            self.operational_entered.notify_one();
+            self.operational_release.notified().await;
+        }
+        Ok(self
+            .operational_response
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(pending_operational_view))
     }
 }
 
@@ -301,6 +348,447 @@ fn app_with_concurrency(facade: Arc<FakeFacade>, max_in_flight: usize) -> axum::
         )
         .unwrap(),
     )
+}
+
+fn operational_app(facade: Arc<FakeFacade>) -> axum::Router {
+    operational_app_with_timeout(facade, Duration::from_secs(2))
+}
+
+fn operational_app_with_timeout(
+    facade: Arc<FakeFacade>,
+    request_timeout: Duration,
+) -> axum::Router {
+    product_control_router_with_operational_v2(
+        facade,
+        HttpBoundaryConfig::new(ORIGIN, 1_024, 8, request_timeout, ["/app".to_string()]).unwrap(),
+    )
+}
+
+fn operational_app_with_gate(
+    facade: Arc<FakeFacade>,
+    readiness_gate: ProductApiReadinessGate,
+) -> axum::Router {
+    product_control_router_with_operational_v2_and_readiness_gate(
+        facade,
+        HttpBoundaryConfig::new(
+            ORIGIN,
+            1_024,
+            8,
+            Duration::from_secs(2),
+            ["/app".to_string()],
+        )
+        .unwrap(),
+        readiness_gate,
+    )
+}
+
+fn timestamp(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn not_expected_serving() -> DeploymentServingFreshnessViewV2 {
+    DeploymentServingFreshnessViewV2 {
+        state: DeploymentServingFreshnessStateV2::NotExpected,
+        last_heartbeat_at: None,
+        lease_expires_at: None,
+    }
+}
+
+fn pending_operational_view() -> DeploymentOperationalViewV2 {
+    DeploymentOperationalViewV2 {
+        installation_id: "install-1".to_string(),
+        promotion_id: PROMOTION.to_string(),
+        decision_observed_at: timestamp("2026-07-19T11:59:59Z"),
+        state: DeploymentOperationalStateV2::Pending,
+        runtime: Some(RuntimeDeploymentOperationalViewV2 {
+            observed_at: timestamp("2026-07-19T12:00:00Z"),
+            phase: DeploymentRuntimePhaseV2::Requested,
+            current_attempt: 0,
+            last_failure_attempt: None,
+            failure: None,
+            retry: None,
+            operator_action: None,
+            attestation: None,
+            serving: not_expected_serving(),
+        }),
+    }
+}
+
+fn set_operational_response(facade: &FakeFacade, view: DeploymentOperationalViewV2) {
+    *facade.operational_response.lock().unwrap() = Some(view);
+}
+
+fn operational_request(installation_id: &str, promotion_id: &str) -> Request<Body> {
+    request_builder(
+        "GET",
+        &format!("/v2/installations/{installation_id}/promotions/{promotion_id}/deployment"),
+    )
+    .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .body(Body::empty())
+    .unwrap()
+}
+
+#[tokio::test]
+async fn deployment_v1_wire_shape_is_frozen() {
+    let response = app(Arc::new(FakeFacade::default()))
+        .oneshot(
+            request_builder(
+                "GET",
+                &format!("/v1/installations/install-1/promotions/{PROMOTION}/deployment"),
+            )
+            .header("cookie", format!("__Host-starring_session={SESSION}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(response).await,
+        format!(
+            "{{\"installation_id\":\"install-1\",\"promotion_id\":\"{PROMOTION}\",\"observed_at\":\"2026-07-19T12:00:00Z\",\"state\":\"pending\",\"retryable\":true,\"failure_code\":null,\"attestation_revision\":null,\"last_serving_heartbeat\":null,\"serving_lease_expires_at\":null}}"
+        )
+    );
+
+    let response = app(Arc::new(FakeFacade::default()))
+        .oneshot(operational_request("install-1", PROMOTION))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(body_text(response).await.contains("route_not_found"));
+}
+
+#[tokio::test]
+async fn operational_v2_requires_a_session_and_rejects_invalid_paths_before_the_facade() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = operational_app(Arc::clone(&facade));
+    let missing_session = request_builder(
+        "GET",
+        &format!("/v2/installations/install-1/promotions/{PROMOTION}/deployment"),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let response = router.clone().oneshot(missing_session).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(facade.operational_calls.load(Ordering::SeqCst), 0);
+
+    for (installation_id, promotion_id) in [("invalid!", PROMOTION), ("install-1", "bad")] {
+        let response = router
+            .clone()
+            .oneshot(operational_request(installation_id, promotion_id))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(facade.operational_calls.load(Ordering::SeqCst), 0);
+
+    let response = router
+        .oneshot(operational_request("install-1", PROMOTION))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-request-id"], "test-request-1");
+    assert_eq!(facade.operational_calls.load(Ordering::SeqCst), 1);
+    let body = serde_json::from_str::<serde_json::Value>(&body_text(response).await).unwrap();
+    assert!(body["runtime"]["last_failure_attempt"].is_null());
+    assert!(body["runtime"]["failure"].is_null());
+    assert!(body["runtime"]["retry"].is_null());
+    assert!(body["runtime"]["operator_action"].is_null());
+    assert!(body["runtime"]["attestation"].is_null());
+    assert!(body["runtime"]["serving"]["last_heartbeat_at"].is_null());
+    assert!(body["runtime"]["serving"]["lease_expires_at"].is_null());
+}
+
+#[tokio::test]
+async fn operational_v2_preserves_retry_operator_authority_and_serving_states() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = operational_app(Arc::clone(&facade));
+    let mut retry_waiting = pending_operational_view();
+    retry_waiting.state = DeploymentOperationalStateV2::Failed;
+    let runtime = retry_waiting.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::RetryWaiting;
+    runtime.current_attempt = 2;
+    runtime.last_failure_attempt = Some(2);
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: true,
+        code: "gateway_start_failed".to_string(),
+    });
+    runtime.retry = Some(DeploymentRetryViewV2 {
+        state: DeploymentRetryStateV2::Waiting,
+        failure_attempt: 2,
+        retry_not_before: timestamp("2026-07-19T12:01:00Z"),
+    });
+
+    let mut retry_due = retry_waiting.clone();
+    let runtime = retry_due.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::RetryDue;
+    runtime.retry = Some(DeploymentRetryViewV2 {
+        state: DeploymentRetryStateV2::Due,
+        failure_attempt: 2,
+        retry_not_before: timestamp("2026-07-19T12:00:00Z"),
+    });
+
+    let mut operator_blocked = pending_operational_view();
+    operator_blocked.state = DeploymentOperationalStateV2::Failed;
+    let runtime = operator_blocked.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::OperatorBlocked;
+    runtime.current_attempt = 3;
+    runtime.last_failure_attempt = Some(3);
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: false,
+        code: "runtime_invariant_violation".to_string(),
+    });
+    runtime.operator_action = Some(DeploymentOperatorActionV2::RecoverBlockedDeployment);
+
+    let mut authority_blocked = pending_operational_view();
+    authority_blocked.state = DeploymentOperationalStateV2::Failed;
+    let runtime = authority_blocked.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::AuthorityBlocked;
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: false,
+        code: "product_authority_inactive".to_string(),
+    });
+    runtime.operator_action = Some(DeploymentOperatorActionV2::RestoreProductAuthority);
+
+    let mut lease_missing = pending_operational_view();
+    let runtime = lease_missing.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::Live;
+    runtime.current_attempt = 2;
+    runtime.attestation = Some(DeploymentAttestationViewV2 {
+        deployment_revision: 7,
+        convergence_attempt: 2,
+    });
+    runtime.serving.state = DeploymentServingFreshnessStateV2::LeaseMissing;
+
+    let mut attestation_missing = lease_missing.clone();
+    let runtime = attestation_missing.runtime.as_mut().unwrap();
+    runtime.attestation = None;
+    runtime.serving.state = DeploymentServingFreshnessStateV2::AttestationMissing;
+
+    let mut identity_mismatch = lease_missing.clone();
+    identity_mismatch.runtime.as_mut().unwrap().serving.state =
+        DeploymentServingFreshnessStateV2::IdentityMismatch;
+
+    let mut disconnected = lease_missing.clone();
+    disconnected.runtime.as_mut().unwrap().serving = DeploymentServingFreshnessViewV2 {
+        state: DeploymentServingFreshnessStateV2::Disconnected,
+        last_heartbeat_at: Some(timestamp("2026-07-19T11:59:59Z")),
+        lease_expires_at: Some(timestamp("2026-07-19T12:01:00Z")),
+    };
+
+    let mut expired = lease_missing.clone();
+    expired.runtime.as_mut().unwrap().serving = DeploymentServingFreshnessViewV2 {
+        state: DeploymentServingFreshnessStateV2::Expired,
+        last_heartbeat_at: Some(timestamp("2026-07-19T11:59:58Z")),
+        lease_expires_at: Some(timestamp("2026-07-19T11:59:59Z")),
+    };
+
+    let mut fresh = lease_missing.clone();
+    fresh.state = DeploymentOperationalStateV2::Live;
+    let runtime = fresh.runtime.as_mut().unwrap();
+    runtime.serving = DeploymentServingFreshnessViewV2 {
+        state: DeploymentServingFreshnessStateV2::Fresh,
+        last_heartbeat_at: Some(timestamp("2026-07-19T11:59:59Z")),
+        lease_expires_at: Some(timestamp("2026-07-19T12:01:00Z")),
+    };
+
+    let mut not_applicable = pending_operational_view();
+    not_applicable.state = DeploymentOperationalStateV2::NotApplicable;
+    not_applicable.runtime = None;
+
+    let cases = [
+        (retry_waiting, "failed", "retry_waiting", "not_expected"),
+        (retry_due, "failed", "retry_due", "not_expected"),
+        (
+            operator_blocked,
+            "failed",
+            "operator_blocked",
+            "not_expected",
+        ),
+        (
+            authority_blocked,
+            "failed",
+            "authority_blocked",
+            "not_expected",
+        ),
+        (
+            attestation_missing,
+            "pending",
+            "live",
+            "attestation_missing",
+        ),
+        (lease_missing, "pending", "live", "lease_missing"),
+        (identity_mismatch, "pending", "live", "identity_mismatch"),
+        (disconnected, "pending", "live", "disconnected"),
+        (expired, "pending", "live", "expired"),
+        (fresh, "live", "live", "fresh"),
+    ];
+    for (view, state, phase, serving) in cases {
+        set_operational_response(&facade, view);
+        let response = router
+            .clone()
+            .oneshot(operational_request("install-1", PROMOTION))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{phase}");
+        let body = body_text(response).await;
+        let json = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(json["state"], state);
+        assert_eq!(json["runtime"]["phase"], phase);
+        assert_eq!(json["runtime"]["serving"]["state"], serving);
+        for forbidden in [
+            SESSION,
+            CSRF,
+            "controller_id",
+            "fencing_token",
+            "failure_id",
+            "failure_message",
+            "attestation_id",
+            "process_instance_id",
+            "runtime_build_revision",
+            "sql",
+        ] {
+            assert!(!body.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    set_operational_response(&facade, not_applicable);
+    let response = router
+        .oneshot(operational_request("install-1", PROMOTION))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = serde_json::from_str::<serde_json::Value>(&body_text(response).await).unwrap();
+    assert_eq!(json["state"], "not_applicable");
+    assert!(json["runtime"].is_null());
+}
+
+#[tokio::test]
+async fn operational_v2_rejects_impossible_or_unbounded_facade_responses() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = operational_app(Arc::clone(&facade));
+
+    let mut wrong_identity = pending_operational_view();
+    wrong_identity.installation_id = "another-installation".to_string();
+
+    let mut private_failure = pending_operational_view();
+    private_failure.state = DeploymentOperationalStateV2::Failed;
+    let runtime = private_failure.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::OperatorBlocked;
+    runtime.current_attempt = 1;
+    runtime.last_failure_attempt = Some(1);
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: false,
+        code: "private_controller_diagnostic".to_string(),
+    });
+    runtime.operator_action = Some(DeploymentOperatorActionV2::RecoverBlockedDeployment);
+
+    let mut missing_authority_action = pending_operational_view();
+    missing_authority_action.state = DeploymentOperationalStateV2::Failed;
+    let runtime = missing_authority_action.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::AuthorityBlocked;
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: false,
+        code: "product_authority_not_current".to_string(),
+    });
+
+    let mut false_live = pending_operational_view();
+    false_live.state = DeploymentOperationalStateV2::Live;
+    let runtime = false_live.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::Live;
+    runtime.current_attempt = 2;
+    runtime.attestation = Some(DeploymentAttestationViewV2 {
+        deployment_revision: 7,
+        convergence_attempt: 2,
+    });
+    runtime.serving.state = DeploymentServingFreshnessStateV2::LeaseMissing;
+
+    let mut malformed_freshness = pending_operational_view();
+    let runtime = malformed_freshness.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::Live;
+    runtime.current_attempt = 2;
+    runtime.attestation = Some(DeploymentAttestationViewV2 {
+        deployment_revision: 7,
+        convergence_attempt: 2,
+    });
+    runtime.serving = DeploymentServingFreshnessViewV2 {
+        state: DeploymentServingFreshnessStateV2::Disconnected,
+        last_heartbeat_at: None,
+        lease_expires_at: Some(timestamp("2026-07-19T12:01:00Z")),
+    };
+
+    let mut wrong_retry_clock = pending_operational_view();
+    wrong_retry_clock.state = DeploymentOperationalStateV2::Failed;
+    let runtime = wrong_retry_clock.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::RetryWaiting;
+    runtime.current_attempt = 2;
+    runtime.last_failure_attempt = Some(2);
+    runtime.failure = Some(DeploymentFailureViewV2 {
+        retryable: true,
+        code: "gateway_start_failed".to_string(),
+    });
+    runtime.retry = Some(DeploymentRetryViewV2 {
+        state: DeploymentRetryStateV2::Waiting,
+        failure_attempt: 2,
+        retry_not_before: timestamp("2026-07-19T12:00:00Z"),
+    });
+
+    for view in [
+        wrong_identity,
+        private_failure,
+        missing_authority_action,
+        false_live,
+        malformed_freshness,
+        wrong_retry_clock,
+    ] {
+        set_operational_response(&facade, view);
+        let response = router
+            .clone()
+            .oneshot(operational_request("install-1", PROMOTION))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_text(response).await;
+        assert!(body.contains("internal_error"));
+        assert!(!body.contains("private_controller_diagnostic"));
+        assert!(!body.contains("another-installation"));
+    }
+}
+
+#[tokio::test]
+async fn operational_v2_maps_facade_failures_and_enforces_the_request_deadline() {
+    for (failure, status, code) in [
+        (1, StatusCode::SERVICE_UNAVAILABLE, "dependency_unavailable"),
+        (2, StatusCode::GATEWAY_TIMEOUT, "dependency_timeout"),
+    ] {
+        let facade = Arc::new(FakeFacade::default());
+        facade.operational_fail.store(failure, Ordering::SeqCst);
+        let response = operational_app(facade)
+            .oneshot(operational_request("install-1", PROMOTION))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body = body_text(response).await;
+        assert!(body.contains(code));
+        assert!(body.contains("\"retryable\":true"));
+        assert!(!body.contains("database"));
+        assert!(!body.contains("controller"));
+    }
+
+    let facade = Arc::new(FakeFacade::default());
+    facade.block_operational.store(1, Ordering::SeqCst);
+    let response = operational_app_with_timeout(Arc::clone(&facade), Duration::from_millis(10))
+        .oneshot(operational_request("install-1", PROMOTION))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = body_text(response).await;
+    assert!(body.contains("request_timeout"));
+    assert!(body.contains("\"retryable\":true"));
+    assert_eq!(facade.operational_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -445,6 +933,123 @@ async fn liveness_remains_available_when_business_capacity_is_exhausted() {
 
     facade.promote_release.notify_one();
     assert_eq!(work.await.unwrap().unwrap().status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn readiness_gate_blocks_business_routes_before_facade_or_capacity() {
+    let facade = Arc::new(FakeFacade::default());
+    let gate = ProductApiReadinessGate::initially_unready();
+    let lease = gate.claim().unwrap();
+    let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(response).await.contains("dependency_unavailable"));
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start?return_to=%2Fapp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_text(response).await.contains("dependency_unavailable"));
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    lease.mark_ready();
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start?return_to=%2Fapp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 1);
+
+    lease.mark_unready();
+    let response = app
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn readiness_endpoint_is_an_atomic_gate_read_without_facade_amplification() {
+    let facade = Arc::new(FakeFacade::default());
+    let gate = ProductApiReadinessGate::initially_unready();
+    let lease = gate.claim().unwrap();
+    lease.mark_ready();
+    let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
+
+    for _ in 0..16 {
+        let response = app
+            .clone()
+            .oneshot(
+                request_builder("GET", "/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
+
+    lease.mark_unready();
+    let response = app
+        .oneshot(
+            request_builder("GET", "/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -779,6 +1384,119 @@ async fn oauth_start_sets_a_host_only_secure_cookie() {
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Lax"));
     assert!(!cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn oauth_start_budget_is_shared_by_router_clones() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = app(Arc::clone(&facade));
+    for _ in 0..10 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    let response = router
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    assert!(response.headers().contains_key("retry-after"));
+    assert!(!response.headers().contains_key("location"));
+    assert!(!response.headers().contains_key("set-cookie"));
+    let body = body_text(response).await;
+    assert!(body.contains("oauth_start_rate_limited"));
+    assert!(body.contains("\"retryable\":true"));
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn malformed_oauth_starts_do_not_consume_the_budget() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = app(Arc::clone(&facade));
+    for _ in 0..20 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start?return_to=%2Fadmin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for _ in 0..10 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
+}
+
+#[tokio::test]
+async fn admitted_oauth_start_failures_are_not_refunded() {
+    let facade = Arc::new(FakeFacade::default());
+    facade.fail_oauth_start.store(1, Ordering::SeqCst);
+    let router = app(Arc::clone(&facade));
+    let response = router
+        .clone()
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    facade.fail_oauth_start.store(0, Ordering::SeqCst);
+
+    for _ in 0..9 {
+        let response = router
+            .clone()
+            .oneshot(
+                request_builder("GET", "/oauth/discord/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
+    let response = router
+        .oneshot(
+            request_builder("GET", "/oauth/discord/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(facade.oauth_start_calls.load(Ordering::SeqCst), 10);
 }
 
 #[tokio::test]
@@ -1147,10 +1865,11 @@ async fn logout_clears_session_and_csrf_cookies() {
 #[tokio::test]
 async fn panic_and_wrong_method_have_redacted_problem_responses() {
     let facade = Arc::new(FakeFacade::default());
-    facade.panic_ready.store(1, Ordering::SeqCst);
+    facade.panic_me.store(1, Ordering::SeqCst);
     let response = app(facade)
         .oneshot(
-            request_builder("GET", "/health/ready")
+            request_builder("GET", "/v1/me")
+                .header("cookie", format!("__Host-starring_session={SESSION}"))
                 .body(Body::empty())
                 .unwrap(),
         )

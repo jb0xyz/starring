@@ -1,0 +1,32 @@
+[package]
+name = "starring-api"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+authoring-application = { path = "../../crates/authoring-application" }
+authoring-application-discord = { path = "../../crates/authoring-application-discord" }
+authoring-application-postgres = { path = "../../crates/authoring-application-postgres" }
+authoring-promotion = { path = "../../crates/authoring-promotion" }
+automation-ruleset = { path = "../../crates/automation-ruleset" }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+base64 = "0.22"
+chrono = "0.4"
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio", "service"] }
+product-control-http = { path = "../../crates/product-control-http" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+twilight-http = "0.17"
+url = "2"
+zeroize = "1"
+
+[dev-dependencies]
+discord-model = { path = "../../crates/discord-model" }
+hyper = { version = "1", default-features = false, features = ["client"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }

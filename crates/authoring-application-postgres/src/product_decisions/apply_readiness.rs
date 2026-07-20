@@ -1,8 +1,10 @@
 use crate::database_capability::{
     begin_bounded_database_probe, begin_scoped_database_readiness, load_scoped_database_topology,
-    verify_scoped_executable_allowlist, verify_scoped_schema_trust, ScopedDatabaseProbeModeV1,
-    ScopedDatabaseTopologyV1, ScopedFunctionContractV1, ScopedRelationContractV1,
+    verify_scoped_executable_allowlist, verify_scoped_global_user_object_deny,
+    verify_scoped_schema_trust, ScopedDatabaseProbeModeV1, ScopedDatabaseTopologyV1,
+    ScopedFunctionContractV1, ScopedRelationContractV1,
 };
+use crate::runtime_convergence_readiness::RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY;
 use crate::ProductDecisionReadinessErrorV1;
 
 use super::apply_contract::{
@@ -115,7 +117,10 @@ WITH common_owner AS (
             'CREATE TRIGGER runtime_deployments_reject_delete BEFORE DELETE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.reject_runtime_deployment_delete()'),
         ('public.runtime_deployments',
             'public.validate_runtime_deployment_projection()',
-            'CREATE TRIGGER runtime_deployments_validate_projection BEFORE INSERT OR UPDATE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_deployment_projection()')
+            'CREATE TRIGGER runtime_deployments_validate_projection BEFORE INSERT OR UPDATE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_deployment_projection()'),
+        ('public.runtime_deployments',
+            'public.validate_runtime_convergence_attempt_projection()',
+            'CREATE TRIGGER runtime_deployments_validate_convergence_attempt BEFORE INSERT OR UPDATE ON public.runtime_deployments FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_convergence_attempt_projection()')
 ), expected_triggers AS (
     SELECT pg_catalog.to_regclass(expected.relation_identity) AS relation_oid,
         pg_catalog.to_regprocedure(expected.function_identity) AS function_oid,
@@ -167,8 +172,8 @@ WITH common_owner AS (
         FROM expected_triggers AS expected
     )
 ), trigger_manifest AS (
-    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 5
-        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 5
+    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 6
+        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 6
         AND NOT EXISTS (
             SELECT 1
             FROM expected_triggers AS expected
@@ -214,9 +219,11 @@ WITH common_owner AS (
         ('public.reject_runtime_deployment_delete()',
             'plpgsql', 'v', FALSE, TRUE, FALSE, 0::REAL, 'trigger'),
         ('public.validate_runtime_deployment_projection()',
+            'plpgsql', 'v', FALSE, TRUE, FALSE, 0::REAL, 'trigger'),
+        ('public.validate_runtime_convergence_attempt_projection()',
             'plpgsql', 'v', FALSE, TRUE, FALSE, 0::REAL, 'trigger')
 ), routine_contract AS (
-    SELECT pg_catalog.count(*) = 10
+    SELECT pg_catalog.count(*) = 11
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -299,6 +306,9 @@ impl PostgresProductDecisions {
         verify_scoped_executable_allowlist(&mut metadata, &FUNCTIONS)
             .await
             .map_err(map_readiness)?;
+        verify_scoped_global_user_object_deny(&mut metadata, &FUNCTIONS)
+            .await
+            .map_err(map_readiness)?;
         verify_scoped_schema_trust(&mut metadata, "public", DATABASE_IDENTITY_FUNCTION)
             .await
             .map_err(map_readiness)?;
@@ -360,7 +370,11 @@ async fn verify_apply_support_contract(
         .fetch_one(&mut **transaction)
         .await
         .map_err(readiness_database)?;
-    if !valid {
+    let attempt_schema_valid = sqlx::query_scalar::<_, bool>(RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(readiness_database)?;
+    if !valid || !attempt_schema_valid {
         return Err(ProductDecisionReadinessErrorV1::ContractMismatch);
     }
     Ok(())

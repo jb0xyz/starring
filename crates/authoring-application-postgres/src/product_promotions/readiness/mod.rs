@@ -1,7 +1,8 @@
 use crate::database_capability::{
     begin_bounded_database_probe, begin_scoped_database_readiness, load_scoped_database_topology,
-    verify_scoped_executable_allowlist, verify_scoped_schema_trust, ScopedDatabaseProbeModeV1,
-    ScopedDatabaseReadinessErrorV1, ScopedDatabaseTopologyV1,
+    verify_scoped_executable_allowlist, verify_scoped_global_user_object_deny,
+    verify_scoped_schema_trust, ScopedDatabaseProbeModeV1, ScopedDatabaseReadinessErrorV1,
+    ScopedDatabaseTopologyV1,
 };
 use crate::product_action_digest::product_action_keyring_coverage_identity_v1;
 use crate::ProductDatabaseFailureV1;
@@ -57,6 +58,9 @@ impl PostgresProductPromotions {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<ScopedDatabaseTopologyV1, ProductPromotionReadinessErrorV1> {
         verify_scoped_executable_allowlist(transaction, &FUNCTIONS)
+            .await
+            .map_err(map_readiness)?;
+        verify_scoped_global_user_object_deny(transaction, &FUNCTIONS)
             .await
             .map_err(map_readiness)?;
         verify_scoped_schema_trust(transaction, "public", DATABASE_IDENTITY_FUNCTION)

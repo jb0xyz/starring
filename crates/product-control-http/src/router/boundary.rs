@@ -121,26 +121,13 @@ where
         return next.run(request).await;
     }
     if request.uri().path() == "/health/ready" {
-        let permit = match Arc::clone(&state.readiness_in_flight).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "readiness_busy",
-                    "The readiness probe is already in progress.",
-                    true,
-                    &request_id,
-                )
-            }
-        };
-        let future = std::panic::AssertUnwindSafe(next.run(request)).catch_unwind();
-        let deadline = state
-            .config
-            .request_timeout()
-            .min(std::time::Duration::from_secs(2));
-        let outcome = tokio::time::timeout(deadline, future).await;
-        drop(permit);
-        return bounded_outcome(outcome, &request_id);
+        return next.run(request).await;
+    }
+    if !state.readiness_gate.is_ready() {
+        return map_facade(
+            FacadeError::new(crate::FacadeErrorCode::DependencyUnavailable),
+            &request_id,
+        );
     }
     let permit = match Arc::clone(&state.in_flight).try_acquire_owned() {
         Ok(permit) => permit,
@@ -158,6 +145,13 @@ where
             return response;
         }
     };
+    if !state.readiness_gate.is_ready() {
+        drop(permit);
+        return map_facade(
+            FacadeError::new(crate::FacadeErrorCode::DependencyUnavailable),
+            &request_id,
+        );
+    }
     let future = std::panic::AssertUnwindSafe(next.run(request)).catch_unwind();
     let outcome = tokio::time::timeout(state.config.request_timeout(), future).await;
     drop(permit);

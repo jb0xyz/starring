@@ -163,6 +163,16 @@ pub struct LeaseRequestV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverBlockedRequestV1 {
+    pub expected_revision: DeploymentRevision,
+    pub expected_failure_id: RuntimeFailureId,
+    pub controller_id: ControllerId,
+    pub fencing_token: FencingToken,
+    pub now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandGuardV1 {
     pub expected_revision: DeploymentRevision,
     pub controller_id: ControllerId,

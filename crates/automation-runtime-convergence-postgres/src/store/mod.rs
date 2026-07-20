@@ -1,4 +1,6 @@
+mod attempt;
 mod deployment;
+mod operator;
 mod serving;
 mod status;
 
@@ -14,7 +16,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::artifact::{runtime_target_artifact_is_valid, RuntimeTargetArtifactRow};
 use crate::error::database;
-use crate::model::{PostgresRuntimeConvergenceConfigV1, RuntimeDeploymentScopeV1};
+use crate::model::{
+    PostgresRuntimeConvergenceConfigV1, RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1,
+};
 use crate::row::{
     runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, ServingLeaseRow,
     DEPLOYMENT_COLUMNS, SERVING_LEASE_COLUMNS,
@@ -25,6 +29,12 @@ use crate::RuntimeConvergenceStoreError;
 pub struct PostgresRuntimeConvergence {
     pool: PgPool,
     config: PostgresRuntimeConvergenceConfigV1,
+}
+
+struct DeploymentExecutionProjection<'a> {
+    live_attestation_id: Option<&'a str>,
+    convergence_attempt: RuntimeConvergenceAttemptV1,
+    last_failure_attempt: Option<std::num::NonZeroU32>,
 }
 
 impl PostgresRuntimeConvergence {
@@ -208,7 +218,7 @@ impl PostgresRuntimeConvergence {
         scope: &RuntimeDeploymentScopeV1,
         previous_revision: u64,
         deployment: &RuntimeDeployment,
-        live_attestation_id: Option<&str>,
+        execution: DeploymentExecutionProjection<'_>,
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeConvergenceStoreError> {
         let snapshot = deployment.snapshot();
@@ -219,9 +229,10 @@ impl PostgresRuntimeConvergence {
              controller_lease_expires_at = $10, last_fencing_token = $11, next_retry_at = $12, \
              last_stable_error_code = $13, live_attestation_id = $14, live_at = $15, \
              blocked_at = $16, superseded_at = $17, cancelled_at = $18, \
-             updated_at = GREATEST($20, updated_at + INTERVAL '1 microsecond') \
+             convergence_attempt_no = $19, last_failure_attempt_no = $20, \
+             updated_at = GREATEST($22, updated_at + INTERVAL '1 microsecond') \
              WHERE tenant_id = $1 AND installation_id = $2 AND deployment_id = $3 \
-             AND revision = $19",
+             AND revision = $21",
         )
         .bind(scope.tenant_id.as_str())
         .bind(scope.installation_id.as_str())
@@ -236,11 +247,17 @@ impl PostgresRuntimeConvergence {
         .bind(projection.last_fencing_token)
         .bind(projection.next_retry_at)
         .bind(projection.last_stable_error_code)
-        .bind(live_attestation_id)
+        .bind(execution.live_attestation_id)
         .bind(projection.live_at)
         .bind(projection.blocked_at)
         .bind(projection.superseded_at)
         .bind(projection.cancelled_at)
+        .bind(i64::from(execution.convergence_attempt.get()))
+        .bind(
+            execution
+                .last_failure_attempt
+                .map(|attempt| i64::from(attempt.get())),
+        )
         .bind(runtime_i64(previous_revision)?)
         .bind(now)
         .execute(&mut **transaction)

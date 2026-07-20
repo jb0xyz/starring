@@ -31,13 +31,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build unsafe development activation
-        run: cargo build -p interaction-smoke --features unsafe-dev-activation
+        run: cargo build --locked -p interaction-smoke --features unsafe-dev-activation
       - name: Check Codex worker
         run: npm --prefix tools/codex-worker run check
       - name: Test Codex worker
@@ -83,20 +83,20 @@ jobs:
           PGPASSWORD: postgres
         run: psql --host localhost --username postgres --dbname postgres --command "CREATE DATABASE starring_test"
       - name: Test RuleSet PostgreSQL store
-        run: cargo test -p automation-ruleset-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1
       - name: Test instance PostgreSQL store
-        run: cargo test -p automation-instance-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1
       - name: Test panel installation PostgreSQL store
-        run: cargo test -p automation-panel-installation-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1
       - name: Test activation PostgreSQL store
-        run: cargo test -p automation-ruleset-activation-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1
       - name: Test authoring promotion PostgreSQL store
-        run: cargo test -p authoring-promotion-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1
       - name: Test authoring application PostgreSQL store
-        run: cargo test -p authoring-application-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1
       - name: Test pinned RuleSet dispatch
-        run: cargo test -p automation-ruleset-dispatch -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1
       - name: Test RuleSet readiness activation
-        run: cargo test -p automation-ruleset-readiness -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1
       - name: Test runtime convergence PostgreSQL store
-        run: cargo test -p automation-runtime-convergence-postgres -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1

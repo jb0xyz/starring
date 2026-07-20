@@ -127,3 +127,106 @@ pub struct DeploymentView {
     pub last_serving_heartbeat: Option<DateTime<Utc>>,
     pub serving_lease_expires_at: Option<DateTime<Utc>>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentOperationalStateV2 {
+    NotApplicable,
+    Pending,
+    Failed,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentRuntimePhaseV2 {
+    Requested,
+    PreflightReady,
+    DrainRequested,
+    Drained,
+    ActivationApplying,
+    RuntimeReady,
+    RetryWaiting,
+    RetryDue,
+    OperatorBlocked,
+    AuthorityBlocked,
+    ReconcilingPanels,
+    AwaitingGatewayReady,
+    Live,
+    Superseded,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentOperatorActionV2 {
+    RecoverBlockedDeployment,
+    RestoreProductAuthority,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentRetryStateV2 {
+    Waiting,
+    Due,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentServingFreshnessStateV2 {
+    NotExpected,
+    AttestationMissing,
+    LeaseMissing,
+    IdentityMismatch,
+    Disconnected,
+    Expired,
+    Fresh,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentFailureViewV2 {
+    pub retryable: bool,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentRetryViewV2 {
+    pub state: DeploymentRetryStateV2,
+    pub failure_attempt: u32,
+    pub retry_not_before: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentAttestationViewV2 {
+    pub deployment_revision: u64,
+    pub convergence_attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentServingFreshnessViewV2 {
+    pub state: DeploymentServingFreshnessStateV2,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimeDeploymentOperationalViewV2 {
+    pub observed_at: DateTime<Utc>,
+    pub phase: DeploymentRuntimePhaseV2,
+    pub current_attempt: u32,
+    pub last_failure_attempt: Option<u32>,
+    pub failure: Option<DeploymentFailureViewV2>,
+    pub retry: Option<DeploymentRetryViewV2>,
+    pub operator_action: Option<DeploymentOperatorActionV2>,
+    pub attestation: Option<DeploymentAttestationViewV2>,
+    pub serving: DeploymentServingFreshnessViewV2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeploymentOperationalViewV2 {
+    pub installation_id: String,
+    pub promotion_id: String,
+    pub decision_observed_at: DateTime<Utc>,
+    pub state: DeploymentOperationalStateV2,
+    pub runtime: Option<RuntimeDeploymentOperationalViewV2>,
+}

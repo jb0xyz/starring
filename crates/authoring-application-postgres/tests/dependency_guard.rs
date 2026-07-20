@@ -10,6 +10,25 @@ fn pure_application_does_not_depend_on_postgres_adapter() {
 }
 
 #[test]
+fn snapshot_cipher_keeps_audited_crypto_and_secret_memory_boundaries() {
+    let manifest = include_str!("../Cargo.toml");
+    let cipher = include_str!("../src/envelope/xchacha.rs");
+    assert!(manifest.contains(
+        "chacha20poly1305 = { version = \"0.11\", default-features = false, features = [\"alloc\", \"zeroize\"] }"
+    ));
+    assert!(cipher.contains("secret: Zeroizing<[u8; 32]>"));
+    assert!(cipher.contains("keys: Arc<[SnapshotEnvelopeKeyV1]>"));
+    assert!(cipher.contains("AeadInOut"));
+    assert!(cipher.contains("decrypt_in_place"));
+    assert!(cipher.contains("let cipher_key: &Key = key.secret().into()"));
+    assert!(cipher.contains("ConstantTimeEq"));
+    assert!(cipher.contains("MAX_SNAPSHOT_ENVELOPE_KEYS: usize = 8"));
+    assert!(cipher.contains("XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1: usize = 24"));
+    assert!(!cipher.contains("impl Clone for SnapshotEnvelopeKeyV1"));
+    assert!(!cipher.contains("Key::from(*key.secret())"));
+}
+
+#[test]
 fn shared_migrators_watch_the_root_migration_history() {
     for build_script in [
         include_str!("../build.rs"),
@@ -151,6 +170,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "verify_apply_executor_readiness",
         "check_apply_executor_readiness",
         "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
         "verify_scoped_schema_trust",
         "verify_approval_support_contract",
         "verify_apply_support_contract",
@@ -173,6 +193,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(readiness.contains("self.check_apply_executor_readiness().await?"));
     assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
+    assert!(readiness.contains("verify_scoped_global_user_object_deny"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
     assert!(database_capability.contains("function_row.proleakproof"));
@@ -251,6 +272,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "check_decision_reader_readiness",
         "begin_scoped_database_readiness(",
         "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
         "verify_scoped_schema_trust",
         "load_scoped_database_topology",
         "public.starring_product_decision_read_v1(",
@@ -502,6 +524,165 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
             .count(),
         1
     );
+}
+
+#[test]
+fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
+    let rejection = include_str!("../src/product_decisions/reject.rs");
+    let rejection_contract = include_str!("../src/product_decisions/rejection_contract.rs");
+    let rejection_readiness = include_str!("../src/product_decisions/rejection_readiness.rs");
+    let digest = include_str!("../src/product_decisions/digest.rs");
+    let store = include_str!("../src/product_decisions/store.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductRejections",
+        "rejection_executor: PgPool",
+        "pub fn new(",
+        "pub fn with_config(",
+        "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
+        "CapabilityV1::Reject",
+        "public.starring_product_reject_v1(",
+        ".bind(\"reject\")",
+        ".bind(request.command().reason.as_str())",
+        "configure_mutation_transaction(&mut transaction, &self.config)",
+        "database_commit(error, \"product rejection commit outcome is unavailable\")",
+        "SELECT outcome, resulting_revision, resulting_state, exact_replay, guild_id",
+        "$28, $29)",
+    ] {
+        assert!(
+            rejection.contains(required),
+            "missing rejection guard: {required}"
+        );
+    }
+    for scope_binding in [
+        "evidence.tenant_id() != request.scope().tenant_id()",
+        "evidence.installation_id() != request.scope().installation_id()",
+        "evidence.guild_id() != request.scope().guild_id()",
+        "evidence.acting_user_id() != request.scope().acting_user_id()",
+    ] {
+        assert!(rejection.contains(scope_binding));
+    }
+    assert!(!rejection.contains(".bind(request.command().idempotency_key.as_str())"));
+    assert!(!rejection.contains("activation_requests"));
+    for required in [
+        "public.starring_product_rejection_executor_database_identity_v1()",
+        "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
+        "public.starring_product_reject_v1(text,text,text,bigint",
+        "expected_rejection_reason text",
+        "TABLE(outcome text, resulting_revision bigint, resulting_state text, exact_replay boolean, guild_id text)",
+    ] {
+        assert!(
+            rejection_contract.contains(required),
+            "missing rejection contract guard: {required}"
+        );
+    }
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 3]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 16]",
+        "ScopedFunctionContractV1::set_plpgsql_named(",
+        "verify_product_rejection_readiness",
+        "check_product_rejection_readiness",
+        "begin_scoped_database_readiness(",
+        "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
+        "verify_scoped_schema_trust",
+        "verify_approval_support_contract",
+        "load_scoped_database_topology",
+        "ScopedDatabaseProbeModeV1::SerializableReadWrite",
+        "starring_product_rejection_keyring_coverage_v1($1, $2)",
+        "LIMIT 2",
+        "idempotency_keyring_incomplete",
+        "outcome: \"invalid_input\"",
+        "transaction.rollback().await",
+    ] {
+        assert!(
+            rejection_readiness.contains(required),
+            "missing rejection readiness guard: {required}"
+        );
+    }
+    assert_eq!(
+        rejection_readiness
+            .matches("ScopedFunctionContractV1::set_plpgsql_named(")
+            .count(),
+        2
+    );
+    let rejection_production = rejection.split("#[cfg(test)]").next().unwrap_or(rejection);
+    assert_eq!(
+        rejection_production
+            .matches("request.command().reason.as_str()")
+            .count(),
+        1
+    );
+    let digest_production = digest.split("#[cfg(test)]").next().unwrap_or(digest);
+    for domain in [
+        "starring.product.rejection.idempotency.v1",
+        "starring.product.rejection.request.v1",
+        "starring.product.rejection.receipt.v1",
+        "starring.product.rejection.audit.v1",
+        "starring.product.rejection.digest-key-fingerprint.v1",
+    ] {
+        assert!(digest_production.contains(domain));
+    }
+    assert_eq!(
+        digest_production
+            .matches("material.reason.as_bytes()")
+            .count(),
+        1
+    );
+    assert!(digest_production.contains("b\"product_reject_v1\".as_slice()"));
+    assert!(!store.contains("rejection_executor"));
+    assert!(module.contains("pub use reject::PostgresProductRejections"));
+    assert!(library.contains("PostgresProductRejections"));
+}
+
+#[test]
+fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
+    let facade = include_str!("../src/product_decisions/facade.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductControl",
+        "decisions: PostgresProductDecisions",
+        "rejections: PostgresProductRejections",
+        "decision_pools: ProductDecisionDatabasePoolsV1",
+        "rejection_executor: PgPool",
+        "PostgresProductDecisionsConfig::production(keyring)?",
+        "PostgresProductDecisions::with_config(decision_pools, config.clone())",
+        "PostgresProductRejections::with_config(rejection_executor, config)",
+        "ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductApprovalPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductApplyPort<FreshDiscordAuthorityEvidenceV1>",
+        "self.decisions.check_decision_reader_readiness().await?",
+        "self.decisions.check_approval_executor_readiness().await?",
+        ".check_product_rejection_readiness()",
+        "self.decisions.check_apply_executor_readiness().await?",
+        "verify_same_database_distinct_roles(&topologies)",
+    ] {
+        assert!(
+            facade.contains(required),
+            "missing product control facade guard: {required}"
+        );
+    }
+    assert_eq!(facade.matches("async fn load_").count(), 4);
+    assert_eq!(facade.matches("async fn approve_payload_bound").count(), 1);
+    assert_eq!(facade.matches("async fn reject_payload_bound").count(), 1);
+    assert_eq!(facade.matches("async fn apply_idempotent").count(), 1);
+    for forbidden in [
+        "from_parts",
+        "pub fn decisions(",
+        "pub fn rejections(",
+        "impl ProductDecisionPort<",
+    ] {
+        assert!(
+            !facade.contains(forbidden),
+            "forbidden product control facade surface: {forbidden}"
+        );
+    }
+    assert!(module.contains("pub use facade::PostgresProductControl"));
+    assert!(library.contains("PostgresProductControl"));
 }
 
 #[test]
@@ -1199,6 +1380,30 @@ fn source_files_contain_no_comments() {
             "src/deployment_status/row.rs",
             include_str!("../src/deployment_status/row.rs"),
         ),
+        (
+            "src/deployment_status/operational/contract.rs",
+            include_str!("../src/deployment_status/operational/contract.rs"),
+        ),
+        (
+            "src/deployment_status/operational/mod.rs",
+            include_str!("../src/deployment_status/operational/mod.rs"),
+        ),
+        (
+            "src/deployment_status/operational/projection.rs",
+            include_str!("../src/deployment_status/operational/projection.rs"),
+        ),
+        (
+            "src/deployment_status/operational/query.rs",
+            include_str!("../src/deployment_status/operational/query.rs"),
+        ),
+        (
+            "src/deployment_status/operational/readiness.rs",
+            include_str!("../src/deployment_status/operational/readiness.rs"),
+        ),
+        (
+            "src/deployment_status/operational/row.rs",
+            include_str!("../src/deployment_status/operational/row.rs"),
+        ),
         ("src/digest.rs", include_str!("../src/digest.rs")),
         ("src/envelope.rs", include_str!("../src/envelope.rs")),
         (
@@ -1265,6 +1470,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_decisions/reader_readiness.rs",
             include_str!("../src/product_decisions/reader_readiness.rs"),
+        ),
+        (
+            "src/product_decisions/reject.rs",
+            include_str!("../src/product_decisions/reject.rs"),
         ),
         (
             "src/product_decisions/readiness.rs",

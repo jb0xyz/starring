@@ -1,3 +1,4 @@
+mod abuse_budget;
 mod boundary;
 mod response_validation;
 
@@ -19,19 +20,22 @@ use crate::facade::{is_live_exact_replay, validate_scoped_path};
 use crate::{
     ApplyCommand, CurrentPrincipalView, DecisionCommand, FacadeError, FacadeErrorCode,
     HttpBoundaryConfig, OAuthCallbackCommand, OAuthStartCommand, ProductControlFacade,
-    PromoteCommand, RejectCommand, SessionCredential,
+    ProductControlOperationalFacadeV2, PromoteCommand, RejectCommand, SessionCredential,
 };
+use abuse_budget::{OAuthStartAdmission, OAuthStartBudget};
 use boundary::*;
 use response_validation::{
     valid_apply_view, valid_approval_view, valid_current_principal, valid_decision_view,
-    valid_deployment_view, valid_preview_view, valid_promotion_view, valid_rejection_view,
+    valid_deployment_operational_view_v2, valid_deployment_view, valid_preview_view,
+    valid_promotion_view, valid_rejection_view,
 };
 
 struct HttpState<F> {
     facade: Arc<F>,
     config: HttpBoundaryConfig,
     in_flight: Arc<Semaphore>,
-    readiness_in_flight: Arc<Semaphore>,
+    readiness_gate: crate::ProductApiReadinessGate,
+    oauth_start_budget: Arc<OAuthStartBudget>,
 }
 
 impl<F> Clone for HttpState<F> {
@@ -40,7 +44,8 @@ impl<F> Clone for HttpState<F> {
             facade: Arc::clone(&self.facade),
             config: self.config.clone(),
             in_flight: Arc::clone(&self.in_flight),
-            readiness_in_flight: Arc::clone(&self.readiness_in_flight),
+            readiness_gate: self.readiness_gate.clone(),
+            oauth_start_budget: Arc::clone(&self.oauth_start_budget),
         }
     }
 }
@@ -70,12 +75,73 @@ pub fn product_control_router<F>(facade: Arc<F>, config: HttpBoundaryConfig) -> 
 where
     F: ProductControlFacade,
 {
-    let state = HttpState {
+    product_control_router_with_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlFacade,
+{
+    let state = http_state(facade, config, readiness_gate);
+    finish_product_control_router(product_control_routes::<F>(), state)
+}
+
+pub fn product_control_router_with_operational_v2<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    product_control_router_with_operational_v2_and_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_operational_v2_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    let state = http_state(facade, config, readiness_gate);
+    let routes = product_control_routes::<F>().route(
+        "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
+        get(deployment_operational_v2::<F>),
+    );
+    finish_product_control_router(routes, state)
+}
+
+fn http_state<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> HttpState<F> {
+    HttpState {
         facade,
         in_flight: Arc::new(Semaphore::new(config.max_in_flight())),
-        readiness_in_flight: Arc::new(Semaphore::new(1)),
+        readiness_gate,
+        oauth_start_budget: Arc::new(OAuthStartBudget::new(config.oauth_start_budget())),
         config,
-    };
+    }
+}
+
+fn product_control_routes<F>() -> Router<HttpState<F>>
+where
+    F: ProductControlFacade,
+{
     Router::new()
         .route("/oauth/discord/start", get(oauth_start::<F>))
         .route("/oauth/discord/callback", get(oauth_callback::<F>))
@@ -113,6 +179,13 @@ where
         .route("/health/ready", get(readiness::<F>))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
+}
+
+fn finish_product_control_router<F>(routes: Router<HttpState<F>>, state: HttpState<F>) -> Router
+where
+    F: ProductControlFacade,
+{
+    routes
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(state.config.body_limit()))
         .layer(middleware::from_fn_with_state(
@@ -139,6 +212,15 @@ where
         .is_some_and(|path| !state.config.allows_return_path(path))
     {
         return malformed_query(&request_id);
+    }
+    match state.oauth_start_budget.try_acquire() {
+        OAuthStartAdmission::Admitted => {}
+        OAuthStartAdmission::Rejected {
+            retry_after_seconds,
+        } => return oauth_start_rate_limited(retry_after_seconds, &request_id),
+        OAuthStartAdmission::Unavailable => {
+            return map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id)
+        }
     }
     match state
         .facade
@@ -185,6 +267,20 @@ where
         }
         Err(error) => map_facade(error, &request_id),
     }
+}
+
+fn oauth_start_rate_limited(retry_after_seconds: u64, request_id: &RequestId) -> Response {
+    let mut response = problem(
+        StatusCode::TOO_MANY_REQUESTS,
+        "oauth_start_rate_limited",
+        "OAuth sign-in is temporarily rate limited.",
+        true,
+        request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 
 async fn oauth_callback<F>(
@@ -602,6 +698,37 @@ where
     }
 }
 
+async fn deployment_operational_v2<F>(
+    State(state): State<HttpState<F>>,
+    Extension(request_id): Extension<RequestId>,
+    Path((installation_id, promotion_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: ProductControlOperationalFacadeV2,
+{
+    let credential = match session_credential(&headers, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !validate_scoped_path(&installation_id, &promotion_id) {
+        return invalid_input(&request_id);
+    }
+    match state
+        .facade
+        .deployment_operational_v2(&credential, &installation_id, &promotion_id)
+        .await
+    {
+        Ok(view)
+            if valid_deployment_operational_view_v2(&view, &installation_id, &promotion_id) =>
+        {
+            Json(view).into_response()
+        }
+        Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),
+        Err(error) => map_facade(error, &request_id),
+    }
+}
+
 async fn liveness() -> StatusCode {
     StatusCode::OK
 }
@@ -613,10 +740,13 @@ async fn readiness<F>(
 where
     F: ProductControlFacade,
 {
-    match state.facade.readiness().await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => map_facade(error, &request_id),
+    if !state.readiness_gate.is_ready() {
+        return map_facade(
+            FacadeError::new(FacadeErrorCode::DependencyUnavailable),
+            &request_id,
+        );
     }
+    StatusCode::OK.into_response()
 }
 
 async fn not_found(Extension(request_id): Extension<RequestId>) -> Response {

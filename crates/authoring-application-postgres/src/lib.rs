@@ -7,10 +7,12 @@ mod digest;
 mod envelope;
 mod installation_authority;
 mod product_action_digest;
+mod product_api_readiness;
 mod product_decisions;
 mod product_identity;
 mod product_promotions;
 mod product_retention;
+mod runtime_convergence_readiness;
 mod secret;
 mod snapshot;
 
@@ -20,7 +22,8 @@ pub use authentication::{
 };
 pub use database::ProductDatabaseFailureV1;
 pub use deployment_status::{
-    PostgresProductDeploymentStatuses, PostgresProductDeploymentStatusesConfig,
+    PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
+    PostgresProductDeploymentStatusesConfig, ProductDeploymentOperationalStatusReadinessErrorV2,
     ProductDeploymentStatusConfigError, ProductDeploymentStatusReadinessErrorV1,
 };
 pub use digest::{
@@ -29,7 +32,10 @@ pub use digest::{
 pub use envelope::{
     build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
     SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1, SnapshotAuthenticatedDataV1,
-    SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+    SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError, SnapshotEnvelopeKeyError,
+    SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringError, SnapshotEnvelopeKeyringV1,
+    XChaCha20Poly1305SnapshotEnvelopeCipherV1, XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1,
+    XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
 };
 pub use installation_authority::{
     InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,
@@ -39,10 +45,12 @@ pub use product_action_digest::{
     ProductActionDigestKeyError, ProductActionDigestKeyV1, ProductActionDigestKeyringError,
     ProductActionDigestKeyringV1,
 };
+pub use product_api_readiness::{PostgresProductApiReadiness, ProductApiReadinessErrorV1};
 pub use product_decisions::{
-    PostgresProductDecisions, PostgresProductDecisionsConfig, ProductDecisionConfigError,
-    ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1,
-    ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1,
+    PostgresProductControl, PostgresProductDecisions, PostgresProductDecisionsConfig,
+    PostgresProductRejections, ProductDecisionConfigError, ProductDecisionDatabasePoolsV1,
+    ProductDecisionDigestKeyError, ProductDecisionDigestKeyV1, ProductDecisionDigestKeyringV1,
+    ProductDecisionReadinessErrorV1,
 };
 pub use product_identity::{
     ConsumedOAuthFlowV1, CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowError,

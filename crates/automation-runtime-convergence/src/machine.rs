@@ -7,11 +7,11 @@ mod validation;
 use crate::{
     ActivationAttestationV1, CommandGuardV1, ControllerLeaseV1, DeploymentId, DeploymentRevision,
     DrainAttestationV1, GatewayReadyAttestationV1, LeaseRequestV1, LiveAttestationV1,
-    LiveRecoveryAttestationV1, PanelCertificateV1, PreflightAttestationV1, RecoverLiveRequestV1,
-    RuntimeDeploymentError, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1,
-    RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1,
-    RuntimeFailureDispositionV1, RuntimeFailureV1, RuntimeGeneration, RuntimePendingConditionV1,
-    RuntimeProcessIdentityV1, SupersedingDeploymentV1,
+    LiveRecoveryAttestationV1, PanelCertificateV1, PreflightAttestationV1, RecoverBlockedRequestV1,
+    RecoverLiveRequestV1, RuntimeDeploymentError, RuntimeDeploymentIdentityV1,
+    RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
+    RuntimeDeploymentTargetV1, RuntimeFailureDispositionV1, RuntimeFailureV1, RuntimeGeneration,
+    RuntimePendingConditionV1, RuntimeProcessIdentityV1, SupersedingDeploymentV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +181,86 @@ impl RuntimeDeployment {
                 return Ok(self.replayed());
             }
         }
+        match &self.phase {
+            RuntimeDeploymentPhaseV1::RuntimePending {
+                condition: RuntimePendingConditionV1::Blocked { .. },
+            } => return Err(self.invalid_transition("acquire_lease")),
+            RuntimeDeploymentPhaseV1::RuntimePending {
+                condition:
+                    RuntimePendingConditionV1::Retryable {
+                        retry_not_before, ..
+                    },
+            } if *retry_not_before > request.now => {
+                return Err(self.invalid_transition("acquire_lease"));
+            }
+            _ => {}
+        }
+        self.validate_lease_request(&request)?;
+        self.install_lease(request);
+        self.bump_revision()
+    }
+
+    pub fn recover_blocked(
+        &mut self,
+        request: RecoverBlockedRequestV1,
+    ) -> Result<TransitionOutcomeV1, RuntimeDeploymentError> {
+        let exact_failure = self
+            .last_runtime_failure
+            .as_ref()
+            .is_some_and(|disposition| {
+                matches!(
+                    disposition,
+                    RuntimeFailureDispositionV1::Blocked { failure }
+                        if failure.failure_id == request.expected_failure_id
+                )
+            });
+        if exact_failure
+            && matches!(
+                &self.phase,
+                RuntimeDeploymentPhaseV1::RuntimePending {
+                    condition: RuntimePendingConditionV1::Ready
+                }
+            )
+            && self.controller_lease.as_ref().is_some_and(|lease| {
+                lease.controller_id == request.controller_id
+                    && lease.fencing_token == request.fencing_token
+                    && lease.acquired_at == request.now
+                    && lease.expires_at == request.expires_at
+            })
+        {
+            return Ok(self.replayed());
+        }
+        self.require_revision(request.expected_revision)?;
+        if !matches!(
+            &self.phase,
+            RuntimeDeploymentPhaseV1::RuntimePending {
+                condition: RuntimePendingConditionV1::Blocked { failure }
+            } if failure.failure_id == request.expected_failure_id
+        ) {
+            return Err(self.invalid_transition("recover_blocked"));
+        }
+        if self.controller_lease.is_some() || !exact_failure {
+            return Err(RuntimeDeploymentError::InvalidSnapshot);
+        }
+        let lease = LeaseRequestV1 {
+            expected_revision: request.expected_revision,
+            controller_id: request.controller_id,
+            fencing_token: request.fencing_token,
+            now: request.now,
+            expires_at: request.expires_at,
+        };
+        self.validate_lease_request(&lease)?;
+        self.install_lease(lease);
+        self.phase = RuntimeDeploymentPhaseV1::RuntimePending {
+            condition: RuntimePendingConditionV1::Ready,
+        };
+        self.bump_revision()
+    }
+
+    fn validate_lease_request(
+        &self,
+        request: &LeaseRequestV1,
+    ) -> Result<(), RuntimeDeploymentError> {
         self.require_revision(request.expected_revision)?;
         if self.phase.is_terminal() {
             return Err(self.invalid_transition("acquire_lease"));
@@ -210,6 +290,10 @@ impl RuntimeDeployment {
         {
             return Err(RuntimeDeploymentError::FencingTokenNotMonotonic);
         }
+        Ok(())
+    }
+
+    fn install_lease(&mut self, request: LeaseRequestV1) {
         self.controller_lease = Some(ControllerLeaseV1 {
             controller_id: request.controller_id,
             fencing_token: request.fencing_token,
@@ -217,7 +301,6 @@ impl RuntimeDeployment {
             expires_at: request.expires_at,
         });
         self.last_fencing_token = Some(request.fencing_token);
-        self.bump_revision()
     }
 
     pub fn accept_preflight(
@@ -343,6 +426,7 @@ impl RuntimeDeployment {
         };
         self.last_runtime_failure = Some(disposition);
         self.clear_unaccepted_runtime_evidence();
+        self.controller_lease = None;
         self.phase = RuntimeDeploymentPhaseV1::RuntimePending { condition };
         self.bump_revision()
     }
@@ -372,6 +456,7 @@ impl RuntimeDeployment {
         }
         self.last_runtime_failure = Some(RuntimeFailureDispositionV1::Blocked { failure });
         self.clear_unaccepted_runtime_evidence();
+        self.controller_lease = None;
         self.phase = RuntimeDeploymentPhaseV1::RuntimePending { condition };
         self.bump_revision()
     }

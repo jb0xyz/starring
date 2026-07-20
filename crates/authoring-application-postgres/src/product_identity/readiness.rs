@@ -2,8 +2,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::database_capability::{
     begin_bounded_database_probe, begin_scoped_database_readiness, load_scoped_database_topology,
-    verify_same_database_distinct_roles, ScopedDatabaseProbeModeV1, ScopedDatabaseReadinessErrorV1,
-    ScopedDatabaseTopologyV1, ScopedFunctionContractV1, ScopedRelationContractV1,
+    verify_same_database_distinct_roles, verify_scoped_executable_allowlist,
+    verify_scoped_global_user_object_deny, verify_scoped_schema_trust, ScopedDatabaseProbeModeV1,
+    ScopedDatabaseReadinessErrorV1, ScopedDatabaseTopologyV1, ScopedFunctionContractV1,
+    ScopedRelationContractV1,
 };
 use crate::ProductDatabaseFailureV1;
 
@@ -89,13 +91,20 @@ pub enum ProductIdentityReadinessErrorV1 {
 
 impl<G> PostgresProductIdentityStore<G> {
     pub async fn verify_readiness(&self) -> Result<(), ProductIdentityReadinessErrorV1> {
+        self.check_readiness().await.map(drop)
+    }
+
+    pub(crate) async fn check_readiness(
+        &self,
+    ) -> Result<[ScopedDatabaseTopologyV1; 4], ProductIdentityReadinessErrorV1> {
         let topologies = [
             self.check_oauth_flow_writer_readiness().await?,
             self.check_session_issuer_readiness().await?,
             self.check_session_api_readiness().await?,
             self.check_security_revoker_readiness().await?,
         ];
-        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
+        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)?;
+        Ok(topologies)
     }
 
     pub async fn verify_oauth_flow_writer_readiness(
@@ -108,7 +117,7 @@ impl<G> PostgresProductIdentityStore<G> {
         &self,
     ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
-        let metadata = begin_scoped_database_readiness(
+        let mut metadata = begin_scoped_database_readiness(
             &self.pools.oauth_flow_writer,
             &timeout,
             &FLOW_FUNCTIONS,
@@ -116,6 +125,7 @@ impl<G> PostgresProductIdentityStore<G> {
         )
         .await
         .map_err(map_readiness)?;
+        verify_identity_scope(&mut metadata, &FLOW_FUNCTIONS, OAUTH_DATABASE_IDENTITY).await?;
         metadata.commit().await.map_err(readiness_database)?;
         let mut probe = begin_bounded_database_probe(
             &self.pools.oauth_flow_writer,
@@ -158,7 +168,7 @@ impl<G> PostgresProductIdentityStore<G> {
         &self,
     ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
-        let metadata = begin_scoped_database_readiness(
+        let mut metadata = begin_scoped_database_readiness(
             &self.pools.session_issuer,
             &timeout,
             &ISSUER_FUNCTIONS,
@@ -166,6 +176,7 @@ impl<G> PostgresProductIdentityStore<G> {
         )
         .await
         .map_err(map_readiness)?;
+        verify_identity_scope(&mut metadata, &ISSUER_FUNCTIONS, ISSUER_DATABASE_IDENTITY).await?;
         metadata.commit().await.map_err(readiness_database)?;
         let mut probe = begin_bounded_database_probe(
             &self.pools.session_issuer,
@@ -201,7 +212,7 @@ impl<G> PostgresProductIdentityStore<G> {
         &self,
     ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
-        let metadata = begin_scoped_database_readiness(
+        let mut metadata = begin_scoped_database_readiness(
             &self.pools.session_api,
             &timeout,
             &SESSION_API_FUNCTIONS,
@@ -209,6 +220,12 @@ impl<G> PostgresProductIdentityStore<G> {
         )
         .await
         .map_err(map_readiness)?;
+        verify_identity_scope(
+            &mut metadata,
+            &SESSION_API_FUNCTIONS,
+            SESSION_API_DATABASE_IDENTITY,
+        )
+        .await?;
         metadata.commit().await.map_err(readiness_database)?;
         let mut probe = begin_bounded_database_probe(
             &self.pools.session_api,
@@ -254,7 +271,7 @@ impl<G> PostgresProductIdentityStore<G> {
         &self,
     ) -> Result<ScopedDatabaseTopologyV1, ProductIdentityReadinessErrorV1> {
         let timeout = self.config.lifetimes().authentication().statement_timeout();
-        let metadata = begin_scoped_database_readiness(
+        let mut metadata = begin_scoped_database_readiness(
             &self.pools.security_revoker,
             &timeout,
             &SECURITY_FUNCTIONS,
@@ -262,6 +279,12 @@ impl<G> PostgresProductIdentityStore<G> {
         )
         .await
         .map_err(map_readiness)?;
+        verify_identity_scope(
+            &mut metadata,
+            &SECURITY_FUNCTIONS,
+            SECURITY_DATABASE_IDENTITY,
+        )
+        .await?;
         metadata.commit().await.map_err(readiness_database)?;
         let mut probe = begin_bounded_database_probe(
             &self.pools.security_revoker,
@@ -284,6 +307,22 @@ impl<G> PostgresProductIdentityStore<G> {
         }
         Ok(topology)
     }
+}
+
+async fn verify_identity_scope(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    functions: &[ScopedFunctionContractV1<'_>],
+    database_identity_function: &str,
+) -> Result<(), ProductIdentityReadinessErrorV1> {
+    verify_scoped_executable_allowlist(transaction, functions)
+        .await
+        .map_err(map_readiness)?;
+    verify_scoped_global_user_object_deny(transaction, functions)
+        .await
+        .map_err(map_readiness)?;
+    verify_scoped_schema_trust(transaction, "public", database_identity_function)
+        .await
+        .map_err(map_readiness)
 }
 
 async fn load_database_topology(

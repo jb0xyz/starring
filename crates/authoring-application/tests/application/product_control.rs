@@ -60,6 +60,7 @@ fn decision_projection(phase: ProductDecisionPhaseV1) -> ProductDecisionProjecti
 struct Decisions {
     events: Arc<Mutex<Vec<&'static str>>>,
     phase: Mutex<ProductDecisionPhaseV1>,
+    rejection_phase: Mutex<ProductDecisionPhaseV1>,
     apply_phase: Mutex<ProductDecisionPhaseV1>,
     apply_exact_replay: Mutex<bool>,
 }
@@ -126,7 +127,7 @@ impl ProductRejectionPort<Evidence> for Decisions {
         assert_eq!(request.command().reason.as_str(), "unsafe requested scope");
         assert_eq!(request.command().idempotency_key.as_str(), "reject-key");
         Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(ProductDecisionPhaseV1::Rejected),
+            decision_projection(self.rejection_phase.lock().unwrap().clone()),
             false,
         ))
     }
@@ -201,6 +202,7 @@ fn product_fixture(
         Decisions {
             events: events.clone(),
             phase: Mutex::new(phase),
+            rejection_phase: Mutex::new(ProductDecisionPhaseV1::Rejected),
             apply_phase: Mutex::new(ProductDecisionPhaseV1::Applied {
                 exact_deployment: exact_deployment(),
             }),
@@ -238,6 +240,48 @@ struct ObservationDeployments {
     status: DeploymentStatusObservationV1,
 }
 
+struct OperationalDecisions {
+    status: ProductDecisionObservationV1,
+}
+
+impl ProductDecisionObservationPort<Evidence> for OperationalDecisions {
+    async fn load_approval_preview_observation(
+        &self,
+        _request: AuthorizedApprovalPreviewV1<'_, Evidence>,
+    ) -> Result<ProductApprovalPreviewObservationV1, ProductControlPortError> {
+        panic!("preview is not used by the operational fixture")
+    }
+
+    async fn load_product_status_observation(
+        &self,
+        _request: AuthorizedProductStatusV1<'_, Evidence>,
+    ) -> Result<ProductDecisionObservationV1, ProductControlPortError> {
+        Ok(self.status.clone())
+    }
+}
+
+struct OperationalDeployments {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    status: DeploymentOperationalObservationV2,
+}
+
+impl DeploymentOperationalStatusPortV2<Evidence> for OperationalDeployments {
+    async fn load_exact_deployment_operational_status_v2(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, Evidence>,
+    ) -> Result<DeploymentOperationalObservationV2, DeploymentStatusPortError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push("deployment_operational_v2");
+        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
+        assert_eq!(request.scope().installation_id().as_str(), "installation-2");
+        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
+        assert_eq!(request.exact_deployment(), &exact_deployment());
+        Ok(self.status.clone())
+    }
+}
+
 impl DeploymentStatusObservationPort<Evidence> for ObservationDeployments {
     async fn load_exact_deployment_observation(
         &self,
@@ -245,6 +289,78 @@ impl DeploymentStatusObservationPort<Evidence> for ObservationDeployments {
     ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
         Ok(self.status.clone())
     }
+}
+
+#[test]
+fn operational_status_v2_uses_only_the_server_derived_exact_deployment() {
+    block_on(async {
+        let decision_observed_at = UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+        let runtime_observed_at = decision_observed_at + Duration::from_secs(1);
+        let decisions = OperationalDecisions {
+            status: ProductDecisionObservationV1::from_server_projection(
+                decision_projection(ProductDecisionPhaseV1::Applied {
+                    exact_deployment: exact_deployment(),
+                }),
+                decision_observed_at,
+            ),
+        };
+        let runtime = DeploymentOperationalObservationV2::from_server_projection(
+            DeploymentStatusObservationV1::from_server_projection(
+                DeploymentStatusProjectionV1::Pending,
+                runtime_observed_at,
+                None,
+                None,
+            )
+            .unwrap(),
+            DeploymentOperationalProjectionV2 {
+                phase: DeploymentConvergencePhaseV2::Requested,
+                current_attempt: 0,
+                last_failure_attempt: None,
+                retry: None,
+                operator_action: None,
+                attestation: None,
+                serving: DeploymentServingFreshnessV2::NotExpected,
+            },
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let deployments = OperationalDeployments {
+            events: events.clone(),
+            status: runtime,
+        };
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let application =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
+        let result = application
+            .get_deployment_operational_status_v2(
+                "opaque-session-token",
+                &installation(),
+                RuntimeDeploymentQueryV1 {
+                    promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status(),
+            &authoring_application::DeploymentStatusV1::Pending
+        );
+        assert_eq!(result.decision_observed_at(), decision_observed_at);
+        let deployment = result.deployment().unwrap();
+        assert_eq!(deployment.observed_at(), runtime_observed_at);
+        assert_eq!(deployment.current_attempt(), 0);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["authenticate", "authorize", "deployment_operational_v2"]
+        );
+    });
 }
 
 async fn exact_preview_observation(
@@ -623,6 +739,36 @@ fn reject_reason_is_bounded_and_digest_bound_port_is_used() {
             *events.lock().unwrap(),
             vec!["authenticate_mutation", "authorize", "reject_payload_bound"]
         );
+    });
+}
+
+#[test]
+fn rejection_rejects_non_rejected_success_projection() {
+    block_on(async {
+        let (_, authentication, authority, decisions, deployments) = product_fixture(
+            ProductDecisionPhaseV1::PendingApproval,
+            DeploymentStatusProjectionV1::NotRequested,
+        );
+        *decisions.rejection_phase.lock().unwrap() = ProductDecisionPhaseV1::Approved;
+        let error =
+            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
+                .reject(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    RejectProductPromotionV1 {
+                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
+                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
+                            .unwrap(),
+                        expected_revision: ProductRevisionV1::new(3).unwrap(),
+                        idempotency_key: ProductIdempotencyKeyV1::parse("reject-key").unwrap(),
+                        reason: RejectionReasonV1::parse("unsafe requested scope").unwrap(),
+                    },
+                )
+                .await
+                .unwrap_err();
+        assert_eq!(error, ProductApplicationError::InvalidProjection);
     });
 }
 

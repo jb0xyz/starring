@@ -14,6 +14,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::RuntimeConvergenceStoreError;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeConvergenceAttemptV1(u32);
+
+impl RuntimeConvergenceAttemptV1 {
+    pub const fn pending() -> Self {
+        Self(0)
+    }
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub const fn started(self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.0)
+    }
+
+    pub const fn checked_next(self) -> Option<NonZeroU32> {
+        match self.0.checked_add(1) {
+            Some(value) => NonZeroU32::new(value),
+            None => None,
+        }
+    }
+}
+
+impl From<NonZeroU32> for RuntimeConvergenceAttemptV1 {
+    fn from(value: NonZeroU32) -> Self {
+        Self(value.get())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostgresRuntimeConvergenceConfigV1 {
     pub maximum_controller_lease: Duration,
@@ -109,12 +144,46 @@ pub struct ClaimNextDeploymentV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverBlockedDeploymentV1 {
+    pub scope: RuntimeDeploymentScopeV1,
+    pub expected_revision: DeploymentRevision,
+    pub expected_failure_id: RuntimeFailureId,
+    pub expected_failure_attempt: NonZeroU32,
+    pub controller_id: ControllerId,
+    pub lease_for: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimReceiptV1 {
     pub snapshot: RuntimeDeploymentSnapshotV1,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimExecutionReceiptV1 {
+    pub snapshot: RuntimeDeploymentSnapshotV1,
+    pub controller_id: ControllerId,
+    pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
+    pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl From<ClaimExecutionReceiptV1> for ClaimReceiptV1 {
+    fn from(value: ClaimExecutionReceiptV1) -> Self {
+        Self {
+            snapshot: value.snapshot,
+            controller_id: value.controller_id,
+            fencing_token: value.fencing_token,
+            convergence_attempt: value.convergence_attempt,
+            acquired_at: value.acquired_at,
+            expires_at: value.expires_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,4 +416,37 @@ impl RuntimeDeploymentStatusV1 {
     pub fn desired_target_digest(&self) -> &str {
         self.desired_target_digest.as_str()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeServingFreshnessV2 {
+    NotExpected,
+    AttestationMissing,
+    LeaseMissing,
+    IdentityMismatch,
+    Disconnected,
+    Expired,
+    Fresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeServingObservationV2 {
+    pub freshness: RuntimeServingFreshnessV2,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeAttestationObservationV2 {
+    pub deployment_revision: DeploymentRevision,
+    pub convergence_attempt: NonZeroU32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDeploymentStatusV2 {
+    pub status: RuntimeDeploymentStatusV1,
+    pub convergence_attempt: RuntimeConvergenceAttemptV1,
+    pub last_failure_attempt: Option<NonZeroU32>,
+    pub attestation: Option<RuntimeAttestationObservationV2>,
+    pub serving: RuntimeServingObservationV2,
 }

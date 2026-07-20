@@ -5,7 +5,21 @@ const SNAPSHOT_FUNCTION: &str =
     "public.starring_product_authorized_snapshot_read_v1(TEXT, TEXT, BYTEA, TEXT, TEXT)";
 const SNAPSHOT_FUNCTION_IDENTITY: &str =
     "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)";
+const SNAPSHOT_DATABASE_IDENTITY_FUNCTION: &str =
+    "public.starring_product_authorized_snapshot_reader_database_identity_v1()";
+const SNAPSHOT_KEY_COVERAGE_FUNCTION: &str =
+    "public.starring_product_authorized_snapshot_key_coverage_v1(TEXT[])";
 const SNAPSHOT_RELATIONS: [&str; 7] = [
+    "product_principals",
+    "product_auth_sessions",
+    "product_tenants",
+    "automation_installations",
+    "authoring_sessions",
+    "authoring_session_generations",
+    "automation_installation_authority_versions",
+];
+const SNAPSHOT_READINESS_RELATIONS: [&str; 8] = [
+    "product_control_plane_identity",
     "product_principals",
     "product_auth_sessions",
     "product_tenants",
@@ -165,7 +179,7 @@ async fn grant_snapshot_role_boundary(
     api_role: &str,
     denied_role: &str,
 ) {
-    for relation in SNAPSHOT_RELATIONS {
+    for relation in SNAPSHOT_READINESS_RELATIONS {
         sqlx::query(&format!(
             "ALTER TABLE public.{relation} OWNER TO {owner_role}"
         ))
@@ -179,6 +193,15 @@ async fn grant_snapshot_role_boundary(
     .execute(pool)
     .await
     .unwrap();
+    for function in [
+        SNAPSHOT_DATABASE_IDENTITY_FUNCTION,
+        SNAPSHOT_KEY_COVERAGE_FUNCTION,
+    ] {
+        sqlx::query(&format!("ALTER FUNCTION {function} OWNER TO {owner_role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
     sqlx::query(&format!(
         "REVOKE ALL ON DATABASE {database_name} FROM PUBLIC"
     ))
@@ -201,12 +224,18 @@ async fn grant_snapshot_role_boundary(
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query(&format!(
-        "GRANT EXECUTE ON FUNCTION {SNAPSHOT_FUNCTION} TO {api_role}"
-    ))
-    .execute(pool)
-    .await
-    .unwrap();
+    for function in [
+        SNAPSHOT_FUNCTION,
+        SNAPSHOT_DATABASE_IDENTITY_FUNCTION,
+        SNAPSHOT_KEY_COVERAGE_FUNCTION,
+    ] {
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION {function} TO {api_role}"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 async fn snapshot_function_count(
@@ -274,8 +303,44 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         .unwrap();
         assert_eq!(role_identity, (api_role.clone(), api_role.clone()));
 
-        let snapshots = PostgresAuthorizedPromotionSnapshots::new(api_pool.clone(), PassthroughCipher);
+        let snapshots =
+            PostgresAuthorizedPromotionSnapshots::new(api_pool.clone(), snapshot_test_cipher());
         snapshots.verify_readiness().await.unwrap();
+
+        let missing_key = SnapshotEnvelopeKeyV1::new(
+            "missing-key-v1",
+            Zeroizing::new(std::array::from_fn(|index| {
+                131_u8.wrapping_add((index as u8).wrapping_mul(23))
+            })),
+        )
+        .unwrap();
+        let missing_key_cipher = XChaCha20Poly1305SnapshotEnvelopeCipherV1::new(
+            SnapshotEnvelopeKeyringV1::new(missing_key, []).unwrap(),
+        );
+        let missing_key_readiness =
+            PostgresAuthorizedPromotionSnapshots::new(api_pool.clone(), missing_key_cipher)
+                .verify_readiness()
+                .await;
+        assert_eq!(
+            missing_key_readiness,
+            Err(authoring_application_postgres::AuthorizedSnapshotReadinessErrorV1::EncryptionKeyCoverageMissing)
+        );
+        let missing_key_rendered = format!("{missing_key_readiness:?}");
+        assert!(!missing_key_rendered.contains("missing-key-v1"));
+        assert!(!missing_key_rendered.contains(SNAPSHOT_TEST_KEY_ID));
+
+        let topology = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT \
+             public.starring_product_authorized_snapshot_reader_database_identity_v1(), \
+             current_database()::TEXT, current_user::TEXT, session_user::TEXT",
+        )
+        .fetch_one(&api_pool)
+        .await
+        .unwrap();
+        assert_eq!(topology.1, database.name);
+        assert_eq!(topology.2, api_role);
+        assert_eq!(topology.2, topology.3);
+        assert_eq!(topology.0.len(), 36);
 
         let session_digest = digest_opaque_session_credential_v1(&fixture.credential)
             .unwrap()
@@ -399,6 +464,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
 
         let direct_privilege_count = sqlx::query_scalar::<_, i64>(
             "WITH relations(name) AS (VALUES \
+              ('public.product_control_plane_identity'), \
               ('public.product_principals'), \
               ('public.product_auth_sessions'), \
               ('public.product_tenants'), \
@@ -420,6 +486,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         assert_eq!(direct_privilege_count, 0);
         let column_privilege_count = sqlx::query_scalar::<_, i64>(
             "WITH relations(name) AS (VALUES \
+              ('public.product_control_plane_identity'), \
               ('public.product_principals'), \
               ('public.product_auth_sessions'), \
               ('public.product_tenants'), \
@@ -590,6 +657,52 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         sqlx::query(&format!(
             "ALTER FUNCTION {SNAPSHOT_FUNCTION} SECURITY DEFINER"
         ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(&format!(
+            "ALTER FUNCTION {SNAPSHOT_DATABASE_IDENTITY_FUNCTION} SECURITY INVOKER"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshots.verify_readiness().await,
+            Err(authoring_application_postgres::AuthorizedSnapshotReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::query(&format!(
+            "ALTER FUNCTION {SNAPSHOT_DATABASE_IDENTITY_FUNCTION} SECURITY DEFINER"
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION \
+             public.starring_product_authorized_snapshot_reader_database_identity_v1() \
+             RETURNS TEXT LANGUAGE sql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER \
+             SET search_path = pg_catalog AS $function$ \
+             SELECT '00000000-0000-0000-0000-000000000000'::TEXT \
+             $function$",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshots.verify_readiness().await,
+            Err(authoring_application_postgres::AuthorizedSnapshotReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION \
+             public.starring_product_authorized_snapshot_reader_database_identity_v1() \
+             RETURNS TEXT LANGUAGE sql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER \
+             SET search_path = pg_catalog AS $function$ \
+             SELECT identity.database_identity::TEXT \
+             FROM public.product_control_plane_identity AS identity \
+             WHERE identity.singleton \
+             $function$",
+        )
         .execute(&database.pool)
         .await
         .unwrap();
@@ -894,6 +1007,149 @@ async fn authorized_snapshot_migration_strips_hostile_default_grants() {
             .await
             .unwrap();
     }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn authority_snapshot_readiness_migration_seals_identity_and_key_coverage() {
+    let mut database = isolated_snapshot_security_database("readiness_migration").await;
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.version <= 202_607_200_005)
+    {
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let hostile_role = format!("starring_readiness_hostile_{}", unique_suffix());
+    assert_snapshot_security_role(&hostile_role);
+    sqlx::query(&format!(
+        "CREATE ROLE {hostile_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 0"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public \
+         GRANT EXECUTE ON FUNCTIONS TO {hostile_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_200_006)
+            .unwrap();
+        let mut transaction = database.pool.begin().await.unwrap();
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let contracts = sqlx::query_as::<_, (String, bool, bool, bool, String, String)>(
+            "SELECT expected.identity, function_row.prosecdef, \
+              pg_catalog.has_function_privilege($1, function_row.oid, 'EXECUTE'), \
+              EXISTS ( \
+               SELECT 1 FROM pg_catalog.aclexplode(COALESCE( \
+                function_row.proacl, pg_catalog.acldefault('f', function_row.proowner) \
+               )) AS privilege \
+               WHERE privilege.grantee = 0 AND privilege.privilege_type = 'EXECUTE' \
+              ), pg_catalog.pg_get_function_result(function_row.oid), \
+              pg_catalog.pg_get_function_identity_arguments(function_row.oid) \
+             FROM (VALUES ($2), ($3), ($4)) AS expected(identity) \
+             INNER JOIN pg_catalog.pg_proc AS function_row \
+              ON function_row.oid = pg_catalog.to_regprocedure(expected.identity) \
+             ORDER BY expected.identity",
+        )
+        .bind(&hostile_role)
+        .bind(SNAPSHOT_DATABASE_IDENTITY_FUNCTION)
+        .bind(SNAPSHOT_KEY_COVERAGE_FUNCTION.to_ascii_lowercase())
+        .bind("public.starring_product_installation_authority_reader_database_identity_v1()")
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(contracts.len(), 3);
+        for (_, security_definer, hostile_execute, public_execute, _, _) in &contracts {
+            assert!(*security_definer);
+            assert!(!*hostile_execute);
+            assert!(!*public_execute);
+        }
+        assert!(contracts.iter().any(|contract| {
+            contract.4 == "TABLE(covered boolean)"
+                && contract.5 == "configured_encryption_key_ids text[]"
+        }));
+
+        let default_execute = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+              SELECT 1 \
+              FROM pg_catalog.pg_default_acl AS default_acl \
+              CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS privilege \
+              WHERE default_acl.defaclobjtype = 'f' \
+               AND privilege.grantee = pg_catalog.to_regrole($1) \
+               AND privilege.privilege_type = 'EXECUTE' \
+             )",
+        )
+        .bind(&hostile_role)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!default_execute);
+
+        let coverage = sqlx::query_scalar::<_, bool>(
+            "SELECT covered \
+             FROM public.starring_product_authorized_snapshot_key_coverage_v1($1)",
+        )
+        .bind(vec![SNAPSHOT_TEST_KEY_ID])
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(coverage);
+        let invalid_coverage = sqlx::query_scalar::<_, bool>(
+            "SELECT covered \
+             FROM public.starring_product_authorized_snapshot_key_coverage_v1($1)",
+        )
+        .bind(Vec::<String>::new())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!invalid_coverage);
+        let oversized_coverage = sqlx::query_scalar::<_, bool>(
+            "SELECT covered \
+             FROM public.starring_product_authorized_snapshot_key_coverage_v1( \
+              pg_catalog.array_fill('valid-key'::TEXT, ARRAY[9]))",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!oversized_coverage);
+        let oversized_key_coverage = sqlx::query_scalar::<_, bool>(
+            "SELECT covered \
+             FROM public.starring_product_authorized_snapshot_key_coverage_v1( \
+              ARRAY[pg_catalog.repeat('a', 129)])",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!oversized_key_coverage);
+    })
+    .catch_unwind()
+    .await;
+    database.pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {hostile_role}"))
+        .execute(&mut database.administrator)
+        .await
+        .unwrap();
     if let Err(payload) = outcome {
         std::panic::resume_unwind(payload);
     }

@@ -66,8 +66,9 @@ pub struct DiscordOAuthStateV1(Zeroizing<String>);
 
 impl DiscordOAuthStateV1 {
     pub fn from_owned(value: String) -> Result<Self, DiscordOAuthSecretError> {
+        let value = Zeroizing::new(value);
         if canonical_secret(&value) {
-            Ok(Self(Zeroizing::new(value)))
+            Ok(Self(value))
         } else {
             Err(DiscordOAuthSecretError::InvalidState)
         }
@@ -88,11 +89,12 @@ pub struct DiscordAuthorizationCodeV1(Zeroizing<String>);
 
 impl DiscordAuthorizationCodeV1 {
     pub fn from_owned(value: String) -> Result<Self, DiscordOAuthSecretError> {
+        let value = Zeroizing::new(value);
         if !value.is_empty()
             && value.len() <= MAX_AUTHORIZATION_CODE_BYTES
             && !value.chars().any(char::is_control)
         {
-            Ok(Self(Zeroizing::new(value)))
+            Ok(Self(value))
         } else {
             Err(DiscordOAuthSecretError::InvalidAuthorizationCode)
         }
@@ -113,11 +115,12 @@ pub struct DiscordOAuthClientSecretV1(Zeroizing<String>);
 
 impl DiscordOAuthClientSecretV1 {
     pub fn from_owned(value: String) -> Result<Self, DiscordOAuthSecretError> {
+        let value = Zeroizing::new(value);
         if !value.is_empty()
             && value.len() <= MAX_CLIENT_SECRET_BYTES
             && !value.chars().any(char::is_control)
         {
-            Ok(Self(Zeroizing::new(value)))
+            Ok(Self(value))
         } else {
             Err(DiscordOAuthSecretError::InvalidClientSecret)
         }
@@ -296,6 +299,14 @@ impl DiscordOAuthClient {
             .build()
             .map_err(|_| DiscordOAuthConfigError::HttpClient)?;
         Ok(Self { http, config })
+    }
+
+    pub fn client_id(&self) -> DiscordApplicationIdV1 {
+        self.config.client_id()
+    }
+
+    pub fn redirect_uri(&self) -> &str {
+        self.config.redirect_uri()
     }
 
     pub fn authorization_url(&self, state: &DiscordOAuthStateV1) -> Url {

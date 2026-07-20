@@ -1,4 +1,6 @@
-use authoring_application::{AuthorizedApplyProductV1, AuthorizedApproveProductV1};
+use authoring_application::{
+    AuthorizedApplyProductV1, AuthorizedApproveProductV1, AuthorizedRejectProductV1,
+};
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 
 use crate::product_action_digest::{
@@ -20,6 +22,12 @@ const APPLY_RECEIPT_ID_DOMAIN: &[u8] = b"starring.product.apply.receipt.v1";
 const APPLY_AUDIT_EVENT_ID_DOMAIN: &[u8] = b"starring.product.apply.audit.v1";
 const APPLY_ATTEMPT_ID_DOMAIN: &[u8] = b"starring.product.apply.attempt.v1";
 const APPLY_DEPLOYMENT_ID_DOMAIN: &[u8] = b"starring.product.apply.deployment.v1";
+const REJECTION_IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.rejection.idempotency.v1";
+const REJECTION_SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.rejection.request.v1";
+const REJECTION_RECEIPT_ID_DOMAIN: &[u8] = b"starring.product.rejection.receipt.v1";
+const REJECTION_AUDIT_EVENT_ID_DOMAIN: &[u8] = b"starring.product.rejection.audit.v1";
+const REJECTION_KEY_MATERIAL_FINGERPRINT_DOMAIN: &[u8] =
+    b"starring.product.rejection.digest-key-fingerprint.v1";
 
 pub(crate) struct ApprovalDigests {
     pub active_idempotency: String,
@@ -45,6 +53,30 @@ pub(crate) struct ApplyDigests {
     pub apply_attempt_id: String,
     pub deployment_id: String,
     pub session_subject: Vec<u8>,
+}
+
+pub(crate) struct RejectionDigests {
+    pub active_idempotency: String,
+    pub idempotency_candidates: Vec<String>,
+    pub idempotency_candidate_key_ids: Vec<String>,
+    pub idempotency_candidate_key_fingerprints: Vec<String>,
+    pub active_key_id: String,
+    pub semantic_request: String,
+    pub receipt_id: String,
+    pub audit_event_id: String,
+    pub session_subject: Vec<u8>,
+}
+
+struct RejectionDigestMaterial<'a> {
+    tenant_id: &'a str,
+    installation_id: &'a str,
+    principal_id: &'a str,
+    promotion_id: &'a str,
+    expected_revision: String,
+    expected_payload_digest: &'a str,
+    idempotency_key: &'a str,
+    reason: &'a str,
+    session_fingerprint: &'a [u8],
 }
 
 pub(crate) fn keyring_coverage_identity(
@@ -187,6 +219,97 @@ pub(crate) fn apply_digests(
     }
 }
 
+pub(crate) fn rejection_digests(
+    keyring: &ProductActionDigestKeyringV1,
+    request: &AuthorizedRejectProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
+) -> RejectionDigests {
+    let scope = request.scope();
+    let command = request.command();
+    rejection_digests_from_material(
+        keyring,
+        RejectionDigestMaterial {
+            tenant_id: scope.tenant_id().as_str(),
+            installation_id: scope.installation_id().as_str(),
+            principal_id: request.actor().principal_id().as_str(),
+            promotion_id: command.promotion.promotion_id().as_str(),
+            expected_revision: command.expected_revision.get().to_string(),
+            expected_payload_digest: command.expected_payload_digest.as_str(),
+            idempotency_key: command.idempotency_key.as_str(),
+            reason: command.reason.as_str(),
+            session_fingerprint: request.session_fingerprint().as_bytes().as_slice(),
+        },
+    )
+}
+
+fn rejection_digests_from_material(
+    keyring: &ProductActionDigestKeyringV1,
+    material: RejectionDigestMaterial<'_>,
+) -> RejectionDigests {
+    let idempotency_fields = [
+        material.tenant_id.as_bytes(),
+        material.installation_id.as_bytes(),
+        material.principal_id.as_bytes(),
+        b"product_reject_v1".as_slice(),
+        material.idempotency_key.as_bytes(),
+    ];
+    let idempotency_candidates = keyring
+        .keys()
+        .iter()
+        .map(|key| keyed_digest(key, REJECTION_IDEMPOTENCY_DOMAIN, &idempotency_fields))
+        .collect::<Vec<_>>();
+    let active_idempotency = idempotency_candidates[0].clone();
+    let keyring_identity = product_action_keyring_coverage_identity_v1(
+        keyring,
+        REJECTION_KEY_MATERIAL_FINGERPRINT_DOMAIN,
+    );
+    let semantic_request = unkeyed_digest(
+        REJECTION_SEMANTIC_REQUEST_DOMAIN,
+        &[
+            material.tenant_id.as_bytes(),
+            material.installation_id.as_bytes(),
+            material.principal_id.as_bytes(),
+            material.promotion_id.as_bytes(),
+            material.expected_revision.as_bytes(),
+            material.expected_payload_digest.as_bytes(),
+            material.reason.as_bytes(),
+        ],
+    );
+    let identity_fields = [
+        material.tenant_id.as_bytes(),
+        material.installation_id.as_bytes(),
+        material.principal_id.as_bytes(),
+        active_idempotency.as_bytes(),
+        semantic_request.as_bytes(),
+    ];
+    let receipt_id = keyed_digest(
+        keyring.active(),
+        REJECTION_RECEIPT_ID_DOMAIN,
+        &identity_fields,
+    );
+    let audit_event_id = keyed_digest(
+        keyring.active(),
+        REJECTION_AUDIT_EVENT_ID_DOMAIN,
+        &identity_fields,
+    );
+    let session_subject = product_action_session_subject_digest_v1(
+        SESSION_SUBJECT_DOMAIN,
+        material.tenant_id.as_bytes(),
+        material.principal_id.as_bytes(),
+        material.session_fingerprint,
+    );
+    RejectionDigests {
+        active_idempotency,
+        idempotency_candidates,
+        idempotency_candidate_key_ids: keyring_identity.key_ids,
+        idempotency_candidate_key_fingerprints: keyring_identity.key_fingerprints,
+        active_key_id: keyring.active().key_id().to_string(),
+        semantic_request,
+        receipt_id,
+        audit_event_id,
+        session_subject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +414,72 @@ mod tests {
             .iter()
             .all(|fingerprint| fingerprint.len() == 64));
         assert!(!format!("{:?}", keyring).contains(&identity.key_fingerprints[0]));
+    }
+
+    #[test]
+    fn rejection_reason_changes_only_semantic_identity_inputs() {
+        let keyring = ProductActionDigestKeyringV1::new(
+            ProductActionDigestKeyV1::from_bytes(
+                "active",
+                std::array::from_fn(|index| 41_u8.wrapping_add(index as u8)),
+            )
+            .unwrap(),
+            [],
+        )
+        .unwrap();
+        let build = |reason| {
+            rejection_digests_from_material(
+                &keyring,
+                RejectionDigestMaterial {
+                    tenant_id: "tenant",
+                    installation_id: "installation",
+                    principal_id: "principal",
+                    promotion_id: &"a".repeat(64),
+                    expected_revision: "7".to_string(),
+                    expected_payload_digest: &"b".repeat(64),
+                    idempotency_key: "same-key",
+                    reason,
+                    session_fingerprint: &[19_u8; 32],
+                },
+            )
+        };
+        let first = build("unsafe permission scope");
+        let second = build("unexpected channel visibility");
+        assert_eq!(first.active_idempotency, second.active_idempotency);
+        assert_eq!(first.idempotency_candidates, second.idempotency_candidates);
+        assert_eq!(first.session_subject, second.session_subject);
+        assert_ne!(first.semantic_request, second.semantic_request);
+        assert_ne!(first.receipt_id, second.receipt_id);
+        assert_ne!(first.audit_event_id, second.audit_event_id);
+    }
+
+    #[test]
+    fn rejection_digest_domains_are_separate_from_approval() {
+        let key = ProductActionDigestKeyV1::from_bytes(
+            "active",
+            std::array::from_fn(|index| 59_u8.wrapping_add(index as u8)),
+        )
+        .unwrap();
+        let fields = [b"same".as_slice(), b"material".as_slice()];
+        assert_ne!(
+            keyed_digest(&key, IDEMPOTENCY_DOMAIN, &fields),
+            keyed_digest(&key, REJECTION_IDEMPOTENCY_DOMAIN, &fields)
+        );
+        assert_ne!(
+            unkeyed_digest(SEMANTIC_REQUEST_DOMAIN, &fields),
+            unkeyed_digest(REJECTION_SEMANTIC_REQUEST_DOMAIN, &fields)
+        );
+        assert_ne!(
+            keyed_digest(&key, RECEIPT_ID_DOMAIN, &fields),
+            keyed_digest(&key, REJECTION_RECEIPT_ID_DOMAIN, &fields)
+        );
+        assert_ne!(
+            keyed_digest(&key, AUDIT_EVENT_ID_DOMAIN, &fields),
+            keyed_digest(&key, REJECTION_AUDIT_EVENT_ID_DOMAIN, &fields)
+        );
+        assert_ne!(
+            unkeyed_digest(KEY_MATERIAL_FINGERPRINT_DOMAIN, &fields),
+            unkeyed_digest(REJECTION_KEY_MATERIAL_FINGERPRINT_DOMAIN, &fields)
+        );
     }
 }

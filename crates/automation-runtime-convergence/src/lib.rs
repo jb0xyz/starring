@@ -22,8 +22,8 @@ pub use identity::{
 };
 pub use machine::{RuntimeDeployment, TransitionOutcomeV1};
 pub use state::{
-    CommandGuardV1, ControllerLeaseV1, LeaseRequestV1, RecoverLiveRequestV1,
-    RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
-    RuntimeFailureDispositionV1, RuntimeFailureKindV1, RuntimeFailureV1, RuntimePendingConditionV1,
-    SupersedingDeploymentV1,
+    CommandGuardV1, ControllerLeaseV1, LeaseRequestV1, RecoverBlockedRequestV1,
+    RecoverLiveRequestV1, RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1,
+    RuntimeDeploymentSnapshotV1, RuntimeFailureDispositionV1, RuntimeFailureKindV1,
+    RuntimeFailureV1, RuntimePendingConditionV1, SupersedingDeploymentV1,
 };

@@ -27,7 +27,7 @@ const PRODUCT_DECISION_BOUNDARY_RELATIONS: [&str; 20] = [
     "runtime_serving_leases",
     "runtime_attestations",
 ];
-const PRODUCT_APPLY_SUPPORT_FUNCTIONS: [&str; 10] = [
+const PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS: [&str; 10] = [
     "public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_authority_projection_v1(text,text,text,text,bytea,text,text,text,text,bigint,text,timestamp with time zone,timestamp with time zone,text,boolean,text)",
     "public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)",
@@ -39,6 +39,14 @@ const PRODUCT_APPLY_SUPPORT_FUNCTIONS: [&str; 10] = [
     "public.reject_runtime_deployment_delete()",
     "public.validate_runtime_deployment_projection()",
 ];
+const PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION: &str =
+    "public.validate_runtime_convergence_attempt_projection()";
+
+fn product_apply_support_functions() -> impl Iterator<Item = &'static str> {
+    PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS
+        .into_iter()
+        .chain([PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION])
+}
 
 fn incomplete_apply_security_keyring() -> ProductDecisionDigestKeyringV1 {
     ProductDecisionDigestKeyringV1::new(
@@ -71,7 +79,7 @@ async fn alter_product_decision_boundary_owner(pool: &PgPool, owner_role: &str) 
     .into_iter()
     .chain(PRODUCT_APPLY_FUNCTIONS)
     .chain(PRODUCT_APPROVAL_SUPPORT_FUNCTIONS)
-    .chain(PRODUCT_APPLY_SUPPORT_FUNCTIONS)
+    .chain(product_apply_support_functions())
     {
         sqlx::query(&format!(
             "ALTER FUNCTION {function} OWNER TO {owner_role}"
@@ -472,6 +480,25 @@ async fn product_apply_executor_is_exactly_scoped_replay_safe_and_fail_closed() 
         .await
         .unwrap();
 
+        sqlx::query(
+            "ALTER TABLE public.runtime_deployments \
+             ALTER COLUMN convergence_attempt_no DROP DEFAULT",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            decisions.verify_apply_executor_readiness().await,
+            Err(ProductDecisionReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::query(
+            "ALTER TABLE public.runtime_deployments \
+             ALTER COLUMN convergence_attempt_no SET DEFAULT 0",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
         let incomplete = PostgresProductDecisions::new(
             ProductDecisionDatabasePoolsV1::new(
                 reader_pool.clone(),
@@ -523,7 +550,7 @@ async fn product_apply_executor_is_exactly_scoped_replay_safe_and_fail_closed() 
     }
 }
 
-fn product_apply_existing_protected_functions() -> Vec<String> {
+fn product_apply_migration_202607190022_existing_protected_functions() -> Vec<String> {
     [
         PRODUCT_APPLY_FUNCTIONS[0],
         PRODUCT_APPLY_FUNCTIONS[1],
@@ -531,13 +558,13 @@ fn product_apply_existing_protected_functions() -> Vec<String> {
     ]
     .into_iter()
     .chain(PRODUCT_APPROVAL_SUPPORT_FUNCTIONS)
-    .chain(PRODUCT_APPLY_SUPPORT_FUNCTIONS)
+    .chain(PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS)
     .map(str::to_owned)
     .collect()
 }
 
 async fn product_apply_protected_function_catalog_state(pool: &PgPool) -> (i64, String) {
-    let signatures = product_apply_existing_protected_functions();
+    let signatures = product_apply_migration_202607190022_existing_protected_functions();
     let state = sqlx::query_as::<_, (i64, String)>(
         "WITH expected(signature) AS ( \
           SELECT pg_catalog.unnest($1::TEXT[]) \
@@ -757,7 +784,7 @@ async fn product_apply_scope_migration_rejects_drift_atomically_and_normalizes_f
 
         sqlx::query(&format!(
             "ALTER FUNCTION {} SECURITY INVOKER",
-            PRODUCT_APPLY_SUPPORT_FUNCTIONS[1]
+            PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS[1]
         ))
         .execute(&database.pool)
         .await
@@ -765,7 +792,7 @@ async fn product_apply_scope_migration_rejects_drift_atomically_and_normalizes_f
         assert_product_apply_scope_migration_rejected_atomically(&database.pool).await;
         sqlx::query(&format!(
             "ALTER FUNCTION {} SECURITY DEFINER",
-            PRODUCT_APPLY_SUPPORT_FUNCTIONS[1]
+            PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS[1]
         ))
         .execute(&database.pool)
         .await
@@ -773,7 +800,7 @@ async fn product_apply_scope_migration_rejects_drift_atomically_and_normalizes_f
 
         for function in [
             PRODUCT_APPLY_FUNCTIONS[1],
-            PRODUCT_APPLY_SUPPORT_FUNCTIONS[1],
+            PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS[1],
         ] {
             sqlx::query(&format!(
                 "GRANT EXECUTE ON FUNCTION {function} TO {hostile_role} WITH GRANT OPTION"
@@ -803,7 +830,8 @@ async fn product_apply_scope_migration_rejects_drift_atomically_and_normalizes_f
             .fetch_one(&database.pool)
             .await
             .unwrap();
-        let protected_functions = product_apply_existing_protected_functions()
+        let protected_functions =
+            product_apply_migration_202607190022_existing_protected_functions()
             .into_iter()
             .chain([
                 PRODUCT_APPLY_FUNCTIONS[2].to_owned(),

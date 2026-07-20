@@ -8,6 +8,31 @@ use url::Url;
 const MIN_BODY_LIMIT: usize = 1_024;
 const MAX_BODY_LIMIT: usize = 1_048_576;
 const MAX_IN_FLIGHT: usize = 4_096;
+const OAUTH_START_BUDGET_CAPACITY: u32 = 10;
+const OAUTH_START_BUDGET_REFILL_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy)]
+pub(crate) struct OAuthStartBudgetConfig {
+    capacity: u32,
+    refill_interval: Duration,
+}
+
+impl OAuthStartBudgetConfig {
+    const fn production() -> Self {
+        Self {
+            capacity: OAUTH_START_BUDGET_CAPACITY,
+            refill_interval: OAUTH_START_BUDGET_REFILL_INTERVAL,
+        }
+    }
+
+    pub(crate) const fn capacity(self) -> u32 {
+        self.capacity
+    }
+
+    pub(crate) const fn refill_interval(self) -> Duration {
+        self.refill_interval
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HttpBoundaryConfigError {
@@ -32,6 +57,7 @@ pub struct HttpBoundaryConfig {
     body_limit: usize,
     max_in_flight: usize,
     request_timeout: Duration,
+    oauth_start_budget: OAuthStartBudgetConfig,
 }
 
 impl HttpBoundaryConfig {
@@ -89,6 +115,7 @@ impl HttpBoundaryConfig {
             body_limit,
             max_in_flight,
             request_timeout,
+            oauth_start_budget: OAuthStartBudgetConfig::production(),
         })
     }
 
@@ -131,6 +158,10 @@ impl HttpBoundaryConfig {
 
     pub(crate) fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    pub(crate) fn oauth_start_budget(&self) -> OAuthStartBudgetConfig {
+        self.oauth_start_budget
     }
 }
 

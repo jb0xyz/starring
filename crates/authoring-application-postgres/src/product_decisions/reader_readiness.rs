@@ -1,7 +1,8 @@
 use crate::database_capability::{
     begin_scoped_database_readiness, load_scoped_database_topology,
-    verify_scoped_executable_allowlist, verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1,
-    ScopedDatabaseTopologyV1, ScopedFunctionContractV1, ScopedRelationContractV1,
+    verify_scoped_executable_allowlist, verify_scoped_global_user_object_deny,
+    verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1, ScopedDatabaseTopologyV1,
+    ScopedFunctionContractV1, ScopedRelationContractV1,
 };
 use crate::{ProductDatabaseFailureV1, ProductDecisionReadinessErrorV1};
 
@@ -55,6 +56,9 @@ impl PostgresProductDecisions {
         .await
         .map_err(map_readiness)?;
         verify_scoped_executable_allowlist(&mut transaction, &FUNCTIONS)
+            .await
+            .map_err(map_readiness)?;
+        verify_scoped_global_user_object_deny(&mut transaction, &FUNCTIONS)
             .await
             .map_err(map_readiness)?;
         verify_scoped_schema_trust(&mut transaction, "public", READ_FUNCTION)

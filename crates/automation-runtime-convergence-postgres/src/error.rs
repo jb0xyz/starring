@@ -1,6 +1,7 @@
 use automation_runtime_convergence::RuntimeDeploymentError;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RuntimeConvergenceStoreError {
     #[error("runtime deployment was not found")]
     NotFound,
@@ -20,6 +21,14 @@ pub enum RuntimeConvergenceStoreError {
     ServingLeaseConflict,
     #[error("runtime attestation identity conflicts")]
     AttestationConflict,
+    #[error("runtime convergence attempt conflicts")]
+    ConvergenceAttemptConflict,
+    #[error("runtime convergence attempt capacity is exhausted")]
+    ConvergenceAttemptOverflow,
+    #[error("runtime convergence retry is not ready")]
+    RetryNotReady,
+    #[error("runtime deployment requires an operator action")]
+    OperatorActionRequired,
     #[error("runtime convergence input is invalid: {0}")]
     InvalidInput(&'static str),
     #[error("persisted runtime convergence state is invalid: {0}")]
@@ -48,6 +57,10 @@ impl RuntimeConvergenceStoreError {
             Self::ProductAuthorityInactive => "runtime_product_authority_inactive",
             Self::ServingLeaseConflict => "runtime_serving_lease_conflict",
             Self::AttestationConflict => "runtime_attestation_conflict",
+            Self::ConvergenceAttemptConflict => "runtime_convergence_attempt_conflict",
+            Self::ConvergenceAttemptOverflow => "runtime_convergence_attempt_overflow",
+            Self::RetryNotReady => "runtime_retry_not_ready",
+            Self::OperatorActionRequired => "runtime_operator_action_required",
             Self::InvalidInput(_) => "runtime_invalid_input",
             Self::InvalidPersistedState(_) => "runtime_invalid_persisted_state",
             Self::Domain(_) => "runtime_domain_rejected",
@@ -61,7 +74,10 @@ impl RuntimeConvergenceStoreError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::DatabaseTimeout | Self::DatabaseConcurrency | Self::DatabaseUnavailable
+            Self::RetryNotReady
+                | Self::DatabaseTimeout
+                | Self::DatabaseConcurrency
+                | Self::DatabaseUnavailable
         )
     }
 }

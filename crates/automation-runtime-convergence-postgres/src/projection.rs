@@ -33,6 +33,7 @@ pub(crate) fn project_status(
     evidence: StatusProjectionEvidence,
 ) -> Result<RuntimeDeploymentStatusV1, RuntimeConvergenceStoreError> {
     let snapshot = evidence.persisted.deployment.snapshot();
+    let convergence_attempt = evidence.persisted.convergence_attempt;
     if snapshot.identity.tenant_id != scope.tenant_id
         || snapshot.identity.installation_id != scope.installation_id
         || snapshot.identity.deployment_id != scope.deployment_id
@@ -114,7 +115,8 @@ pub(crate) fn project_status(
         ));
     };
     let identity = &snapshot.identity;
-    if attestation.id != expected_attestation_id
+    if convergence_attempt != attestation.convergence_attempt.map(Into::into)
+        || attestation.id != expected_attestation_id
         || attestation.deployment_id != identity.deployment_id.as_str()
         || attestation.tenant_id != identity.tenant_id.as_str()
         || attestation.installation_id != identity.installation_id.as_str()
@@ -140,25 +142,17 @@ pub(crate) fn project_status(
             ));
         }
     }
+    let serving_identity_exact = evidence
+        .serving
+        .as_ref()
+        .map(|serving| serving_identity_matches(scope, &snapshot, &attestation, serving))
+        .transpose()?
+        .unwrap_or(false);
     let live = evidence
         .serving
         .as_ref()
         .filter(|serving| {
-            serving.guild_id == snapshot.target.guild_id.to_string()
-                && serving.ruleset_key == snapshot.target.ruleset_key.as_str()
-                && serving.tenant_id == scope.tenant_id.as_str()
-                && serving.installation_id == scope.installation_id.as_str()
-                && serving.deployment_id == scope.deployment_id.as_str()
-                && serving.attestation_id == attestation.id.as_str()
-                && serving.process_instance_id
-                    == attestation.record.live.process_instance_id.as_str()
-                && serving.runtime_generation
-                    == runtime_i64(snapshot.runtime_generation.get()).unwrap_or(-1)
-                && serving.target_version == i64::from(snapshot.target.version.get())
-                && serving.target_content_hash == snapshot.target.content_hash.to_hex()
-                && serving.binding_revision
-                    == runtime_i64(snapshot.target.binding_revision.get()).unwrap_or(-1)
-                && serving.binding_fingerprint == snapshot.target.binding_fingerprint.as_str()
+            serving_identity_exact
                 && serving.connected
                 && serving.serving
                 && serving.expires_at > observed_at
@@ -183,6 +177,11 @@ pub(crate) fn project_status(
             DeploymentAvailabilityV1::RuntimePending,
             "serving_lease_missing",
         )
+    } else if !serving_identity_exact {
+        (
+            DeploymentAvailabilityV1::RuntimePending,
+            "serving_identity_mismatch",
+        )
     } else if evidence
         .serving
         .as_ref()
@@ -202,10 +201,9 @@ pub(crate) fn project_status(
             "serving_lease_expired",
         )
     } else {
-        (
-            DeploymentAvailabilityV1::RuntimePending,
-            "serving_identity_mismatch",
-        )
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "serving status projection",
+        ));
     };
     Ok(status_projection(
         snapshot,
@@ -215,6 +213,26 @@ pub(crate) fn project_status(
         live,
         desired_target_digest,
     ))
+}
+
+fn serving_identity_matches(
+    scope: &RuntimeDeploymentScopeV1,
+    snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
+    attestation: &PersistedAttestation,
+    serving: &ServingLeaseRow,
+) -> Result<bool, RuntimeConvergenceStoreError> {
+    Ok(serving.guild_id == snapshot.target.guild_id.to_string()
+        && serving.ruleset_key == snapshot.target.ruleset_key.as_str()
+        && serving.tenant_id == scope.tenant_id.as_str()
+        && serving.installation_id == scope.installation_id.as_str()
+        && serving.deployment_id == scope.deployment_id.as_str()
+        && serving.attestation_id == attestation.id.as_str()
+        && serving.process_instance_id == attestation.record.live.process_instance_id.as_str()
+        && serving.runtime_generation == runtime_i64(snapshot.runtime_generation.get())?
+        && serving.target_version == i64::from(snapshot.target.version.get())
+        && serving.target_content_hash == snapshot.target.content_hash.to_hex()
+        && serving.binding_revision == runtime_i64(snapshot.target.binding_revision.get())?
+        && serving.binding_fingerprint == snapshot.target.binding_fingerprint.as_str())
 }
 
 fn authority_status(

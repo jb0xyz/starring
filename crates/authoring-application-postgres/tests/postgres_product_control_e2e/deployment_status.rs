@@ -1072,9 +1072,11 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     assert_eq!(applied.status(), ProductStatusV1::RuntimePending);
     let role_suffix = suffix();
     let owner_role = format!("starring_status_owner_{role_suffix}");
-    let reader_role = format!("starring_status_reader_{role_suffix}");
-    let reader_password = database_role_password();
-    for role in [&owner_role, &reader_role] {
+    let reader_v1_role = format!("starring_status_reader_v1_{role_suffix}");
+    let reader_v2_role = format!("starring_status_reader_v2_{role_suffix}");
+    let reader_v1_password = database_role_password();
+    let reader_v2_password = database_role_password();
+    for role in [&owner_role, &reader_v1_role, &reader_v2_role] {
         assert!(
             role.len() <= 63
                 && role
@@ -1089,19 +1091,25 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     .execute(&database.pool)
     .await
     .unwrap();
-    let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
-        .bind(&reader_password)
-        .fetch_one(&database.pool)
+    for (role, password) in [
+        (&reader_v1_role, &reader_v1_password),
+        (&reader_v2_role, &reader_v2_password),
+    ] {
+        let password_literal =
+            sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
+                .bind(password)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        sqlx::query(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD {password_literal} \
+             NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
+             NOBYPASSRLS CONNECTION LIMIT 4"
+        ))
+        .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query(&format!(
-        "CREATE ROLE {reader_role} LOGIN PASSWORD {password_literal} \
-         NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION \
-         NOBYPASSRLS CONNECTION LIMIT 4"
-    ))
-    .execute(&database.pool)
-    .await
-    .unwrap();
+    }
     for relation in [
         "product_control_plane_identity",
         "product_principals",
@@ -1127,11 +1135,16 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     for function in [
         "public.starring_product_deployment_status_reader_database_identity_v1()",
         "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.starring_product_deployment_status_reader_database_identity_v2()",
+        "public.starring_product_deployment_status_read_core_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.starring_product_deployment_status_read_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
         "public.validate_runtime_deployment_projection()",
+        "public.validate_runtime_convergence_attempt_projection()",
         "public.enforce_runtime_deployment_policy_shadow()",
         "public.guard_runtime_ruleset_artifact_transition()",
         "public.reject_runtime_deployment_delete()",
         "public.validate_runtime_attestation_projection()",
+        "public.validate_runtime_attestation_attempt_projection()",
         "public.reject_immutable_product_row()",
         "public.validate_runtime_serving_lease_transition()",
         "public.reject_runtime_serving_lease_delete()",
@@ -1157,15 +1170,17 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
         .execute(&database.pool)
         .await
         .unwrap();
+    for role in [&reader_v1_role, &reader_v2_role] {
+        sqlx::query(&format!(
+            "GRANT CONNECT ON DATABASE {} TO {role}",
+            database.name
+        ))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
     sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {} TO {reader_role}",
-        database.name
-    ))
-    .execute(&database.pool)
-    .await
-    .unwrap();
-    sqlx::query(&format!(
-        "GRANT USAGE ON SCHEMA public TO {owner_role}, {reader_role}"
+        "GRANT USAGE ON SCHEMA public TO {owner_role}, {reader_v1_role}, {reader_v2_role}"
     ))
     .execute(&database.pool)
     .await
@@ -1174,16 +1189,30 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
         "GRANT EXECUTE ON FUNCTION \
          public.starring_product_deployment_status_reader_database_identity_v1(), \
          public.starring_product_deployment_status_read_v1( \
-          TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_role}"
+          TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_v1_role}"
     ))
     .execute(&database.pool)
     .await
     .unwrap();
-    let reader_pool =
-        database_role_login_pool(&database.name, &reader_role, &reader_password).await;
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION \
+         public.starring_product_deployment_status_reader_database_identity_v2(), \
+         public.starring_product_deployment_status_read_v2( \
+          TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_v2_role}"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let reader_v1_pool =
+        database_role_login_pool(&database.name, &reader_v1_role, &reader_v1_password).await;
+    let reader_v2_pool =
+        database_role_login_pool(&database.name, &reader_v2_role, &reader_v2_password).await;
     let outcome = std::panic::AssertUnwindSafe(async {
-        let deployments = PostgresProductDeploymentStatuses::new(reader_pool.clone());
+        let deployments = PostgresProductDeploymentStatuses::new(reader_v1_pool.clone());
         deployments.verify_readiness().await.unwrap();
+        let operational_deployments = authoring_application_postgres::
+            PostgresProductDeploymentOperationalStatusesV2::new(reader_v2_pool.clone());
+        operational_deployments.verify_readiness().await.unwrap();
         let authentication = ClaimsAuthentication {
             claims: authoring_application::AuthenticationClaimsV1::from_authentication(
                 fixture.approver_principal.clone(),
@@ -1198,6 +1227,12 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
         };
         let application =
             ProductControlApplication::new(&authentication, &authority, &projected, &deployments);
+        let operational_application = ProductControlApplication::new(
+            &authentication,
+            &authority,
+            &projected,
+            &operational_deployments,
+        );
         let mut writer_lock = database.pool.begin().await.unwrap();
         sqlx::query(&format!("SET LOCAL ROLE {owner_role}"))
             .execute(&mut *writer_lock)
@@ -1227,9 +1262,37 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
             .unwrap(),
             DeploymentStatusV1::Pending
         );
+        let operational = tokio::time::timeout(
+            Duration::from_secs(1),
+            operational_application.get_deployment_operational_status_v2(
+                &fixture.credential,
+                &selector(&fixture),
+                authoring_application::RuntimeDeploymentQueryV1 {
+                    promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+                },
+            ),
+        )
+        .await
+        .expect("operational status reader must not wait for a runtime row lock")
+        .unwrap();
+        assert_eq!(operational.status(), &DeploymentStatusV1::Pending);
+        let operational_observation = operational.deployment().unwrap();
+        assert_eq!(
+            operational_observation.phase(),
+            authoring_application::DeploymentConvergencePhaseV2::Requested
+        );
+        assert_eq!(operational_observation.current_attempt(), 0);
+        assert_eq!(operational_observation.last_failure_attempt(), None);
+        assert_eq!(operational_observation.retry(), None);
+        assert_eq!(operational_observation.operator_action(), None);
+        assert_eq!(operational_observation.attestation(), None);
+        assert_eq!(
+            operational_observation.serving(),
+            authoring_application::DeploymentServingFreshnessV2::NotExpected
+        );
         writer_lock.rollback().await.unwrap();
         let raw_request = RawDeploymentStatusRequest::exact(&fixture, applied.exact_deployment());
-        let mut open_status_read = reader_pool.begin().await.unwrap();
+        let mut open_status_read = reader_v1_pool.begin().await.unwrap();
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
             .execute(&mut *open_status_read)
             .await
@@ -1281,19 +1344,31 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
             "CREATE TEMPORARY TABLE forbidden_status_temp (value INTEGER)",
             "CREATE SCHEMA forbidden_status_schema",
             "SELECT public.starring_product_apply_executor_database_identity_v1()",
+            "SELECT public.starring_product_deployment_status_reader_database_identity_v2()",
         ] {
-            assert_database_permission_denied(&reader_pool, statement).await;
+            assert_database_permission_denied(&reader_v1_pool, statement).await;
+        }
+        for statement in [
+            "SELECT deployment_id FROM public.runtime_deployments LIMIT 1",
+            "UPDATE public.runtime_deployments SET phase = phase WHERE FALSE",
+            "CREATE TABLE public.forbidden_operational_status_table (value INTEGER)",
+            "SELECT public.starring_product_deployment_status_reader_database_identity_v1()",
+            "SELECT * FROM public.starring_product_deployment_status_read_core_v2(\
+                'x','x','x','x','x','x','x','x','x'::BYTEA)",
+        ] {
+            assert_database_permission_denied(&reader_v2_pool, statement).await;
         }
     })
     .catch_unwind()
     .await;
-    reader_pool.close().await;
+    reader_v1_pool.close().await;
+    reader_v2_pool.close().await;
     database.pool.close().await;
     sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
         .execute(&mut database.administrator)
         .await
         .unwrap();
-    for role in [&reader_role, &owner_role] {
+    for role in [&reader_v1_role, &reader_v2_role, &owner_role] {
         sqlx::query(&format!("DROP ROLE {role}"))
             .execute(&mut database.administrator)
             .await

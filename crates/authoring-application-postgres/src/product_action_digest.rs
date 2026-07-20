@@ -24,6 +24,13 @@ pub struct ProductActionDigestKeyV1 {
 
 impl ProductActionDigestKeyV1 {
     pub fn from_bytes(key_id: &str, secret: [u8; 32]) -> Result<Self, ProductActionDigestKeyError> {
+        Self::from_zeroizing(key_id, Zeroizing::new(secret))
+    }
+
+    pub fn from_zeroizing(
+        key_id: &str,
+        secret: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, ProductActionDigestKeyError> {
         if key_id.is_empty()
             || key_id.len() > 64
             || !key_id.bytes().all(|byte| {
@@ -37,7 +44,7 @@ impl ProductActionDigestKeyV1 {
         }
         Ok(Self {
             key_id: key_id.to_string(),
-            secret: Zeroizing::new(secret),
+            secret,
         })
     }
 

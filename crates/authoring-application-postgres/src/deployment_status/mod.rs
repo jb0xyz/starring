@@ -12,12 +12,17 @@ use sqlx::postgres::PgPool;
 
 mod config;
 mod contract;
+mod operational;
 mod projection;
 mod query;
 mod readiness;
 mod row;
 
 pub use config::{PostgresProductDeploymentStatusesConfig, ProductDeploymentStatusConfigError};
+pub use operational::{
+    PostgresProductDeploymentOperationalStatusesV2,
+    ProductDeploymentOperationalStatusReadinessErrorV2,
+};
 pub use readiness::ProductDeploymentStatusReadinessErrorV1;
 
 use config::PostgresProductDeploymentStatusesConfig as StatusConfig;
