@@ -20,8 +20,8 @@ const REJECTION_QUERY: &str =
 
 #[derive(Clone)]
 pub struct PostgresProductRejections {
-    rejection_executor: PgPool,
-    config: PostgresProductDecisionsConfig,
+    pub(super) rejection_executor: PgPool,
+    pub(super) config: PostgresProductDecisionsConfig,
 }
 
 impl PostgresProductRejections {

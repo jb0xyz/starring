@@ -526,6 +526,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
 #[test]
 fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
     let rejection = include_str!("../src/product_decisions/reject.rs");
+    let rejection_contract = include_str!("../src/product_decisions/rejection_contract.rs");
+    let rejection_readiness = include_str!("../src/product_decisions/rejection_readiness.rs");
     let digest = include_str!("../src/product_decisions/digest.rs");
     let store = include_str!("../src/product_decisions/store.rs");
     let module = include_str!("../src/product_decisions/mod.rs");
@@ -560,6 +562,48 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
     }
     assert!(!rejection.contains(".bind(request.command().idempotency_key.as_str())"));
     assert!(!rejection.contains("activation_requests"));
+    for required in [
+        "public.starring_product_rejection_executor_database_identity_v1()",
+        "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
+        "public.starring_product_reject_v1(text,text,text,bigint",
+        "expected_rejection_reason text",
+        "TABLE(outcome text, resulting_revision bigint, resulting_state text, exact_replay boolean, guild_id text)",
+    ] {
+        assert!(
+            rejection_contract.contains(required),
+            "missing rejection contract guard: {required}"
+        );
+    }
+    for required in [
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 3]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 16]",
+        "ScopedFunctionContractV1::set_plpgsql_named(",
+        "verify_product_rejection_readiness",
+        "check_product_rejection_readiness",
+        "begin_scoped_database_readiness(",
+        "verify_scoped_executable_allowlist",
+        "verify_scoped_global_user_object_deny",
+        "verify_scoped_schema_trust",
+        "verify_approval_support_contract",
+        "load_scoped_database_topology",
+        "ScopedDatabaseProbeModeV1::SerializableReadWrite",
+        "starring_product_rejection_keyring_coverage_v1($1, $2)",
+        "LIMIT 2",
+        "idempotency_keyring_incomplete",
+        "outcome: \"invalid_input\"",
+        "transaction.rollback().await",
+    ] {
+        assert!(
+            rejection_readiness.contains(required),
+            "missing rejection readiness guard: {required}"
+        );
+    }
+    assert_eq!(
+        rejection_readiness
+            .matches("ScopedFunctionContractV1::set_plpgsql_named(")
+            .count(),
+        2
+    );
     let rejection_production = rejection.split("#[cfg(test)]").next().unwrap_or(rejection);
     assert_eq!(
         rejection_production
