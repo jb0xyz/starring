@@ -7,6 +7,7 @@ mod digest;
 mod envelope;
 mod installation_authority;
 mod product_action_digest;
+mod product_api_readiness;
 mod product_decisions;
 mod product_identity;
 mod product_promotions;
@@ -44,6 +45,7 @@ pub use product_action_digest::{
     ProductActionDigestKeyError, ProductActionDigestKeyV1, ProductActionDigestKeyringError,
     ProductActionDigestKeyringV1,
 };
+pub use product_api_readiness::{PostgresProductApiReadiness, ProductApiReadinessErrorV1};
 pub use product_decisions::{
     PostgresProductControl, PostgresProductDecisions, PostgresProductDecisionsConfig,
     PostgresProductRejections, ProductDecisionConfigError, ProductDecisionDatabasePoolsV1,

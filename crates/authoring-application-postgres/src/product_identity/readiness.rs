@@ -91,13 +91,20 @@ pub enum ProductIdentityReadinessErrorV1 {
 
 impl<G> PostgresProductIdentityStore<G> {
     pub async fn verify_readiness(&self) -> Result<(), ProductIdentityReadinessErrorV1> {
+        self.check_readiness().await.map(drop)
+    }
+
+    pub(crate) async fn check_readiness(
+        &self,
+    ) -> Result<[ScopedDatabaseTopologyV1; 4], ProductIdentityReadinessErrorV1> {
         let topologies = [
             self.check_oauth_flow_writer_readiness().await?,
             self.check_session_issuer_readiness().await?,
             self.check_session_api_readiness().await?,
             self.check_security_revoker_readiness().await?,
         ];
-        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
+        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)?;
+        Ok(topologies)
     }
 
     pub async fn verify_oauth_flow_writer_readiness(

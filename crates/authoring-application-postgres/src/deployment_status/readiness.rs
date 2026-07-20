@@ -1,8 +1,8 @@
 use crate::database_capability::{
     begin_scoped_database_readiness, load_scoped_database_topology,
     verify_scoped_executable_allowlist, verify_scoped_global_user_object_deny,
-    verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1, ScopedFunctionContractV1,
-    ScopedRelationContractV1,
+    verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1, ScopedDatabaseTopologyV1,
+    ScopedFunctionContractV1, ScopedRelationContractV1,
 };
 use crate::runtime_convergence_readiness::RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY;
 use crate::ProductDatabaseFailureV1;
@@ -346,6 +346,12 @@ pub enum ProductDeploymentStatusReadinessErrorV1 {
 
 impl PostgresProductDeploymentStatuses {
     pub async fn verify_readiness(&self) -> Result<(), ProductDeploymentStatusReadinessErrorV1> {
+        self.check_readiness().await.map(drop)
+    }
+
+    pub(crate) async fn check_readiness(
+        &self,
+    ) -> Result<ScopedDatabaseTopologyV1, ProductDeploymentStatusReadinessErrorV1> {
         let mut transaction = begin_scoped_database_readiness(
             &self.pool,
             &self.config.statement_timeout(),
@@ -376,7 +382,7 @@ impl PostgresProductDeploymentStatuses {
             transaction.rollback().await.map_err(readiness_database)?;
             return Err(ProductDeploymentStatusReadinessErrorV1::ContractMismatch);
         }
-        load_scoped_database_topology(&mut transaction, TOPOLOGY_QUERY)
+        let topology = load_scoped_database_topology(&mut transaction, TOPOLOGY_QUERY)
             .await
             .map_err(map_readiness)?;
         let probe_count = sqlx::query_scalar::<_, i64>(
@@ -394,7 +400,7 @@ impl PostgresProductDeploymentStatuses {
             return Err(ProductDeploymentStatusReadinessErrorV1::ContractMismatch);
         }
         transaction.commit().await.map_err(readiness_database)?;
-        Ok(())
+        Ok(topology)
     }
 }
 

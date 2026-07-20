@@ -8,7 +8,7 @@ use authoring_application::{
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use sqlx::postgres::PgPool;
 
-use crate::database_capability::verify_same_database_distinct_roles;
+use crate::database_capability::{verify_same_database_distinct_roles, ScopedDatabaseTopologyV1};
 use crate::product_action_digest::ProductActionDigestKeyringV1;
 
 use super::config::{PostgresProductDecisionsConfig, ProductDecisionConfigError};
@@ -47,13 +47,20 @@ impl PostgresProductControl {
     }
 
     pub async fn verify_readiness(&self) -> Result<(), ProductDecisionReadinessErrorV1> {
+        self.check_readiness().await.map(drop)
+    }
+
+    pub(crate) async fn check_readiness(
+        &self,
+    ) -> Result<[ScopedDatabaseTopologyV1; 4], ProductDecisionReadinessErrorV1> {
         let topologies = [
             self.decisions.check_decision_reader_readiness().await?,
             self.decisions.check_approval_executor_readiness().await?,
             self.rejections.check_product_rejection_readiness().await?,
             self.decisions.check_apply_executor_readiness().await?,
         ];
-        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)
+        verify_same_database_distinct_roles(&topologies).map_err(map_readiness)?;
+        Ok(topologies)
     }
 }
 
