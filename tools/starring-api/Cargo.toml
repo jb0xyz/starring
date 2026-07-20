@@ -12,6 +12,7 @@ authoring-promotion = { path = "../../crates/authoring-promotion" }
 automation-ruleset = { path = "../../crates/automation-ruleset" }
 chrono = "0.4"
 product-control-http = { path = "../../crates/product-control-http" }
+thiserror.workspace = true
 
 [dev-dependencies]
 discord-model = { path = "../../crates/discord-model" }

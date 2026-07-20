@@ -9,8 +9,9 @@ pub use error::{
     map_product_application_error, map_product_control_error, map_product_identity_error,
 };
 pub use facade::{
-    ProductionAuthorityDependenciesV1, ProductionIdentityDependenciesV1,
-    ProductionPersistenceDependenciesV1, ProductionProductControlFacadeV1,
+    ProductionAuthorityDependenciesV1, ProductionFacadeConfigurationErrorV1,
+    ProductionIdentityDependenciesV1, ProductionPersistenceDependenciesV1,
+    ProductionProductControlFacadeV1,
 };
 pub use input::{
     map_apply_command, map_approve_command, map_discord_authorization_code,

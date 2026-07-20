@@ -46,6 +46,14 @@ type ProductionAuthority = DiscordGuildAuthorityAdapter<
     TwilightDiscordGuildAuthorityClient,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProductionFacadeConfigurationErrorV1 {
+    #[error("product identity and Discord OAuth redirect configuration differs")]
+    OAuthRedirectMismatch,
+    #[error("default OAuth return path is not allowed")]
+    DefaultReturnPathNotAllowed,
+}
+
 pub struct ProductionIdentityDependenciesV1 {
     identity: ProductionIdentityStore,
     oauth: DiscordOAuthClient,
@@ -59,13 +67,19 @@ impl ProductionIdentityDependenciesV1 {
         oauth: DiscordOAuthClient,
         oauth_client_secret: DiscordOAuthClientSecretV1,
         default_return_path: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProductionFacadeConfigurationErrorV1> {
+        if identity.oauth_redirect_uri() != oauth.redirect_uri() {
+            return Err(ProductionFacadeConfigurationErrorV1::OAuthRedirectMismatch);
+        }
+        if !identity.allows_return_path(&default_return_path) {
+            return Err(ProductionFacadeConfigurationErrorV1::DefaultReturnPathNotAllowed);
+        }
+        Ok(Self {
             identity,
             oauth,
             oauth_client_secret,
             default_return_path,
-        }
+        })
     }
 }
 

@@ -85,6 +85,14 @@ impl<G> PostgresProductIdentityStore<G> {
             self.config.lifetimes().authentication(),
         )
     }
+
+    pub fn oauth_redirect_uri(&self) -> &str {
+        self.config.redirect_uri()
+    }
+
+    pub fn allows_return_path(&self, return_path: &str) -> bool {
+        self.config.allows_return_path(return_path)
+    }
 }
 
 impl<G> PostgresProductIdentityStore<G>

@@ -3105,6 +3105,7 @@ dependencies = [
  "discord-model",
  "product-control-http",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
