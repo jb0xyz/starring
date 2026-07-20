@@ -193,9 +193,24 @@ fn promotion_migration_is_fail_closed_and_scoped() {
         .split("$function$;")
         .next()
         .unwrap();
-    assert!(repair_body.contains("RETURN QUERY SELECT 'persistence_corrupt'"));
-    assert!(!repair_body.contains("INSERT INTO"));
-    assert!(!repair_body.contains("UPDATE public."));
+    for required in [
+        "starring_product_promotion_authorize_current_v1",
+        "FOR UPDATE",
+        "starring.product_promotion_legacy_repair_gate",
+        "UPDATE public.authoring_promotions",
+        "UPDATE public.activation_requests",
+        "starring_product_promotion_finalize_receipt_v1",
+        "'recovered'",
+        "'final_replay_required'",
+    ] {
+        assert!(
+            repair_body.contains(required),
+            "missing repair guard: {required}"
+        );
+    }
+    assert!(!repair_body.contains("INSERT INTO public.automation_ruleset_versions"));
+    assert!(!repair_body.contains("INSERT INTO public.activation_requests"));
+    assert!(!repair_body.contains("UPDATE public.automation_ruleset_activations"));
     assert!(!repair_body.contains("DELETE FROM"));
 
     for helper in [

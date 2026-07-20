@@ -45,6 +45,7 @@ use crate::product_promotions::store::PostgresProductPromotions;
 use crate::MIGRATOR;
 
 mod orchestrator_e2e;
+mod repair_e2e;
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.promotion.idempotency.v1";
 const SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.promotion.request.v1";
@@ -624,7 +625,7 @@ fn validate_admitted(admitted: &ProductPromotionAdmittedStageV1, case: &Prepared
     assert_eq!(admitted.admission_digest, case.admission.digest);
     assert_eq!(
         admitted.admission.payload.idempotency_digest_key_id,
-        "active-v2"
+        case.admission.payload.idempotency_digest_key_id
     );
     assert_eq!(
         admitted.admission.payload.idempotency_key_digest,
