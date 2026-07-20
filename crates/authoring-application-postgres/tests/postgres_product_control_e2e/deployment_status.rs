@@ -110,6 +110,22 @@ impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for RecordingDeployme
     }
 }
 
+impl DeploymentStatusObservationPort<FreshDiscordAuthorityEvidenceV1>
+    for RecordingDeploymentStatuses
+{
+    async fn load_exact_deployment_observation(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
+        let evidence = request.evidence();
+        self.authority_windows.lock().unwrap().push((
+            evidence.capability(),
+            (evidence.expires_at() - evidence.observed_at()).num_milliseconds(),
+        ));
+        self.inner.load_exact_deployment_observation(request).await
+    }
+}
+
 #[derive(Clone)]
 struct ProjectedDecision {
     projection: ProductDecisionProjectionV1,
@@ -534,6 +550,38 @@ async fn product_status_requires_exact_attestation_and_connected_unexpired_servi
             attestation_revision: NonZeroU64::new(live.snapshot.revision.get()).unwrap(),
         }
     );
+    let live_observation = application
+        .get_deployment_status_observation(
+            &fixture.credential,
+            &selector(&fixture),
+            authoring_application::RuntimeDeploymentQueryV1 {
+                promotion: PromotionSelectorV1::new(fixture.promotion_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live_observation.status(),
+        &DeploymentStatusV1::Live {
+            attestation_revision: NonZeroU64::new(live.snapshot.revision.get()).unwrap(),
+        }
+    );
+    assert_eq!(live_observation.decision().revision().get(), 4);
+    assert!(matches!(
+        live_observation.decision().phase(),
+        ProductDecisionPhaseV1::Applied { .. }
+    ));
+    let runtime_observation = live_observation.deployment().unwrap();
+    assert_eq!(
+        runtime_observation.last_heartbeat_at(),
+        Some(serving.last_heartbeat_at.into())
+    );
+    assert_eq!(
+        runtime_observation.lease_expires_at(),
+        Some(serving.expires_at.into())
+    );
+    assert!(runtime_observation.observed_at() >= live_observation.decision_observed_at());
+    assert!(runtime_observation.observed_at() < SystemTime::from(serving.expires_at));
     tokio::time::sleep(Duration::from_millis(2_200)).await;
     assert_eq!(
         application
@@ -955,11 +1003,12 @@ async fn product_status_reader_denies_enumeration_and_inactive_session_state() {
         .unwrap();
     sqlx::query(
         "UPDATE public.product_auth_sessions \
-         SET authenticated_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
-             created_at = pg_catalog.clock_timestamp() - INTERVAL '2 hours', \
-             last_seen_at = pg_catalog.clock_timestamp() - INTERVAL '90 minutes', \
-             idle_expires_at = pg_catalog.clock_timestamp() - INTERVAL '80 minutes', \
-             absolute_expires_at = pg_catalog.clock_timestamp() - INTERVAL '60 minutes' \
+         SET authenticated_at = observation.captured_at - INTERVAL '2 hours', \
+             created_at = observation.captured_at - INTERVAL '2 hours', \
+             last_seen_at = observation.captured_at - INTERVAL '90 minutes', \
+             idle_expires_at = observation.captured_at - INTERVAL '80 minutes', \
+             absolute_expires_at = observation.captured_at - INTERVAL '60 minutes' \
+         FROM (SELECT pg_catalog.clock_timestamp() AS captured_at) AS observation \
          WHERE session_digest = $1",
     )
     .bind(request.product_session_digest.as_slice())
@@ -1179,10 +1228,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
             DeploymentStatusV1::Pending
         );
         writer_lock.rollback().await.unwrap();
-        let raw_request = RawDeploymentStatusRequest::exact(
-            &fixture,
-            applied.exact_deployment(),
-        );
+        let raw_request = RawDeploymentStatusRequest::exact(&fixture, applied.exact_deployment());
         let mut open_status_read = reader_pool.begin().await.unwrap();
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
             .execute(&mut *open_status_read)

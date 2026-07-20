@@ -13,6 +13,7 @@ use resource_resolution::{
 };
 use serde_json::Value;
 use sqlx::types::Json;
+use std::time::SystemTime;
 
 use crate::bindings::decode_resource_bindings;
 
@@ -75,6 +76,8 @@ pub(crate) struct ProductDecisionRow {
 pub(crate) struct ValidatedDecisionRow {
     pub preview: ProductApprovalPreviewV1,
     pub projection: ProductDecisionProjectionV1,
+    pub activation_expires_at: SystemTime,
+    pub observed_at: SystemTime,
 }
 
 pub(crate) fn validate_decision_row(
@@ -123,6 +126,8 @@ pub(crate) fn validate_decision_row(
     Ok(ValidatedDecisionRow {
         preview,
         projection,
+        activation_expires_at: row.activation_expires_at.into(),
+        observed_at: row.database_now.into(),
     })
 }
 

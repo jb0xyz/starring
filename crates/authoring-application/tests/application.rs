@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
@@ -11,26 +12,30 @@ use authoring_application::{
     AuthorizedProductStatusV1, AuthorizedPromotionAccessV1, AuthorizedPromotionSnapshotError,
     AuthorizedPromotionSnapshotPort, AuthorizedPromotionSnapshotV1,
     AuthorizedPromotionSubmissionErrorV1, AuthorizedPromotionSubmissionPort,
-    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
-    DeploymentStatusPortError, DeploymentStatusProjectionV1, ExactDeploymentSelectorV1,
-    ExactLiveProjectionV1, FreshGuildAuthorityError, FreshGuildAuthorityPort,
-    InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
-    ProductApprovalPort, ProductApprovalPreviewV1, ProductCandidateErrorCodeV1,
-    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
-    ProductDecisionPort, ProductDecisionProjectionV1, ProductDecisionQueryPort,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductPromotionIdempotencyKeyError,
-    ProductPromotionIdempotencyKeyV1, ProductRejectionPort, ProductRequestIdError,
-    ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
-    PromoteOwnedSessionV1, PromotionSubmissionDispositionV1, PromotionSubmissionPort,
-    PromotionSubmissionV1, RejectProductPromotionV1, RejectionReasonError, RejectionReasonV1,
-    ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
+    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1,
+    DeploymentFailureCodeV1, DeploymentStatusObservationPort, DeploymentStatusObservationV1,
+    DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
+    ExactDeploymentSelectorV1, ExactLiveProjectionV1, FreshGuildAuthorityError,
+    FreshGuildAuthorityPort, InstallationSelectorV1, MutationAuthenticationPort,
+    ProductApplicationError, ProductApplyPort, ProductApprovalPort,
+    ProductApprovalPreviewObservationV1, ProductApprovalPreviewV1, ProductCandidateErrorCodeV1,
+    ProductControlApplication, ProductControlPortError, ProductDecisionObservationPort,
+    ProductDecisionObservationV1, ProductDecisionPhaseV1, ProductDecisionPort,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductIdempotencyKeyV1,
+    ProductMutationReceiptV1, ProductPromotionIdempotencyKeyError,
+    ProductPromotionIdempotencyKeyV1, ProductPromotionStateV1, ProductRejectionPort,
+    ProductRequestIdError, ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1,
+    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionDispositionV1,
+    PromotionSubmissionPort, PromotionSubmissionV1, RejectProductPromotionV1, RejectionReasonError,
+    RejectionReasonV1, ResolvedPromotionAuthorityV1, RuntimeDeploymentQueryV1,
 };
 use authoring_promotion::{
-    ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId,
-    BindingRevision, EnsurePendingActivationV1, IdempotencyKey, InMemoryPromotionStore,
-    PendingActivationDispositionV1, PendingActivationPort, PendingActivationPortError,
-    PendingActivationReceiptV1, PolicyRevision, PrincipalId, PromotionId, PromotionService,
-    ResolveProductApprovalContextV1, ResolvedProductApprovalContextV1, SessionGeneration,
+    approval_payload_digest_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
+    AuthoringSessionId, AutomationInstallationId, BindingRevision, EnsurePendingActivationV1,
+    IdempotencyKey, InMemoryPromotionStore, PendingActivationDispositionV1, PendingActivationPort,
+    PendingActivationPortError, PendingActivationReceiptV1, PolicyRevision, PrincipalId,
+    PromotionId, PromotionService, ResolveProductApprovalContextV1,
+    ResolvedProductApprovalContextV1, ResumePromotionOutcomeV1, SessionGeneration,
     StartPromotionV1, TenantId, UtcPromotionClock,
 };
 use automation_ruleset::InMemoryRuleSetStore;
@@ -271,8 +276,17 @@ struct PromotionCapture {
     access: Mutex<Option<CapturedPromotionAccess>>,
     captured: Mutex<Option<CapturedPromotion>>,
     failure: Option<AuthorizedPromotionSubmissionErrorV1>,
-    wrong_projection: bool,
+    fault: PromotionCaptureFault,
     replay_artifact: Option<PreviewReadyArtifactV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromotionCaptureFault {
+    None,
+    SubmitAuthority,
+    SubmitIdentity,
+    ReplayIdentity,
+    ReplayDisposition,
 }
 
 struct PendingPipeline {
@@ -377,9 +391,13 @@ impl AuthorizedPromotionSubmissionPort<Evidence> for PromotionCapture {
         let Some(artifact) = &self.replay_artifact else {
             return Ok(None);
         };
-        let idempotency_key = access.with_product_idempotency_secret(|secret| {
-            IdempotencyKey::parse(std::str::from_utf8(secret).unwrap()).unwrap()
-        });
+        let idempotency_key = if self.fault == PromotionCaptureFault::ReplayIdentity {
+            IdempotencyKey::parse("different-promotion-key").unwrap()
+        } else {
+            access.with_product_idempotency_secret(|secret| {
+                IdempotencyKey::parse(std::str::from_utf8(secret).unwrap()).unwrap()
+            })
+        };
         let input = StartPromotionV1 {
             idempotency_key,
             context: AuthenticatedPromotionContext {
@@ -402,7 +420,9 @@ impl AuthorizedPromotionSubmissionPort<Evidence> for PromotionCapture {
             artifact: artifact.clone(),
         };
         let mut submission = run_test_promotion(input).await?;
-        submission.disposition = PromotionSubmissionDispositionV1::ExactReplay;
+        if self.fault != PromotionCaptureFault::ReplayDisposition {
+            submission.disposition = PromotionSubmissionDispositionV1::ExactReplay;
+        }
         Ok(Some(submission))
     }
 
@@ -428,8 +448,16 @@ impl AuthorizedPromotionSubmissionPort<Evidence> for PromotionCapture {
             return Err(error.clone());
         }
         let mut input = request.into_input();
-        if self.wrong_projection {
-            input.context.tenant_id = TenantId::parse("tenant-wrong").unwrap();
+        match self.fault {
+            PromotionCaptureFault::SubmitAuthority => {
+                input.context.tenant_id = TenantId::parse("tenant-wrong").unwrap();
+            }
+            PromotionCaptureFault::SubmitIdentity => {
+                input.idempotency_key = IdempotencyKey::parse("different-promotion-key").unwrap();
+            }
+            PromotionCaptureFault::None
+            | PromotionCaptureFault::ReplayIdentity
+            | PromotionCaptureFault::ReplayDisposition => {}
         }
         run_test_promotion(input).await
     }
@@ -445,6 +473,57 @@ async fn run_test_promotion(
     PromotionSubmissionPort::submit_verified_promotion(&service, input)
         .await
         .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)
+}
+
+async fn run_expired_test_promotion(
+    input: StartPromotionV1,
+) -> Result<PromotionSubmissionV1, AuthorizedPromotionSubmissionErrorV1> {
+    let submission = run_test_promotion(input).await?;
+    let mut record = match submission.advancement {
+        ResumePromotionOutcomeV1::Advanced(record)
+        | ResumePromotionOutcomeV1::AlreadyActivationPending(record)
+        | ResumePromotionOutcomeV1::TerminalExpired(record) => record,
+    };
+    let (publication, mut activation) = match record.stage {
+        authoring_promotion::PromotionStageV1::ActivationPending {
+            publication,
+            activation,
+        } => (publication, activation),
+        _ => return Err(AuthorizedPromotionSubmissionErrorV1::InvalidCandidate),
+    };
+    activation.disposition = PendingActivationDispositionV1::Reused;
+    activation.request_state_at_journal =
+        automation_ruleset_activation::ActivationRequestState::Expired;
+    record.updated_at = activation.expires_at;
+    record.stage = authoring_promotion::PromotionStageV1::Expired {
+        publication,
+        activation,
+    };
+    record
+        .validate()
+        .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)?;
+    Ok(PromotionSubmissionV1 {
+        disposition: submission.disposition,
+        advancement: ResumePromotionOutcomeV1::TerminalExpired(record),
+    })
+}
+
+struct ExpiredPromotionCapture;
+
+impl AuthorizedPromotionSubmissionPort<Evidence> for ExpiredPromotionCapture {
+    async fn find_or_resume_authorized_promotion(
+        &self,
+        _access: &AuthorizedPromotionAccessV1<'_, Evidence>,
+    ) -> Result<Option<PromotionSubmissionV1>, AuthorizedPromotionSubmissionErrorV1> {
+        Ok(None)
+    }
+
+    async fn submit_authorized_promotion(
+        &self,
+        request: AuthorizedPromotionSubmissionV1<'_, Evidence>,
+    ) -> Result<PromotionSubmissionV1, AuthorizedPromotionSubmissionErrorV1> {
+        run_expired_test_promotion(request.into_input()).await
+    }
 }
 
 fn installation() -> InstallationSelectorV1 {
@@ -505,7 +584,7 @@ fn promotion_orders_authentication_fresh_authority_atomic_snapshot_and_submissio
             access: Mutex::new(None),
             captured: Mutex::new(None),
             failure: None,
-            wrong_projection: false,
+            fault: PromotionCaptureFault::None,
             replay_artifact: None,
         };
         AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
@@ -567,6 +646,139 @@ fn promotion_orders_authentication_fresh_authority_atomic_snapshot_and_submissio
 }
 
 #[test]
+fn promotion_observation_projects_exact_created_metadata() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events,
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            fault: PromotionCaptureFault::None,
+            replay_artifact: None,
+        };
+        let observation =
+            AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+                .promote_owned_session_observation(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    promote_command(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(observation.revision(), 3);
+        assert_eq!(
+            observation.state(),
+            ProductPromotionStateV1::ActivationLinked
+        );
+        assert!(!observation.exact_replay());
+        assert_eq!(observation.target_version(), 1);
+        assert_eq!(observation.target_content_hash().len(), 64);
+        assert_eq!(observation.approval_payload_digest().as_str().len(), 64);
+        assert_eq!(observation.promotion_id().as_str().len(), 64);
+        assert!(observation.activation_expires_at() > SystemTime::now());
+    });
+}
+
+#[test]
+fn promotion_observation_preserves_exact_replay_metadata() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let replay_artifact = artifact().await;
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: replay_artifact.clone(),
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events,
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            fault: PromotionCaptureFault::None,
+            replay_artifact: Some(replay_artifact),
+        };
+        let observation =
+            AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+                .promote_owned_session_observation(
+                    "opaque-session-token",
+                    "csrf-proof",
+                    &product_request_id(),
+                    &installation(),
+                    promote_command(),
+                )
+                .await
+                .unwrap();
+        assert!(observation.exact_replay());
+        assert_eq!(observation.revision(), 3);
+        assert_eq!(
+            observation.state(),
+            ProductPromotionStateV1::ActivationLinked
+        );
+    });
+}
+
+#[test]
+fn promotion_observation_projects_expired_terminal_metadata() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events,
+        };
+        let observation = AuthoringApplication::new(
+            &authentication,
+            &authority,
+            &snapshots,
+            &ExpiredPromotionCapture,
+        )
+        .promote_owned_session_observation(
+            "opaque-session-token",
+            "csrf-proof",
+            &product_request_id(),
+            &installation(),
+            promote_command(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observation.revision(), 3);
+        assert_eq!(observation.state(), ProductPromotionStateV1::Expired);
+        assert!(!observation.exact_replay());
+        assert_eq!(observation.target_version(), 1);
+        assert_eq!(observation.target_content_hash().len(), 64);
+    });
+}
+
+#[test]
 fn exact_replay_resumes_before_snapshot_and_skips_new_submission() {
     block_on(async {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -588,7 +800,7 @@ fn exact_replay_resumes_before_snapshot_and_skips_new_submission() {
             access: Mutex::new(None),
             captured: Mutex::new(None),
             failure: None,
-            wrong_projection: false,
+            fault: PromotionCaptureFault::None,
             replay_artifact: Some(replay_artifact),
         };
         let output =
@@ -615,6 +827,60 @@ fn exact_replay_resumes_before_snapshot_and_skips_new_submission() {
         assert_eq!(access.session_id, "session-1");
         assert_eq!(access.expected_generation, 7);
         assert!(promotions.captured.lock().unwrap().is_none());
+    });
+}
+
+#[test]
+fn replay_requires_exact_disposition_and_deterministic_identity_without_snapshot_access() {
+    block_on(async {
+        for fault in [
+            PromotionCaptureFault::ReplayIdentity,
+            PromotionCaptureFault::ReplayDisposition,
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let replay_artifact = artifact().await;
+            let authentication = Authentication {
+                events: events.clone(),
+                failure: None,
+            };
+            let authority = GuildAuthority {
+                events: events.clone(),
+                failure: None,
+            };
+            let snapshots = AuthorizedSnapshot {
+                artifact: replay_artifact.clone(),
+                events: events.clone(),
+            };
+            let promotions = PromotionCapture {
+                events: events.clone(),
+                access: Mutex::new(None),
+                captured: Mutex::new(None),
+                failure: None,
+                fault,
+                replay_artifact: Some(replay_artifact),
+            };
+            let error =
+                AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+                    .promote_owned_session_observation(
+                        "opaque-session-token",
+                        "csrf-proof",
+                        &product_request_id(),
+                        &installation(),
+                        promote_command(),
+                    )
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                AuthoringApplicationError::AuthorizedPromotion(
+                    AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+                )
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["authenticate_mutation", "authorize", "resume"]
+            );
+        }
     });
 }
 
@@ -651,7 +917,7 @@ fn authentication_and_authority_failures_stop_every_downstream_port() {
                 access: Mutex::new(None),
                 captured: Mutex::new(None),
                 failure: None,
-                wrong_projection: false,
+                fault: PromotionCaptureFault::None,
                 replay_artifact: None,
             };
             assert!(AuthoringApplication::new(
@@ -697,7 +963,7 @@ fn invalid_csrf_stops_before_authority_and_snapshot_access() {
             access: Mutex::new(None),
             captured: Mutex::new(None),
             failure: None,
-            wrong_projection: false,
+            fault: PromotionCaptureFault::None,
             replay_artifact: None,
         };
         let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
@@ -741,7 +1007,7 @@ fn authorized_promotion_error_propagates_without_losing_the_authenticated_bounda
             access: Mutex::new(None),
             captured: Mutex::new(None),
             failure: Some(AuthorizedPromotionSubmissionErrorV1::Indeterminate),
-            wrong_projection: false,
+            fault: PromotionCaptureFault::None,
             replay_artifact: None,
         };
         let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
@@ -798,7 +1064,7 @@ fn valid_but_wrong_final_promotion_projection_is_rejected() {
             access: Mutex::new(None),
             captured: Mutex::new(None),
             failure: None,
-            wrong_projection: true,
+            fault: PromotionCaptureFault::SubmitAuthority,
             replay_artifact: None,
         };
         let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
@@ -814,7 +1080,7 @@ fn valid_but_wrong_final_promotion_projection_is_rejected() {
         assert_eq!(
             error,
             AuthoringApplicationError::AuthorizedPromotion(
-                AuthorizedPromotionSubmissionErrorV1::ScopeMismatch
+                AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
             )
         );
         let captured = promotions.captured.lock().unwrap().take().unwrap();
@@ -822,643 +1088,52 @@ fn valid_but_wrong_final_promotion_projection_is_rejected() {
     });
 }
 
-fn promotion_id() -> PromotionId {
-    PromotionId::parse(&"a".repeat(64)).unwrap()
+#[test]
+fn valid_submission_with_different_identity_and_request_digest_is_rejected() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = GuildAuthority {
+            events: events.clone(),
+            failure: None,
+        };
+        let snapshots = AuthorizedSnapshot {
+            artifact: artifact().await,
+            events: events.clone(),
+        };
+        let promotions = PromotionCapture {
+            events,
+            access: Mutex::new(None),
+            captured: Mutex::new(None),
+            failure: None,
+            fault: PromotionCaptureFault::SubmitIdentity,
+            replay_artifact: None,
+        };
+        let error = AuthoringApplication::new(&authentication, &authority, &snapshots, &promotions)
+            .promote_owned_session(
+                "opaque-session-token",
+                "csrf-proof",
+                &product_request_id(),
+                &installation(),
+                promote_command(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AuthoringApplicationError::AuthorizedPromotion(
+                AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt
+            )
+        );
+    });
 }
 
 fn product_request_id() -> ProductRequestIdV1 {
     ProductRequestIdV1::parse("req_01JZ7QW9YB2G8M4K6T3P5R1C0D").unwrap()
 }
 
-fn approve_command() -> ApproveProductPromotionV1 {
-    ApproveProductPromotionV1 {
-        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap(),
-        expected_revision: ProductRevisionV1::new(3).unwrap(),
-        idempotency_key: ProductIdempotencyKeyV1::parse("approve-key").unwrap(),
-    }
-}
-
-#[test]
-fn product_request_id_is_bounded_validated_and_redacted() {
-    assert_eq!(
-        ProductRequestIdV1::parse("").unwrap_err(),
-        ProductRequestIdError::Empty
-    );
-    assert_eq!(
-        ProductRequestIdV1::parse(&"a".repeat(129)).unwrap_err(),
-        ProductRequestIdError::TooLong
-    );
-    for invalid in ["request id", "요청", "request/id", "request\n"] {
-        assert_eq!(
-            ProductRequestIdV1::parse(invalid).unwrap_err(),
-            ProductRequestIdError::InvalidCharacter
-        );
-    }
-    let request_id = product_request_id();
-    assert_eq!(request_id.as_str(), "req_01JZ7QW9YB2G8M4K6T3P5R1C0D");
-    let debug = format!("{request_id:?}");
-    assert_eq!(debug, "ProductRequestIdV1(<redacted>)");
-    assert!(!debug.contains(request_id.as_str()));
-}
-
-fn exact_deployment() -> ExactDeploymentSelectorV1 {
-    ExactDeploymentSelectorV1::from_server_projection(
-        AutomationInstallationId::parse("installation-2").unwrap(),
-        promotion_id(),
-        "deployment-1",
-        "b".repeat(64),
-    )
-    .unwrap()
-}
-
-fn decision_projection(phase: ProductDecisionPhaseV1) -> ProductDecisionProjectionV1 {
-    ProductDecisionProjectionV1::from_server_projection(
-        TenantId::parse("tenant-1").unwrap(),
-        AutomationInstallationId::parse("installation-2").unwrap(),
-        GuildId(900),
-        promotion_id(),
-        ProductRevisionV1::new(4).unwrap(),
-        phase,
-    )
-}
-
-struct Decisions {
-    events: Arc<Mutex<Vec<&'static str>>>,
-    phase: Mutex<ProductDecisionPhaseV1>,
-    apply_phase: Mutex<ProductDecisionPhaseV1>,
-    apply_exact_replay: Mutex<bool>,
-}
-
-impl ProductDecisionQueryPort<Evidence> for Decisions {
-    async fn load_approval_preview(
-        &self,
-        _request: AuthorizedApprovalPreviewV1<'_, Evidence>,
-    ) -> Result<ProductApprovalPreviewV1, ProductControlPortError> {
-        panic!("preview is not used by this fixture")
-    }
-
-    async fn load_product_status(
-        &self,
-        request: AuthorizedProductStatusV1<'_, Evidence>,
-    ) -> Result<ProductDecisionProjectionV1, ProductControlPortError> {
-        self.events.lock().unwrap().push("decision_status");
-        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
-        assert_eq!(request.scope().acting_user_id(), UserId(200));
-        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
-        assert_eq!(request.promotion().promotion_id(), &promotion_id());
-        Ok(decision_projection(self.phase.lock().unwrap().clone()))
-    }
-}
-
-impl ProductApprovalPort<Evidence> for Decisions {
-    async fn approve_payload_bound(
-        &self,
-        request: AuthorizedApproveProductV1<'_, Evidence>,
-    ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
-        self.events.lock().unwrap().push("approve_payload_bound");
-        assert_eq!(request.request_id(), &product_request_id());
-        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
-        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
-        assert_eq!(request.scope().acting_user_id(), UserId(200));
-        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
-        assert_eq!(
-            format!("{:?}", request.context()),
-            "ProductMutationContextV1(<redacted>)"
-        );
-        assert_eq!(
-            request.command().expected_payload_digest.as_str(),
-            "c".repeat(64)
-        );
-        assert_eq!(request.command().expected_revision.get(), 3);
-        assert_eq!(request.command().idempotency_key.as_str(), "approve-key");
-        Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(self.phase.lock().unwrap().clone()),
-            false,
-        ))
-    }
-}
-
-impl ProductRejectionPort<Evidence> for Decisions {
-    async fn reject_payload_bound(
-        &self,
-        request: AuthorizedRejectProductV1<'_, Evidence>,
-    ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
-        self.events.lock().unwrap().push("reject_payload_bound");
-        assert_eq!(request.request_id(), &product_request_id());
-        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
-        assert_eq!(request.scope().acting_user_id(), UserId(200));
-        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
-        assert_eq!(request.command().reason.as_str(), "unsafe requested scope");
-        assert_eq!(request.command().idempotency_key.as_str(), "reject-key");
-        Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(ProductDecisionPhaseV1::Rejected),
-            false,
-        ))
-    }
-}
-
-impl ProductApplyPort<Evidence> for Decisions {
-    async fn apply_idempotent(
-        &self,
-        request: AuthorizedApplyProductV1<'_, Evidence>,
-    ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
-        self.events.lock().unwrap().push("apply_idempotent");
-        assert_eq!(request.request_id(), &product_request_id());
-        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
-        assert_eq!(request.session_fingerprint().as_bytes(), &[7_u8; 32]);
-        assert_eq!(request.scope().acting_user_id(), UserId(200));
-        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
-        assert_eq!(
-            request.command().expected_payload_digest.as_str(),
-            "c".repeat(64)
-        );
-        assert_eq!(request.command().expected_revision.get(), 3);
-        assert_eq!(request.command().idempotency_key.as_str(), "apply-key");
-        Ok(ProductMutationReceiptV1::from_server_projection(
-            decision_projection(self.apply_phase.lock().unwrap().clone()),
-            *self.apply_exact_replay.lock().unwrap(),
-        ))
-    }
-}
-
-fn assert_compatibility_decision_port<T: ProductDecisionPort<Evidence>>() {}
-
-struct Deployments {
-    events: Arc<Mutex<Vec<&'static str>>>,
-    status: Mutex<DeploymentStatusProjectionV1>,
-}
-
-impl DeploymentStatusPort<Evidence> for Deployments {
-    async fn load_exact_deployment_status(
-        &self,
-        request: AuthorizedDeploymentStatusV1<'_, Evidence>,
-    ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
-        self.events.lock().unwrap().push("deployment_status");
-        assert_eq!(request.actor().principal_id().as_str(), "principal-1");
-        assert_eq!(request.scope().installation_id().as_str(), "installation-2");
-        assert_eq!(request.evidence(), &Evidence("fresh-authority-evidence"));
-        assert_eq!(request.exact_deployment(), &exact_deployment());
-        Ok(self.status.lock().unwrap().clone())
-    }
-}
-
-fn product_fixture(
-    phase: ProductDecisionPhaseV1,
-    deployment: DeploymentStatusProjectionV1,
-) -> (
-    Arc<Mutex<Vec<&'static str>>>,
-    Authentication,
-    GuildAuthority,
-    Decisions,
-    Deployments,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    (
-        events.clone(),
-        Authentication {
-            events: events.clone(),
-            failure: None,
-        },
-        GuildAuthority {
-            events: events.clone(),
-            failure: None,
-        },
-        Decisions {
-            events: events.clone(),
-            phase: Mutex::new(phase),
-            apply_phase: Mutex::new(ProductDecisionPhaseV1::Applied {
-                exact_deployment: exact_deployment(),
-            }),
-            apply_exact_replay: Mutex::new(false),
-        },
-        Deployments {
-            events: events.clone(),
-            status: Mutex::new(deployment),
-        },
-    )
-}
-
-#[test]
-fn approval_supports_pending_quorum_and_approved_outcomes() {
-    block_on(async {
-        assert_compatibility_decision_port::<Decisions>();
-        for phase in [
-            ProductDecisionPhaseV1::PendingApproval,
-            ProductDecisionPhaseV1::Approved,
-        ] {
-            let (events, authentication, authority, decisions, deployments) =
-                product_fixture(phase.clone(), DeploymentStatusProjectionV1::NotRequested);
-            let application = ProductControlApplication::new(
-                &authentication,
-                &authority,
-                &decisions,
-                &deployments,
-            );
-            let receipt = application
-                .approve(
-                    "opaque-session-token",
-                    "csrf-proof",
-                    &product_request_id(),
-                    &installation(),
-                    approve_command(),
-                )
-                .await
-                .unwrap();
-            assert!(!receipt.exact_replay());
-            assert_eq!(receipt.projection().phase(), &phase);
-            assert_eq!(
-                *events.lock().unwrap(),
-                vec![
-                    "authenticate_mutation",
-                    "authorize",
-                    "approve_payload_bound"
-                ]
-            );
-        }
-    });
-}
-
-#[test]
-fn approval_rejects_non_approval_success_projection() {
-    block_on(async {
-        let (_, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Rejected,
-            DeploymentStatusProjectionV1::NotRequested,
-        );
-        let error =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .approve(
-                    "opaque-session-token",
-                    "csrf-proof",
-                    &product_request_id(),
-                    &installation(),
-                    approve_command(),
-                )
-                .await
-                .unwrap_err();
-        assert_eq!(error, ProductApplicationError::InvalidProjection);
-    });
-}
-
-#[test]
-fn reject_reason_is_bounded_and_digest_bound_port_is_used() {
-    assert_eq!(
-        RejectionReasonV1::parse("  ").unwrap_err(),
-        RejectionReasonError::Empty
-    );
-    assert_eq!(
-        RejectionReasonV1::parse(&"x".repeat(1_001)).unwrap_err(),
-        RejectionReasonError::TooLong
-    );
-    assert!(RejectionReasonV1::parse(&"😀".repeat(1_000)).is_ok());
-    assert_eq!(
-        RejectionReasonV1::parse("line\nbreak").unwrap_err(),
-        RejectionReasonError::ControlCharacter
-    );
-    block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::PendingApproval,
-            DeploymentStatusProjectionV1::NotRequested,
-        );
-        ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-            .reject(
-                "opaque-session-token",
-                "csrf-proof",
-                &product_request_id(),
-                &installation(),
-                RejectProductPromotionV1 {
-                    promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                    expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
-                        .unwrap(),
-                    expected_revision: ProductRevisionV1::new(3).unwrap(),
-                    idempotency_key: ProductIdempotencyKeyV1::parse("reject-key").unwrap(),
-                    reason: RejectionReasonV1::parse("unsafe requested scope").unwrap(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec!["authenticate_mutation", "authorize", "reject_payload_bound"]
-        );
-    });
-}
-
-#[test]
-fn applied_pointer_is_runtime_pending_until_exact_live_attestation() {
-    block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Applied {
-                exact_deployment: exact_deployment(),
-            },
-            DeploymentStatusProjectionV1::Pending,
-        );
-        let application =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
-        let query = ProductStatusQueryV1 {
-            promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-        };
-        assert_eq!(
-            application
-                .get_product_status("opaque-session-token", &installation(), query.clone())
-                .await
-                .unwrap(),
-            ProductStatusV1::RuntimePending
-        );
-        *deployments.status.lock().unwrap() =
-            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
-                exact_deployment(),
-                NonZeroU64::new(9).unwrap(),
-            ));
-        assert_eq!(
-            application
-                .get_product_status("opaque-session-token", &installation(), query)
-                .await
-                .unwrap(),
-            ProductStatusV1::Live
-        );
-        assert_eq!(
-            events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|event| **event == "deployment_status")
-                .count(),
-            2
-        );
-    });
-}
-
-#[test]
-fn apply_passes_no_attempt_identifier_and_reports_runtime_pending() {
-    block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Approved,
-            DeploymentStatusProjectionV1::NotRequested,
-        );
-        let result =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .apply(
-                    "opaque-session-token",
-                    "csrf-proof",
-                    &product_request_id(),
-                    &installation(),
-                    ApplyProductPromotionV1 {
-                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
-                            .unwrap(),
-                        expected_revision: ProductRevisionV1::new(3).unwrap(),
-                        idempotency_key: ProductIdempotencyKeyV1::parse("apply-key").unwrap(),
-                    },
-                )
-                .await
-                .unwrap();
-        assert_eq!(result.status(), ProductStatusV1::RuntimePending);
-        assert!(!result.exact_replay());
-        assert_eq!(result.exact_deployment(), &exact_deployment());
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec!["authenticate_mutation", "authorize", "apply_idempotent"]
-        );
-    });
-}
-
-#[test]
-fn apply_surfaces_terminal_supersession_without_querying_runtime() {
-    block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Approved,
-            DeploymentStatusProjectionV1::NotRequested,
-        );
-        *decisions.apply_phase.lock().unwrap() = ProductDecisionPhaseV1::Superseded;
-        let error =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .apply(
-                    "opaque-session-token",
-                    "csrf-proof",
-                    &product_request_id(),
-                    &installation(),
-                    ApplyProductPromotionV1 {
-                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
-                            .unwrap(),
-                        expected_revision: ProductRevisionV1::new(3).unwrap(),
-                        idempotency_key: ProductIdempotencyKeyV1::parse("apply-key").unwrap(),
-                    },
-                )
-                .await
-                .unwrap_err();
-        assert_eq!(
-            error,
-            ProductApplicationError::Control(ProductControlPortError::Superseded)
-        );
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec!["authenticate_mutation", "authorize", "apply_idempotent"]
-        );
-    });
-}
-
-#[test]
-fn exact_apply_replay_may_project_live_after_runtime_verification() {
-    block_on(async {
-        let (events, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Approved,
-            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
-                exact_deployment(),
-                NonZeroU64::new(7).unwrap(),
-            )),
-        );
-        *decisions.apply_exact_replay.lock().unwrap() = true;
-        let result =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .apply(
-                    "opaque-session-token",
-                    "csrf-proof",
-                    &product_request_id(),
-                    &installation(),
-                    ApplyProductPromotionV1 {
-                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64))
-                            .unwrap(),
-                        expected_revision: ProductRevisionV1::new(3).unwrap(),
-                        idempotency_key: ProductIdempotencyKeyV1::parse("apply-key").unwrap(),
-                    },
-                )
-                .await
-                .unwrap();
-        assert_eq!(result.status(), ProductStatusV1::Live);
-        assert!(result.exact_replay());
-        assert_eq!(result.exact_deployment(), &exact_deployment());
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![
-                "authenticate_mutation",
-                "authorize",
-                "apply_idempotent",
-                "deployment_status"
-            ]
-        );
-    });
-}
-
-#[test]
-fn mismatched_exact_live_projection_is_rejected() {
-    block_on(async {
-        let wrong = ExactDeploymentSelectorV1::from_server_projection(
-            AutomationInstallationId::parse("installation-2").unwrap(),
-            promotion_id(),
-            "deployment-wrong",
-            "b".repeat(64),
-        )
-        .unwrap();
-        let (_, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Applied {
-                exact_deployment: exact_deployment(),
-            },
-            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
-                wrong,
-                NonZeroU64::new(2).unwrap(),
-            )),
-        );
-        let result =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .get_product_status(
-                    "opaque-session-token",
-                    &installation(),
-                    ProductStatusQueryV1 {
-                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                    },
-                )
-                .await;
-        assert_eq!(
-            result.unwrap_err(),
-            ProductApplicationError::InvalidProjection
-        );
-    });
-}
-
-#[test]
-fn deployment_status_requires_the_server_derived_exact_target() {
-    block_on(async {
-        let (_, authentication, authority, decisions, deployments) = product_fixture(
-            ProductDecisionPhaseV1::Applied {
-                exact_deployment: exact_deployment(),
-            },
-            DeploymentStatusProjectionV1::Pending,
-        );
-        let result =
-            ProductControlApplication::new(&authentication, &authority, &decisions, &deployments)
-                .get_deployment_status(
-                    "opaque-session-token",
-                    &installation(),
-                    RuntimeDeploymentQueryV1 {
-                        promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                    },
-                )
-                .await
-                .unwrap();
-        assert_eq!(result, authoring_application::DeploymentStatusV1::Pending);
-    });
-}
-
-#[test]
-fn deployment_failure_code_is_bounded_and_cannot_leak_backend_text() {
-    block_on(async {
-        for failure_code in ["Discord said no: secret detail", "", &"a".repeat(65)] {
-            let (_, authentication, authority, decisions, deployments) = product_fixture(
-                ProductDecisionPhaseV1::Applied {
-                    exact_deployment: exact_deployment(),
-                },
-                DeploymentStatusProjectionV1::Failed {
-                    retryable: true,
-                    failure_code: failure_code.to_string(),
-                },
-            );
-            let result = ProductControlApplication::new(
-                &authentication,
-                &authority,
-                &decisions,
-                &deployments,
-            )
-            .get_deployment_status(
-                "opaque-session-token",
-                &installation(),
-                RuntimeDeploymentQueryV1 {
-                    promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),
-                },
-            )
-            .await;
-            assert_eq!(
-                result.unwrap_err(),
-                ProductApplicationError::InvalidProjection
-            );
-        }
-    });
-}
-
-#[test]
-fn product_candidate_failures_have_bounded_stable_codes() {
-    let cases = [
-        (
-            ProductCandidateErrorCodeV1::TargetCorrupt,
-            "product target artifact is corrupt",
-        ),
-        (
-            ProductCandidateErrorCodeV1::BindingRevisionUnavailable,
-            "authoritative product binding revision is unavailable",
-        ),
-        (
-            ProductCandidateErrorCodeV1::UnsupportedSchema,
-            "product target schema is unsupported",
-        ),
-        (
-            ProductCandidateErrorCodeV1::StructurallyInvalid,
-            "product target structure is invalid",
-        ),
-        (
-            ProductCandidateErrorCodeV1::HashComputationFailed,
-            "product target hash could not be verified",
-        ),
-        (
-            ProductCandidateErrorCodeV1::HashMismatch,
-            "product target hash does not match its content",
-        ),
-        (
-            ProductCandidateErrorCodeV1::BindingInvalid,
-            "product target bindings are invalid",
-        ),
-        (
-            ProductCandidateErrorCodeV1::BlockingPolicy,
-            "product target violates a blocking policy",
-        ),
-        (
-            ProductCandidateErrorCodeV1::MissingCapabilities,
-            "product target requires unavailable capabilities",
-        ),
-        (
-            ProductCandidateErrorCodeV1::RoleHierarchyUnavailable,
-            "product target role hierarchy evidence is unavailable",
-        ),
-        (
-            ProductCandidateErrorCodeV1::RoleHierarchyIncomplete,
-            "product target role hierarchy evidence is incomplete",
-        ),
-        (
-            ProductCandidateErrorCodeV1::RoleUnmanageable,
-            "product target requires a role the bot cannot manage",
-        ),
-    ];
-    for (code, message) in cases {
-        assert_eq!(code.to_string(), message);
-        assert_eq!(
-            ProductControlPortError::InvalidServerCandidate(code).to_string(),
-            format!("server-owned product candidate is invalid: {message}")
-        );
-    }
-    assert_eq!(
-        ProductControlPortError::Superseded.to_string(),
-        "promotion was superseded by newer server state"
-    );
-}
+#[path = "application/product_control.rs"]
+mod product_control;

@@ -1,6 +1,8 @@
 use authoring_application::{
-    AuthorizedApprovalPreviewV1, AuthorizedProductStatusV1, CapabilityV1, ProductApprovalPreviewV1,
-    ProductControlPortError, ProductDecisionProjectionV1, ProductDecisionQueryPort,
+    AuthorizedApprovalPreviewV1, AuthorizedProductStatusV1, CapabilityV1,
+    ProductApprovalPreviewObservationV1, ProductApprovalPreviewV1, ProductControlPortError,
+    ProductDecisionObservationPort, ProductDecisionObservationV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 
@@ -38,6 +40,45 @@ impl ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1> for PostgresProdu
             )
             .await?;
         Ok(validated.projection)
+    }
+}
+
+impl ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1> for PostgresProductDecisions {
+    async fn load_approval_preview_observation(
+        &self,
+        request: AuthorizedApprovalPreviewV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<ProductApprovalPreviewObservationV1, ProductControlPortError> {
+        let validated = self
+            .load_validated(
+                request.actor(),
+                request.scope(),
+                request.evidence(),
+                request.promotion(),
+            )
+            .await?;
+        Ok(ProductApprovalPreviewObservationV1::from_server_projection(
+            validated.preview,
+            validated.activation_expires_at,
+            validated.observed_at,
+        ))
+    }
+
+    async fn load_product_status_observation(
+        &self,
+        request: AuthorizedProductStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<ProductDecisionObservationV1, ProductControlPortError> {
+        let validated = self
+            .load_validated(
+                request.actor(),
+                request.scope(),
+                request.evidence(),
+                request.promotion(),
+            )
+            .await?;
+        Ok(ProductDecisionObservationV1::from_server_projection(
+            validated.projection,
+            validated.observed_at,
+        ))
     }
 }
 

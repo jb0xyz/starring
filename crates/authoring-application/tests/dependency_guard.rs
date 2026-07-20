@@ -164,7 +164,12 @@ fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
     assert!(authentication_claims.contains("session_fingerprint"));
     assert!(identity.contains("AuthenticatedSessionFingerprintV1(<redacted>)"));
     assert!(identity.contains("AuthenticationClaimsV1(<redacted>)"));
-    let application = include_str!("../src/application.rs");
+    let application = [
+        include_str!("../src/application.rs"),
+        include_str!("../src/application/promotion_flow.rs"),
+        include_str!("../src/application/decision_mutation.rs"),
+    ]
+    .join("\n");
     assert!(application.contains("authenticate_mutation(credential, csrf)"));
     for mutation in ["promote_owned_session", "approve", "reject", "apply"] {
         let method = application
@@ -278,14 +283,7 @@ fn product_mutation_context_is_crate_issued_bound_and_redacted() {
 
 #[test]
 fn production_promotion_uses_only_the_authorized_resume_first_boundary() {
-    let application = include_str!("../src/application.rs");
-    let promotion = application
-        .split("impl<A, G, S, P> AuthoringApplication")
-        .nth(1)
-        .unwrap()
-        .split("pub struct ProductControlApplication")
-        .next()
-        .unwrap();
+    let promotion = include_str!("../src/application/promotion_flow.rs");
     assert!(promotion.contains("P: AuthorizedPromotionSubmissionPort<G::Evidence>"));
     assert!(!promotion.contains("P: PromotionSubmissionPort"));
     let resume = promotion
@@ -305,11 +303,17 @@ fn source() -> String {
     [
         include_str!("../src/lib.rs"),
         include_str!("../src/application.rs"),
+        include_str!("../src/application/approval_query.rs"),
+        include_str!("../src/application/decision_mutation.rs"),
+        include_str!("../src/application/projection_validation.rs"),
+        include_str!("../src/application/promotion_flow.rs"),
+        include_str!("../src/application/status_query.rs"),
         include_str!("../src/authority.rs"),
         include_str!("../src/control.rs"),
         include_str!("../src/identity.rs"),
         include_str!("../src/promotion.rs"),
         include_str!("../src/status.rs"),
+        include_str!("../src/status/runtime.rs"),
     ]
     .join("\n")
 }

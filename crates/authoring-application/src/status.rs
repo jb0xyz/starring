@@ -1,11 +1,21 @@
-use std::num::NonZeroU64;
+mod runtime;
+
+pub(crate) use runtime::validate_exact_live;
+pub use runtime::{
+    AuthorizedDeploymentStatusV1, DeploymentFailureCodeErrorV1, DeploymentFailureCodeV1,
+    DeploymentFailureMetadataV1, DeploymentStatusObservationErrorV1,
+    DeploymentStatusObservationPort, DeploymentStatusObservationV1, DeploymentStatusPort,
+    DeploymentStatusPortError, DeploymentStatusProjectionV1, DeploymentStatusV1,
+    ExactLiveProjectionV1, ProductDeploymentStatusObservationV1, ProductStatusObservationV1,
+    RuntimeDeploymentQueryV1,
+};
 
 use authoring_promotion::{AutomationInstallationId, PromotionId, TenantId};
 use discord_model::GuildId;
 
 use crate::{
-    AuthenticatedActorV1, AuthenticationError, AuthorizedInstallationScopeV1,
-    FreshGuildAuthorityError, ProductControlPortError, ProductRevisionV1, PromotionSelectorV1,
+    AuthenticationError, AuthorizedInstallationScopeV1, FreshGuildAuthorityError,
+    ProductControlPortError, ProductRevisionV1, PromotionSelectorV1,
 };
 
 const DEPLOYMENT_REFERENCE_MAX_BYTES: usize = 128;
@@ -189,119 +199,6 @@ impl ProductApplyResultV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeDeploymentQueryV1 {
-    pub promotion: PromotionSelectorV1,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExactLiveProjectionV1 {
-    exact_deployment: ExactDeploymentSelectorV1,
-    attestation_revision: NonZeroU64,
-}
-
-impl ExactLiveProjectionV1 {
-    pub fn from_exact_attestation(
-        exact_deployment: ExactDeploymentSelectorV1,
-        attestation_revision: NonZeroU64,
-    ) -> Self {
-        Self {
-            exact_deployment,
-            attestation_revision,
-        }
-    }
-
-    pub fn exact_deployment(&self) -> &ExactDeploymentSelectorV1 {
-        &self.exact_deployment
-    }
-
-    pub fn attestation_revision(&self) -> NonZeroU64 {
-        self.attestation_revision
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeploymentStatusProjectionV1 {
-    NotRequested,
-    Pending,
-    Failed {
-        retryable: bool,
-        failure_code: String,
-    },
-    ExactLive(ExactLiveProjectionV1),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeploymentStatusV1 {
-    NotApplicable,
-    NotRequested,
-    Pending,
-    Failed {
-        retryable: bool,
-        failure_code: String,
-    },
-    Live {
-        attestation_revision: NonZeroU64,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum DeploymentStatusPortError {
-    #[error("runtime deployment was not found")]
-    NotFound,
-    #[error("runtime deployment outcome is indeterminate: {0}")]
-    Indeterminate(String),
-    #[error("runtime deployment backend failed: {0}")]
-    Backend(String),
-}
-
-pub struct AuthorizedDeploymentStatusV1<'a, E> {
-    actor: &'a AuthenticatedActorV1,
-    scope: &'a AuthorizedInstallationScopeV1,
-    evidence: &'a E,
-    exact_deployment: &'a ExactDeploymentSelectorV1,
-}
-
-impl<'a, E> AuthorizedDeploymentStatusV1<'a, E> {
-    pub(crate) fn new(
-        actor: &'a AuthenticatedActorV1,
-        scope: &'a AuthorizedInstallationScopeV1,
-        evidence: &'a E,
-        exact_deployment: &'a ExactDeploymentSelectorV1,
-    ) -> Self {
-        Self {
-            actor,
-            scope,
-            evidence,
-            exact_deployment,
-        }
-    }
-
-    pub fn actor(&self) -> &AuthenticatedActorV1 {
-        self.actor
-    }
-
-    pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
-        self.scope
-    }
-
-    pub fn evidence(&self) -> &E {
-        self.evidence
-    }
-
-    pub fn exact_deployment(&self) -> &ExactDeploymentSelectorV1 {
-        self.exact_deployment
-    }
-}
-
-#[allow(async_fn_in_trait)]
-pub trait DeploymentStatusPort<E> {
-    async fn load_exact_deployment_status(
-        &self,
-        request: AuthorizedDeploymentStatusV1<'_, E>,
-    ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError>;
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductApplicationError {
     #[error(transparent)]
@@ -349,15 +246,4 @@ pub(crate) fn map_non_applied_status(phase: &ProductDecisionPhaseV1) -> Option<P
         ProductDecisionPhaseV1::Superseded => Some(ProductStatusV1::Superseded),
         ProductDecisionPhaseV1::Withdrawn => Some(ProductStatusV1::Withdrawn),
     }
-}
-
-pub(crate) fn validate_exact_live(
-    expected: &ExactDeploymentSelectorV1,
-    status: &DeploymentStatusProjectionV1,
-) -> bool {
-    matches!(
-        status,
-        DeploymentStatusProjectionV1::ExactLive(live)
-            if live.exact_deployment() == expected
-    )
 }

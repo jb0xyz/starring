@@ -167,6 +167,18 @@ policy drift instead commits a durable `Superseded` terminal record. Immutable
 target corruption remains a distinct bounded error and does not get hidden as
 drift.
 
+Additive transport-neutral observation ports preserve exact promotion identity,
+revision, immutable target, approval digest and expiry, decision database time,
+runtime database time, Live heartbeat, and serving-lease evidence without adding
+a second database read. Promotion replay is bound to its deterministic identity
+and exact-replay disposition; new submission is bound to the full planned
+request digest. The stable promotion milestone is named `ActivationLinked`
+rather than implying the linked activation is still awaiting approval. Runtime
+failure metadata crosses the new observation boundary only through a closed
+public-code enum, while the older string-bearing public projections remain
+source compatible. Serving-lease expiry is internal validation evidence and is
+not an HTTP response field.
+
 A provisioned product installation exclusively owns its `(guild, RuleSet key)`
 slot. Legacy and generic direct activation attempts plus installation takeover
 share one transaction-scoped slot lock and recheck ownership after waiting.
@@ -682,27 +694,31 @@ The immediate sequence is:
 2. Add declarative owner/API bootstrap, restrictive defaults, aggregate
    same-database and distinct-role readiness, and one complete non-owner process
    probe while keeping the runtime role separate.
-3. Bridge the existing hardened router to `ProductControlApplication` through a
+3. Extend the runtime observation with typed phase, attempt, retry or operator
+   action, and attestation identities, and compose the current decision state
+   for promotion responses without exposing leases or adding direct database
+   reads in the facade.
+4. Bridge the existing hardened router to `ProductControlApplication` through a
    closed `ProductControlFacade`, then add a loopback-only `tools/starring-api`
    binary with bounded configuration, graceful shutdown, finite telemetry
    labels, and readiness that fails before accepting traffic. Normalize
    inaccessible Discord membership and unknown installation IDs without turning
    a valid member's insufficient permission into a false 404.
-4. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
+5. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
    restrictive grants/default privileges; row policies; direct-DML denial; and
    a CI-tested positive/negative capability matrix.
-5. Build `tools/starring-runtime` with its separate DB role and bot credential,
+6. Build `tools/starring-runtime` with its separate DB role and bot credential,
    then prove Requested through exact Live and Live-loss recovery against a real
    Discord test guild.
-6. Connect a trusted server-side harness writer so only validated and simulated
+7. Connect a trusted server-side harness writer so only validated and simulated
    Luna output can advance encrypted `PreviewReady` generations.
-7. Preserve the passing clean-source cohort and failed diagnostic cohorts as
+8. Preserve the passing clean-source cohort and failed diagnostic cohorts as
    separate immutable evidence, then measure queueing, concurrency, saturation,
    soak recovery, and worker high availability before setting a commercial SLO.
-8. Add typed multi-turn preference accumulation and the typed-planner handoff
+9. Add typed multi-turn preference accumulation and the typed-planner handoff
    while preserving the same deterministic candidate gates and no-deploy model
    boundary.
-9. Add whole-plan deterministic preflight, compensation, reconciliation, and
+10. Add whole-plan deterministic preflight, compensation, reconciliation, and
    uncertain-external-effect replay before expanding the recipe catalog or
    beginning the separate `StatefulSpec` runtime arc.
 

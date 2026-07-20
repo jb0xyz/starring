@@ -1,8 +1,8 @@
 use std::num::NonZeroU64;
 
 use authoring_application::{
-    AuthorizedDeploymentStatusV1, DeploymentStatusPortError, DeploymentStatusProjectionV1,
-    ExactLiveProjectionV1,
+    AuthorizedDeploymentStatusV1, DeploymentFailureCodeV1, DeploymentStatusPortError,
+    DeploymentStatusProjectionV1, ExactLiveProjectionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use automation_runtime_convergence::{
@@ -67,7 +67,9 @@ pub(super) fn project_status(
                 condition: RuntimePendingConditionV1::Retryable { failure, .. },
             } => Ok(DeploymentStatusProjectionV1::Failed {
                 retryable: true,
-                failure_code: public_runtime_failure_code(failure.kind).to_string(),
+                failure_code: public_runtime_failure_code(failure.kind)
+                    .as_str()
+                    .to_string(),
             }),
             RuntimeDeploymentPhaseV1::RuntimePending {
                 condition: RuntimePendingConditionV1::Blocked { .. },
@@ -76,12 +78,14 @@ pub(super) fn project_status(
         },
         DeploymentAvailabilityV1::Blocked => Ok(DeploymentStatusProjectionV1::Failed {
             retryable: false,
-            failure_code: public_blocked_failure_code(status)?.to_string(),
+            failure_code: public_blocked_failure_code(status)?.as_str().to_string(),
         }),
         DeploymentAvailabilityV1::Superseded | DeploymentAvailabilityV1::Cancelled => {
             Ok(DeploymentStatusProjectionV1::Failed {
                 retryable: false,
-                failure_code: public_status_reason_code(status.reason_code)?.to_string(),
+                failure_code: public_status_reason_code(status.reason_code)?
+                    .as_str()
+                    .to_string(),
             })
         }
     }
@@ -89,7 +93,7 @@ pub(super) fn project_status(
 
 fn public_blocked_failure_code(
     status: &RuntimeDeploymentStatusV1,
-) -> Result<&'static str, DeploymentStatusPortError> {
+) -> Result<DeploymentFailureCodeV1, DeploymentStatusPortError> {
     let phase_failure = match &status.snapshot.phase {
         RuntimeDeploymentPhaseV1::RuntimePending {
             condition: RuntimePendingConditionV1::Blocked { failure },
@@ -102,7 +106,7 @@ fn public_blocked_failure_code(
 fn blocked_failure_code(
     reason_code: &str,
     phase_failure: Option<RuntimeFailureKindV1>,
-) -> Result<&'static str, DeploymentStatusPortError> {
+) -> Result<DeploymentFailureCodeV1, DeploymentStatusPortError> {
     if reason_code == "deployment_blocked" {
         return phase_failure
             .map(public_runtime_failure_code)
@@ -111,26 +115,36 @@ fn blocked_failure_code(
     public_status_reason_code(reason_code)
 }
 
-fn public_runtime_failure_code(kind: RuntimeFailureKindV1) -> &'static str {
+fn public_runtime_failure_code(kind: RuntimeFailureKindV1) -> DeploymentFailureCodeV1 {
     match kind {
-        RuntimeFailureKindV1::EnvironmentUnavailable => "runtime_environment_unavailable",
-        RuntimeFailureKindV1::ActivationNotObservable => "activation_not_observable",
-        RuntimeFailureKindV1::PanelReconciliation => "panel_reconciliation_failed",
-        RuntimeFailureKindV1::GatewayStart => "gateway_start_failed",
-        RuntimeFailureKindV1::GatewayReadyTimeout => "gateway_ready_timeout",
-        RuntimeFailureKindV1::InvariantViolation => "runtime_invariant_violation",
+        RuntimeFailureKindV1::EnvironmentUnavailable => {
+            DeploymentFailureCodeV1::RuntimeEnvironmentUnavailable
+        }
+        RuntimeFailureKindV1::ActivationNotObservable => {
+            DeploymentFailureCodeV1::ActivationNotObservable
+        }
+        RuntimeFailureKindV1::PanelReconciliation => {
+            DeploymentFailureCodeV1::PanelReconciliationFailed
+        }
+        RuntimeFailureKindV1::GatewayStart => DeploymentFailureCodeV1::GatewayStartFailed,
+        RuntimeFailureKindV1::GatewayReadyTimeout => DeploymentFailureCodeV1::GatewayReadyTimeout,
+        RuntimeFailureKindV1::InvariantViolation => {
+            DeploymentFailureCodeV1::RuntimeInvariantViolation
+        }
     }
 }
 
-fn public_status_reason_code(value: &str) -> Result<&'static str, DeploymentStatusPortError> {
+fn public_status_reason_code(
+    value: &str,
+) -> Result<DeploymentFailureCodeV1, DeploymentStatusPortError> {
     match value {
-        "deployment_blocked" => Ok("deployment_blocked"),
-        "active_target_changed" => Ok("active_target_changed"),
-        "binding_authority_changed" => Ok("binding_authority_changed"),
-        "product_authority_inactive" => Ok("product_authority_inactive"),
-        "product_authority_not_current" => Ok("product_authority_not_current"),
-        "deployment_superseded" => Ok("deployment_superseded"),
-        "deployment_cancelled" => Ok("deployment_cancelled"),
+        "deployment_blocked" => Ok(DeploymentFailureCodeV1::DeploymentBlocked),
+        "active_target_changed" => Ok(DeploymentFailureCodeV1::ActiveTargetChanged),
+        "binding_authority_changed" => Ok(DeploymentFailureCodeV1::BindingAuthorityChanged),
+        "product_authority_inactive" => Ok(DeploymentFailureCodeV1::ProductAuthorityInactive),
+        "product_authority_not_current" => Ok(DeploymentFailureCodeV1::ProductAuthorityNotCurrent),
+        "deployment_superseded" => Ok(DeploymentFailureCodeV1::DeploymentSuperseded),
+        "deployment_cancelled" => Ok(DeploymentFailureCodeV1::DeploymentCancelled),
         _ => Err(indeterminate()),
     }
 }
@@ -190,12 +204,14 @@ mod tests {
             ),
         ];
         for (kind, expected) in cases {
-            assert_eq!(public_runtime_failure_code(kind), expected);
+            assert_eq!(public_runtime_failure_code(kind).as_str(), expected);
         }
         assert!(public_status_reason_code(&"a".repeat(64)).is_err());
         assert!(public_status_reason_code("private_internal_identifier").is_err());
         assert_eq!(
-            public_status_reason_code("binding_authority_changed").unwrap(),
+            public_status_reason_code("binding_authority_changed")
+                .unwrap()
+                .as_str(),
             "binding_authority_changed"
         );
     }
@@ -207,7 +223,8 @@ mod tests {
                 "product_authority_inactive",
                 Some(RuntimeFailureKindV1::GatewayStart)
             )
-            .unwrap(),
+            .unwrap()
+            .as_str(),
             "product_authority_inactive"
         );
         assert_eq!(
@@ -215,7 +232,8 @@ mod tests {
                 "deployment_blocked",
                 Some(RuntimeFailureKindV1::GatewayStart)
             )
-            .unwrap(),
+            .unwrap()
+            .as_str(),
             "gateway_start_failed"
         );
         assert!(blocked_failure_code("deployment_blocked", None).is_err());

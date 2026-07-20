@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
+use std::time::SystemTime;
 
 use authoring_promotion::{AutomationInstallationId, ProductApprovalPayloadV1, PromotionId};
 use discord_model::GuildId;
@@ -242,6 +243,43 @@ pub struct ProductApprovalPreviewV1 {
     phase: ProductDecisionPhaseV1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductApprovalPreviewObservationV1 {
+    preview: ProductApprovalPreviewV1,
+    activation_expires_at: SystemTime,
+    observed_at: SystemTime,
+}
+
+impl ProductApprovalPreviewObservationV1 {
+    pub fn from_server_projection(
+        preview: ProductApprovalPreviewV1,
+        activation_expires_at: SystemTime,
+        observed_at: SystemTime,
+    ) -> Self {
+        Self {
+            preview,
+            activation_expires_at,
+            observed_at,
+        }
+    }
+
+    pub fn preview(&self) -> &ProductApprovalPreviewV1 {
+        &self.preview
+    }
+
+    pub fn activation_expires_at(&self) -> SystemTime {
+        self.activation_expires_at
+    }
+
+    pub fn observed_at(&self) -> SystemTime {
+        self.observed_at
+    }
+
+    pub fn into_preview(self) -> ProductApprovalPreviewV1 {
+        self.preview
+    }
+}
+
 impl ProductApprovalPreviewV1 {
     pub fn from_server_projection(
         installation_id: AutomationInstallationId,
@@ -304,6 +342,36 @@ impl Debug for ProductApprovalPreviewV1 {
 pub struct ProductMutationReceiptV1 {
     projection: ProductDecisionProjectionV1,
     exact_replay: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductDecisionObservationV1 {
+    projection: ProductDecisionProjectionV1,
+    observed_at: SystemTime,
+}
+
+impl ProductDecisionObservationV1 {
+    pub fn from_server_projection(
+        projection: ProductDecisionProjectionV1,
+        observed_at: SystemTime,
+    ) -> Self {
+        Self {
+            projection,
+            observed_at,
+        }
+    }
+
+    pub fn projection(&self) -> &ProductDecisionProjectionV1 {
+        &self.projection
+    }
+
+    pub fn observed_at(&self) -> SystemTime {
+        self.observed_at
+    }
+
+    pub fn into_projection(self) -> ProductDecisionProjectionV1 {
+        self.projection
+    }
 }
 
 impl ProductMutationReceiptV1 {
@@ -666,6 +734,19 @@ pub trait ProductDecisionQueryPort<E> {
         &self,
         request: AuthorizedProductStatusV1<'_, E>,
     ) -> Result<ProductDecisionProjectionV1, ProductControlPortError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ProductDecisionObservationPort<E> {
+    async fn load_approval_preview_observation(
+        &self,
+        request: AuthorizedApprovalPreviewV1<'_, E>,
+    ) -> Result<ProductApprovalPreviewObservationV1, ProductControlPortError>;
+
+    async fn load_product_status_observation(
+        &self,
+        request: AuthorizedProductStatusV1<'_, E>,
+    ) -> Result<ProductDecisionObservationV1, ProductControlPortError>;
 }
 
 #[allow(async_fn_in_trait)]

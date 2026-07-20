@@ -654,6 +654,17 @@ Deployment status includes:
 It excludes internal exception text, Discord bodies, SQL errors, leases, and
 credentials.
 
+The internal application observation may retain serving-lease expiry solely to
+prove `heartbeat <= observed_at < lease_expires_at`; the HTTP mapper must omit
+that value. Its public failure metadata is parsed through a closed stable-code
+set even though the compatibility projection remains string-bearing. The
+promotion observation exposes the durable `activation_linked` journal milestone,
+not the current approval or Apply state. The facade must obtain current product
+state from the exact decision observation. Before this endpoint is bound, the
+runtime observation must also preserve typed phase, attempt, retry scheduling or
+operator-action requirement, and current attestation identities so the facade
+does not issue direct database reads or an extra status query.
+
 ### Health
 
 ```text

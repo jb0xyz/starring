@@ -168,8 +168,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     .unwrap();
     let decisions = PostgresProductDecisions::new(product_decision_pools(&pool), keyring).unwrap();
     decisions.verify_keyring_coverage().await.unwrap();
-    let deployments =
-        PostgresProductDeploymentStatuses::new(pool.clone());
+    let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
     let application =
         ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
     let installation = selector(&fixture);
@@ -184,6 +183,41 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
     assert_eq!(preview.payload_digest().as_str(), fixture.payload_digest);
     assert_eq!(preview.revision().get(), 1);
     assert_eq!(preview.phase(), &ProductDecisionPhaseV1::PendingApproval);
+    let preview_observation = application
+        .get_approval_preview_observation(
+            &fixture.credential,
+            &installation,
+            status_query(&fixture),
+        )
+        .await
+        .unwrap();
+    let activation_expires_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT expires_at FROM public.activation_requests WHERE id = $1",
+    )
+    .bind(&fixture.activation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preview_observation.preview(), &preview);
+    assert_eq!(
+        preview_observation.activation_expires_at(),
+        SystemTime::from(activation_expires_at)
+    );
+    assert!(preview_observation.observed_at() < preview_observation.activation_expires_at());
+    let status_observation = application
+        .get_product_status_observation(&fixture.credential, &installation, status_query(&fixture))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_observation.status(),
+        ProductStatusV1::PendingApproval
+    );
+    assert_eq!(status_observation.decision().revision().get(), 1);
+    assert_eq!(
+        status_observation.decision().phase(),
+        &ProductDecisionPhaseV1::PendingApproval
+    );
+    assert!(status_observation.deployment().is_none());
     assert_eq!(
         application
             .get_product_status(&fixture.credential, &installation, status_query(&fixture))
@@ -437,7 +471,7 @@ async fn product_control_application_approves_and_replays_through_all_trust_boun
         fixture.authority_binding_fingerprint
     );
     assert_eq!(audit.policy_revision, 1);
-    assert_eq!(client_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(client_calls.load(Ordering::SeqCst), 7);
 
     let apply_key = format!("apply-e2e-{}", suffix());
     let apply_request = ProductRequestIdV1::parse(&format!("apply.first.{}", suffix())).unwrap();
@@ -556,8 +590,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
             .unwrap(),
         )
         .unwrap();
-        let deployments =
-            PostgresProductDeploymentStatuses::new(pool.clone());
+        let deployments = PostgresProductDeploymentStatuses::new(pool.clone());
         let application =
             ProductControlApplication::new(&authentication, &authority, &decisions, &deployments);
         let installation = selector(&fixture);
@@ -609,10 +642,7 @@ async fn product_apply_maps_corrupt_drift_target_without_persisting_apply_eviden
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(
-            persisted,
-            ("approved".to_string(), 2, 0, None, 0, 0, 0, 0)
-        );
+        assert_eq!(persisted, ("approved".to_string(), 2, 0, None, 0, 0, 0, 0));
     }
     drop_isolated_product_control_database(database).await;
 }

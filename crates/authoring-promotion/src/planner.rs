@@ -131,6 +131,12 @@ impl PreparedPromotionPlanV1 {
 pub fn plan_start_promotion_v1(
     input: StartPromotionV1,
 ) -> Result<PreparedPromotionPlanV1, PromotionError> {
+    plan_start_promotion_ref_v1(&input)
+}
+
+pub fn plan_start_promotion_ref_v1(
+    input: &StartPromotionV1,
+) -> Result<PreparedPromotionPlanV1, PromotionError> {
     if input.artifact.contract().requested_outcome != IntentRequestedOutcome::ValidatedPreview {
         return Err(PromotionError::ValidatedPreviewRequired);
     }
@@ -197,7 +203,7 @@ pub fn plan_start_promotion_v1(
     )?;
     let intent = PromotionIntentV1 {
         idempotency_scope_digest: identity.idempotency_scope_digest,
-        authority: input.context,
+        authority: input.context.clone(),
         evidence,
         definition,
         preview: AuthoringPreviewV1 {

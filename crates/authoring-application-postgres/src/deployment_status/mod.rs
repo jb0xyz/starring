@@ -1,6 +1,6 @@
 use authoring_application::{
-    AuthorizedDeploymentStatusV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1,
+    AuthorizedDeploymentStatusV1, DeploymentStatusObservationPort, DeploymentStatusObservationV1,
+    DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use automation_runtime_convergence::{DeploymentId, InstallationId, TenantId};
@@ -51,6 +51,26 @@ impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for PostgresProductDe
         &self,
         request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
     ) -> Result<DeploymentStatusProjectionV1, DeploymentStatusPortError> {
+        Ok(self.load_observation(request).await?.into_projection())
+    }
+}
+
+impl DeploymentStatusObservationPort<FreshDiscordAuthorityEvidenceV1>
+    for PostgresProductDeploymentStatuses
+{
+    async fn load_exact_deployment_observation(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
+        self.load_observation(request).await
+    }
+}
+
+impl PostgresProductDeploymentStatuses {
+    async fn load_observation(
+        &self,
+        request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
         validate_request_scope(&request)?;
         let rows = load_status_rows(&self.pool, self.config, &request)
             .await
@@ -80,7 +100,24 @@ impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for PostgresProductDe
             return Err(indeterminate());
         }
         validate_runtime_projection(&request, &status)?;
-        project_status(request.exact_deployment(), &status)
+        let projection = project_status(request.exact_deployment(), &status)?;
+        let (last_heartbeat_at, lease_expires_at) = status
+            .live
+            .as_ref()
+            .map(|live| {
+                (
+                    Some(live.last_heartbeat_at.into()),
+                    Some(live.expires_at.into()),
+                )
+            })
+            .unwrap_or((None, None));
+        DeploymentStatusObservationV1::from_server_projection(
+            projection,
+            status.observed_at.into(),
+            last_heartbeat_at,
+            lease_expires_at,
+        )
+        .map_err(|_| indeterminate())
     }
 }
 
