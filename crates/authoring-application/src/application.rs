@@ -1,8 +1,9 @@
-use authoring_promotion::approval_payload_digest_v1;
+use authoring_promotion::{approval_payload_digest_v1, plan_start_promotion_ref_v1};
 
 use crate::authority::validate_authorized_scope;
 use crate::promotion::{
-    build_start_promotion, validate_authorized_replay, validate_authorized_submission,
+    build_start_promotion, product_promotion_observation, validate_authorized_replay,
+    validate_authorized_submission, ExpectedPromotionSubmissionV1,
 };
 use crate::status::{map_non_applied_status, validate_decision_projection, validate_exact_live};
 use crate::{
@@ -10,14 +11,17 @@ use crate::{
     AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1,
     AuthorizedInstallationV1, AuthorizedProductStatusV1, AuthorizedPromotionAccessV1,
     AuthorizedPromotionSnapshotPort, AuthorizedPromotionSubmissionPort,
-    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort,
+    AuthorizedPromotionSubmissionV1, AuthorizedRejectProductV1, CapabilityV1,
+    DeploymentStatusObservationPort, DeploymentStatusObservationV1, DeploymentStatusPort,
     DeploymentStatusProjectionV1, DeploymentStatusV1, FreshGuildAuthorityPort,
     InstallationSelectorV1, MutationAuthenticationPort, ProductApplicationError, ProductApplyPort,
-    ProductApplyResultV1, ProductApprovalPort, ProductApprovalPreviewV1, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDecisionQueryPort,
-    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1, ProductStatusQueryV1,
-    ProductStatusV1, PromoteOwnedSessionV1, PromotionSubmissionV1, RejectProductPromotionV1,
-    RuntimeDeploymentQueryV1,
+    ProductApplyResultV1, ProductApprovalPort, ProductApprovalPreviewObservationV1,
+    ProductApprovalPreviewV1, ProductControlPortError, ProductDecisionObservationPort,
+    ProductDecisionObservationV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort, ProductDeploymentStatusObservationV1, ProductMutationReceiptV1,
+    ProductPromotionObservationV1, ProductRejectionPort, ProductRequestIdV1,
+    ProductStatusObservationV1, ProductStatusQueryV1, ProductStatusV1, PromoteOwnedSessionV1,
+    PromotionSubmissionV1, RejectProductPromotionV1, RuntimeDeploymentQueryV1,
 };
 use crate::{ApproveProductPromotionV1, AuthoringApplicationError};
 
@@ -59,6 +63,42 @@ where
         installation: &InstallationSelectorV1,
         command: PromoteOwnedSessionV1,
     ) -> Result<PromotionSubmissionV1, AuthoringApplicationError> {
+        Ok(self
+            .promote_owned_session_inner(credential, csrf, request_id, installation, command, false)
+            .await?
+            .0)
+    }
+
+    pub async fn promote_owned_session_observation(
+        &self,
+        credential: &A::Credential,
+        csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
+        installation: &InstallationSelectorV1,
+        command: PromoteOwnedSessionV1,
+    ) -> Result<ProductPromotionObservationV1, AuthoringApplicationError> {
+        let (_, observation) = self
+            .promote_owned_session_inner(credential, csrf, request_id, installation, command, true)
+            .await?;
+        observation.ok_or({
+            AuthoringApplicationError::AuthorizedPromotion(
+                crate::AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt,
+            )
+        })
+    }
+
+    async fn promote_owned_session_inner(
+        &self,
+        credential: &A::Credential,
+        csrf: &A::CsrfProof,
+        request_id: &ProductRequestIdV1,
+        installation: &InstallationSelectorV1,
+        command: PromoteOwnedSessionV1,
+        include_observation: bool,
+    ) -> Result<
+        (PromotionSubmissionV1, Option<ProductPromotionObservationV1>),
+        AuthoringApplicationError,
+    > {
         let claims = self
             .authentication
             .authenticate_mutation(credential, csrf)
@@ -81,8 +121,11 @@ where
             .find_or_resume_authorized_promotion(&access)
             .await?
         {
-            validate_authorized_replay(&access, &submission)?;
-            return Ok(submission);
+            let record = validate_authorized_replay(&access, &submission)?;
+            let observation = include_observation
+                .then(|| product_promotion_observation(record, submission.disposition))
+                .transpose()?;
+            return Ok((submission, observation));
         }
         let snapshot = self
             .snapshots
@@ -95,13 +138,17 @@ where
             )
             .await?;
         let input = build_start_promotion(&actor, authorized.scope(), &access, snapshot)?;
-        let expected = input.context.clone();
+        let plan = plan_start_promotion_ref_v1(&input)?;
+        let expected = ExpectedPromotionSubmissionV1::from_plan(&plan);
         let submission = self
             .promotions
-            .submit_authorized_promotion(AuthorizedPromotionSubmissionV1::new(access, input))
+            .submit_authorized_promotion(AuthorizedPromotionSubmissionV1::new(access, input, plan))
             .await?;
-        validate_authorized_submission(&expected, &submission)?;
-        Ok(submission)
+        let record = validate_authorized_submission(&expected, &submission)?;
+        let observation = include_observation
+            .then(|| product_promotion_observation(record, submission.disposition))
+            .transpose()?;
+        Ok((submission, observation))
     }
 }
 
@@ -203,6 +250,31 @@ where
         Ok(preview)
     }
 
+    pub async fn get_approval_preview_observation(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+        query: ProductStatusQueryV1,
+    ) -> Result<ProductApprovalPreviewObservationV1, ProductApplicationError>
+    where
+        D: ProductDecisionObservationPort<G::Evidence>,
+    {
+        let (actor, authorized) = self
+            .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
+            .await?;
+        let observation = self
+            .decisions
+            .load_approval_preview_observation(AuthorizedApprovalPreviewV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                &query.promotion,
+            ))
+            .await?;
+        validate_preview_observation(authorized.scope(), &query.promotion, &observation)?;
+        Ok(observation)
+    }
+
     pub async fn get_product_status(
         &self,
         credential: &A::Credential,
@@ -227,6 +299,37 @@ where
             .await?;
         validate_decision_projection(authorized.scope(), &query.promotion, &projection)?;
         self.resolve_product_status(&actor, &authorized, &projection)
+            .await
+    }
+
+    pub async fn get_product_status_observation(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+        query: ProductStatusQueryV1,
+    ) -> Result<ProductStatusObservationV1, ProductApplicationError>
+    where
+        D: ProductDecisionObservationPort<G::Evidence>,
+        R: DeploymentStatusObservationPort<G::Evidence>,
+    {
+        let (actor, authorized) = self
+            .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
+            .await?;
+        let observation = self
+            .decisions
+            .load_product_status_observation(AuthorizedProductStatusV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                &query.promotion,
+            ))
+            .await?;
+        validate_decision_projection(
+            authorized.scope(),
+            &query.promotion,
+            observation.projection(),
+        )?;
+        self.resolve_product_status_observation(&actor, &authorized, observation)
             .await
     }
 
@@ -393,6 +496,105 @@ where
         deployment_status(exact_deployment, runtime)
     }
 
+    pub async fn get_deployment_status_observation(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+        query: RuntimeDeploymentQueryV1,
+    ) -> Result<ProductDeploymentStatusObservationV1, ProductApplicationError>
+    where
+        D: ProductDecisionObservationPort<G::Evidence>,
+        R: DeploymentStatusObservationPort<G::Evidence>,
+    {
+        let (actor, authorized) = self
+            .authenticate_and_authorize(credential, installation, CapabilityV1::Read)
+            .await?;
+        let decision = self
+            .decisions
+            .load_product_status_observation(AuthorizedProductStatusV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                &query.promotion,
+            ))
+            .await?;
+        validate_decision_projection(authorized.scope(), &query.promotion, decision.projection())?;
+        let ProductDecisionPhaseV1::Applied { exact_deployment } = decision.projection().phase()
+        else {
+            return Ok(
+                ProductDeploymentStatusObservationV1::from_verified_application(
+                    DeploymentStatusV1::NotApplicable,
+                    decision.projection().clone(),
+                    decision.observed_at(),
+                    None,
+                ),
+            );
+        };
+        let runtime = self
+            .deployments
+            .load_exact_deployment_observation(AuthorizedDeploymentStatusV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                exact_deployment,
+            ))
+            .await?;
+        validate_runtime_observation(exact_deployment, decision.observed_at(), &runtime)?;
+        let status = deployment_status(exact_deployment, runtime.projection().clone())?;
+        Ok(
+            ProductDeploymentStatusObservationV1::from_verified_application(
+                status,
+                decision.projection().clone(),
+                decision.observed_at(),
+                Some(runtime),
+            ),
+        )
+    }
+
+    async fn resolve_product_status_observation(
+        &self,
+        actor: &AuthenticatedActorV1,
+        authorized: &AuthorizedInstallationV1<G::Evidence>,
+        decision: ProductDecisionObservationV1,
+    ) -> Result<ProductStatusObservationV1, ProductApplicationError>
+    where
+        R: DeploymentStatusObservationPort<G::Evidence>,
+    {
+        if let Some(status) = map_non_applied_status(decision.projection().phase()) {
+            return Ok(ProductStatusObservationV1::from_verified_application(
+                status,
+                decision.projection().clone(),
+                decision.observed_at(),
+                None,
+            ));
+        }
+        let ProductDecisionPhaseV1::Applied { exact_deployment } = decision.projection().phase()
+        else {
+            return Err(ProductApplicationError::InvalidProjection);
+        };
+        let runtime = self
+            .deployments
+            .load_exact_deployment_observation(AuthorizedDeploymentStatusV1::new(
+                actor,
+                authorized.scope(),
+                authorized.evidence(),
+                exact_deployment,
+            ))
+            .await?;
+        validate_runtime_observation(exact_deployment, decision.observed_at(), &runtime)?;
+        let status = if validate_exact_live(exact_deployment, runtime.projection()) {
+            ProductStatusV1::Live
+        } else {
+            ProductStatusV1::RuntimePending
+        };
+        Ok(ProductStatusObservationV1::from_verified_application(
+            status,
+            decision.projection().clone(),
+            decision.observed_at(),
+            Some(runtime),
+        ))
+    }
+
     async fn resolve_product_status(
         &self,
         actor: &AuthenticatedActorV1,
@@ -467,6 +669,27 @@ fn validate_preview(
     Ok(())
 }
 
+fn validate_preview_observation(
+    scope: &crate::AuthorizedInstallationScopeV1,
+    promotion: &crate::PromotionSelectorV1,
+    observation: &ProductApprovalPreviewObservationV1,
+) -> Result<(), ProductApplicationError> {
+    validate_preview(scope, promotion, observation.preview())?;
+    match observation.preview().phase() {
+        ProductDecisionPhaseV1::PendingApproval | ProductDecisionPhaseV1::Approved
+            if observation.observed_at() >= observation.activation_expires_at() =>
+        {
+            Err(ProductApplicationError::InvalidProjection)
+        }
+        ProductDecisionPhaseV1::Expired
+            if observation.observed_at() < observation.activation_expires_at() =>
+        {
+            Err(ProductApplicationError::InvalidProjection)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn deployment_status(
     exact_deployment: &crate::ExactDeploymentSelectorV1,
     status: DeploymentStatusProjectionV1,
@@ -500,11 +723,7 @@ fn validate_runtime_projection(
 ) -> Result<(), ProductApplicationError> {
     match status {
         DeploymentStatusProjectionV1::Failed { failure_code, .. }
-            if failure_code.is_empty()
-                || failure_code.len() > 64
-                || !failure_code.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
-                }) =>
+            if crate::DeploymentFailureCodeV1::parse(failure_code).is_err() =>
         {
             Err(ProductApplicationError::InvalidProjection)
         }
@@ -513,4 +732,15 @@ fn validate_runtime_projection(
         }
         _ => Ok(()),
     }
+}
+
+fn validate_runtime_observation(
+    expected: &crate::ExactDeploymentSelectorV1,
+    decision_observed_at: std::time::SystemTime,
+    observation: &DeploymentStatusObservationV1,
+) -> Result<(), ProductApplicationError> {
+    if observation.observed_at() < decision_observed_at {
+        return Err(ProductApplicationError::InvalidProjection);
+    }
+    validate_runtime_projection(expected, observation.projection())
 }

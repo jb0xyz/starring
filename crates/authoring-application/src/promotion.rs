@@ -1,9 +1,11 @@
 use std::fmt::{Debug, Formatter};
+use std::time::SystemTime;
 
 use authoring_promotion::{
-    ApprovalPolicyV1, AuthenticatedPromotionContext, AuthoringSessionId, AutomationInstallationId,
-    BindingRevision, CreatePromotionOutcomeV1, IdempotencyKey, PromotionError, PromotionService,
-    ResumePromotionOutcomeV1, SessionGeneration, StartPromotionV1,
+    derive_promotion_identity_from_secret_v1, ApprovalPolicyV1, AuthenticatedPromotionContext,
+    AuthoringSessionId, AutomationInstallationId, BindingRevision, CreatePromotionOutcomeV1,
+    IdempotencyKey, PreparedPromotionPlanV1, PromotionError, PromotionId, PromotionRequestDigest,
+    PromotionService, ResumePromotionOutcomeV1, SessionGeneration, StartPromotionV1,
 };
 use automation_ruleset::RuleSetKey;
 use design_harness::PreviewReadyArtifactV1;
@@ -12,8 +14,9 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthenticatedActorV1, AuthenticationError, AuthorizedInstallationScopeV1,
-    FreshGuildAuthorityError, ProductMutationContextV1, ProductRequestIdV1,
+    ApprovalPayloadDigestV1, AuthenticatedActorV1, AuthenticationError,
+    AuthorizedInstallationScopeV1, FreshGuildAuthorityError, ProductMutationContextV1,
+    ProductRequestIdV1,
 };
 
 const PRODUCT_PROMOTION_IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
@@ -185,6 +188,58 @@ pub struct PromotionSubmissionV1 {
     pub advancement: ResumePromotionOutcomeV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductPromotionStateV1 {
+    ActivationLinked,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductPromotionObservationV1 {
+    promotion_id: authoring_promotion::PromotionId,
+    revision: u64,
+    state: ProductPromotionStateV1,
+    approval_payload_digest: ApprovalPayloadDigestV1,
+    activation_expires_at: SystemTime,
+    target_version: u32,
+    target_content_hash: String,
+    exact_replay: bool,
+}
+
+impl ProductPromotionObservationV1 {
+    pub fn promotion_id(&self) -> &authoring_promotion::PromotionId {
+        &self.promotion_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn state(&self) -> ProductPromotionStateV1 {
+        self.state
+    }
+
+    pub fn approval_payload_digest(&self) -> &ApprovalPayloadDigestV1 {
+        &self.approval_payload_digest
+    }
+
+    pub fn activation_expires_at(&self) -> SystemTime {
+        self.activation_expires_at
+    }
+
+    pub fn target_version(&self) -> u32 {
+        self.target_version
+    }
+
+    pub fn target_content_hash(&self) -> &str {
+        &self.target_content_hash
+    }
+
+    pub fn exact_replay(&self) -> bool {
+        self.exact_replay
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait PromotionSubmissionPort {
     type Output;
@@ -264,11 +319,20 @@ impl<E> Debug for AuthorizedPromotionAccessV1<'_, E> {
 pub struct AuthorizedPromotionSubmissionV1<'a, E> {
     access: AuthorizedPromotionAccessV1<'a, E>,
     input: StartPromotionV1,
+    plan: PreparedPromotionPlanV1,
 }
 
 impl<'a, E> AuthorizedPromotionSubmissionV1<'a, E> {
-    pub(crate) fn new(access: AuthorizedPromotionAccessV1<'a, E>, input: StartPromotionV1) -> Self {
-        Self { access, input }
+    pub(crate) fn new(
+        access: AuthorizedPromotionAccessV1<'a, E>,
+        input: StartPromotionV1,
+        plan: PreparedPromotionPlanV1,
+    ) -> Self {
+        Self {
+            access,
+            input,
+            plan,
+        }
     }
 
     pub fn access(&self) -> &AuthorizedPromotionAccessV1<'a, E> {
@@ -315,12 +379,22 @@ impl<'a, E> AuthorizedPromotionSubmissionV1<'a, E> {
         &self.input
     }
 
+    pub fn plan(&self) -> &PreparedPromotionPlanV1 {
+        &self.plan
+    }
+
     pub fn into_input(self) -> StartPromotionV1 {
         self.input
     }
 
     pub fn into_access_and_input(self) -> (AuthorizedPromotionAccessV1<'a, E>, StartPromotionV1) {
         (self.access, self.input)
+    }
+
+    pub fn into_access_and_plan(
+        self,
+    ) -> (AuthorizedPromotionAccessV1<'a, E>, PreparedPromotionPlanV1) {
+        (self.access, self.plan)
     }
 }
 
@@ -470,23 +544,60 @@ pub(crate) fn build_start_promotion<E>(
     })
 }
 
-pub(crate) fn validate_authorized_submission(
-    expected: &AuthenticatedPromotionContext,
-    submission: &PromotionSubmissionV1,
-) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
-    let record = validated_final_record(submission)?;
-    if &record.intent.authority != expected {
-        return Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch);
-    }
-    Ok(())
+pub(crate) struct ExpectedPromotionSubmissionV1 {
+    promotion_id: PromotionId,
+    request_digest: PromotionRequestDigest,
+    authority: AuthenticatedPromotionContext,
 }
 
-pub(crate) fn validate_authorized_replay<E>(
+impl ExpectedPromotionSubmissionV1 {
+    pub(crate) fn from_plan(plan: &PreparedPromotionPlanV1) -> Self {
+        Self {
+            promotion_id: plan.promotion_id.clone(),
+            request_digest: plan.request_digest.clone(),
+            authority: plan.intent.authority.clone(),
+        }
+    }
+}
+
+pub(crate) fn validate_authorized_submission<'a>(
+    expected: &ExpectedPromotionSubmissionV1,
+    submission: &'a PromotionSubmissionV1,
+) -> Result<&'a authoring_promotion::PromotionRecordV1, AuthorizedPromotionSubmissionErrorV1> {
+    let record = validated_final_record(submission)?;
+    if record.id != expected.promotion_id
+        || record.request_digest != expected.request_digest
+        || record.intent.authority != expected.authority
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    Ok(record)
+}
+
+pub(crate) fn validate_authorized_replay<'a, E>(
     access: &AuthorizedPromotionAccessV1<'_, E>,
-    submission: &PromotionSubmissionV1,
-) -> Result<(), AuthorizedPromotionSubmissionErrorV1> {
+    submission: &'a PromotionSubmissionV1,
+) -> Result<&'a authoring_promotion::PromotionRecordV1, AuthorizedPromotionSubmissionErrorV1> {
     let record = validated_final_record(submission)?;
     let authority = &record.intent.authority;
+    let expected_promotion_id = access
+        .with_product_idempotency_secret(|secret| {
+            std::str::from_utf8(secret).ok().and_then(|secret| {
+                derive_promotion_identity_from_secret_v1(
+                    access.scope().tenant_id(),
+                    access.actor().principal_id(),
+                    secret,
+                )
+                .ok()
+                .map(|identity| identity.promotion_id)
+            })
+        })
+        .ok_or(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    if submission.disposition != PromotionSubmissionDispositionV1::ExactReplay
+        || record.id != expected_promotion_id
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
     if authority.tenant_id != *access.scope().tenant_id()
         || authority.installation_id != *access.scope().installation_id()
         || authority.guild_id != access.scope().guild_id()
@@ -498,7 +609,7 @@ pub(crate) fn validate_authorized_replay<E>(
     {
         return Err(AuthorizedPromotionSubmissionErrorV1::ScopeMismatch);
     }
-    Ok(())
+    Ok(record)
 }
 
 fn validated_final_record(
@@ -524,4 +635,48 @@ fn validated_final_record(
         ) => Ok(record),
         _ => Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt),
     }
+}
+
+pub(crate) fn product_promotion_observation(
+    record: &authoring_promotion::PromotionRecordV1,
+    disposition: PromotionSubmissionDispositionV1,
+) -> Result<ProductPromotionObservationV1, AuthorizedPromotionSubmissionErrorV1> {
+    let (state, publication, activation) = match &record.stage {
+        authoring_promotion::PromotionStageV1::ActivationPending {
+            publication,
+            activation,
+        } => (
+            ProductPromotionStateV1::ActivationLinked,
+            publication,
+            activation,
+        ),
+        authoring_promotion::PromotionStageV1::Expired {
+            publication,
+            activation,
+        } => (ProductPromotionStateV1::Expired, publication, activation),
+        authoring_promotion::PromotionStageV1::Prepared
+        | authoring_promotion::PromotionStageV1::Published { .. } => {
+            return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)
+        }
+    };
+    if publication.version != activation.target.version
+        || publication.content_hash != activation.target.content_hash
+        || activation.created_at >= activation.expires_at
+    {
+        return Err(AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt);
+    }
+    let approval_payload_digest = ApprovalPayloadDigestV1::parse(
+        activation.approval_context.approval_payload_digest.as_str(),
+    )
+    .map_err(|_| AuthorizedPromotionSubmissionErrorV1::PersistenceCorrupt)?;
+    Ok(ProductPromotionObservationV1 {
+        promotion_id: record.id.clone(),
+        revision: record.revision.get(),
+        state,
+        approval_payload_digest,
+        activation_expires_at: activation.expires_at.into(),
+        target_version: activation.target.version.get(),
+        target_content_hash: activation.target.content_hash.to_hex(),
+        exact_replay: matches!(disposition, PromotionSubmissionDispositionV1::ExactReplay),
+    })
 }

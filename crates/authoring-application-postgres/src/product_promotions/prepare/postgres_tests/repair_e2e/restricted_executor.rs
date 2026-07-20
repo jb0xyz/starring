@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use authoring_application::{
-    AuthoringApplication, InstallationSelectorV1, ProductRequestIdV1,
+    AuthoringApplication, InstallationSelectorV1, ProductPromotionStateV1, ProductRequestIdV1,
     PromotionSubmissionDispositionV1,
 };
 use authoring_promotion::{ResumePromotionOutcomeV1, SessionGeneration};
@@ -231,6 +231,26 @@ async fn restricted_executor_completes_new_and_legacy_promotion_verticals() {
         )
         .await;
         assert_approved_activation(&owner_pool, legacy.case.plan.promotion_id.as_str()).await;
+        let progressed_observation = normal_application
+            .promote_owned_session_observation(
+                "valid-credential",
+                "valid-csrf",
+                &ProductRequestIdV1::parse("restricted-executor-progressed-observation").unwrap(),
+                &installation,
+                promotion_command(idempotency_key, SessionGeneration::new(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(progressed_observation.exact_replay());
+        assert_eq!(
+            progressed_observation.state(),
+            ProductPromotionStateV1::ActivationLinked
+        );
+        assert_eq!(
+            progressed_observation.promotion_id(),
+            &legacy.case.plan.promotion_id
+        );
+        assert_eq!(normal_snapshot_calls.load(Ordering::SeqCst), 1);
         promotions.verify_readiness().await.unwrap();
     })
     .catch_unwind()

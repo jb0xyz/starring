@@ -3,7 +3,7 @@ use authoring_application::{
     AuthorizedPromotionSubmissionV1,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
-use authoring_promotion::{plan_start_promotion_v1, PreparedPromotionPlanV1};
+use authoring_promotion::PreparedPromotionPlanV1;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::types::Json;
@@ -51,9 +51,7 @@ impl PostgresProductPromotions {
         let context = product_promotion_admission_context_v1(request.access());
         let digests = promotion_digests_v1(self.config.keyring(), request.access())
             .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)?;
-        let (access, input) = request.into_access_and_input();
-        let plan = plan_start_promotion_v1(input)
-            .map_err(|_| AuthorizedPromotionSubmissionErrorV1::InvalidCandidate)?;
+        let (access, plan) = request.into_access_and_plan();
         let admission = prepare_product_promotion_admission_v1(
             self.config.keyring(),
             &context,

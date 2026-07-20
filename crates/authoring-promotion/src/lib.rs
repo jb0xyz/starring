@@ -28,11 +28,11 @@ pub use model::{
 pub use planner::{
     derive_promotion_identity_from_secret_v1, derive_promotion_identity_v1,
     plan_activation_link_v1, plan_approval_environment_v1, plan_pending_activation_v1,
-    plan_ruleset_publication_v1, plan_start_promotion_v1, validate_exact_planned_record_v1,
-    ActivationLinkProposalV1, ApprovalEnvironmentProposalV1, LinkedActivationTransitionV1,
-    PendingActivationProposalV1, PendingActivationTransitionV1, PreparedPromotionPlanV1,
-    PromotionIdentityV1, PromotionPlanValidationErrorV1, PublicationTransitionV1,
-    RuleSetPublicationProposalV1,
+    plan_ruleset_publication_v1, plan_start_promotion_ref_v1, plan_start_promotion_v1,
+    validate_exact_planned_record_v1, ActivationLinkProposalV1, ApprovalEnvironmentProposalV1,
+    LinkedActivationTransitionV1, PendingActivationProposalV1, PendingActivationTransitionV1,
+    PreparedPromotionPlanV1, PromotionIdentityV1, PromotionPlanValidationErrorV1,
+    PublicationTransitionV1, RuleSetPublicationProposalV1,
 };
 pub use ports::{
     EnsurePendingActivationV1, LinkPendingActivationV1, PendingActivationPort,
