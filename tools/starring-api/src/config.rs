@@ -25,6 +25,21 @@ const MAX_MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_DISCORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WRITE_AUTHORITY_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_READ_AUTHORITY_LIFETIME: Duration = Duration::from_secs(30);
+const FORBIDDEN_POSTGRES_ENVIRONMENT: [&str; 13] = [
+    "PGAPPNAME",
+    "PGDATABASE",
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGOPTIONS",
+    "PGPASSFILE",
+    "PGPASSWORD",
+    "PGPORT",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGSSLMODE",
+    "PGSSLROOTCERT",
+    "PGUSER",
+];
 #[cfg(test)]
 const DISCORD_API_ORIGIN: &str = concat!("https:", "/", "/discord.com");
 
@@ -153,6 +168,8 @@ impl ProductionConfigurationFieldV1 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProductionConfigErrorV1 {
+    #[error("ambient PostgreSQL configuration is forbidden")]
+    AmbientDatabaseConfiguration,
     #[error("required production configuration is missing")]
     Missing(ProductionConfigurationFieldV1),
     #[error("production configuration encoding is invalid")]
@@ -367,6 +384,12 @@ impl ProductionConfigV1 {
     pub(crate) fn from_source(
         source: &impl NonSecretConfigurationSourceV1,
     ) -> Result<Self, ProductionConfigErrorV1> {
+        if FORBIDDEN_POSTGRES_ENVIRONMENT
+            .iter()
+            .any(|name| source.read(name).is_some())
+        {
+            return Err(ProductionConfigErrorV1::AmbientDatabaseConfiguration);
+        }
         let bind_port = parse_number::<u16>(source, ProductionConfigurationFieldV1::BindPort)?;
         if bind_port < MIN_BIND_PORT {
             return Err(ProductionConfigErrorV1::InvalidValue(
@@ -824,6 +847,18 @@ mod tests {
         assert_eq!(config.discord().bot_user_id().get(), 5678);
         assert!(config.discord().api_origin().ends_with("discord.com"));
         assert_eq!(DatabaseRoleV1::ALL.len(), 13);
+    }
+
+    #[test]
+    fn ambient_postgres_configuration_is_rejected_before_secret_resolution() {
+        for name in FORBIDDEN_POSTGRES_ENVIRONMENT {
+            let mut source = valid_source();
+            source.values.insert(name.to_string(), "ambient".into());
+            assert_eq!(
+                ProductionConfigV1::from_source(&source).unwrap_err(),
+                ProductionConfigErrorV1::AmbientDatabaseConfiguration
+            );
+        }
     }
 
     #[test]

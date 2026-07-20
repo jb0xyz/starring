@@ -1,7 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +22,9 @@ use tokio::time::timeout;
 use twilight_http::Client as TwilightHttpClient;
 
 use crate::config::{DatabaseRoleV1, PoolConfigV1, ProductionConfigV1};
-use crate::secret::{DatabaseUrlSecretV1, ResolvedProductionSecretsV1};
+use crate::secret::{
+    DatabaseEndpointV1, DatabaseSslModeV1, DatabaseUrlSecretV1, ResolvedProductionSecretsV1,
+};
 use crate::{
     ProductionAuthorityDependenciesV1, ProductionFacadeConfigurationErrorV1,
     ProductionIdentityDependenciesV1, ProductionPersistenceDependenciesV1,
@@ -487,9 +488,7 @@ async fn connect_pool_v1(
     database_url: DatabaseUrlSecretV1,
     config: PoolConfigV1,
 ) -> Result<PgPool, DatabasePoolConnectErrorV1> {
-    let database_url = database_url.into_zeroizing();
-    let options = PgConnectOptions::from_str(&database_url)
-        .map_err(|_| DatabasePoolConnectErrorV1::Configuration)?;
+    let options = database_connect_options_v1(database_url);
     validate_database_transport_v1(&options)?;
     let options = options
         .application_name(APPLICATION_NAME)
@@ -505,6 +504,33 @@ async fn connect_pool_v1(
         Ok(Ok(pool)) => Ok(pool),
         Ok(Err(_)) | Err(_) => Err(DatabasePoolConnectErrorV1::Unavailable),
     }
+}
+
+fn database_connect_options_v1(database_url: DatabaseUrlSecretV1) -> PgConnectOptions {
+    let (username, password, database, endpoint, port, ssl_mode, ssl_root_cert) =
+        database_url.into_connection_secret().into_parts();
+    let ssl_mode = match ssl_mode {
+        DatabaseSslModeV1::Disable => PgSslMode::Disable,
+        DatabaseSslModeV1::Allow => PgSslMode::Allow,
+        DatabaseSslModeV1::Prefer => PgSslMode::Prefer,
+        DatabaseSslModeV1::Require => PgSslMode::Require,
+        DatabaseSslModeV1::VerifyCa => PgSslMode::VerifyCa,
+        DatabaseSslModeV1::VerifyFull => PgSslMode::VerifyFull,
+    };
+    let mut options = PgConnectOptions::new_without_pgpass()
+        .port(port)
+        .username(&username)
+        .password(&password)
+        .database(&database)
+        .ssl_mode(ssl_mode);
+    options = match endpoint {
+        DatabaseEndpointV1::Network(host) => options.host(&host),
+        DatabaseEndpointV1::Socket(path) => options.socket(path),
+    };
+    if let Some(root_cert) = ssl_root_cert {
+        options = options.ssl_root_cert(root_cert);
+    }
+    options
 }
 
 fn validate_database_transport_v1(

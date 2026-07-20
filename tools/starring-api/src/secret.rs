@@ -16,6 +16,7 @@ use authoring_application_postgres::{
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::Deserialize;
+use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{DatabaseRoleV1, ProductionConfigV1};
@@ -379,18 +380,78 @@ impl Debug for ResolvedSecretV1 {
     }
 }
 
-pub(crate) struct DatabaseUrlSecretV1(Zeroizing<String>);
+pub(crate) struct DatabaseUrlSecretV1(DatabaseConnectionSecretV1);
+
+pub(crate) struct DatabaseConnectionSecretV1 {
+    username: String,
+    password: Zeroizing<String>,
+    database: String,
+    endpoint: DatabaseEndpointV1,
+    port: u16,
+    ssl_mode: DatabaseSslModeV1,
+    ssl_root_cert: Option<String>,
+}
+
+pub(crate) enum DatabaseEndpointV1 {
+    Network(String),
+    Socket(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatabaseSslModeV1 {
+    Disable,
+    Allow,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl DatabaseConnectionSecretV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Zeroizing<String>,
+        String,
+        DatabaseEndpointV1,
+        u16,
+        DatabaseSslModeV1,
+        Option<String>,
+    ) {
+        let Self {
+            username,
+            password,
+            database,
+            endpoint,
+            port,
+            ssl_mode,
+            ssl_root_cert,
+        } = self;
+        (
+            username,
+            password,
+            database,
+            endpoint,
+            port,
+            ssl_mode,
+            ssl_root_cert,
+        )
+    }
+}
 
 impl DatabaseUrlSecretV1 {
     pub(crate) fn parse(secret: ResolvedSecretV1) -> Result<Self, SecretResolutionErrorV1> {
         let value = secret.into_zeroizing();
-        if value.len() > MAX_DATABASE_URL_BYTES || !valid_database_url_shape(&value) {
+        if value.len() > MAX_DATABASE_URL_BYTES {
             return Err(SecretResolutionErrorV1::InvalidSecret);
         }
-        Ok(Self(value))
+        parse_database_connection_secret(&value)
+            .map(Self)
+            .ok_or(SecretResolutionErrorV1::InvalidSecret)
     }
 
-    pub(crate) fn into_zeroizing(self) -> Zeroizing<String> {
+    pub(crate) fn into_connection_secret(self) -> DatabaseConnectionSecretV1 {
         self.0
     }
 }
@@ -616,13 +677,120 @@ fn valid_keychain_component(value: &str) -> bool {
         })
 }
 
-fn valid_database_url_shape(value: &str) -> bool {
-    ["postgres:", "postgresql:"]
-        .into_iter()
-        .find_map(|scheme| value.strip_prefix(scheme))
-        .is_some_and(|remainder| {
-            let bytes = remainder.as_bytes();
-            bytes.len() >= 2 && bytes[0] == b'/' && bytes[1] == b'/'
+fn parse_database_connection_secret(value: &str) -> Option<DatabaseConnectionSecretV1> {
+    if !value.is_ascii() || value.contains('%') {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") || url.fragment().is_some() {
+        return None;
+    }
+    let username = url.username();
+    let password = url.password()?;
+    let database = url.path().strip_prefix('/')?;
+    if !valid_database_identifier(username)
+        || !valid_database_password(password)
+        || !valid_database_identifier(database)
+    {
+        return None;
+    }
+
+    let mut ssl_mode = None;
+    let mut socket = None;
+    let mut query_port = None;
+    let mut ssl_root_cert = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "sslmode" if ssl_mode.is_none() => {
+                ssl_mode = Some(DatabaseSslModeV1::parse(&value)?);
+            }
+            "host" if socket.is_none() && value.starts_with('/') => {
+                if !valid_absolute_database_path(&value) {
+                    return None;
+                }
+                socket = Some(value.into_owned());
+            }
+            "port" if query_port.is_none() => {
+                query_port = Some(value.parse::<u16>().ok().filter(|port| *port != 0)?);
+            }
+            "sslrootcert" if ssl_root_cert.is_none() => {
+                if !valid_absolute_database_path(&value) {
+                    return None;
+                }
+                ssl_root_cert = Some(value.into_owned());
+            }
+            _ => return None,
+        }
+    }
+    let ssl_mode = ssl_mode?;
+    let authority_port = url.port();
+    if authority_port.is_some() && query_port.is_some() {
+        return None;
+    }
+    let port = authority_port.or(query_port)?;
+    let authority_host = url.host_str();
+    let endpoint = if let Some(socket) = socket {
+        if authority_host != Some("localhost")
+            || ssl_mode != DatabaseSslModeV1::Disable
+            || ssl_root_cert.is_some()
+        {
+            return None;
+        }
+        DatabaseEndpointV1::Socket(socket)
+    } else {
+        DatabaseEndpointV1::Network(authority_host?.to_string())
+    };
+    Some(DatabaseConnectionSecretV1 {
+        username: username.to_string(),
+        password: Zeroizing::new(password.to_string()),
+        database: database.to_string(),
+        endpoint,
+        port,
+        ssl_mode,
+        ssl_root_cert,
+    })
+}
+
+impl DatabaseSslModeV1 {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disable" => Some(Self::Disable),
+            "allow" => Some(Self::Allow),
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            "verify-ca" => Some(Self::VerifyCa),
+            "verify-full" => Some(Self::VerifyFull),
+            _ => None,
+        }
+    }
+}
+
+fn valid_database_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_database_password(value: &str) -> bool {
+    (24..=512).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'~'))
+}
+
+fn valid_absolute_database_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() <= 1_024
+        && value.is_ascii()
+        && value.split('/').skip(1).all(|segment| {
+            !segment.is_empty()
+                && !matches!(segment, "." | "..")
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         })
 }
 
@@ -1042,7 +1210,15 @@ mod tests {
             .unwrap();
         assert_eq!(format!("{database:?}"), "DatabaseUrlSecretV1(<redacted>)");
         assert_eq!(format!("{token:?}"), "DiscordBotTokenV1(<redacted>)");
-        assert!(database.into_zeroizing().starts_with("postgresql:"));
+        let database = database.into_connection_secret();
+        assert_eq!(database.username, "starring_identity_oauth");
+        assert!(matches!(
+            database.endpoint,
+            DatabaseEndpointV1::Network(ref host) if host == "db.example"
+        ));
+        assert_eq!(database.port, 5432);
+        assert_eq!(database.database, "starring");
+        assert!(matches!(database.ssl_mode, DatabaseSslModeV1::VerifyFull));
         assert_eq!(token.into_zeroizing().as_str(), "bot-token");
     }
 
@@ -1085,6 +1261,47 @@ mod tests {
             DiscordBotTokenV1::parse(invalid_token).unwrap_err(),
             SecretResolutionErrorV1::InvalidSecret
         );
+    }
+
+    #[test]
+    fn database_urls_are_complete_and_ignore_no_credential_component() {
+        let socket = ResolvedSecretV1::from_zeroizing(Zeroizing::new(format!(
+            "postgresql:{}{}:{}@localhost:5432/starring?host=/private/tmp&sslmode=disable",
+            "/",
+            "/starring_identity_oauth",
+            database_password()
+        )))
+        .unwrap();
+        let socket = DatabaseUrlSecretV1::parse(socket)
+            .unwrap()
+            .into_connection_secret();
+        assert!(matches!(
+            socket.endpoint,
+            DatabaseEndpointV1::Socket(ref path) if path == "/private/tmp"
+        ));
+        assert_eq!(socket.username, "starring_identity_oauth");
+        assert_eq!(socket.database, "starring");
+        assert!(matches!(socket.ssl_mode, DatabaseSslModeV1::Disable));
+
+        for invalid in [
+            format!("postgresql:{}{}db.example:5432/starring?sslmode=verify-full", "/", "/"),
+            format!("postgresql:{}{}starring_identity_oauth@db.example:5432/starring?sslmode=verify-full", "/", "/"),
+            format!("postgresql:{}{}starring_identity_oauth:short@db.example:5432/starring?sslmode=verify-full", "/", "/"),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example/starring?sslmode=verify-full", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/?sslmode=verify-full", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring?sslmode=verify-full&sslmode=verify-full", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring?sslmode=verify-full&options=-c", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring?sslmode=verify-full&user=other", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring?sslmode=verify-full&sslrootcert=relative.pem", "/", "/", database_password()),
+            format!("postgresql:{}{}starring_identity_oauth:{}@localhost:5432/starring?host=/private/tmp&sslmode=verify-full", "/", "/", database_password()),
+        ] {
+            let secret = ResolvedSecretV1::from_zeroizing(Zeroizing::new(invalid)).unwrap();
+            assert_eq!(
+                DatabaseUrlSecretV1::parse(secret).unwrap_err(),
+                SecretResolutionErrorV1::InvalidSecret
+            );
+        }
     }
 
     #[test]
@@ -1177,6 +1394,15 @@ mod tests {
     }
 
     fn database_url() -> String {
-        format!("postgresql:{}{}db.example/starring", "/", "/")
+        format!(
+            "postgresql:{}{}starring_identity_oauth:{}@db.example:5432/starring?sslmode=verify-full",
+            "/",
+            "/",
+            database_password()
+        )
+    }
+
+    fn database_password() -> &'static str {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-"
     }
 }
