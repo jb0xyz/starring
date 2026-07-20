@@ -940,6 +940,7 @@ async fn liveness_remains_available_when_business_capacity_is_exhausted() {
 async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_calls() {
     let facade = Arc::new(FakeFacade::default());
     let gate = ProductApiReadinessGate::initially_unready();
+    let lease = gate.claim().unwrap();
     let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
 
     let response = app
@@ -955,7 +956,7 @@ async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_ca
     assert!(body_text(response).await.contains("dependency_unavailable"));
     assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 0);
 
-    gate.mark_ready();
+    lease.mark_ready();
     let response = app
         .clone()
         .oneshot(
@@ -968,7 +969,7 @@ async fn readiness_gate_closes_before_startup_and_shutdown_without_dependency_ca
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(facade.readiness_calls.load(Ordering::SeqCst), 1);
 
-    gate.mark_unready();
+    lease.mark_unready();
     let response = app
         .oneshot(
             request_builder("GET", "/health/ready")
@@ -986,7 +987,8 @@ async fn readiness_gate_rechecks_after_an_in_flight_dependency_probe() {
     let facade = Arc::new(FakeFacade::default());
     facade.block_readiness.store(1, Ordering::SeqCst);
     let gate = ProductApiReadinessGate::initially_unready();
-    gate.mark_ready();
+    let lease = gate.claim().unwrap();
+    lease.mark_ready();
     let app = operational_app_with_gate(Arc::clone(&facade), gate.clone());
     let probe = tokio::spawn(
         app.oneshot(
@@ -996,7 +998,7 @@ async fn readiness_gate_rechecks_after_an_in_flight_dependency_probe() {
         ),
     );
     facade.readiness_entered.notified().await;
-    gate.mark_unready();
+    lease.mark_unready();
     facade.readiness_release.notify_one();
     let response = probe.await.unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

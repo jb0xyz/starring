@@ -22,7 +22,9 @@ pub use facade::{
     ProductControlOperationalFacadeV2, ProductRequestId, ProductRequestIdParseError,
     PromoteCommand, RejectCommand,
 };
-pub use readiness::ProductApiReadinessGate;
+pub use readiness::{
+    ProductApiReadinessClaimErrorV1, ProductApiReadinessGate, ProductApiReadinessLeaseV1,
+};
 pub use router::{
     product_control_router, product_control_router_with_operational_v2,
     product_control_router_with_operational_v2_and_readiness_gate,
