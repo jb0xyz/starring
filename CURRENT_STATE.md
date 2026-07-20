@@ -699,9 +699,10 @@ Stated as capabilities (durable across the phase numbering):
   workspace test, Clippy, and formatting gates completed locally; treat a
   recurrence as a host operational fault and continue requiring independent CI
   before merge.
-- The data volume is about 91% used with roughly 20 GiB free. Recover at least
-  another 30 GiB before retaining additional large build or evaluation cohorts;
-  this is an operational capacity target, not a certified production margin.
+- The data volume is about 83% used with roughly 36 GiB free. Keep at least
+  30 GiB free and recover additional headroom before retaining another large
+  build or evaluation cohort; this is an operational capacity floor, not a
+  certified production margin.
 
 ## Next Phase: Prove Commercial Operation
 
