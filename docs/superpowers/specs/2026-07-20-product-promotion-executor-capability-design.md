@@ -214,12 +214,20 @@ product_promotions/
   authorization.rs
   digest.rs
   admission.rs
+  orchestrator.rs
+  prepare.rs
+  repair.rs
   replay.rs
   publication.rs
   approval_environment.rs
   activation_link.rs
+  transaction.rs
   row.rs
-  readiness.rs
+  readiness/
+    mod.rs
+    manifest.rs
+    metadata.rs
+    probes.rs
 ```
 
 `store` owns the public adapter, dedicated pool, and high-level orchestrator.
@@ -871,6 +879,9 @@ security tests includes:
 - `activation_requests_enforce_product_scope`;
 - `activation_requests_guard_legacy_product_slot`;
 - `activation_requests_guard_ruleset_artifact_transition`;
+- `activation_request_approvals_enforce_payload_binding`;
+- `activation_request_approvals_enforce_scope`;
+- `activation_request_approvals_reject_mutation`;
 - `product_action_receipts_assert_approval_alias` with promote-aware body;
 - `product_action_receipts_assert_approval_audit` with promote-aware body;
 - `product_action_receipts_reject_mutation`;
@@ -885,7 +896,7 @@ identities, not names alone.
 
 ## Exact relation manifest
 
-The production capability directly or transitively touches exactly these 17
+The production capability directly or transitively touches exactly these 18
 ordinary relations:
 
 1. `public.product_control_plane_identity`;
@@ -901,14 +912,15 @@ ordinary relations:
 11. `public.automation_ruleset_versions`;
 12. `public.automation_ruleset_activations`;
 13. `public.activation_requests`;
-14. `public.product_action_receipts`;
-15. `public.product_action_receipt_idempotency_aliases`;
-16. `public.product_audit_events`;
-17. `public.product_action_receipt_audit_evidence`.
+14. `public.activation_request_approvals`;
+15. `public.product_action_receipts`;
+16. `public.product_action_receipt_idempotency_aliases`;
+17. `public.product_audit_events`;
+18. `public.product_action_receipt_audit_evidence`.
 
-All 17 must be ordinary tables, share the same common owner as the functions,
-and have no executor table or column privilege. The existing tables use ordinary
-owner-enforced invariants rather than RLS; readiness requires RLS to remain
+All 18 must be permanent ordinary tables, share the same common owner as the
+functions, and have no executor table or column privilege. The existing tables
+use ordinary owner-enforced invariants rather than RLS; readiness requires RLS to remain
 disabled so an unexpected policy cannot silently alter SECURITY DEFINER
 semantics. Trigger helper functions are owner-only and are not part of the
 executor allowlist.
@@ -931,14 +943,21 @@ It verifies:
 - common NOLOGIN non-member ownership for all functions, relations, and trigger
   helpers;
 - the exact eight-function executable allowlist and absence of helper execution;
-- all 17 relation contracts and absence of table or column privilege;
+- all 18 relation contracts and absence of table or column privilege;
 - no database create, temporary, schema create, membership, superuser,
   create-role, create-database, replication, bypass-RLS, or grant option;
-- trusted public schema and default-privilege contracts;
-- exact constraints and the complete trigger manifest;
+- trusted public schema and dedicated-database default-privilege contracts;
+- exact required constraints, concurrency-arbiter indexes, and promotion-required
+  trigger manifest, including the complete three-trigger approval-table manifest;
 - keyring coverage for live receipts and nonterminal admissions;
-- invalid authorization, malformed digest, stale generation, hostile JSON,
-  impossible scope, and duplicate-result probes leave no data.
+- six unauthenticated executor probes return only `access_denied`, expose no
+  projection, and roll back without data.
+
+Authenticated malformed digest, stale generation, hostile JSON, impossible
+scope, collision, and replay behavior belongs to the restricted-role positive
+and negative PostgreSQL suites. The full keyring coverage scan runs at startup
+and periodically in the background; an HTTP readiness handler consumes only a
+cached aggregate result.
 
 Readiness reports only contract mismatch, missing capability, excessive
 capability, incomplete keyring coverage, invalid probe result, or classified
@@ -1069,17 +1088,25 @@ same-key replay. A new key is never used to guess commit success.
 ### Restricted-role security
 
 - direct SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, and column
-  access fail on all 17 relations;
+  access fail on all 18 relations;
 - unrelated product, approval, Apply, status, identity, retention, runtime, and
   helper functions cannot be executed;
 - only the exact eight external functions execute;
 - SET ROLE, owner membership, grant option, temporary objects, schema create,
   and database create fail;
-- PUBLIC, inherited, column, default-privilege, overload, owner, trigger,
-  search-path, RLS, and schema-trust drift fail readiness;
+- PUBLIC, inherited, column, default-privilege, overload, owner, required-trigger
+  definition or enablement, search-path, RLS, and schema-trust drift fail
+  readiness;
 - hostile migration prerequisites roll back without residue;
 - a direct-login restricted role completes and replays one exact authorized
-  promotion.
+  promotion, repairs one progressed approved legacy promotion, and observes
+  atomic receipt, alias, audit, and evidence persistence.
+
+This component treats the three non-internal approval-table triggers as an
+exact total. On the other shared relations it attests the promotion-required
+trigger set and rejects reuse of those helpers, but it does not claim to detect
+an arbitrary additional trigger with both a new name and a new helper. The
+aggregate same-database readiness gate owns that whole-graph exclusion.
 
 ### Regression gates
 
@@ -1129,14 +1156,15 @@ are not valid production credentials.
 
 ## Non-goals and following work
 
-This slice does not implement rejection, the production approval-environment
-provider used by Apply, the authenticated snapshot cipher, the concrete HTTP
-facade, `tools/starring-api`, the trusted authoring-generation writer,
-`tools/starring-runtime`, or public Cloudflare ingress.
+This slice does not implement rejection, the authenticated snapshot cipher, the
+concrete HTTP facade, `tools/starring-api`, the trusted authoring-generation
+writer, `tools/starring-runtime`, or public Cloudflare ingress. Production
+approval-environment resolution is part of the authenticated promotion
+executor implemented here.
 
 After this capability, the order remains:
 
-1. production approval environment, snapshot cipher, and rejection adapters;
+1. production snapshot cipher and rejection adapters;
 2. aggregate product-role readiness and concrete `ProductControlFacade`;
 3. loopback-only runnable API with graceful shutdown;
 4. trusted Luna authoring-generation writer and conversational endpoint;

@@ -24,7 +24,7 @@ use super::super::*;
 
 pub(super) const ACTIVATION_GATE_CLASS: i32 = 18771;
 
-pub(super) struct Authentication;
+pub(in crate::product_promotions::prepare::postgres_tests) struct Authentication;
 
 impl authoring_application::AuthenticationPort for Authentication {
     type Credential = str;
@@ -59,7 +59,7 @@ impl MutationAuthenticationPort for Authentication {
 }
 
 #[derive(Clone)]
-pub(super) struct AuthoritySource {
+pub(in crate::product_promotions::prepare::postgres_tests) struct AuthoritySource {
     record: InstallationAuthorityRecordV1,
 }
 
@@ -77,7 +77,7 @@ impl InstallationAuthoritySource for AuthoritySource {
 }
 
 #[derive(Clone)]
-pub(super) struct AuthorityClient {
+pub(in crate::product_promotions::prepare::postgres_tests) struct AuthorityClient {
     application_id: DiscordApplicationIdV1,
     snapshot: DiscordGuildAuthoritySnapshotV1,
 }
@@ -98,11 +98,13 @@ impl DiscordGuildAuthorityClient for AuthorityClient {
     }
 }
 
-pub(super) struct Snapshot {
-    pub(super) artifact: PreviewReadyArtifactV1,
-    pub(super) authority: ResolvedPromotionAuthorityV1,
-    pub(super) expected_generation: SessionGeneration,
-    pub(super) calls: Arc<AtomicUsize>,
+pub(in crate::product_promotions::prepare::postgres_tests) struct Snapshot {
+    pub(in crate::product_promotions::prepare::postgres_tests) artifact: PreviewReadyArtifactV1,
+    pub(in crate::product_promotions::prepare::postgres_tests) authority:
+        ResolvedPromotionAuthorityV1,
+    pub(in crate::product_promotions::prepare::postgres_tests) expected_generation:
+        SessionGeneration,
+    pub(in crate::product_promotions::prepare::postgres_tests) calls: Arc<AtomicUsize>,
 }
 
 impl AuthorizedPromotionSnapshotPort<FreshDiscordAuthorityEvidenceV1> for Snapshot {
@@ -131,7 +133,7 @@ impl AuthorizedPromotionSnapshotPort<FreshDiscordAuthorityEvidenceV1> for Snapsh
     }
 }
 
-pub(super) fn authority_adapter(
+pub(in crate::product_promotions::prepare::postgres_tests) fn authority_adapter(
     plan: &PreparedPromotionPlanV1,
 ) -> DiscordGuildAuthorityAdapter<AuthoritySource, AuthorityClient> {
     let context = &plan.intent.authority;
@@ -184,7 +186,9 @@ pub(super) fn authority_adapter(
     )
 }
 
-pub(super) fn resolved_authority(plan: &PreparedPromotionPlanV1) -> ResolvedPromotionAuthorityV1 {
+pub(in crate::product_promotions::prepare::postgres_tests) fn resolved_authority(
+    plan: &PreparedPromotionPlanV1,
+) -> ResolvedPromotionAuthorityV1 {
     let context = &plan.intent.authority;
     ResolvedPromotionAuthorityV1 {
         guild_id: context.guild_id,
@@ -196,7 +200,7 @@ pub(super) fn resolved_authority(plan: &PreparedPromotionPlanV1) -> ResolvedProm
     }
 }
 
-pub(super) fn promotion_command(
+pub(in crate::product_promotions::prepare::postgres_tests) fn promotion_command(
     idempotency_key: &str,
     expected_generation: SessionGeneration,
 ) -> PromoteOwnedSessionV1 {

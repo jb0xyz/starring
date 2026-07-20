@@ -53,6 +53,7 @@ pub use product_identity::{
 };
 pub use product_promotions::{
     PostgresProductPromotions, PostgresProductPromotionsConfig, ProductPromotionConfigError,
+    ProductPromotionReadinessErrorV1,
 };
 pub use product_retention::{
     PostgresProductActionRetention, PostgresProductActionRetentionConfig,

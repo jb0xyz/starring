@@ -2,6 +2,7 @@ DO $scope$
 DECLARE
     relation_count BIGINT;
     ordinary_count BIGINT;
+    durable_count BIGINT;
     rls_disabled_count BIGINT;
     owner_count BIGINT;
     common_owner OID;
@@ -12,6 +13,7 @@ DECLARE
 BEGIN
     SELECT pg_catalog.count(relation.oid),
         pg_catalog.count(relation.oid) FILTER (WHERE relation.relkind = 'r'),
+        pg_catalog.count(relation.oid) FILTER (WHERE relation.relpersistence = 'p'),
         pg_catalog.count(relation.oid) FILTER (
             WHERE NOT relation.relrowsecurity AND NOT relation.relforcerowsecurity
         ),
@@ -19,6 +21,7 @@ BEGIN
         pg_catalog.min(relation.relowner::BIGINT)::OID
     INTO relation_count,
         ordinary_count,
+        durable_count,
         rls_disabled_count,
         owner_count,
         common_owner
@@ -37,6 +40,7 @@ BEGIN
             (pg_catalog.to_regclass('public.automation_ruleset_versions')),
             (pg_catalog.to_regclass('public.automation_ruleset_activations')),
             (pg_catalog.to_regclass('public.activation_requests')),
+            (pg_catalog.to_regclass('public.activation_request_approvals')),
             (pg_catalog.to_regclass('public.product_action_receipts')),
             (pg_catalog.to_regclass('public.product_action_receipt_idempotency_aliases')),
             (pg_catalog.to_regclass('public.product_audit_events')),
@@ -45,9 +49,10 @@ BEGIN
     LEFT JOIN pg_catalog.pg_class AS relation
         ON relation.oid = expected.relation_oid;
 
-    IF relation_count <> 17
-        OR ordinary_count <> 17
-        OR rls_disabled_count <> 17
+    IF relation_count <> 18
+        OR ordinary_count <> 18
+        OR durable_count <> 18
+        OR rls_disabled_count <> 18
         OR owner_count <> 1
         OR common_owner IS NULL
     THEN
@@ -132,6 +137,9 @@ BEGIN
             ('activation_requests', 'activation_requests_enforce_product_scope'),
             ('activation_requests', 'activation_requests_guard_legacy_product_slot'),
             ('activation_requests', 'activation_requests_guard_ruleset_artifact_transition'),
+            ('activation_request_approvals', 'activation_request_approvals_enforce_payload_binding'),
+            ('activation_request_approvals', 'activation_request_approvals_enforce_scope'),
+            ('activation_request_approvals', 'activation_request_approvals_reject_mutation'),
             ('product_action_receipts', 'product_action_receipts_assert_approval_alias'),
             ('product_action_receipts', 'product_action_receipts_assert_approval_audit'),
             ('product_action_receipts', 'product_action_receipts_reject_mutation'),
@@ -141,7 +149,7 @@ BEGIN
             ('product_audit_events', 'product_audit_events_reject_mutation'),
             ('product_action_receipt_audit_evidence', 'product_action_receipt_audit_evidence_reject_mutation')
         );
-    IF required_trigger_count <> 15 THEN
+    IF required_trigger_count <> 18 THEN
         RAISE EXCEPTION 'product promotion trigger prerequisite is invalid'
             USING ERRCODE = '55000';
     END IF;
@@ -168,6 +176,7 @@ END;
 $scope$;
 
 LOCK TABLE public.authoring_promotions,
+    public.activation_request_approvals,
     public.product_action_receipts,
     public.product_action_receipt_idempotency_aliases,
     public.product_audit_events,
@@ -10045,6 +10054,9 @@ DECLARE
         'public.enforce_product_activation_scope()',
         'public.guard_legacy_activation_product_slot()',
         'public.guard_product_ruleset_artifact_transition()',
+        'public.enforce_activation_approval_payload_binding()',
+        'public.enforce_activation_approval_scope()',
+        'public.reject_activation_approval_mutation()',
         'public.assert_product_approval_receipt_alias()',
         'public.assert_product_approval_receipt_audit()',
         'public.enforce_product_action_receipt_retention()',

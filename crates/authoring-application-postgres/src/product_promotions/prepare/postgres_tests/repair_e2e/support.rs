@@ -165,7 +165,7 @@ pub(super) async fn create_legacy_fixture(
     }
 }
 
-async fn erase_product_finalization(pool: &PgPool, case: &PreparedCase, linked: bool) {
+pub(super) async fn erase_product_finalization(pool: &PgPool, case: &PreparedCase, linked: bool) {
     let mut transaction = pool.begin().await.unwrap();
     sqlx::raw_sql(
         "ALTER TABLE public.authoring_promotions DISABLE TRIGGER USER; \

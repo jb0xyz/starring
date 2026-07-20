@@ -14,6 +14,7 @@ mod orchestrator;
 mod prepare;
 #[allow(dead_code)]
 mod publication;
+mod readiness;
 #[allow(dead_code)]
 mod repair;
 #[allow(dead_code)]
@@ -25,4 +26,5 @@ mod store;
 mod transaction;
 
 pub use config::{PostgresProductPromotionsConfig, ProductPromotionConfigError};
+pub use readiness::ProductPromotionReadinessErrorV1;
 pub use store::PostgresProductPromotions;

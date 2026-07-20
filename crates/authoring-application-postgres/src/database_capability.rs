@@ -154,6 +154,7 @@ struct FunctionCapabilityRow {
 #[derive(sqlx::FromRow)]
 struct RelationCapabilityRow {
     ordinary_table: bool,
+    durable_table: bool,
     rls_disabled: bool,
     owner_name: Option<String>,
     caller_has_table_privilege: bool,
@@ -212,7 +213,7 @@ impl ScopedDatabaseCapabilitiesV1 {
     }
 
     fn observe_relation(&mut self, row: RelationCapabilityRow, require_rls_disabled: bool) {
-        self.contract_valid &= row.ordinary_table;
+        self.contract_valid &= row.ordinary_table && row.durable_table;
         if require_rls_disabled {
             self.contract_valid &= row.rls_disabled;
         }
@@ -557,6 +558,7 @@ async fn load_relation_capability(
            SELECT pg_catalog.to_regclass($1) AS relation_oid \
          ) \
          SELECT COALESCE(relation.relkind = 'r', FALSE) AS ordinary_table, \
+          COALESCE(relation.relpersistence = 'p', FALSE) AS durable_table, \
           COALESCE(NOT relation.relrowsecurity AND NOT relation.relforcerowsecurity, FALSE) \
            AS rls_disabled, \
           pg_catalog.pg_get_userbyid(relation.relowner)::TEXT AS owner_name, \
