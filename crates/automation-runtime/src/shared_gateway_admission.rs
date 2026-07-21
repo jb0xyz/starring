@@ -118,6 +118,16 @@ impl SharedGatewayAdmissionBudgetV3 {
         guild_id: GuildId,
         custom_id: &str,
     ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
+        self.try_reserve(observer, ready_lease)?
+            .admit(registry, instances, guild_id, custom_id)
+            .await
+    }
+
+    pub fn try_reserve(
+        &self,
+        observer: &GatewayConnectionObserverV3,
+        ready_lease: &GatewayReadyLeaseV3,
+    ) -> Result<SharedGatewayAdmissionReservationV3, SharedGatewayAdmissionErrorV3> {
         if !observer.ready_lease_is_current(ready_lease) {
             return Err(SharedGatewayAdmissionErrorV3::NotReady);
         }
@@ -126,6 +136,38 @@ impl SharedGatewayAdmissionBudgetV3 {
             .clone()
             .try_acquire_owned()
             .map_err(|_| SharedGatewayAdmissionErrorV3::Overloaded)?;
+        if !observer.ready_lease_is_current(ready_lease) {
+            return Err(SharedGatewayAdmissionErrorV3::NotReady);
+        }
+        Ok(SharedGatewayAdmissionReservationV3 {
+            observer: observer.clone(),
+            ready_lease: *ready_lease,
+            global_permit,
+        })
+    }
+}
+
+pub struct SharedGatewayAdmissionReservationV3 {
+    observer: GatewayConnectionObserverV3,
+    ready_lease: GatewayReadyLeaseV3,
+    global_permit: OwnedSemaphorePermit,
+}
+
+impl SharedGatewayAdmissionReservationV3 {
+    pub fn epoch(&self) -> GatewayConnectionEpochV3 {
+        self.ready_lease.epoch()
+    }
+
+    pub async fn admit(
+        self,
+        registry: &ServingSlotRegistryV1,
+        instances: &impl InstanceStore,
+        guild_id: GuildId,
+        custom_id: &str,
+    ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
+        if !self.observer.ready_lease_is_current(&self.ready_lease) {
+            return Err(SharedGatewayAdmissionErrorV3::NotReady);
+        }
         let Some(admitted) =
             admit_shared_gateway_route_v1(registry, instances, guild_id, custom_id)
                 .await
@@ -133,15 +175,13 @@ impl SharedGatewayAdmissionBudgetV3 {
         else {
             return Ok(None);
         };
-        if !observer.ready_lease_is_current(ready_lease) {
-            drop(admitted);
-            drop(global_permit);
+        if !self.observer.ready_lease_is_current(&self.ready_lease) {
             return Err(SharedGatewayAdmissionErrorV3::NotReady);
         }
         Ok(Some(SharedGatewayAdmittedInteractionV3 {
             admitted,
-            ready_lease: *ready_lease,
-            _global_permit: global_permit,
+            ready_lease: self.ready_lease,
+            _global_permit: self.global_permit,
         }))
     }
 }
@@ -390,6 +430,50 @@ mod tests {
             ),
             Err(SharedGatewayAdmissionConfigurationErrorV3::GlobalCapacity)
         );
+    }
+
+    #[test]
+    fn reservation_holds_capacity_before_async_route_work_starts() {
+        let (control, _runtime, lease) = connected_control();
+        let observer = control.connection_observer();
+        let budget = budget(1);
+        let reservation = budget.try_reserve(&observer, &lease).unwrap();
+        assert_eq!(reservation.epoch(), lease.epoch());
+        assert!(matches!(
+            budget.try_reserve(&observer, &lease),
+            Err(SharedGatewayAdmissionErrorV3::Overloaded)
+        ));
+        drop(reservation);
+        assert!(budget.try_reserve(&observer, &lease).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_reservation_fails_closed_and_returns_capacity() {
+        let guild_id = GuildId(7);
+        let registry = registry(1);
+        install_route(&registry, guild_id, "study");
+        let instances = InMemoryInstanceStore::new();
+        let (control, mut runtime, lease) = connected_control();
+        let observer = control.connection_observer();
+        let budget = budget(1);
+        let reservation = budget.try_reserve(&observer, &lease).unwrap();
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        let error = admission_error(
+            reservation
+                .admit(
+                    &registry,
+                    &instances,
+                    guild_id,
+                    "starring:7:study:button:create",
+                )
+                .await,
+        );
+        assert_eq!(error, SharedGatewayAdmissionErrorV3::NotReady);
+        let next_epoch = runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
+        let next_lease = observer.issue_ready_lease(next_epoch).unwrap();
+        assert!(budget.try_reserve(&observer, &next_lease).is_ok());
     }
 
     #[tokio::test]

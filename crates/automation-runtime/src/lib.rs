@@ -47,7 +47,8 @@ pub use runner::{InteractionExecutionCategoryV3, InteractionExecutionOutcomeV3};
 pub use shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3,
     SharedGatewayAdmissionConfigurationErrorV3, SharedGatewayAdmissionErrorV3,
-    SharedGatewayAdmittedInteractionV3, MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3,
+    SharedGatewayAdmissionReservationV3, SharedGatewayAdmittedInteractionV3,
+    MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3,
 };
 pub use shared_gateway_control::{
     shared_gateway_control_channel_v3, GatewayCommandAckV3, GatewayConnectionEpochV3,
