@@ -240,7 +240,7 @@ pub fn validate_strict_panel_operation_v1(
     Ok(())
 }
 
-fn validate_strict_panel_key_v1(
+pub fn validate_strict_panel_key_v1(
     panel_key: &str,
 ) -> Result<(), StrictPanelOperationValidationErrorV1> {
     if panel_key.is_empty() {

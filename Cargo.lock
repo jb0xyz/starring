@@ -302,6 +302,7 @@ dependencies = [
  "automation-panel-installation",
  "automation-ruleset",
  "discord-model",
+ "serde_json",
  "sqlx",
  "tokio",
 ]
