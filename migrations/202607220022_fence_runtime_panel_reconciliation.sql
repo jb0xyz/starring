@@ -742,7 +742,7 @@ BEGIN
             MESSAGE = 'runtime_panel_persistence_corrupt';
     END IF;
 
-    SELECT pg_catalog.greatest(
+    SELECT GREATEST(
         COALESCE((
             SELECT pg_catalog.max(installation.record_revision)
             FROM public.ruleset_panel_installations AS installation
@@ -850,7 +850,7 @@ BEGIN
     FOR UPDATE;
 
     IF FOUND THEN
-        SELECT pg_catalog.greatest(
+        SELECT GREATEST(
             COALESCE((
                 SELECT pg_catalog.max(installation.record_revision)
                 FROM public.ruleset_panel_installations AS installation
@@ -963,7 +963,7 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT pg_catalog.greatest(
+    SELECT GREATEST(
         COALESCE((
             SELECT pg_catalog.max(installation.record_revision)
             FROM public.ruleset_panel_installations AS installation
