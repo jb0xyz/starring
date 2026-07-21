@@ -177,6 +177,13 @@ impl RuntimeConvergenceSessionV1 {
         self.in_flight.as_ref().map(ExecutionActionV1::id)
     }
 
+    pub fn execution_guard(
+        &self,
+    ) -> Result<RuntimeExecutionGuardV1, RuntimeConvergenceSessionError> {
+        self.require_action_slot()?;
+        Ok(self.guard())
+    }
+
     pub fn begin_renewal(
         &mut self,
         lease_for: Duration,
@@ -1384,6 +1391,39 @@ mod tests {
             session.apply_renewal(receipt),
             Err(RuntimeConvergenceSessionError::FencingTokenNotAdvanced)
         );
+    }
+
+    #[test]
+    fn execution_guard_is_available_only_between_actions() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        let guard = session.execution_guard().unwrap();
+        assert!(guard.scope.matches(&session.snapshot().identity));
+        assert_eq!(guard.expected_revision, session.snapshot().revision);
+        assert_eq!(guard.controller_id, *session.controller_id());
+        assert_eq!(guard.fencing_token, session.fencing_token());
+        assert_eq!(
+            guard.runtime_generation,
+            session.snapshot().runtime_generation
+        );
+        assert_eq!(guard.convergence_attempt, session.convergence_attempt());
+
+        let current_target = session.snapshot().target.clone();
+        let request = session
+            .begin_mutation(RuntimeConvergenceMutationV1::AcceptPreflight(
+                PreflightAttestationV1 {
+                    target: current_target,
+                    runtime_generation: RuntimeGeneration::FIRST,
+                    observed_runtime: None,
+                    checked_at: at(20),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            session.execution_guard(),
+            Err(RuntimeConvergenceSessionError::ActionInFlight)
+        );
+        session.abort_action(request.action_id).unwrap();
+        assert_eq!(session.execution_guard(), Ok(guard));
     }
 
     #[test]
