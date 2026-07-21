@@ -475,6 +475,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-panel-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-panel-installation",
+ "automation-ruleset",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "automation-runtime-convergence-postgres",
+ "chrono",
+ "discord-model",
+ "getrandom 0.4.3",
+ "resource-resolution",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "automation-runtime-registry"
 version = "0.1.0"
 dependencies = [
