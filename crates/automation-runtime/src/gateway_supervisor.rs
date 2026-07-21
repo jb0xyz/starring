@@ -144,11 +144,11 @@ async fn wait_for_interaction_or_drain<F>(
     control: &mut GatewayRuntimeControlV2,
 ) -> InteractionBoundaryV2
 where
-    F: Future<Output = ()>,
+    F: Future,
 {
     tokio::pin!(interaction);
     tokio::select! {
-        () = &mut interaction => InteractionBoundaryV2::Completed,
+        _ = &mut interaction => InteractionBoundaryV2::Completed,
         command = control.commands.recv() => {
             let deadline = match command {
                 Some(GatewayCommandV2::DrainAndShutdown { deadline }) => deadline,
@@ -339,7 +339,8 @@ mod tests {
             .drain_and_shutdown(Duration::from_millis(1))
             .await
             .unwrap();
-        let outcome = wait_for_interaction_or_drain(std::future::pending(), &mut runtime).await;
+        let outcome =
+            wait_for_interaction_or_drain(std::future::pending::<()>(), &mut runtime).await;
         assert!(matches!(
             outcome,
             InteractionBoundaryV2::Drain(GatewayDrainOutcomeV2::DeadlineExceeded)
