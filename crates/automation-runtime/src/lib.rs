@@ -10,6 +10,8 @@ pub mod readiness;
 pub mod responder;
 pub mod resume;
 pub mod runner;
+pub mod shared_gateway_admission;
+pub mod shared_gateway_control;
 pub mod shared_gateway_router;
 pub mod snapshot;
 pub mod strict_panel_installer;
@@ -40,6 +42,19 @@ pub use readiness::{
 };
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};
+pub use shared_gateway_admission::{
+    SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3,
+    SharedGatewayAdmissionConfigurationErrorV3, SharedGatewayAdmissionErrorV3,
+    SharedGatewayAdmittedInteractionV3, MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3,
+};
+pub use shared_gateway_control::{
+    shared_gateway_control_channel_v3, GatewayCommandAckV3, GatewayConnectionEpochV3,
+    GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
+    GatewayControlErrorV3, GatewayControlTransitionErrorV3, GatewayDisconnectKindV3,
+    GatewayDrainCauseV3, GatewayLifecycleEventV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
+    GatewayReadyLeaseV3, GatewayRuntimeCommandOutcomeV3, SharedGatewayControlV3,
+    SharedGatewayRuntimeControlV3,
+};
 pub use shared_gateway_router::{
     admit_shared_gateway_route_v1, admit_shared_gateway_route_with_config_v1,
     parse_shared_gateway_route_v1, SharedGatewayRouteConfigV1,
