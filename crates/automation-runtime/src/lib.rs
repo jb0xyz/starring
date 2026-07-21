@@ -33,7 +33,7 @@ pub use gateway_supervisor::{
     GatewayControlErrorV2, GatewayControlV2, GatewayDisconnectKindV2, GatewayDrainOutcomeV2,
     GatewayExitV2, GatewayLifecycleEventV2, GatewayReadyKindV2, GatewayRuntimeControlV2,
 };
-pub use instance_deleter::TwilightInstanceDeleter;
+pub use instance_deleter::{OwnedTwilightInstanceDeleter, TwilightInstanceDeleter};
 pub use mutation::TwilightMutationAdapter;
 pub use panel_installer::TwilightPanelInstaller;
 pub use readiness::{
@@ -64,5 +64,5 @@ pub use shared_gateway_router::{
     parse_shared_gateway_route_v1, SharedGatewayRouteConfigV1,
     SharedGatewayRouteConfigurationErrorV1, SharedGatewayRouteErrorV1, SharedGatewayRouteHintV1,
 };
-pub use snapshot::TwilightGuildRoleSnapshotProvider;
+pub use snapshot::{OwnedTwilightGuildRoleSnapshotProvider, TwilightGuildRoleSnapshotProvider};
 pub use strict_panel_installer::{render_strict_declared_panel_v1, TwilightStrictPanelInstaller};

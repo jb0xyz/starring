@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use automation_instance_teardown::{
     DeleteOutcome, DeleterError, DeleterErrorKind, InstanceDeleter,
 };
@@ -15,8 +17,19 @@ pub struct TwilightInstanceDeleter<'a> {
     http: &'a Client,
 }
 
+#[derive(Clone)]
+pub struct OwnedTwilightInstanceDeleter {
+    http: Arc<Client>,
+}
+
 impl<'a> TwilightInstanceDeleter<'a> {
     pub fn new(http: &'a Client) -> Self {
+        Self { http }
+    }
+}
+
+impl OwnedTwilightInstanceDeleter {
+    pub fn new(http: Arc<Client>) -> Self {
         Self { http }
     }
 }
@@ -67,6 +80,41 @@ fn classify_delete_error(
     })
 }
 
+async fn delete_message_with_client(
+    http: &Client,
+    channel: ChannelId,
+    message: MessageId,
+) -> Result<DeleteOutcome, DeleterError> {
+    match http
+        .delete_message(Id::new(channel.0), Id::new(message.0))
+        .await
+    {
+        Ok(_) => Ok(DeleteOutcome::Deleted),
+        Err(error) => classify_delete_error(&error, UNKNOWN_MESSAGE),
+    }
+}
+
+async fn delete_channel_with_client(
+    http: &Client,
+    channel: ChannelId,
+) -> Result<DeleteOutcome, DeleterError> {
+    match http.delete_channel(Id::new(channel.0)).await {
+        Ok(_) => Ok(DeleteOutcome::Deleted),
+        Err(error) => classify_delete_error(&error, UNKNOWN_CHANNEL),
+    }
+}
+
+async fn delete_role_with_client(
+    http: &Client,
+    guild: GuildId,
+    role: RoleId,
+) -> Result<DeleteOutcome, DeleterError> {
+    match http.delete_role(Id::new(guild.0), Id::new(role.0)).await {
+        Ok(_) => Ok(DeleteOutcome::Deleted),
+        Err(error) => classify_delete_error(&error, UNKNOWN_ROLE),
+    }
+}
+
 impl InstanceDeleter for TwilightInstanceDeleter<'_> {
     async fn delete_message(
         &self,
@@ -74,14 +122,7 @@ impl InstanceDeleter for TwilightInstanceDeleter<'_> {
         channel: ChannelId,
         message: MessageId,
     ) -> Result<DeleteOutcome, DeleterError> {
-        match self
-            .http
-            .delete_message(Id::new(channel.0), Id::new(message.0))
-            .await
-        {
-            Ok(_) => Ok(DeleteOutcome::Deleted),
-            Err(error) => classify_delete_error(&error, UNKNOWN_MESSAGE),
-        }
+        delete_message_with_client(self.http, channel, message).await
     }
 
     async fn delete_channel(
@@ -89,10 +130,7 @@ impl InstanceDeleter for TwilightInstanceDeleter<'_> {
         _: GuildId,
         channel: ChannelId,
     ) -> Result<DeleteOutcome, DeleterError> {
-        match self.http.delete_channel(Id::new(channel.0)).await {
-            Ok(_) => Ok(DeleteOutcome::Deleted),
-            Err(error) => classify_delete_error(&error, UNKNOWN_CHANNEL),
-        }
+        delete_channel_with_client(self.http, channel).await
     }
 
     async fn delete_role(
@@ -100,14 +138,34 @@ impl InstanceDeleter for TwilightInstanceDeleter<'_> {
         guild: GuildId,
         role: RoleId,
     ) -> Result<DeleteOutcome, DeleterError> {
-        match self
-            .http
-            .delete_role(Id::new(guild.0), Id::new(role.0))
-            .await
-        {
-            Ok(_) => Ok(DeleteOutcome::Deleted),
-            Err(error) => classify_delete_error(&error, UNKNOWN_ROLE),
-        }
+        delete_role_with_client(self.http, guild, role).await
+    }
+}
+
+impl InstanceDeleter for OwnedTwilightInstanceDeleter {
+    async fn delete_message(
+        &self,
+        _: GuildId,
+        channel: ChannelId,
+        message: MessageId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        delete_message_with_client(&self.http, channel, message).await
+    }
+
+    async fn delete_channel(
+        &self,
+        _: GuildId,
+        channel: ChannelId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        delete_channel_with_client(&self.http, channel).await
+    }
+
+    async fn delete_role(
+        &self,
+        guild: GuildId,
+        role: RoleId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        delete_role_with_client(&self.http, guild, role).await
     }
 }
 
@@ -116,7 +174,16 @@ mod tests {
     use automation_instance_teardown::{DeleteOutcome, DeleterErrorKind};
     use twilight_http::error::ErrorType;
 
-    use super::{classify_delete_error_type, classify_delete_response};
+    use super::{
+        classify_delete_error_type, classify_delete_response, OwnedTwilightInstanceDeleter,
+    };
+
+    fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+
+    #[test]
+    fn owned_deleter_is_clone_send_and_sync() {
+        assert_clone_send_sync::<OwnedTwilightInstanceDeleter>();
+    }
 
     #[test]
     fn exact_unknown_codes_are_already_gone() {
