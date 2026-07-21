@@ -43,6 +43,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/contract.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/lib.rs"),
+        include_str!("../src/reconcile.rs"),
         include_str!("../src/row.rs"),
         include_str!("../src/session.rs"),
         include_str!("../src/store.rs"),
