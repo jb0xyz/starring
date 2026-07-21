@@ -8,6 +8,9 @@ automation-core = { path = "../automation-core" }
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-state = { path = "../automation-state" }
+desired-state = { path = "../desired-state" }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,6 +19,4 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 thiserror = { workspace = true }
 
 [dev-dependencies]
-discord-model = { path = "../discord-model" }
-resource-resolution = { path = "../resource-resolution" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }

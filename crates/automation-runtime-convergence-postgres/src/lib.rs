@@ -2,6 +2,7 @@ mod artifact;
 mod digest;
 mod error;
 mod evidence;
+mod hydration;
 mod model;
 mod prepare;
 mod projection;
@@ -14,6 +15,7 @@ pub use evidence::{
     RuntimeDeploymentStatusEvidenceV1, RuntimeDeploymentStatusEvidenceV2,
     RuntimeDeploymentStatusExpectationV1,
 };
+pub use hydration::{PostgresRuntimeExactTargetReader, RuntimeExactTargetV1};
 pub use model::{
     AttestationIdV1, ClaimDeploymentV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1,
     ClaimReceiptV1, DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,

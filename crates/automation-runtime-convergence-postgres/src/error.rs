@@ -27,6 +27,8 @@ pub enum RuntimeConvergenceStoreError {
     ConvergenceAttemptOverflow,
     #[error("runtime convergence retry is not ready")]
     RetryNotReady,
+    #[error("runtime execution claim is stale or no longer authorized")]
+    ExecutionClaimStale,
     #[error("runtime deployment requires an operator action")]
     OperatorActionRequired,
     #[error("runtime convergence input is invalid: {0}")]
@@ -60,6 +62,7 @@ impl RuntimeConvergenceStoreError {
             Self::ConvergenceAttemptConflict => "runtime_convergence_attempt_conflict",
             Self::ConvergenceAttemptOverflow => "runtime_convergence_attempt_overflow",
             Self::RetryNotReady => "runtime_retry_not_ready",
+            Self::ExecutionClaimStale => "runtime_execution_claim_stale",
             Self::OperatorActionRequired => "runtime_operator_action_required",
             Self::InvalidInput(_) => "runtime_invalid_input",
             Self::InvalidPersistedState(_) => "runtime_invalid_persisted_state",

@@ -29,6 +29,10 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/digest.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/evidence.rs"),
+        include_str!("../src/hydration/bindings.rs"),
+        include_str!("../src/hydration/contract.rs"),
+        include_str!("../src/hydration/mod.rs"),
+        include_str!("../src/hydration/row.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/model.rs"),
         include_str!("../src/prepare.rs"),
@@ -48,6 +52,49 @@ fn adapter_sources_contain_no_comments() {
             assert!(!trimmed.starts_with("/*"));
             assert!(!trimmed.starts_with('*'));
         }
+    }
+}
+
+#[test]
+fn exact_target_hydration_is_scoped_to_private_capabilities() {
+    let migration =
+        include_str!("../../../migrations/202607220001_scope_runtime_exact_target_hydration.sql");
+    assert_eq!(
+        migration.matches("SECURITY DEFINER").count(),
+        migration.matches("SET search_path = pg_catalog").count()
+    );
+    for function in [
+        "starring_runtime_exact_target_reader_database_identity_v1",
+        "starring_runtime_exact_target_read_v1",
+    ] {
+        assert!(migration.contains(&format!("CREATE FUNCTION public.{function}(")));
+    }
+    assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE"));
+    assert!(migration
+        .contains("deployment.controller_fencing_token = expected_controller_fencing_token"));
+    assert!(
+        migration.contains("deployment.controller_lease_expires_at > request_clock.database_now")
+    );
+    assert!(migration.contains("current_authority.resource_bindings"));
+    assert!(migration.contains("IS NOT DISTINCT FROM historical_authority.resource_bindings"));
+    assert!(migration.contains("version.canonical_content_hash = version.content_hash"));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let contract = include_str!("../src/hydration/contract.rs");
+    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    for relation in [
+        "runtime_deployments",
+        "activation_requests",
+        "authoring_promotions",
+        "automation_installation_authority_versions",
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+    ] {
+        assert!(!contract.contains(relation));
     }
 }
 

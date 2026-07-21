@@ -459,6 +459,7 @@ dependencies = [
  "automation-runtime-convergence",
  "automation-state",
  "chrono",
+ "desired-state",
  "discord-model",
  "resource-resolution",
  "serde",

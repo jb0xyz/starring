@@ -17,9 +17,10 @@ use automation_runtime_convergence_postgres::{
     DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
-    PostgresRuntimeConvergenceConfigV1, RecoverBlockedDeploymentV1, RecoverStaleLiveV1,
-    RuntimeBuildRevisionV1, RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
-    SubmitDeploymentMutationV1, SubmitLiveAttestationV1, MIGRATOR,
+    PostgresRuntimeConvergenceConfigV1, PostgresRuntimeExactTargetReader,
+    RecoverBlockedDeploymentV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
+    RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1,
+    SubmitLiveAttestationV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use discord_model::GuildId;
@@ -43,7 +44,7 @@ const NEXT_DEPLOYMENT: &str = "runtime-pg-deployment-next";
 const CONTENT_HASH: &str = "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6";
 const NEXT_CONTENT_HASH: &str = "91d936ba08910497f8f31e16e7f2b1ffce5ee9447a4636d47ddddc5c79fb0103";
 const BINDING_FINGERPRINT: &str =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    "a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655";
 const ROTATED_BINDING_FINGERPRINT: &str =
     "7777777777777777777777777777777777777777777777777777777777777777";
 
@@ -51,4 +52,5 @@ include!("postgres_convergence/migration_acl.rs");
 include!("postgres_convergence/binding_authority.rs");
 include!("postgres_convergence/convergence_attempt.rs");
 include!("postgres_convergence/lifecycle.rs");
+include!("postgres_convergence/hydration.rs");
 include!("postgres_convergence/support.rs");

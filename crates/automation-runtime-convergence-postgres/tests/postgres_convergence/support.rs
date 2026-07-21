@@ -853,7 +853,7 @@ async fn seed_product_target(pool: &PgPool) {
     .bind(GUILD.to_string())
     .bind(RULESET)
     .bind(CONTENT_HASH)
-    .bind(PRINCIPAL)
+    .bind("9200201")
     .execute(&mut *transaction)
     .await
     .unwrap();
