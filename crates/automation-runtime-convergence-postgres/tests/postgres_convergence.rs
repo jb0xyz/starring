@@ -4,6 +4,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetVersionId};
+use automation_runtime_controller::RuntimeExecutionReceiptV1;
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
     ControllerId, ControllerLeaseV1, DeploymentId, DrainAttestationV1, FencingToken,

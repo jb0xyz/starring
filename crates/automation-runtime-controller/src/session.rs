@@ -184,6 +184,20 @@ impl RuntimeConvergenceSessionV1 {
         Ok(self.guard())
     }
 
+    pub fn current_execution_receipt(
+        &self,
+    ) -> Result<RuntimeExecutionReceiptV1, RuntimeConvergenceSessionError> {
+        self.require_action_slot()?;
+        Ok(RuntimeExecutionReceiptV1 {
+            snapshot: self.snapshot.clone(),
+            controller_id: self.controller_id.clone(),
+            fencing_token: self.fencing_token,
+            convergence_attempt: self.convergence_attempt,
+            acquired_at: self.acquired_at,
+            expires_at: self.expires_at,
+        })
+    }
+
     pub fn begin_renewal(
         &mut self,
         lease_for: Duration,
@@ -1427,6 +1441,44 @@ mod tests {
     }
 
     #[test]
+    fn current_execution_receipt_tracks_the_checked_session_authority() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        let initial = session.current_execution_receipt().unwrap();
+        assert_eq!(initial.snapshot, *session.snapshot());
+        assert_eq!(initial.controller_id, *session.controller_id());
+        assert_eq!(initial.fencing_token, session.fencing_token());
+        assert_eq!(initial.convergence_attempt, session.convergence_attempt());
+        assert_eq!(initial.acquired_at, session.acquired_at());
+        assert_eq!(initial.expires_at, session.expires_at());
+
+        let before = session.snapshot().clone();
+        let request = session
+            .begin_mutation(RuntimeConvergenceMutationV1::AcceptPreflight(
+                PreflightAttestationV1 {
+                    target: before.target.clone(),
+                    runtime_generation: RuntimeGeneration::FIRST,
+                    observed_runtime: None,
+                    checked_at: at(20),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            session.current_execution_receipt(),
+            Err(RuntimeConvergenceSessionError::ActionInFlight)
+        );
+        let receipt = mutation_receipt(&request, &before);
+        session.apply_mutation(receipt).unwrap();
+        let current = session.current_execution_receipt().unwrap();
+        assert_eq!(current.snapshot, *session.snapshot());
+        assert!(current.snapshot.revision > initial.snapshot.revision);
+        assert_eq!(current.controller_id, initial.controller_id);
+        assert_eq!(current.fencing_token, initial.fencing_token);
+        assert_eq!(current.convergence_attempt, initial.convergence_attempt);
+        assert_eq!(current.acquired_at, initial.acquired_at);
+        assert_eq!(current.expires_at, initial.expires_at);
+    }
+
+    #[test]
     fn session_allows_only_the_phase_safe_mutation() {
         let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
         assert_eq!(
@@ -1528,6 +1580,10 @@ mod tests {
         assert_eq!(
             session.state(),
             RuntimeConvergenceSessionStateV1::CertifiedLive
+        );
+        assert_eq!(
+            session.current_execution_receipt(),
+            Err(RuntimeConvergenceSessionError::InactiveSession)
         );
         assert_eq!(live.state(), RuntimeServingSessionStateV1::Serving);
     }

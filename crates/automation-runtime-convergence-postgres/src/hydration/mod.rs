@@ -5,7 +5,8 @@ mod row;
 use std::time::Duration;
 
 use automation_ruleset::RuleSetVersion;
-use automation_runtime_convergence::RuntimeDeploymentSnapshotV1;
+use automation_runtime_controller::RuntimeExecutionReceiptV1;
+use automation_runtime_convergence::{ControllerId, FencingToken, RuntimeDeploymentSnapshotV1};
 use resource_resolution::ResourceBindingMap;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -16,6 +17,35 @@ use crate::RuntimeConvergenceStoreError;
 
 use self::contract::{DATABASE_IDENTITY_QUERY, EXACT_TARGET_QUERY};
 use self::row::RuntimeExactTargetRow;
+
+pub(super) struct RuntimeExactTargetExecutionV1<'a> {
+    pub(super) snapshot: &'a RuntimeDeploymentSnapshotV1,
+    pub(super) controller_id: &'a ControllerId,
+    pub(super) fencing_token: FencingToken,
+    pub(super) convergence_attempt: std::num::NonZeroU32,
+}
+
+impl<'a> From<&'a ClaimExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'a> {
+    fn from(value: &'a ClaimExecutionReceiptV1) -> Self {
+        Self {
+            snapshot: &value.snapshot,
+            controller_id: &value.controller_id,
+            fencing_token: value.fencing_token,
+            convergence_attempt: value.convergence_attempt,
+        }
+    }
+}
+
+impl<'a> From<&'a RuntimeExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'a> {
+    fn from(value: &'a RuntimeExecutionReceiptV1) -> Self {
+        Self {
+            snapshot: &value.snapshot,
+            controller_id: &value.controller_id,
+            fencing_token: value.fencing_token,
+            convergence_attempt: value.convergence_attempt,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeExactTargetV1 {
@@ -84,7 +114,22 @@ impl PostgresRuntimeExactTargetReader {
         &self,
         claim: &ClaimExecutionReceiptV1,
     ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
-        let snapshot = &claim.snapshot;
+        self.load(RuntimeExactTargetExecutionV1::from(claim)).await
+    }
+
+    pub async fn load_for_execution(
+        &self,
+        execution: &RuntimeExecutionReceiptV1,
+    ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
+        self.load(RuntimeExactTargetExecutionV1::from(execution))
+            .await
+    }
+
+    async fn load(
+        &self,
+        execution: RuntimeExactTargetExecutionV1<'_>,
+    ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
+        let snapshot = execution.snapshot;
         let identity = &snapshot.identity;
         let target = &snapshot.target;
         let mut transaction = self.begin().await?;
@@ -95,9 +140,9 @@ impl PostgresRuntimeExactTargetReader {
             .bind(identity.promotion_id.as_str())
             .bind(identity.activation_request_id.as_str())
             .bind(runtime_i64(snapshot.revision.get())?)
-            .bind(claim.controller_id.as_str())
-            .bind(runtime_i64(claim.fencing_token.get())?)
-            .bind(i64::from(claim.convergence_attempt.get()))
+            .bind(execution.controller_id.as_str())
+            .bind(runtime_i64(execution.fencing_token.get())?)
+            .bind(i64::from(execution.convergence_attempt.get()))
             .bind(runtime_i64(snapshot.runtime_generation.get())?)
             .bind(target.guild_id.to_string())
             .bind(target.ruleset_key.as_str())
@@ -118,7 +163,7 @@ impl PostgresRuntimeExactTargetReader {
                 ))
             };
         };
-        let hydrated = row.decode(claim)?;
+        let hydrated = row.decode(&execution)?;
         transaction.commit().await.map_err(database)?;
         Ok(hydrated)
     }

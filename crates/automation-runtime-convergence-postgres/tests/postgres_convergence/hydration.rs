@@ -63,5 +63,61 @@ async fn exact_target_hydration_requires_the_current_fenced_claim_scenario(
         reader.load_for_claim(&claim).await.unwrap_err(),
         RuntimeConvergenceStoreError::ExecutionClaimStale
     ));
-    assert_eq!(reader.load_for_claim(&renewed).await.unwrap().artifact.version, RuleSetVersionId::FIRST);
+    assert_eq!(
+        reader
+            .load_for_claim(&renewed)
+            .await
+            .unwrap()
+            .artifact
+            .version,
+        RuleSetVersionId::FIRST
+    );
+
+    let current_execution = RuntimeExecutionReceiptV1 {
+        snapshot: renewed.snapshot.clone(),
+        controller_id: renewed.controller_id.clone(),
+        fencing_token: renewed.fencing_token,
+        convergence_attempt: renewed.convergence_attempt,
+        acquired_at: renewed.acquired_at,
+        expires_at: renewed.expires_at,
+    };
+    assert_eq!(
+        reader
+            .load_for_execution(&current_execution)
+            .await
+            .unwrap()
+            .snapshot,
+        renewed.snapshot
+    );
+
+    let mutated = adapter
+        .mutate(SubmitDeploymentMutationV1 {
+            scope: scope(),
+            expected_revision: current_execution.snapshot.revision,
+            controller_id: current_execution.controller_id.clone(),
+            fencing_token: current_execution.fencing_token,
+            runtime_generation: current_execution.snapshot.runtime_generation,
+            mutation: DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
+                target: current_execution.snapshot.target.clone(),
+                runtime_generation: current_execution.snapshot.runtime_generation,
+                observed_runtime: None,
+                checked_at: current_execution.acquired_at,
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        reader.load_for_claim(&renewed).await.unwrap_err(),
+        RuntimeConvergenceStoreError::ExecutionClaimStale
+    ));
+    let post_mutation_execution = RuntimeExecutionReceiptV1 {
+        snapshot: mutated.snapshot,
+        ..current_execution
+    };
+    let post_mutation = reader
+        .load_for_execution(&post_mutation_execution)
+        .await
+        .unwrap();
+    assert_eq!(post_mutation.snapshot, post_mutation_execution.snapshot);
+    assert_eq!(post_mutation.artifact.version, RuleSetVersionId::FIRST);
 }

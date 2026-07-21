@@ -9,11 +9,10 @@ use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingFinger
 use serde_json::Value;
 use sqlx::types::Json;
 
-use crate::model::ClaimExecutionReceiptV1;
 use crate::RuntimeConvergenceStoreError;
 
 use super::bindings::decode_resource_bindings;
-use super::RuntimeExactTargetV1;
+use super::{RuntimeExactTargetExecutionV1, RuntimeExactTargetV1};
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub(super) struct RuntimeExactTargetRow {
@@ -37,12 +36,12 @@ pub(super) struct RuntimeExactTargetRow {
 impl RuntimeExactTargetRow {
     pub(super) fn decode(
         &self,
-        claim: &ClaimExecutionReceiptV1,
+        execution: &RuntimeExactTargetExecutionV1<'_>,
     ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
         let invalid = || {
             RuntimeConvergenceStoreError::InvalidPersistedState("runtime exact target projection")
         };
-        let snapshot = &claim.snapshot;
+        let snapshot = execution.snapshot;
         let target = &snapshot.target;
         let deployment_revision = u64::try_from(self.deployment_revision)
             .ok()
@@ -90,7 +89,7 @@ impl RuntimeExactTargetRow {
         let calculated_hash = content_hash(schema_version, &definition).map_err(|_| invalid())?;
         let calculated_fingerprint = resource_binding_fingerprint_v2(&bindings);
         if deployment_revision != snapshot.revision
-            || convergence_attempt != claim.convergence_attempt
+            || convergence_attempt != execution.convergence_attempt
             || installation_authority_revision == 0
             || current_authority_revision == 0
             || guild_id != target.guild_id
