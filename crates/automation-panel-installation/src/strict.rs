@@ -11,6 +11,10 @@ use crate::{
     PanelInstallationStoreError,
 };
 
+pub const MAX_STRICT_PANEL_RECORDS_PER_SLOT: usize = 256;
+pub const MAX_STRICT_PANEL_KEY_BYTES: usize = 128;
+pub const MAX_STRICT_PANEL_JOURNAL_JSON_BYTES: usize = 240 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StrictPanelButtonPayloadV1 {
@@ -182,6 +186,137 @@ pub struct StrictPanelOperationV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StrictPanelOperationValidationErrorV1 {
+    ZeroGuildId,
+    EmptyPanelKey,
+    PanelKeyTooLong,
+    PanelIdentityMismatch,
+    InvalidSpecHash,
+    InvalidPostDisposition,
+    AppliedMessageMatchesPrevious,
+    ZeroChannelId,
+    ZeroMessageId,
+    InvalidCleanupDisposition,
+    PayloadTooLarge,
+    Serialization,
+}
+
+pub fn validate_strict_panel_operation_v1(
+    operation: &StrictPanelOperationV1,
+) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    if operation.key.guild_id.0 == 0 {
+        return Err(StrictPanelOperationValidationErrorV1::ZeroGuildId);
+    }
+    validate_strict_panel_key_v1(&operation.key.panel_key)?;
+    match &operation.state {
+        StrictPanelOperationStateV1::PostDispatching { intent }
+        | StrictPanelOperationStateV1::AmbiguousPost { intent } => {
+            validate_post_intent(&operation.key, intent)?;
+        }
+        StrictPanelOperationStateV1::PostApplied { intent, message_id } => {
+            validate_post_intent(&operation.key, intent)?;
+            validate_message_id(*message_id)?;
+            if intent.previous_message.as_ref().is_some_and(|previous| {
+                previous.message.channel_id == intent.channel_id
+                    && previous.message.message_id == *message_id
+            }) {
+                return Err(StrictPanelOperationValidationErrorV1::AppliedMessageMatchesPrevious);
+            }
+        }
+        StrictPanelOperationStateV1::CleanupPending { intent } => {
+            validate_message_ref(&intent.message)?;
+            let valid_disposition = matches!(intent.kind, StrictPanelCleanupKindV1::Removed)
+                == intent.remove_installation;
+            if !valid_disposition {
+                return Err(StrictPanelOperationValidationErrorV1::InvalidCleanupDisposition);
+            }
+        }
+    }
+    let encoded = serde_json::to_vec(operation)
+        .map_err(|_| StrictPanelOperationValidationErrorV1::Serialization)?;
+    if encoded.len() > MAX_STRICT_PANEL_JOURNAL_JSON_BYTES {
+        return Err(StrictPanelOperationValidationErrorV1::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_strict_panel_key_v1(
+    panel_key: &str,
+) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    if panel_key.is_empty() {
+        return Err(StrictPanelOperationValidationErrorV1::EmptyPanelKey);
+    }
+    if panel_key.len() > MAX_STRICT_PANEL_KEY_BYTES {
+        return Err(StrictPanelOperationValidationErrorV1::PanelKeyTooLong);
+    }
+    Ok(())
+}
+
+fn validate_post_intent(
+    key: &StrictPanelOperationKeyV1,
+    intent: &StrictPanelPostIntentV1,
+) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    if intent.panel.spec.key != key.panel_key {
+        return Err(StrictPanelOperationValidationErrorV1::PanelIdentityMismatch);
+    }
+    if intent.spec_hash.len() != 64
+        || !intent
+            .spec_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StrictPanelOperationValidationErrorV1::InvalidSpecHash);
+    }
+    validate_channel_id(intent.channel_id)?;
+    if let Some(previous) = &intent.previous_message {
+        validate_message_ref(&previous.message)?;
+    }
+    let valid_disposition = match intent.install_kind {
+        StrictPanelInstallKindV1::Fresh | StrictPanelInstallKindV1::MissingMessage => {
+            intent.previous_message.is_none()
+        }
+        StrictPanelInstallKindV1::ChannelMoved => {
+            intent.previous_message.as_ref().is_some_and(|previous| {
+                previous.cleanup_kind == StrictPanelCleanupKindV1::ChannelMoved
+            })
+        }
+        StrictPanelInstallKindV1::PayloadReplaced => {
+            intent.previous_message.as_ref().is_some_and(|previous| {
+                previous.cleanup_kind == StrictPanelCleanupKindV1::PayloadReplaced
+            })
+        }
+        StrictPanelInstallKindV1::MetadataUpdated => false,
+    };
+    if !valid_disposition {
+        return Err(StrictPanelOperationValidationErrorV1::InvalidPostDisposition);
+    }
+    Ok(())
+}
+
+fn validate_message_ref(
+    message: &StrictPanelMessageRefV1,
+) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    validate_channel_id(message.channel_id)?;
+    validate_message_id(message.message_id)
+}
+
+fn validate_channel_id(channel_id: ChannelId) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    if channel_id.0 == 0 {
+        Err(StrictPanelOperationValidationErrorV1::ZeroChannelId)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_message_id(message_id: MessageId) -> Result<(), StrictPanelOperationValidationErrorV1> {
+    if message_id.0 == 0 {
+        Err(StrictPanelOperationValidationErrorV1::ZeroMessageId)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StrictPanelJournalError(pub String);
 
 #[allow(async_fn_in_trait)]
@@ -341,6 +476,16 @@ pub enum StrictPanelReconcileErrorV1 {
     DuplicateJournalOperation(String),
     StoredPanelOutsideSlot,
     JournalOperationOutsideSlot,
+    TooManyDeclaredPanels {
+        count: usize,
+    },
+    SlotCapacityExceeded {
+        count: usize,
+    },
+    InvalidOperation {
+        panel_key: String,
+        error: StrictPanelOperationValidationErrorV1,
+    },
     InvalidJournalState(String),
     CountOverflow,
 }
@@ -400,10 +545,22 @@ where
         installer: &'a I,
         journal: &'a J,
     ) -> Result<Self, StrictPanelReconcileErrorV1> {
+        if request.panels.len() > MAX_STRICT_PANEL_RECORDS_PER_SLOT {
+            return Err(StrictPanelReconcileErrorV1::TooManyDeclaredPanels {
+                count: request.panels.len(),
+            });
+        }
+        if request.guild_id.0 == 0 {
+            return Err(StrictPanelReconcileErrorV1::InvalidOperation {
+                panel_key: String::new(),
+                error: StrictPanelOperationValidationErrorV1::ZeroGuildId,
+            });
+        }
         let declared_count = u32::try_from(request.panels.len())
             .map_err(|_| StrictPanelReconcileErrorV1::CountOverflow)?;
         let mut declared = BTreeSet::new();
         for panel in request.panels {
+            validate_declared_panel_capacity(&request, panel)?;
             if !declared.insert(panel.spec.key.clone()) {
                 return Err(StrictPanelReconcileErrorV1::DuplicateDeclaredPanel(
                     panel.spec.key.clone(),
@@ -441,6 +598,12 @@ where
                 return Err(StrictPanelReconcileErrorV1::JournalOperationOutsideSlot);
             }
             let panel_key = operation.key.panel_key.clone();
+            validate_strict_panel_operation_v1(&operation).map_err(|error| {
+                StrictPanelReconcileErrorV1::InvalidOperation {
+                    panel_key: panel_key.clone(),
+                    error,
+                }
+            })?;
             if operations.insert(panel_key.clone(), operation).is_some() {
                 return Err(StrictPanelReconcileErrorV1::DuplicateJournalOperation(
                     panel_key,
@@ -478,6 +641,14 @@ where
         for panel_key in removed_keys {
             self.reconcile_removed(&panel_key).await?;
         }
+        let mut resident_keys = declared_keys.clone();
+        resident_keys.extend(self.installations.keys().cloned());
+        resident_keys.extend(self.operations.keys().cloned());
+        if resident_keys.len() > MAX_STRICT_PANEL_RECORDS_PER_SLOT {
+            return Err(StrictPanelReconcileErrorV1::SlotCapacityExceeded {
+                count: resident_keys.len(),
+            });
+        }
         let panels = self.request.panels.to_vec();
         for panel in panels {
             self.reconcile_declared(panel).await?;
@@ -489,7 +660,7 @@ where
         &mut self,
         panel_key: &str,
     ) -> Result<(), StrictPanelReconcileErrorV1> {
-        if let Some(operation) = self.operations.remove(panel_key) {
+        if let Some(operation) = self.operations.get(panel_key).cloned() {
             match operation.state.clone() {
                 StrictPanelOperationStateV1::PostDispatching { intent } => {
                     self.record_ambiguous_post(operation.key, intent).await?;
@@ -587,7 +758,7 @@ where
             return Ok(());
         };
         let desired_hash = spec_hash(self.request.render_revision, &panel.spec);
-        if let Some(operation) = self.operations.remove(&panel_key) {
+        if let Some(operation) = self.operations.get(&panel_key).cloned() {
             match self
                 .resume_operation(operation, &panel, channel_id, &desired_hash)
                 .await?
@@ -832,15 +1003,6 @@ where
                 Ok(())
             }
             Ok(StrictObservedMessageV1::Present(_)) => {
-                if intent.previous_message.as_ref().is_some_and(|previous| {
-                    previous.message
-                        == (StrictPanelMessageRefV1 {
-                            channel_id: intent.channel_id,
-                            message_id,
-                        })
-                }) {
-                    return Err(StrictPanelReconcileErrorV1::InvalidJournalState(panel_key));
-                }
                 let installation = PanelInstallation {
                     guild_id: key.guild_id,
                     ruleset_key: key.ruleset_key.clone(),
@@ -850,29 +1012,92 @@ where
                     message_id,
                     spec_hash: intent.spec_hash.clone(),
                 };
+                if let Some(previous) = &intent.previous_message {
+                    match self.installations.get(&panel_key) {
+                        Some(current) if current == &installation => {
+                            return match self
+                                .installer
+                                .observe_message(
+                                    previous.message.channel_id,
+                                    previous.message.message_id,
+                                )
+                                .await
+                            {
+                                Err(_) => {
+                                    self.report.transient(&panel_key)?;
+                                    self.report.cleanup_pending(
+                                        &panel_key,
+                                        previous.cleanup_kind,
+                                        false,
+                                    )
+                                }
+                                Ok(StrictObservedMessageV1::Present(_)) => {
+                                    Err(StrictPanelReconcileErrorV1::InvalidJournalState(panel_key))
+                                }
+                                Ok(StrictObservedMessageV1::Missing) => {
+                                    self.report
+                                        .cleanup_completed(&panel_key, previous.cleanup_kind);
+                                    self.report.installed(&panel_key, intent.install_kind)?;
+                                    self.remove_operation(&key).await
+                                }
+                            };
+                        }
+                        Some(current) if message_ref(current) == previous.message => {}
+                        Some(_) | None => {
+                            return Err(StrictPanelReconcileErrorV1::InvalidJournalState(
+                                panel_key,
+                            ));
+                        }
+                    }
+                    match self
+                        .installer
+                        .delete_message(previous.message.channel_id, previous.message.message_id)
+                        .await
+                    {
+                        StrictDeleteOutcomeV1::Deleted | StrictDeleteOutcomeV1::AlreadyGone => {
+                            self.report
+                                .cleanup_completed(&panel_key, previous.cleanup_kind);
+                        }
+                        StrictDeleteOutcomeV1::DefinitelyNotApplied => {
+                            self.report.cleanup_pending(
+                                &panel_key,
+                                previous.cleanup_kind,
+                                false,
+                            )?;
+                            return Ok(());
+                        }
+                        StrictDeleteOutcomeV1::Ambiguous => {
+                            self.report
+                                .cleanup_pending(&panel_key, previous.cleanup_kind, true)?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    let current_is_valid = match intent.install_kind {
+                        StrictPanelInstallKindV1::Fresh => self
+                            .installations
+                            .get(&panel_key)
+                            .is_none_or(|current| current == &installation),
+                        StrictPanelInstallKindV1::MissingMessage => {
+                            self.installations.get(&panel_key).is_none_or(|current| {
+                                current == &installation || current.channel_id == intent.channel_id
+                            })
+                        }
+                        StrictPanelInstallKindV1::ChannelMoved
+                        | StrictPanelInstallKindV1::PayloadReplaced
+                        | StrictPanelInstallKindV1::MetadataUpdated => false,
+                    };
+                    if !current_is_valid {
+                        return Err(StrictPanelReconcileErrorV1::InvalidJournalState(panel_key));
+                    }
+                }
                 self.store
                     .upsert(installation.clone())
                     .await
                     .map_err(StrictPanelReconcileErrorV1::Store)?;
                 self.installations.insert(panel_key.clone(), installation);
                 self.report.installed(&panel_key, intent.install_kind)?;
-                if let Some(previous) = intent.previous_message {
-                    let cleanup = StrictPanelOperationV1 {
-                        key,
-                        state: StrictPanelOperationStateV1::CleanupPending {
-                            intent: StrictPanelCleanupIntentV1 {
-                                message: previous.message,
-                                kind: previous.cleanup_kind,
-                                remove_installation: false,
-                            },
-                        },
-                    };
-                    self.put_operation(cleanup.clone()).await?;
-                    self.drive_cleanup(cleanup).await?;
-                    Ok(())
-                } else {
-                    self.remove_operation(&key).await
-                }
+                self.remove_operation(&key).await
             }
         }
     }
@@ -895,8 +1120,45 @@ where
         &mut self,
         operation: StrictPanelOperationV1,
     ) -> Result<bool, StrictPanelReconcileErrorV1> {
+        validate_strict_panel_operation_v1(&operation).map_err(|error| {
+            StrictPanelReconcileErrorV1::InvalidOperation {
+                panel_key: operation.key.panel_key.clone(),
+                error,
+            }
+        })?;
         let key = operation.key.clone();
         let intent = cleanup_intent(&operation)?.clone();
+        if intent.remove_installation {
+            match self.installations.get(&key.panel_key) {
+                Some(installation) if message_ref(installation) != intent.message => {
+                    return Err(StrictPanelReconcileErrorV1::InvalidJournalState(
+                        key.panel_key,
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return match self
+                        .installer
+                        .observe_message(intent.message.channel_id, intent.message.message_id)
+                        .await
+                    {
+                        Err(_) => {
+                            self.report
+                                .cleanup_pending(&key.panel_key, intent.kind, false)?;
+                            Ok(false)
+                        }
+                        Ok(StrictObservedMessageV1::Present(_)) => Err(
+                            StrictPanelReconcileErrorV1::InvalidJournalState(key.panel_key),
+                        ),
+                        Ok(StrictObservedMessageV1::Missing) => {
+                            self.remove_operation(&key).await?;
+                            self.report.cleanup_completed(&key.panel_key, intent.kind);
+                            Ok(true)
+                        }
+                    };
+                }
+            }
+        }
         match self
             .installer
             .delete_message(intent.message.channel_id, intent.message.message_id)
@@ -937,23 +1199,34 @@ where
     }
 
     async fn put_operation(
-        &self,
+        &mut self,
         operation: StrictPanelOperationV1,
     ) -> Result<(), StrictPanelReconcileErrorV1> {
+        validate_strict_panel_operation_v1(&operation).map_err(|error| {
+            StrictPanelReconcileErrorV1::InvalidOperation {
+                panel_key: operation.key.panel_key.clone(),
+                error,
+            }
+        })?;
         self.journal
-            .put(operation)
+            .put(operation.clone())
             .await
-            .map_err(StrictPanelReconcileErrorV1::Journal)
+            .map_err(StrictPanelReconcileErrorV1::Journal)?;
+        self.operations
+            .insert(operation.key.panel_key.clone(), operation);
+        Ok(())
     }
 
     async fn remove_operation(
-        &self,
+        &mut self,
         key: &StrictPanelOperationKeyV1,
     ) -> Result<(), StrictPanelReconcileErrorV1> {
         self.journal
             .remove(key)
             .await
-            .map_err(StrictPanelReconcileErrorV1::Journal)
+            .map_err(StrictPanelReconcileErrorV1::Journal)?;
+        self.operations.remove(&key.panel_key);
+        Ok(())
     }
 
     fn operation_key(&self, panel_key: &str) -> StrictPanelOperationKeyV1 {
@@ -963,6 +1236,42 @@ where
             panel_key: panel_key.to_string(),
         }
     }
+}
+
+fn validate_declared_panel_capacity(
+    request: &StrictPanelReconcileRequestV1<'_>,
+    panel: &StrictDeclaredPanelV1,
+) -> Result<(), StrictPanelReconcileErrorV1> {
+    let operation = StrictPanelOperationV1 {
+        key: StrictPanelOperationKeyV1 {
+            guild_id: request.guild_id,
+            ruleset_key: request.ruleset_key.clone(),
+            panel_key: panel.spec.key.clone(),
+        },
+        state: StrictPanelOperationStateV1::PostApplied {
+            intent: StrictPanelPostIntentV1 {
+                panel: panel.clone(),
+                ruleset_version: request.ruleset_version,
+                channel_id: ChannelId(u64::MAX),
+                spec_hash: "f".repeat(64),
+                install_kind: StrictPanelInstallKindV1::PayloadReplaced,
+                previous_message: Some(StrictPanelPreviousMessageV1 {
+                    message: StrictPanelMessageRefV1 {
+                        channel_id: ChannelId(u64::MAX),
+                        message_id: MessageId(u64::MAX),
+                    },
+                    cleanup_kind: StrictPanelCleanupKindV1::PayloadReplaced,
+                }),
+            },
+            message_id: MessageId(u64::MAX - 1),
+        },
+    };
+    validate_strict_panel_operation_v1(&operation).map_err(|error| {
+        StrictPanelReconcileErrorV1::InvalidOperation {
+            panel_key: panel.spec.key.clone(),
+            error,
+        }
+    })
 }
 
 fn message_ref(installation: &PanelInstallation) -> StrictPanelMessageRefV1 {

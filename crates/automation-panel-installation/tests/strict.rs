@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use automation_panel_installation::strict::{
     reconcile_declared_panels_strict, StrictDeclaredPanelV1, StrictDeleteOutcomeV1,
     StrictExternalPostResultV1, StrictObservedMessageV1, StrictPanelActionRowPayloadV1,
-    StrictPanelActionV1, StrictPanelButtonPayloadV1, StrictPanelCleanupKindV1,
-    StrictPanelInstallKindV1, StrictPanelInstallationStore, StrictPanelInstaller,
-    StrictPanelJournalError, StrictPanelMessagePayloadV1, StrictPanelOperationJournal,
-    StrictPanelOperationKeyV1, StrictPanelOperationStateV1, StrictPanelOperationV1,
-    StrictPanelPostIntentV1, StrictPanelReconcileRequestV1, StrictPanelReportV1,
+    StrictPanelActionV1, StrictPanelButtonPayloadV1, StrictPanelCleanupIntentV1,
+    StrictPanelCleanupKindV1, StrictPanelInstallKindV1, StrictPanelInstallationStore,
+    StrictPanelInstaller, StrictPanelJournalError, StrictPanelMessagePayloadV1,
+    StrictPanelMessageRefV1, StrictPanelOperationJournal, StrictPanelOperationKeyV1,
+    StrictPanelOperationStateV1, StrictPanelOperationV1, StrictPanelPostIntentV1,
+    StrictPanelReconcileErrorV1, StrictPanelReconcileRequestV1, StrictPanelReportV1,
+    MAX_STRICT_PANEL_RECORDS_PER_SLOT,
 };
 use automation_panel_installation::{
     spec_hash, InstallerError, PanelInstallation, PanelInstallationKey, PanelInstallationStore,
@@ -383,6 +385,16 @@ fn run(
     installer: &FakeInstaller,
     journal: &FakeJournal,
 ) -> StrictPanelReportV1 {
+    run_result(panels, bindings, store, installer, journal).unwrap()
+}
+
+fn run_result(
+    panels: &[StrictDeclaredPanelV1],
+    bindings: &ResourceBindingMap,
+    store: &FakeStore,
+    installer: &FakeInstaller,
+    journal: &FakeJournal,
+) -> Result<StrictPanelReportV1, StrictPanelReconcileErrorV1> {
     block_on(reconcile_declared_panels_strict(
         StrictPanelReconcileRequestV1 {
             guild_id: GUILD,
@@ -396,7 +408,6 @@ fn run(
         installer,
         journal,
     ))
-    .unwrap()
 }
 
 fn has_action(report: &StrictPanelReportV1, action: StrictPanelActionV1) -> bool {
@@ -509,14 +520,18 @@ fn channel_move_stays_ineligible_until_old_message_cleanup_resumes() {
         &installer,
         &journal,
     );
-    assert_eq!(first.installed_count, 1);
+    assert_eq!(first.installed_count, 0);
     assert_eq!(first.ambiguous_outcome_count, 1);
     assert_eq!(first.reposted_old_message_cleanup_pending_count, 1);
     assert!(!first.is_eligible());
     assert!(matches!(
         journal.operation("entry").unwrap().state,
-        StrictPanelOperationStateV1::CleanupPending { .. }
+        StrictPanelOperationStateV1::PostApplied { .. }
     ));
+    assert_eq!(
+        store.installation("entry").unwrap().message_id,
+        MessageId(100)
+    );
     let second = run(
         std::slice::from_ref(&declared),
         &bindings(&[("new_hub", 20)]),
@@ -524,7 +539,7 @@ fn channel_move_stays_ineligible_until_old_message_cleanup_resumes() {
         &installer,
         &journal,
     );
-    assert_eq!(second.unchanged_count, 1);
+    assert_eq!(second.installed_count, 1);
     assert_eq!(second.reposted_old_message_cleanup_pending_count, 0);
     assert!(has_action(
         &second,
@@ -758,4 +773,208 @@ fn durable_operation_states_roundtrip_strictly() {
         serde_json::from_str::<StrictPanelOperationV1>(&encoded).unwrap(),
         operation
     );
+}
+
+#[test]
+fn declared_panel_count_is_rejected_before_external_work() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    let panels = (0..=MAX_STRICT_PANEL_RECORDS_PER_SLOT)
+        .map(|index| panel(&format!("panel_{index}"), "hub", "hello"))
+        .collect::<Vec<_>>();
+    let error = run_result(
+        &panels,
+        &bindings(&[("hub", 10)]),
+        &store,
+        &installer,
+        &journal,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        StrictPanelReconcileErrorV1::TooManyDeclaredPanels {
+            count: MAX_STRICT_PANEL_RECORDS_PER_SLOT + 1
+        }
+    );
+    assert!(installer.calls().is_empty());
+    assert!(journal.is_empty());
+}
+
+#[test]
+fn oversized_panel_identity_and_payload_are_rejected_before_external_work() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    let oversized_key = panel(&"k".repeat(129), "hub", "hello");
+    assert!(matches!(
+        run_result(
+            &[oversized_key],
+            &bindings(&[("hub", 10)]),
+            &store,
+            &installer,
+            &journal,
+        ),
+        Err(StrictPanelReconcileErrorV1::InvalidOperation { .. })
+    ));
+    let oversized_payload = panel("entry", "hub", &"x".repeat(250_000));
+    assert!(matches!(
+        run_result(
+            &[oversized_payload],
+            &bindings(&[("hub", 10)]),
+            &store,
+            &installer,
+            &journal,
+        ),
+        Err(StrictPanelReconcileErrorV1::InvalidOperation { .. })
+    ));
+    assert!(installer.calls().is_empty());
+    assert!(journal.is_empty());
+}
+
+#[test]
+fn retained_cleanup_keys_block_new_posts_before_slot_overflow() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    for index in 0..MAX_STRICT_PANEL_RECORDS_PER_SLOT {
+        let key = format!("old_{index}");
+        let declared = panel(&key, "hub", "old");
+        journal.seed(StrictPanelOperationV1 {
+            key: operation_key(&key),
+            state: StrictPanelOperationStateV1::AmbiguousPost {
+                intent: post_intent(declared, ChannelId(10), StrictPanelInstallKindV1::Fresh),
+            },
+        });
+    }
+    let desired = panel("new", "hub", "new");
+    let error = run_result(
+        &[desired],
+        &bindings(&[("hub", 10)]),
+        &store,
+        &installer,
+        &journal,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        StrictPanelReconcileErrorV1::SlotCapacityExceeded {
+            count: MAX_STRICT_PANEL_RECORDS_PER_SLOT + 1
+        }
+    );
+    assert!(!installer
+        .calls()
+        .iter()
+        .any(|call| matches!(call, InstallerCall::Post(_, _))));
+}
+
+#[test]
+fn invalid_cleanup_disposition_fails_before_discord_delete() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    journal.seed(StrictPanelOperationV1 {
+        key: operation_key("old"),
+        state: StrictPanelOperationStateV1::CleanupPending {
+            intent: StrictPanelCleanupIntentV1 {
+                message: StrictPanelMessageRefV1 {
+                    channel_id: ChannelId(10),
+                    message_id: MessageId(100),
+                },
+                kind: StrictPanelCleanupKindV1::Orphan,
+                remove_installation: true,
+            },
+        },
+    });
+    assert!(matches!(
+        run_result(
+            &[],
+            &ResourceBindingMap::default(),
+            &store,
+            &installer,
+            &journal,
+        ),
+        Err(StrictPanelReconcileErrorV1::InvalidOperation { .. })
+    ));
+    assert!(!installer
+        .calls()
+        .iter()
+        .any(|call| matches!(call, InstallerCall::Delete(_, _))));
+}
+
+#[test]
+fn invalid_post_disposition_fails_before_discord_delete() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    let declared = panel("entry", "hub", "hello");
+    let mut intent = post_intent(
+        declared.clone(),
+        ChannelId(10),
+        StrictPanelInstallKindV1::Fresh,
+    );
+    intent.previous_message = Some(
+        automation_panel_installation::strict::StrictPanelPreviousMessageV1 {
+            message: StrictPanelMessageRefV1 {
+                channel_id: ChannelId(20),
+                message_id: MessageId(200),
+            },
+            cleanup_kind: StrictPanelCleanupKindV1::PayloadReplaced,
+        },
+    );
+    journal.seed(StrictPanelOperationV1 {
+        key: operation_key("entry"),
+        state: StrictPanelOperationStateV1::PostApplied {
+            intent,
+            message_id: MessageId(300),
+        },
+    });
+    assert!(matches!(
+        run_result(
+            &[declared],
+            &bindings(&[("hub", 10)]),
+            &store,
+            &installer,
+            &journal,
+        ),
+        Err(StrictPanelReconcileErrorV1::InvalidOperation { .. })
+    ));
+    assert!(installer.calls().is_empty());
+}
+
+#[test]
+fn missing_installation_never_authorizes_deleting_a_present_message() {
+    let store = FakeStore::default();
+    let installer = FakeInstaller::default();
+    let journal = FakeJournal::default();
+    let payload = panel("old", "hub", "old").expected_payload;
+    installer.seed_message(ChannelId(10), MessageId(100), payload);
+    journal.seed(StrictPanelOperationV1 {
+        key: operation_key("old"),
+        state: StrictPanelOperationStateV1::CleanupPending {
+            intent: StrictPanelCleanupIntentV1 {
+                message: StrictPanelMessageRefV1 {
+                    channel_id: ChannelId(10),
+                    message_id: MessageId(100),
+                },
+                kind: StrictPanelCleanupKindV1::Removed,
+                remove_installation: true,
+            },
+        },
+    });
+    assert!(matches!(
+        run_result(
+            &[],
+            &ResourceBindingMap::default(),
+            &store,
+            &installer,
+            &journal,
+        ),
+        Err(StrictPanelReconcileErrorV1::InvalidJournalState(_))
+    ));
+    assert!(installer.has_message(ChannelId(10), MessageId(100)));
+    assert!(!installer
+        .calls()
+        .iter()
+        .any(|call| matches!(call, InstallerCall::Delete(_, _))));
 }
