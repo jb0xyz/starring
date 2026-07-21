@@ -426,6 +426,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-controller"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "automation-runtime-convergence"
 version = "0.1.0"
 dependencies = [

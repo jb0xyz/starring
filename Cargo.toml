@@ -26,6 +26,7 @@ members = [
     "crates/product-control-http",
     "crates/automation-runtime",
     "crates/automation-runtime-convergence",
+    "crates/automation-runtime-controller",
     "crates/automation-runtime-convergence-postgres",
     "crates/automation-instance",
     "crates/automation-instance-postgres",
