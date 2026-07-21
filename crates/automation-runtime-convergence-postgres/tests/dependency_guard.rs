@@ -26,6 +26,7 @@ fn adapter_does_not_depend_on_runtime_or_product_authority_edges() {
 fn adapter_sources_contain_no_comments() {
     let sources = [
         include_str!("../src/artifact.rs"),
+        include_str!("../src/controller.rs"),
         include_str!("../src/digest.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/evidence.rs"),

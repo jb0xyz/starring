@@ -1,4 +1,5 @@
 mod artifact;
+mod controller;
 mod digest;
 mod error;
 mod evidence;

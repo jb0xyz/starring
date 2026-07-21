@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 automation-core = { path = "../automation-core" }
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+automation-runtime-controller = { path = "../automation-runtime-controller" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-state = { path = "../automation-state" }
 desired-state = { path = "../desired-state" }
