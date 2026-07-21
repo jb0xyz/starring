@@ -414,6 +414,7 @@ dependencies = [
  "automation-panel-installation",
  "automation-ruleset",
  "automation-ruleset-dispatch",
+ "automation-ruleset-readiness",
  "automation-state",
  "desired-state",
  "discord-model",
