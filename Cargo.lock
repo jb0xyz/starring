@@ -419,6 +419,7 @@ dependencies = [
  "discord-model",
  "futures",
  "resource-resolution",
+ "thiserror 1.0.69",
  "tokio",
  "twilight-gateway",
  "twilight-http",

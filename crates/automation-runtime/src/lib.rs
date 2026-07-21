@@ -2,6 +2,7 @@ pub mod convert;
 pub mod custom_id;
 pub mod error;
 pub mod gateway;
+pub mod gateway_supervisor;
 pub mod instance_deleter;
 pub mod mutation;
 pub mod panel_installer;
@@ -20,6 +21,11 @@ pub use gateway::{
     control_channel, run, run_controlled, GatewayCommandV1, GatewayControlV1,
     GatewayDisconnectKindV1, GatewayExitV1, GatewayLifecycleEventV1, GatewayReadyKindV1,
     GatewayRuntimeControlV1,
+};
+pub use gateway_supervisor::{
+    control_channel_v2, run_until_shutdown, GatewayCommandV2, GatewayConnectionStateV2,
+    GatewayControlErrorV2, GatewayControlV2, GatewayDisconnectKindV2, GatewayDrainOutcomeV2,
+    GatewayExitV2, GatewayLifecycleEventV2, GatewayReadyKindV2, GatewayRuntimeControlV2,
 };
 pub use instance_deleter::TwilightInstanceDeleter;
 pub use mutation::TwilightMutationAdapter;
