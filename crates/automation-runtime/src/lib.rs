@@ -11,6 +11,7 @@ pub mod responder;
 pub mod resume;
 pub mod runner;
 pub mod snapshot;
+pub mod strict_panel_installer;
 
 pub use convert::interaction_to_event;
 pub use custom_id::{
@@ -39,3 +40,4 @@ pub use readiness::{
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};
 pub use snapshot::TwilightGuildRoleSnapshotProvider;
+pub use strict_panel_installer::{render_strict_declared_panel_v1, TwilightStrictPanelInstaller};
