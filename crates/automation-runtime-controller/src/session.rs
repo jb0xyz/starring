@@ -327,7 +327,10 @@ impl RuntimeConvergenceSessionV1 {
                 .snapshot
                 .panel_certificate
                 .as_ref()
-                .is_none_or(|panel| panel.process_instance_id != gateway_ready.process_instance_id)
+                .is_none_or(|panel| {
+                    panel.process_instance_id != gateway_ready.process_instance_id
+                        || panel.report_digest != metadata.panel_report_digest
+                })
         {
             return Err(RuntimeConvergenceSessionError::InvalidMutationForPhase);
         }
@@ -1271,6 +1274,7 @@ mod tests {
             session,
             RuntimeConvergenceMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
                 certificate_id: PanelCertificateId::parse("panel").unwrap(),
+                report_digest: PanelReportDigestV1::parse("4".repeat(64)).unwrap(),
                 target: target(),
                 runtime_generation: RuntimeGeneration::FIRST,
                 process_instance_id: process.clone(),
@@ -1586,6 +1590,29 @@ mod tests {
             Err(RuntimeConvergenceSessionError::InactiveSession)
         );
         assert_eq!(live.state(), RuntimeServingSessionStateV1::Serving);
+    }
+
+    #[test]
+    fn certification_rejects_a_digest_from_another_panel_report() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        let process = advance_to_awaiting(&mut session);
+        let gateway_ready = GatewayReadyAttestationV1 {
+            target: target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            process_instance_id: process,
+            kind: GatewayReadyKindV1::DiscordReady,
+            ready_at: at(15),
+        };
+        let mut mismatched = metadata();
+        mismatched.panel_report_digest = PanelReportDigestV1::parse("5".repeat(64)).unwrap();
+        assert_eq!(
+            session.begin_certification(gateway_ready.clone(), mismatched, Duration::from_secs(45)),
+            Err(RuntimeConvergenceSessionError::InvalidMutationForPhase)
+        );
+        assert!(session.in_flight_action().is_none());
+        assert!(session
+            .begin_certification(gateway_ready, metadata(), Duration::from_secs(45))
+            .is_ok());
     }
 
     #[test]

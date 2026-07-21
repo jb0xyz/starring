@@ -482,7 +482,6 @@ version = "0.1.0"
 dependencies = [
  "automation-panel-installation",
  "automation-ruleset",
- "automation-runtime-controller",
  "automation-runtime-convergence",
  "chrono",
  "discord-model",

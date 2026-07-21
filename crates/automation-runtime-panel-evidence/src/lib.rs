@@ -4,10 +4,9 @@ use automation_panel_installation::strict::{
     validate_strict_panel_key_v1, StrictPanelActionV1, StrictPanelCleanupKindV1,
     StrictPanelInstallKindV1, StrictPanelReportV1, MAX_STRICT_PANEL_RECORDS_PER_SLOT,
 };
-use automation_runtime_controller::PanelReportDigestV1;
 use automation_runtime_convergence::{
-    PanelCertificateId, PanelCertificateV1, ProcessInstanceId, RuntimeDeploymentTargetV1,
-    RuntimeGeneration,
+    PanelCertificateId, PanelCertificateV1, PanelReportDigestV1, ProcessInstanceId,
+    RuntimeDeploymentTargetV1, RuntimeGeneration,
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -24,8 +23,6 @@ pub enum CertifiedPanelEvidenceErrorV1 {
     CapacityExceeded,
     #[error("panel report exceeds the certified outcome limit")]
     OutcomeCapacityExceeded,
-    #[error("panel report contains too many distinct panel keys")]
-    PanelKeyCapacityExceeded,
     #[error("panel report contains an invalid panel key")]
     InvalidPanelKey,
     #[error("panel report contains duplicate terminal panel outcomes")]
@@ -43,7 +40,6 @@ pub enum CertifiedPanelEvidenceErrorV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertifiedPanelEvidenceV1 {
     certificate: PanelCertificateV1,
-    report_digest: PanelReportDigestV1,
     report: StrictPanelReportV1,
 }
 
@@ -73,6 +69,7 @@ impl CertifiedPanelEvidenceV1 {
         )?;
         let certificate = PanelCertificateV1 {
             certificate_id,
+            report_digest,
             target,
             runtime_generation,
             process_instance_id,
@@ -92,7 +89,6 @@ impl CertifiedPanelEvidenceV1 {
 
         Ok(Self {
             certificate,
-            report_digest,
             report,
         })
     }
@@ -102,15 +98,15 @@ impl CertifiedPanelEvidenceV1 {
     }
 
     pub fn report_digest(&self) -> &PanelReportDigestV1 {
-        &self.report_digest
+        &self.certificate.report_digest
     }
 
     pub fn report(&self) -> &StrictPanelReportV1 {
         &self.report
     }
 
-    pub fn into_parts(self) -> (PanelCertificateV1, PanelReportDigestV1, StrictPanelReportV1) {
-        (self.certificate, self.report_digest, self.report)
+    pub fn into_parts(self) -> (PanelCertificateV1, StrictPanelReportV1) {
+        (self.certificate, self.report)
     }
 }
 
@@ -127,14 +123,12 @@ fn validate_report(report: &StrictPanelReportV1) -> Result<(), CertifiedPanelEvi
         return Err(CertifiedPanelEvidenceErrorV1::IneligibleReport);
     }
 
-    let mut panel_keys = BTreeSet::new();
     let mut terminal_panel_keys = BTreeSet::new();
     let mut installed_count = 0u32;
     let mut unchanged_count = 0u32;
     for outcome in &report.outcomes {
         validate_strict_panel_key_v1(&outcome.panel_key)
             .map_err(|_| CertifiedPanelEvidenceErrorV1::InvalidPanelKey)?;
-        panel_keys.insert(outcome.panel_key.as_str());
         match &outcome.action {
             StrictPanelActionV1::Installed(_) => {
                 if !terminal_panel_keys.insert(outcome.panel_key.as_str()) {
@@ -155,9 +149,6 @@ fn validate_report(report: &StrictPanelReportV1) -> Result<(), CertifiedPanelEvi
             StrictPanelActionV1::CleanupCompleted(_) => {}
             _ => return Err(CertifiedPanelEvidenceErrorV1::IneligibleAction),
         }
-    }
-    if panel_keys.len() > MAX_STRICT_PANEL_RECORDS_PER_SLOT {
-        return Err(CertifiedPanelEvidenceErrorV1::PanelKeyCapacityExceeded);
     }
     if installed_count != report.installed_count || unchanged_count != report.unchanged_count {
         return Err(CertifiedPanelEvidenceErrorV1::CounterMismatch);
@@ -642,21 +633,6 @@ mod tests {
             Err(CertifiedPanelEvidenceErrorV1::IneligibleReport)
         );
 
-        let outcomes = (0..=MAX_STRICT_PANEL_RECORDS_PER_SLOT)
-            .map(|index| StrictPanelOutcomeV1 {
-                panel_key: format!("panel_{index}"),
-                action: StrictPanelActionV1::CleanupCompleted(StrictPanelCleanupKindV1::Removed),
-            })
-            .collect();
-        let too_many_panel_keys = StrictPanelReportV1 {
-            outcomes,
-            ..StrictPanelReportV1::default()
-        };
-        assert_eq!(
-            build(too_many_panel_keys),
-            Err(CertifiedPanelEvidenceErrorV1::PanelKeyCapacityExceeded)
-        );
-
         let too_many_outcomes = StrictPanelReportV1 {
             outcomes: (0..=MAX_CERTIFIED_PANEL_OUTCOMES_V1)
                 .map(|_| StrictPanelOutcomeV1 {
@@ -722,6 +698,34 @@ mod tests {
     }
 
     #[test]
+    fn maximum_distinct_cleanup_and_declared_keys_remain_certifiable() {
+        let cleanup_count = MAX_STRICT_PANEL_RECORDS_PER_SLOT * 2;
+        let mut outcomes = (0..cleanup_count)
+            .map(|index| StrictPanelOutcomeV1 {
+                panel_key: format!("removed_{index}"),
+                action: StrictPanelActionV1::CleanupCompleted(StrictPanelCleanupKindV1::Removed),
+            })
+            .collect::<Vec<_>>();
+        outcomes.extend(
+            (0..MAX_STRICT_PANEL_RECORDS_PER_SLOT).map(|index| StrictPanelOutcomeV1 {
+                panel_key: format!("declared_{index}"),
+                action: StrictPanelActionV1::Installed(StrictPanelInstallKindV1::Fresh),
+            }),
+        );
+        let report = StrictPanelReportV1 {
+            outcomes,
+            declared_count: MAX_STRICT_PANEL_RECORDS_PER_SLOT as u32,
+            installed_count: MAX_STRICT_PANEL_RECORDS_PER_SLOT as u32,
+            ..StrictPanelReportV1::default()
+        };
+        let evidence = build(report).unwrap();
+        assert_eq!(
+            evidence.report().outcomes.len(),
+            MAX_CERTIFIED_PANEL_OUTCOMES_V1
+        );
+    }
+
+    #[test]
     fn zero_guild_target_is_rejected() {
         let result = CertifiedPanelEvidenceV1::build(
             RuntimeDeploymentTargetV1 {
@@ -751,9 +755,9 @@ mod tests {
         assert_eq!(certificate.orphan_message_cleanup_pending_count, 0);
         assert_eq!(certificate.reposted_old_message_cleanup_pending_count, 0);
         assert_eq!(evidence.report(), &report());
-        let (certificate, digest, owned_report) = evidence.into_parts();
+        let (certificate, owned_report) = evidence.into_parts();
         assert_eq!(certificate.declared_count, 2);
-        assert_eq!(digest.as_str().len(), 64);
+        assert_eq!(certificate.report_digest.as_str().len(), 64);
         assert_eq!(owned_report, report());
     }
 }

@@ -296,6 +296,10 @@ async fn certify_product_runtime_live(
                 suffix()
             ))
             .unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(sha256_hex(
+                &format!("product-panel-report:{}", suffix()),
+            ))
+            .unwrap(),
             target: target.clone(),
             runtime_generation: generation,
             process_instance_id: process_instance_id.clone(),

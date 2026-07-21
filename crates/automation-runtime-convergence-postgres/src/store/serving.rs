@@ -33,6 +33,16 @@ impl PostgresRuntimeConvergence {
         let mut transaction = self.begin().await?;
         let mut persisted = Self::load_scoped_for_update(&mut transaction, &request.scope).await?;
         Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
+        let certification_snapshot = persisted.deployment.snapshot();
+        let panel_report_digest = certification_snapshot
+            .panel_certificate
+            .as_ref()
+            .map(|certificate| certificate.report_digest.as_str());
+        if panel_report_digest != Some(request.metadata.panel_report_digest.as_str()) {
+            return Err(RuntimeConvergenceStoreError::InvalidInput(
+                "panel report digest mismatch",
+            ));
+        }
         let current_serving = Self::load_serving_lease_for_update(
             &mut transaction,
             persisted.deployment.target().guild_id.to_string(),

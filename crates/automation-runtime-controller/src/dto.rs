@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
+pub use automation_runtime_convergence::PanelReportDigestV1;
 use automation_runtime_convergence::{
     ActivationAttestationV1, ControllerId, DeploymentId, DeploymentRevision, DrainAttestationV1,
     FencingToken, GatewayReadyAttestationV1, InstallationId, PanelCertificateV1,
@@ -86,7 +87,6 @@ macro_rules! define_digest {
 define_safe_text!(RuntimeBuildRevisionV1);
 define_safe_text!(GatewayShardIdV1);
 define_digest!(RuntimeAttestationIdV1);
-define_digest!(PanelReportDigestV1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeSessionActionIdV1(NonZeroU64);

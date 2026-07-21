@@ -315,6 +315,10 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         claim.fencing_token,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-pg-panel-next").unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
+                "4".repeat(64),
+            )
+            .unwrap(),
             target: target(),
             runtime_generation: next_generation,
             process_instance_id: next_process.clone(),
@@ -540,6 +544,10 @@ async fn converge_claimed(
         fencing_token,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-policy-panel").unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
+                "7".repeat(64),
+            )
+            .unwrap(),
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
             process_instance_id: process_instance_id.clone(),
@@ -613,6 +621,10 @@ async fn converge_recovered(
                 "runtime-pg-panel-{}",
                 process_instance_id.as_str()
             ))
+            .unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
+                report_digest_character.repeat(64),
+            )
             .unwrap(),
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,

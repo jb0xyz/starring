@@ -13,9 +13,9 @@ pub use attestation::{
 pub use error::{PanelIneligibilityV1, RuntimeDeploymentError};
 pub use id::{
     ActivationRequestId, BindingRevision, ControllerId, DeploymentId, DeploymentRevision,
-    FencingToken, InstallationId, OpaqueRuntimeIdError, PanelCertificateId, ProcessInstanceId,
-    PromotionId, PromotionIdError, RuntimeFailureId, RuntimeGeneration, RuntimeRevisionError,
-    TenantId,
+    FencingToken, InstallationId, OpaqueRuntimeIdError, PanelCertificateId,
+    PanelReportDigestErrorV1, PanelReportDigestV1, ProcessInstanceId, PromotionId,
+    PromotionIdError, RuntimeFailureId, RuntimeGeneration, RuntimeRevisionError, TenantId,
 };
 pub use identity::{
     RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1,

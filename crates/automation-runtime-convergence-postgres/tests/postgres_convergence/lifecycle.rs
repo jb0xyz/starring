@@ -209,6 +209,10 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         claim.fencing_token,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-pg-panel-certificate").unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
+                "d".repeat(64),
+            )
+            .unwrap(),
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
             process_instance_id: process.clone(),
@@ -226,6 +230,33 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         }),
     )
     .await;
+    let mismatched_digest = adapter
+        .certify_live(SubmitLiveAttestationV1 {
+            scope: scope(),
+            expected_revision: revision,
+            controller_id: controller.clone(),
+            fencing_token: claim.fencing_token,
+            runtime_generation: RuntimeGeneration::FIRST,
+            gateway_ready: GatewayReadyAttestationV1 {
+                target: target(),
+                runtime_generation: RuntimeGeneration::FIRST,
+                process_instance_id: process.clone(),
+                kind: GatewayReadyKindV1::DiscordReady,
+                ready_at: claim.acquired_at,
+            },
+            metadata: LiveMetadataV1 {
+                runtime_build_revision: RuntimeBuildRevisionV1::parse("test-build-1").unwrap(),
+                panel_report_digest: PanelReportDigestV1::parse("e".repeat(64)).unwrap(),
+                gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+            },
+            serving_lease_for: Duration::from_secs(45),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        mismatched_digest,
+        RuntimeConvergenceStoreError::InvalidInput("panel report digest mismatch")
+    ));
     let stale_ready = adapter
         .certify_live(SubmitLiveAttestationV1 {
             scope: scope(),

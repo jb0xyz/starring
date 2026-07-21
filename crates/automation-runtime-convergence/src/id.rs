@@ -76,6 +76,54 @@ pub enum PromotionIdError {
     LowerHex,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PanelReportDigestErrorV1 {
+    #[error("panel report digest must contain exactly 64 characters")]
+    Length,
+    #[error("panel report digest must be lowercase hexadecimal")]
+    LowerHex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct PanelReportDigestV1(String);
+
+impl PanelReportDigestV1 {
+    pub fn parse(value: impl Into<String>) -> Result<Self, PanelReportDigestErrorV1> {
+        let value = value.into();
+        if value.len() != 64 {
+            return Err(PanelReportDigestErrorV1::Length);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PanelReportDigestErrorV1::LowerHex);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for PanelReportDigestV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PanelReportDigestV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PromotionId(String);
