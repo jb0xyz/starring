@@ -416,6 +416,8 @@ dependencies = [
  "automation-ruleset",
  "automation-ruleset-dispatch",
  "automation-ruleset-readiness",
+ "automation-runtime-convergence",
+ "automation-runtime-registry",
  "automation-state",
  "desired-state",
  "discord-model",

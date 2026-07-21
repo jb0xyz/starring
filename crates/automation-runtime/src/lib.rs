@@ -10,6 +10,7 @@ pub mod readiness;
 pub mod responder;
 pub mod resume;
 pub mod runner;
+pub mod shared_gateway_router;
 pub mod snapshot;
 pub mod strict_panel_installer;
 
@@ -39,5 +40,9 @@ pub use readiness::{
 };
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};
+pub use shared_gateway_router::{
+    admit_shared_gateway_route_v1, parse_shared_gateway_route_v1, SharedGatewayRouteErrorV1,
+    SharedGatewayRouteHintV1,
+};
 pub use snapshot::TwilightGuildRoleSnapshotProvider;
 pub use strict_panel_installer::{render_strict_declared_panel_v1, TwilightStrictPanelInstaller};

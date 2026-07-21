@@ -12,6 +12,7 @@ automation-core = { path = "../automation-core" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-dispatch = { path = "../automation-ruleset-dispatch" }
 automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+automation-runtime-registry = { path = "../automation-runtime-registry" }
 desired-state = { path = "../desired-state" }
 discord-model = { path = "../discord-model" }
 resource-resolution = { path = "../resource-resolution" }
@@ -21,3 +22,6 @@ twilight-model = "0.17"
 futures = "0.3"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
