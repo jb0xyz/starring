@@ -20,6 +20,8 @@ fn regular_dependencies_stay_pure() {
         "reqwest",
         "design-harness",
         "automation-runtime =",
+        "automation-runtime-convergence-postgres",
+        "tokio",
     ] {
         assert!(
             !regular.contains(forbidden),
@@ -38,10 +40,13 @@ fn crate_is_library_only() {
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
+        ("src/dto.rs", include_str!("../src/dto.rs")),
         ("src/failure.rs", include_str!("../src/failure.rs")),
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/planner.rs", include_str!("../src/planner.rs")),
+        ("src/port.rs", include_str!("../src/port.rs")),
         ("src/retry.rs", include_str!("../src/retry.rs")),
+        ("src/session.rs", include_str!("../src/session.rs")),
         (
             "tests/dependency_guard.rs",
             include_str!("dependency_guard.rs"),
