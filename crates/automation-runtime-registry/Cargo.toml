@@ -1,0 +1,15 @@
+[package]
+name = "automation-runtime-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+automation-ruleset = { path = "../automation-ruleset" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+thiserror = "1"
+
+[dev-dependencies]
+automation-state = { path = "../automation-state" }
+desired-state = { path = "../desired-state" }

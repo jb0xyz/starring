@@ -474,6 +474,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-registry"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "resource-resolution",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "automation-state"
 version = "0.1.0"
 dependencies = [
