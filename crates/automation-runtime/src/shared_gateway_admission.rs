@@ -477,6 +477,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_pause_reservation_cannot_cross_a_pause_resume_barrier() {
+        let guild_id = GuildId(7);
+        let registry = registry(1);
+        install_route(&registry, guild_id, "study");
+        let instances = InMemoryInstanceStore::new();
+        let (control, mut runtime, lease) = connected_control();
+        let observer = control.connection_observer();
+        let budget = budget(1);
+        let reservation = budget.try_reserve(&observer, &lease).unwrap();
+        let (paused, _) = tokio::join!(control.pause_admission(), runtime.process_next_command());
+        assert!(paused.is_ok());
+        let (resumed, _) = tokio::join!(
+            control.resume_admission(lease.epoch()),
+            runtime.process_next_command()
+        );
+        assert!(resumed.is_ok());
+        assert_eq!(
+            admission_error(
+                reservation
+                    .admit(
+                        &registry,
+                        &instances,
+                        guild_id,
+                        "starring:7:study:button:create",
+                    )
+                    .await,
+            ),
+            SharedGatewayAdmissionErrorV3::NotReady
+        );
+        let current = observer.issue_ready_lease(lease.epoch()).unwrap();
+        assert!(budget.try_reserve(&observer, &current).is_ok());
+    }
+
+    #[tokio::test]
     async fn global_capacity_never_queues_and_spans_slots() {
         let guild_id = GuildId(7);
         let registry = registry(2);
