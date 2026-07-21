@@ -3,6 +3,7 @@ pub mod installer;
 pub mod model;
 pub mod reconcile;
 pub mod store;
+pub mod strict;
 
 pub use hash::spec_hash;
 pub use installer::{InstallerError, PanelEditOutcome, PanelInstaller, PanelPresence};
