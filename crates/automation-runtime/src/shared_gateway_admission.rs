@@ -9,7 +9,8 @@ use discord_model::GuildId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::shared_gateway_control::{
-    GatewayConnectionEpochV3, GatewayReadyLeaseV3, SharedGatewayControlV3,
+    GatewayConnectionEpochV3, GatewayConnectionObserverV3, GatewayReadyLeaseV3,
+    SharedGatewayControlV3,
 };
 use crate::shared_gateway_router::{admit_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
 
@@ -97,7 +98,27 @@ impl SharedGatewayAdmissionBudgetV3 {
         guild_id: GuildId,
         custom_id: &str,
     ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
-        if !control.ready_lease_is_current(ready_lease) {
+        self.admit_with_observer(
+            &control.connection_observer(),
+            ready_lease,
+            registry,
+            instances,
+            guild_id,
+            custom_id,
+        )
+        .await
+    }
+
+    pub async fn admit_with_observer(
+        &self,
+        observer: &GatewayConnectionObserverV3,
+        ready_lease: &GatewayReadyLeaseV3,
+        registry: &ServingSlotRegistryV1,
+        instances: &impl InstanceStore,
+        guild_id: GuildId,
+        custom_id: &str,
+    ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
+        if !observer.ready_lease_is_current(ready_lease) {
             return Err(SharedGatewayAdmissionErrorV3::NotReady);
         }
         let global_permit = self
@@ -112,7 +133,7 @@ impl SharedGatewayAdmissionBudgetV3 {
         else {
             return Ok(None);
         };
-        if !control.ready_lease_is_current(ready_lease) {
+        if !observer.ready_lease_is_current(ready_lease) {
             drop(admitted);
             drop(global_permit);
             return Err(SharedGatewayAdmissionErrorV3::NotReady);
@@ -478,10 +499,11 @@ mod tests {
         install_route(&registry, guild_id, "study");
         let instances = InMemoryInstanceStore::new();
         let (control, _runtime, lease) = connected_control();
+        let observer = control.connection_observer();
         let budget = budget(1);
         assert!(budget
-            .admit(
-                &control,
+            .admit_with_observer(
+                &observer,
                 &lease,
                 &registry,
                 &instances,

@@ -49,11 +49,11 @@ pub use shared_gateway_admission::{
 };
 pub use shared_gateway_control::{
     shared_gateway_control_channel_v3, GatewayCommandAckV3, GatewayConnectionEpochV3,
-    GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
-    GatewayControlErrorV3, GatewayControlTransitionErrorV3, GatewayDisconnectKindV3,
-    GatewayDrainCauseV3, GatewayLifecycleEventV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
-    GatewayReadyLeaseV3, GatewayRuntimeCommandOutcomeV3, SharedGatewayControlV3,
-    SharedGatewayRuntimeControlV3,
+    GatewayConnectionObserverV3, GatewayConnectionStateV3, GatewayControlConfigV3,
+    GatewayControlConfigurationErrorV3, GatewayControlErrorV3, GatewayControlTransitionErrorV3,
+    GatewayDisconnectKindV3, GatewayDrainCauseV3, GatewayLifecycleEventV3,
+    GatewayPausedConnectionV3, GatewayReadyKindV3, GatewayReadyLeaseV3,
+    GatewayRuntimeCommandOutcomeV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 pub use shared_gateway_router::{
     admit_shared_gateway_route_v1, admit_shared_gateway_route_with_config_v1,

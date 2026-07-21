@@ -262,6 +262,36 @@ pub struct SharedGatewayControlV3 {
     connection: watch::Receiver<GatewayConnectionStateV3>,
 }
 
+#[derive(Clone)]
+pub struct GatewayConnectionObserverV3 {
+    connection: watch::Receiver<GatewayConnectionStateV3>,
+}
+
+impl GatewayConnectionObserverV3 {
+    pub fn current_connection(&self) -> GatewayConnectionStateV3 {
+        *self.connection.borrow()
+    }
+
+    pub async fn connection_changed(&mut self) -> Option<GatewayConnectionStateV3> {
+        self.connection
+            .changed()
+            .await
+            .ok()
+            .map(|()| *self.connection.borrow_and_update())
+    }
+
+    pub fn issue_ready_lease(
+        &self,
+        expected_epoch: GatewayConnectionEpochV3,
+    ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
+        issue_ready_lease(self.current_connection(), expected_epoch)
+    }
+
+    pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
+        ready_lease_is_current(self.current_connection(), lease)
+    }
+}
+
 impl SharedGatewayControlV3 {
     pub async fn pause_admission(&self) -> Result<GatewayCommandAckV3, GatewayControlErrorV3> {
         let (sender, receiver) = oneshot::channel();
@@ -317,6 +347,12 @@ impl SharedGatewayControlV3 {
         self.connection.clone()
     }
 
+    pub fn connection_observer(&self) -> GatewayConnectionObserverV3 {
+        GatewayConnectionObserverV3 {
+            connection: self.connection.clone(),
+        }
+    }
+
     pub async fn connection_changed(&mut self) -> Option<GatewayConnectionStateV3> {
         self.connection
             .changed()
@@ -333,35 +369,42 @@ impl SharedGatewayControlV3 {
         &self,
         expected_epoch: GatewayConnectionEpochV3,
     ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-        match self.current_connection() {
-            GatewayConnectionStateV3::Connected { epoch, kind } if epoch == expected_epoch => {
-                Ok(GatewayReadyLeaseV3 { epoch, kind })
-            }
-            GatewayConnectionStateV3::Connected { .. } => {
-                Err(GatewayControlTransitionErrorV3::StaleConnectionEpoch)
-            }
-            GatewayConnectionStateV3::Paused { .. } => {
-                Err(GatewayControlTransitionErrorV3::AdmissionPaused)
-            }
-            GatewayConnectionStateV3::Starting | GatewayConnectionStateV3::Disconnected { .. } => {
-                Err(GatewayControlTransitionErrorV3::NotConnected)
-            }
-            GatewayConnectionStateV3::Draining { .. } => {
-                Err(GatewayControlTransitionErrorV3::Draining)
-            }
-            GatewayConnectionStateV3::Stopped { .. } => {
-                Err(GatewayControlTransitionErrorV3::Stopped)
-            }
-        }
+        issue_ready_lease(self.current_connection(), expected_epoch)
     }
 
     pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
-        matches!(
-            self.current_connection(),
-            GatewayConnectionStateV3::Connected { epoch, kind }
-                if epoch == lease.epoch && kind == lease.kind
-        )
+        ready_lease_is_current(self.current_connection(), lease)
     }
+}
+
+fn issue_ready_lease(
+    state: GatewayConnectionStateV3,
+    expected_epoch: GatewayConnectionEpochV3,
+) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
+    match state {
+        GatewayConnectionStateV3::Connected { epoch, kind } if epoch == expected_epoch => {
+            Ok(GatewayReadyLeaseV3 { epoch, kind })
+        }
+        GatewayConnectionStateV3::Connected { .. } => {
+            Err(GatewayControlTransitionErrorV3::StaleConnectionEpoch)
+        }
+        GatewayConnectionStateV3::Paused { .. } => {
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        }
+        GatewayConnectionStateV3::Starting | GatewayConnectionStateV3::Disconnected { .. } => {
+            Err(GatewayControlTransitionErrorV3::NotConnected)
+        }
+        GatewayConnectionStateV3::Draining { .. } => Err(GatewayControlTransitionErrorV3::Draining),
+        GatewayConnectionStateV3::Stopped { .. } => Err(GatewayControlTransitionErrorV3::Stopped),
+    }
+}
+
+fn ready_lease_is_current(state: GatewayConnectionStateV3, lease: &GatewayReadyLeaseV3) -> bool {
+    matches!(
+        state,
+        GatewayConnectionStateV3::Connected { epoch, kind }
+            if epoch == lease.epoch && kind == lease.kind
+    )
 }
 
 pub struct SharedGatewayRuntimeControlV3 {
@@ -988,5 +1031,27 @@ mod tests {
                 cause: GatewayDrainCauseV3::Commanded
             } if value == epoch
         ));
+    }
+
+    #[tokio::test]
+    async fn cloned_observer_issues_and_invalidates_leases_without_command_ownership() {
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        let observer = control.connection_observer();
+        let mut second = observer.clone();
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        assert_eq!(
+            second.connection_changed().await,
+            Some(GatewayConnectionStateV3::Connected {
+                epoch,
+                kind: GatewayReadyKindV3::Ready
+            })
+        );
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+        assert!(second.ready_lease_is_current(&lease));
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        assert!(!observer.ready_lease_is_current(&lease));
     }
 }
