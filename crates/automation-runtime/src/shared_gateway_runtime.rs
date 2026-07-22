@@ -1,7 +1,9 @@
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::Duration;
 
+use automation_core::InteractionResponder;
 use automation_instance::{InstanceIdGenerator, InstanceStore};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetStore;
@@ -15,6 +17,7 @@ use twilight_http::Client;
 use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::gateway::CloseFrame;
 
+use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionErrorV3,
@@ -28,10 +31,13 @@ use crate::shared_gateway_executor::execute_admitted_interaction_v3;
 use crate::shared_gateway_router::parse_shared_gateway_route_v1;
 
 const MAX_SHARED_GATEWAY_DRAIN_TIMEOUT_V3: Duration = Duration::from_secs(60);
+const MAX_SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENTS_V3: usize = 1_024;
+const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedGatewayRuntimeConfigV3 {
     drain_timeout: Duration,
+    rejection_acknowledgement_capacity: NonZeroUsize,
 }
 
 impl SharedGatewayRuntimeConfigV3 {
@@ -39,11 +45,30 @@ impl SharedGatewayRuntimeConfigV3 {
         if drain_timeout.is_zero() || drain_timeout > MAX_SHARED_GATEWAY_DRAIN_TIMEOUT_V3 {
             return Err(SharedGatewayRuntimeConfigurationErrorV3::DrainTimeout);
         }
-        Ok(Self { drain_timeout })
+        Ok(Self {
+            drain_timeout,
+            rejection_acknowledgement_capacity: NonZeroUsize::new(64)
+                .expect("default rejection acknowledgement capacity is non-zero"),
+        })
     }
 
     pub fn drain_timeout(self) -> Duration {
         self.drain_timeout
+    }
+
+    pub fn with_rejection_acknowledgement_capacity(
+        mut self,
+        capacity: NonZeroUsize,
+    ) -> Result<Self, SharedGatewayRuntimeConfigurationErrorV3> {
+        if capacity.get() > MAX_SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENTS_V3 {
+            return Err(SharedGatewayRuntimeConfigurationErrorV3::RejectionAcknowledgementCapacity);
+        }
+        self.rejection_acknowledgement_capacity = capacity;
+        Ok(self)
+    }
+
+    pub fn rejection_acknowledgement_capacity(self) -> NonZeroUsize {
+        self.rejection_acknowledgement_capacity
     }
 }
 
@@ -51,6 +76,8 @@ impl Default for SharedGatewayRuntimeConfigV3 {
     fn default() -> Self {
         Self {
             drain_timeout: Duration::from_secs(15),
+            rejection_acknowledgement_capacity: NonZeroUsize::new(64)
+                .expect("default rejection acknowledgement capacity is non-zero"),
         }
     }
 }
@@ -59,6 +86,8 @@ impl Default for SharedGatewayRuntimeConfigV3 {
 pub enum SharedGatewayRuntimeConfigurationErrorV3 {
     #[error("shared gateway drain timeout is invalid")]
     DrainTimeout,
+    #[error("shared gateway rejection acknowledgement capacity is invalid")]
+    RejectionAcknowledgementCapacity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +113,12 @@ pub struct SharedGatewayRuntimeReportV3 {
     pub not_ready: u64,
     pub overloaded: u64,
     pub admission_rejected: u64,
+    pub rejection_acknowledged: u64,
+    pub rejection_acknowledgement_failed: u64,
+    pub rejection_acknowledgement_timed_out: u64,
+    pub rejection_acknowledgement_dropped: u64,
     pub cancelled_during_drain: u64,
+    pub rejection_acknowledgements_cancelled_during_drain: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,14 +131,29 @@ pub struct SharedGatewayExitV3 {
 enum SharedGatewayDispatchOutcomeV3 {
     Executed(InteractionExecutionOutcomeV3),
     Ignored,
-    Rejected(SharedGatewayAdmissionErrorV3),
+    Rejected {
+        error: SharedGatewayAdmissionErrorV3,
+        interaction: Box<Interaction>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    Sent,
+    Failed,
+    TimedOut,
 }
 
 type SharedGatewayDispatchFutureV3<'a> =
     Pin<Box<dyn Future<Output = SharedGatewayDispatchOutcomeV3> + 'a>>;
+type SharedGatewayRejectionAcknowledgementFutureV3<'a> =
+    Pin<Box<dyn Future<Output = SharedGatewayRejectionAcknowledgementOutcomeV3> + 'a>>;
 
 impl SharedGatewayRuntimeReportV3 {
-    fn record_dispatch(&mut self, outcome: SharedGatewayDispatchOutcomeV3) {
+    fn record_dispatch(
+        &mut self,
+        outcome: SharedGatewayDispatchOutcomeV3,
+    ) -> Option<Box<Interaction>> {
         match outcome {
             SharedGatewayDispatchOutcomeV3::Executed(outcome) => {
                 if matches!(
@@ -118,9 +167,16 @@ impl SharedGatewayRuntimeReportV3 {
                 } else {
                     increment(&mut self.completed);
                 }
+                None
             }
-            SharedGatewayDispatchOutcomeV3::Ignored => increment(&mut self.ignored),
-            SharedGatewayDispatchOutcomeV3::Rejected(error) => self.record_admission_error(&error),
+            SharedGatewayDispatchOutcomeV3::Ignored => {
+                increment(&mut self.ignored);
+                None
+            }
+            SharedGatewayDispatchOutcomeV3::Rejected { error, interaction } => {
+                self.record_admission_error(&error);
+                Some(interaction)
+            }
         }
     }
 
@@ -129,6 +185,23 @@ impl SharedGatewayRuntimeReportV3 {
             SharedGatewayAdmissionErrorV3::NotReady => increment(&mut self.not_ready),
             SharedGatewayAdmissionErrorV3::Overloaded => increment(&mut self.overloaded),
             SharedGatewayAdmissionErrorV3::Router(_) => increment(&mut self.admission_rejected),
+        }
+    }
+
+    fn record_rejection_acknowledgement(
+        &mut self,
+        outcome: SharedGatewayRejectionAcknowledgementOutcomeV3,
+    ) {
+        match outcome {
+            SharedGatewayRejectionAcknowledgementOutcomeV3::Sent => {
+                increment(&mut self.rejection_acknowledged)
+            }
+            SharedGatewayRejectionAcknowledgementOutcomeV3::Failed => {
+                increment(&mut self.rejection_acknowledgement_failed)
+            }
+            SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut => {
+                increment(&mut self.rejection_acknowledgement_timed_out)
+            }
         }
     }
 }
@@ -161,6 +234,9 @@ pub async fn run_shared_gateway_v3(
         | EventTypeFlags::GATEWAY_INVALIDATE_SESSION;
     let mut ready_lease = None;
     let mut active: FuturesUnordered<SharedGatewayDispatchFutureV3<'_>> = FuturesUnordered::new();
+    let mut rejection_acknowledgements: FuturesUnordered<
+        SharedGatewayRejectionAcknowledgementFutureV3<'_>,
+    > = FuturesUnordered::new();
     let mut report = SharedGatewayRuntimeReportV3::default();
 
     loop {
@@ -182,9 +258,13 @@ pub async fn run_shared_gateway_v3(
                             &mut shard,
                             &mut control,
                             &mut active,
+                            &mut rejection_acknowledgements,
                             report,
                             SharedGatewayExitReasonV3::Commanded,
                             config.drain_timeout(),
+                            http,
+                            failure_message,
+                            config.rejection_acknowledgement_capacity(),
                         )
                         .await;
                     }
@@ -196,9 +276,13 @@ pub async fn run_shared_gateway_v3(
                             &mut shard,
                             &mut control,
                             &mut active,
+                            &mut rejection_acknowledgements,
                             report,
                             SharedGatewayExitReasonV3::ControlOrphaned,
                             config.drain_timeout(),
+                            http,
+                            failure_message,
+                            config.rejection_acknowledgement_capacity(),
                         )
                         .await;
                     }
@@ -206,7 +290,21 @@ pub async fn run_shared_gateway_v3(
             }
             outcome = active.next(), if !active.is_empty() => {
                 if let Some(outcome) = outcome {
-                    report.record_dispatch(outcome);
+                    if let Some(interaction) = report.record_dispatch(outcome) {
+                        enqueue_rejection_acknowledgement(
+                            interaction,
+                            http,
+                            failure_message,
+                            &mut rejection_acknowledgements,
+                            config.rejection_acknowledgement_capacity(),
+                            &mut report,
+                        );
+                    }
+                }
+            }
+            outcome = rejection_acknowledgements.next(), if !rejection_acknowledgements.is_empty() => {
+                if let Some(outcome) = outcome {
+                    report.record_rejection_acknowledgement(outcome);
                 }
             }
             item = shard.next_event(event_types) => {
@@ -215,9 +313,13 @@ pub async fn run_shared_gateway_v3(
                         &mut shard,
                         &mut control,
                         &mut active,
+                        &mut rejection_acknowledgements,
                         report,
                         SharedGatewayExitReasonV3::StreamEnded,
                         config.drain_timeout(),
+                        http,
+                        failure_message,
+                        config.rejection_acknowledgement_capacity(),
                     )
                     .await;
                 };
@@ -233,9 +335,13 @@ pub async fn run_shared_gateway_v3(
                                 &mut shard,
                                 &mut control,
                                 &mut active,
+                                &mut rejection_acknowledgements,
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
+                                http,
+                                failure_message,
+                                config.rejection_acknowledgement_capacity(),
                             )
                             .await;
                         }
@@ -251,9 +357,13 @@ pub async fn run_shared_gateway_v3(
                                     &mut shard,
                                     &mut control,
                                     &mut active,
+                                    &mut rejection_acknowledgements,
                                     report,
                                     SharedGatewayExitReasonV3::RuntimeFailure,
                                     config.drain_timeout(),
+                                    http,
+                                    failure_message,
+                                    config.rejection_acknowledgement_capacity(),
                                 )
                                 .await;
                             }
@@ -267,9 +377,13 @@ pub async fn run_shared_gateway_v3(
                                     &mut shard,
                                     &mut control,
                                     &mut active,
+                                    &mut rejection_acknowledgements,
                                     report,
                                     SharedGatewayExitReasonV3::RuntimeFailure,
                                     config.drain_timeout(),
+                                    http,
+                                    failure_message,
+                                    config.rejection_acknowledgement_capacity(),
                                 )
                                 .await;
                             }
@@ -285,9 +399,13 @@ pub async fn run_shared_gateway_v3(
                                 &mut shard,
                                 &mut control,
                                 &mut active,
+                                &mut rejection_acknowledgements,
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
+                                http,
+                                failure_message,
+                                config.rejection_acknowledgement_capacity(),
                             )
                             .await;
                         }
@@ -302,9 +420,13 @@ pub async fn run_shared_gateway_v3(
                                 &mut shard,
                                 &mut control,
                                 &mut active,
+                                &mut rejection_acknowledgements,
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
+                                http,
+                                failure_message,
+                                config.rejection_acknowledgement_capacity(),
                             )
                             .await;
                         }
@@ -319,9 +441,13 @@ pub async fn run_shared_gateway_v3(
                                 &mut shard,
                                 &mut control,
                                 &mut active,
+                                &mut rejection_acknowledgements,
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
+                                http,
+                                failure_message,
+                                config.rejection_acknowledgement_capacity(),
                             )
                             .await;
                         }
@@ -341,6 +467,8 @@ pub async fn run_shared_gateway_v3(
                             http,
                             failure_message,
                             &mut active,
+                            &mut rejection_acknowledgements,
+                            config.rejection_acknowledgement_capacity(),
                             &mut report,
                         );
                     }
@@ -373,6 +501,10 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
     http: &'a Client,
     failure_message: &'a str,
     active: &mut FuturesUnordered<SharedGatewayDispatchFutureV3<'a>>,
+    rejection_acknowledgements: &mut FuturesUnordered<
+        SharedGatewayRejectionAcknowledgementFutureV3<'a>,
+    >,
+    rejection_acknowledgement_capacity: NonZeroUsize,
     report: &mut SharedGatewayRuntimeReportV3,
 ) where
     I: InstanceStore,
@@ -393,17 +525,41 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
         }
         Err(_) => {
             increment(&mut report.route_rejected);
+            enqueue_rejection_acknowledgement(
+                Box::new(interaction),
+                http,
+                failure_message,
+                rejection_acknowledgements,
+                rejection_acknowledgement_capacity,
+                report,
+            );
             return;
         }
     }
     let Some(ready_lease) = ready_lease else {
         increment(&mut report.not_ready);
+        enqueue_rejection_acknowledgement(
+            Box::new(interaction),
+            http,
+            failure_message,
+            rejection_acknowledgements,
+            rejection_acknowledgement_capacity,
+            report,
+        );
         return;
     };
     let reservation = match admission_budget.try_reserve(observer, &ready_lease) {
         Ok(reservation) => reservation,
         Err(error) => {
             report.record_admission_error(&error);
+            enqueue_rejection_acknowledgement(
+                Box::new(interaction),
+                http,
+                failure_message,
+                rejection_acknowledgements,
+                rejection_acknowledgement_capacity,
+                report,
+            );
             return;
         }
     };
@@ -421,6 +577,53 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
         custom_id,
         interaction,
     )));
+}
+
+fn enqueue_rejection_acknowledgement<'a>(
+    interaction: Box<Interaction>,
+    http: &'a Client,
+    failure_message: &'a str,
+    active: &mut FuturesUnordered<SharedGatewayRejectionAcknowledgementFutureV3<'a>>,
+    capacity: NonZeroUsize,
+    report: &mut SharedGatewayRuntimeReportV3,
+) {
+    enqueue_rejection_acknowledgement_future(
+        Box::pin(acknowledge_rejection(http, interaction, failure_message)),
+        active,
+        capacity,
+        report,
+    );
+}
+
+fn enqueue_rejection_acknowledgement_future<'a>(
+    acknowledgement: SharedGatewayRejectionAcknowledgementFutureV3<'a>,
+    active: &mut FuturesUnordered<SharedGatewayRejectionAcknowledgementFutureV3<'a>>,
+    capacity: NonZeroUsize,
+    report: &mut SharedGatewayRuntimeReportV3,
+) {
+    if active.len() >= capacity.get() {
+        increment(&mut report.rejection_acknowledgement_dropped);
+        return;
+    }
+    active.push(acknowledgement);
+}
+
+async fn acknowledge_rejection(
+    http: &Client,
+    interaction: Box<Interaction>,
+    failure_message: &str,
+) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    let responder = TwilightInteractionResponder::from_interaction(http, &interaction, "");
+    match tokio::time::timeout(
+        SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
+        responder.respond_ephemeral(failure_message.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(())) => SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
+        Ok(Err(_)) => SharedGatewayRejectionAcknowledgementOutcomeV3::Failed,
+        Err(_) => SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut,
+    }
 }
 
 fn interaction_route(interaction: &Interaction) -> Option<(GuildId, String)> {
@@ -474,24 +677,50 @@ where
             .await,
         ),
         Ok(None) => SharedGatewayDispatchOutcomeV3::Ignored,
-        Err(error) => SharedGatewayDispatchOutcomeV3::Rejected(error),
+        Err(error) => SharedGatewayDispatchOutcomeV3::Rejected {
+            error,
+            interaction: Box::new(interaction),
+        },
     }
 }
 
-async fn finish_gateway<F>(
+#[allow(clippy::too_many_arguments)]
+async fn finish_gateway<'a, F>(
     shard: &mut Shard,
     control: &mut SharedGatewayRuntimeControlV3,
     active: &mut FuturesUnordered<F>,
+    rejection_acknowledgements: &mut FuturesUnordered<
+        SharedGatewayRejectionAcknowledgementFutureV3<'a>,
+    >,
     mut report: SharedGatewayRuntimeReportV3,
     reason: SharedGatewayExitReasonV3,
     drain_timeout: Duration,
+    http: &'a Client,
+    failure_message: &'a str,
+    rejection_acknowledgement_capacity: NonZeroUsize,
 ) -> SharedGatewayExitV3
 where
     F: Future<Output = SharedGatewayDispatchOutcomeV3>,
 {
     control.begin_runtime_failure_drain();
     shard.close(CloseFrame::NORMAL);
-    let drain = drain_active(active, &mut report, drain_timeout).await;
+    let drain = drain_active(
+        active,
+        rejection_acknowledgements,
+        &mut report,
+        drain_timeout,
+        |interaction, acknowledgements, report| {
+            enqueue_rejection_acknowledgement(
+                interaction,
+                http,
+                failure_message,
+                acknowledgements,
+                rejection_acknowledgement_capacity,
+                report,
+            );
+        },
+    )
+    .await;
     let _ = control.mark_stopped();
     SharedGatewayExitV3 {
         reason,
@@ -500,17 +729,43 @@ where
     }
 }
 
-async fn drain_active<F>(
+async fn drain_active<'a, F, A>(
     active: &mut FuturesUnordered<F>,
+    rejection_acknowledgements: &mut FuturesUnordered<
+        SharedGatewayRejectionAcknowledgementFutureV3<'a>,
+    >,
     report: &mut SharedGatewayRuntimeReportV3,
     drain_timeout: Duration,
+    mut acknowledge_rejection: A,
 ) -> SharedGatewayDrainOutcomeV3
 where
     F: Future<Output = SharedGatewayDispatchOutcomeV3>,
+    A: FnMut(
+        Box<Interaction>,
+        &mut FuturesUnordered<SharedGatewayRejectionAcknowledgementFutureV3<'a>>,
+        &mut SharedGatewayRuntimeReportV3,
+    ),
 {
     let drain = async {
-        while let Some(outcome) = active.next().await {
-            report.record_dispatch(outcome);
+        while !active.is_empty() || !rejection_acknowledgements.is_empty() {
+            tokio::select! {
+                outcome = active.next(), if !active.is_empty() => {
+                    if let Some(outcome) = outcome {
+                        if let Some(interaction) = report.record_dispatch(outcome) {
+                            acknowledge_rejection(
+                                interaction,
+                                rejection_acknowledgements,
+                                report,
+                            );
+                        }
+                    }
+                }
+                outcome = rejection_acknowledgements.next(), if !rejection_acknowledgements.is_empty() => {
+                    if let Some(outcome) = outcome {
+                        report.record_rejection_acknowledgement(outcome);
+                    }
+                }
+            }
         }
     };
     if tokio::time::timeout(drain_timeout, drain).await.is_ok() {
@@ -519,7 +774,11 @@ where
         report.cancelled_during_drain = report
             .cancelled_during_drain
             .saturating_add(active.len() as u64);
+        report.rejection_acknowledgements_cancelled_during_drain = report
+            .rejection_acknowledgements_cancelled_during_drain
+            .saturating_add(rejection_acknowledgements.len() as u64);
         *active = FuturesUnordered::new();
+        *rejection_acknowledgements = FuturesUnordered::new();
         SharedGatewayDrainOutcomeV3::DeadlineExceeded
     }
 }
@@ -546,6 +805,41 @@ mod tests {
             SharedGatewayRuntimeConfigV3::new(Duration::from_secs(61)),
             Err(SharedGatewayRuntimeConfigurationErrorV3::DrainTimeout)
         );
+        assert_eq!(
+            SharedGatewayRuntimeConfigV3::default()
+                .rejection_acknowledgement_capacity()
+                .get(),
+            64
+        );
+        assert_eq!(
+            SharedGatewayRuntimeConfigV3::default()
+                .with_rejection_acknowledgement_capacity(NonZeroUsize::new(1_025).unwrap()),
+            Err(SharedGatewayRuntimeConfigurationErrorV3::RejectionAcknowledgementCapacity)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_acknowledgement_lane_is_strictly_bounded() {
+        let mut acknowledgements: FuturesUnordered<
+            SharedGatewayRejectionAcknowledgementFutureV3<'_>,
+        > = FuturesUnordered::new();
+        let mut report = SharedGatewayRuntimeReportV3::default();
+        enqueue_rejection_acknowledgement_future(
+            Box::pin(std::future::pending()),
+            &mut acknowledgements,
+            NonZeroUsize::new(1).unwrap(),
+            &mut report,
+        );
+        enqueue_rejection_acknowledgement_future(
+            Box::pin(std::future::ready(
+                SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
+            )),
+            &mut acknowledgements,
+            NonZeroUsize::new(1).unwrap(),
+            &mut report,
+        );
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(report.rejection_acknowledgement_dropped, 1);
     }
 
     #[tokio::test]
@@ -557,14 +851,29 @@ mod tests {
         active.push(std::future::ready(
             SharedGatewayDispatchOutcomeV3::Executed(InteractionExecutionOutcomeV3::StaticFailed),
         ));
+        let mut acknowledgements: FuturesUnordered<
+            SharedGatewayRejectionAcknowledgementFutureV3<'_>,
+        > = FuturesUnordered::new();
+        acknowledgements.push(Box::pin(std::future::ready(
+            SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
+        )));
         let mut report = SharedGatewayRuntimeReportV3::default();
         assert_eq!(
-            drain_active(&mut active, &mut report, Duration::from_secs(1)).await,
+            drain_active(
+                &mut active,
+                &mut acknowledgements,
+                &mut report,
+                Duration::from_secs(1),
+                |_, _, _| panic!("completed dispatches do not require rejection acknowledgement"),
+            )
+            .await,
             SharedGatewayDrainOutcomeV3::Clean
         );
         assert_eq!(report.completed, 1);
         assert_eq!(report.execution_failed, 1);
+        assert_eq!(report.rejection_acknowledged, 1);
         assert!(active.is_empty());
+        assert!(acknowledgements.is_empty());
     }
 
     #[tokio::test]
@@ -586,13 +895,34 @@ mod tests {
                 std::future::pending().await
             });
         }
+        let acknowledgement_drops = Arc::new(AtomicUsize::new(0));
+        let mut acknowledgements: FuturesUnordered<
+            SharedGatewayRejectionAcknowledgementFutureV3<'_>,
+        > = FuturesUnordered::new();
+        for _ in 0..NonZeroUsize::new(2).unwrap().get() {
+            let signal = DropSignal(Arc::clone(&acknowledgement_drops));
+            acknowledgements.push(Box::pin(async move {
+                let _signal = signal;
+                std::future::pending().await
+            }));
+        }
         let mut report = SharedGatewayRuntimeReportV3::default();
         assert_eq!(
-            drain_active(&mut active, &mut report, Duration::from_millis(1)).await,
+            drain_active(
+                &mut active,
+                &mut acknowledgements,
+                &mut report,
+                Duration::from_millis(1),
+                |_, _, _| panic!("pending dispatches do not require rejection acknowledgement"),
+            )
+            .await,
             SharedGatewayDrainOutcomeV3::DeadlineExceeded
         );
         assert_eq!(report.cancelled_during_drain, 3);
+        assert_eq!(report.rejection_acknowledgements_cancelled_during_drain, 2);
         assert!(active.is_empty());
+        assert!(acknowledgements.is_empty());
         assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert_eq!(acknowledgement_drops.load(Ordering::SeqCst), 2);
     }
 }
