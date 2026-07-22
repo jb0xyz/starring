@@ -94,6 +94,7 @@ fn adapter_contract_is_function_only_and_manifest_is_isolated() {
         "starring_runtime_gateway_owner_acquire_v1",
         "starring_runtime_gateway_owner_renew_v1",
         "starring_runtime_gateway_owner_release_v1",
+        "starring_runtime_writer_fence_observe_v1",
     ] {
         assert!(contract.contains(capability));
     }
@@ -198,13 +199,14 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_only_execution_observation_and_gateway_owner_ports() {
+fn adapter_exposes_only_execution_observation_gateway_owner_and_writer_fence_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
     for required in [
         "impl RuntimeExecutionConvergencePort",
         "impl RuntimePreviousServingObservationPort",
         "impl RuntimeGatewayOwnerLeasePortV1",
+        "impl RuntimeWriterFenceObservationPortV1",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -213,6 +215,24 @@ fn adapter_exposes_only_execution_observation_and_gateway_owner_ports() {
     assert!(source.contains("execute_observe_previous_serving_v1"));
     assert!(source.contains("execute_recover_next_stale_live_v1"));
     assert!(source.contains("!matches!(self, Self::Observe { .. })"));
+}
+
+#[test]
+fn writer_fence_observation_uses_only_its_scoped_function_and_verified_transaction() {
+    let writer_fence = include_str!("../src/writer_fence/mod.rs");
+    let query = include_str!("../src/writer_fence/query.rs");
+    assert!(query.contains("starring_runtime_writer_fence_observe_v1"));
+    for required in [
+        "begin_execution_mutation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "RuntimeWriterFenceObservationRowV1",
+        "RuntimeWriterFenceObservationPortV1",
+    ] {
+        assert!(writer_fence.contains(required));
+    }
+    for forbidden in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE "] {
+        assert!(!writer_fence.contains(forbidden));
+    }
 }
 
 #[test]

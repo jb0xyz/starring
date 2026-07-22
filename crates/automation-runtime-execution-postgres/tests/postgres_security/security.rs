@@ -471,6 +471,9 @@ async fn assert_raw_sql_rejected(executor_pool: &PgPool, administrator_role: &st
         "UPDATE public.runtime_execution_mutation_markers \
          SET mutation_revision = mutation_revision"
             .to_string(),
+        "SELECT fence_state FROM public.runtime_writer_fence".to_string(),
+        "UPDATE public.runtime_writer_fence SET fence_generation = fence_generation".to_string(),
+        "DELETE FROM public.runtime_writer_fence".to_string(),
         "CREATE TABLE public.runtime_execution_escape(value BIGINT)".to_string(),
         "CREATE TEMP TABLE runtime_execution_escape(value BIGINT)".to_string(),
         "CREATE ROLE runtime_execution_escape".to_string(),

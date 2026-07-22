@@ -13,6 +13,7 @@ mod query;
 mod recovery;
 mod row;
 mod store;
+mod writer_fence;
 
 pub use bootstrap::{
     observe_runtime_execution_database_identity_v1,

@@ -5,8 +5,8 @@ use automation_runtime_controller::{
     RuntimeAcquireGatewayOwnerLeaseV1, RuntimeCertificationRequestV1,
     RuntimeConvergenceErrorClassV1, RuntimeExecutionConvergencePort, RuntimeMutationRequestV1,
     RuntimeObserveGatewayOwnerLeaseV1, RuntimeObservePreviousServingV1,
-    RuntimePreviousServingObservationPort, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeObserveWriterFenceV1, RuntimePreviousServingObservationPort,
+    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseV1,
 };
 use automation_runtime_execution_postgres::{
     observe_runtime_execution_database_identity_v1,
@@ -16,7 +16,9 @@ use automation_runtime_execution_postgres::{
     MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION, MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION,
     MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION, MIN_RUNTIME_GATEWAY_OWNER_LEASE_DURATION,
 };
-use automation_runtime_worker::RuntimeGatewayOwnerLeasePortV1;
+use automation_runtime_worker::{
+    RuntimeGatewayOwnerLeasePortV1, RuntimeWriterFenceObservationPortV1,
+};
 
 fn assert_mutate_signature(
     adapter: &PostgresRuntimeExecutionV1,
@@ -52,6 +54,12 @@ where
 {
 }
 
+fn assert_writer_fence_port<T>()
+where
+    T: RuntimeWriterFenceObservationPortV1<Error = RuntimeExecutionPersistenceErrorV1>,
+{
+}
+
 fn assert_gateway_owner_signatures(
     adapter: &PostgresRuntimeExecutionV1,
     observe: RuntimeObserveGatewayOwnerLeaseV1,
@@ -63,6 +71,13 @@ fn assert_gateway_owner_signatures(
     std::mem::drop(adapter.acquire_gateway_owner(acquire));
     std::mem::drop(adapter.renew_gateway_owner(renew));
     std::mem::drop(adapter.release_gateway_owner(release));
+}
+
+fn assert_writer_fence_signature(
+    adapter: &PostgresRuntimeExecutionV1,
+    request: RuntimeObserveWriterFenceV1,
+) {
+    std::mem::drop(adapter.observe_writer_fence(request));
 }
 
 #[test]
@@ -219,7 +234,9 @@ fn verified_adapter_exposes_the_scoped_execution_contract() {
     let _ = PostgresRuntimeExecutionV1::recover_next_stale_live;
     assert_execution_port::<PostgresRuntimeExecutionV1>();
     assert_gateway_owner_port::<PostgresRuntimeExecutionV1>();
+    assert_writer_fence_port::<PostgresRuntimeExecutionV1>();
     let _ = assert_gateway_owner_signatures;
+    let _ = assert_writer_fence_signature;
     assert_eq!(
         MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
         Duration::from_secs(1)

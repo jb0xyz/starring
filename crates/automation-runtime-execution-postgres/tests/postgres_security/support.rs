@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,8 +15,9 @@ use automation_runtime_controller::{
     RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
     RuntimeGatewayOwnerLeaseDurationV1, RuntimeGatewayOwnerLeaseObservationV1,
     RuntimeLiveAttestationRecordV1, RuntimeMutationReceiptV1, RuntimeObserveGatewayOwnerLeaseV1,
-    RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeObserveWriterFenceV1, RuntimeReleaseGatewayOwnerLeaseOutcomeV1,
+    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseOutcomeV1,
+    RuntimeRenewGatewayOwnerLeaseV1, RuntimeWriterFenceObservationV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, DrainAttestationV1,
@@ -39,7 +41,7 @@ use automation_runtime_worker::{
     classify_unknown_gateway_owner_acquire_v1, classify_unknown_gateway_owner_release_v1,
     classify_unknown_gateway_owner_renew_v1, RuntimeGatewayOwnerAcquireRecoveryV1,
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerReleaseRecoveryV1,
-    RuntimeGatewayOwnerRenewRecoveryV1,
+    RuntimeGatewayOwnerRenewRecoveryV1, RuntimeWriterFenceObservationPortV1,
 };
 
 const READINESS_FUNCTION: &str = "public.starring_runtime_execution_database_readiness_v1()";
@@ -54,7 +56,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 13] = [
+const EXECUTOR_FUNCTIONS: [&str; 14] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -68,9 +70,10 @@ const EXECUTOR_FUNCTIONS: [&str; 13] = [
     "public.starring_runtime_gateway_owner_acquire_v1(text,text,text,bigint)",
     "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
+    "public.starring_runtime_writer_fence_observe_v1()",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "003baab6fe5443a3bcf6dc6356cd5595434ac68c507a56151a65874397432ff1";
+    "cf84d5a445c591cd11802e9d956c2f03ae7f9c4205134aa1511d4cc40d88fbc3";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
@@ -82,6 +85,7 @@ const DEPLOYMENT: &str = "runtime-execution-deployment";
 const CONTENT_HASH: &str = "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6";
 const BINDING_FINGERPRINT: &str =
     "a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655";
+static UNIQUE_SUFFIX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct IsolatedDatabase {
     name: String,
@@ -981,8 +985,9 @@ fn canonical_sha256(value: &str) -> bool {
 }
 
 fn unique_suffix() -> u128 {
-    SystemTime::now()
+    let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos()
+        .as_nanos();
+    (clock << 64) | u128::from(UNIQUE_SUFFIX_SEQUENCE.fetch_add(1, Ordering::Relaxed))
 }
