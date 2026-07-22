@@ -40,8 +40,9 @@ use automation_runtime_convergence_postgres::{
 };
 use automation_runtime_panel_postgres::{
     verify_runtime_panel_database_with_timeouts_v1, PostgresFencedStrictPanelStoreV1,
-    RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseTimeoutsV1, RuntimePanelErrorClassV1,
-    RuntimePanelLatchedErrorV1, RuntimePanelPersistenceErrorV1, RuntimePanelSessionIdV1,
+    PostgresRuntimePanelV1, RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseTimeoutsV1,
+    RuntimePanelErrorClassV1, RuntimePanelLatchedErrorV1, RuntimePanelPersistenceErrorV1,
+    RuntimePanelSessionIdV1,
 };
 use automation_state::{InteractionRuleSet, PanelSpec};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -868,6 +869,7 @@ async fn panel_store_lock_wait_is_bounded_by_transaction_local_timeout() {
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn restricted_login_readiness_enforces_exact_panel_boundary() {
     run_migrated_runtime_database_test("readiness_acl", |pool, options| async move {
+        let (_, controller, exact) = advance_to_panel_reconciliation(&pool).await;
         let database_name = options.get_database().unwrap().to_string();
         let role_suffix = runtime_panel_role_suffix(&database_name);
         let role = format!("runtime_panel_login_{role_suffix}");
@@ -963,6 +965,22 @@ async fn restricted_login_readiness_enforces_exact_panel_boundary() {
         assert_eq!(readiness.database_identity, database_identity);
         assert_eq!(readiness.database_name, database_name);
         assert_eq!(readiness.executor_role, role);
+        let verified_panel = PostgresRuntimePanelV1::connect_verified(
+            restricted_pool.clone(),
+            expectation.clone(),
+            RuntimePanelDatabaseTimeoutsV1::default(),
+        )
+        .await
+        .unwrap();
+        let verified_store = verified_panel
+            .claim(
+                controller.execution_guard().unwrap(),
+                exact,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        verified_store.prime().await.unwrap();
         let settings_after = sqlx::query_as::<_, (String, String, String, String)>(
             "SELECT pg_catalog.current_setting('statement_timeout'), \
                     pg_catalog.current_setting('lock_timeout'), \
@@ -1009,6 +1027,10 @@ async fn restricted_login_readiness_enforces_exact_panel_boundary() {
             .await,
             Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt)
         );
+        assert_eq!(
+            verified_store.check_session(Duration::from_millis(1)).await,
+            Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt)
+        );
         sqlx::query(&format!(
             "REVOKE SELECT ON TABLE pg_catalog.pg_authid FROM {role}"
         ))
@@ -1022,6 +1044,10 @@ async fn restricted_login_readiness_enforces_exact_panel_boundary() {
         )
         .await
         .unwrap();
+        verified_store
+            .check_session(Duration::from_millis(1))
+            .await
+            .unwrap();
 
         assert!(!sqlx::query_scalar::<_, bool>(
             "SELECT pg_catalog.has_table_privilege( \

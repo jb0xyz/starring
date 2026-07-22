@@ -58,8 +58,9 @@ impl PostgresRuntimePanelV1 {
         exact_target: RuntimeExactTargetV1,
         side_effect_headroom: Duration,
     ) -> Result<PostgresFencedStrictPanelStoreV1, RuntimePanelPersistenceErrorV1> {
-        PostgresFencedStrictPanelStoreV1::claim_with_timeouts(
+        PostgresFencedStrictPanelStoreV1::claim_verified_with_timeouts(
             self.pool.clone(),
+            self.expectation.clone(),
             guard,
             exact_target,
             side_effect_headroom,
@@ -75,8 +76,9 @@ impl PostgresRuntimePanelV1 {
         side_effect_headroom: Duration,
         session_id: &RuntimePanelSessionIdV1,
     ) -> Result<PostgresFencedStrictPanelStoreV1, RuntimePanelPersistenceErrorV1> {
-        PostgresFencedStrictPanelStoreV1::claim_with_session_id_and_timeouts(
+        PostgresFencedStrictPanelStoreV1::claim_verified_with_session_id_and_timeouts(
             self.pool.clone(),
+            self.expectation.clone(),
             guard,
             exact_target,
             side_effect_headroom,

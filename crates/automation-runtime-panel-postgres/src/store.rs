@@ -16,7 +16,6 @@ use crate::authority::bind_runtime_panel_authority;
 use crate::contract::{
     INSTALLATION_REMOVE_QUERY, INSTALLATION_UPSERT_QUERY, JOURNAL_PUT_QUERY, JOURNAL_REMOVE_QUERY,
 };
-use crate::database::begin_panel_transaction;
 use crate::error::{map_mutation_commit_error, map_mutation_error, stable_error_code};
 use crate::row::{state_tag, valid_hash, RECORD_FORMAT_VERSION};
 use crate::session::{PostgresFencedStrictPanelStoreV1, RuntimePanelStoreStateV1, VersionedV1};
@@ -88,14 +87,13 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&installation.panel_key)
             .map_or(0, |record| record.revision);
-        let mut transaction =
-            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    state.record_error(&error);
-                    return Err(error);
-                }
-            };
+        let mut transaction = match self.begin_transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                state.record_error(&error);
+                return Err(error);
+            }
+        };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(INSTALLATION_UPSERT_QUERY),
             &self.authority,
@@ -149,14 +147,13 @@ impl PostgresFencedStrictPanelStoreV1 {
             .installations
             .get(&key.panel_key)
             .map_or(0, |record| record.revision);
-        let mut transaction =
-            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    state.record_error(&error);
-                    return Err(error);
-                }
-            };
+        let mut transaction = match self.begin_transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                state.record_error(&error);
+                return Err(error);
+            }
+        };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(INSTALLATION_REMOVE_QUERY),
             &self.authority,
@@ -228,14 +225,13 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&operation.key.panel_key)
             .map_or(0, |record| record.revision);
-        let mut transaction =
-            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    state.record_error(&error);
-                    return Err(error);
-                }
-            };
+        let mut transaction = match self.begin_transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                state.record_error(&error);
+                return Err(error);
+            }
+        };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(JOURNAL_PUT_QUERY),
             &self.authority,
@@ -287,14 +283,13 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&key.panel_key)
             .map_or(0, |record| record.revision);
-        let mut transaction =
-            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    state.record_error(&error);
-                    return Err(error);
-                }
-            };
+        let mut transaction = match self.begin_transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                state.record_error(&error);
+                return Err(error);
+            }
+        };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(JOURNAL_REMOVE_QUERY),
             &self.authority,

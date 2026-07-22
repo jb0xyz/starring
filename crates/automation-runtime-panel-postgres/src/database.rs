@@ -130,8 +130,20 @@ pub async fn verify_runtime_panel_database_with_timeouts_v1(
     timeouts: RuntimePanelDatabaseTimeoutsV1,
 ) -> Result<RuntimePanelDatabaseReadinessV1, RuntimePanelPersistenceErrorV1> {
     let mut transaction = begin_panel_transaction(pool, timeouts).await?;
+    let readiness = verify_runtime_panel_binding_v1(&mut transaction, expectation).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| map_query_error(&error))?;
+    Ok(readiness)
+}
+
+pub(crate) async fn verify_runtime_panel_binding_v1(
+    transaction: &mut Transaction<'_, Postgres>,
+    expectation: &RuntimePanelDatabaseExpectationV1,
+) -> Result<RuntimePanelDatabaseReadinessV1, RuntimePanelPersistenceErrorV1> {
     let rows = sqlx::query_as::<_, RuntimePanelDatabaseReadinessRowV1>(DATABASE_READINESS_QUERY)
-        .fetch_all(&mut *transaction)
+        .fetch_all(&mut **transaction)
         .await
         .map_err(|error| map_query_error(&error))?;
     let [row] = rows.as_slice() else {
@@ -146,17 +158,12 @@ pub async fn verify_runtime_panel_database_with_timeouts_v1(
     {
         return Err(RuntimePanelPersistenceErrorV1::InvalidAuthority);
     }
-    let readiness = RuntimePanelDatabaseReadinessV1 {
+    Ok(RuntimePanelDatabaseReadinessV1 {
         database_identity: row.database_identity.clone(),
         database_name: row.database_name.clone(),
         executor_role: row.executor_role.clone(),
         checked_at: row.checked_at,
-    };
-    transaction
-        .commit()
-        .await
-        .map_err(|error| map_query_error(&error))?;
-    Ok(readiness)
+    })
 }
 
 pub(crate) async fn begin_panel_transaction(

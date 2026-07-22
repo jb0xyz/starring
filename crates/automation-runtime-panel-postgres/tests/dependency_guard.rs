@@ -66,14 +66,29 @@ fn verified_adapter_keeps_the_pool_private() {
     for required in [
         "PostgresRuntimePanelV1",
         "verify_runtime_panel_database_with_timeouts_v1",
-        "PostgresFencedStrictPanelStoreV1::claim_with_timeouts",
-        "PostgresFencedStrictPanelStoreV1::claim_with_session_id_and_timeouts",
+        "PostgresFencedStrictPanelStoreV1::claim_verified_with_timeouts",
+        "PostgresFencedStrictPanelStoreV1::claim_verified_with_session_id_and_timeouts",
+        "self.expectation.clone()",
     ] {
         assert!(adapter.contains(required), "{required}");
     }
     for forbidden in ["pub fn pool", "pub fn connection", "pub fn connect_options"] {
         assert!(!adapter.contains(forbidden), "{forbidden}");
     }
+}
+
+#[test]
+fn verified_panel_sessions_recheck_database_binding_for_every_transaction() {
+    let session = include_str!("../src/session.rs");
+    let store = include_str!("../src/store.rs");
+    for required in [
+        "verify_runtime_panel_binding_v1(&mut transaction, expectation)",
+        "Some(database_expectation)",
+    ] {
+        assert!(session.contains(required), "{required}");
+    }
+    assert_eq!(session.matches("self.begin_transaction().await").count(), 2);
+    assert_eq!(store.matches("self.begin_transaction().await").count(), 4);
 }
 
 #[test]

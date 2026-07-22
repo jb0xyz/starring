@@ -210,13 +210,16 @@ fn route_read_deadline_wraps_the_complete_database_operation() {
     let begin = store[helper..]
         .find("begin_interaction_transaction_on_connection")
         .unwrap();
+    let binding = store[helper..]
+        .find("verify_runtime_interaction_binding_v1")
+        .unwrap();
     let query = store[helper..].find("ROUTE_READ_QUERY").unwrap();
     let decode = store[helper..]
         .find(".decode(guild_id, instance_id)")
         .unwrap();
     let commit = store[helper..].find(".commit()").unwrap();
     assert!(operation > 0);
-    assert!(begin < query && query < decode && decode < commit);
+    assert!(begin < binding && binding < query && query < decode && decode < commit);
     assert!(store.contains("RouteConnectionGuardV1::new"));
     assert!(store.contains("InstanceStoreError::TimedOut"));
 
@@ -224,6 +227,17 @@ fn route_read_deadline_wraps_the_complete_database_operation() {
     assert!(guard.contains("impl Drop for RouteConnectionGuardV1"));
     assert!(guard.contains("drop(connection.detach())"));
     assert!(guard.contains("release_to_pool"));
+}
+
+#[test]
+fn every_interaction_operation_rechecks_database_binding() {
+    let store = include_str!("../src/store.rs");
+    assert_eq!(
+        store
+            .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
+            .count(),
+        3
+    );
 }
 
 #[test]

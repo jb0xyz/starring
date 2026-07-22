@@ -14,7 +14,7 @@ use sqlx::{PgConnection, PgPool};
 use crate::contract::{INSTANCE_REGISTER_QUERY, PINNED_READ_QUERY, ROUTE_READ_QUERY};
 use crate::database::{
     begin_interaction_transaction, begin_interaction_transaction_on_connection,
-    verify_runtime_interaction_database_with_timeouts_v1,
+    verify_runtime_interaction_binding_v1, verify_runtime_interaction_database_with_timeouts_v1,
 };
 use crate::error::{map_mutation_commit_error, map_mutation_error, map_query_error};
 use crate::route_connection::RouteConnectionGuardV1;
@@ -121,6 +121,7 @@ impl PostgresRuntimeInteractionV1 {
         let mut transaction =
             begin_interaction_transaction_on_connection(connection, self.route_database_timeouts)
                 .await?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation).await?;
         let rows = sqlx::query_as::<_, InstanceRowV1>(ROUTE_READ_QUERY)
             .bind(guild_id.to_string())
             .bind(instance_id.as_str())
@@ -192,6 +193,9 @@ impl InstanceRegistrarV1 for PostgresRuntimeInteractionV1 {
         let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
             .await
             .map_err(instance_backend)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_backend)?;
         let rows = sqlx::query_as::<_, InstanceRegistrationOutcomeRowV1>(INSTANCE_REGISTER_QUERY)
             .bind(instance.guild_id.to_string())
             .bind(instance.id.as_str())
@@ -226,6 +230,9 @@ impl PinnedInstanceResolverV1 for PostgresRuntimeInteractionV1 {
         instance_id: &InstanceId,
     ) -> Result<ResolvedPinnedInstanceV1, PinnedInstanceResolverErrorV1> {
         let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(pinned_instance_backend)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
             .await
             .map_err(pinned_instance_backend)?;
         let rows = sqlx::query_as::<_, PinnedInstanceRowV1>(PINNED_READ_QUERY)

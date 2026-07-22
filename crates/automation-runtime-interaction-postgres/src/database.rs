@@ -130,9 +130,21 @@ pub async fn verify_runtime_interaction_database_with_timeouts_v1(
     timeouts: RuntimeInteractionDatabaseTimeoutsV1,
 ) -> Result<RuntimeInteractionDatabaseReadinessV1, RuntimeInteractionPersistenceErrorV1> {
     let mut transaction = begin_interaction_transaction(pool, timeouts).await?;
+    let readiness = verify_runtime_interaction_binding_v1(&mut transaction, expectation).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| map_query_error(&error))?;
+    Ok(readiness)
+}
+
+pub(crate) async fn verify_runtime_interaction_binding_v1(
+    transaction: &mut Transaction<'_, Postgres>,
+    expectation: &RuntimeInteractionDatabaseExpectationV1,
+) -> Result<RuntimeInteractionDatabaseReadinessV1, RuntimeInteractionPersistenceErrorV1> {
     let rows =
         sqlx::query_as::<_, RuntimeInteractionDatabaseReadinessRowV1>(DATABASE_READINESS_QUERY)
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|error| map_query_error(&error))?;
     let [row] = rows.as_slice() else {
@@ -147,17 +159,12 @@ pub async fn verify_runtime_interaction_database_with_timeouts_v1(
     {
         return Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority);
     }
-    let readiness = RuntimeInteractionDatabaseReadinessV1 {
+    Ok(RuntimeInteractionDatabaseReadinessV1 {
         database_identity: row.database_identity.clone(),
         database_name: row.database_name.clone(),
         executor_role: row.executor_role.clone(),
         checked_at: row.checked_at,
-    };
-    transaction
-        .commit()
-        .await
-        .map_err(|error| map_query_error(&error))?;
-    Ok(readiness)
+    })
 }
 
 pub(crate) async fn begin_interaction_transaction(
