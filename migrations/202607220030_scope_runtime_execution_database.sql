@@ -125,6 +125,287 @@ BEGIN
 END;
 $preflight$;
 
+CREATE OR REPLACE FUNCTION public.starring_runtime_observe_previous_serving_v1(
+    expected_tenant_id TEXT,
+    expected_installation_id TEXT,
+    expected_deployment_id TEXT,
+    expected_deployment_revision BIGINT,
+    expected_controller_id TEXT,
+    expected_controller_fencing_token BIGINT,
+    expected_convergence_attempt_no BIGINT,
+    expected_runtime_generation BIGINT,
+    expected_guild_id TEXT,
+    expected_ruleset_key TEXT,
+    expected_target_version BIGINT,
+    expected_target_content_hash TEXT,
+    expected_binding_revision BIGINT,
+    expected_binding_fingerprint TEXT,
+    expected_previous_runtime JSONB
+)
+RETURNS TABLE(
+    state_name TEXT,
+    observed_at TIMESTAMPTZ,
+    lease_tenant_id TEXT,
+    lease_installation_id TEXT,
+    lease_deployment_id TEXT,
+    lease_attestation_id TEXT,
+    lease_process_instance_id TEXT,
+    lease_runtime_generation BIGINT,
+    lease_guild_id TEXT,
+    lease_ruleset_key TEXT,
+    lease_target_version BIGINT,
+    lease_target_content_hash TEXT,
+    lease_binding_revision BIGINT,
+    lease_binding_fingerprint TEXT,
+    lease_epoch BIGINT,
+    lease_revision BIGINT,
+    lease_connected BOOLEAN,
+    lease_serving BOOLEAN,
+    lease_acquired_at TIMESTAMPTZ,
+    lease_last_heartbeat_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+VOLATILE
+PARALLEL UNSAFE
+SECURITY DEFINER
+SET search_path = pg_catalog
+ROWS 1
+AS $function$
+DECLARE
+    deployment_row public.runtime_deployments%ROWTYPE;
+    serving_row public.runtime_serving_leases%ROWTYPE;
+    authority_outcome TEXT;
+    database_now TIMESTAMPTZ;
+    serving_found BOOLEAN;
+BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
+
+    IF expected_tenant_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
+        OR expected_installation_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
+        OR expected_deployment_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
+        OR expected_deployment_revision NOT BETWEEN 1 AND 9223372036854775807
+        OR expected_controller_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
+        OR expected_controller_fencing_token NOT BETWEEN 1 AND 9223372036854775807
+        OR expected_convergence_attempt_no NOT BETWEEN 1 AND 4294967295
+        OR expected_runtime_generation NOT BETWEEN 1 AND 9223372036854775807
+        OR NOT (CASE
+            WHEN expected_guild_id ~ '^[1-9][0-9]{0,19}$'
+                THEN expected_guild_id::NUMERIC <= 18446744073709551615
+            ELSE FALSE
+        END)
+        OR expected_ruleset_key !~ '^[A-Za-z0-9_-]{1,64}$'
+        OR expected_target_version NOT BETWEEN 1 AND 4294967295
+        OR expected_target_content_hash !~ '^[0-9a-f]{64}$'
+        OR expected_binding_revision NOT BETWEEN 1 AND 9223372036854775807
+        OR expected_binding_fingerprint !~ '^[0-9a-f]{64}$'
+        OR (
+            expected_previous_runtime IS NOT NULL
+            AND (
+                pg_catalog.jsonb_typeof(expected_previous_runtime) <> 'object'
+                OR pg_catalog.octet_length(expected_previous_runtime::TEXT) > 16384
+                OR expected_previous_runtime #>> '{target,guild_id}'
+                    IS DISTINCT FROM expected_guild_id
+                OR expected_previous_runtime #>> '{target,ruleset_key}'
+                    IS DISTINCT FROM expected_ruleset_key
+                OR NOT (CASE
+                    WHEN expected_previous_runtime #>> '{target,version}'
+                        ~ '^[1-9][0-9]{0,9}$'
+                    THEN (expected_previous_runtime #>> '{target,version}')::NUMERIC
+                        <= 4294967295
+                    ELSE FALSE
+                END)
+                OR expected_previous_runtime #>> '{target,content_hash}'
+                    !~ '^[0-9a-f]{64}$'
+                OR NOT (CASE
+                    WHEN expected_previous_runtime #>> '{target,binding_revision}'
+                        ~ '^[1-9][0-9]{0,18}$'
+                    THEN (expected_previous_runtime #>> '{target,binding_revision}')::NUMERIC
+                        <= 9223372036854775807
+                    ELSE FALSE
+                END)
+                OR expected_previous_runtime #>> '{target,binding_fingerprint}'
+                    !~ '^[0-9a-f]{64}$'
+                OR NOT (CASE
+                    WHEN expected_previous_runtime ->> 'runtime_generation'
+                        ~ '^[1-9][0-9]{0,18}$'
+                    THEN (expected_previous_runtime ->> 'runtime_generation')::NUMERIC
+                        < expected_runtime_generation
+                    ELSE FALSE
+                END)
+                OR expected_previous_runtime ->> 'process_instance_id'
+                    !~ '^[A-Za-z0-9_.:-]{1,128}$'
+            )
+        )
+    THEN
+        RETURN;
+    END IF;
+
+    SELECT deployment.*
+    INTO deployment_row
+    FROM public.runtime_deployments AS deployment
+    WHERE deployment.tenant_id = expected_tenant_id
+        AND deployment.installation_id = expected_installation_id
+        AND deployment.deployment_id = expected_deployment_id
+    FOR UPDATE;
+
+    IF NOT FOUND
+        OR deployment_row.revision IS DISTINCT FROM expected_deployment_revision
+        OR deployment_row.controller_id IS DISTINCT FROM expected_controller_id
+        OR deployment_row.controller_fencing_token
+            IS DISTINCT FROM expected_controller_fencing_token
+        OR deployment_row.convergence_attempt_no
+            IS DISTINCT FROM expected_convergence_attempt_no
+        OR deployment_row.runtime_generation IS DISTINCT FROM expected_runtime_generation
+        OR deployment_row.guild_id IS DISTINCT FROM expected_guild_id
+        OR deployment_row.ruleset_key IS DISTINCT FROM expected_ruleset_key
+        OR deployment_row.target_version IS DISTINCT FROM expected_target_version
+        OR deployment_row.target_content_hash IS DISTINCT FROM expected_target_content_hash
+        OR deployment_row.binding_revision IS DISTINCT FROM expected_binding_revision
+        OR deployment_row.binding_fingerprint IS DISTINCT FROM expected_binding_fingerprint
+        OR deployment_row.previous_runtime IS DISTINCT FROM expected_previous_runtime
+        OR deployment_row.snapshot -> 'previous_runtime'
+            IS DISTINCT FROM COALESCE(expected_previous_runtime, 'null'::JSONB)
+        OR deployment_row.phase <> 'drain_requested'
+        OR deployment_row.blocked_at IS NOT NULL
+        OR deployment_row.controller_acquired_at IS NULL
+        OR deployment_row.controller_lease_expires_at IS NULL
+    THEN
+        RETURN;
+    END IF;
+
+    authority_outcome := public.starring_runtime_lock_current_authority(
+        deployment_row.activation_request_id,
+        deployment_row.promotion_id,
+        deployment_row.tenant_id,
+        deployment_row.installation_id,
+        deployment_row.installation_authority_revision,
+        deployment_row.guild_id,
+        deployment_row.ruleset_key,
+        deployment_row.target_version,
+        deployment_row.target_content_hash,
+        deployment_row.binding_revision,
+        deployment_row.binding_fingerprint
+    );
+    IF authority_outcome IS DISTINCT FROM 'exact' THEN
+        RETURN;
+    END IF;
+
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+        pg_catalog.concat(
+            'starring-runtime-serving-slot-v1:',
+            expected_guild_id,
+            ':',
+            expected_ruleset_key
+        ),
+        0
+    ));
+
+    SELECT lease.*
+    INTO serving_row
+    FROM public.runtime_serving_leases AS lease
+    WHERE lease.guild_id = expected_guild_id
+        AND lease.ruleset_key = expected_ruleset_key
+    FOR UPDATE;
+    serving_found := FOUND;
+
+    database_now := pg_catalog.clock_timestamp();
+    IF deployment_row.controller_acquired_at > database_now
+        OR deployment_row.controller_lease_expires_at <= database_now
+    THEN
+        RETURN;
+    END IF;
+
+    IF expected_previous_runtime IS NULL THEN
+        IF serving_found
+            AND serving_row.connected
+            AND serving_row.serving
+            AND serving_row.expires_at > database_now
+        THEN
+            RETURN;
+        END IF;
+        state_name := 'absent';
+        observed_at := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF NOT serving_found
+        OR serving_row.tenant_id IS DISTINCT FROM expected_tenant_id
+        OR serving_row.installation_id IS DISTINCT FROM expected_installation_id
+        OR serving_row.deployment_id IS NOT DISTINCT FROM expected_deployment_id
+        OR serving_row.guild_id
+            IS DISTINCT FROM expected_previous_runtime #>> '{target,guild_id}'
+        OR serving_row.ruleset_key
+            IS DISTINCT FROM expected_previous_runtime #>> '{target,ruleset_key}'
+        OR serving_row.target_version
+            IS DISTINCT FROM (expected_previous_runtime #>> '{target,version}')::BIGINT
+        OR serving_row.target_content_hash
+            IS DISTINCT FROM expected_previous_runtime #>> '{target,content_hash}'
+        OR serving_row.binding_revision
+            IS DISTINCT FROM (expected_previous_runtime #>> '{target,binding_revision}')::BIGINT
+        OR serving_row.binding_fingerprint
+            IS DISTINCT FROM expected_previous_runtime #>> '{target,binding_fingerprint}'
+        OR serving_row.runtime_generation
+            IS DISTINCT FROM (expected_previous_runtime ->> 'runtime_generation')::BIGINT
+        OR serving_row.process_instance_id
+            IS DISTINCT FROM expected_previous_runtime ->> 'process_instance_id'
+        OR serving_row.acquired_at > serving_row.last_heartbeat_at
+        OR serving_row.last_heartbeat_at > serving_row.expires_at
+        OR serving_row.acquired_at > database_now
+        OR serving_row.acquired_at > deployment_row.requested_at
+    THEN
+        RETURN;
+    END IF;
+
+    state_name := CASE
+        WHEN NOT serving_row.connected AND NOT serving_row.serving THEN 'disconnected'
+        WHEN serving_row.connected AND serving_row.serving
+            AND serving_row.expires_at <= database_now THEN 'expired'
+        WHEN serving_row.connected AND serving_row.serving
+            AND serving_row.expires_at > database_now THEN 'serving'
+    END;
+    IF state_name IS NULL
+        OR (state_name = 'disconnected'
+            AND (
+                serving_row.last_heartbeat_at IS DISTINCT FROM serving_row.expires_at
+                OR serving_row.last_heartbeat_at < deployment_row.requested_at
+            ))
+        OR (state_name = 'expired'
+            AND (
+                serving_row.last_heartbeat_at >= serving_row.expires_at
+                OR serving_row.expires_at <= deployment_row.requested_at
+            ))
+        OR (state_name = 'serving'
+            AND serving_row.last_heartbeat_at > database_now)
+    THEN
+        RETURN;
+    END IF;
+
+    observed_at := database_now;
+    lease_tenant_id := serving_row.tenant_id;
+    lease_installation_id := serving_row.installation_id;
+    lease_deployment_id := serving_row.deployment_id;
+    lease_attestation_id := serving_row.attestation_id;
+    lease_process_instance_id := serving_row.process_instance_id;
+    lease_runtime_generation := serving_row.runtime_generation;
+    lease_guild_id := serving_row.guild_id;
+    lease_ruleset_key := serving_row.ruleset_key;
+    lease_target_version := serving_row.target_version;
+    lease_target_content_hash := serving_row.target_content_hash;
+    lease_binding_revision := serving_row.binding_revision;
+    lease_binding_fingerprint := serving_row.binding_fingerprint;
+    lease_epoch := serving_row.lease_epoch;
+    lease_revision := serving_row.revision;
+    lease_connected := serving_row.connected;
+    lease_serving := serving_row.serving;
+    lease_acquired_at := serving_row.acquired_at;
+    lease_last_heartbeat_at := serving_row.last_heartbeat_at;
+    lease_expires_at := serving_row.expires_at;
+    RETURN NEXT;
+END;
+$function$;
+
 CREATE TABLE public.runtime_execution_mutation_markers (
     deployment_id TEXT PRIMARY KEY,
     mutation_revision BIGINT NOT NULL,
@@ -2520,9 +2801,12 @@ DECLARE
     canonical_artifact BOOLEAN;
     prepared_clock TIMESTAMPTZ;
     key_count BIGINT;
+    target_key_count BIGINT;
     serving_found BOOLEAN;
     attestation_found BOOLEAN;
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
+
     IF expected_tenant_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_installation_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_deployment_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
@@ -2535,6 +2819,9 @@ BEGIN
         OR expected_runtime_generation
             NOT BETWEEN 1 AND 9223372036854775807
         OR pg_catalog.jsonb_typeof(expected_gateway_ready) <> 'object'
+        OR pg_catalog.octet_length(expected_gateway_ready::TEXT) > 4096
+        OR pg_catalog.jsonb_typeof(expected_gateway_ready -> 'target')
+            <> 'object'
         OR expected_runtime_build_revision
             !~ '^[A-Za-z0-9_.:/-]{1,128}$'
         OR expected_panel_report_digest !~ '^[0-9a-f]{64}$'
@@ -2552,7 +2839,12 @@ BEGIN
     INTO key_count
     FROM pg_catalog.jsonb_object_keys(expected_gateway_ready);
 
+    SELECT pg_catalog.count(*)
+    INTO target_key_count
+    FROM pg_catalog.jsonb_object_keys(expected_gateway_ready -> 'target');
+
     IF key_count <> 5
+        OR target_key_count <> 6
         OR NOT expected_gateway_ready ?& ARRAY[
             'target',
             'runtime_generation',
@@ -2560,8 +2852,61 @@ BEGIN
             'kind',
             'ready_at'
         ]
-        OR pg_catalog.jsonb_typeof(expected_gateway_ready -> 'target')
-            <> 'object'
+        OR NOT (expected_gateway_ready -> 'target') ?& ARRAY[
+            'guild_id',
+            'ruleset_key',
+            'version',
+            'content_hash',
+            'binding_revision',
+            'binding_fingerprint'
+        ]
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,guild_id}'
+        ) <> 'string'
+        OR NOT (CASE
+            WHEN expected_gateway_ready #>> '{target,guild_id}'
+                ~ '^[1-9][0-9]{0,19}$'
+            THEN (expected_gateway_ready #>> '{target,guild_id}')::NUMERIC
+                <= 18446744073709551615
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,ruleset_key}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,ruleset_key}'
+            !~ '^[A-Za-z0-9_-]{1,64}$'
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,version}'
+        ) <> 'number'
+        OR NOT (CASE
+            WHEN (expected_gateway_ready #> '{target,version}')::TEXT
+                ~ '^[1-9][0-9]{0,9}$'
+            THEN (expected_gateway_ready #>> '{target,version}')::NUMERIC
+                <= 4294967295
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,content_hash}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,content_hash}'
+            !~ '^[0-9a-f]{64}$'
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,binding_revision}'
+        ) <> 'number'
+        OR NOT (CASE
+            WHEN (expected_gateway_ready
+                    #> '{target,binding_revision}')::TEXT
+                ~ '^[1-9][0-9]{0,18}$'
+            THEN (expected_gateway_ready
+                    #>> '{target,binding_revision}')::NUMERIC
+                <= 9223372036854775807
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,binding_fingerprint}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,binding_fingerprint}'
+            !~ '^[0-9a-f]{64}$'
         OR pg_catalog.jsonb_typeof(
             expected_gateway_ready -> 'runtime_generation'
         ) <> 'number'
@@ -2581,7 +2926,9 @@ BEGIN
             'timestamp with time zone'
         )
         OR expected_gateway_ready ->> 'ready_at'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+        OR expected_gateway_ready ->> 'ready_at'
+            ~ '[.][0-9]*000Z$'
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RX002',
@@ -2603,6 +2950,8 @@ BEGIN
             IS DISTINCT FROM expected_convergence_attempt_no
         OR expected_gateway_ready -> 'target'
             IS DISTINCT FROM deployment_row.snapshot -> 'target'
+        OR (expected_gateway_ready -> 'target')::TEXT
+            IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
         OR expected_gateway_ready ->> 'runtime_generation'
             IS DISTINCT FROM expected_runtime_generation::TEXT
         OR expected_gateway_ready ->> 'process_instance_id'
@@ -2615,6 +2964,46 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = 'RX001',
             MESSAGE = 'runtime_execution_certify_prepare_ownership_lost';
+    END IF;
+
+    authority_outcome := public.starring_runtime_lock_current_authority(
+        deployment_row.activation_request_id,
+        deployment_row.promotion_id,
+        deployment_row.tenant_id,
+        deployment_row.installation_id,
+        deployment_row.installation_authority_revision,
+        deployment_row.guild_id,
+        deployment_row.ruleset_key,
+        deployment_row.target_version,
+        deployment_row.target_content_hash,
+        deployment_row.binding_revision,
+        deployment_row.binding_fingerprint
+    );
+    IF authority_outcome = 'active_mismatch' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX006',
+            MESSAGE = 'runtime_execution_certify_prepare_target_superseded';
+    ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX003',
+            MESSAGE = 'runtime_execution_certify_prepare_authority_changed';
+    END IF;
+
+    SELECT version.content_hash = deployment_row.target_content_hash
+        AND version.canonical_content_hash
+            = deployment_row.target_content_hash
+        AND version.schema_version = 1
+    INTO canonical_artifact
+    FROM public.automation_ruleset_versions AS version
+    WHERE version.guild_id = deployment_row.guild_id
+        AND version.ruleset_key = deployment_row.ruleset_key
+        AND version.version = deployment_row.target_version
+    FOR SHARE;
+
+    IF canonical_artifact IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX004',
+            MESSAGE = 'runtime_execution_certify_prepare_artifact_invalid';
     END IF;
 
     IF deployment_row.revision = expected_deployment_revision + 1
@@ -2667,6 +3056,23 @@ BEGIN
                 IS DISTINCT FROM expected_gateway_shard_id
             OR attestation_row.convergence_attempt_no
                 IS DISTINCT FROM expected_convergence_attempt_no
+            OR attestation_row.deployment_revision
+                IS DISTINCT FROM deployment_row.revision
+            OR attestation_row.controller_fencing_token
+                IS DISTINCT FROM expected_controller_fencing_token
+            OR attestation_row.runtime_generation
+                IS DISTINCT FROM expected_runtime_generation
+            OR attestation_row.process_instance_id
+                IS DISTINCT FROM expected_gateway_ready
+                    ->> 'process_instance_id'
+            OR attestation_row.target_version
+                IS DISTINCT FROM deployment_row.target_version
+            OR attestation_row.target_content_hash
+                IS DISTINCT FROM deployment_row.target_content_hash
+            OR attestation_row.binding_revision
+                IS DISTINCT FROM deployment_row.binding_revision
+            OR attestation_row.binding_fingerprint
+                IS DISTINCT FROM deployment_row.binding_fingerprint
             OR attestation_row.serving_lease_duration_nanos
                 IS DISTINCT FROM
                     requested_serving_lease_milliseconds * 1000000
@@ -2682,13 +3088,47 @@ BEGIN
                     ->> 'process_instance_id'
             OR serving_row.runtime_generation
                 IS DISTINCT FROM expected_runtime_generation
-            OR NOT serving_row.connected
-            OR NOT serving_row.serving
-            OR serving_row.expires_at <= prepared_clock
+            OR serving_row.guild_id IS DISTINCT FROM deployment_row.guild_id
+            OR serving_row.ruleset_key
+                IS DISTINCT FROM deployment_row.ruleset_key
+            OR serving_row.target_version
+                IS DISTINCT FROM deployment_row.target_version
+            OR serving_row.target_content_hash
+                IS DISTINCT FROM deployment_row.target_content_hash
+            OR serving_row.binding_revision
+                IS DISTINCT FROM deployment_row.binding_revision
+            OR serving_row.binding_fingerprint
+                IS DISTINCT FROM deployment_row.binding_fingerprint
+            OR serving_row.acquired_at
+                IS DISTINCT FROM attestation_row.certified_at
+            OR serving_row.acquired_at > serving_row.last_heartbeat_at
+            OR serving_row.last_heartbeat_at > serving_row.expires_at
+            OR serving_row.serving IS DISTINCT FROM serving_row.connected
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX004',
                 MESSAGE = 'runtime_execution_certify_prepare_replay_mismatch';
+        END IF;
+
+        IF NOT serving_row.connected
+            OR NOT serving_row.serving
+            OR serving_row.expires_at <= prepared_clock
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX005',
+                MESSAGE = 'runtime_execution_certify_prepare_replay_not_ready';
+        END IF;
+
+        IF serving_row.last_heartbeat_at
+                IS DISTINCT FROM serving_row.acquired_at
+            OR serving_row.expires_at - serving_row.last_heartbeat_at
+                IS DISTINCT FROM
+                    requested_serving_lease_milliseconds
+                        * INTERVAL '1 millisecond'
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX001',
+                MESSAGE = 'runtime_execution_certify_prepare_replay_advanced';
         END IF;
 
         preparation_name := 'replayed';
@@ -2717,46 +3157,6 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = 'RX001',
             MESSAGE = 'runtime_execution_certify_prepare_ownership_lost';
-    END IF;
-
-    authority_outcome := public.starring_runtime_lock_current_authority(
-        deployment_row.activation_request_id,
-        deployment_row.promotion_id,
-        deployment_row.tenant_id,
-        deployment_row.installation_id,
-        deployment_row.installation_authority_revision,
-        deployment_row.guild_id,
-        deployment_row.ruleset_key,
-        deployment_row.target_version,
-        deployment_row.target_content_hash,
-        deployment_row.binding_revision,
-        deployment_row.binding_fingerprint
-    );
-    IF authority_outcome = 'active_mismatch' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX006',
-            MESSAGE = 'runtime_execution_certify_prepare_target_superseded';
-    ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX003',
-            MESSAGE = 'runtime_execution_certify_prepare_authority_changed';
-    END IF;
-
-    SELECT version.content_hash = deployment_row.target_content_hash
-        AND version.canonical_content_hash
-            = deployment_row.target_content_hash
-        AND version.schema_version = 1
-    INTO canonical_artifact
-    FROM public.automation_ruleset_versions AS version
-    WHERE version.guild_id = deployment_row.guild_id
-        AND version.ruleset_key = deployment_row.ruleset_key
-        AND version.version = deployment_row.target_version
-    FOR SHARE;
-
-    IF canonical_artifact IS DISTINCT FROM TRUE THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX004',
-            MESSAGE = 'runtime_execution_certify_prepare_artifact_invalid';
     END IF;
 
     PERFORM pg_catalog.pg_advisory_xact_lock(
@@ -2790,7 +3190,7 @@ BEGIN
         OR (expected_gateway_ready ->> 'ready_at')::TIMESTAMPTZ
             < prepared_clock - INTERVAL '90 seconds'
         OR (expected_gateway_ready ->> 'ready_at')::TIMESTAMPTZ
-            > prepared_clock + INTERVAL '30 seconds'
+            > prepared_clock
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RX002',
@@ -2883,6 +3283,7 @@ DECLARE
     domain_bytes BYTEA;
     record_key_count BIGINT;
     gateway_key_count BIGINT;
+    target_key_count BIGINT;
     serving_found BOOLEAN;
     attestation_found BOOLEAN;
     canonical_target_bytes TEXT;
@@ -2900,6 +3301,8 @@ DECLARE
     gateway_time TIMESTAMPTZ;
     certified_time TIMESTAMPTZ;
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
+
     IF expected_tenant_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_installation_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_deployment_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
@@ -2912,7 +3315,11 @@ BEGIN
         OR expected_runtime_generation
             NOT BETWEEN 1 AND 9223372036854775807
         OR pg_catalog.jsonb_typeof(expected_gateway_ready) <> 'object'
+        OR pg_catalog.octet_length(expected_gateway_ready::TEXT) > 4096
+        OR pg_catalog.jsonb_typeof(expected_gateway_ready -> 'target')
+            <> 'object'
         OR pg_catalog.jsonb_typeof(expected_observed_snapshot) <> 'object'
+        OR pg_catalog.octet_length(expected_observed_snapshot::TEXT) > 262144
         OR expected_runtime_build_revision
             !~ '^[A-Za-z0-9_.:/-]{1,128}$'
         OR expected_panel_report_digest !~ '^[0-9a-f]{64}$'
@@ -2976,7 +3383,11 @@ BEGIN
     SELECT pg_catalog.count(*)
     INTO gateway_key_count
     FROM pg_catalog.jsonb_object_keys(expected_gateway_ready);
+    SELECT pg_catalog.count(*)
+    INTO target_key_count
+    FROM pg_catalog.jsonb_object_keys(expected_gateway_ready -> 'target');
     IF gateway_key_count <> 5
+        OR target_key_count <> 6
         OR NOT expected_gateway_ready ?& ARRAY[
             'target',
             'runtime_generation',
@@ -2984,8 +3395,61 @@ BEGIN
             'kind',
             'ready_at'
         ]
-        OR pg_catalog.jsonb_typeof(expected_gateway_ready -> 'target')
-            <> 'object'
+        OR NOT (expected_gateway_ready -> 'target') ?& ARRAY[
+            'guild_id',
+            'ruleset_key',
+            'version',
+            'content_hash',
+            'binding_revision',
+            'binding_fingerprint'
+        ]
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,guild_id}'
+        ) <> 'string'
+        OR NOT (CASE
+            WHEN expected_gateway_ready #>> '{target,guild_id}'
+                ~ '^[1-9][0-9]{0,19}$'
+            THEN (expected_gateway_ready #>> '{target,guild_id}')::NUMERIC
+                <= 18446744073709551615
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,ruleset_key}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,ruleset_key}'
+            !~ '^[A-Za-z0-9_-]{1,64}$'
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,version}'
+        ) <> 'number'
+        OR NOT (CASE
+            WHEN (expected_gateway_ready #> '{target,version}')::TEXT
+                ~ '^[1-9][0-9]{0,9}$'
+            THEN (expected_gateway_ready #>> '{target,version}')::NUMERIC
+                <= 4294967295
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,content_hash}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,content_hash}'
+            !~ '^[0-9a-f]{64}$'
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,binding_revision}'
+        ) <> 'number'
+        OR NOT (CASE
+            WHEN (expected_gateway_ready
+                    #> '{target,binding_revision}')::TEXT
+                ~ '^[1-9][0-9]{0,18}$'
+            THEN (expected_gateway_ready
+                    #>> '{target,binding_revision}')::NUMERIC
+                <= 9223372036854775807
+            ELSE FALSE
+        END)
+        OR pg_catalog.jsonb_typeof(
+            expected_gateway_ready #> '{target,binding_fingerprint}'
+        ) <> 'string'
+        OR expected_gateway_ready #>> '{target,binding_fingerprint}'
+            !~ '^[0-9a-f]{64}$'
         OR pg_catalog.jsonb_typeof(
             expected_gateway_ready -> 'runtime_generation'
         ) <> 'number'
@@ -3007,7 +3471,9 @@ BEGIN
             'timestamp with time zone'
         )
         OR expected_gateway_ready ->> 'ready_at'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+        OR expected_gateway_ready ->> 'ready_at'
+            ~ '[.][0-9]*000Z$'
         OR pg_catalog.jsonb_typeof(
             proposed_attestation_record #> '{live,activation}'
         ) <> 'object'
@@ -3038,15 +3504,26 @@ BEGIN
         )
         OR proposed_attestation_record
                 #>> '{live,activation,activated_at}'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
         OR proposed_attestation_record
                 #>> '{live,panel_certificate,reconciled_at}'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
         OR proposed_attestation_record
                 #>> '{live,gateway_ready,ready_at}'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
         OR proposed_attestation_record #>> '{live,certified_at}'
-            !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+        OR proposed_attestation_record
+                #>> '{live,activation,activated_at}'
+            ~ '[.][0-9]*000Z$'
+        OR proposed_attestation_record
+                #>> '{live,panel_certificate,reconciled_at}'
+            ~ '[.][0-9]*000Z$'
+        OR proposed_attestation_record
+                #>> '{live,gateway_ready,ready_at}'
+            ~ '[.][0-9]*000Z$'
+        OR proposed_attestation_record #>> '{live,certified_at}'
+            ~ '[.][0-9]*000Z$'
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RX002',
@@ -3310,6 +3787,45 @@ BEGIN
             MESSAGE = 'runtime_execution_certify_commit_ownership_lost';
     END IF;
 
+    authority_outcome := public.starring_runtime_lock_current_authority(
+        deployment_row.activation_request_id,
+        deployment_row.promotion_id,
+        deployment_row.tenant_id,
+        deployment_row.installation_id,
+        deployment_row.installation_authority_revision,
+        deployment_row.guild_id,
+        deployment_row.ruleset_key,
+        deployment_row.target_version,
+        deployment_row.target_content_hash,
+        deployment_row.binding_revision,
+        deployment_row.binding_fingerprint
+    );
+    IF authority_outcome = 'active_mismatch' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX006',
+            MESSAGE = 'runtime_execution_certify_commit_target_superseded';
+    ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX003',
+            MESSAGE = 'runtime_execution_certify_commit_authority_changed';
+    END IF;
+
+    SELECT version.content_hash = deployment_row.target_content_hash
+        AND version.canonical_content_hash
+            = deployment_row.target_content_hash
+        AND version.schema_version = 1
+    INTO canonical_artifact
+    FROM public.automation_ruleset_versions AS version
+    WHERE version.guild_id = deployment_row.guild_id
+        AND version.ruleset_key = deployment_row.ruleset_key
+        AND version.version = deployment_row.target_version
+    FOR SHARE;
+    IF canonical_artifact IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX004',
+            MESSAGE = 'runtime_execution_certify_commit_artifact_invalid';
+    END IF;
+
     IF deployment_row.revision = expected_deployment_revision + 1
         AND deployment_row.phase = 'live'
     THEN
@@ -3352,6 +3868,8 @@ BEGIN
                 IS DISTINCT FROM expected_runtime_generation
             OR deployment_row.snapshot -> 'gateway_ready'
                 IS DISTINCT FROM expected_gateway_ready
+            OR (deployment_row.snapshot -> 'gateway_ready')::TEXT
+                IS DISTINCT FROM expected_gateway_ready::TEXT
             OR deployment_row.live_attestation_id
                 IS DISTINCT FROM proposed_attestation_id
             OR NOT serving_found
@@ -3361,20 +3879,77 @@ BEGIN
             OR existing_attestation.serving_lease_duration_nanos
                 IS DISTINCT FROM
                     requested_serving_lease_milliseconds * 1000000
+            OR existing_attestation.deployment_revision
+                IS DISTINCT FROM deployment_row.revision
+            OR existing_attestation.controller_fencing_token
+                IS DISTINCT FROM expected_controller_fencing_token
+            OR existing_attestation.runtime_generation
+                IS DISTINCT FROM expected_runtime_generation
+            OR existing_attestation.process_instance_id
+                IS DISTINCT FROM expected_gateway_ready
+                    ->> 'process_instance_id'
+            OR existing_attestation.target_version
+                IS DISTINCT FROM deployment_row.target_version
+            OR existing_attestation.target_content_hash
+                IS DISTINCT FROM deployment_row.target_content_hash
+            OR existing_attestation.binding_revision
+                IS DISTINCT FROM deployment_row.binding_revision
+            OR existing_attestation.binding_fingerprint
+                IS DISTINCT FROM deployment_row.binding_fingerprint
             OR serving_row.attestation_id
                 IS DISTINCT FROM proposed_attestation_id
+            OR serving_row.tenant_id IS DISTINCT FROM expected_tenant_id
+            OR serving_row.installation_id
+                IS DISTINCT FROM expected_installation_id
+            OR serving_row.deployment_id
+                IS DISTINCT FROM expected_deployment_id
             OR serving_row.process_instance_id
                 IS DISTINCT FROM expected_gateway_ready
                     ->> 'process_instance_id'
             OR serving_row.runtime_generation
                 IS DISTINCT FROM expected_runtime_generation
-            OR NOT serving_row.connected
-            OR NOT serving_row.serving
-            OR serving_row.expires_at <= pg_catalog.clock_timestamp()
+            OR serving_row.guild_id IS DISTINCT FROM deployment_row.guild_id
+            OR serving_row.ruleset_key
+                IS DISTINCT FROM deployment_row.ruleset_key
+            OR serving_row.target_version
+                IS DISTINCT FROM deployment_row.target_version
+            OR serving_row.target_content_hash
+                IS DISTINCT FROM deployment_row.target_content_hash
+            OR serving_row.binding_revision
+                IS DISTINCT FROM deployment_row.binding_revision
+            OR serving_row.binding_fingerprint
+                IS DISTINCT FROM deployment_row.binding_fingerprint
+            OR serving_row.acquired_at
+                IS DISTINCT FROM existing_attestation.certified_at
+            OR serving_row.acquired_at > serving_row.last_heartbeat_at
+            OR serving_row.last_heartbeat_at > serving_row.expires_at
+            OR serving_row.serving IS DISTINCT FROM serving_row.connected
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX004',
                 MESSAGE = 'runtime_execution_certify_commit_replay_mismatch';
+        END IF;
+
+        current_clock := pg_catalog.clock_timestamp();
+        IF NOT serving_row.connected
+            OR NOT serving_row.serving
+            OR serving_row.expires_at <= current_clock
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX005',
+                MESSAGE = 'runtime_execution_certify_commit_replay_not_ready';
+        END IF;
+
+        IF serving_row.last_heartbeat_at
+                IS DISTINCT FROM serving_row.acquired_at
+            OR serving_row.expires_at - serving_row.last_heartbeat_at
+                IS DISTINCT FROM
+                    requested_serving_lease_milliseconds
+                        * INTERVAL '1 millisecond'
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX001',
+                MESSAGE = 'runtime_execution_certify_commit_replay_advanced';
         END IF;
 
         outcome_name := 'replayed';
@@ -3419,6 +3994,8 @@ BEGIN
         OR deployment_row.controller_lease_expires_at IS NULL
         OR expected_gateway_ready -> 'target'
             IS DISTINCT FROM deployment_row.snapshot -> 'target'
+        OR (expected_gateway_ready -> 'target')::TEXT
+            IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
         OR expected_gateway_ready ->> 'runtime_generation'
             IS DISTINCT FROM expected_runtime_generation::TEXT
         OR expected_gateway_ready ->> 'process_instance_id'
@@ -3431,45 +4008,6 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = 'RX001',
             MESSAGE = 'runtime_execution_certify_commit_ownership_lost';
-    END IF;
-
-    authority_outcome := public.starring_runtime_lock_current_authority(
-        deployment_row.activation_request_id,
-        deployment_row.promotion_id,
-        deployment_row.tenant_id,
-        deployment_row.installation_id,
-        deployment_row.installation_authority_revision,
-        deployment_row.guild_id,
-        deployment_row.ruleset_key,
-        deployment_row.target_version,
-        deployment_row.target_content_hash,
-        deployment_row.binding_revision,
-        deployment_row.binding_fingerprint
-    );
-    IF authority_outcome = 'active_mismatch' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX006',
-            MESSAGE = 'runtime_execution_certify_commit_target_superseded';
-    ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX003',
-            MESSAGE = 'runtime_execution_certify_commit_authority_changed';
-    END IF;
-
-    SELECT version.content_hash = deployment_row.target_content_hash
-        AND version.canonical_content_hash
-            = deployment_row.target_content_hash
-        AND version.schema_version = 1
-    INTO canonical_artifact
-    FROM public.automation_ruleset_versions AS version
-    WHERE version.guild_id = deployment_row.guild_id
-        AND version.ruleset_key = deployment_row.ruleset_key
-        AND version.version = deployment_row.target_version
-    FOR SHARE;
-    IF canonical_artifact IS DISTINCT FROM TRUE THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RX004',
-            MESSAGE = 'runtime_execution_certify_commit_artifact_invalid';
     END IF;
 
     PERFORM pg_catalog.pg_advisory_xact_lock(
@@ -3507,7 +4045,7 @@ BEGIN
                 #>> '{panel_certificate,reconciled_at}'
         )::TIMESTAMPTZ
         OR gateway_time < current_clock - INTERVAL '90 seconds'
-        OR gateway_time > current_clock + INTERVAL '30 seconds'
+        OR gateway_time > current_clock
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RX002',
@@ -3517,6 +4055,8 @@ BEGIN
     IF certified_time IS DISTINCT FROM current_clock
         OR proposed_attestation_record #> '{live,target}'
             IS DISTINCT FROM deployment_row.snapshot -> 'target'
+        OR (proposed_attestation_record #> '{live,target}')::TEXT
+            IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
         OR proposed_attestation_record
             #>> '{live,runtime_generation}'
             IS DISTINCT FROM expected_runtime_generation::TEXT
@@ -3526,10 +4066,18 @@ BEGIN
                 ->> 'process_instance_id'
         OR proposed_attestation_record #> '{live,activation}'
             IS DISTINCT FROM deployment_row.snapshot -> 'activation'
+        OR (proposed_attestation_record #> '{live,activation}')::TEXT
+            IS DISTINCT FROM (deployment_row.snapshot -> 'activation')::TEXT
         OR proposed_attestation_record #> '{live,panel_certificate}'
             IS DISTINCT FROM deployment_row.snapshot -> 'panel_certificate'
+        OR (proposed_attestation_record
+                #> '{live,panel_certificate}')::TEXT
+            IS DISTINCT FROM
+                (deployment_row.snapshot -> 'panel_certificate')::TEXT
         OR proposed_attestation_record #> '{live,gateway_ready}'
             IS DISTINCT FROM expected_gateway_ready
+        OR (proposed_attestation_record #> '{live,gateway_ready}')::TEXT
+            IS DISTINCT FROM expected_gateway_ready::TEXT
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RX004',
@@ -3828,6 +4376,8 @@ DECLARE
     next_revision BIGINT;
     serving_found BOOLEAN;
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
+
     SELECT deployment.*
     INTO deployment_row
     FROM public.runtime_deployments AS deployment
@@ -4447,7 +4997,7 @@ BEGIN
 
     RETURN observed_count = 472
         AND observed_digest
-            = '3d12dc4468b6d42cd9ec0b5bc0814117684fff43e28356f1fb40089c127ab641';
+            = '86247ffa5c796b6c2c4e4edb6b7f4464b7a53fe51363285642c7c5e52056d48b';
 END;
 $function$;
 
@@ -5214,7 +5764,7 @@ BEGIN
                 'boolean'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
-                '242c36e163845f1b5b13f09b82676ce1af39a86214eab5b2f88143ae9c386940'::TEXT
+                '2680d0c4d909e5019c9bedbebdbff7d082699df68404874c3bd49c28d3239b09'::TEXT
             )
     ) AS expected(
         identity,

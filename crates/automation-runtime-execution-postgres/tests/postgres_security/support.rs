@@ -7,14 +7,17 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use automation_runtime_controller::{
-    runtime_desired_target_digest_v1, RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1,
-    RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1,
-    RuntimeExecutionReceiptV1, RuntimeMutationReceiptV1,
+    encode_runtime_live_attestation_record_v1, runtime_desired_target_digest_v1,
+    runtime_live_attestation_digest_v1, GatewayShardIdV1, RuntimeBuildRevisionV1,
+    RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1,
+    RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
+    RuntimeLiveAttestationRecordV1, RuntimeMutationReceiptV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, DrainAttestationV1,
-    PanelCertificateId, PanelCertificateV1, PanelReportDigestV1, PreflightAttestationV1,
-    ProcessInstanceId, RuntimeDeployment, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseV1,
+    GatewayReadyAttestationV1, GatewayReadyKindV1, LiveAttestationV1, PanelCertificateId,
+    PanelCertificateV1, PanelReportDigestV1, PreflightAttestationV1, ProcessInstanceId,
+    RuntimeDeployment, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseV1,
     RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
     RuntimeGeneration, RuntimePendingConditionV1, SupersedingDeploymentV1, TransitionOutcomeV1,
 };
@@ -52,7 +55,7 @@ const EXECUTOR_FUNCTIONS: [&str; 9] = [
     "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "ccd6e8e9bd6fb83b29deef85d88beede796ef8b282f4619e82ee0678a21fe77d";
+    "bcf5881f5b3ae919a3d6e29570b270dba1777627e4c16e3fa058750e2786a311";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
