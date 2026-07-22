@@ -1,11 +1,11 @@
 use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
+use automation_runtime_controller::runtime_failure_message_v1;
 use automation_runtime_convergence::{
     CommandGuardV1, FencingToken, LeaseRequestV1, RuntimeDeployment, RuntimeDeploymentError,
     RuntimeDeploymentPhaseV1, RuntimeFailureV1, RuntimePendingConditionV1, TransitionOutcomeV1,
 };
 use sqlx::types::Json;
 
-use crate::digest::desired_target_digest;
 use crate::error::database;
 use crate::model::{
     ClaimDeploymentV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1, ClaimReceiptV1,
@@ -13,6 +13,7 @@ use crate::model::{
     RenewDeploymentV1, RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1,
     SubmitDeploymentMutationV1,
 };
+use crate::persistence::desired_target_digest_v1;
 use crate::prepare::prepare_requested_deployment_v1;
 use crate::row::{
     runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, ServingLeaseRow,
@@ -32,13 +33,13 @@ impl PostgresRuntimeConvergence {
                 "installation authority revision",
             ));
         }
-        let desired_digest = desired_target_digest(
+        let desired_digest = desired_target_digest_v1(
             &request.identity,
             &request.target,
             request.runtime_generation.get(),
             request.installation_authority_revision,
             request.previous_runtime.as_ref(),
-        );
+        )?;
         let mut transaction = self.begin().await?;
         let existing = sqlx::query_as::<_, DeploymentRow>(&format!(
             "SELECT {DEPLOYMENT_COLUMNS} FROM public.runtime_deployments \
@@ -958,7 +959,7 @@ fn sanitize_failure_evidence(mutation: DeploymentMutationV1) -> DeploymentMutati
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
             attempt,
             retry_after,
         },
@@ -971,34 +972,9 @@ fn sanitize_failure_evidence(mutation: DeploymentMutationV1) -> DeploymentMutati
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
         },
         mutation => mutation,
-    }
-}
-
-fn stable_failure_message(
-    kind: automation_runtime_convergence::RuntimeFailureKindV1,
-) -> &'static str {
-    match kind {
-        automation_runtime_convergence::RuntimeFailureKindV1::EnvironmentUnavailable => {
-            "runtime environment unavailable"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::ActivationNotObservable => {
-            "activation not observable"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::PanelReconciliation => {
-            "panel reconciliation failed"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::GatewayStart => {
-            "gateway start failed"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::GatewayReadyTimeout => {
-            "gateway Ready timed out"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::InvariantViolation => {
-            "runtime invariant rejected"
-        }
     }
 }
 

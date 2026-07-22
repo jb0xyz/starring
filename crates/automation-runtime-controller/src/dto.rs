@@ -12,6 +12,7 @@ use automation_runtime_convergence::{
     TransitionOutcomeV1,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeControllerDtoError {
@@ -23,7 +24,8 @@ pub enum RuntimeControllerDtoError {
 
 macro_rules! define_safe_text {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -51,12 +53,23 @@ macro_rules! define_safe_text {
                 formatter.write_str(&self.0)
             }
         }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
 macro_rules! define_digest {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -80,6 +93,16 @@ macro_rules! define_digest {
         impl Display for $name {
             fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
             }
         }
     };

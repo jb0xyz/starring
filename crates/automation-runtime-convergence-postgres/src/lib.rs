@@ -1,11 +1,11 @@
 mod artifact;
 mod controller;
 mod database_identity;
-mod digest;
 mod error;
 mod evidence;
 mod hydration;
 mod model;
+mod persistence;
 mod prepare;
 mod projection;
 mod row;

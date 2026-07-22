@@ -133,6 +133,17 @@ impl RuntimeFailureSourceV1 {
     }
 }
 
+pub fn runtime_failure_message_v1(kind: RuntimeFailureKindV1) -> &'static str {
+    match kind {
+        RuntimeFailureKindV1::EnvironmentUnavailable => "runtime environment unavailable",
+        RuntimeFailureKindV1::ActivationNotObservable => "activation not observable",
+        RuntimeFailureKindV1::PanelReconciliation => "panel reconciliation failed",
+        RuntimeFailureKindV1::GatewayStart => "gateway start failed",
+        RuntimeFailureKindV1::GatewayReadyTimeout => "gateway Ready timed out",
+        RuntimeFailureKindV1::InvariantViolation => "runtime invariant rejected",
+    }
+}
+
 fn recorded(
     kind: RuntimeFailureKindV1,
     code: &'static str,
@@ -197,5 +208,37 @@ mod tests {
             RuntimeFailureSourceV1::ShutdownRequested.decide(),
             RuntimeFailureDecisionV1::Stop
         );
+    }
+
+    #[test]
+    fn persisted_failure_messages_are_stable_and_bounded() {
+        let cases = [
+            (
+                RuntimeFailureKindV1::EnvironmentUnavailable,
+                "runtime environment unavailable",
+            ),
+            (
+                RuntimeFailureKindV1::ActivationNotObservable,
+                "activation not observable",
+            ),
+            (
+                RuntimeFailureKindV1::PanelReconciliation,
+                "panel reconciliation failed",
+            ),
+            (RuntimeFailureKindV1::GatewayStart, "gateway start failed"),
+            (
+                RuntimeFailureKindV1::GatewayReadyTimeout,
+                "gateway Ready timed out",
+            ),
+            (
+                RuntimeFailureKindV1::InvariantViolation,
+                "runtime invariant rejected",
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(runtime_failure_message_v1(kind), expected);
+            assert!(!expected.is_empty());
+            assert!(expected.len() <= 64);
+        }
     }
 }

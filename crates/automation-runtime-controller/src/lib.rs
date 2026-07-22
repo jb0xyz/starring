@@ -1,6 +1,7 @@
 mod config;
 mod dto;
 mod failure;
+mod persistence;
 mod planner;
 mod port;
 mod retry;
@@ -19,7 +20,16 @@ pub use dto::{
     RuntimeRenewExecutionV1, RuntimeServingIdentityV1, RuntimeServingReceiptV1,
     RuntimeServingUpdateReceiptV1, RuntimeSessionActionIdV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
-pub use failure::{RuntimeFailureDecisionV1, RuntimeFailureSourceV1, RuntimeRecordedFailureV1};
+pub use failure::{
+    runtime_failure_message_v1, RuntimeFailureDecisionV1, RuntimeFailureSourceV1,
+    RuntimeRecordedFailureV1,
+};
+pub use persistence::{
+    decode_runtime_live_attestation_record_v1, encode_runtime_live_attestation_record_v1,
+    runtime_desired_target_digest_v1, runtime_live_attestation_digest_v1,
+    RuntimeDesiredTargetDigestV1, RuntimeLiveAttestationRecordV1,
+    RuntimePersistenceContractErrorV1,
+};
 pub use planner::{
     plan_runtime_action_v1, RuntimeControllerActionV1, RuntimeControllerPlanError,
     RuntimeControllerStopReasonV1,

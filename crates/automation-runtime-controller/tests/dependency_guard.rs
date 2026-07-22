@@ -80,6 +80,32 @@ fn execution_and_serving_ports_stay_independent() {
 }
 
 #[test]
+fn persistence_contract_is_versioned_and_database_independent() {
+    let manifest = include_str!("../Cargo.toml");
+    let regular = manifest
+        .split("[dependencies]")
+        .nth(1)
+        .unwrap_or("")
+        .split("[dev-dependencies]")
+        .next()
+        .unwrap_or("");
+    for forbidden in ["sqlx", "rusqlite", "twilight", "reqwest"] {
+        assert!(!regular.contains(forbidden));
+    }
+    let source = include_str!("../src/persistence.rs");
+    for contract in [
+        "runtime_desired_target_digest_v1",
+        "encode_runtime_live_attestation_record_v1",
+        "decode_runtime_live_attestation_record_v1",
+        "runtime_live_attestation_digest_v1",
+        "RuntimeLiveAttestationRecordV1",
+    ] {
+        assert!(source.contains(contract));
+    }
+    assert!(source.contains("impl<'de> Deserialize<'de> for RuntimeDesiredTargetDigestV1"));
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -88,6 +114,7 @@ fn source_files_contain_no_comments() {
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/planner.rs", include_str!("../src/planner.rs")),
         ("src/port.rs", include_str!("../src/port.rs")),
+        ("src/persistence.rs", include_str!("../src/persistence.rs")),
         ("src/retry.rs", include_str!("../src/retry.rs")),
         ("src/session.rs", include_str!("../src/session.rs")),
         (

@@ -440,6 +440,9 @@ dependencies = [
  "chrono",
  "discord-model",
  "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
@@ -471,7 +474,6 @@ dependencies = [
  "resource-resolution",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",

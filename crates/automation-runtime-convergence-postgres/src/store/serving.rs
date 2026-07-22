@@ -1,17 +1,19 @@
 use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
+use automation_runtime_controller::{
+    encode_runtime_live_attestation_record_v1, RuntimeLiveAttestationRecordV1,
+};
 use automation_runtime_convergence::{
     CommandGuardV1, LiveLossKindV1, RecoverLiveRequestV1, RuntimeDeploymentPhaseV1,
     TransitionOutcomeV1,
 };
 use sqlx::types::Json;
 
-use crate::digest::live_attestation_digest;
 use crate::error::database;
 use crate::model::{
-    AttestationIdV1, AttestationRecordV1, HeartbeatServingLeaseV1, MarkServingDisconnectedV1,
-    MutationReceiptV1, RecoverStaleLiveV1, ServingLeaseIdentityV1, ServingLeaseReceiptV1,
-    SubmitLiveAttestationV1,
+    AttestationIdV1, HeartbeatServingLeaseV1, MarkServingDisconnectedV1, MutationReceiptV1,
+    RecoverStaleLiveV1, ServingLeaseIdentityV1, ServingLeaseReceiptV1, SubmitLiveAttestationV1,
 };
+use crate::persistence::{live_attestation_id_v1, live_attestation_record_v1};
 use crate::row::{
     gateway_ready_kind_name, runtime_i64, AttestationRow, ServingLeaseRow, ATTESTATION_COLUMNS,
     SERVING_LEASE_COLUMNS,
@@ -92,18 +94,13 @@ impl PostgresRuntimeConvergence {
                 .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(
                     "Live transition did not produce an attestation",
                 ))?;
-        let record = AttestationRecordV1 {
-            live: live.clone(),
-            runtime_build_revision: request.metadata.runtime_build_revision,
-            panel_report_digest: request.metadata.panel_report_digest,
-            gateway_shard_id: request.metadata.gateway_shard_id,
-            controller_fencing_token: request.fencing_token,
-            deployment_revision: snapshot.revision,
-        };
-        let attestation_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-            })?);
+        let record = live_attestation_record_v1(
+            live.clone(),
+            &request.metadata,
+            request.fencing_token,
+            snapshot.revision,
+        )?;
+        let attestation_id = live_attestation_id_v1(&record)?;
         let existing_attestation =
             Self::load_attestation(&mut transaction, &request.scope, &attestation_id, true).await?;
         match (outcome, existing_attestation) {
@@ -645,18 +642,13 @@ impl PostgresRuntimeConvergence {
         {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
-        let record = AttestationRecordV1 {
-            live: live.clone(),
-            runtime_build_revision: request.metadata.runtime_build_revision.clone(),
-            panel_report_digest: request.metadata.panel_report_digest.clone(),
-            gateway_shard_id: request.metadata.gateway_shard_id.clone(),
-            controller_fencing_token: request.fencing_token,
-            deployment_revision: snapshot.revision,
-        };
-        let attestation_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-            })?);
+        let record = live_attestation_record_v1(
+            live.clone(),
+            &request.metadata,
+            request.fencing_token,
+            snapshot.revision,
+        )?;
+        let attestation_id = live_attestation_id_v1(&record)?;
         if persisted.live_attestation_id.as_ref() != Some(&attestation_id) {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
@@ -726,12 +718,19 @@ impl PostgresRuntimeConvergence {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         scope: &crate::RuntimeDeploymentScopeV1,
         attestation_id: &AttestationIdV1,
-        record: &AttestationRecordV1,
+        record: &RuntimeLiveAttestationRecordV1,
         snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
         convergence_attempt: std::num::NonZeroU32,
         serving_lease_duration_nanos: i64,
     ) -> Result<(), RuntimeConvergenceStoreError> {
         let live = &record.live;
+        let encoded_record = encode_runtime_live_attestation_record_v1(record).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
+        })?;
+        let record_json: serde_json::Value =
+            serde_json::from_slice(&encoded_record).map_err(|_| {
+                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
+            })?;
         sqlx::query(
             "INSERT INTO public.runtime_attestations (attestation_id, attestation_digest, deployment_id, \
              deployment_revision, convergence_attempt_no, serving_lease_duration_nanos, tenant_id, installation_id, promotion_id, activation_request_id, \
@@ -768,9 +767,7 @@ impl PostgresRuntimeConvergence {
         .bind(gateway_ready_kind_name(live.gateway_ready.kind))
         .bind(live.gateway_ready.ready_at)
         .bind(live.certified_at)
-        .bind(Json(serde_json::to_value(record).map_err(|_| {
-            RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-        })?))
+        .bind(Json(record_json))
         .execute(&mut **transaction)
         .await
         .map_err(|error| {

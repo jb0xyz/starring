@@ -27,7 +27,6 @@ fn adapter_sources_contain_no_comments() {
     let sources = [
         include_str!("../src/artifact.rs"),
         include_str!("../src/controller.rs"),
-        include_str!("../src/digest.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/evidence.rs"),
         include_str!("../src/hydration/bindings.rs"),
@@ -38,6 +37,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/hydration/row.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/model.rs"),
+        include_str!("../src/persistence.rs"),
         include_str!("../src/prepare.rs"),
         include_str!("../src/projection.rs"),
         include_str!("../src/row.rs"),
@@ -110,6 +110,31 @@ fn broad_owner_store_does_not_implement_the_serving_lease_port() {
     assert!(!controller.contains("impl RuntimeServingLeasePort for PostgresRuntimeConvergence"));
     assert!(!controller.contains("RuntimeHeartbeatServingV1"));
     assert!(!controller.contains("RuntimeDisconnectServingV1"));
+}
+
+#[test]
+fn persistence_encoding_and_failure_messages_are_shared_with_the_controller() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(!manifest.contains("sha2"));
+    let library = include_str!("../src/lib.rs");
+    assert!(!library.contains("mod digest;"));
+    let model = include_str!("../src/model.rs");
+    assert!(!model.contains("struct AttestationRecordV1"));
+    let persistence = include_str!("../src/persistence.rs");
+    for shared in [
+        "runtime_desired_target_digest_v1",
+        "runtime_live_attestation_digest_v1",
+        "RuntimeLiveAttestationRecordV1",
+    ] {
+        assert!(persistence.contains(shared));
+    }
+    for source in [
+        include_str!("../src/controller.rs"),
+        include_str!("../src/store/deployment.rs"),
+    ] {
+        assert!(source.contains("runtime_failure_message_v1"));
+        assert!(!source.contains("fn stable_failure_message"));
+    }
 }
 
 #[test]

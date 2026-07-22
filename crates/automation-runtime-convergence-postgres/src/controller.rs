@@ -1,7 +1,8 @@
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
-    GatewayShardIdV1 as ControllerGatewayShardIdV1, PanelReportDigestV1 as ControllerPanelDigestV1,
+    runtime_failure_message_v1, GatewayShardIdV1 as ControllerGatewayShardIdV1,
+    PanelReportDigestV1 as ControllerPanelDigestV1,
     RuntimeAttestationIdV1 as ControllerAttestationIdV1,
     RuntimeBuildRevisionV1 as ControllerBuildV1, RuntimeCertificationReceiptV1,
     RuntimeCertificationRequestV1, RuntimeClaimNextExecutionV1, RuntimeConvergenceErrorClassV1,
@@ -13,7 +14,9 @@ use automation_runtime_controller::{
     RuntimeServingIdentityV1 as ControllerServingIdentityV1,
     RuntimeServingReceiptV1 as ControllerServingReceiptV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
-use automation_runtime_convergence::{RuntimeDeploymentError, RuntimeFailureKindV1};
+use automation_runtime_convergence::RuntimeDeploymentError;
+#[cfg(test)]
+use automation_runtime_convergence::RuntimeFailureKindV1;
 
 use crate::{
     ClaimExecutionReceiptV1, ClaimNextDeploymentV1, DeploymentMutationV1, GatewayShardIdV1,
@@ -186,7 +189,7 @@ fn mutation(value: RuntimeConvergenceMutationV1) -> DeploymentMutationV1 {
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
             attempt,
             retry_after,
         },
@@ -198,7 +201,7 @@ fn mutation(value: RuntimeConvergenceMutationV1) -> DeploymentMutationV1 {
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
         },
         RuntimeConvergenceMutationV1::ResumeRuntimePending => {
             DeploymentMutationV1::ResumeRuntimePending
@@ -272,17 +275,6 @@ fn stale_live_receipt(value: MutationReceiptV1) -> RuntimeStaleLiveRecoveryRecei
     RuntimeStaleLiveRecoveryReceiptV1 {
         outcome: value.outcome,
         snapshot: value.snapshot,
-    }
-}
-
-fn stable_failure_message(kind: RuntimeFailureKindV1) -> &'static str {
-    match kind {
-        RuntimeFailureKindV1::EnvironmentUnavailable => "runtime environment unavailable",
-        RuntimeFailureKindV1::ActivationNotObservable => "activation not observable",
-        RuntimeFailureKindV1::PanelReconciliation => "panel reconciliation failed",
-        RuntimeFailureKindV1::GatewayStart => "gateway start failed",
-        RuntimeFailureKindV1::GatewayReadyTimeout => "gateway Ready timed out",
-        RuntimeFailureKindV1::InvariantViolation => "runtime invariant rejected",
     }
 }
 
@@ -387,7 +379,7 @@ mod tests {
             RuntimeFailureKindV1::GatewayReadyTimeout,
             RuntimeFailureKindV1::InvariantViolation,
         ] {
-            let message = stable_failure_message(kind);
+            let message = runtime_failure_message_v1(kind);
             assert!(!message.is_empty());
             assert!(message.len() <= 64);
         }

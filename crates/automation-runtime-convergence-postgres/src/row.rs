@@ -1,3 +1,6 @@
+use automation_runtime_controller::{
+    decode_runtime_live_attestation_record_v1, RuntimeLiveAttestationRecordV1,
+};
 use automation_runtime_convergence::{
     ControllerId, RuntimeDeployment, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
     RuntimeFailureDispositionV1, RuntimePendingConditionV1,
@@ -7,11 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sqlx::types::Json;
 
-use crate::digest::{desired_target_digest, live_attestation_digest};
-use crate::model::{
-    AttestationIdV1, AttestationRecordV1, LiveMetadataV1, RuntimeConvergenceAttemptV1,
-    RuntimeDigestV1,
-};
+use crate::model::{AttestationIdV1, LiveMetadataV1, RuntimeConvergenceAttemptV1, RuntimeDigestV1};
+use crate::persistence::{desired_target_digest_v1, live_attestation_id_v1, live_metadata_v1};
 use crate::RuntimeConvergenceStoreError;
 
 pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installation_id, \
@@ -189,13 +189,13 @@ impl DeploymentRow {
                     _ => false,
                 }
             };
-        let recomputed_desired_target_digest = desired_target_digest(
+        let recomputed_desired_target_digest = desired_target_digest_v1(
             identity,
             target,
             snapshot.runtime_generation.get(),
             authority_revision,
             snapshot.previous_runtime.as_ref(),
-        );
+        )?;
         let valid = self.deployment_id == identity.deployment_id.as_str()
             && self.tenant_id == identity.tenant_id.as_str()
             && self.installation_id == identity.installation_id.as_str()
@@ -362,7 +362,7 @@ pub(crate) struct AttestationRow {
 
 pub(crate) struct PersistedAttestation {
     pub id: AttestationIdV1,
-    pub record: AttestationRecordV1,
+    pub record: RuntimeLiveAttestationRecordV1,
     pub deployment_id: String,
     pub tenant_id: String,
     pub installation_id: String,
@@ -393,10 +393,12 @@ impl AttestationRow {
             ));
         }
         let id = AttestationIdV1::parse(self.attestation_id)?;
-        let record =
-            serde_json::from_value::<AttestationRecordV1>(self.record.0).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
-            })?;
+        let encoded_record = serde_json::to_vec(&self.record.0).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
+        })?;
+        let record = decode_runtime_live_attestation_record_v1(&encoded_record).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
+        })?;
         let live = &record.live;
         let convergence_attempt = self
             .convergence_attempt_no
@@ -417,10 +419,7 @@ impl AttestationRow {
             ));
         }
         let target = &live.target;
-        let recomputed_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidPersistedState("attestation record digest")
-            })?);
+        let recomputed_id = live_attestation_id_v1(&record)?;
         let valid = self.deployment_revision == runtime_i64(record.deployment_revision.get())?
             && self.guild_id == target.guild_id.to_string()
             && self.ruleset_key == target.ruleset_key.as_str()
@@ -635,10 +634,8 @@ pub(crate) fn positive_u64(
         .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(field))
 }
 
-pub(crate) fn metadata(record: &AttestationRecordV1) -> LiveMetadataV1 {
-    LiveMetadataV1 {
-        runtime_build_revision: record.runtime_build_revision.clone(),
-        panel_report_digest: record.panel_report_digest.clone(),
-        gateway_shard_id: record.gateway_shard_id.clone(),
-    }
+pub(crate) fn metadata(
+    record: &RuntimeLiveAttestationRecordV1,
+) -> Result<LiveMetadataV1, RuntimeConvergenceStoreError> {
+    live_metadata_v1(record)
 }
