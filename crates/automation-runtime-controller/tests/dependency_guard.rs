@@ -262,6 +262,94 @@ fn v2_certification_inputs_stay_inert_and_exact() {
 }
 
 #[test]
+fn v2_certification_intent_canonical_surface_stays_closed() {
+    let canonical = include_str!("../src/v2_certification_canonical.rs");
+    let wire = include_str!("../src/v2_certification_canonical/wire.rs");
+
+    for forbidden in [
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "pub intent:",
+        "pub bytes:",
+        "pub fingerprint:",
+        "pub fn decode_certification_intent",
+        "pub fn encode_certification_intent",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !canonical.contains(forbidden),
+            "forbidden V2 certification canonical surface: {forbidden}"
+        );
+    }
+    assert!(canonical.contains("pub struct RuntimeCanonicalCertificationIntentV2"));
+    assert!(canonical.contains("intent: RuntimeCertificationIntentV2"));
+    assert!(canonical.contains("bytes: Box<[u8]>"));
+    assert!(canonical.contains("fingerprint: RuntimeCertificationIntentFingerprintV2"));
+    assert!(canonical.contains("pub fn new("));
+    assert!(canonical.contains("pub fn from_persisted("));
+
+    for forbidden in [
+        "pub struct",
+        "serde_json::Value",
+        "HashMap",
+        "BTreeMap",
+        "flatten",
+        "untagged",
+        "rename_all",
+        "skip_serializing_if",
+        "serde(default",
+        "to_vec(intent)",
+        "from_slice::<RuntimeCertificationIntentV2>",
+    ] {
+        assert!(
+            !wire.contains(forbidden),
+            "forbidden V2 certification intent wire surface: {forbidden}"
+        );
+    }
+    for projection in [
+        "struct CertificationIntentWireV2",
+        "struct ExecutionGuardWireV2",
+        "struct DeploymentScopeWireV2",
+        "struct DeploymentTargetWireV2",
+        "struct BindingPinWireV2",
+        "struct ProcessIdentityWireV2",
+        "struct GatewayOwnerLeaseIdWireV2",
+        "struct PanelEvidenceWireV2",
+    ] {
+        assert!(wire.contains(projection));
+    }
+    assert_eq!(wire.matches("#[serde(deny_unknown_fields)]").count(), 8);
+
+    let intent_wire = wire
+        .split("struct CertificationIntentWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    let mut previous = 0;
+    for field in [
+        "format_version",
+        "action_id",
+        "operation_id",
+        "guard",
+        "target",
+        "binding_pin",
+        "process_identity",
+        "gateway_owner_lease_id",
+        "observed_owner_revision",
+        "runtime_build_revision",
+        "panel",
+        "serving_lease_milliseconds",
+    ] {
+        let position = intent_wire.find(&format!("    {field}:")).unwrap();
+        assert!(position >= previous);
+        previous = position;
+    }
+    assert_eq!(intent_wire.matches("    ").count(), 12);
+}
+
+#[test]
 fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
     for (path, source) in [
         ("v2_product.rs", include_str!("../src/v2_product.rs")),
@@ -446,6 +534,18 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_certification.rs",
             include_str!("../src/v2_certification.rs"),
+        ),
+        (
+            "src/v2_certification_canonical.rs",
+            include_str!("../src/v2_certification_canonical.rs"),
+        ),
+        (
+            "src/v2_certification_canonical/wire.rs",
+            include_str!("../src/v2_certification_canonical/wire.rs"),
+        ),
+        (
+            "src/v2_certification_canonical/tests.rs",
+            include_str!("../src/v2_certification_canonical/tests.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
