@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use automation_runtime_controller::RuntimeConvergenceErrorClassV1;
-use automation_runtime_controller::RuntimeMutationRequestV1;
+use automation_runtime_controller::{
+    RuntimeCertificationRequestV1, RuntimeConvergenceErrorClassV1, RuntimeExecutionConvergencePort,
+    RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingObservationPort,
+};
 use automation_runtime_execution_postgres::{
     PostgresRuntimeExecutionV1, RuntimeExecutionDatabaseExpectationV1,
     RuntimeExecutionDatabaseTimeoutsV1, RuntimeExecutionPersistenceErrorV1,
+    MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+    MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
 };
 
 fn assert_mutate_signature(
@@ -13,6 +18,27 @@ fn assert_mutate_signature(
     request: RuntimeMutationRequestV1,
 ) {
     std::mem::drop(adapter.mutate(request));
+}
+
+fn assert_certification_signature(
+    adapter: &PostgresRuntimeExecutionV1,
+    request: RuntimeCertificationRequestV1,
+) {
+    std::mem::drop(adapter.certify_live(request));
+}
+
+fn assert_observation_signature(
+    adapter: &PostgresRuntimeExecutionV1,
+    request: RuntimeObservePreviousServingV1,
+) {
+    std::mem::drop(adapter.observe_previous_serving(request));
+}
+
+fn assert_execution_port<T>()
+where
+    T: RuntimeExecutionConvergencePort<Error = RuntimeExecutionPersistenceErrorV1>
+        + RuntimePreviousServingObservationPort,
+{
 }
 
 #[test]
@@ -162,6 +188,18 @@ fn database_expectation_accepts_only_canonical_authority() {
 }
 
 #[test]
-fn verified_adapter_exposes_the_inherent_mutation_operation() {
+fn verified_adapter_exposes_the_scoped_execution_contract() {
     let _ = assert_mutate_signature;
+    let _ = assert_certification_signature;
+    let _ = assert_observation_signature;
+    let _ = PostgresRuntimeExecutionV1::recover_next_stale_live;
+    assert_execution_port::<PostgresRuntimeExecutionV1>();
+    assert_eq!(
+        MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+        Duration::from_secs(300)
+    );
 }

@@ -1,18 +1,26 @@
 use std::time::Duration;
 
 use automation_runtime_controller::{
-    RuntimeClaimNextExecutionV1, RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1,
-    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeRenewExecutionV1,
+    RuntimeCertificationReceiptV1, RuntimeCertificationRequestV1, RuntimeClaimNextExecutionV1,
+    RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1, RuntimeMutationReceiptV1,
+    RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingObservationReceiptV1, RuntimeRenewExecutionV1,
+    RuntimeStaleLiveRecoveryReceiptV1,
 };
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 
+use crate::certification::{execute_certification_v1, RuntimeCertificationBindingsV1};
 use crate::connection::ExecutionConnectionGuardV1;
 use crate::database::{begin_execution_mutation_transaction, verify_runtime_execution_binding_v1};
 use crate::error::{map_mutation_commit_error, map_query_error, validate_millisecond_duration};
 use crate::mutation::{encode_runtime_mutation_v1, EncodedRuntimeMutationV1};
+use crate::observation::{
+    execute_observe_previous_serving_v1, RuntimeObservePreviousServingBindingsV1,
+};
 use crate::proof::{prove_claim_next_v1, prove_mutation_v1, prove_renew_v1};
 use crate::query::{CLAIM_NEXT_QUERY, MUTATE_QUERY, RENEW_QUERY};
+use crate::recovery::execute_recover_next_stale_live_v1;
 use crate::row::{
     RuntimeClaimOperationRowV1, RuntimeExecutionOperationRowV1, RuntimeMutationOperationRowV1,
 };
@@ -91,7 +99,10 @@ impl PostgresRuntimeExecutionV1 {
         {
             RuntimeExecutionOperationReceiptV1::ClaimNext(receipt) => Ok(receipt),
             RuntimeExecutionOperationReceiptV1::Renew(_)
-            | RuntimeExecutionOperationReceiptV1::Mutate(_) => {
+            | RuntimeExecutionOperationReceiptV1::Mutate(_)
+            | RuntimeExecutionOperationReceiptV1::Certify(_)
+            | RuntimeExecutionOperationReceiptV1::Observe(_)
+            | RuntimeExecutionOperationReceiptV1::Recover(_) => {
                 Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
             }
         }
@@ -119,7 +130,10 @@ impl PostgresRuntimeExecutionV1 {
                 })
             }
             RuntimeExecutionOperationReceiptV1::ClaimNext(_)
-            | RuntimeExecutionOperationReceiptV1::Mutate(_) => {
+            | RuntimeExecutionOperationReceiptV1::Mutate(_)
+            | RuntimeExecutionOperationReceiptV1::Certify(_)
+            | RuntimeExecutionOperationReceiptV1::Observe(_)
+            | RuntimeExecutionOperationReceiptV1::Recover(_) => {
                 Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
             }
         }
@@ -141,7 +155,77 @@ impl PostgresRuntimeExecutionV1 {
         {
             RuntimeExecutionOperationReceiptV1::Mutate(receipt) => Ok(receipt),
             RuntimeExecutionOperationReceiptV1::ClaimNext(_)
-            | RuntimeExecutionOperationReceiptV1::Renew(_) => {
+            | RuntimeExecutionOperationReceiptV1::Renew(_)
+            | RuntimeExecutionOperationReceiptV1::Certify(_)
+            | RuntimeExecutionOperationReceiptV1::Observe(_)
+            | RuntimeExecutionOperationReceiptV1::Recover(_) => {
+                Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            }
+        }
+    }
+
+    pub async fn certify_live(
+        &self,
+        request: RuntimeCertificationRequestV1,
+    ) -> Result<RuntimeCertificationReceiptV1, RuntimeExecutionPersistenceErrorV1> {
+        let bindings = RuntimeCertificationBindingsV1::from_request(&request)?;
+        match self
+            .execute_operation(RuntimeExecutionOperationV1::Certify {
+                request: &request,
+                bindings,
+            })
+            .await?
+        {
+            RuntimeExecutionOperationReceiptV1::Certify(receipt) => Ok(*receipt),
+            RuntimeExecutionOperationReceiptV1::ClaimNext(_)
+            | RuntimeExecutionOperationReceiptV1::Renew(_)
+            | RuntimeExecutionOperationReceiptV1::Mutate(_)
+            | RuntimeExecutionOperationReceiptV1::Observe(_)
+            | RuntimeExecutionOperationReceiptV1::Recover(_) => {
+                Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            }
+        }
+    }
+
+    pub async fn observe_previous_serving(
+        &self,
+        request: RuntimeObservePreviousServingV1,
+    ) -> Result<RuntimePreviousServingObservationReceiptV1, RuntimeExecutionPersistenceErrorV1>
+    {
+        let bindings = RuntimeObservePreviousServingBindingsV1::from_request(&request)?;
+        match self
+            .execute_operation(RuntimeExecutionOperationV1::Observe {
+                request: Box::new(request),
+                bindings,
+            })
+            .await?
+        {
+            RuntimeExecutionOperationReceiptV1::Observe(receipt) => Ok(*receipt),
+            RuntimeExecutionOperationReceiptV1::ClaimNext(_)
+            | RuntimeExecutionOperationReceiptV1::Renew(_)
+            | RuntimeExecutionOperationReceiptV1::Mutate(_)
+            | RuntimeExecutionOperationReceiptV1::Certify(_)
+            | RuntimeExecutionOperationReceiptV1::Recover(_) => {
+                Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            }
+        }
+    }
+
+    pub async fn recover_next_stale_live(
+        &self,
+    ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, RuntimeExecutionPersistenceErrorV1> {
+        match self
+            .execute_operation(RuntimeExecutionOperationV1::Recover)
+            .await?
+        {
+            RuntimeExecutionOperationReceiptV1::Recover(receipt) => {
+                Ok(receipt.map(|receipt| *receipt))
+            }
+            RuntimeExecutionOperationReceiptV1::ClaimNext(_)
+            | RuntimeExecutionOperationReceiptV1::Renew(_)
+            | RuntimeExecutionOperationReceiptV1::Mutate(_)
+            | RuntimeExecutionOperationReceiptV1::Certify(_)
+            | RuntimeExecutionOperationReceiptV1::Observe(_) => {
                 Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
             }
         }
@@ -151,6 +235,7 @@ impl PostgresRuntimeExecutionV1 {
         &self,
         operation: RuntimeExecutionOperationV1<'_>,
     ) -> Result<RuntimeExecutionOperationReceiptV1, RuntimeExecutionPersistenceErrorV1> {
+        let mutates = operation.mutates();
         let deadline = tokio::time::Instant::now() + self.timeouts.statement_timeout();
         let connection = tokio::time::timeout_at(deadline, self.pool.acquire())
             .await
@@ -170,7 +255,8 @@ impl PostgresRuntimeExecutionV1 {
                 connection.release_to_pool();
                 result
             }
-            Err(_) => Err(RuntimeExecutionPersistenceErrorV1::Indeterminate),
+            Err(_) if mutates => Err(RuntimeExecutionPersistenceErrorV1::Indeterminate),
+            Err(_) => Err(RuntimeExecutionPersistenceErrorV1::Timeout),
         }
     }
 
@@ -179,6 +265,7 @@ impl PostgresRuntimeExecutionV1 {
         connection: &mut PgConnection,
         operation: RuntimeExecutionOperationV1<'_>,
     ) -> Result<RuntimeExecutionOperationReceiptV1, RuntimeExecutionPersistenceErrorV1> {
+        let mutates = operation.mutates();
         let mut transaction =
             begin_execution_mutation_transaction(connection, self.timeouts).await?;
         verify_runtime_execution_binding_v1(&mut transaction, &self.expectation).await?;
@@ -268,11 +355,29 @@ impl PostgresRuntimeExecutionV1 {
                 )?;
                 RuntimeExecutionOperationReceiptV1::Mutate(receipt)
             }
+            RuntimeExecutionOperationV1::Certify { request, bindings } => {
+                RuntimeExecutionOperationReceiptV1::Certify(Box::new(
+                    execute_certification_v1(&mut transaction, request, &bindings).await?,
+                ))
+            }
+            RuntimeExecutionOperationV1::Observe { request, bindings } => {
+                RuntimeExecutionOperationReceiptV1::Observe(Box::new(
+                    execute_observe_previous_serving_v1(&mut transaction, *request, bindings)
+                        .await?,
+                ))
+            }
+            RuntimeExecutionOperationV1::Recover => RuntimeExecutionOperationReceiptV1::Recover(
+                execute_recover_next_stale_live_v1(&mut transaction)
+                    .await?
+                    .map(Box::new),
+            ),
         };
-        transaction
-            .commit()
-            .await
-            .map_err(map_mutation_commit_error)?;
+        let commit = transaction.commit().await;
+        if mutates {
+            commit.map_err(map_mutation_commit_error)?;
+        } else {
+            commit.map_err(map_query_error)?;
+        }
         Ok(receipt)
     }
 }
@@ -292,6 +397,21 @@ enum RuntimeExecutionOperationV1<'a> {
         mutation: &'a EncodedRuntimeMutationV1,
         bindings: RuntimeMutationBindingsV1,
     },
+    Certify {
+        request: &'a RuntimeCertificationRequestV1,
+        bindings: RuntimeCertificationBindingsV1,
+    },
+    Observe {
+        request: Box<RuntimeObservePreviousServingV1>,
+        bindings: RuntimeObservePreviousServingBindingsV1,
+    },
+    Recover,
+}
+
+impl RuntimeExecutionOperationV1<'_> {
+    fn mutates(&self) -> bool {
+        !matches!(self, Self::Observe { .. })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -340,6 +460,9 @@ enum RuntimeExecutionOperationReceiptV1 {
     ClaimNext(Option<RuntimeExecutionReceiptV1>),
     Renew(RuntimeExecutionReceiptV1),
     Mutate(RuntimeMutationReceiptV1),
+    Certify(Box<RuntimeCertificationReceiptV1>),
+    Observe(Box<RuntimePreviousServingObservationReceiptV1>),
+    Recover(Option<Box<RuntimeStaleLiveRecoveryReceiptV1>>),
 }
 
 fn validate_lease_duration(duration: Duration) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {

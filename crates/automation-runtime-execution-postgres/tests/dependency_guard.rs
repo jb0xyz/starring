@@ -9,12 +9,18 @@ fn regular_dependencies(manifest: &str) -> &str {
 }
 
 fn rust_sources(directory: &Path) -> Vec<String> {
-    let mut sources = fs::read_dir(directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
-        .map(|path| fs::read_to_string(path).unwrap())
-        .collect::<Vec<_>>();
+    let mut pending = vec![directory.to_path_buf()];
+    let mut sources = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(fs::read_to_string(path).unwrap());
+            }
+        }
+    }
     sources.sort_unstable();
     sources
 }
@@ -183,16 +189,20 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_no_runtime_port_implementation_yet() {
+fn adapter_exposes_only_execution_and_observation_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
-    for forbidden in [
+    for required in [
         "impl RuntimeExecutionConvergencePort",
         "impl RuntimePreviousServingObservationPort",
-        "impl RuntimeServingLeasePort",
     ] {
-        assert!(!source.contains(forbidden), "premature port: {forbidden}");
+        assert!(source.contains(required), "missing port: {required}");
     }
+    assert!(!source.contains("impl RuntimeServingLeasePort"));
+    assert!(source.contains("execute_certification_v1"));
+    assert!(source.contains("execute_observe_previous_serving_v1"));
+    assert!(source.contains("execute_recover_next_stale_live_v1"));
+    assert!(source.contains("!matches!(self, Self::Observe { .. })"));
 }
 
 #[test]

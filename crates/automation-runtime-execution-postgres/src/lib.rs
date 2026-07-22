@@ -1,13 +1,21 @@
+mod certification;
 mod connection;
 mod contract;
+mod controller;
 mod database;
 mod error;
 mod mutation;
+mod observation;
 mod proof;
 mod query;
+mod recovery;
 mod row;
 mod store;
 
+pub use certification::{
+    MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+    MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+};
 pub use database::{
     verify_runtime_execution_database_v1, verify_runtime_execution_database_with_timeouts_v1,
     RuntimeExecutionDatabaseExpectationV1, RuntimeExecutionDatabaseReadinessV1,
