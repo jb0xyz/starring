@@ -1,7 +1,8 @@
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -59,6 +60,64 @@ pub enum GatewayDrainCauseV3 {
     LifecycleOverflow,
     LifecycleClosed,
     RuntimeFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayInvalidationSignalV3 {
+    AdmissionPaused,
+    Disconnected(GatewayDisconnectKindV3),
+    Draining(GatewayDrainCauseV3),
+    Stopped(GatewayDrainCauseV3),
+    ControlOrphaned,
+}
+
+pub trait GatewaySynchronousInvalidatorV3: Send + Sync {
+    fn invalidate(&self, signal: GatewayInvalidationSignalV3);
+}
+
+#[derive(Clone, Default)]
+struct GatewaySynchronousInvalidationHookV3 {
+    state: Option<Arc<GatewaySynchronousInvalidationStateV3>>,
+}
+
+struct GatewaySynchronousInvalidationStateV3 {
+    invalidator: Arc<dyn GatewaySynchronousInvalidatorV3>,
+    healthy: AtomicBool,
+    serial: StdMutex<()>,
+}
+
+impl GatewaySynchronousInvalidationHookV3 {
+    fn new(invalidator: impl GatewaySynchronousInvalidatorV3 + 'static) -> Self {
+        Self {
+            state: Some(Arc::new(GatewaySynchronousInvalidationStateV3 {
+                invalidator: Arc::new(invalidator),
+                healthy: AtomicBool::new(true),
+                serial: StdMutex::new(()),
+            })),
+        }
+    }
+
+    fn invalidate(&self, signal: GatewayInvalidationSignalV3) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let _serial = state
+            .serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.healthy.load(Ordering::Acquire) {
+            return;
+        }
+        if catch_unwind(AssertUnwindSafe(|| state.invalidator.invalidate(signal))).is_err() {
+            state.healthy.store(false, Ordering::Release);
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_none_or(|state| state.healthy.load(Ordering::Acquire))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,12 +453,14 @@ pub struct SharedGatewayControlV3 {
     connection: watch::Receiver<GatewayConnectionStateV3>,
     admission: watch::Receiver<GatewayAdmissionSnapshotV3>,
     control_alive: Arc<AtomicBool>,
+    invalidation: GatewaySynchronousInvalidationHookV3,
 }
 
 #[derive(Clone)]
 pub struct GatewayConnectionObserverV3 {
     admission: watch::Receiver<GatewayAdmissionSnapshotV3>,
     control_alive: Arc<AtomicBool>,
+    invalidation: GatewaySynchronousInvalidationHookV3,
 }
 
 impl GatewayConnectionObserverV3 {
@@ -429,7 +490,7 @@ impl GatewayConnectionObserverV3 {
         &self,
         expected_epoch: GatewayConnectionEpochV3,
     ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-        if !self.control_alive.load(Ordering::Acquire) {
+        if !self.control_alive.load(Ordering::Acquire) || !self.invalidation.is_healthy() {
             return Err(GatewayControlTransitionErrorV3::ControlOrphaned);
         }
         issue_ready_lease(self.current_admission_snapshot(), expected_epoch)
@@ -437,6 +498,7 @@ impl GatewayConnectionObserverV3 {
 
     pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
         self.control_alive.load(Ordering::Acquire)
+            && self.invalidation.is_healthy()
             && ready_lease_is_current(self.current_admission_snapshot(), lease)
     }
 }
@@ -460,6 +522,9 @@ impl SharedGatewayControlV3 {
         &self,
         pause_token: &GatewayPauseTokenV3,
     ) -> Result<GatewayCommandAckV3, GatewayControlErrorV3> {
+        if !self.invalidation.is_healthy() {
+            return Err(GatewayControlTransitionErrorV3::ControlOrphaned.into());
+        }
         if !Weak::ptr_eq(
             &pause_token.control_alive,
             &Arc::downgrade(&self.control_alive),
@@ -514,6 +579,7 @@ impl SharedGatewayControlV3 {
         GatewayConnectionObserverV3 {
             admission: self.admission.clone(),
             control_alive: self.control_alive.clone(),
+            invalidation: self.invalidation.clone(),
         }
     }
 
@@ -533,7 +599,7 @@ impl SharedGatewayControlV3 {
         &self,
         expected_epoch: GatewayConnectionEpochV3,
     ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-        if !self.control_alive.load(Ordering::Acquire) {
+        if !self.control_alive.load(Ordering::Acquire) || !self.invalidation.is_healthy() {
             return Err(GatewayControlTransitionErrorV3::ControlOrphaned);
         }
         issue_ready_lease(self.current_admission_snapshot(), expected_epoch)
@@ -541,12 +607,15 @@ impl SharedGatewayControlV3 {
 
     pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
         self.control_alive.load(Ordering::Acquire)
+            && self.invalidation.is_healthy()
             && ready_lease_is_current(self.current_admission_snapshot(), lease)
     }
 }
 
 impl Drop for SharedGatewayControlV3 {
     fn drop(&mut self) {
+        self.invalidation
+            .invalidate(GatewayInvalidationSignalV3::ControlOrphaned);
         self.control_alive.store(false, Ordering::Release);
     }
 }
@@ -616,6 +685,7 @@ pub struct SharedGatewayRuntimeControlV3 {
     state: GatewayConnectionStateV3,
     admission_snapshot: GatewayAdmissionSnapshotV3,
     control_alive: Arc<AtomicBool>,
+    invalidation: GatewaySynchronousInvalidationHookV3,
     last_issued_epoch: u64,
     admission_policy: GatewayAdmissionPolicyV3,
 }
@@ -629,6 +699,33 @@ pub fn shared_gateway_control_channel_v3(
 pub fn shared_gateway_control_channel_with_policy_v3(
     config: GatewayControlConfigV3,
     admission_policy: GatewayAdmissionPolicyV3,
+) -> (SharedGatewayControlV3, SharedGatewayRuntimeControlV3) {
+    shared_gateway_control_channel_inner_v3(
+        config,
+        admission_policy,
+        GatewaySynchronousInvalidationHookV3::default(),
+    )
+}
+
+pub fn shared_gateway_control_channel_with_policy_and_invalidator_v3<I>(
+    config: GatewayControlConfigV3,
+    admission_policy: GatewayAdmissionPolicyV3,
+    invalidator: I,
+) -> (SharedGatewayControlV3, SharedGatewayRuntimeControlV3)
+where
+    I: GatewaySynchronousInvalidatorV3 + 'static,
+{
+    shared_gateway_control_channel_inner_v3(
+        config,
+        admission_policy,
+        GatewaySynchronousInvalidationHookV3::new(invalidator),
+    )
+}
+
+fn shared_gateway_control_channel_inner_v3(
+    config: GatewayControlConfigV3,
+    admission_policy: GatewayAdmissionPolicyV3,
+    invalidation: GatewaySynchronousInvalidationHookV3,
 ) -> (SharedGatewayControlV3, SharedGatewayRuntimeControlV3) {
     let (command_sender, command_receiver) = mpsc::channel(config.command_capacity.get());
     let (lifecycle_sender, lifecycle_receiver) = mpsc::channel(config.lifecycle_capacity.get());
@@ -661,6 +758,7 @@ pub fn shared_gateway_control_channel_with_policy_v3(
             connection: connection_receiver,
             admission: admission_receiver,
             control_alive: control_alive.clone(),
+            invalidation: invalidation.clone(),
         },
         SharedGatewayRuntimeControlV3 {
             commands: command_receiver,
@@ -670,6 +768,7 @@ pub fn shared_gateway_control_channel_with_policy_v3(
             state: initial,
             admission_snapshot: initial_admission_snapshot,
             control_alive,
+            invalidation,
             last_issued_epoch: 0,
             admission_policy,
         },
@@ -685,6 +784,7 @@ impl SharedGatewayRuntimeControlV3 {
         GatewayConnectionObserverV3 {
             admission: self.admission.subscribe(),
             control_alive: self.control_alive.clone(),
+            invalidation: self.invalidation.clone(),
         }
     }
 
@@ -778,7 +878,10 @@ impl SharedGatewayRuntimeControlV3 {
             self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
             return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
         };
-        if !self.control_alive.load(Ordering::Acquire) || self.commands.is_closed() {
+        if !self.control_alive.load(Ordering::Acquire)
+            || self.commands.is_closed()
+            || !self.invalidation.is_healthy()
+        {
             self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
             return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
         }
@@ -982,6 +1085,9 @@ impl SharedGatewayRuntimeControlV3 {
     }
 
     fn require_running(&self) -> Result<(), GatewayControlTransitionErrorV3> {
+        if !self.invalidation.is_healthy() {
+            return Err(GatewayControlTransitionErrorV3::ControlOrphaned);
+        }
         match self.state {
             GatewayConnectionStateV3::Draining { .. } => {
                 Err(GatewayControlTransitionErrorV3::Draining)
@@ -1139,10 +1245,37 @@ impl SharedGatewayRuntimeControlV3 {
     }
 
     fn replace_snapshot(&mut self, snapshot: GatewayAdmissionSnapshotV3) {
+        if let Some(signal) = invalidation_signal(self.state, snapshot.connection) {
+            self.invalidation.invalidate(signal);
+        }
         self.state = snapshot.connection;
         self.admission_snapshot = snapshot;
         self.admission.send_replace(snapshot);
         self.connection.send_replace(snapshot.connection);
+    }
+}
+
+fn invalidation_signal(
+    previous: GatewayConnectionStateV3,
+    next: GatewayConnectionStateV3,
+) -> Option<GatewayInvalidationSignalV3> {
+    match next {
+        GatewayConnectionStateV3::Disconnected { kind, .. }
+        | GatewayConnectionStateV3::Paused {
+            connection: GatewayPausedConnectionV3::Disconnected { kind, .. },
+        } => Some(GatewayInvalidationSignalV3::Disconnected(kind)),
+        GatewayConnectionStateV3::Paused { .. } if previous.admits_interactions() => {
+            Some(GatewayInvalidationSignalV3::AdmissionPaused)
+        }
+        GatewayConnectionStateV3::Draining { cause, .. } => {
+            Some(GatewayInvalidationSignalV3::Draining(cause))
+        }
+        GatewayConnectionStateV3::Stopped { cause, .. } => {
+            Some(GatewayInvalidationSignalV3::Stopped(cause))
+        }
+        GatewayConnectionStateV3::Starting
+        | GatewayConnectionStateV3::Connected { .. }
+        | GatewayConnectionStateV3::Paused { .. } => None,
     }
 }
 
@@ -1195,9 +1328,44 @@ fn command_outcome(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingInvalidatorV3 {
+        signals: Arc<Mutex<Vec<GatewayInvalidationSignalV3>>>,
+    }
+
+    impl GatewaySynchronousInvalidatorV3 for RecordingInvalidatorV3 {
+        fn invalidate(&self, signal: GatewayInvalidationSignalV3) {
+            self.signals.lock().unwrap().push(signal);
+        }
+    }
+
+    impl RecordingInvalidatorV3 {
+        fn signals(&self) -> Vec<GatewayInvalidationSignalV3> {
+            self.signals.lock().unwrap().clone()
+        }
+    }
+
+    struct BlockingInvalidatorV3 {
+        target: GatewayInvalidationSignalV3,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl GatewaySynchronousInvalidatorV3 for BlockingInvalidatorV3 {
+        fn invalidate(&self, signal: GatewayInvalidationSignalV3) {
+            if signal == self.target {
+                self.entered.wait();
+                self.release.wait();
+            }
+        }
+    }
 
     async fn pause(
         control: &SharedGatewayControlV3,
@@ -1244,6 +1412,311 @@ mod tests {
             })
             .unwrap();
         receiver
+    }
+
+    #[test]
+    fn disconnect_invalidation_finishes_before_the_closed_snapshot_is_published() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            BlockingInvalidatorV3 {
+                target: GatewayInvalidationSignalV3::Disconnected(
+                    GatewayDisconnectKindV3::Reconnect,
+                ),
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let observer = control.connection_observer();
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+        let disconnect = thread::spawn(move || {
+            let result = runtime.mark_disconnected(GatewayDisconnectKindV3::Reconnect);
+            (runtime, result)
+        });
+
+        entered.wait();
+        assert!(matches!(
+            observer.current_connection(),
+            GatewayConnectionStateV3::Connected { .. }
+        ));
+        assert!(observer.ready_lease_is_current(&lease));
+        release.wait();
+
+        let (runtime, result) = disconnect.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(matches!(
+            observer.current_connection(),
+            GatewayConnectionStateV3::Disconnected {
+                kind: GatewayDisconnectKindV3::Reconnect,
+                ..
+            }
+        ));
+        assert!(!observer.ready_lease_is_current(&lease));
+        drop(runtime);
+    }
+
+    #[test]
+    fn control_owner_invalidation_finishes_before_liveness_is_closed() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            BlockingInvalidatorV3 {
+                target: GatewayInvalidationSignalV3::ControlOrphaned,
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let observer = control.connection_observer();
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+        let owner_drop = thread::spawn(move || drop(control));
+
+        entered.wait();
+        assert!(observer.ready_lease_is_current(&lease));
+        release.wait();
+
+        owner_drop.join().unwrap();
+        assert!(!observer.ready_lease_is_current(&lease));
+    }
+
+    #[tokio::test]
+    async fn admission_pause_is_synchronously_invalidated_before_acknowledgement() {
+        let invalidator = RecordingInvalidatorV3::default();
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            invalidator.clone(),
+        );
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+
+        let acknowledgement = pause(&control, &mut runtime).await.unwrap();
+
+        assert!(matches!(
+            acknowledgement,
+            GatewayCommandAckV3::Paused { .. }
+        ));
+        assert_eq!(
+            invalidator.signals(),
+            [GatewayInvalidationSignalV3::AdmissionPaused]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ready_and_resume_do_not_invalidate_an_already_closed_generation() {
+        let invalidator = RecordingInvalidatorV3::default();
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+            invalidator.clone(),
+        );
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let paused = pause(&control, &mut runtime).await.unwrap();
+        let token = resume_token(paused);
+        resume(&control, &mut runtime, &token).await.unwrap();
+
+        assert!(invalidator.signals().is_empty());
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Connected { .. }
+        ));
+    }
+
+    #[test]
+    fn every_disconnect_kind_is_preserved_by_the_invalidation_signal() {
+        for kind in [
+            GatewayDisconnectKindV3::Close,
+            GatewayDisconnectKindV3::Reconnect,
+            GatewayDisconnectKindV3::SessionInvalidated,
+            GatewayDisconnectKindV3::ReceiveError,
+        ] {
+            let invalidator = RecordingInvalidatorV3::default();
+            let (control, mut runtime) =
+                shared_gateway_control_channel_with_policy_and_invalidator_v3(
+                    GatewayControlConfigV3::default(),
+                    GatewayAdmissionPolicyV3::ResumeOnConnect,
+                    invalidator.clone(),
+                );
+            runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+
+            runtime.mark_disconnected(kind).unwrap();
+
+            assert_eq!(
+                invalidator.signals(),
+                [GatewayInvalidationSignalV3::Disconnected(kind)]
+            );
+            drop(runtime);
+            drop(control);
+        }
+    }
+
+    #[test]
+    fn lifecycle_overflow_is_invalidated_before_the_draining_snapshot() {
+        let invalidator = RecordingInvalidatorV3::default();
+        let config = GatewayControlConfigV3::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            config,
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            invalidator.clone(),
+        );
+
+        assert_eq!(
+            runtime.mark_connected(GatewayReadyKindV3::Ready),
+            Err(GatewayControlTransitionErrorV3::LifecycleOverflow)
+        );
+        assert_eq!(
+            invalidator.signals(),
+            [GatewayInvalidationSignalV3::Draining(
+                GatewayDrainCauseV3::LifecycleOverflow
+            )]
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Draining {
+                cause: GatewayDrainCauseV3::LifecycleOverflow,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_drop_is_invalidated_before_stopped_is_published() {
+        let invalidator = RecordingInvalidatorV3::default();
+        let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            invalidator.clone(),
+        );
+
+        drop(runtime);
+
+        assert_eq!(
+            invalidator.signals(),
+            [GatewayInvalidationSignalV3::Stopped(
+                GatewayDrainCauseV3::RuntimeFailure
+            )]
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Stopped {
+                cause: GatewayDrainCauseV3::RuntimeFailure,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn commanded_drain_is_invalidated_before_acknowledgement() {
+        let invalidator = RecordingInvalidatorV3::default();
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            invalidator.clone(),
+        );
+        let (acknowledgement, outcome) =
+            tokio::join!(control.begin_drain(), runtime.process_next_command());
+
+        assert!(matches!(
+            acknowledgement.unwrap(),
+            GatewayCommandAckV3::Draining { .. }
+        ));
+        assert!(matches!(
+            outcome,
+            GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::Draining { .. })
+        ));
+        assert_eq!(
+            invalidator.signals(),
+            [GatewayInvalidationSignalV3::Draining(
+                GatewayDrainCauseV3::Commanded
+            )]
+        );
+    }
+
+    struct PanickingInvalidatorV3;
+
+    impl GatewaySynchronousInvalidatorV3 for PanickingInvalidatorV3 {
+        fn invalidate(&self, _: GatewayInvalidationSignalV3) {
+            panic!("invalidation panic")
+        }
+    }
+
+    #[test]
+    fn invalidator_panic_is_contained_and_permanently_closes_ready_leases() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            PanickingInvalidatorV3,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let observer = control.connection_observer();
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Close)
+            .unwrap();
+
+        assert!(!observer.ready_lease_is_current(&lease));
+        assert_eq!(
+            runtime.mark_connected(GatewayReadyKindV3::Ready),
+            Err(GatewayControlTransitionErrorV3::ControlOrphaned)
+        );
+        assert_eq!(
+            observer.issue_ready_lease(epoch),
+            Err(GatewayControlTransitionErrorV3::ControlOrphaned)
+        );
+    }
+
+    struct BlockingPanickingInvalidatorV3 {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl GatewaySynchronousInvalidatorV3 for BlockingPanickingInvalidatorV3 {
+        fn invalidate(&self, _: GatewayInvalidationSignalV3) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.wait();
+            self.release.wait();
+            panic!("serialized invalidation panic")
+        }
+    }
+
+    #[test]
+    fn concurrent_callbacks_are_serial_and_stop_after_the_first_panic() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let started = Arc::new(Barrier::new(2));
+        let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ResumeOnConnect,
+            BlockingPanickingInvalidatorV3 {
+                calls: calls.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+        let owner_drop = thread::spawn(move || drop(control));
+        entered.wait();
+        let runtime_started = started.clone();
+        let runtime_drop = thread::spawn(move || {
+            runtime_started.wait();
+            drop(runtime);
+        });
+        started.wait();
+        release.wait();
+
+        owner_drop.join().unwrap();
+        runtime_drop.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
