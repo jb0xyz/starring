@@ -32,6 +32,7 @@ mod v2_identity;
 mod v2_product;
 mod v2_product_drain_canonical;
 mod v2_route;
+mod v2_writer_fence;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
 pub use dto::{
@@ -100,9 +101,9 @@ pub use v2_gateway::{
     RuntimeRenewGatewayOwnerLeaseV1,
 };
 pub use v2_identity::{
-    RuntimeBarrierIdV1, RuntimeCertificationOperationIdV2, RuntimeDrainIntentIdV2,
-    RuntimeGatewayAdmissionSequenceV2, RuntimeProductOperationIdV2, RuntimeRecoveryIdV2,
-    RuntimeSuspensionIdV2,
+    RuntimeBarrierIdV1, RuntimeCertificationOperationIdV2, RuntimeCutoverCoordinatorIdV1,
+    RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2, RuntimeProductOperationIdV2,
+    RuntimeRecoveryIdV2, RuntimeSuspensionIdV2,
 };
 pub use v2_product::{RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2};
 pub use v2_product_drain_canonical::{
@@ -111,3 +112,8 @@ pub use v2_product_drain_canonical::{
     RuntimeProductDrainCorrelationV2,
 };
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
+pub use v2_writer_fence::{
+    RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,
+    RuntimeWriterFenceClosedLeaseIdV1, RuntimeWriterFenceGenerationV1,
+    RuntimeWriterFenceObservationV1,
+};

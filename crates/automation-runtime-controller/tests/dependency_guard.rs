@@ -110,6 +110,10 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
     for (path, source) in [
         ("v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
+        (
+            "v2_writer_fence.rs",
+            include_str!("../src/v2_writer_fence.rs"),
+        ),
     ] {
         for forbidden in [
             "Serialize",
@@ -674,6 +678,10 @@ fn source_files_contain_no_comments() {
             include_str!("../src/v2_product_drain_canonical/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
+        (
+            "src/v2_writer_fence.rs",
+            include_str!("../src/v2_writer_fence.rs"),
+        ),
         (
             "tests/dependency_guard.rs",
             include_str!("dependency_guard.rs"),

@@ -1,5 +1,6 @@
 mod gateway_lifecycle;
 mod gateway_owner;
+mod writer_fence;
 
 pub use gateway_lifecycle::{
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
@@ -16,3 +17,4 @@ pub use gateway_owner::{
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerProtocolViolationV1,
     RuntimeGatewayOwnerReleaseRecoveryV1, RuntimeGatewayOwnerRenewRecoveryV1,
 };
+pub use writer_fence::RuntimeWriterFenceObservationPortV1;

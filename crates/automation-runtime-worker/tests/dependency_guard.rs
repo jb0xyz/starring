@@ -38,6 +38,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/writer_fence.rs"),
         ]
     );
     assert!(!crate_root.join("build.rs").exists());
@@ -141,4 +142,25 @@ fn worker_coordinator_authority_and_state_surface_stay_exact() {
     assert!(!lifecycle.contains("AdmissionAcknowledging"));
     assert!(!invalidation.contains("Starting"));
     assert_eq!(invalidation.matches("    ").count(), 5);
+}
+
+#[test]
+fn worker_writer_fence_surface_is_observe_only() {
+    let source = include_str!("../src/writer_fence.rs");
+
+    assert_eq!(source.matches("fn observe_writer_fence(").count(), 1);
+    assert_eq!(source.matches("\n    fn ").count(), 1);
+    for forbidden in [
+        "close_writer_fence",
+        "open_writer_fence",
+        "renew_writer_fence",
+        "acquire_writer_fence",
+        "release_writer_fence",
+        "Mutation",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden writer fence authority: {forbidden}"
+        );
+    }
 }
