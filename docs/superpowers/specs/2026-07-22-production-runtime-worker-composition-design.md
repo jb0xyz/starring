@@ -758,6 +758,7 @@ separator, or textual form. Parsing never generates an ID.
 | --- | --- | --- | --- |
 | `RuntimeBarrierIdV1` | gateway shard, process instance, coordinator generation | The worker requests one ID from the injected generator immediately before the first pause dispatch for one barrier. | Lost pause or resume acknowledgement exact-observes the same control lifetime, generation, and ID. It neither reuses the ID with another generation nor mints a competing barrier until the old control lifetime is proven closed. |
 | `RuntimeRecoveryIdV2` | gateway shard, process instance, recovery generation | The closed-recovery supervisor requests one ID from the injected generator when it creates the recovery permit. | Every recovery retry uses that ID. Restart exact-observes gateway ownership, coordinator generation, and durable/local recovery evidence before adopting it; a successor is legal only after the old recovery authority is proven closed. |
+| `RuntimeCutoverCoordinatorIdV1` | global writer-fence generation and cutover lease epoch | The offline cutover coordinator generates it once immediately before the first close or an explicit expired-lease takeover. | Close, renewal, open commit, and acknowledgement recovery exact-observe the singleton fence and adopt only the same generation, epoch, and coordinator. A foreign coordinator or generation gap is never replay. |
 | `RuntimeCertificationOperationIdV2` | `RuntimeDeploymentScopeV1` plus deployment revision and convergence attempt | `tools/starring-runtime` generates it once before certification-intent reservation. | Reservation, prepare, commit-unknown observation, and restart use scope-only observation and adopt any persisted ID. A known row with different canonical bytes or digest is typed divergence. |
 | `RuntimeDrainIntentIdV2` | `RuntimeDeploymentScopeV1` plus serving slot and expected revision | The Product mutation boundary generates it once before first drain-intent create. | Create uncertainty observes the exact natural scope and adopts a persisted ID and preimage. Claim, refence, acknowledgement, consumption, and restart never replace it. |
 | `RuntimeProductOperationIdV2` | `RuntimeDeploymentScopeV1` plus expected revision | The Product mutation boundary generates it once before the first Product mutation. | Product retries and runtime handoff use scope-only observation and adopt any persisted operation. Runtime cannot mint or substitute it; changed semantic or canonical input is typed divergence. |
@@ -2434,6 +2435,16 @@ proven in a prerequisite release, before projection changes.
 `Closed` names one CSPRNG cutover coordinator, lease epoch, generation, and
 expiry. A narrow cutover capability may renew that cutover lease and, for the
 exact generation, run only this closed operation allowlist:
+
+`RuntimeCutoverCoordinatorIdV1` follows the canonical 128-bit identifier rule
+and has no unchecked constructor. Writer-fence generation advances on every
+`Open -> Closed`, expired-lease takeover, and `Closed -> Open` transition.
+Lease epoch is a durable high-water mark and advances on close or takeover but
+not renewal. Expiry never opens the fence. One serialized renewal lane uses an
+exact previous-expiry compare-and-swap; a successful renewal changes only the
+expiry. Opening requires the exact fresh closed generation, coordinator, epoch,
+and expiry. Generation or epoch exhaustion remains closed and requires an
+offline repair rather than wrapping an identity counter.
 
 - gateway-owner observe, acquire, renew, and release
 - controller claim, renew, release, and the versioned worker-only convergence
