@@ -2,6 +2,7 @@ use crate::{
     RuntimeCertificationReceiptV1, RuntimeCertificationRequestV1, RuntimeClaimNextExecutionV1,
     RuntimeDisconnectServingV1, RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1,
     RuntimeHeartbeatServingV1, RuntimeMutationReceiptV1, RuntimeMutationRequestV1,
+    RuntimeObservePreviousServingV1, RuntimePreviousServingObservationReceiptV1,
     RuntimeRenewExecutionV1, RuntimeServingUpdateReceiptV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
 
@@ -54,4 +55,12 @@ pub trait RuntimeConvergencePort {
     ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, Self::Error>;
 
     fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RuntimePreviousServingObservationPort: RuntimeConvergencePort {
+    async fn observe_previous_serving(
+        &self,
+        request: RuntimeObservePreviousServingV1,
+    ) -> Result<RuntimePreviousServingObservationReceiptV1, <Self as RuntimeConvergencePort>::Error>;
 }

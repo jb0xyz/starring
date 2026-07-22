@@ -11,8 +11,10 @@ use crate::{
     RuntimeCertificationReceiptV1, RuntimeCertificationRequestV1, RuntimeConvergenceMutationV1,
     RuntimeDisconnectServingV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
     RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1, RuntimeLiveMetadataV1,
-    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeRenewExecutionV1,
-    RuntimeServingReceiptV1, RuntimeServingUpdateReceiptV1, RuntimeSessionActionIdV1,
+    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingLeaseEvidenceV1, RuntimePreviousServingObservationReceiptV1,
+    RuntimePreviousServingStateV1, RuntimeRenewExecutionV1, RuntimeServingReceiptV1,
+    RuntimeServingUpdateReceiptV1, RuntimeSessionActionIdV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +69,7 @@ pub enum RuntimeConvergenceSessionError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ExecutionActionV1 {
     Renew(RuntimeRenewExecutionV1),
+    ObservePreviousServing(RuntimeObservePreviousServingV1),
     Mutate(RuntimeMutationRequestV1),
     Certify(RuntimeCertificationRequestV1),
 }
@@ -75,6 +78,7 @@ impl ExecutionActionV1 {
     fn id(&self) -> RuntimeSessionActionIdV1 {
         match self {
             Self::Renew(request) => request.action_id,
+            Self::ObservePreviousServing(request) => request.action_id,
             Self::Mutate(request) => request.action_id,
             Self::Certify(request) => request.action_id,
         }
@@ -269,6 +273,51 @@ impl RuntimeConvergenceSessionV1 {
         };
         self.in_flight = Some(ExecutionActionV1::Mutate(request.clone()));
         Ok(request)
+    }
+
+    pub fn begin_previous_serving_observation(
+        &mut self,
+    ) -> Result<RuntimeObservePreviousServingV1, RuntimeConvergenceSessionError> {
+        self.require_action_slot()?;
+        if !matches!(
+            self.snapshot.phase,
+            RuntimeDeploymentPhaseV1::DrainRequested
+        ) {
+            return Err(RuntimeConvergenceSessionError::InvalidMutationForPhase);
+        }
+        let request = RuntimeObservePreviousServingV1 {
+            action_id: self.allocate_action_id()?,
+            guard: self.guard(),
+            expected_target: self.snapshot.target.clone(),
+            expected_previous_runtime: self.snapshot.previous_runtime.clone(),
+        };
+        self.in_flight = Some(ExecutionActionV1::ObservePreviousServing(request.clone()));
+        Ok(request)
+    }
+
+    pub fn apply_previous_serving_observation(
+        &mut self,
+        receipt: RuntimePreviousServingObservationReceiptV1,
+    ) -> Result<RuntimePreviousServingObservationReceiptV1, RuntimeConvergenceSessionError> {
+        let request = match self.in_flight.as_ref() {
+            Some(ExecutionActionV1::ObservePreviousServing(request))
+                if request.action_id == receipt.action_id =>
+            {
+                request.clone()
+            }
+            Some(_) => return Err(RuntimeConvergenceSessionError::ActionMismatch),
+            None => return Err(RuntimeConvergenceSessionError::NoActionInFlight),
+        };
+        self.validate_guard(&request.guard)?;
+        validate_previous_serving_observation(
+            &self.snapshot,
+            self.acquired_at,
+            self.expires_at,
+            &request,
+            &receipt,
+        )?;
+        self.in_flight = None;
+        Ok(receipt)
     }
 
     pub fn apply_mutation(
@@ -699,6 +748,73 @@ fn renewal_payload_matches(
         && current.last_runtime_failure == next.last_runtime_failure
 }
 
+fn validate_previous_serving_observation(
+    snapshot: &RuntimeDeploymentSnapshotV1,
+    execution_acquired_at: chrono::DateTime<chrono::Utc>,
+    execution_expires_at: chrono::DateTime<chrono::Utc>,
+    request: &RuntimeObservePreviousServingV1,
+    receipt: &RuntimePreviousServingObservationReceiptV1,
+) -> Result<(), RuntimeConvergenceSessionError> {
+    let preflight = snapshot
+        .preflight
+        .as_ref()
+        .ok_or(RuntimeConvergenceSessionError::ReceiptMismatch)?;
+    if !matches!(snapshot.phase, RuntimeDeploymentPhaseV1::DrainRequested)
+        || !request.guard.scope.matches(&snapshot.identity)
+        || request.guard.expected_revision != snapshot.revision
+        || request.guard.runtime_generation != snapshot.runtime_generation
+        || request.expected_target != snapshot.target
+        || request.expected_previous_runtime != snapshot.previous_runtime
+        || receipt.guard != request.guard
+        || receipt.expected_target != request.expected_target
+        || receipt.expected_previous_runtime != request.expected_previous_runtime
+        || receipt.observed_at < execution_acquired_at
+        || receipt.observed_at < preflight.checked_at
+        || receipt.observed_at >= execution_expires_at
+    {
+        return Err(RuntimeConvergenceSessionError::ReceiptMismatch);
+    }
+    let valid = match &receipt.state {
+        RuntimePreviousServingStateV1::Absent => request.expected_previous_runtime.is_none(),
+        RuntimePreviousServingStateV1::Disconnected {
+            lease,
+            disconnected_at,
+        } => {
+            previous_serving_lease_matches(request, lease)
+                && lease.acquired_at <= lease.last_heartbeat_at
+                && lease.last_heartbeat_at == *disconnected_at
+                && *disconnected_at <= receipt.observed_at
+        }
+        RuntimePreviousServingStateV1::Expired { lease, expires_at } => {
+            previous_serving_lease_matches(request, lease)
+                && lease.acquired_at <= lease.last_heartbeat_at
+                && lease.last_heartbeat_at < *expires_at
+                && *expires_at <= receipt.observed_at
+        }
+        RuntimePreviousServingStateV1::Serving { lease, expires_at } => {
+            previous_serving_lease_matches(request, lease)
+                && lease.acquired_at <= lease.last_heartbeat_at
+                && lease.last_heartbeat_at <= receipt.observed_at
+                && receipt.observed_at < *expires_at
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+    }
+}
+
+fn previous_serving_lease_matches(
+    request: &RuntimeObservePreviousServingV1,
+    lease: &RuntimePreviousServingLeaseEvidenceV1,
+) -> bool {
+    request.expected_previous_runtime.as_ref() == Some(&lease.identity.process)
+        && lease.identity.scope.tenant_id == request.guard.scope.tenant_id
+        && lease.identity.scope.installation_id == request.guard.scope.installation_id
+        && lease.identity.scope.deployment_id != request.guard.scope.deployment_id
+}
+
 fn validate_mutation_request(
     snapshot: &RuntimeDeploymentSnapshotV1,
     convergence_attempt: NonZeroU32,
@@ -1104,7 +1220,10 @@ fn validate_serving_advance(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
 
     use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
     use automation_runtime_convergence::{
@@ -1113,7 +1232,7 @@ mod tests {
         GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1,
         PanelCertificateId, PanelCertificateV1, PreflightAttestationV1, ProcessInstanceId,
         PromotionId, RuntimeDeployment, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
-        RuntimeGeneration, TenantId,
+        RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
     };
     use chrono::{DateTime, Utc};
     use discord_model::GuildId;
@@ -1141,6 +1260,13 @@ mod tests {
     }
 
     fn claimed() -> RuntimeExecutionReceiptV1 {
+        claimed_with(RuntimeGeneration::FIRST, None)
+    }
+
+    fn claimed_with(
+        runtime_generation: RuntimeGeneration,
+        previous_runtime: Option<RuntimeProcessIdentityV1>,
+    ) -> RuntimeExecutionReceiptV1 {
         let mut deployment = RuntimeDeployment::request(
             RuntimeDeploymentIdentityV1 {
                 deployment_id: DeploymentId::parse("deployment").unwrap(),
@@ -1150,8 +1276,8 @@ mod tests {
                 activation_request_id: ActivationRequestId::parse("activation").unwrap(),
             },
             target(),
-            RuntimeGeneration::FIRST,
-            None,
+            runtime_generation,
+            previous_runtime,
             at(1),
         )
         .unwrap();
@@ -1173,6 +1299,141 @@ mod tests {
             convergence_attempt: NonZeroU32::new(1).unwrap(),
             acquired_at: at(10),
             expires_at: at(100),
+        }
+    }
+
+    fn previous_runtime() -> RuntimeProcessIdentityV1 {
+        RuntimeProcessIdentityV1 {
+            target: target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            process_instance_id: ProcessInstanceId::parse("previous-process").unwrap(),
+        }
+    }
+
+    fn advance_to_drain_requested(session: &mut RuntimeConvergenceSessionV1) {
+        apply(
+            session,
+            RuntimeConvergenceMutationV1::AcceptPreflight(PreflightAttestationV1 {
+                target: session.snapshot().target.clone(),
+                runtime_generation: session.snapshot().runtime_generation,
+                observed_runtime: session.snapshot().previous_runtime.clone(),
+                checked_at: at(11),
+            }),
+        );
+        apply(session, RuntimeConvergenceMutationV1::RequestDrain);
+    }
+
+    fn previous_lease(
+        request: &RuntimeObservePreviousServingV1,
+    ) -> RuntimePreviousServingLeaseEvidenceV1 {
+        RuntimePreviousServingLeaseEvidenceV1 {
+            identity: crate::RuntimePreviousServingLeaseIdentityV1 {
+                scope: RuntimeDeploymentScopeV1 {
+                    tenant_id: request.guard.scope.tenant_id.clone(),
+                    installation_id: request.guard.scope.installation_id.clone(),
+                    deployment_id: DeploymentId::parse("previous-deployment").unwrap(),
+                },
+                attestation_id: RuntimeAttestationIdV1::parse("6".repeat(64)).unwrap(),
+                process: request.expected_previous_runtime.clone().unwrap(),
+                lease_epoch: NonZeroU64::new(3).unwrap(),
+                revision: NonZeroU64::new(7).unwrap(),
+            },
+            acquired_at: at(2),
+            last_heartbeat_at: at(18),
+        }
+    }
+
+    fn observation_receipt(
+        request: &RuntimeObservePreviousServingV1,
+        state: RuntimePreviousServingStateV1,
+    ) -> RuntimePreviousServingObservationReceiptV1 {
+        RuntimePreviousServingObservationReceiptV1 {
+            action_id: request.action_id,
+            guard: request.guard.clone(),
+            observed_at: at(20),
+            expected_target: request.expected_target.clone(),
+            expected_previous_runtime: request.expected_previous_runtime.clone(),
+            state,
+        }
+    }
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
+    }
+
+    struct FakeObservationPort {
+        expected: RuntimeObservePreviousServingV1,
+        receipt: RuntimePreviousServingObservationReceiptV1,
+    }
+
+    impl crate::RuntimeConvergencePort for FakeObservationPort {
+        type Error = ();
+
+        async fn claim_next_execution(
+            &self,
+            _request: crate::RuntimeClaimNextExecutionV1,
+        ) -> Result<Option<RuntimeExecutionReceiptV1>, Self::Error> {
+            panic!("unexpected claim")
+        }
+
+        async fn renew_execution(
+            &self,
+            _request: RuntimeRenewExecutionV1,
+        ) -> Result<RuntimeExecutionUpdateReceiptV1, Self::Error> {
+            panic!("unexpected renewal")
+        }
+
+        async fn mutate(
+            &self,
+            _request: RuntimeMutationRequestV1,
+        ) -> Result<RuntimeMutationReceiptV1, Self::Error> {
+            panic!("unexpected mutation")
+        }
+
+        async fn certify_live(
+            &self,
+            _request: RuntimeCertificationRequestV1,
+        ) -> Result<RuntimeCertificationReceiptV1, Self::Error> {
+            panic!("unexpected certification")
+        }
+
+        async fn heartbeat_serving(
+            &self,
+            _request: RuntimeHeartbeatServingV1,
+        ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
+            panic!("unexpected heartbeat")
+        }
+
+        async fn mark_serving_disconnected(
+            &self,
+            _request: RuntimeDisconnectServingV1,
+        ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
+            panic!("unexpected disconnect")
+        }
+
+        async fn recover_next_stale_live(
+            &self,
+        ) -> Result<Option<crate::RuntimeStaleLiveRecoveryReceiptV1>, Self::Error> {
+            panic!("unexpected recovery")
+        }
+
+        fn classify_error(_error: &Self::Error) -> crate::RuntimeConvergenceErrorClassV1 {
+            crate::RuntimeConvergenceErrorClassV1::InvalidState
+        }
+    }
+
+    impl crate::RuntimePreviousServingObservationPort for FakeObservationPort {
+        async fn observe_previous_serving(
+            &self,
+            request: RuntimeObservePreviousServingV1,
+        ) -> Result<RuntimePreviousServingObservationReceiptV1, Self::Error> {
+            assert_eq!(request, self.expected);
+            Ok(self.receipt.clone())
         }
     }
 
@@ -1505,6 +1766,249 @@ mod tests {
         );
         session.abort_action(request.action_id).unwrap();
         assert!(session.in_flight_action().is_none());
+    }
+
+    #[test]
+    fn previous_serving_observation_is_available_only_in_drain_requested() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        assert_eq!(
+            session.begin_previous_serving_observation(),
+            Err(RuntimeConvergenceSessionError::InvalidMutationForPhase)
+        );
+        advance_to_drain_requested(&mut session);
+        let request = session.begin_previous_serving_observation().unwrap();
+        assert_eq!(request.guard, session.guard());
+        assert_eq!(request.expected_target, session.snapshot().target);
+        assert_eq!(
+            request.expected_previous_runtime,
+            session.snapshot().previous_runtime
+        );
+        assert_eq!(session.in_flight_action(), Some(request.action_id));
+        assert_eq!(
+            session.begin_renewal(Duration::from_secs(90)),
+            Err(RuntimeConvergenceSessionError::ActionInFlight)
+        );
+        session.abort_action(request.action_id).unwrap();
+        assert!(session.in_flight_action().is_none());
+    }
+
+    #[test]
+    fn fake_port_round_trip_accepts_exact_absent_observation() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        advance_to_drain_requested(&mut session);
+        let request = session.begin_previous_serving_observation().unwrap();
+        let expected = observation_receipt(&request, RuntimePreviousServingStateV1::Absent);
+        let port = FakeObservationPort {
+            expected: request.clone(),
+            receipt: expected.clone(),
+        };
+        let receipt = block_on_ready(
+            <FakeObservationPort as crate::RuntimePreviousServingObservationPort>::observe_previous_serving(
+                &port, request,
+            ),
+        )
+        .unwrap();
+        let validated = session.apply_previous_serving_observation(receipt).unwrap();
+        assert_eq!(validated, expected);
+        assert!(session.in_flight_action().is_none());
+        assert_eq!(
+            session.snapshot().phase,
+            RuntimeDeploymentPhaseV1::DrainRequested
+        );
+    }
+
+    #[test]
+    fn exact_previous_serving_closed_states_are_accepted() {
+        let previous = previous_runtime();
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed_with(
+            RuntimeGeneration::FIRST.next().unwrap(),
+            Some(previous),
+        ))
+        .unwrap();
+        advance_to_drain_requested(&mut session);
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let disconnected = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Disconnected {
+                lease: previous_lease(&request),
+                disconnected_at: at(18),
+            },
+        );
+        assert_eq!(
+            session
+                .apply_previous_serving_observation(disconnected.clone())
+                .unwrap(),
+            disconnected
+        );
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let expired = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Expired {
+                lease: previous_lease(&request),
+                expires_at: at(19),
+            },
+        );
+        assert_eq!(
+            session
+                .apply_previous_serving_observation(expired.clone())
+                .unwrap(),
+            expired
+        );
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let serving = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Serving {
+                lease: previous_lease(&request),
+                expires_at: at(30),
+            },
+        );
+        assert_eq!(
+            session
+                .apply_previous_serving_observation(serving.clone())
+                .unwrap(),
+            serving
+        );
+    }
+
+    #[test]
+    fn previous_serving_observation_rejects_cross_incarnation_and_time_boundaries() {
+        let previous = previous_runtime();
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed_with(
+            RuntimeGeneration::FIRST.next().unwrap(),
+            Some(previous),
+        ))
+        .unwrap();
+        advance_to_drain_requested(&mut session);
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut wrong_lease = previous_lease(&request);
+        wrong_lease.identity.process.process_instance_id =
+            ProcessInstanceId::parse("reused-process").unwrap();
+        let wrong_process = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Expired {
+                lease: wrong_lease,
+                expires_at: at(19),
+            },
+        );
+        assert_eq!(
+            session.apply_previous_serving_observation(wrong_process),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+        assert_eq!(session.in_flight_action(), Some(request.action_id));
+        session.abort_action(request.action_id).unwrap();
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let expired_at_heartbeat = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Expired {
+                lease: previous_lease(&request),
+                expires_at: at(18),
+            },
+        );
+        assert_eq!(
+            session.apply_previous_serving_observation(expired_at_heartbeat),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+        session.abort_action(request.action_id).unwrap();
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let serving_at_expiry = observation_receipt(
+            &request,
+            RuntimePreviousServingStateV1::Serving {
+                lease: previous_lease(&request),
+                expires_at: at(20),
+            },
+        );
+        assert_eq!(
+            session.apply_previous_serving_observation(serving_at_expiry),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn previous_serving_observation_rejects_tampered_execution_evidence() {
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        advance_to_drain_requested(&mut session);
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut wrong_guard = observation_receipt(&request, RuntimePreviousServingStateV1::Absent);
+        wrong_guard.guard.expected_revision = wrong_guard.guard.expected_revision.next().unwrap();
+        assert_eq!(
+            session.apply_previous_serving_observation(wrong_guard),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+        session.abort_action(request.action_id).unwrap();
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut wrong_previous =
+            observation_receipt(&request, RuntimePreviousServingStateV1::Absent);
+        wrong_previous.expected_previous_runtime = Some(previous_runtime());
+        assert_eq!(
+            session.apply_previous_serving_observation(wrong_previous),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+        session.abort_action(request.action_id).unwrap();
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut expired_execution =
+            observation_receipt(&request, RuntimePreviousServingStateV1::Absent);
+        expired_execution.observed_at = session.expires_at();
+        assert_eq!(
+            session.apply_previous_serving_observation(expired_execution),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn previous_serving_state_must_match_snapshot_previous_identity() {
+        let previous = previous_runtime();
+        let mut with_previous = RuntimeConvergenceSessionV1::from_claim(claimed_with(
+            RuntimeGeneration::FIRST.next().unwrap(),
+            Some(previous),
+        ))
+        .unwrap();
+        advance_to_drain_requested(&mut with_previous);
+        let request = with_previous.begin_previous_serving_observation().unwrap();
+        assert_eq!(
+            with_previous.apply_previous_serving_observation(observation_receipt(
+                &request,
+                RuntimePreviousServingStateV1::Absent,
+            )),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+
+        let mut absent = RuntimeConvergenceSessionV1::from_claim(claimed()).unwrap();
+        advance_to_drain_requested(&mut absent);
+        let request = absent.begin_previous_serving_observation().unwrap();
+        let lease = RuntimePreviousServingLeaseEvidenceV1 {
+            identity: crate::RuntimePreviousServingLeaseIdentityV1 {
+                scope: RuntimeDeploymentScopeV1 {
+                    tenant_id: request.guard.scope.tenant_id.clone(),
+                    installation_id: request.guard.scope.installation_id.clone(),
+                    deployment_id: DeploymentId::parse("previous-deployment").unwrap(),
+                },
+                attestation_id: RuntimeAttestationIdV1::parse("6".repeat(64)).unwrap(),
+                process: previous_runtime(),
+                lease_epoch: NonZeroU64::new(1).unwrap(),
+                revision: NonZeroU64::new(1).unwrap(),
+            },
+            acquired_at: at(2),
+            last_heartbeat_at: at(18),
+        };
+        assert_eq!(
+            absent.apply_previous_serving_observation(observation_receipt(
+                &request,
+                RuntimePreviousServingStateV1::Serving {
+                    lease,
+                    expires_at: at(30),
+                },
+            )),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
     }
 
     #[test]

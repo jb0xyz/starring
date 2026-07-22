@@ -7,8 +7,9 @@ use automation_runtime_convergence::{
     ActivationAttestationV1, ControllerId, DeploymentId, DeploymentRevision, DrainAttestationV1,
     FencingToken, GatewayReadyAttestationV1, InstallationId, PanelCertificateV1,
     PreflightAttestationV1, ProcessInstanceId, RuntimeDeploymentIdentityV1,
-    RuntimeDeploymentSnapshotV1, RuntimeFailureId, RuntimeFailureKindV1, RuntimeGeneration,
-    SupersedingDeploymentV1, TenantId, TransitionOutcomeV1,
+    RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
+    RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId,
+    TransitionOutcomeV1,
 };
 use chrono::{DateTime, Utc};
 
@@ -161,6 +162,57 @@ pub struct RuntimeRenewExecutionV1 {
 pub struct RuntimeExecutionUpdateReceiptV1 {
     pub action_id: RuntimeSessionActionIdV1,
     pub execution: RuntimeExecutionReceiptV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeObservePreviousServingV1 {
+    pub action_id: RuntimeSessionActionIdV1,
+    pub guard: RuntimeExecutionGuardV1,
+    pub expected_target: RuntimeDeploymentTargetV1,
+    pub expected_previous_runtime: Option<RuntimeProcessIdentityV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePreviousServingLeaseIdentityV1 {
+    pub scope: RuntimeDeploymentScopeV1,
+    pub attestation_id: RuntimeAttestationIdV1,
+    pub process: RuntimeProcessIdentityV1,
+    pub lease_epoch: NonZeroU64,
+    pub revision: NonZeroU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePreviousServingLeaseEvidenceV1 {
+    pub identity: RuntimePreviousServingLeaseIdentityV1,
+    pub acquired_at: DateTime<Utc>,
+    pub last_heartbeat_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimePreviousServingStateV1 {
+    Absent,
+    Disconnected {
+        lease: RuntimePreviousServingLeaseEvidenceV1,
+        disconnected_at: DateTime<Utc>,
+    },
+    Expired {
+        lease: RuntimePreviousServingLeaseEvidenceV1,
+        expires_at: DateTime<Utc>,
+    },
+    Serving {
+        lease: RuntimePreviousServingLeaseEvidenceV1,
+        expires_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePreviousServingObservationReceiptV1 {
+    pub action_id: RuntimeSessionActionIdV1,
+    pub guard: RuntimeExecutionGuardV1,
+    pub observed_at: DateTime<Utc>,
+    pub expected_target: RuntimeDeploymentTargetV1,
+    pub expected_previous_runtime: Option<RuntimeProcessIdentityV1>,
+    pub state: RuntimePreviousServingStateV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

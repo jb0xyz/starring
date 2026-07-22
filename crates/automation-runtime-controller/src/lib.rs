@@ -13,16 +13,20 @@ pub use dto::{
     RuntimeControllerDtoError, RuntimeConvergenceMutationV1, RuntimeDeploymentScopeV1,
     RuntimeDisconnectServingV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
     RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1, RuntimeLiveMetadataV1,
-    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeRenewExecutionV1,
-    RuntimeServingIdentityV1, RuntimeServingReceiptV1, RuntimeServingUpdateReceiptV1,
-    RuntimeSessionActionIdV1, RuntimeStaleLiveRecoveryReceiptV1,
+    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingLeaseEvidenceV1, RuntimePreviousServingLeaseIdentityV1,
+    RuntimePreviousServingObservationReceiptV1, RuntimePreviousServingStateV1,
+    RuntimeRenewExecutionV1, RuntimeServingIdentityV1, RuntimeServingReceiptV1,
+    RuntimeServingUpdateReceiptV1, RuntimeSessionActionIdV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
 pub use failure::{RuntimeFailureDecisionV1, RuntimeFailureSourceV1, RuntimeRecordedFailureV1};
 pub use planner::{
     plan_runtime_action_v1, RuntimeControllerActionV1, RuntimeControllerPlanError,
     RuntimeControllerStopReasonV1,
 };
-pub use port::{RuntimeConvergenceErrorClassV1, RuntimeConvergencePort};
+pub use port::{
+    RuntimeConvergenceErrorClassV1, RuntimeConvergencePort, RuntimePreviousServingObservationPort,
+};
 pub use retry::{RetryPolicyError, RetryPolicyV1};
 pub use session::{
     RuntimeConvergenceSessionError, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
