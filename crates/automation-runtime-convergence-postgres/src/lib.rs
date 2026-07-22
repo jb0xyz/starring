@@ -1,5 +1,6 @@
 mod artifact;
 mod controller;
+mod database_identity;
 mod digest;
 mod error;
 mod evidence;
@@ -10,6 +11,7 @@ mod projection;
 mod row;
 mod store;
 
+pub use database_identity::PostgresRuntimeConvergenceDatabaseIdentityReader;
 pub use error::RuntimeConvergenceStoreError;
 pub use evidence::{
     project_runtime_deployment_status_v1, project_runtime_deployment_status_v2,
