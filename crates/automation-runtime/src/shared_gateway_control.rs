@@ -174,6 +174,12 @@ impl Default for GatewayControlConfigV3 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayAdmissionPolicyV3 {
+    ResumeOnConnect,
+    ExplicitResumeAfterEveryConnect,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayControlConfigurationErrorV3 {
     #[error("gateway command capacity is invalid")]
@@ -462,14 +468,29 @@ pub struct SharedGatewayRuntimeControlV3 {
     state: GatewayConnectionStateV3,
     last_issued_epoch: u64,
     last_admission_revision: u64,
+    admission_policy: GatewayAdmissionPolicyV3,
 }
 
 pub fn shared_gateway_control_channel_v3(
     config: GatewayControlConfigV3,
 ) -> (SharedGatewayControlV3, SharedGatewayRuntimeControlV3) {
+    shared_gateway_control_channel_with_policy_v3(config, GatewayAdmissionPolicyV3::ResumeOnConnect)
+}
+
+pub fn shared_gateway_control_channel_with_policy_v3(
+    config: GatewayControlConfigV3,
+    admission_policy: GatewayAdmissionPolicyV3,
+) -> (SharedGatewayControlV3, SharedGatewayRuntimeControlV3) {
     let (command_sender, command_receiver) = mpsc::channel(config.command_capacity.get());
     let (lifecycle_sender, lifecycle_receiver) = mpsc::channel(config.lifecycle_capacity.get());
-    let initial = GatewayConnectionStateV3::Starting;
+    let initial = match admission_policy {
+        GatewayAdmissionPolicyV3::ResumeOnConnect => GatewayConnectionStateV3::Starting,
+        GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect => {
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Starting,
+            }
+        }
+    };
     let (connection_sender, connection_receiver) = watch::channel(initial);
     let initial_admission_revision = GatewayAdmissionRevisionV3(NonZeroU64::MIN);
     let (admission_revision_sender, admission_revision_receiver) =
@@ -492,6 +513,7 @@ pub fn shared_gateway_control_channel_v3(
             state: initial,
             last_issued_epoch: 0,
             last_admission_revision: initial_admission_revision.get(),
+            admission_policy,
         },
     )
 }
@@ -531,7 +553,10 @@ impl SharedGatewayRuntimeControlV3 {
             self.fail_closed(GatewayDrainCauseV3::ConnectionEpochOverflow);
             return Err(GatewayControlTransitionErrorV3::ConnectionEpochOverflow);
         };
-        let paused = matches!(self.state, GatewayConnectionStateV3::Paused { .. });
+        let paused = matches!(
+            self.admission_policy,
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect
+        ) || matches!(self.state, GatewayConnectionStateV3::Paused { .. });
         let state = if paused {
             GatewayConnectionStateV3::Paused {
                 connection: GatewayPausedConnectionV3::Connected { epoch, kind },
@@ -557,7 +582,12 @@ impl SharedGatewayRuntimeControlV3 {
     ) -> Result<(), GatewayControlTransitionErrorV3> {
         self.require_running()?;
         let last_epoch = self.state.current_epoch();
-        let paused = matches!(self.state, GatewayConnectionStateV3::Paused { .. });
+        let explicit_resume = matches!(
+            self.admission_policy,
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect
+        );
+        let paused =
+            explicit_resume || matches!(self.state, GatewayConnectionStateV3::Paused { .. });
         let state = if paused {
             GatewayConnectionStateV3::Paused {
                 connection: GatewayPausedConnectionV3::Disconnected { last_epoch, kind },
@@ -572,7 +602,11 @@ impl SharedGatewayRuntimeControlV3 {
                 kind,
                 paused,
             },
-        )
+        )?;
+        if explicit_resume {
+            self.advance_admission_revision()?;
+        }
+        Ok(())
     }
 
     pub async fn process_next_command(&mut self) -> GatewayRuntimeCommandOutcomeV3 {
@@ -1159,5 +1193,127 @@ mod tests {
         assert_eq!(after_resume.epoch(), before_pause.epoch());
         assert!(after_resume.admission_revision() > before_pause.admission_revision());
         assert!(observer.ready_lease_is_current(&after_resume));
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_policy_starts_paused_and_stays_paused_after_reconnect() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        assert_eq!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Starting,
+            }
+        );
+        let first = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        assert_eq!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Connected {
+                    epoch: first,
+                    kind: GatewayReadyKindV3::Ready,
+                },
+            }
+        );
+        assert_eq!(
+            control.issue_ready_lease(first),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
+        resume(&control, &mut runtime, first).await.unwrap();
+        let first_lease = control.issue_ready_lease(first).unwrap();
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        assert!(!control.ready_lease_is_current(&first_lease));
+        assert_eq!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Disconnected {
+                    last_epoch: Some(first),
+                    kind: GatewayDisconnectKindV3::Reconnect,
+                },
+            }
+        );
+        let second = runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
+        assert!(second > first);
+        assert_eq!(
+            control.issue_ready_lease(second),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
+        assert_eq!(
+            resume(&control, &mut runtime, first).await,
+            Err(GatewayControlErrorV3::Transition(
+                GatewayControlTransitionErrorV3::StaleConnectionEpoch
+            ))
+        );
+        resume(&control, &mut runtime, second).await.unwrap();
+        let second_lease = control.issue_ready_lease(second).unwrap();
+        assert!(second_lease.admission_revision() > first_lease.admission_revision());
+        assert!(control.ready_lease_is_current(&second_lease));
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_revision_overflow_fails_closed() {
+        let (_control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        runtime.last_admission_revision = u64::MAX;
+        assert_eq!(
+            runtime.mark_disconnected(GatewayDisconnectKindV3::ReceiveError),
+            Err(GatewayControlTransitionErrorV3::AdmissionRevisionOverflow)
+        );
+        assert!(matches!(
+            runtime.current_connection(),
+            GatewayConnectionStateV3::Draining {
+                cause: GatewayDrainCauseV3::AdmissionRevisionOverflow,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_policy_repauses_even_without_a_disconnect_transition() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let first = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        resume(&control, &mut runtime, first).await.unwrap();
+        let first_lease = control.issue_ready_lease(first).unwrap();
+        let second = runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
+        assert!(second > first);
+        assert!(!control.ready_lease_is_current(&first_lease));
+        assert_eq!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Connected {
+                    epoch: second,
+                    kind: GatewayReadyKindV3::Resumed,
+                },
+            }
+        );
+        assert_eq!(
+            control.issue_ready_lease(second),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
+        resume(&control, &mut runtime, second).await.unwrap();
+        assert!(control.ready_lease_is_current(&control.issue_ready_lease(second).unwrap()));
+    }
+
+    #[test]
+    fn explicit_disconnect_closes_admission_before_advancing_revision() {
+        let source = include_str!("shared_gateway_control.rs");
+        let method = source
+            .split("pub fn mark_disconnected(")
+            .nth(1)
+            .and_then(|tail| tail.split("pub async fn process_next_command").next())
+            .unwrap();
+        let publish = method.find("self.publish(").unwrap();
+        let advance = method.find("self.advance_admission_revision()?").unwrap();
+        assert!(publish < advance);
     }
 }
