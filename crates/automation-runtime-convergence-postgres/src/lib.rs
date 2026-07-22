@@ -25,11 +25,11 @@ pub use model::{
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, MutationReceiptV1, PanelReportDigestV1,
     PostgresRuntimeConvergenceConfigV1, RecoverBlockedDeploymentV1, RecoverStaleLiveV1,
-    RuntimeAttestationObservationV2, RuntimeBuildRevisionV1, RuntimeConvergenceAttemptV1,
-    RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1, RuntimeDeploymentStatusV2,
-    RuntimeServingFreshnessV2, RuntimeServingObservationV2, ServingLeaseIdentityV1,
-    ServingLeaseReceiptV1, StrictLiveProjectionV1, SubmitDeploymentMutationV1,
-    SubmitLiveAttestationV1,
+    RenewDeploymentV1, RuntimeAttestationObservationV2, RuntimeBuildRevisionV1,
+    RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1,
+    RuntimeDeploymentStatusV2, RuntimeServingFreshnessV2, RuntimeServingObservationV2,
+    ServingLeaseIdentityV1, ServingLeaseReceiptV1, StrictLiveProjectionV1,
+    SubmitDeploymentMutationV1, SubmitLiveAttestationV1,
 };
 pub use prepare::{prepare_requested_deployment_v1, PreparedRequestedDeploymentV1};
 pub use store::PostgresRuntimeConvergence;

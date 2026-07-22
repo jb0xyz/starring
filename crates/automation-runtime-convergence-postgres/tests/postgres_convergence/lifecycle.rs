@@ -112,7 +112,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
     let claim = claiming.await.unwrap().unwrap();
     assert!(claim.acquired_at >= released_at);
     assert_eq!(claim.expires_at - claim.acquired_at, TimeDelta::seconds(90));
-    let replayed_claim = adapter
+    let replay_error = adapter
         .claim(ClaimDeploymentV1 {
             scope: scope(),
             expected_revision: initial.revision,
@@ -120,9 +120,11 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
             lease_for: Duration::from_secs(90),
         })
         .await
-        .unwrap();
-    assert_eq!(replayed_claim.fencing_token, claim.fencing_token);
-    assert_eq!(replayed_claim.snapshot, claim.snapshot);
+        .unwrap_err();
+    assert!(matches!(
+        replay_error,
+        RuntimeConvergenceStoreError::RevisionConflict
+    ));
     let process = ProcessInstanceId::parse("runtime-pg-process").unwrap();
     let mut revision = claim.snapshot.revision;
     let preflight = PreflightAttestationV1 {
@@ -137,6 +139,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(preflight.clone()),
     )
     .await;
@@ -146,6 +149,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
             expected_revision: preflight_expected,
             controller_id: controller.clone(),
             fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::AcceptPreflight(preflight),
         })
@@ -157,6 +161,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -165,6 +170,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: None,
             target_runtime_generation: RuntimeGeneration::FIRST,
@@ -177,6 +183,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::BeginActivation,
     )
     .await;
@@ -185,6 +192,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
             activation_request_id: ActivationRequestId::parse(ACTIVATION).unwrap(),
             target: target(),
@@ -199,6 +207,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
@@ -207,6 +216,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-pg-panel-certificate").unwrap(),
             report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
@@ -236,6 +246,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
             expected_revision: revision,
             controller_id: controller.clone(),
             fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             gateway_ready: GatewayReadyAttestationV1 {
                 target: target(),
@@ -263,6 +274,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
             expected_revision: revision,
             controller_id: controller.clone(),
             fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             gateway_ready: GatewayReadyAttestationV1 {
                 target: target(),
@@ -289,6 +301,7 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
         expected_revision: revision,
         controller_id: controller,
         fencing_token: claim.fencing_token,
+        convergence_attempt: claim.convergence_attempt,
         runtime_generation: RuntimeGeneration::FIRST,
         gateway_ready: GatewayReadyAttestationV1 {
             target: target(),
@@ -313,6 +326,14 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
     .await
     .unwrap();
     assert!(live_transition.snapshot.live.is_some());
+    let guard_pool = pool.clone();
+    let guard_adapter = adapter.clone();
+    let guard_request = live_request.clone();
+    tokio::spawn(async move {
+        assert_live_replay_guards(&guard_pool, &guard_adapter, guard_request).await;
+    })
+    .await
+    .unwrap();
     let (replayed_live, replayed_serving) = adapter.certify_live(live_request).await.unwrap();
     assert!(matches!(
         replayed_live.outcome,
@@ -529,6 +550,77 @@ async fn exact_live_status_and_fencing_survive_postgres_scenario(
     })
     .await
     .unwrap();
+}
+
+async fn live_replay_projection(
+    pool: &PgPool,
+) -> (
+    i64,
+    Option<String>,
+    Option<i64>,
+    i64,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    i64,
+) {
+    sqlx::query_as(
+        "SELECT deployment.revision, deployment.last_controller_id, \
+                deployment.last_fencing_token, deployment.convergence_attempt_no, \
+                serving.acquired_at, serving.expires_at, serving.revision \
+         FROM public.runtime_deployments AS deployment \
+         INNER JOIN public.runtime_serving_leases AS serving \
+           ON serving.deployment_id = deployment.deployment_id \
+         WHERE deployment.deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn assert_live_replay_guards(
+    pool: &PgPool,
+    adapter: &PostgresRuntimeConvergence,
+    live_request: SubmitLiveAttestationV1,
+) {
+    let live_projection = live_replay_projection(pool).await;
+    let mut altered_controller = live_request.clone();
+    altered_controller.controller_id = ControllerId::parse("runtime-pg-controller-altered").unwrap();
+    let error = adapter
+        .certify_live(altered_controller)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::AttestationConflict
+    ));
+    assert_eq!(live_replay_projection(pool).await, live_projection);
+    let mut altered_duration = live_request.clone();
+    altered_duration.serving_lease_for = Duration::from_secs(46);
+    let error = adapter
+        .certify_live(altered_duration)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::AttestationConflict
+    ));
+    assert_eq!(live_replay_projection(pool).await, live_projection);
+    let mut altered_attempt = live_request.clone();
+    altered_attempt.convergence_attempt = NonZeroU32::new(
+        live_request
+            .convergence_attempt
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let error = adapter.certify_live(altered_attempt).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::ConvergenceAttemptConflict
+    ));
+    assert_eq!(live_replay_projection(pool).await, live_projection);
 }
 
 #[tokio::test]

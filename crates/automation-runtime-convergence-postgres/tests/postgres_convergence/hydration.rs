@@ -49,10 +49,13 @@ async fn exact_target_hydration_requires_the_current_fenced_claim_scenario(
     ));
 
     let renewed = adapter
-        .claim_execution(ClaimDeploymentV1 {
+        .renew_execution(RenewDeploymentV1 {
             scope: scope(),
             expected_revision: claim.snapshot.revision,
             controller_id: claim.controller_id.clone(),
+            fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
+            runtime_generation: claim.snapshot.runtime_generation,
             lease_for: Duration::from_secs(100),
         })
         .await
@@ -96,6 +99,7 @@ async fn exact_target_hydration_requires_the_current_fenced_claim_scenario(
             expected_revision: current_execution.snapshot.revision,
             controller_id: current_execution.controller_id.clone(),
             fencing_token: current_execution.fencing_token,
+            convergence_attempt: current_execution.convergence_attempt,
             runtime_generation: current_execution.snapshot.runtime_generation,
             mutation: DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
                 target: current_execution.snapshot.target.clone(),

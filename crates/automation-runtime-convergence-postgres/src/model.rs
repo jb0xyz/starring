@@ -144,6 +144,17 @@ pub struct ClaimNextDeploymentV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewDeploymentV1 {
+    pub scope: RuntimeDeploymentScopeV1,
+    pub expected_revision: DeploymentRevision,
+    pub controller_id: ControllerId,
+    pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
+    pub runtime_generation: RuntimeGeneration,
+    pub lease_for: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverBlockedDeploymentV1 {
     pub scope: RuntimeDeploymentScopeV1,
     pub expected_revision: DeploymentRevision,
@@ -225,6 +236,7 @@ pub struct SubmitDeploymentMutationV1 {
     pub expected_revision: DeploymentRevision,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub runtime_generation: RuntimeGeneration,
     pub mutation: DeploymentMutationV1,
 }
@@ -233,6 +245,7 @@ pub struct SubmitDeploymentMutationV1 {
 pub struct MutationReceiptV1 {
     pub outcome: TransitionOutcomeV1,
     pub snapshot: RuntimeDeploymentSnapshotV1,
+    pub convergence_attempt: NonZeroU32,
 }
 
 macro_rules! define_safe_text {
@@ -328,6 +341,7 @@ pub struct SubmitLiveAttestationV1 {
     pub expected_revision: DeploymentRevision,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub runtime_generation: RuntimeGeneration,
     pub gateway_ready: GatewayReadyAttestationV1,
     pub metadata: LiveMetadataV1,

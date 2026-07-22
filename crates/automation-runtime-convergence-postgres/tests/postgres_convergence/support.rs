@@ -237,6 +237,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         claim.snapshot.revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: next_generation,
@@ -252,6 +253,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -269,6 +271,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: Some(previous_runtime),
             target_runtime_generation: next_generation,
@@ -283,6 +286,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::BeginActivation,
     )
     .await;
@@ -293,6 +297,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
             activation_request_id: ActivationRequestId::parse(NEXT_ACTIVATION).unwrap(),
             target: target(),
@@ -309,6 +314,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
@@ -320,6 +326,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-pg-panel-next").unwrap(),
             report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
@@ -348,6 +355,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         expected_revision: revision,
         controller_id: controller,
         fencing_token: claim.fencing_token,
+        convergence_attempt: claim.convergence_attempt,
         runtime_generation: next_generation,
         gateway_ready: GatewayReadyAttestationV1 {
             target: target(),
@@ -493,11 +501,13 @@ async fn converge_claimed_with_lease(
 ) {
     let controller_id = claim.controller_id.clone();
     let fencing_token = claim.fencing_token;
+    let convergence_attempt = claim.convergence_attempt;
     let mut revision = mutate(
         adapter,
         claim.snapshot.revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
@@ -511,6 +521,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -519,6 +530,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: None,
             target_runtime_generation: RuntimeGeneration::FIRST,
@@ -531,6 +543,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::BeginActivation,
     )
     .await;
@@ -539,6 +552,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
             activation_request_id: ActivationRequestId::parse(ACTIVATION).unwrap(),
             target: target(),
@@ -553,6 +567,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
@@ -561,6 +576,7 @@ async fn converge_claimed_with_lease(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("runtime-policy-panel").unwrap(),
             report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
@@ -590,6 +606,7 @@ async fn converge_claimed_with_lease(
             expected_revision: revision,
             controller_id,
             fencing_token,
+            convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             gateway_ready: GatewayReadyAttestationV1 {
                 target: target(),
@@ -622,11 +639,13 @@ async fn converge_recovered(
 ) {
     let controller_id = claim.controller_id.clone();
     let fencing_token = claim.fencing_token;
+    let convergence_attempt = claim.convergence_attempt;
     let mut revision = mutate(
         adapter,
         claim.snapshot.revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
@@ -635,6 +654,7 @@ async fn converge_recovered(
         revision,
         &controller_id,
         fencing_token,
+        convergence_attempt,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse(format!(
                 "runtime-pg-panel-{}",
@@ -668,6 +688,7 @@ async fn converge_recovered(
             expected_revision: revision,
             controller_id,
             fencing_token,
+            convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             gateway_ready: GatewayReadyAttestationV1 {
                 target: target(),
@@ -702,6 +723,7 @@ async fn mutate(
     expected_revision: automation_runtime_convergence::DeploymentRevision,
     controller_id: &ControllerId,
     fencing_token: automation_runtime_convergence::FencingToken,
+    convergence_attempt: std::num::NonZeroU32,
     mutation: DeploymentMutationV1,
 ) -> automation_runtime_convergence::DeploymentRevision {
     mutate_scoped(
@@ -711,11 +733,13 @@ async fn mutate(
         expected_revision,
         controller_id,
         fencing_token,
+        convergence_attempt,
         mutation,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mutate_scoped(
     adapter: &PostgresRuntimeConvergence,
     scope: RuntimeDeploymentScopeV1,
@@ -723,6 +747,7 @@ async fn mutate_scoped(
     expected_revision: automation_runtime_convergence::DeploymentRevision,
     controller_id: &ControllerId,
     fencing_token: automation_runtime_convergence::FencingToken,
+    convergence_attempt: std::num::NonZeroU32,
     mutation: DeploymentMutationV1,
 ) -> automation_runtime_convergence::DeploymentRevision {
     adapter
@@ -731,6 +756,7 @@ async fn mutate_scoped(
             expected_revision,
             controller_id: controller_id.clone(),
             fencing_token,
+            convergence_attempt,
             runtime_generation,
             mutation,
         })

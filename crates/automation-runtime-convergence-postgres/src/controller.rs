@@ -18,9 +18,9 @@ use automation_runtime_controller::{
 use automation_runtime_convergence::{RuntimeDeploymentError, RuntimeFailureKindV1};
 
 use crate::{
-    AttestationIdV1, ClaimDeploymentV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1,
-    DeploymentMutationV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
-    MarkServingDisconnectedV1, MutationReceiptV1, PanelReportDigestV1, PostgresRuntimeConvergence,
+    AttestationIdV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1, DeploymentMutationV1,
+    GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1, MarkServingDisconnectedV1,
+    MutationReceiptV1, PanelReportDigestV1, PostgresRuntimeConvergence, RenewDeploymentV1,
     RuntimeBuildRevisionV1, RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
     ServingLeaseIdentityV1, ServingLeaseReceiptV1, SubmitDeploymentMutationV1,
     SubmitLiveAttestationV1,
@@ -48,12 +48,15 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
         &self,
         request: RuntimeRenewExecutionV1,
     ) -> Result<RuntimeExecutionUpdateReceiptV1, Self::Error> {
-        let receipt = PostgresRuntimeConvergence::claim_execution(
+        let receipt = PostgresRuntimeConvergence::renew_execution(
             self,
-            ClaimDeploymentV1 {
+            RenewDeploymentV1 {
                 scope: scope(&request.guard.scope),
                 expected_revision: request.guard.expected_revision,
                 controller_id: request.guard.controller_id,
+                fencing_token: request.guard.fencing_token,
+                convergence_attempt: request.guard.convergence_attempt,
+                runtime_generation: request.guard.runtime_generation,
                 lease_for: request.lease_for,
             },
         )
@@ -75,6 +78,7 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
                 expected_revision: request.guard.expected_revision,
                 controller_id: request.guard.controller_id,
                 fencing_token: request.guard.fencing_token,
+                convergence_attempt: request.guard.convergence_attempt,
                 runtime_generation: request.guard.runtime_generation,
                 mutation: mutation(request.mutation),
             },
@@ -84,7 +88,7 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
             action_id: request.action_id,
             outcome: receipt.outcome,
             snapshot: receipt.snapshot,
-            convergence_attempt: request.guard.convergence_attempt,
+            convergence_attempt: receipt.convergence_attempt,
         })
     }
 
@@ -100,6 +104,7 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
                 expected_revision: request.guard.expected_revision,
                 controller_id: request.guard.controller_id,
                 fencing_token: request.guard.fencing_token,
+                convergence_attempt: request.guard.convergence_attempt,
                 runtime_generation: request.guard.runtime_generation,
                 gateway_ready: request.gateway_ready,
                 metadata,
@@ -111,7 +116,7 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
             action_id: request.action_id,
             outcome: mutation.outcome,
             snapshot: mutation.snapshot,
-            convergence_attempt: request.guard.convergence_attempt,
+            convergence_attempt: mutation.convergence_attempt,
             metadata: request.metadata,
             serving: serving_receipt(serving, request.guard.runtime_generation)?,
         })

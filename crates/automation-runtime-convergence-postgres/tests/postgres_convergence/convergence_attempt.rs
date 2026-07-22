@@ -43,14 +43,46 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
         .await
         .unwrap();
     assert_eq!(first.convergence_attempt, NonZeroU32::MIN);
-    let replay = adapter.claim_execution(first_request).await.unwrap();
-    assert_eq!(replay.convergence_attempt, first.convergence_attempt);
-    assert_eq!(replay.fencing_token, first.fencing_token);
-    let renewed = adapter
+    let claim_projection = execution_projection(&pool).await;
+    let mut altered_replay = first_request.clone();
+    altered_replay.lease_for = Duration::from_millis(101);
+    let error = adapter.claim_execution(altered_replay).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::RevisionConflict
+    ));
+    assert_eq!(execution_projection(&pool).await, claim_projection);
+    let error = adapter
+        .claim_execution(first_request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::RevisionConflict
+    ));
+    assert_eq!(execution_projection(&pool).await, claim_projection);
+    let error = adapter
         .claim_execution(ClaimDeploymentV1 {
             scope: scope(),
             expected_revision: first.snapshot.revision,
+            controller_id: controller_a.clone(),
+            lease_for: Duration::from_millis(300),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::ExecutionClaimStale
+    ));
+    assert_eq!(execution_projection(&pool).await, claim_projection);
+    let renewed = adapter
+        .renew_execution(RenewDeploymentV1 {
+            scope: scope(),
+            expected_revision: first.snapshot.revision,
             controller_id: controller_a,
+            fencing_token: first.fencing_token,
+            convergence_attempt: first.convergence_attempt,
+            runtime_generation: first.snapshot.runtime_generation,
             lease_for: Duration::from_millis(300),
         })
         .await
@@ -58,6 +90,13 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
     assert_eq!(renewed.convergence_attempt, NonZeroU32::MIN);
     assert!(renewed.fencing_token > first.fencing_token);
     assert_eq!(deployment_attempt(&pool).await, (1, None));
+    let renewed_projection = execution_projection(&pool).await;
+    let error = adapter.claim_execution(first_request).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::RevisionConflict
+    ));
+    assert_eq!(execution_projection(&pool).await, renewed_projection);
     assert_direct_claim_tamper_is_rejected(
         &pool,
         "runtime-attempt-tampered-active",
@@ -98,6 +137,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: revision,
             controller_id: controller_b.clone(),
             fencing_token: reclaimed.fencing_token,
+            convergence_attempt: reclaimed.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::RecordRetryableFailure {
                 failure_id: automation_runtime_convergence::RuntimeFailureId::parse(
@@ -122,6 +162,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: revision,
             controller_id: controller_b,
             fencing_token: reclaimed.fencing_token,
+            convergence_attempt: reclaimed.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::RecordRetryableFailure {
                 failure_id: automation_runtime_convergence::RuntimeFailureId::parse(
@@ -147,6 +188,19 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
         replayed_failure.outcome,
         automation_runtime_convergence::TransitionOutcomeV1::Replayed { .. }
     ));
+    let failure_projection = execution_projection(&pool).await;
+    let mut altered_failure_controller = failure_request.clone();
+    altered_failure_controller.controller_id =
+        ControllerId::parse("runtime-attempt-controller-altered").unwrap();
+    let error = adapter
+        .mutate(altered_failure_controller)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeConvergenceStoreError::IdempotencyConflict
+    ));
+    assert_eq!(execution_projection(&pool).await, failure_projection);
     let retry_operator = adapter
         .recover_blocked_for_operator(RecoverBlockedDeploymentV1 {
             scope: scope(),
@@ -193,6 +247,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: failure.snapshot.revision,
             controller_id: controller_c.clone(),
             fencing_token: retry.fencing_token,
+            convergence_attempt: retry.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: failure_request.mutation,
         })
@@ -208,6 +263,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: retry.snapshot.revision,
             controller_id: controller_c,
             fencing_token: retry.fencing_token,
+            convergence_attempt: retry.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::ResumeRuntimePending,
         })
@@ -226,6 +282,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: resumed.snapshot.revision,
             controller_id: ControllerId::parse("runtime-attempt-controller-c").unwrap(),
             fencing_token: retry.fencing_token,
+            convergence_attempt: retry.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::BeginPanelReconciliation,
         })
@@ -237,6 +294,7 @@ async fn claims_and_failures_persist_exact_convergence_attempts_scenario(
             expected_revision: panels.snapshot.revision,
             controller_id: ControllerId::parse("runtime-attempt-controller-c").unwrap(),
             fencing_token: retry.fencing_token,
+            convergence_attempt: retry.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::RecordBlockedFailure {
                 failure_id: automation_runtime_convergence::RuntimeFailureId::parse(
@@ -437,6 +495,7 @@ async fn advance_claim_to_runtime_pending(
         claim.snapshot.revision,
         controller_id,
         fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
@@ -450,6 +509,7 @@ async fn advance_claim_to_runtime_pending(
         revision,
         controller_id,
         fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -458,6 +518,7 @@ async fn advance_claim_to_runtime_pending(
         revision,
         controller_id,
         fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: None,
             target_runtime_generation: RuntimeGeneration::FIRST,
@@ -470,6 +531,7 @@ async fn advance_claim_to_runtime_pending(
         revision,
         controller_id,
         fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::BeginActivation,
     )
     .await;
@@ -478,6 +540,7 @@ async fn advance_claim_to_runtime_pending(
         revision,
         controller_id,
         fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
             activation_request_id: ActivationRequestId::parse(ACTIVATION).unwrap(),
             target: target(),
@@ -719,6 +782,97 @@ async fn attempt_migration_rejects_ambiguous_legacy_execution_history() {
     .await
     .unwrap();
     assert_eq!(columns, 0);
+    drop_runtime_database(database).await;
+}
+
+#[tokio::test]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn last_controller_migration_rejects_ambiguous_execution_history() {
+    let database = isolated_runtime_database("last_controller_migration_legacy").await;
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.version < 202607220026)
+    {
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    seed_product_target(&database.pool).await;
+    let snapshot = sqlx::query_scalar::<_, Json<Value>>(
+        "SELECT snapshot FROM public.runtime_deployments WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let mut deployment = automation_runtime_convergence::RuntimeDeployment::restore(
+        serde_json::from_value(snapshot.0).unwrap(),
+    )
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+    let expires_at = now + TimeDelta::seconds(60);
+    deployment
+        .acquire_lease(automation_runtime_convergence::LeaseRequestV1 {
+            expected_revision: deployment.revision(),
+            controller_id: ControllerId::parse("legacy-last-controller").unwrap(),
+            fencing_token: FencingToken::new(1).unwrap(),
+            now,
+            expires_at,
+        })
+        .unwrap();
+    let claimed = deployment.snapshot();
+    sqlx::query("SELECT pg_catalog.set_config('starring.runtime_mutation_clock', $1, TRUE)")
+        .bind(now.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments SET snapshot = $2, revision = $3, \
+         controller_id = $4, controller_fencing_token = 1, controller_acquired_at = $5, \
+         controller_lease_expires_at = $6, last_fencing_token = 1, \
+         convergence_attempt_no = 1, updated_at = $5 WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .bind(Json(serde_json::to_value(&claimed).unwrap()))
+    .bind(i64::try_from(claimed.revision.get()).unwrap())
+    .bind("legacy-last-controller")
+    .bind(now)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 202607220026)
+        .unwrap();
+    let mut migration_transaction = database.pool.begin().await.unwrap();
+    let error = sqlx::raw_sql(migration.sql.as_ref())
+        .execute(&mut *migration_transaction)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("legacy runtime controller history cannot be inferred safely"));
+    migration_transaction.rollback().await.unwrap();
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT pg_catalog.to_regclass('public.runtime_deployments') IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute \
+             WHERE attrelid = 'public.runtime_deployments'::pg_catalog.regclass \
+               AND attname = 'last_controller_id' AND attnum > 0 AND NOT attisdropped)",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap());
     drop_runtime_database(database).await;
 }
 

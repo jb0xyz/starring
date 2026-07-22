@@ -60,6 +60,79 @@ fn adapter_sources_contain_no_comments() {
 }
 
 #[test]
+fn production_controller_uses_only_exact_convergence_guards() {
+    let controller = include_str!("../src/controller.rs");
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::renew_execution(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::mutate(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::certify_live(")
+            .count(),
+        1
+    );
+    for bypass in [
+        "renew_execution_guarded",
+        "mutate_guarded",
+        "certify_live_guarded",
+        "SubmitGuardedDeploymentMutationV1",
+        "SubmitGuardedLiveAttestationV1",
+    ] {
+        assert!(!controller.contains(bypass));
+    }
+    assert!(controller.contains("convergence_attempt: receipt.convergence_attempt"));
+    assert!(controller.contains("convergence_attempt: mutation.convergence_attempt"));
+    let model = include_str!("../src/model.rs");
+    for request in ["SubmitDeploymentMutationV1", "SubmitLiveAttestationV1"] {
+        let definition = model
+            .split(&format!("pub struct {request}"))
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .unwrap();
+        assert!(definition.contains("pub convergence_attempt: NonZeroU32"));
+    }
+}
+
+#[test]
+fn last_controller_migration_preserves_readiness_shape_and_fails_closed() {
+    let migration =
+        include_str!("../../../migrations/202607220026_persist_runtime_last_controller.sql");
+    assert!(migration.contains("legacy runtime controller history cannot be inferred safely"));
+    assert!(migration.contains("ADD COLUMN last_controller_id TEXT"));
+    assert!(migration.contains("AND last_controller_id IS NOT NULL"));
+    assert!(migration.contains("last_controller_id IS NOT DISTINCT FROM controller_id"));
+    assert!(migration.contains("ADD COLUMN serving_lease_duration_nanos BIGINT NOT NULL"));
+    assert!(migration.contains("runtime_attestations_serving_lease_duration_valid CHECK"));
+    assert!(migration.contains("duration_column_count <> 1"));
+    assert!(migration.contains("invalid_duration_column_count <> 0"));
+    assert!(migration.contains("duration_constraint_definition <> 'CHECK"));
+    assert!(migration.contains(
+        "CREATE OR REPLACE FUNCTION public.validate_runtime_convergence_attempt_projection()"
+    ));
+    assert!(migration.contains("runtime controller identity cannot change without a new fence"));
+    assert!(migration.contains("runtime fencing transition lacks its controller identity"));
+    assert!(!migration
+        .lines()
+        .any(|line| line.trim_start().starts_with("CREATE TRIGGER")));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT "));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+}
+
+#[test]
 fn previous_serving_observation_is_a_private_fenced_capability() {
     let migration =
         include_str!("../../../migrations/202607220023_observe_previous_runtime_serving.sql");

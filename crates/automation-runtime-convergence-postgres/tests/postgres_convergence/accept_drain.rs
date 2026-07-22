@@ -465,6 +465,7 @@ async fn prepare_drain_acceptance(pool: &PgPool) -> DrainAcceptanceFixture {
         next_claim.snapshot.revision,
         &next_claim.controller_id,
         next_claim.fencing_token,
+        next_claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: next_generation,
@@ -480,6 +481,7 @@ async fn prepare_drain_acceptance(pool: &PgPool) -> DrainAcceptanceFixture {
         next_revision,
         &next_claim.controller_id,
         next_claim.fencing_token,
+        next_claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -517,6 +519,7 @@ async fn prepare_no_previous_drain_acceptance(
         claim.snapshot.revision,
         &claim.controller_id,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
@@ -530,6 +533,7 @@ async fn prepare_no_previous_drain_acceptance(
         revision,
         &claim.controller_id,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -550,6 +554,7 @@ fn no_previous_accept_drain_request(
         expected_revision: fixture.revision,
         controller_id: fixture.claim.controller_id.clone(),
         fencing_token: fixture.claim.fencing_token,
+        convergence_attempt: fixture.claim.convergence_attempt,
         runtime_generation: RuntimeGeneration::FIRST,
         mutation: DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: None,
@@ -609,6 +614,7 @@ fn accept_drain_request_at(
         expected_revision: fixture.next_revision,
         controller_id: fixture.next_claim.controller_id.clone(),
         fencing_token: fixture.next_claim.fencing_token,
+        convergence_attempt: fixture.next_claim.convergence_attempt,
         runtime_generation: RuntimeGeneration::new(2).unwrap(),
         mutation: DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: Some(fixture.previous_runtime.clone()),
@@ -628,6 +634,7 @@ fn replay_certification_request(fixture: &DrainAcceptanceFixture) -> SubmitLiveA
         .unwrap(),
         controller_id: fixture.prior_claim.controller_id.clone(),
         fencing_token: fixture.prior_claim.fencing_token,
+        convergence_attempt: fixture.prior_claim.convergence_attempt,
         runtime_generation: RuntimeGeneration::FIRST,
         gateway_ready: live.gateway_ready,
         metadata: LiveMetadataV1 {

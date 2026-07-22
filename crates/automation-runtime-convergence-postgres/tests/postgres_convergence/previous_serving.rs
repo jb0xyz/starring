@@ -40,6 +40,7 @@ async fn previous_serving_absence_scenario(pool: PgPool, _: PgConnectOptions) {
         claim.snapshot.revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: RuntimeGeneration::FIRST,
@@ -53,6 +54,7 @@ async fn previous_serving_absence_scenario(pool: PgPool, _: PgConnectOptions) {
         revision,
         &controller,
         claim.fencing_token,
+        claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
@@ -154,6 +156,7 @@ async fn previous_serving_observation_scenario(
         next_claim.snapshot.revision,
         &next_controller,
         next_claim.fencing_token,
+        next_claim.convergence_attempt,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target(),
             runtime_generation: RuntimeGeneration::new(2).unwrap(),
@@ -169,6 +172,7 @@ async fn previous_serving_observation_scenario(
         revision,
         &next_controller,
         next_claim.fencing_token,
+        next_claim.convergence_attempt,
         DeploymentMutationV1::RequestDrain,
     )
     .await;

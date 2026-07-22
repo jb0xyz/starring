@@ -22,7 +22,7 @@ use automation_runtime_convergence_postgres::{
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
     PostgresRuntimeConvergenceConfigV1, PostgresRuntimeExactTargetReader,
-    RecoverBlockedDeploymentV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
+    RecoverBlockedDeploymentV1, RecoverStaleLiveV1, RenewDeploymentV1, RuntimeBuildRevisionV1,
     RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1,
     SubmitLiveAttestationV1, MIGRATOR,
 };
@@ -55,6 +55,7 @@ const ROTATED_BINDING_FINGERPRINT: &str =
 include!("postgres_convergence/migration_acl.rs");
 include!("postgres_convergence/binding_authority.rs");
 include!("postgres_convergence/convergence_attempt.rs");
+include!("postgres_convergence/guard_exactness.rs");
 include!("postgres_convergence/lifecycle.rs");
 include!("postgres_convergence/hydration.rs");
 include!("postgres_convergence/previous_serving.rs");

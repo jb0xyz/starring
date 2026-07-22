@@ -316,6 +316,7 @@ async fn operational_status_tracks_pristine_retry_blocked_and_recovered_attempts
             expected_revision: ready_revision,
             controller_id: first_claim.controller_id.clone(),
             fencing_token: first_claim.fencing_token,
+            convergence_attempt: first_claim.convergence_attempt,
             runtime_generation: first_claim.snapshot.runtime_generation,
             mutation: DeploymentMutationV1::RecordRetryableFailure {
                 failure_id: retry_failure_id,
@@ -398,6 +399,7 @@ async fn operational_status_tracks_pristine_retry_blocked_and_recovered_attempts
         second_claim.snapshot.revision,
         &second_controller,
         second_claim.fencing_token,
+        second_claim.convergence_attempt,
         second_claim.snapshot.runtime_generation,
         DeploymentMutationV1::ResumeRuntimePending,
     )
@@ -408,6 +410,7 @@ async fn operational_status_tracks_pristine_retry_blocked_and_recovered_attempts
         resumed_revision,
         &second_controller,
         second_claim.fencing_token,
+        second_claim.convergence_attempt,
         second_claim.snapshot.runtime_generation,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
@@ -421,6 +424,7 @@ async fn operational_status_tracks_pristine_retry_blocked_and_recovered_attempts
             expected_revision: panels_revision,
             controller_id: second_controller,
             fencing_token: second_claim.fencing_token,
+            convergence_attempt: second_claim.convergence_attempt,
             runtime_generation: second_claim.snapshot.runtime_generation,
             mutation: DeploymentMutationV1::RecordBlockedFailure {
                 failure_id: blocked_failure_id.clone(),
