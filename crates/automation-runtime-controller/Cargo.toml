@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
 chrono = "0.4"
+resource-resolution = { path = "../resource-resolution" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
@@ -14,4 +15,3 @@ thiserror = { workspace = true }
 [dev-dependencies]
 automation-ruleset = { path = "../automation-ruleset" }
 discord-model = { path = "../discord-model" }
-resource-resolution = { path = "../resource-resolution" }

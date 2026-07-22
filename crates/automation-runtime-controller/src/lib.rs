@@ -6,6 +6,7 @@ mod planner;
 mod port;
 mod retry;
 mod session;
+mod v2_binding;
 mod v2_identity;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
@@ -44,6 +45,7 @@ pub use session::{
     RuntimeConvergenceSessionError, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
     RuntimeServingSessionStateV1, RuntimeServingSessionV1,
 };
+pub use v2_binding::RuntimeBindingPinV1;
 pub use v2_identity::{
     RuntimeBarrierIdV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
     RuntimeRecoveryIdV2,

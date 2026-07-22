@@ -117,6 +117,7 @@ fn source_files_contain_no_comments() {
         ("src/persistence.rs", include_str!("../src/persistence.rs")),
         ("src/retry.rs", include_str!("../src/retry.rs")),
         ("src/session.rs", include_str!("../src/session.rs")),
+        ("src/v2_binding.rs", include_str!("../src/v2_binding.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
         (
             "tests/dependency_guard.rs",
