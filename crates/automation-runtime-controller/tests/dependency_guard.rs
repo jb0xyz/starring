@@ -127,6 +127,34 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
 }
 
 #[test]
+fn v2_digest_surface_stays_typed_and_nonserializable() {
+    let source = include_str!("../src/v2_digest.rs");
+    for forbidden in [
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "pub fn framed_sha256",
+        "pub(crate) fn framed_sha256",
+        "impl_computed_runtime_digest_v2!(RuntimeProductSemanticRequestDigestV2)",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 digest surface: {forbidden}"
+        );
+    }
+    for typed_helper in [
+        "certification_intent_fingerprint_v2",
+        "certification_request_digest_v2",
+        "live_attestation_digest_v2",
+        "product_mutation_digest_v2",
+        "drain_intent_digest_v2",
+        "suspend_attempt_digest_v2",
+    ] {
+        assert!(source.contains(&format!("pub(crate) fn {typed_helper}")));
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -139,6 +167,7 @@ fn source_files_contain_no_comments() {
         ("src/retry.rs", include_str!("../src/retry.rs")),
         ("src/session.rs", include_str!("../src/session.rs")),
         ("src/v2_binding.rs", include_str!("../src/v2_binding.rs")),
+        ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),

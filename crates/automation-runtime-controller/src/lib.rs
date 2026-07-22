@@ -7,6 +7,14 @@ mod port;
 mod retry;
 mod session;
 mod v2_binding;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "typed digest helpers are consumed by staged V2 canonical roots"
+    )
+)]
+mod v2_digest;
 mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
@@ -49,6 +57,11 @@ pub use session::{
     RuntimeServingSessionStateV1, RuntimeServingSessionV1,
 };
 pub use v2_binding::RuntimeBindingPinV1;
+pub use v2_digest::{
+    RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,
+    RuntimeDrainIntentDigestV2, RuntimeLiveAttestationDigestV2, RuntimeProductMutationDigestV2,
+    RuntimeProductSemanticRequestDigestV2, RuntimeSuspendAttemptDigestV2,
+};
 pub use v2_evidence::{
     RuntimeBarrierPauseWitnessV2, RuntimeEvidenceErrorV2, RuntimePanelEvidenceV2,
     RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,
