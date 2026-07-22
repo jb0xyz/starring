@@ -8,6 +8,7 @@ mod retry;
 mod session;
 mod v2_binding;
 mod v2_identity;
+mod v2_route;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
 pub use dto::{
@@ -50,3 +51,4 @@ pub use v2_identity::{
     RuntimeBarrierIdV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
     RuntimeRecoveryIdV2,
 };
+pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};

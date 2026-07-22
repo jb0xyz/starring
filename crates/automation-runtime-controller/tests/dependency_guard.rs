@@ -119,6 +119,7 @@ fn source_files_contain_no_comments() {
         ("src/session.rs", include_str!("../src/session.rs")),
         ("src/v2_binding.rs", include_str!("../src/v2_binding.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
+        ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
             "tests/dependency_guard.rs",
             include_str!("dependency_guard.rs"),
