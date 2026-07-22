@@ -478,6 +478,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-interaction-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-instance",
+ "automation-ruleset",
+ "automation-ruleset-dispatch",
+ "automation-state",
+ "chrono",
+ "discord-model",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "automation-runtime-panel-evidence"
 version = "0.1.0"
 dependencies = [

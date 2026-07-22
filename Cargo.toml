@@ -29,6 +29,7 @@ members = [
     "crates/automation-runtime-controller",
     "crates/automation-runtime-registry",
     "crates/automation-runtime-convergence-postgres",
+    "crates/automation-runtime-interaction-postgres",
     "crates/automation-runtime-panel-postgres",
     "crates/automation-runtime-panel-evidence",
     "crates/automation-instance",
