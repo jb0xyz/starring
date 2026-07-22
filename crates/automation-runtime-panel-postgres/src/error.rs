@@ -127,6 +127,10 @@ pub(crate) fn map_mutation_error(error: &sqlx::Error) -> RuntimePanelPersistence
     }
 }
 
+pub(crate) fn map_mutation_commit_error(_error: &sqlx::Error) -> RuntimePanelPersistenceErrorV1 {
+    RuntimePanelPersistenceErrorV1::Indeterminate
+}
+
 fn mutation_outcome_is_indeterminate(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(database) => database.code().is_some_and(|code| {
@@ -242,5 +246,15 @@ mod tests {
             map_mutation_error(&mutation),
             RuntimePanelPersistenceErrorV1::Indeterminate
         );
+    }
+
+    #[test]
+    fn every_mutation_commit_failure_is_indeterminate() {
+        for error in [database("57014"), database("55P03"), database("40001")] {
+            assert_eq!(
+                map_mutation_commit_error(&error),
+                RuntimePanelPersistenceErrorV1::Indeterminate
+            );
+        }
     }
 }

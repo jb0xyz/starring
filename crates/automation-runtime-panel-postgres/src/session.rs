@@ -16,8 +16,10 @@ use tokio::sync::Mutex;
 
 use crate::authority::{bind_runtime_panel_authority, RuntimePanelAuthorityV1};
 use crate::contract::{CHECK_QUERY, CLAIM_QUERY, SNAPSHOT_QUERY};
+use crate::database::{begin_panel_transaction, RuntimePanelDatabaseTimeoutsV1};
 use crate::error::{
-    map_mutation_error, map_query_error, stable_error_code, validate_millisecond_duration,
+    map_mutation_commit_error, map_mutation_error, map_query_error, stable_error_code,
+    validate_millisecond_duration,
 };
 use crate::row::{DecodedSnapshotRecordV1, RuntimePanelSnapshotRowV1};
 use crate::{RuntimePanelErrorClassV1, RuntimePanelLatchedErrorV1, RuntimePanelPersistenceErrorV1};
@@ -142,6 +144,7 @@ pub struct PostgresFencedStrictPanelStoreV1 {
     pub(crate) authority: RuntimePanelAuthorityV1,
     pub(crate) receipt: RuntimePanelSessionReceiptV1,
     pub(crate) side_effect_headroom: Duration,
+    pub(crate) database_timeouts: RuntimePanelDatabaseTimeoutsV1,
     pub(crate) state: Mutex<RuntimePanelStoreStateV1>,
 }
 
@@ -153,8 +156,34 @@ impl PostgresFencedStrictPanelStoreV1 {
         side_effect_headroom: Duration,
     ) -> Result<Self, RuntimePanelPersistenceErrorV1> {
         let session_id = RuntimePanelSessionIdV1::generate()?;
-        Self::claim_with_session_id(pool, guard, exact_target, side_effect_headroom, &session_id)
-            .await
+        Self::claim_with_session_id_and_timeouts(
+            pool,
+            guard,
+            exact_target,
+            side_effect_headroom,
+            &session_id,
+            RuntimePanelDatabaseTimeoutsV1::default(),
+        )
+        .await
+    }
+
+    pub async fn claim_with_timeouts(
+        pool: PgPool,
+        guard: RuntimeExecutionGuardV1,
+        exact_target: RuntimeExactTargetV1,
+        side_effect_headroom: Duration,
+        database_timeouts: RuntimePanelDatabaseTimeoutsV1,
+    ) -> Result<Self, RuntimePanelPersistenceErrorV1> {
+        let session_id = RuntimePanelSessionIdV1::generate()?;
+        Self::claim_with_session_id_and_timeouts(
+            pool,
+            guard,
+            exact_target,
+            side_effect_headroom,
+            &session_id,
+            database_timeouts,
+        )
+        .await
     }
 
     pub async fn claim_with_session_id(
@@ -164,15 +193,35 @@ impl PostgresFencedStrictPanelStoreV1 {
         side_effect_headroom: Duration,
         session_id: &RuntimePanelSessionIdV1,
     ) -> Result<Self, RuntimePanelPersistenceErrorV1> {
+        Self::claim_with_session_id_and_timeouts(
+            pool,
+            guard,
+            exact_target,
+            side_effect_headroom,
+            session_id,
+            RuntimePanelDatabaseTimeoutsV1::default(),
+        )
+        .await
+    }
+
+    pub async fn claim_with_session_id_and_timeouts(
+        pool: PgPool,
+        guard: RuntimeExecutionGuardV1,
+        exact_target: RuntimeExactTargetV1,
+        side_effect_headroom: Duration,
+        session_id: &RuntimePanelSessionIdV1,
+        database_timeouts: RuntimePanelDatabaseTimeoutsV1,
+    ) -> Result<Self, RuntimePanelPersistenceErrorV1> {
         validate_millisecond_duration(side_effect_headroom, MAX_RUNTIME_PANEL_LEASE_HEADROOM)?;
         let authority = RuntimePanelAuthorityV1::new(guard, exact_target)?;
+        let mut transaction = begin_panel_transaction(&pool, database_timeouts).await?;
         let query = bind_runtime_panel_authority!(
             sqlx::query_as::<_, SessionRowV1>(CLAIM_QUERY),
             &authority,
             session_id
         );
         let rows = query
-            .fetch_all(&pool)
+            .fetch_all(&mut *transaction)
             .await
             .map_err(|error| map_mutation_error(&error))?;
         let [row] = rows.as_slice() else {
@@ -185,6 +234,10 @@ impl PostgresFencedStrictPanelStoreV1 {
         if row.checked_at >= row.controller_lease_expires_at {
             return Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt);
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| map_mutation_commit_error(&error))?;
         Ok(Self {
             pool,
             authority,
@@ -195,6 +248,7 @@ impl PostgresFencedStrictPanelStoreV1 {
                 controller_lease_expires_at: row.controller_lease_expires_at,
             },
             side_effect_headroom,
+            database_timeouts,
             state: Mutex::new(RuntimePanelStoreStateV1::unprimed()),
         })
     }
@@ -211,13 +265,21 @@ impl PostgresFencedStrictPanelStoreV1 {
         if let Some(latch) = state.latch {
             return Err(latched_error(latch));
         }
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_as::<_, RuntimePanelSnapshotRowV1>(SNAPSHOT_QUERY),
             &self.authority,
             &self.receipt.session_id
         )
         .bind(self.receipt.session_record_revision.get() as i64);
-        let rows = match query.fetch_all(&self.pool).await {
+        let rows = match query.fetch_all(&mut *transaction).await {
             Ok(rows) => rows,
             Err(database) => {
                 let error = map_query_error(&database);
@@ -225,6 +287,11 @@ impl PostgresFencedStrictPanelStoreV1 {
                 return Err(error);
             }
         };
+        if let Err(database) = transaction.commit().await {
+            let error = map_query_error(&database);
+            state.record_error(&error);
+            return Err(error);
+        }
         let mut installations = BTreeMap::new();
         let mut journal = BTreeMap::new();
         for row in rows {
@@ -286,6 +353,14 @@ impl PostgresFencedStrictPanelStoreV1 {
         )?;
         let mut state = self.state.lock().await;
         state.require_active()?;
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_as::<_, SessionCheckRowV1>(CHECK_QUERY),
             &self.authority,
@@ -293,7 +368,7 @@ impl PostgresFencedStrictPanelStoreV1 {
         )
         .bind(self.receipt.session_record_revision.get() as i64)
         .bind(required_lease_headroom_ms);
-        let rows = match query.fetch_all(&self.pool).await {
+        let rows = match query.fetch_all(&mut *transaction).await {
             Ok(rows) => rows,
             Err(database) => {
                 let error = map_query_error(&database);
@@ -310,6 +385,11 @@ impl PostgresFencedStrictPanelStoreV1 {
             || row.controller_lease_expires_at != self.receipt.controller_lease_expires_at
         {
             let error = RuntimePanelPersistenceErrorV1::PersistenceCorrupt;
+            state.record_error(&error);
+            return Err(error);
+        }
+        if let Err(database) = transaction.commit().await {
+            let error = map_query_error(&database);
             state.record_error(&error);
             return Err(error);
         }

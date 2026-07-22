@@ -16,7 +16,8 @@ use crate::authority::bind_runtime_panel_authority;
 use crate::contract::{
     INSTALLATION_REMOVE_QUERY, INSTALLATION_UPSERT_QUERY, JOURNAL_PUT_QUERY, JOURNAL_REMOVE_QUERY,
 };
-use crate::error::{map_mutation_error, stable_error_code};
+use crate::database::begin_panel_transaction;
+use crate::error::{map_mutation_commit_error, map_mutation_error, stable_error_code};
 use crate::row::{state_tag, valid_hash, RECORD_FORMAT_VERSION};
 use crate::session::{PostgresFencedStrictPanelStoreV1, RuntimePanelStoreStateV1, VersionedV1};
 use crate::RuntimePanelPersistenceErrorV1;
@@ -87,6 +88,14 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&installation.panel_key)
             .map_or(0, |record| record.revision);
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(INSTALLATION_UPSERT_QUERY),
             &self.authority,
@@ -101,7 +110,7 @@ impl PostgresFencedStrictPanelStoreV1 {
         .bind(&installation.spec_hash)
         .bind(expected_journal_record_revision as i64);
         let revision = match fetch_mutation_revision(
-            query.fetch_all(&self.pool).await,
+            query.fetch_all(&mut *transaction).await,
             expected_record_revision,
         ) {
             Ok(revision) => revision,
@@ -110,6 +119,11 @@ impl PostgresFencedStrictPanelStoreV1 {
                 return Err(error);
             }
         };
+        if let Err(database) = transaction.commit().await {
+            let error = map_mutation_commit_error(&database);
+            state.record_error(&error);
+            return Err(error);
+        }
         state.installations.insert(
             installation.panel_key.clone(),
             VersionedV1 {
@@ -135,6 +149,14 @@ impl PostgresFencedStrictPanelStoreV1 {
             .installations
             .get(&key.panel_key)
             .map_or(0, |record| record.revision);
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(INSTALLATION_REMOVE_QUERY),
             &self.authority,
@@ -144,7 +166,7 @@ impl PostgresFencedStrictPanelStoreV1 {
         .bind(expected_record_revision as i64)
         .bind(&key.panel_key);
         let _revision = match fetch_mutation_revision(
-            query.fetch_all(&self.pool).await,
+            query.fetch_all(&mut *transaction).await,
             expected_record_revision,
         ) {
             Ok(revision) => revision,
@@ -153,6 +175,11 @@ impl PostgresFencedStrictPanelStoreV1 {
                 return Err(error);
             }
         };
+        if let Err(database) = transaction.commit().await {
+            let error = map_mutation_commit_error(&database);
+            state.record_error(&error);
+            return Err(error);
+        }
         state.installations.remove(&key.panel_key);
         state.record_success();
         Ok(())
@@ -201,6 +228,14 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&operation.key.panel_key)
             .map_or(0, |record| record.revision);
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(JOURNAL_PUT_QUERY),
             &self.authority,
@@ -213,7 +248,7 @@ impl PostgresFencedStrictPanelStoreV1 {
         .bind(state_tag(&operation.state))
         .bind(Json(&operation));
         let revision = match fetch_mutation_revision(
-            query.fetch_all(&self.pool).await,
+            query.fetch_all(&mut *transaction).await,
             expected_record_revision,
         ) {
             Ok(revision) => revision,
@@ -222,6 +257,11 @@ impl PostgresFencedStrictPanelStoreV1 {
                 return Err(error);
             }
         };
+        if let Err(database) = transaction.commit().await {
+            let error = map_mutation_commit_error(&database);
+            state.record_error(&error);
+            return Err(error);
+        }
         state.journal.insert(
             operation.key.panel_key.clone(),
             VersionedV1 {
@@ -247,6 +287,14 @@ impl PostgresFencedStrictPanelStoreV1 {
             .journal
             .get(&key.panel_key)
             .map_or(0, |record| record.revision);
+        let mut transaction =
+            match begin_panel_transaction(&self.pool, self.database_timeouts).await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    state.record_error(&error);
+                    return Err(error);
+                }
+            };
         let query = bind_runtime_panel_authority!(
             sqlx::query_scalar::<_, i64>(JOURNAL_REMOVE_QUERY),
             &self.authority,
@@ -256,7 +304,7 @@ impl PostgresFencedStrictPanelStoreV1 {
         .bind(expected_record_revision as i64)
         .bind(&key.panel_key);
         let _revision = match fetch_mutation_revision(
-            query.fetch_all(&self.pool).await,
+            query.fetch_all(&mut *transaction).await,
             expected_record_revision,
         ) {
             Ok(revision) => revision,
@@ -265,6 +313,11 @@ impl PostgresFencedStrictPanelStoreV1 {
                 return Err(error);
             }
         };
+        if let Err(database) = transaction.commit().await {
+            let error = map_mutation_commit_error(&database);
+            state.record_error(&error);
+            return Err(error);
+        }
         state.journal.remove(&key.panel_key);
         state.record_success();
         Ok(())

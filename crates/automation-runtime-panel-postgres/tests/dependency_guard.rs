@@ -41,6 +41,7 @@ fn adapter_sources_contain_no_comments() {
     let sources = [
         include_str!("../src/authority.rs"),
         include_str!("../src/contract.rs"),
+        include_str!("../src/database.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/reconcile.rs"),
@@ -62,6 +63,7 @@ fn adapter_sources_contain_no_comments() {
 fn adapter_contract_uses_only_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     for capability in [
+        "starring_runtime_panel_database_readiness_v1",
         "starring_runtime_panel_reconciliation_claim_v1",
         "starring_runtime_panel_reconciliation_check_v1",
         "starring_runtime_panel_reconciliation_snapshot_v1",
@@ -82,4 +84,24 @@ fn adapter_contract_uses_only_private_capabilities() {
     ] {
         assert!(!contract.contains(forbidden));
     }
+}
+
+#[test]
+fn adapter_database_transactions_are_bounded_in_canonical_order() {
+    let database = include_str!("../src/database.rs");
+    let statement = database
+        .find("pg_catalog.set_config('statement_timeout'")
+        .unwrap();
+    let lock = database
+        .find("pg_catalog.set_config('lock_timeout'")
+        .unwrap();
+    let idle = database
+        .find("pg_catalog.set_config('idle_in_transaction_session_timeout'")
+        .unwrap();
+    let search_path = database
+        .find("pg_catalog.set_config('search_path'")
+        .unwrap();
+    assert!(statement < lock && lock < idle && idle < search_path);
+    assert!(database.contains("MAX_RUNTIME_PANEL_DATABASE_TIMEOUT"));
+    assert!(database.contains("begin_panel_transaction"));
 }
