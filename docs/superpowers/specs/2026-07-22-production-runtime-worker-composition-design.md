@@ -883,9 +883,19 @@ Every top-level projection follows all of these rules:
   Byte identities use their one checked lowercase hexadecimal representation.
   A `Debug` string, platform formatter, locale, or database JSON rendering is
   never canonical input.
+- Discord snowflake values in a V2 root use JSON strings containing their
+  unsigned decimal representation. The accepted range is
+  `1..=18446744073709551615`; a sign, leading zero, whitespace, non-decimal
+  byte, JSON number, or zero is rejected. PostgreSQL stores this value as
+  `text`, never casts it to `bigint`, and checks
+  `^[1-9][0-9]{0,19}$` plus, for a 20-byte value, C-collation lexical order at
+  or below `18446744073709551615`. This rule is spelled out by the private V2
+  projection and does not delegate canonical identity to `discord-model`
+  Serde.
 
-Every persistence-bound `u64` and `NonZeroU64`, including values nested in V1
-domain objects, is restricted to `0..=9223372036854775807` or
+Except for the textual Discord snowflakes above, every persistence-bound `u64`
+and `NonZeroU64`, including values nested in V1 domain objects, is restricted
+to `0..=9223372036854775807` or
 `1..=9223372036854775807` respectively. Rust constructors and canonical
 decoders reject larger values before SQLx binding. PostgreSQL stores them as
 `bigint` with matching checks. Golden and real-database tests cover
@@ -967,8 +977,10 @@ implicitly.
 
 Every `DateTime<Utc>` in a V2 canonical projection is a signed 64-bit Unix
 microsecond JSON integer in a field ending `_unix_microseconds`. Encoding
-rejects a domain value with nonzero sub-microsecond nanoseconds. The inclusive
-canonical range is
+rejects a domain value with nonzero sub-microsecond nanoseconds. It also
+rejects Chrono's leap-second representation, identified by
+`timestamp_subsec_nanos() >= 1_000_000_000`, because PostgreSQL has no
+bijective representation for that value. The inclusive canonical range is
 `-62135596800000000..=253402300799999999`, covering UTC years 0001 through
 9999. Rust checked conversion rejects every value outside that range.
 
@@ -1151,7 +1163,12 @@ serving output, commit timestamp, or snapshot into the Live preimage must be
 impossible through the typed API. Root-size limits, `i64::MAX` integer bounds,
 all payload variant shapes, no-flatten guards, Product semantic digest format,
 Product and drain non-self-reference, `from_request` cross-field mismatches,
-and exact Live-record concatenation are mandatory cases.
+and exact Live-record concatenation are mandatory cases. Snowflake cases accept
+`"1"`, `"9223372036854775808"`, and `"18446744073709551615"`; they reject an
+empty string, `"0"`, `"01"`, signs, whitespace, non-decimal bytes,
+`"18446744073709551616"`, JSON numbers, and alternate escapes. Timestamp cases
+also reject a microsecond-aligned Chrono leap second with
+`timestamp_subsec_nanos() == 1_000_000_000`.
 
 Real PostgreSQL 16 release gates create the migrated schema and directly prove
 all identifier and digest checks, including uppercase and wrong-length
@@ -1160,6 +1177,9 @@ persist and reload exact canonical `bytea`, and prove no `jsonb` round trip is
 used. Direct hostile calls submit reordered, whitespace-padded,
 alternate-escaped, and cross-field-mismatched roots together with the correct
 hash of those hostile bytes; every procedure must reject without a write.
+Snowflake SQL cases accept `9223372036854775808` and
+`18446744073709551615` as text while rejecting zero, leading zeros, JSON
+numbers, and `18446744073709551616` without a `bigint` cast.
 Timestamp parity covers negative microseconds, epoch, positive values,
 database-produced `clock_timestamp()`, boundary rejection, and exact
 microsecond round trips. Lease parity covers both accepted boundaries and each
