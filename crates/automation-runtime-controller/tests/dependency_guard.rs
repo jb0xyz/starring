@@ -106,6 +106,23 @@ fn persistence_contract_is_versioned_and_database_independent() {
 }
 
 #[test]
+fn gateway_evidence_stays_domain_only_and_runtime_independent() {
+    let source = include_str!("../src/v2_gateway.rs");
+    for forbidden in [
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "GatewayReadyLeaseV3",
+        "automation_runtime::",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden gateway surface: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -118,6 +135,7 @@ fn source_files_contain_no_comments() {
         ("src/retry.rs", include_str!("../src/retry.rs")),
         ("src/session.rs", include_str!("../src/session.rs")),
         ("src/v2_binding.rs", include_str!("../src/v2_binding.rs")),
+        ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
