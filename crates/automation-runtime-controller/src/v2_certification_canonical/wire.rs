@@ -183,6 +183,41 @@ struct TargetFields {
     binding_fingerprint: RuntimeCertificationCanonicalFieldV2,
 }
 
+pub(super) struct CanonicalIntentEncoding {
+    wire: CertificationIntentWireV2,
+    bytes: Vec<u8>,
+    fingerprint: RuntimeCertificationIntentFingerprintV2,
+}
+
+impl CanonicalIntentEncoding {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn into_parts(self) -> (Vec<u8>, RuntimeCertificationIntentFingerprintV2) {
+        (self.bytes, self.fingerprint)
+    }
+}
+
+pub(super) struct CanonicalRequestEncoding {
+    bytes: Vec<u8>,
+    digest: RuntimeCertificationRequestDigestV2,
+}
+
+impl CanonicalRequestEncoding {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn digest(&self) -> &RuntimeCertificationRequestDigestV2 {
+        &self.digest
+    }
+
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 const TARGET_FIELDS: TargetFields = TargetFields {
     guild_id: RuntimeCertificationCanonicalFieldV2::TargetGuildId,
     ruleset_key: RuntimeCertificationCanonicalFieldV2::TargetRuleSetKey,
@@ -221,7 +256,13 @@ const ROUTE_TARGET_FIELDS: TargetFields = TargetFields {
 
 pub(super) fn encode_certification_intent(
     intent: &RuntimeCertificationIntentV2,
-) -> Result<Vec<u8>, RuntimeCertificationCanonicalErrorV2> {
+) -> Result<CanonicalIntentEncoding, RuntimeCertificationCanonicalErrorV2> {
+    encode_intent(intent)
+}
+
+fn encode_intent(
+    intent: &RuntimeCertificationIntentV2,
+) -> Result<CanonicalIntentEncoding, RuntimeCertificationCanonicalErrorV2> {
     validate_intent(intent)?;
     let root = RuntimeCertificationCanonicalRootV2::Intent;
     let lease = RuntimeServingLeaseMillisecondsV2::from_duration(intent.serving_lease_for)
@@ -258,7 +299,12 @@ pub(super) fn encode_certification_intent(
     let encoded = serde_json::to_vec(&wire)
         .map_err(|_| RuntimeCertificationCanonicalErrorV2::Encoding { root })?;
     ensure_size(&encoded)?;
-    Ok(encoded)
+    let fingerprint = crate::v2_digest::certification_intent_fingerprint_v2(&encoded);
+    Ok(CanonicalIntentEncoding {
+        wire,
+        bytes: encoded,
+        fingerprint,
+    })
 }
 
 pub(super) fn decode_certification_intent(
@@ -268,6 +314,18 @@ pub(super) fn decode_certification_intent(
     let root = RuntimeCertificationCanonicalRootV2::Intent;
     let wire = serde_json::from_slice::<CertificationIntentWireV2>(encoded)
         .map_err(|_| RuntimeCertificationCanonicalErrorV2::Decoding { root })?;
+    let intent = decode_intent_wire(wire)?;
+    let canonical = encode_certification_intent(&intent)?;
+    if canonical.bytes() != encoded {
+        return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
+    }
+    Ok(intent)
+}
+
+fn decode_intent_wire(
+    wire: CertificationIntentWireV2,
+) -> Result<RuntimeCertificationIntentV2, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::Intent;
     if wire.format_version != FORMAT_VERSION {
         return Err(RuntimeCertificationCanonicalErrorV2::UnsupportedFormatVersion { root });
     }
@@ -307,23 +365,22 @@ pub(super) fn decode_certification_intent(
         serving_lease_for: Duration::from_millis(serving_lease.get()),
     };
     validate_intent(&intent)?;
-    let canonical_bytes = encode_certification_intent(&intent)?;
-    if canonical_bytes != encoded {
-        return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
-    }
     Ok(intent)
 }
 
 pub(super) fn encode_certification_request(
     request: &RuntimeCertificationRequestV2,
-) -> Result<Vec<u8>, RuntimeCertificationCanonicalErrorV2> {
-    validate_request(request)?;
+) -> Result<CanonicalRequestEncoding, RuntimeCertificationCanonicalErrorV2> {
     let root = RuntimeCertificationCanonicalRootV2::Request;
     let wire = encode_request_wire(request)?;
     let encoded = serde_json::to_vec(&wire)
         .map_err(|_| RuntimeCertificationCanonicalErrorV2::Encoding { root })?;
     ensure_root_size(&encoded, root, CERTIFICATION_REQUEST_MAX_OCTETS)?;
-    Ok(encoded)
+    let digest = certification_request_digest_v2(&encoded);
+    Ok(CanonicalRequestEncoding {
+        bytes: encoded,
+        digest,
+    })
 }
 
 pub(super) fn decode_certification_request(
@@ -334,35 +391,30 @@ pub(super) fn decode_certification_request(
     let wire = serde_json::from_slice::<CertificationRequestWireV2>(encoded)
         .map_err(|_| RuntimeCertificationCanonicalErrorV2::Decoding { root })?;
     let request = decode_request_wire(wire)?;
-    validate_request(&request)?;
-    if encode_certification_request(&request)? != encoded {
+    let canonical = encode_certification_request(&request)?;
+    if canonical.bytes() != encoded {
         return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
     }
+    drop(canonical);
     Ok(request)
 }
 
 pub(super) fn encode_live_attestation_record(
-    record: &RuntimeLiveAttestationRecordV2,
-    request_bytes: &[u8],
+    request_digest: &RuntimeCertificationRequestDigestV2,
+    request: &CanonicalRequestEncoding,
 ) -> Result<Vec<u8>, RuntimeCertificationCanonicalErrorV2> {
     let root = RuntimeCertificationCanonicalRootV2::LiveAttestation;
-    if encode_certification_request(record.request())? != request_bytes {
-        return Err(
-            RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
-                field: RuntimeCertificationRequestCorrelationV2::LiveRequestRoot,
-            },
-        );
-    }
-    if certification_request_digest_v2(request_bytes) != *record.request_digest() {
+    if request.digest() != request_digest {
         return Err(
             RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
                 field: RuntimeCertificationRequestCorrelationV2::LiveRequestDigest,
             },
         );
     }
+    let request_bytes = request.bytes();
     let mut encoded = Vec::with_capacity(115 + request_bytes.len());
     encoded.extend_from_slice(b"{\"format_version\":2,\"request_digest\":\"");
-    encoded.extend_from_slice(record.request_digest().as_str().as_bytes());
+    encoded.extend_from_slice(request_digest.as_str().as_bytes());
     encoded.extend_from_slice(b"\",\"request\":");
     encoded.extend_from_slice(request_bytes);
     encoded.push(b'}');
@@ -383,32 +435,28 @@ pub(super) fn decode_live_attestation_record(
     let request_digest = RuntimeCertificationRequestDigestV2::parse(wire.request_digest)
         .map_err(|_| live_invalid(RuntimeCertificationCanonicalFieldV2::RequestDigest))?;
     let request = decode_request_wire(wire.request)?;
-    validate_request(&request)?;
-    let request_bytes = encode_certification_request(&request)?;
-    if certification_request_digest_v2(&request_bytes) != request_digest {
+    let request_encoding = encode_certification_request(&request)?;
+    if request_encoding.digest() != &request_digest {
         return Err(
             RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
                 field: RuntimeCertificationRequestCorrelationV2::LiveRequestDigest,
             },
         );
     }
-    let record = RuntimeLiveAttestationRecordV2 {
-        request_digest,
-        request,
-    };
-    if encode_live_attestation_record(&record, &request_bytes)? != encoded {
+    if encode_live_attestation_record(&request_digest, &request_encoding)? != encoded {
         return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
     }
-    Ok(record)
+    Ok(RuntimeLiveAttestationRecordV2 {
+        request_digest,
+        request,
+    })
 }
 
 fn encode_request_wire(
     request: &RuntimeCertificationRequestV2,
 ) -> Result<CertificationRequestWireV2, RuntimeCertificationCanonicalErrorV2> {
-    let root = RuntimeCertificationCanonicalRootV2::Request;
-    let intent_bytes = encode_certification_intent(&request.intent)?;
-    let intent = serde_json::from_slice::<CertificationIntentWireV2>(&intent_bytes)
-        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Encoding { root })?;
+    let intent = encode_intent(&request.intent)?;
+    validate_request(request, &intent.fingerprint)?;
     let must_commit_before = RuntimeUnixMicrosecondsV2::from_datetime(request.must_commit_before)
         .map_err(|reason| {
         request_canonical(
@@ -418,7 +466,7 @@ fn encode_request_wire(
     })?;
     Ok(CertificationRequestWireV2 {
         format_version: FORMAT_VERSION,
-        intent,
+        intent: intent.wire,
         intent_fingerprint: request.intent_fingerprint.as_str().to_owned(),
         must_commit_before_unix_microseconds: must_commit_before.get(),
         route_admission: encode_route_admission(&request.route_admission)?,

@@ -444,6 +444,20 @@ fn v2_certification_canonical_surface_stays_closed() {
 }
 
 #[test]
+fn v2_certification_encoding_reuses_checked_canonical_parts() {
+    let canonical = include_str!("../src/v2_certification_canonical.rs");
+    let wire = include_str!("../src/v2_certification_canonical/wire.rs");
+
+    assert!(wire.contains("struct CanonicalIntentEncoding"));
+    assert!(wire.contains("pub(super) struct CanonicalRequestEncoding"));
+    assert!(wire.contains("validate_request(request, &intent.fingerprint)?"));
+    assert!(!wire.contains("serde_json::from_slice::<CertificationIntentWireV2>(&intent_bytes)"));
+    assert!(!wire.contains("encode_certification_request(record.request())?"));
+    assert!(canonical.contains("if record.request.intent != self.intent"));
+    assert!(!canonical.contains("record.request.intent.clone()"));
+}
+
+#[test]
 fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
     for (path, source) in [
         ("v2_product.rs", include_str!("../src/v2_product.rs")),

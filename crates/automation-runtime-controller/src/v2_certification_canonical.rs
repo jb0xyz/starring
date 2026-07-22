@@ -195,8 +195,7 @@ impl RuntimeCanonicalCertificationIntentV2 {
     pub fn new(
         intent: RuntimeCertificationIntentV2,
     ) -> Result<Self, RuntimeCertificationCanonicalErrorV2> {
-        let bytes = wire::encode_certification_intent(&intent)?;
-        let fingerprint = certification_intent_fingerprint_v2(&bytes);
+        let (bytes, fingerprint) = wire::encode_certification_intent(&intent)?.into_parts();
         Ok(Self {
             intent,
             bytes: bytes.into_boxed_slice(),
@@ -240,10 +239,8 @@ impl RuntimeCanonicalCertificationIntentV2 {
         &self,
         record: RuntimeLiveAttestationRecordV2,
     ) -> Result<RuntimeCanonicalLiveAttestationV2, RuntimeCertificationCanonicalErrorV2> {
-        let embedded_intent =
-            RuntimeCanonicalCertificationIntentV2::new(record.request.intent.clone())?;
-        if embedded_intent.certification_intent_bytes() != self.certification_intent_bytes()
-            || embedded_intent.intent_fingerprint() != self.intent_fingerprint()
+        if record.request.intent != self.intent
+            || record.request.intent_fingerprint != self.fingerprint
         {
             return Err(
                 RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
@@ -251,17 +248,18 @@ impl RuntimeCanonicalCertificationIntentV2 {
                 },
             );
         }
-        let request_bytes = wire::encode_certification_request(&record.request)?;
-        let request_digest = certification_request_digest_v2(&request_bytes);
-        if request_digest != record.request_digest {
+        let request_encoding = wire::encode_certification_request(&record.request)?;
+        if request_encoding.digest() != &record.request_digest {
             return Err(
                 RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
                     field: RuntimeCertificationRequestCorrelationV2::LiveRequestDigest,
                 },
             );
         }
-        let live_record_bytes = wire::encode_live_attestation_record(&record, &request_bytes)?;
+        let live_record_bytes =
+            wire::encode_live_attestation_record(&record.request_digest, &request_encoding)?;
         let live_digest = live_attestation_digest_v2(&live_record_bytes);
+        let request_bytes = request_encoding.into_bytes();
         Ok(RuntimeCanonicalLiveAttestationV2 {
             reserved_intent: self.clone(),
             record,
@@ -282,8 +280,9 @@ impl RuntimeLiveAttestationRecordV2 {
     pub fn from_request(
         request: RuntimeCertificationRequestV2,
     ) -> Result<Self, RuntimeCertificationCanonicalErrorV2> {
-        let request_bytes = wire::encode_certification_request(&request)?;
-        let request_digest = certification_request_digest_v2(&request_bytes);
+        let request_digest = wire::encode_certification_request(&request)?
+            .digest()
+            .clone();
         Ok(Self {
             request_digest,
             request,
@@ -447,10 +446,9 @@ fn validate_intent(
 
 fn validate_request(
     request: &RuntimeCertificationRequestV2,
+    intent_fingerprint: &RuntimeCertificationIntentFingerprintV2,
 ) -> Result<(), RuntimeCertificationCanonicalErrorV2> {
-    let intent_bytes = wire::encode_certification_intent(&request.intent)?;
-    let intent_fingerprint = certification_intent_fingerprint_v2(&intent_bytes);
-    if intent_fingerprint != request.intent_fingerprint {
+    if intent_fingerprint != &request.intent_fingerprint {
         return Err(
             RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
                 field: RuntimeCertificationRequestCorrelationV2::IntentFingerprint,
