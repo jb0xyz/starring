@@ -58,7 +58,8 @@ pub use v2_gateway::{
     RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
 };
 pub use v2_identity::{
-    RuntimeBarrierIdV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
-    RuntimeRecoveryIdV2,
+    RuntimeBarrierIdV1, RuntimeCertificationOperationIdV2, RuntimeDrainIntentIdV2,
+    RuntimeGatewayAdmissionSequenceV2, RuntimeProductOperationIdV2, RuntimeRecoveryIdV2,
+    RuntimeSuspensionIdV2,
 };
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
