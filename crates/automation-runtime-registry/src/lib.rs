@@ -8,5 +8,5 @@ pub use registry::{
     ActiveInteractionGuardV1, AdmittedInteractionV1, ServingSlotRegistryConfigV1,
     ServingSlotRegistryV1, ServingSlotSnapshotV1, SlotActivationOutcomeV1, SlotDrainObservationV1,
     SlotDrainOutcomeV1, SlotInstallOutcomeV1, SlotInstallReceiptV1, SlotLifecycleV1,
-    SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteStatusV1,
+    SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteStatusV1, SlotRouteWitnessV1,
 };

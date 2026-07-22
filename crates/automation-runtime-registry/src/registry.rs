@@ -150,6 +150,14 @@ pub struct SlotRouteStatusV1 {
     pub token: SlotMutationTokenV1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotRouteWitnessV1 {
+    pub identity: RuntimeProcessIdentityV1,
+    pub fencing_token: FencingToken,
+    pub incarnation: NonZeroU64,
+    pub lifecycle: SlotLifecycleV1,
+}
+
 pub struct AdmittedInteractionV1 {
     route: ExactServingRouteV1,
     snapshot: ServingSlotSnapshotV1,
@@ -630,6 +638,78 @@ impl ServingSlotRegistryV1 {
             active_interactions: route.active_interactions,
             token: route.mutation_token(Arc::downgrade(&self.inner), token.key()),
         })
+    }
+
+    pub fn route_witness(
+        &self,
+        token: &SlotMutationTokenV1,
+    ) -> Result<SlotRouteWitnessV1, ServingSlotRegistryError> {
+        self.ensure_registry_token(token)?;
+        let state = self.lock_state()?;
+        let slot = state
+            .slots
+            .get(token.key())
+            .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        let route = find_record(slot, token).ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        Ok(SlotRouteWitnessV1 {
+            identity: route.route.identity().clone(),
+            fencing_token: route.fencing_token,
+            incarnation: route.incarnation,
+            lifecycle: route.lifecycle,
+        })
+    }
+
+    pub fn advance_authority(
+        &self,
+        token: &SlotMutationTokenV1,
+        expected_identity: &RuntimeProcessIdentityV1,
+        next_fencing_token: FencingToken,
+    ) -> Result<SlotMutationTokenV1, ServingSlotRegistryError> {
+        self.ensure_registry_token(token)?;
+        let mut state = self.lock_state()?;
+        let slot = state
+            .slots
+            .get_mut(token.key())
+            .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_high_water(Some(slot), token)?;
+        let staged_matches = slot
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.matches(token));
+        let current_matches = slot
+            .current
+            .as_ref()
+            .is_some_and(|current| current.matches(token));
+        if !staged_matches && !current_matches {
+            return Err(ServingSlotRegistryError::StaleMutationToken);
+        }
+        if token.identity() != expected_identity {
+            return Err(ServingSlotRegistryError::AuthorityTargetMismatch);
+        }
+        let expected_fencing_token = token
+            .fencing_token()
+            .next()
+            .map_err(|_| ServingSlotRegistryError::FencingTokenExhausted)?;
+        if next_fencing_token != expected_fencing_token {
+            return Err(ServingSlotRegistryError::NonSuccessorFencingToken {
+                expected: expected_fencing_token,
+                actual: next_fencing_token,
+            });
+        }
+        let (route, high_water) = if staged_matches {
+            match (&mut slot.staged, &mut slot.high_water) {
+                (Some(staged), Some(high_water)) => (staged, high_water),
+                _ => return Err(ServingSlotRegistryError::StaleMutationToken),
+            }
+        } else {
+            match (&mut slot.current, &mut slot.high_water) {
+                (Some(current), Some(high_water)) => (current, high_water),
+                _ => return Err(ServingSlotRegistryError::StaleMutationToken),
+            }
+        };
+        route.fencing_token = next_fencing_token;
+        high_water.fencing_token = next_fencing_token;
+        Ok(route.mutation_token(Arc::downgrade(&self.inner), token.key()))
     }
 
     fn ensure_registry_token(

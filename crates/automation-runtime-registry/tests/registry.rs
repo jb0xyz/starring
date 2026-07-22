@@ -501,6 +501,14 @@ fn token_from_another_registry_is_never_authoritative() {
         second_registry.activate(&foreign, candidate.identity()),
         Err(ServingSlotRegistryError::StaleMutationToken)
     );
+    assert_eq!(
+        second_registry.route_witness(&foreign),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(
+        second_registry.advance_authority(&foreign, candidate.identity(), fence(2)),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
 }
 
 #[test]
@@ -583,6 +591,230 @@ fn latest_authority_can_control_current_after_staged_cancellation() {
     assert_eq!(
         registry
             .remove_with_authority(&replacement_token, &first_token)
+            .unwrap(),
+        SlotRemovalOutcomeV1::RemovedDraining
+    );
+}
+
+#[test]
+fn staged_authority_advances_by_one_and_invalidates_the_old_token() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let old = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    let before = registry.route_witness(&old).unwrap();
+    assert_eq!(before.identity, candidate.identity().clone());
+    assert_eq!(before.fencing_token, fence(1));
+    assert_eq!(before.lifecycle, SlotLifecycleV1::Staged);
+
+    let other = route(10, "study", 2, 2, "p2", Some(50));
+    assert_eq!(
+        registry.advance_authority(&old, other.identity(), fence(2)),
+        Err(ServingSlotRegistryError::AuthorityTargetMismatch)
+    );
+    for actual in [fence(1), fence(3)] {
+        assert_eq!(
+            registry.advance_authority(&old, candidate.identity(), actual),
+            Err(ServingSlotRegistryError::NonSuccessorFencingToken {
+                expected: fence(2),
+                actual,
+            })
+        );
+        assert_eq!(registry.route_witness(&old).unwrap(), before);
+    }
+
+    let current = registry
+        .advance_authority(&old, candidate.identity(), fence(2))
+        .unwrap();
+    let after = registry.route_witness(&current).unwrap();
+    assert_eq!(after.identity, before.identity);
+    assert_eq!(after.incarnation, before.incarnation);
+    assert_eq!(after.fencing_token, fence(2));
+    assert_eq!(after.lifecycle, SlotLifecycleV1::Staged);
+    assert_eq!(
+        registry.route_witness(&old),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(
+        registry.advance_authority(&old, candidate.identity(), fence(u64::MAX)),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(
+        registry.install(key.clone(), candidate.clone(), fence(1)),
+        Err(ServingSlotRegistryError::StaleFencingToken {
+            minimum: fence(2),
+            actual: fence(1),
+        })
+    );
+    let replay = registry.install(key, candidate.clone(), fence(2)).unwrap();
+    assert_eq!(replay.outcome, SlotInstallOutcomeV1::AlreadyStaged);
+    assert_eq!(replay.token, current);
+    registry.activate(&current, candidate.identity()).unwrap();
+}
+
+#[test]
+fn serving_and_draining_authority_advancement_preserves_active_work() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let serving = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&serving, candidate.identity()).unwrap();
+    let interaction = registry.admit(&key).unwrap();
+    let renewed = registry
+        .advance_authority(&serving, candidate.identity(), fence(2))
+        .unwrap();
+    let status = registry.route_status(&renewed).unwrap();
+    assert_eq!(status.lifecycle, SlotLifecycleV1::Serving);
+    assert_eq!(status.active_interactions, 1);
+    assert_eq!(
+        registry.begin_drain(&renewed).unwrap(),
+        SlotDrainOutcomeV1::DrainStarted {
+            active_interactions: 1
+        }
+    );
+    let draining = registry
+        .advance_authority(&renewed, candidate.identity(), fence(3))
+        .unwrap();
+    let witness = registry.route_witness(&draining).unwrap();
+    assert_eq!(witness.lifecycle, SlotLifecycleV1::Draining);
+    assert_eq!(witness.fencing_token, fence(3));
+    assert_eq!(
+        registry.remove(&draining),
+        Err(ServingSlotRegistryError::ActiveInteractionsRemain { active: 1 })
+    );
+    drop(interaction);
+    assert!(registry.observe_drain(&draining).unwrap().drained);
+    assert_eq!(
+        registry.remove(&draining).unwrap(),
+        SlotRemovalOutcomeV1::RemovedDraining
+    );
+}
+
+#[test]
+fn retired_or_exhausted_authority_cannot_be_advanced() {
+    let active_registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let key = first.slot_key();
+    let first_token = active_registry
+        .install(key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    active_registry
+        .activate(&first_token, first.identity())
+        .unwrap();
+    let interaction = active_registry.admit(&key).unwrap();
+    let replacement = route(10, "study", 2, 2, "p2", Some(50));
+    let replacement_token = active_registry
+        .install(key, replacement.clone(), fence(2))
+        .unwrap()
+        .token;
+    active_registry
+        .activate(&replacement_token, replacement.identity())
+        .unwrap();
+    assert_eq!(
+        active_registry.advance_authority(&first_token, first.identity(), fence(2)),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    drop(interaction);
+
+    let exhausted_registry = registry(8);
+    let exhausted = route(20, "study", 1, 1, "p3", None);
+    let exhausted_token = exhausted_registry
+        .install(exhausted.slot_key(), exhausted.clone(), fence(u64::MAX))
+        .unwrap()
+        .token;
+    assert_eq!(
+        exhausted_registry.advance_authority(
+            &exhausted_token,
+            exhausted.identity(),
+            fence(u64::MAX),
+        ),
+        Err(ServingSlotRegistryError::FencingTokenExhausted)
+    );
+    assert_eq!(
+        exhausted_registry
+            .route_witness(&exhausted_token)
+            .unwrap()
+            .fencing_token,
+        fence(u64::MAX)
+    );
+}
+
+#[test]
+fn authority_advancement_does_not_consume_an_incarnation() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let first_token = registry
+        .install(first.slot_key(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    let first_witness = registry.route_witness(&first_token).unwrap();
+    let renewed = registry
+        .advance_authority(&first_token, first.identity(), fence(2))
+        .unwrap();
+    registry.remove(&renewed).unwrap();
+
+    let second = route(10, "study", 2, 2, "p2", Some(50));
+    let second_token = registry
+        .install(second.slot_key(), second, fence(1))
+        .unwrap()
+        .token;
+    let second_witness = registry.route_witness(&second_token).unwrap();
+    assert_eq!(
+        second_witness.incarnation.get(),
+        first_witness.incarnation.get() + 1
+    );
+}
+
+#[test]
+fn replacement_authority_can_remove_a_refenced_retired_route() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let key = first.slot_key();
+    let first_token = registry
+        .install(key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&first_token, first.identity()).unwrap();
+    let interaction = registry.admit(&key).unwrap();
+    let old_snapshot = interaction.token().clone();
+    let first_renewed = registry
+        .advance_authority(&first_token, first.identity(), fence(2))
+        .unwrap();
+    assert_eq!(
+        registry.route_witness(&old_snapshot),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+
+    let replacement = route(10, "study", 2, 2, "p2", Some(50));
+    let replacement_token = registry
+        .install(key, replacement.clone(), fence(3))
+        .unwrap()
+        .token;
+    registry
+        .activate(&replacement_token, replacement.identity())
+        .unwrap();
+    let retired = registry.route_witness(&first_renewed).unwrap();
+    assert_eq!(retired.lifecycle, SlotLifecycleV1::Draining);
+    assert_eq!(retired.fencing_token, fence(2));
+    assert_eq!(
+        registry
+            .route_status(&first_renewed)
+            .unwrap()
+            .active_interactions,
+        1
+    );
+    drop(interaction);
+    assert!(registry.observe_drain(&first_renewed).unwrap().drained);
+    assert_eq!(
+        registry
+            .remove_with_authority(&replacement_token, &first_renewed)
             .unwrap(),
         SlotRemovalOutcomeV1::RemovedDraining
     );

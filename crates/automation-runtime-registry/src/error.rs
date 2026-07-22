@@ -30,6 +30,15 @@ pub enum ServingSlotRegistryError {
     },
     #[error("runtime generation cannot identify two different immutable targets")]
     RuntimeGenerationIdentityConflict,
+    #[error("slot authority target does not exactly match the installed target")]
+    AuthorityTargetMismatch,
+    #[error("fencing token {actual} is not the exact successor {expected}")]
+    NonSuccessorFencingToken {
+        expected: FencingToken,
+        actual: FencingToken,
+    },
+    #[error("serving slot fencing token space is exhausted")]
+    FencingTokenExhausted,
     #[error("slot mutation token is stale")]
     StaleMutationToken,
     #[error("activation target does not exactly match the staged target")]
