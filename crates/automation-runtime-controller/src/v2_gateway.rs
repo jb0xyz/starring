@@ -39,7 +39,8 @@ pub struct RuntimeGatewayReadyAttestationV2 {
 
 impl RuntimeGatewayReadyAttestationV2 {
     pub fn was_explicitly_resumed(&self) -> bool {
-        self.resume_sequence.get() > self.connected_event_sequence.get()
+        self.kind == RuntimeGatewayReadyKindV2::Resumed
+            && self.resume_sequence.get() > self.connected_event_sequence.get()
     }
 }
 
@@ -148,6 +149,12 @@ mod tests {
     fn ready_evidence_requires_strict_resume_order_to_qualify() {
         let explicit = ready();
         assert!(explicit.was_explicitly_resumed());
+
+        let ready_without_resume_kind = RuntimeGatewayReadyAttestationV2 {
+            kind: RuntimeGatewayReadyKindV2::Ready,
+            ..explicit.clone()
+        };
+        assert!(!ready_without_resume_kind.was_explicitly_resumed());
 
         let legacy_equal = RuntimeGatewayReadyAttestationV2 {
             resume_sequence: explicit.connected_event_sequence,
