@@ -165,6 +165,9 @@ fn v2_canonical_values_stay_checked_and_nonserializable() {
     }
     assert!(source.contains("pub(crate) struct RuntimePersistenceU64V2"));
     assert!(!source.contains("pub struct RuntimePersistenceU64V2"));
+    assert!(source.contains("pub(crate) struct RuntimeDiscordSnowflakeV2"));
+    assert!(!source.contains("pub struct RuntimeDiscordSnowflakeV2"));
+    assert!(!include_str!("../src/lib.rs").contains("RuntimeDiscordSnowflakeV2"));
 }
 
 #[test]

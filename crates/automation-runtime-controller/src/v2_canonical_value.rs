@@ -22,6 +22,10 @@ pub enum RuntimeCanonicalValueErrorV2 {
     ServingLeaseOutOfRange,
     #[error("runtime canonical persistence integer exceeds the database range")]
     PersistenceIntegerOutOfRange,
+    #[error("runtime canonical Discord snowflake text is not canonical")]
+    DiscordSnowflakeNonCanonical,
+    #[error("runtime canonical Discord snowflake is outside the supported range")]
+    DiscordSnowflakeOutOfRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -116,6 +120,42 @@ impl RuntimePersistenceU64V2 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RuntimeDiscordSnowflakeV2(u64);
+
+impl RuntimeDiscordSnowflakeV2 {
+    pub(crate) const fn from_u64(value: u64) -> Result<Self, RuntimeCanonicalValueErrorV2> {
+        if value == 0 {
+            return Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeOutOfRange);
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn parse_text(value: &str) -> Result<Self, RuntimeCanonicalValueErrorV2> {
+        if value == "0" {
+            return Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeOutOfRange);
+        }
+        if value.is_empty()
+            || value.starts_with('0')
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeNonCanonical);
+        }
+        let value = value
+            .parse::<u64>()
+            .map_err(|_| RuntimeCanonicalValueErrorV2::DiscordSnowflakeOutOfRange)?;
+        Self::from_u64(value)
+    }
+
+    pub(crate) const fn get_u64(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn canonical_text(self) -> String {
+        self.0.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -124,8 +164,9 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{
-        RuntimeCanonicalValueErrorV2, RuntimePersistenceU64V2, RuntimeServingLeaseMillisecondsV2,
-        RuntimeUnixMicrosecondsV2, MAX_UNIX_MICROSECONDS, MIN_UNIX_MICROSECONDS,
+        RuntimeCanonicalValueErrorV2, RuntimeDiscordSnowflakeV2, RuntimePersistenceU64V2,
+        RuntimeServingLeaseMillisecondsV2, RuntimeUnixMicrosecondsV2, MAX_UNIX_MICROSECONDS,
+        MIN_UNIX_MICROSECONDS,
     };
 
     #[test]
@@ -268,5 +309,48 @@ mod tests {
             RuntimePersistenceU64V2::from_non_zero(NonZeroU64::new(i64::MAX as u64 + 1).unwrap()),
             Err(RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange)
         );
+    }
+
+    #[test]
+    fn discord_snowflake_accepts_the_full_unsigned_range_as_canonical_text() {
+        for (value, expected) in [
+            (1, "1"),
+            (i64::MAX as u64, "9223372036854775807"),
+            (i64::MAX as u64 + 1, "9223372036854775808"),
+            (u64::MAX, "18446744073709551615"),
+        ] {
+            let from_number = RuntimeDiscordSnowflakeV2::from_u64(value).unwrap();
+            let from_text = RuntimeDiscordSnowflakeV2::parse_text(expected).unwrap();
+
+            assert_eq!(from_number, from_text);
+            assert_eq!(from_number.get_u64(), value);
+            assert_eq!(from_number.canonical_text(), expected);
+        }
+    }
+
+    #[test]
+    fn discord_snowflake_rejects_zero_and_unsigned_overflow() {
+        assert_eq!(
+            RuntimeDiscordSnowflakeV2::from_u64(0),
+            Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeOutOfRange)
+        );
+        for value in ["0", "18446744073709551616", "999999999999999999999"] {
+            assert_eq!(
+                RuntimeDiscordSnowflakeV2::parse_text(value),
+                Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeOutOfRange)
+            );
+        }
+    }
+
+    #[test]
+    fn discord_snowflake_rejects_noncanonical_decimal_text() {
+        for value in [
+            "", "00", "01", "+1", "-1", " 1", "1 ", "1\n", "1.0", "1_0", "1a", "１",
+        ] {
+            assert_eq!(
+                RuntimeDiscordSnowflakeV2::parse_text(value),
+                Err(RuntimeCanonicalValueErrorV2::DiscordSnowflakeNonCanonical)
+            );
+        }
     }
 }
