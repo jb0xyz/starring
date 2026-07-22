@@ -718,6 +718,53 @@ BEGIN
         FROM pg_catalog.pg_trigger AS trigger_row
         WHERE trigger_row.tgrelid IN (SELECT relation_oid FROM protected)
             AND NOT trigger_row.tgisinternal
+    ), permitted_external_index(index_oid) AS (
+        SELECT index_row.oid
+        FROM pg_catalog.pg_index AS index_contract
+        INNER JOIN pg_catalog.pg_class AS table_row
+            ON table_row.oid = index_contract.indrelid
+        INNER JOIN pg_catalog.pg_namespace AS table_namespace
+            ON table_namespace.oid = table_row.relnamespace
+        INNER JOIN pg_catalog.pg_class AS index_row
+            ON index_row.oid = index_contract.indexrelid
+        INNER JOIN pg_catalog.pg_namespace AS index_namespace
+            ON index_namespace.oid = index_row.relnamespace
+        INNER JOIN pg_catalog.pg_am AS index_method
+            ON index_method.oid = index_row.relam
+        WHERE table_namespace.nspname = 'public'
+            AND table_row.relname = 'runtime_deployments'
+            AND index_namespace.nspname = 'public'
+            AND index_row.relname
+                = 'runtime_deployments_active_controller_index'
+            AND index_row.relowner = table_row.relowner
+            AND index_row.relkind = 'i'
+            AND index_row.relpersistence = 'p'
+            AND NOT index_row.relispartition
+            AND index_method.amname = 'btree'
+            AND NOT index_contract.indisprimary
+            AND NOT index_contract.indisunique
+            AND index_contract.indisvalid
+            AND index_contract.indisready
+            AND index_contract.indislive
+            AND index_contract.indimmediate
+            AND NOT index_contract.indisclustered
+            AND NOT index_contract.indisreplident
+            AND NOT index_contract.indnullsnotdistinct
+            AND index_contract.indnkeyatts = 4
+            AND index_contract.indnatts = 4
+            AND index_contract.indexprs IS NULL
+            AND pg_catalog.pg_get_expr(
+                index_contract.indpred,
+                index_contract.indrelid
+            ) = '(controller_id IS NOT NULL)'
+            AND pg_catalog.pg_get_indexdef(index_row.oid, 1, TRUE)
+                = 'controller_id'
+            AND pg_catalog.pg_get_indexdef(index_row.oid, 2, TRUE)
+                = 'controller_lease_expires_at'
+            AND pg_catalog.pg_get_indexdef(index_row.oid, 3, TRUE)
+                = 'controller_acquired_at'
+            AND pg_catalog.pg_get_indexdef(index_row.oid, 4, TRUE)
+                = 'deployment_id'
     ), manifest(value) AS (
         SELECT pg_catalog.concat_ws(
             '|',
@@ -881,6 +928,9 @@ BEGIN
         INNER JOIN pg_catalog.pg_am AS index_method
             ON index_method.oid = index_row.relam
         WHERE index_contract.indrelid IN (SELECT relation_oid FROM protected)
+            AND index_contract.indexrelid NOT IN (
+                SELECT index_oid FROM permitted_external_index
+            )
         UNION ALL
         SELECT pg_catalog.concat_ws(
             '|',
@@ -1547,7 +1597,7 @@ BEGIN
                 'boolean'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
-                'd986f1060de154e0538309af9b58dbf78c64262be00b1267b15f1e265ff2eb88'::TEXT
+                'b61a87b523c89b641e66ce8affbd7904c2a1ee0d29c88131a9a3475becc0c8d2'::TEXT
             )
     ) AS expected(
         identity,

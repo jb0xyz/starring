@@ -51,7 +51,7 @@ const EXECUTOR_FUNCTIONS: [&str; 9] = [
     "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "29acadef105024b086dc80c02420e1a60714341d011286d0a09a216136509927";
+    "bd13ca3d38ab5a8f7c00191b30d3d218a667046ef1aa1ba4e009ff48e5845a5d";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
@@ -243,6 +243,10 @@ async fn execution_mutations_are_proven_and_closed() {
     replay_rechecks_current_authority_scenario(&authority_database).await;
     cleanup(authority_database).await;
 
+    let claim_expiry_database = isolated_database(cluster.connect_options()).await;
+    claim_revalidates_expiry_after_row_lock_scenario(&claim_expiry_database).await;
+    cleanup(claim_expiry_database).await;
+
     drop(cluster);
 }
 
@@ -369,6 +373,7 @@ async fn cleanup(mut database: IsolatedDatabase) {
 }
 
 async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
+    assert_controller_lookup_index(&database.owner_pool).await;
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
         "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
@@ -430,6 +435,117 @@ async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
     .await
     .unwrap();
     assert_eq!(execution_rows, 1);
+}
+
+async fn assert_controller_lookup_index(pool: &PgPool) {
+    let exact = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_catalog.count(*) = 1 \
+         FROM pg_catalog.pg_index AS index_contract \
+         JOIN pg_catalog.pg_class AS table_row \
+             ON table_row.oid = index_contract.indrelid \
+         JOIN pg_catalog.pg_namespace AS table_namespace \
+             ON table_namespace.oid = table_row.relnamespace \
+         JOIN pg_catalog.pg_class AS index_row \
+             ON index_row.oid = index_contract.indexrelid \
+         JOIN pg_catalog.pg_namespace AS index_namespace \
+             ON index_namespace.oid = index_row.relnamespace \
+         JOIN pg_catalog.pg_am AS index_method ON index_method.oid = index_row.relam \
+         WHERE table_namespace.nspname = 'public' \
+             AND table_row.relname = 'runtime_deployments' \
+             AND index_namespace.nspname = 'public' \
+             AND index_row.relname = 'runtime_deployments_active_controller_index' \
+             AND index_row.relowner = table_row.relowner \
+             AND index_row.relkind = 'i' AND index_row.relpersistence = 'p' \
+             AND NOT index_row.relispartition AND index_method.amname = 'btree' \
+             AND NOT index_contract.indisprimary \
+             AND NOT index_contract.indisunique \
+             AND index_contract.indisvalid AND index_contract.indisready \
+             AND index_contract.indislive AND index_contract.indimmediate \
+             AND NOT index_contract.indisclustered \
+             AND NOT index_contract.indisreplident \
+             AND NOT index_contract.indnullsnotdistinct \
+             AND index_contract.indnkeyatts = 4 AND index_contract.indnatts = 4 \
+             AND index_contract.indexprs IS NULL \
+             AND pg_catalog.pg_get_expr( \
+                 index_contract.indpred, index_contract.indrelid \
+             ) = '(controller_id IS NOT NULL)' \
+             AND pg_catalog.pg_get_indexdef(index_row.oid, 1, TRUE) = 'controller_id' \
+             AND pg_catalog.pg_get_indexdef(index_row.oid, 2, TRUE) \
+                 = 'controller_lease_expires_at' \
+             AND pg_catalog.pg_get_indexdef(index_row.oid, 3, TRUE) \
+                 = 'controller_acquired_at' \
+             AND pg_catalog.pg_get_indexdef(index_row.oid, 4, TRUE) = 'deployment_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(exact);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let plan = sqlx::query_scalar::<_, Json<Value>>(
+        "EXPLAIN (FORMAT JSON, COSTS FALSE) \
+         SELECT deployment.* FROM public.runtime_deployments AS deployment \
+         WHERE deployment.controller_id = $1 \
+             AND deployment.controller_lease_expires_at > $2 \
+             AND deployment.phase NOT IN ('live', 'superseded', 'cancelled') \
+         ORDER BY deployment.controller_acquired_at, deployment.deployment_id \
+         LIMIT 1 FOR UPDATE",
+    )
+    .bind("runtime-index-plan-probe")
+    .bind(database_now(pool).await)
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    let plan = serde_json::to_string(&plan.0).unwrap();
+    assert!(plan.contains("runtime_deployments_active_controller_index"));
+    assert!(plan.contains("Index Cond"));
+    assert!(plan.contains("controller_id"));
+    assert!(plan.contains("controller_lease_expires_at"));
+    transaction.rollback().await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DROP INDEX public.runtime_deployments_active_controller_index")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+            public.starring_runtime_serving_schema_manifest_v1(), \
+            public.starring_runtime_execution_schema_manifest_v1()",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (true, true, false));
+    transaction.rollback().await.unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DROP INDEX public.runtime_deployments_active_controller_index")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE INDEX runtime_deployments_active_controller_index \
+         ON public.runtime_deployments (controller_id) \
+         WHERE controller_id IS NOT NULL",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+            public.starring_runtime_serving_schema_manifest_v1(), \
+            public.starring_runtime_execution_schema_manifest_v1()",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (false, false, false));
+    transaction.rollback().await.unwrap();
 }
 
 async fn restricted_readiness_pool(
@@ -1448,6 +1564,86 @@ async fn replay_rechecks_current_authority_scenario(database: &IsolatedDatabase)
         persisted_deployment_image(&database.owner_pool).await,
         unchanged
     );
+}
+
+async fn claim_revalidates_expiry_after_row_lock_scenario(database: &IsolatedDatabase) {
+    seed_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(database).await;
+    let controller_id = ControllerId::parse("runtime-execution-lock-wait-controller").unwrap();
+    let initial = adapter
+        .claim_next_execution(RuntimeClaimNextExecutionV1 {
+            controller_id: controller_id.clone(),
+            lease_for: Duration::from_secs(1),
+        })
+        .await
+        .unwrap()
+        .expect("seeded execution must be claimable");
+
+    let mut blocker = database.owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT deployment_id FROM public.runtime_deployments \
+         WHERE deployment_id = $1 FOR UPDATE",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+
+    let executor_pool = database.executor_pool.clone();
+    let controller = controller_id.as_str().to_string();
+    let claim = tokio::spawn(async move {
+        let mut transaction = executor_pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_catalog.set_config('statement_timeout', '5000ms', TRUE), \
+                pg_catalog.set_config('lock_timeout', '4000ms', TRUE)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        let result = sqlx::query_as::<_, (String, Json<Value>, DateTime<Utc>)>(
+            "SELECT outcome_name, snapshot, expires_at \
+             FROM public.starring_runtime_execution_claim_next_v1($1, 30000)",
+        )
+        .bind(controller)
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        result
+    });
+
+    wait_for_blocked_claim(&database.owner_pool).await;
+    wait_for_database_time(&database.owner_pool, initial.expires_at).await;
+    blocker.commit().await.unwrap();
+
+    let (outcome, snapshot, expires_at) = claim.await.unwrap();
+    assert_eq!(outcome, "applied");
+    assert_eq!(snapshot.0["revision"], 3);
+    assert_eq!(snapshot.0["controller_lease"]["fencing_token"], 2);
+    assert!(expires_at > database_now(&database.owner_pool).await);
+}
+
+async fn wait_for_blocked_claim(pool: &PgPool) {
+    for _ in 0..200 {
+        let blocked = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.count(*) = 1 \
+             FROM pg_catalog.pg_stat_activity AS activity \
+             WHERE activity.datname = current_database() \
+                AND activity.pid <> pg_catalog.pg_backend_pid() \
+                AND activity.state = 'active' \
+                AND activity.wait_event_type = 'Lock' \
+                AND activity.query LIKE \
+                    '%starring_runtime_execution_claim_next_v1($1, 30000)%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("execution claim did not reach the deployment row lock");
 }
 
 async fn rotate_current_authority(pool: &PgPool) {

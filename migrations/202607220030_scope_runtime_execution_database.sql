@@ -112,6 +112,9 @@ BEGIN
     IF pg_catalog.to_regclass(
             'public.runtime_execution_mutation_markers'
         ) IS NOT NULL
+        OR pg_catalog.to_regclass(
+            'public.runtime_deployments_active_controller_index'
+        ) IS NOT NULL
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RE001',
@@ -153,6 +156,15 @@ CREATE TABLE public.runtime_execution_mutation_markers (
         AND pg_catalog.octet_length(mutation_payload::TEXT) <= 262144
     )
 );
+
+CREATE INDEX runtime_deployments_active_controller_index
+ON public.runtime_deployments (
+    controller_id,
+    controller_lease_expires_at,
+    controller_acquired_at,
+    deployment_id
+)
+WHERE controller_id IS NOT NULL;
 
 CREATE FUNCTION public.starring_runtime_execution_database_identity_v1()
 RETURNS TEXT
@@ -201,6 +213,8 @@ DECLARE
     next_snapshot JSONB;
     authority_outcome TEXT;
     mutation_clock TIMESTAMPTZ;
+    replay_lookup_clock TIMESTAMPTZ;
+    replay_validation_clock TIMESTAMPTZ;
     requested_duration INTERVAL;
     next_revision BIGINT;
     next_fencing_token BIGINT;
@@ -228,25 +242,30 @@ BEGIN
             0
         )
     );
+    replay_lookup_clock := pg_catalog.clock_timestamp();
 
     SELECT deployment.*
     INTO deployment_row
     FROM public.runtime_deployments AS deployment
     WHERE deployment.controller_id = expected_controller_id
         AND deployment.controller_lease_expires_at
-            > pg_catalog.clock_timestamp()
+            > replay_lookup_clock
         AND deployment.phase NOT IN ('live', 'superseded', 'cancelled')
     ORDER BY deployment.controller_acquired_at, deployment.deployment_id
     LIMIT 1
     FOR UPDATE;
 
     IF FOUND THEN
+        replay_validation_clock := GREATEST(
+            pg_catalog.clock_timestamp(),
+            replay_lookup_clock
+        );
         IF EXISTS (
             SELECT 1
             FROM public.runtime_deployments AS duplicate
             WHERE duplicate.controller_id = expected_controller_id
                 AND duplicate.controller_lease_expires_at
-                    > pg_catalog.clock_timestamp()
+                    > replay_validation_clock
                 AND duplicate.phase NOT IN ('live', 'superseded', 'cancelled')
                 AND duplicate.deployment_id <> deployment_row.deployment_id
         ) THEN
@@ -255,7 +274,7 @@ BEGIN
                 MESSAGE = 'runtime_execution_claim_controller_ambiguous';
         END IF;
 
-        mutation_clock := pg_catalog.clock_timestamp();
+        mutation_clock := replay_validation_clock;
         IF deployment_row.controller_lease_expires_at > mutation_clock THEN
             IF deployment_row.last_controller_id
                     IS DISTINCT FROM expected_controller_id
@@ -311,19 +330,27 @@ BEGIN
                     MESSAGE = 'runtime_execution_claim_authority_changed';
             END IF;
 
-            outcome_name := 'replayed';
-            previous_snapshot := deployment_row.snapshot;
-            snapshot := deployment_row.snapshot;
-            controller_id := deployment_row.controller_id;
-            fencing_token := deployment_row.controller_fencing_token;
-            previous_convergence_attempt_no :=
-                deployment_row.convergence_attempt_no - 1;
-            convergence_attempt_no :=
-                deployment_row.convergence_attempt_no;
-            acquired_at := deployment_row.controller_acquired_at;
-            expires_at := deployment_row.controller_lease_expires_at;
-            RETURN NEXT;
-            RETURN;
+            replay_validation_clock := GREATEST(
+                pg_catalog.clock_timestamp(),
+                replay_validation_clock
+            );
+            IF deployment_row.controller_lease_expires_at
+                > replay_validation_clock
+            THEN
+                outcome_name := 'replayed';
+                previous_snapshot := deployment_row.snapshot;
+                snapshot := deployment_row.snapshot;
+                controller_id := deployment_row.controller_id;
+                fencing_token := deployment_row.controller_fencing_token;
+                previous_convergence_attempt_no :=
+                    deployment_row.convergence_attempt_no - 1;
+                convergence_attempt_no :=
+                    deployment_row.convergence_attempt_no;
+                acquired_at := deployment_row.controller_acquired_at;
+                expires_at := deployment_row.controller_lease_expires_at;
+                RETURN NEXT;
+                RETURN;
+            END IF;
         END IF;
     END IF;
 
@@ -4349,9 +4376,9 @@ BEGIN
     INTO observed_count, observed_digest
     FROM manifest;
 
-    RETURN observed_count = 467
+    RETURN observed_count = 468
         AND observed_digest
-            = 'c353cc69c545bfdefdfaf17bb6cc55af1f0076961a1dd282c02e50043281d016';
+            = '37294a6a98f255ff9dcf64b6da9524fa8d5e9b0e08bf1e5d3d86e86ff6accd07';
 END;
 $function$;
 
@@ -5114,7 +5141,7 @@ BEGIN
                 'boolean'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
-                '8559a5ee0f57d9fc1d7f009fdc8d788edd162d4ae86f60e6f2f93488e135ff1d'::TEXT
+                'ac832b379abe41291109716a32c12790ea9bf0beee670fe7a625a8966fe52772'::TEXT
             )
     ) AS expected(
         identity,

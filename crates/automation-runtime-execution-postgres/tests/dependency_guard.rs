@@ -121,16 +121,46 @@ fn mutation_operation_uses_only_the_scoped_function_and_verified_transaction_pat
 }
 
 #[test]
-fn mutation_replay_marker_is_execution_owned_and_preserves_shared_schema() {
+fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
     let migration =
         include_str!("../../../migrations/202607220030_scope_runtime_execution_database.sql");
+    let exact_target =
+        include_str!("../../../migrations/202607220028_scope_runtime_exact_target_database.sql");
+    let serving =
+        include_str!("../../../migrations/202607220029_scope_runtime_serving_database.sql");
     assert!(migration.contains("CREATE TABLE public.runtime_execution_mutation_markers"));
     assert!(migration.contains("FROM public.runtime_execution_mutation_markers AS marker"));
     assert!(migration.contains("INSERT INTO public.runtime_execution_mutation_markers AS marker"));
+    assert!(migration.contains("CREATE INDEX runtime_deployments_active_controller_index"));
+    assert!(migration.contains("replay_lookup_clock := pg_catalog.clock_timestamp()"));
+    assert_eq!(
+        migration
+            .matches("replay_validation_clock := GREATEST(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        migration
+            .matches("controller_lease_expires_at\n            > replay_lookup_clock")
+            .count(),
+        1
+    );
+    assert_eq!(
+        migration
+            .matches("controller_lease_expires_at\n                    > replay_validation_clock")
+            .count(),
+        1
+    );
+    for manifest in [exact_target, serving] {
+        assert!(manifest.contains("permitted_external_index(index_oid)"));
+        assert!(manifest.contains("runtime_deployments_active_controller_index"));
+        assert!(manifest.contains("index_contract.indexrelid NOT IN"));
+        assert!(manifest.contains("index_contract.indnkeyatts = 4"));
+        assert!(manifest.contains("= '(controller_id IS NOT NULL)'"));
+    }
     assert!(!migration.contains("last_execution_mutation_revision"));
     assert!(!migration.contains("last_execution_mutation_kind"));
     assert!(!migration.contains("last_execution_mutation_payload"));
-    assert!(!migration.contains("runtime_deployments_active_controller_index"));
 }
 
 #[test]
