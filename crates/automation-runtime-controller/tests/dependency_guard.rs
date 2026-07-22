@@ -168,6 +168,78 @@ fn v2_canonical_values_stay_checked_and_nonserializable() {
 }
 
 #[test]
+fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
+    for (path, source) in [
+        ("v2_product.rs", include_str!("../src/v2_product.rs")),
+        ("v2_drain.rs", include_str!("../src/v2_drain.rs")),
+    ] {
+        for forbidden in [
+            "serde",
+            "Serialize",
+            "Deserialize",
+            "Default",
+            "Sha256",
+            "DateTime",
+            "canonical_bytes",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "forbidden inert V2 preimage surface in {path}: {forbidden}"
+            );
+        }
+    }
+    let product = include_str!("../src/v2_product.rs");
+    assert!(!product.contains("RuntimeProductMutationDigestV2"));
+    assert!(!product.contains("RuntimeDrainIntentIdV2"));
+    let product_preimage = product
+        .split("pub struct RuntimeProductMutationPreimageV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[cfg(test)]").next())
+        .unwrap();
+    for field in [
+        "operation_id",
+        "scope",
+        "expected_revision",
+        "slot",
+        "expected_target",
+        "mutation_kind",
+        "product_semantic_request_digest",
+    ] {
+        assert!(product_preimage.contains(&format!("pub {field}:")));
+    }
+    assert_eq!(product_preimage.matches("    pub ").count(), 7);
+
+    let drain = include_str!("../src/v2_drain.rs");
+    assert!(!drain.contains("RuntimeDrainIntentDigestV2"));
+    assert!(drain.contains("pub fn from_key(key: RuntimeDrainIntentKeyV2) -> Self"));
+    let drain_key = drain
+        .split("pub struct RuntimeDrainIntentKeyV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for field in [
+        "intent_id",
+        "product_operation_id",
+        "product_mutation_digest",
+        "scope",
+        "expected_revision",
+        "slot",
+        "expected_target",
+        "mutation_kind",
+    ] {
+        assert!(drain_key.contains(&format!("pub {field}:")));
+    }
+    assert_eq!(drain_key.matches("    pub ").count(), 8);
+    let drain_preimage = drain
+        .split("pub struct RuntimeDrainIntentPreimageV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(drain_preimage.contains("pub key: RuntimeDrainIntentKeyV2"));
+    assert_eq!(drain_preimage.matches("    pub ").count(), 1);
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -185,9 +257,11 @@ fn source_files_contain_no_comments() {
             include_str!("../src/v2_canonical_value.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
+        ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
+        ("src/v2_product.rs", include_str!("../src/v2_product.rs")),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
             "tests/dependency_guard.rs",

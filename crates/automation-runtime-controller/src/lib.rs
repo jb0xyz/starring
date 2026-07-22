@@ -23,9 +23,11 @@ mod v2_canonical_value;
     )
 )]
 mod v2_digest;
+mod v2_drain;
 mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
+mod v2_product;
 mod v2_route;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
@@ -73,6 +75,7 @@ pub use v2_digest::{
     RuntimeDrainIntentDigestV2, RuntimeLiveAttestationDigestV2, RuntimeProductMutationDigestV2,
     RuntimeProductSemanticRequestDigestV2, RuntimeSuspendAttemptDigestV2,
 };
+pub use v2_drain::{RuntimeDrainIntentKeyV2, RuntimeDrainIntentPreimageV2};
 pub use v2_evidence::{
     RuntimeBarrierPauseWitnessV2, RuntimeEvidenceErrorV2, RuntimePanelEvidenceV2,
     RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,
@@ -86,4 +89,5 @@ pub use v2_identity::{
     RuntimeGatewayAdmissionSequenceV2, RuntimeProductOperationIdV2, RuntimeRecoveryIdV2,
     RuntimeSuspensionIdV2,
 };
+pub use v2_product::{RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2};
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
