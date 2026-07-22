@@ -105,6 +105,14 @@ fn production_controller_uses_only_exact_convergence_guards() {
 }
 
 #[test]
+fn broad_owner_store_does_not_implement_the_serving_lease_port() {
+    let controller = include_str!("../src/controller.rs");
+    assert!(!controller.contains("impl RuntimeServingLeasePort for PostgresRuntimeConvergence"));
+    assert!(!controller.contains("RuntimeHeartbeatServingV1"));
+    assert!(!controller.contains("RuntimeDisconnectServingV1"));
+}
+
+#[test]
 fn last_controller_migration_preserves_readiness_shape_and_fails_closed() {
     let migration =
         include_str!("../../../migrations/202607220026_persist_runtime_last_controller.sql");

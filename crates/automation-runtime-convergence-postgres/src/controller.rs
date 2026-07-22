@@ -6,22 +6,20 @@ use automation_runtime_controller::{
     RuntimeBuildRevisionV1 as ControllerBuildV1, RuntimeCertificationReceiptV1,
     RuntimeCertificationRequestV1, RuntimeClaimNextExecutionV1, RuntimeConvergenceErrorClassV1,
     RuntimeConvergenceMutationV1, RuntimeDeploymentScopeV1 as ControllerScopeV1,
-    RuntimeDisconnectServingV1, RuntimeExecutionConvergencePort, RuntimeExecutionReceiptV1,
-    RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1, RuntimeLiveMetadataV1,
-    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
-    RuntimePreviousServingObservationPort, RuntimePreviousServingObservationReceiptV1,
-    RuntimeRenewExecutionV1, RuntimeServingIdentityV1 as ControllerServingIdentityV1,
-    RuntimeServingLeasePort, RuntimeServingReceiptV1 as ControllerServingReceiptV1,
-    RuntimeServingUpdateReceiptV1, RuntimeStaleLiveRecoveryReceiptV1,
+    RuntimeExecutionConvergencePort, RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1,
+    RuntimeLiveMetadataV1, RuntimeMutationReceiptV1, RuntimeMutationRequestV1,
+    RuntimeObservePreviousServingV1, RuntimePreviousServingObservationPort,
+    RuntimePreviousServingObservationReceiptV1, RuntimeRenewExecutionV1,
+    RuntimeServingIdentityV1 as ControllerServingIdentityV1,
+    RuntimeServingReceiptV1 as ControllerServingReceiptV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
 use automation_runtime_convergence::{RuntimeDeploymentError, RuntimeFailureKindV1};
 
 use crate::{
-    AttestationIdV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1, DeploymentMutationV1,
-    GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1, MarkServingDisconnectedV1,
-    MutationReceiptV1, PanelReportDigestV1, PostgresRuntimeConvergence, RenewDeploymentV1,
-    RuntimeBuildRevisionV1, RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
-    ServingLeaseIdentityV1, ServingLeaseReceiptV1, SubmitDeploymentMutationV1,
+    ClaimExecutionReceiptV1, ClaimNextDeploymentV1, DeploymentMutationV1, GatewayShardIdV1,
+    LiveMetadataV1, MutationReceiptV1, PanelReportDigestV1, PostgresRuntimeConvergence,
+    RenewDeploymentV1, RuntimeBuildRevisionV1, RuntimeConvergenceStoreError,
+    RuntimeDeploymentScopeV1, ServingLeaseReceiptV1, SubmitDeploymentMutationV1,
     SubmitLiveAttestationV1,
 };
 
@@ -134,51 +132,6 @@ impl RuntimeExecutionConvergencePort for PostgresRuntimeConvergence {
     }
 }
 
-impl RuntimeServingLeasePort for PostgresRuntimeConvergence {
-    type Error = RuntimeConvergenceStoreError;
-
-    async fn heartbeat_serving(
-        &self,
-        request: RuntimeHeartbeatServingV1,
-    ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
-        let runtime_generation = request.identity.runtime_generation;
-        let serving = PostgresRuntimeConvergence::heartbeat_serving(
-            self,
-            HeartbeatServingLeaseV1 {
-                identity: serving_identity(&request.identity)?,
-                lease_for: request.lease_for,
-            },
-        )
-        .await?;
-        Ok(RuntimeServingUpdateReceiptV1 {
-            action_id: request.action_id,
-            serving: serving_receipt(serving, runtime_generation)?,
-        })
-    }
-
-    async fn mark_serving_disconnected(
-        &self,
-        request: RuntimeDisconnectServingV1,
-    ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
-        let runtime_generation = request.identity.runtime_generation;
-        let serving = PostgresRuntimeConvergence::mark_serving_disconnected(
-            self,
-            MarkServingDisconnectedV1 {
-                identity: serving_identity(&request.identity)?,
-            },
-        )
-        .await?;
-        Ok(RuntimeServingUpdateReceiptV1 {
-            action_id: request.action_id,
-            serving: serving_receipt(serving, runtime_generation)?,
-        })
-    }
-
-    fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1 {
-        classify_error(error)
-    }
-}
-
 impl RuntimePreviousServingObservationPort for PostgresRuntimeConvergence {
     async fn observe_previous_serving(
         &self,
@@ -276,20 +229,6 @@ fn live_metadata(
         gateway_shard_id: GatewayShardIdV1::parse(ControllerGatewayShardIdV1::as_str(
             &value.gateway_shard_id,
         ))?,
-    })
-}
-
-fn serving_identity(
-    value: &ControllerServingIdentityV1,
-) -> Result<ServingLeaseIdentityV1, RuntimeConvergenceStoreError> {
-    Ok(ServingLeaseIdentityV1 {
-        scope: scope(&value.scope),
-        attestation_id: AttestationIdV1::parse(ControllerAttestationIdV1::as_str(
-            &value.attestation_id,
-        ))?,
-        process_instance_id: value.process_instance_id.clone(),
-        lease_epoch: value.lease_epoch.get(),
-        expected_revision: value.expected_revision.get(),
     })
 }
 
@@ -433,10 +372,6 @@ mod tests {
                 <PostgresRuntimeConvergence as RuntimeExecutionConvergencePort>::classify_error(
                     &error,
                 ),
-                expected
-            );
-            assert_eq!(
-                <PostgresRuntimeConvergence as RuntimeServingLeasePort>::classify_error(&error),
                 expected
             );
         }

@@ -544,6 +544,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-serving-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "automation-state"
 version = "0.1.0"
 dependencies = [
