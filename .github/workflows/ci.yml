@@ -100,3 +100,5 @@ jobs:
         run: cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1
       - name: Test runtime convergence PostgreSQL store
         run: cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1
+      - name: Test runtime execution PostgreSQL store
+        run: cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1

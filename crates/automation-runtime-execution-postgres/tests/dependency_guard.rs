@@ -128,9 +128,25 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
         include_str!("../../../migrations/202607220028_scope_runtime_exact_target_database.sql");
     let serving =
         include_str!("../../../migrations/202607220029_scope_runtime_serving_database.sql");
+    let ci = include_str!("../../../.github/workflows/ci.yml");
     assert!(migration.contains("CREATE TABLE public.runtime_execution_mutation_markers"));
     assert!(migration.contains("FROM public.runtime_execution_mutation_markers AS marker"));
     assert!(migration.contains("INSERT INTO public.runtime_execution_mutation_markers AS marker"));
+    assert!(migration.contains(
+        "CREATE FUNCTION public.validate_runtime_execution_mutation_marker_transition()"
+    ));
+    assert!(
+        migration.contains("CREATE TRIGGER runtime_execution_mutation_markers_validate_transition")
+    );
+    assert!(migration
+        .contains("CREATE FUNCTION public.reject_runtime_execution_mutation_marker_delete()"));
+    assert!(migration.contains("CREATE TRIGGER runtime_execution_mutation_markers_reject_delete"));
+    assert!(migration.contains("NEW.deployment_id IS DISTINCT FROM OLD.deployment_id"));
+    assert!(migration.contains("NEW.mutation_revision <= OLD.mutation_revision"));
+    assert!(migration.contains("NEW.mutation_revision IS DISTINCT FROM deployment_revision"));
+    assert!(
+        migration.contains("WHERE deployment.deployment_id = NEW.deployment_id\n    FOR UPDATE")
+    );
     assert!(migration.contains("CREATE INDEX runtime_deployments_active_controller_index"));
     assert!(migration.contains("replay_lookup_clock := pg_catalog.clock_timestamp()"));
     assert_eq!(
@@ -161,6 +177,9 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
     assert!(!migration.contains("last_execution_mutation_revision"));
     assert!(!migration.contains("last_execution_mutation_kind"));
     assert!(!migration.contains("last_execution_mutation_payload"));
+    assert!(ci.contains(
+        "cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1"
+    ));
 }
 
 #[test]

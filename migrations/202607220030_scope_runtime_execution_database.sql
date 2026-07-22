@@ -100,7 +100,9 @@ BEGIN
             'starring_runtime_execution_mutate_v1',
             'starring_runtime_execution_certify_prepare_v1',
             'starring_runtime_execution_certify_commit_v1',
-            'starring_runtime_execution_recover_stale_live_v1'
+            'starring_runtime_execution_recover_stale_live_v1',
+            'validate_runtime_execution_mutation_marker_transition',
+            'reject_runtime_execution_mutation_marker_delete'
         );
 
     IF collision_count <> 0 THEN
@@ -156,6 +158,73 @@ CREATE TABLE public.runtime_execution_mutation_markers (
         AND pg_catalog.octet_length(mutation_payload::TEXT) <= 262144
     )
 );
+
+CREATE FUNCTION public.validate_runtime_execution_mutation_marker_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    deployment_revision BIGINT;
+BEGIN
+    IF TG_OP = 'UPDATE'
+        AND (
+            NEW.deployment_id IS DISTINCT FROM OLD.deployment_id
+            OR NEW.mutation_revision <= OLD.mutation_revision
+        )
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'runtime_execution_mutation_marker_transition_invalid';
+    END IF;
+
+    SELECT deployment.revision
+    INTO deployment_revision
+    FROM public.runtime_deployments AS deployment
+    WHERE deployment.deployment_id = NEW.deployment_id
+    FOR UPDATE;
+
+    IF NOT FOUND
+        OR NEW.mutation_revision IS DISTINCT FROM deployment_revision
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'runtime_execution_mutation_marker_parent_invalid';
+    END IF;
+    RETURN NEW;
+END;
+$function$;
+
+CREATE TRIGGER runtime_execution_mutation_markers_validate_transition
+BEFORE INSERT OR UPDATE ON public.runtime_execution_mutation_markers
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_runtime_execution_mutation_marker_transition();
+
+CREATE FUNCTION public.reject_runtime_execution_mutation_marker_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = '23514',
+        MESSAGE = 'runtime_execution_mutation_marker_delete_rejected';
+END;
+$function$;
+
+CREATE TRIGGER runtime_execution_mutation_markers_reject_delete
+BEFORE DELETE ON public.runtime_execution_mutation_markers
+FOR EACH ROW
+EXECUTE FUNCTION public.reject_runtime_execution_mutation_marker_delete();
+
+REVOKE ALL ON FUNCTION
+    public.validate_runtime_execution_mutation_marker_transition()
+FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    public.reject_runtime_execution_mutation_marker_delete()
+FROM PUBLIC;
 
 CREATE INDEX runtime_deployments_active_controller_index
 ON public.runtime_deployments (
@@ -4376,9 +4445,9 @@ BEGIN
     INTO observed_count, observed_digest
     FROM manifest;
 
-    RETURN observed_count = 468
+    RETURN observed_count = 472
         AND observed_digest
-            = '37294a6a98f255ff9dcf64b6da9524fa8d5e9b0e08bf1e5d3d86e86ff6accd07';
+            = '3d12dc4468b6d42cd9ec0b5bc0814117684fff43e28356f1fb40089c127ab641';
 END;
 $function$;
 
@@ -4560,6 +4629,8 @@ BEGIN
         'public.reject_immutable_product_row()',
         'public.validate_runtime_serving_lease_transition()',
         'public.reject_runtime_serving_lease_delete()',
+        'public.validate_runtime_execution_mutation_marker_transition()',
+        'public.reject_runtime_execution_mutation_marker_delete()',
         'public.reject_ruleset_artifact_mutation()'
     ]::TEXT[]
     LOOP
@@ -4800,6 +4871,8 @@ BEGIN
             ('public.reject_immutable_product_row()'),
             ('public.validate_runtime_serving_lease_transition()'),
             ('public.reject_runtime_serving_lease_delete()'),
+            ('public.validate_runtime_execution_mutation_marker_transition()'),
+            ('public.reject_runtime_execution_mutation_marker_delete()'),
             ('public.reject_ruleset_artifact_mutation()')
     ) AS expected(identity)
     LEFT JOIN pg_catalog.pg_proc AS function_row
@@ -5141,7 +5214,7 @@ BEGIN
                 'boolean'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
-                'ac832b379abe41291109716a32c12790ea9bf0beee670fe7a625a8966fe52772'::TEXT
+                '242c36e163845f1b5b13f09b82676ce1af39a86214eab5b2f88143ae9c386940'::TEXT
             )
     ) AS expected(
         identity,
@@ -5221,6 +5294,8 @@ BEGIN
             ('public.reject_immutable_product_row()'),
             ('public.validate_runtime_serving_lease_transition()'),
             ('public.reject_runtime_serving_lease_delete()'),
+            ('public.validate_runtime_execution_mutation_marker_transition()'),
+            ('public.reject_runtime_execution_mutation_marker_delete()'),
             ('public.reject_ruleset_artifact_mutation()')
     ) AS expected(identity)
     LEFT JOIN pg_catalog.pg_proc AS function_row

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use automation_runtime_convergence::{
     PanelCertificateId, PanelCertificateV1, PanelReportDigestV1, PreflightAttestationV1,
     ProcessInstanceId, RuntimeDeployment, RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseV1,
     RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
-    RuntimeGeneration, RuntimePendingConditionV1, TransitionOutcomeV1,
+    RuntimeGeneration, RuntimePendingConditionV1, SupersedingDeploymentV1, TransitionOutcomeV1,
 };
 use automation_runtime_execution_postgres::{
     PostgresRuntimeExecutionV1, RuntimeExecutionDatabaseExpectationV1,
@@ -51,7 +52,7 @@ const EXECUTOR_FUNCTIONS: [&str; 9] = [
     "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "bd13ca3d38ab5a8f7c00191b30d3d218a667046ef1aa1ba4e009ff48e5845a5d";
+    "ccd6e8e9bd6fb83b29deef85d88beede796ef8b282f4619e82ee0678a21fe77d";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
@@ -84,6 +85,43 @@ struct EphemeralPostgresCluster {
     administrator_role: String,
     pg_ctl: String,
     running: bool,
+}
+
+enum PostgresTestServer {
+    External(Box<PgConnectOptions>),
+    Ephemeral(EphemeralPostgresCluster),
+}
+
+impl PostgresTestServer {
+    fn start() -> Self {
+        if let Some(url) = std::env::var_os("STARRING_TEST_DATABASE_URL") {
+            let url = url
+                .into_string()
+                .expect("STARRING_TEST_DATABASE_URL must be valid Unicode");
+            let options = url
+                .parse::<PgConnectOptions>()
+                .expect("STARRING_TEST_DATABASE_URL must be a PostgreSQL URL");
+            let database = options
+                .get_database()
+                .expect("STARRING_TEST_DATABASE_URL must name a database");
+            assert!(
+                database.starts_with("starring_")
+                    && database.split('_').any(|segment| segment == "test")
+                    && canonical_identifier(database),
+                "refusing to use a database outside the strict Starring test namespace"
+            );
+            Self::External(Box::new(options))
+        } else {
+            Self::Ephemeral(EphemeralPostgresCluster::start())
+        }
+    }
+
+    fn connect_options(&self) -> PgConnectOptions {
+        match self {
+            Self::External(options) => options.as_ref().clone(),
+            Self::Ephemeral(cluster) => cluster.connect_options(),
+        }
+    }
 }
 
 impl EphemeralPostgresCluster {
@@ -194,10 +232,10 @@ impl Drop for EphemeralPostgresCluster {
 }
 
 #[tokio::test]
-#[ignore = "requires initdb and pg_ctl"]
+#[ignore = "requires PostgreSQL test authority"]
 async fn execution_database_is_function_only_and_least_privilege() {
-    let cluster = EphemeralPostgresCluster::start();
-    let mut database = isolated_database(cluster.connect_options()).await;
+    let server = PostgresTestServer::start();
+    let mut database = isolated_database(server.connect_options()).await;
     assert_cross_runtime_readiness(&mut database).await;
     let owner_pool = database.owner_pool.clone();
     let executor_pool = database.executor_pool.clone();
@@ -219,35 +257,74 @@ async fn execution_database_is_function_only_and_least_privilege() {
     .await;
     cleanup(database).await;
     outcome.expect("restricted execution proof must complete");
-    drop(cluster);
+    drop(server);
 }
 
 #[tokio::test]
-#[ignore = "requires initdb and pg_ctl"]
+#[ignore = "requires PostgreSQL test authority"]
 async fn execution_mutations_are_proven_and_closed() {
-    let cluster = EphemeralPostgresCluster::start();
+    let server = PostgresTestServer::start();
 
-    let canonicality_database = isolated_database(cluster.connect_options()).await;
+    let canonicality_database = isolated_database(server.connect_options()).await;
     mutation_canonicality_and_expiry_scenario(&canonicality_database).await;
     cleanup(canonicality_database).await;
 
-    let future_evidence_database = isolated_database(cluster.connect_options()).await;
+    let future_evidence_database = isolated_database(server.connect_options()).await;
     future_activation_failure_scenario(&future_evidence_database).await;
     cleanup(future_evidence_database).await;
 
-    let recovery_database = isolated_database(cluster.connect_options()).await;
+    let recovery_database = isolated_database(server.connect_options()).await;
     retry_recovery_and_blocked_failure_scenario(&recovery_database).await;
     cleanup(recovery_database).await;
 
-    let authority_database = isolated_database(cluster.connect_options()).await;
+    let authority_database = isolated_database(server.connect_options()).await;
     replay_rechecks_current_authority_scenario(&authority_database).await;
     cleanup(authority_database).await;
 
-    let claim_expiry_database = isolated_database(cluster.connect_options()).await;
+    let claim_expiry_database = isolated_database(server.connect_options()).await;
     claim_revalidates_expiry_after_row_lock_scenario(&claim_expiry_database).await;
     cleanup(claim_expiry_database).await;
 
-    drop(cluster);
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL test authority"]
+async fn execution_mutation_matrix_is_exact_and_marker_guarded() {
+    let server = PostgresTestServer::start();
+    let mut covered = BTreeSet::new();
+
+    let happy_database = isolated_database(server.connect_options()).await;
+    mutation_matrix_happy_flow(&happy_database, &mut covered).await;
+    assert_marker_database_invariants(&happy_database).await;
+    cleanup(happy_database).await;
+
+    let retry_database = isolated_database(server.connect_options()).await;
+    mutation_matrix_retry_flow(&retry_database, &mut covered).await;
+    cleanup(retry_database).await;
+
+    let cancel_database = isolated_database(server.connect_options()).await;
+    mutation_matrix_cancel_flow(&cancel_database, &mut covered).await;
+    cleanup(cancel_database).await;
+
+    assert_eq!(
+        covered,
+        BTreeSet::from([
+            "accept_activation",
+            "accept_drain",
+            "accept_panel_certificate",
+            "accept_preflight",
+            "begin_activation",
+            "begin_panel_reconciliation",
+            "cancel",
+            "record_blocked_failure",
+            "record_retryable_failure",
+            "request_drain",
+            "resume_runtime_pending",
+            "supersede",
+        ])
+    );
+    drop(server);
 }
 
 async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
@@ -1644,6 +1721,403 @@ async fn wait_for_blocked_claim(pool: &PgPool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("execution claim did not reach the deployment row lock");
+}
+
+async fn mutation_matrix_happy_flow(
+    database: &IsolatedDatabase,
+    covered: &mut BTreeSet<&'static str>,
+) {
+    seed_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(database).await;
+    let mut session = claimed_session(
+        &adapter,
+        "runtime-execution-matrix-happy-controller",
+        Duration::from_secs(60),
+    )
+    .await;
+    let preflight = PreflightAttestationV1 {
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        observed_runtime: session.snapshot().previous_runtime.clone(),
+        checked_at: database_now(&database.owner_pool).await,
+    };
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptPreflight(preflight),
+        covered,
+    )
+    .await;
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::RequestDrain,
+        covered,
+    )
+    .await;
+    let drain = DrainAttestationV1 {
+        previous_runtime: session.snapshot().previous_runtime.clone(),
+        target_runtime_generation: session.snapshot().runtime_generation,
+        drained_at: database_now(&database.owner_pool).await,
+    };
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptDrain(drain),
+        covered,
+    )
+    .await;
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::BeginActivation,
+        covered,
+    )
+    .await;
+    let activation = ActivationAttestationV1 {
+        activation_request_id: session.snapshot().identity.activation_request_id.clone(),
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        kind: ActivationOutcomeKindV1::Activated,
+        activated_at: database_now(&database.owner_pool).await,
+    };
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptActivation(activation),
+        covered,
+    )
+    .await;
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::BeginPanelReconciliation,
+        covered,
+    )
+    .await;
+    let certificate = PanelCertificateV1 {
+        certificate_id: PanelCertificateId::parse("runtime-matrix-panel-certificate").unwrap(),
+        report_digest: PanelReportDigestV1::parse("8".repeat(64)).unwrap(),
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        process_instance_id: ProcessInstanceId::parse("runtime-matrix-process").unwrap(),
+        declared_count: 1,
+        installed_count: 1,
+        unchanged_count: 0,
+        skipped_transient_count: 0,
+        skipped_unresolved_channel_count: 0,
+        failed_count: 0,
+        ambiguous_outcome_count: 0,
+        stale_message_cleanup_pending_count: 0,
+        orphan_message_cleanup_pending_count: 0,
+        reposted_old_message_cleanup_pending_count: 0,
+        reconciled_at: database_now(&database.owner_pool).await,
+    };
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptPanelCertificate(certificate),
+        covered,
+    )
+    .await;
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::RecordBlockedFailure {
+            failure_id: RuntimeFailureId::parse("runtime-matrix-blocked-failure").unwrap(),
+            kind: RuntimeFailureKindV1::InvariantViolation,
+            code: "invalid_runtime_state".to_string(),
+        },
+        covered,
+    )
+    .await;
+    assert_eq!(session.state(), RuntimeConvergenceSessionStateV1::Released);
+}
+
+async fn mutation_matrix_retry_flow(
+    database: &IsolatedDatabase,
+    covered: &mut BTreeSet<&'static str>,
+) {
+    seed_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(database).await;
+    let mut session = claimed_session(
+        &adapter,
+        "runtime-execution-matrix-retry-controller",
+        Duration::from_secs(60),
+    )
+    .await;
+    advance_to_activation_applying(&database.owner_pool, &adapter, &mut session).await;
+    let activation = ActivationAttestationV1 {
+        activation_request_id: session.snapshot().identity.activation_request_id.clone(),
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        kind: ActivationOutcomeKindV1::Activated,
+        activated_at: database_now(&database.owner_pool).await,
+    };
+    mutate_applied(
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptActivation(activation),
+    )
+    .await;
+    let retry_attempt = session.convergence_attempt();
+    let retry = prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::RecordRetryableFailure {
+            failure_id: RuntimeFailureId::parse("runtime-matrix-retryable-failure").unwrap(),
+            kind: RuntimeFailureKindV1::GatewayStart,
+            code: "gateway_start_failed".to_string(),
+            attempt: retry_attempt,
+            retry_after: Duration::from_millis(1),
+        },
+        covered,
+    )
+    .await;
+    let retry_not_before = match &session.snapshot().phase {
+        RuntimeDeploymentPhaseV1::RuntimePending {
+            condition:
+                RuntimePendingConditionV1::Retryable {
+                    retry_not_before, ..
+                },
+        } => *retry_not_before,
+        _ => panic!("matrix retry must persist its retry boundary"),
+    };
+    wait_for_database_time(&database.owner_pool, retry_not_before).await;
+    let mut resumed = claimed_session(
+        &adapter,
+        "runtime-execution-matrix-resume-controller",
+        Duration::from_secs(60),
+    )
+    .await;
+    let resume = prove_mutation_case(
+        database,
+        &adapter,
+        &mut resumed,
+        RuntimeConvergenceMutationV1::ResumeRuntimePending,
+        covered,
+    )
+    .await;
+    assert_eq!(
+        resume.snapshot.revision.get(),
+        retry.snapshot.revision.get() + 2
+    );
+    let successor = SupersedingDeploymentV1 {
+        identity: serde_json::from_value(json!({
+            "deployment_id": "runtime-execution-matrix-successor",
+            "tenant_id": TENANT,
+            "installation_id": INSTALLATION,
+            "promotion_id": "d".repeat(64),
+            "activation_request_id": "runtime-execution-matrix-successor-activation"
+        }))
+        .unwrap(),
+        target: resumed.snapshot().target.clone(),
+        runtime_generation: RuntimeGeneration::new(2).unwrap(),
+    };
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut resumed,
+        RuntimeConvergenceMutationV1::Supersede {
+            by: successor,
+            reason: "new deployment selected".to_string(),
+        },
+        covered,
+    )
+    .await;
+    assert_eq!(resumed.state(), RuntimeConvergenceSessionStateV1::Released);
+}
+
+async fn mutation_matrix_cancel_flow(
+    database: &IsolatedDatabase,
+    covered: &mut BTreeSet<&'static str>,
+) {
+    seed_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(database).await;
+    let mut session = claimed_session(
+        &adapter,
+        "runtime-execution-matrix-cancel-controller",
+        Duration::from_secs(60),
+    )
+    .await;
+    prove_mutation_case(
+        database,
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::Cancel {
+            reason: "operator requested cancellation".to_string(),
+        },
+        covered,
+    )
+    .await;
+    assert_eq!(session.state(), RuntimeConvergenceSessionStateV1::Released);
+}
+
+async fn prove_mutation_case(
+    database: &IsolatedDatabase,
+    adapter: &PostgresRuntimeExecutionV1,
+    session: &mut RuntimeConvergenceSessionV1,
+    mutation: RuntimeConvergenceMutationV1,
+    covered: &mut BTreeSet<&'static str>,
+) -> RuntimeMutationReceiptV1 {
+    let kind = mutation_contract_name(&mutation);
+    assert!(covered.insert(kind));
+    let request = session.begin_mutation(mutation).unwrap();
+    let applied = adapter.mutate(request.clone()).await.unwrap();
+    assert!(matches!(
+        applied.outcome,
+        TransitionOutcomeV1::Applied { .. }
+    ));
+    let persisted = persisted_mutation_image(&database.owner_pool).await;
+    assert_eq!(
+        persisted.1,
+        i64::try_from(applied.snapshot.revision.get()).unwrap()
+    );
+    assert_eq!(persisted.2, kind);
+    let marker_payload = (persisted.3).0.clone();
+
+    let replayed = adapter.mutate(request.clone()).await.unwrap();
+    assert!(matches!(
+        replayed.outcome,
+        TransitionOutcomeV1::Replayed { .. }
+    ));
+    assert_eq!(replayed.action_id, applied.action_id);
+    assert_eq!(replayed.snapshot, applied.snapshot);
+    assert_eq!(replayed.convergence_attempt, applied.convergence_attempt);
+    assert_eq!(
+        persisted_mutation_image(&database.owner_pool).await,
+        persisted
+    );
+
+    let mut wrong_payload = marker_payload.clone();
+    wrong_payload
+        .as_object_mut()
+        .unwrap()
+        .insert("wrong_provenance".to_string(), json!(true));
+    let error = raw_mutate(&database.executor_pool, &request.guard, kind, wrong_payload)
+        .await
+        .unwrap_err();
+    assert_sqlstate(&error, "RX004");
+    assert_eq!(
+        persisted_mutation_image(&database.owner_pool).await,
+        persisted
+    );
+
+    let wrong_kind = if kind == "cancel" {
+        "supersede"
+    } else {
+        "cancel"
+    };
+    let error = raw_mutate(
+        &database.executor_pool,
+        &request.guard,
+        wrong_kind,
+        marker_payload,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&error, "RX004");
+    assert_eq!(
+        persisted_mutation_image(&database.owner_pool).await,
+        persisted
+    );
+
+    session.apply_mutation(applied.clone()).unwrap();
+    applied
+}
+
+fn mutation_contract_name(mutation: &RuntimeConvergenceMutationV1) -> &'static str {
+    match mutation {
+        RuntimeConvergenceMutationV1::AcceptPreflight(_) => "accept_preflight",
+        RuntimeConvergenceMutationV1::RequestDrain => "request_drain",
+        RuntimeConvergenceMutationV1::AcceptDrain(_) => "accept_drain",
+        RuntimeConvergenceMutationV1::BeginActivation => "begin_activation",
+        RuntimeConvergenceMutationV1::AcceptActivation(_) => "accept_activation",
+        RuntimeConvergenceMutationV1::RecordRetryableFailure { .. } => "record_retryable_failure",
+        RuntimeConvergenceMutationV1::RecordBlockedFailure { .. } => "record_blocked_failure",
+        RuntimeConvergenceMutationV1::ResumeRuntimePending => "resume_runtime_pending",
+        RuntimeConvergenceMutationV1::BeginPanelReconciliation => "begin_panel_reconciliation",
+        RuntimeConvergenceMutationV1::AcceptPanelCertificate(_) => "accept_panel_certificate",
+        RuntimeConvergenceMutationV1::Supersede { .. } => "supersede",
+        RuntimeConvergenceMutationV1::Cancel { .. } => "cancel",
+    }
+}
+
+async fn persisted_mutation_image(pool: &PgPool) -> (Json<Value>, i64, String, Json<Value>) {
+    sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(deployment), marker.mutation_revision, \
+            marker.mutation_kind, marker.mutation_payload \
+         FROM public.runtime_deployments AS deployment \
+         INNER JOIN public.runtime_execution_mutation_markers AS marker \
+            ON marker.deployment_id = deployment.deployment_id \
+         WHERE deployment.deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn assert_marker_database_invariants(database: &IsolatedDatabase) {
+    let persisted = persisted_mutation_image(&database.owner_pool).await;
+    for statement in [
+        "UPDATE public.runtime_execution_mutation_markers \
+         SET mutation_revision = mutation_revision",
+        "UPDATE public.runtime_execution_mutation_markers \
+         SET mutation_revision = mutation_revision - 1",
+        "UPDATE public.runtime_execution_mutation_markers \
+         SET deployment_id = 'runtime-marker-other'",
+        "UPDATE public.runtime_execution_mutation_markers \
+         SET mutation_revision = mutation_revision + 1",
+        "DELETE FROM public.runtime_execution_mutation_markers",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(&database.owner_pool)
+            .await
+            .unwrap_err();
+        assert_sqlstate(&error, "23514");
+        assert_eq!(
+            persisted_mutation_image(&database.owner_pool).await,
+            persisted
+        );
+    }
+
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "DROP TRIGGER runtime_execution_mutation_markers_validate_transition \
+         ON public.runtime_execution_mutation_markers",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+            public.starring_runtime_serving_schema_manifest_v1(), \
+            public.starring_runtime_execution_schema_manifest_v1()",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (true, true, false));
+    transaction.rollback().await.unwrap();
+    let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+            public.starring_runtime_serving_schema_manifest_v1(), \
+            public.starring_runtime_execution_schema_manifest_v1()",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (true, true, true));
 }
 
 async fn rotate_current_authority(pool: &PgPool) {
