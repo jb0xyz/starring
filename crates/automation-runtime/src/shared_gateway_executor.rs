@@ -17,7 +17,8 @@ use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_admitted_interaction_v3(
-    http: &Client,
+    mutation_http: &Client,
+    interaction_http: &Client,
     admitted: SharedGatewayAdmittedInteractionV3,
     interaction: &Interaction,
     failure_message: &str,
@@ -28,9 +29,9 @@ pub async fn execute_admitted_interaction_v3(
     snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) -> InteractionExecutionOutcomeV3 {
     let (identity, ruleset, bindings) = execution_inputs(admitted.route());
-    let mutation = TwilightMutationAdapter::new(http, identity.key.clone());
+    let mutation = TwilightMutationAdapter::new(mutation_http, identity.key.clone());
     let handler = handle_interaction(
-        http,
+        interaction_http,
         &identity,
         &mutation,
         &ruleset.definition,

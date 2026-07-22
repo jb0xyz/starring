@@ -210,6 +210,14 @@ fn increment(value: &mut u64) {
     *value = value.saturating_add(1);
 }
 
+fn interaction_callback_client(token: String) -> Client {
+    Client::builder()
+        .token(token)
+        .ratelimiter(None)
+        .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+        .build()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_shared_gateway_v3(
     token: String,
@@ -226,6 +234,7 @@ pub async fn run_shared_gateway_v3(
     config: SharedGatewayRuntimeConfigV3,
 ) -> SharedGatewayExitV3 {
     let observer = control.connection_observer();
+    let interaction_http = interaction_callback_client(token.clone());
     let mut shard = Shard::new(ShardId::ONE, token, Intents::empty());
     let event_types = EventTypeFlags::INTERACTION_CREATE
         | EventTypeFlags::READY
@@ -262,7 +271,7 @@ pub async fn run_shared_gateway_v3(
                             report,
                             SharedGatewayExitReasonV3::Commanded,
                             config.drain_timeout(),
-                            http,
+                            &interaction_http,
                             failure_message,
                             config.rejection_acknowledgement_capacity(),
                         )
@@ -280,7 +289,7 @@ pub async fn run_shared_gateway_v3(
                             report,
                             SharedGatewayExitReasonV3::ControlOrphaned,
                             config.drain_timeout(),
-                            http,
+                            &interaction_http,
                             failure_message,
                             config.rejection_acknowledgement_capacity(),
                         )
@@ -293,7 +302,7 @@ pub async fn run_shared_gateway_v3(
                     if let Some(interaction) = report.record_dispatch(outcome) {
                         enqueue_rejection_acknowledgement(
                             interaction,
-                            http,
+                            &interaction_http,
                             failure_message,
                             &mut rejection_acknowledgements,
                             config.rejection_acknowledgement_capacity(),
@@ -317,7 +326,7 @@ pub async fn run_shared_gateway_v3(
                         report,
                         SharedGatewayExitReasonV3::StreamEnded,
                         config.drain_timeout(),
-                        http,
+                        &interaction_http,
                         failure_message,
                         config.rejection_acknowledgement_capacity(),
                     )
@@ -339,7 +348,7 @@ pub async fn run_shared_gateway_v3(
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
-                                http,
+                                &interaction_http,
                                 failure_message,
                                 config.rejection_acknowledgement_capacity(),
                             )
@@ -361,7 +370,7 @@ pub async fn run_shared_gateway_v3(
                                     report,
                                     SharedGatewayExitReasonV3::RuntimeFailure,
                                     config.drain_timeout(),
-                                    http,
+                                    &interaction_http,
                                     failure_message,
                                     config.rejection_acknowledgement_capacity(),
                                 )
@@ -381,7 +390,7 @@ pub async fn run_shared_gateway_v3(
                                     report,
                                     SharedGatewayExitReasonV3::RuntimeFailure,
                                     config.drain_timeout(),
-                                    http,
+                                    &interaction_http,
                                     failure_message,
                                     config.rejection_acknowledgement_capacity(),
                                 )
@@ -403,7 +412,7 @@ pub async fn run_shared_gateway_v3(
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
-                                http,
+                                &interaction_http,
                                 failure_message,
                                 config.rejection_acknowledgement_capacity(),
                             )
@@ -424,7 +433,7 @@ pub async fn run_shared_gateway_v3(
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
-                                http,
+                                &interaction_http,
                                 failure_message,
                                 config.rejection_acknowledgement_capacity(),
                             )
@@ -445,7 +454,7 @@ pub async fn run_shared_gateway_v3(
                                 report,
                                 SharedGatewayExitReasonV3::RuntimeFailure,
                                 config.drain_timeout(),
-                                http,
+                                &interaction_http,
                                 failure_message,
                                 config.rejection_acknowledgement_capacity(),
                             )
@@ -465,6 +474,7 @@ pub async fn run_shared_gateway_v3(
                             ruleset_store,
                             snapshot_provider,
                             http,
+                            &interaction_http,
                             failure_message,
                             &mut active,
                             &mut rejection_acknowledgements,
@@ -498,7 +508,8 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
     teardown: &'a T,
     ruleset_store: &'a R,
     snapshot_provider: &'a S,
-    http: &'a Client,
+    mutation_http: &'a Client,
+    interaction_http: &'a Client,
     failure_message: &'a str,
     active: &mut FuturesUnordered<SharedGatewayDispatchFutureV3<'a>>,
     rejection_acknowledgements: &mut FuturesUnordered<
@@ -527,7 +538,7 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
             increment(&mut report.route_rejected);
             enqueue_rejection_acknowledgement(
                 Box::new(interaction),
-                http,
+                interaction_http,
                 failure_message,
                 rejection_acknowledgements,
                 rejection_acknowledgement_capacity,
@@ -540,7 +551,7 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
         increment(&mut report.not_ready);
         enqueue_rejection_acknowledgement(
             Box::new(interaction),
-            http,
+            interaction_http,
             failure_message,
             rejection_acknowledgements,
             rejection_acknowledgement_capacity,
@@ -554,7 +565,7 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
             report.record_admission_error(&error);
             enqueue_rejection_acknowledgement(
                 Box::new(interaction),
-                http,
+                interaction_http,
                 failure_message,
                 rejection_acknowledgements,
                 rejection_acknowledgement_capacity,
@@ -571,7 +582,8 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
         teardown,
         ruleset_store,
         snapshot_provider,
-        http,
+        mutation_http,
+        interaction_http,
         failure_message,
         guild_id,
         custom_id,
@@ -609,11 +621,12 @@ fn enqueue_rejection_acknowledgement_future<'a>(
 }
 
 async fn acknowledge_rejection(
-    http: &Client,
+    interaction_http: &Client,
     interaction: Box<Interaction>,
     failure_message: &str,
 ) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
-    let responder = TwilightInteractionResponder::from_interaction(http, &interaction, "");
+    let responder =
+        TwilightInteractionResponder::from_interaction(interaction_http, &interaction, "");
     match tokio::time::timeout(
         SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
         responder.respond_ephemeral(failure_message.to_string()),
@@ -645,7 +658,8 @@ async fn dispatch_reserved<I, G, T, R, S>(
     teardown: &T,
     ruleset_store: &R,
     snapshot_provider: &S,
-    http: &Client,
+    mutation_http: &Client,
+    interaction_http: &Client,
     failure_message: &str,
     guild_id: GuildId,
     custom_id: String,
@@ -664,7 +678,8 @@ where
     {
         Ok(Some(admitted)) => SharedGatewayDispatchOutcomeV3::Executed(
             execute_admitted_interaction_v3(
-                http,
+                mutation_http,
+                interaction_http,
                 admitted,
                 &interaction,
                 failure_message,
@@ -816,6 +831,15 @@ mod tests {
                 .with_rejection_acknowledgement_capacity(NonZeroUsize::new(1_025).unwrap()),
             Err(SharedGatewayRuntimeConfigurationErrorV3::RejectionAcknowledgementCapacity)
         );
+    }
+
+    #[tokio::test]
+    async fn interaction_callbacks_do_not_share_the_mutation_rate_limit_queue() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mutation_http = Client::new("test-token".to_string());
+        let interaction_http = interaction_callback_client("test-token".to_string());
+        assert!(mutation_http.ratelimiter().is_some());
+        assert!(interaction_http.ratelimiter().is_none());
     }
 
     #[tokio::test]

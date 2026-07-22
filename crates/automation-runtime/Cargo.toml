@@ -25,3 +25,4 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+rustls = { version = "0.23", features = ["ring"] }

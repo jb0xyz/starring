@@ -423,6 +423,7 @@ dependencies = [
  "discord-model",
  "futures",
  "resource-resolution",
+ "rustls",
  "thiserror 1.0.69",
  "tokio",
  "twilight-gateway",
