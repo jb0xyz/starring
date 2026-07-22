@@ -783,12 +783,14 @@ fn validate_previous_serving_observation(
             previous_serving_lease_matches(snapshot, request, lease)
                 && lease.acquired_at <= lease.last_heartbeat_at
                 && lease.last_heartbeat_at == *disconnected_at
+                && *disconnected_at >= snapshot.requested_at
                 && *disconnected_at <= receipt.observed_at
         }
         RuntimePreviousServingStateV1::Expired { lease, expires_at } => {
             previous_serving_lease_matches(snapshot, request, lease)
                 && lease.acquired_at <= lease.last_heartbeat_at
                 && lease.last_heartbeat_at < *expires_at
+                && *expires_at > snapshot.requested_at
                 && *expires_at <= receipt.observed_at
         }
         RuntimePreviousServingStateV1::Serving { lease, expires_at } => {
@@ -1965,6 +1967,43 @@ mod tests {
             );
             session.abort_action(request.action_id).unwrap();
         }
+    }
+
+    #[test]
+    fn previous_serving_observation_rejects_pre_request_closure_evidence() {
+        let previous = previous_runtime();
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed_with(
+            RuntimeGeneration::FIRST.next().unwrap(),
+            Some(previous),
+        ))
+        .unwrap();
+        advance_to_drain_requested(&mut session);
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut disconnected_lease = previous_lease(&request);
+        disconnected_lease.last_heartbeat_at = at(0);
+        let disconnected = RuntimePreviousServingStateV1::Disconnected {
+            lease: disconnected_lease,
+            disconnected_at: at(0),
+        };
+        assert_eq!(
+            session
+                .apply_previous_serving_observation(observation_receipt(&request, disconnected,)),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
+        session.abort_action(request.action_id).unwrap();
+
+        let request = session.begin_previous_serving_observation().unwrap();
+        let mut expired_lease = previous_lease(&request);
+        expired_lease.last_heartbeat_at = at(0);
+        let expired = RuntimePreviousServingStateV1::Expired {
+            lease: expired_lease,
+            expires_at: session.snapshot().requested_at,
+        };
+        assert_eq!(
+            session.apply_previous_serving_observation(observation_receipt(&request, expired)),
+            Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+        );
     }
 
     #[test]
