@@ -210,6 +210,7 @@ fn package_is_registered_once_and_has_only_the_bounded_first_slice() {
             "src/config.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/secret.rs",
             "tests/dependency_guard.rs",
             "tests/process_contract.rs"
         ]
@@ -218,12 +219,24 @@ fn package_is_registered_once_and_has_only_the_bounded_first_slice() {
 
 #[test]
 fn direct_dependencies_exclude_runtime_adapters_ai_and_environment_loaders() {
-    let dependencies = package_dependencies();
-    assert_eq!(dependencies.len(), 1);
-    let dependency = &dependencies[0];
-    assert_eq!(dependency["name"], "serde_json");
-    assert_eq!(dependency["kind"], "dev");
-    assert!(dependency["rename"].is_null());
+    let mut dependencies = package_dependencies()
+        .into_iter()
+        .map(|dependency| {
+            assert!(dependency["rename"].is_null());
+            (
+                dependency["name"].as_str().unwrap().to_string(),
+                dependency["kind"].as_str().map(str::to_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    assert_eq!(
+        dependencies,
+        [
+            ("serde_json".to_string(), Some("dev".to_string())),
+            ("zeroize".to_string(), None),
+        ]
+    );
 }
 
 #[test]
@@ -256,7 +269,51 @@ fn source_is_comment_free_and_cannot_compose_external_systems() {
 }
 
 #[test]
-fn executable_stops_after_configuration_and_cannot_claim_readiness() {
+fn secret_resolution_is_bounded_redacted_and_stops_before_pool_composition() {
+    let sources = source_files();
+    let secret = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/secret.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    for required in [
+        "Command::new(\"/usr/bin/security\")",
+        ".env_clear()",
+        "KEYCHAIN_TIMEOUT",
+        "KEYCHAIN_CAPTURE_BYTES",
+        "terminate_and_reap",
+        "child.kill()",
+        "child.wait()",
+        "Zeroizing<String>",
+        "Zeroizing<Vec<u8>>",
+        "Vec::with_capacity(KEYCHAIN_CAPTURE_BYTES)",
+        "RuntimeDatabaseSecretsByCapabilityV1(<redacted>)",
+        "RuntimeDatabasePasswordV1(<redacted>)",
+        "RuntimeDiscordBotTokenV1(<redacted>)",
+        "RuntimeDatabaseUrlSecretV1(<redacted>)",
+    ] {
+        assert!(secret.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "PgPool",
+        "twilight_http",
+        "twilight_gateway",
+        "Url",
+        "into_zeroizing",
+    ] {
+        assert!(!contains_identifier(secret, forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "pub type RuntimeDatabaseConnectionPartsV1",
+        "pub fn into_zeroizing",
+    ] {
+        assert!(!secret.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
     let sources = source_files();
     let main = sources
         .iter()
@@ -264,6 +321,7 @@ fn executable_stops_after_configuration_and_cannot_claim_readiness() {
         .map(|(_, source)| source.as_str())
         .unwrap();
     assert!(main.contains("RuntimeConfigV1::from_process_environment"));
+    assert!(main.contains("resolve_runtime_secrets_v1"));
     assert!(main.contains("runtime_not_composed"));
     for forbidden in ["health_ready", "ready_to_serve", "gateway_connected"] {
         assert!(!main.contains(forbidden));

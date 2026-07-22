@@ -236,7 +236,7 @@ enum RuntimeSecretReferenceSourceV1 {
 }
 
 impl RuntimeSecretReferenceV1 {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         if let Some(environment_name) = value.strip_prefix("env:") {
             if !valid_environment_name(environment_name)
                 || FORBIDDEN_POSTGRES_ENVIRONMENT.contains(&environment_name)
@@ -377,6 +377,16 @@ pub struct RuntimeSecretReferencesV1 {
 }
 
 impl RuntimeSecretReferencesV1 {
+    pub(crate) fn from_parts(
+        database_urls: [RuntimeSecretReferenceV1; 5],
+        discord_bot_token: RuntimeSecretReferenceV1,
+    ) -> Self {
+        Self {
+            database_urls,
+            discord_bot_token,
+        }
+    }
+
     pub fn database_url(&self, capability: DatabaseCapabilityV1) -> &RuntimeSecretReferenceV1 {
         &self.database_urls[capability.index()]
     }
@@ -628,10 +638,10 @@ fn parse_secret_references(
     let database_urls: [RuntimeSecretReferenceV1; 5] = database_urls
         .try_into()
         .map_err(|_| RuntimeConfigErrorV1::DuplicateSecretReference)?;
-    Ok(RuntimeSecretReferencesV1 {
+    Ok(RuntimeSecretReferencesV1::from_parts(
         database_urls,
         discord_bot_token,
-    })
+    ))
 }
 
 fn parse_secret_reference(

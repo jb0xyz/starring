@@ -1,20 +1,33 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use starring_runtime::{RuntimeConfigErrorV1, RuntimeConfigV1};
+use starring_runtime::{
+    resolve_runtime_secrets_v1, RuntimeConfigErrorV1, RuntimeConfigV1,
+    RuntimeSecretsResolutionErrorV1,
+};
 
 fn main() -> ExitCode {
     install_panic_hook();
     match RuntimeConfigV1::from_process_environment() {
-        Ok(_) => {
-            emit_status("runtime_not_composed", None);
-            ExitCode::from(70)
-        }
+        Ok(config) => match resolve_runtime_secrets_v1(&config) {
+            Ok(_) => {
+                emit_status("runtime_not_composed", None);
+                ExitCode::from(70)
+            }
+            Err(error) => {
+                emit_secret_error(error);
+                ExitCode::from(78)
+            }
+        },
         Err(error) => {
             emit_configuration_error(error);
             ExitCode::from(78)
         }
     }
+}
+
+fn emit_secret_error(error: RuntimeSecretsResolutionErrorV1) {
+    emit_status(error.code(), error.context());
 }
 
 fn emit_configuration_error(error: RuntimeConfigErrorV1) {
