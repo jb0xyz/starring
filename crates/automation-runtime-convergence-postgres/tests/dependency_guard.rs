@@ -31,7 +31,9 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/error.rs"),
         include_str!("../src/evidence.rs"),
         include_str!("../src/hydration/bindings.rs"),
+        include_str!("../src/hydration/connection.rs"),
         include_str!("../src/hydration/contract.rs"),
+        include_str!("../src/hydration/database.rs"),
         include_str!("../src/hydration/mod.rs"),
         include_str!("../src/hydration/row.rs"),
         include_str!("../src/lib.rs"),
@@ -227,6 +229,88 @@ fn exact_target_hydration_is_scoped_to_private_capabilities() {
     ] {
         assert!(!contract.contains(relation));
     }
+}
+
+#[test]
+fn exact_target_database_capability_is_verified_and_fail_closed() {
+    let migration =
+        include_str!("../../../migrations/202607220028_scope_runtime_exact_target_database.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_runtime_exact_target_schema_manifest_v1()",
+        "CREATE FUNCTION public.starring_runtime_exact_target_database_readiness_v1()",
+        "TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)",
+        "ERRCODE = 'RE001'",
+        "pg_catalog.current_setting('role') <> 'none'",
+        "role_row.rolconnlimit NOT BETWEEN 1 AND 4",
+        "pg_catalog.pg_auth_members",
+        "pg_catalog.pg_db_role_setting",
+        "pg_catalog.pg_default_acl",
+        "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_largeobject_metadata",
+        "public.starring_runtime_exact_target_schema_manifest_v1()",
+        "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for relation in [
+        "product_control_plane_identity",
+        "runtime_deployments",
+        "activation_requests",
+        "authoring_promotions",
+        "product_tenants",
+        "automation_installations",
+        "automation_installation_authority_versions",
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+    ] {
+        assert!(migration.contains(relation));
+    }
+    for forbidden in ["CREATE ROLE", "GRANT EXECUTE", "GRANT SELECT", "COMMENT ON"] {
+        assert!(!migration.contains(forbidden));
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let adapter = include_str!("../src/hydration/mod.rs");
+    assert!(adapter.contains("pub async fn connect_verified("));
+    assert!(adapter.contains("pub async fn connect_verified_default("));
+    assert!(adapter.contains("pub async fn verify_database_v1("));
+    assert!(!adapter.contains("pub fn new("));
+    assert!(!adapter.contains("pub fn with_timeouts("));
+    assert!(!adapter.contains("pub async fn database_identity("));
+    let contract = include_str!("../src/hydration/contract.rs");
+    assert!(contract.contains("starring_runtime_exact_target_database_readiness_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_reader_database_identity_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    assert!(contract.contains("pg_catalog.pg_get_functiondef"));
+    assert!(!contract.contains("runtime_deployments"));
+    assert!(!contract.contains("automation_ruleset_versions"));
+    let connection = include_str!("../src/hydration/connection.rs");
+    assert!(connection.contains("drop(connection.detach())"));
+    assert!(adapter.contains("tokio::time::timeout_at"));
+    assert!(adapter.contains("verify_runtime_exact_target_binding_v1"));
+    let database = include_str!("../src/hydration/database.rs");
+    assert!(database.contains("RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V1"));
+}
+
+#[test]
+fn exact_target_database_migration_is_registered_after_interaction_scope() {
+    let versions = automation_runtime_convergence_postgres::MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let interaction = versions
+        .iter()
+        .position(|version| *version == 202_607_220_027)
+        .unwrap();
+    let exact_target = versions
+        .iter()
+        .position(|version| *version == 202_607_220_028)
+        .unwrap();
+    assert!(interaction < exact_target);
 }
 
 #[test]

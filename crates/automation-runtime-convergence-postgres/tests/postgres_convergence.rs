@@ -23,8 +23,9 @@ use automation_runtime_convergence_postgres::{
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
     PostgresRuntimeConvergenceConfigV1, PostgresRuntimeExactTargetReader,
     RecoverBlockedDeploymentV1, RecoverStaleLiveV1, RenewDeploymentV1, RuntimeBuildRevisionV1,
-    RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1,
-    SubmitLiveAttestationV1, MIGRATOR,
+    RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
+    RuntimeExactTargetDatabaseExpectationV1, RuntimeExactTargetDatabaseTimeoutsV1,
+    SubmitDeploymentMutationV1, SubmitLiveAttestationV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use discord_model::GuildId;

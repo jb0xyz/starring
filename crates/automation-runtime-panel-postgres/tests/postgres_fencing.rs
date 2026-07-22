@@ -14,7 +14,9 @@ use automation_panel_installation::strict::{
 use automation_panel_installation::{
     PanelInstallation, PanelInstallationKey, PanelInstallationStore,
 };
-use automation_ruleset::{RuleSetContentHash, RuleSetVersionId};
+use automation_ruleset::{
+    RuleSetContentHash, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
+};
 use automation_runtime_controller::{
     RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergencePort,
     RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
@@ -32,21 +34,20 @@ use automation_runtime_convergence_postgres::{
     DeploymentAvailabilityV1, DeploymentMutationV1, EnqueueDeploymentOutcomeV1,
     EnqueueDeploymentV1, GatewayShardIdV1, HeartbeatServingLeaseV1, LiveMetadataV1,
     MarkServingDisconnectedV1, PanelReportDigestV1, PostgresRuntimeConvergence,
-    PostgresRuntimeConvergenceConfigV1, PostgresRuntimeExactTargetReader,
-    RecoverBlockedDeploymentV1, RecoverStaleLiveV1, RuntimeBuildRevisionV1,
-    RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1, RuntimeExactTargetV1,
-    SubmitDeploymentMutationV1, SubmitLiveAttestationV1, MIGRATOR,
+    PostgresRuntimeConvergenceConfigV1, RecoverBlockedDeploymentV1, RecoverStaleLiveV1,
+    RuntimeBuildRevisionV1, RuntimeConvergenceStoreError, RuntimeDeploymentScopeV1,
+    RuntimeExactTargetV1, SubmitDeploymentMutationV1, SubmitLiveAttestationV1, MIGRATOR,
 };
 use automation_runtime_panel_postgres::{
     verify_runtime_panel_database_with_timeouts_v1, PostgresFencedStrictPanelStoreV1,
     RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseTimeoutsV1, RuntimePanelErrorClassV1,
     RuntimePanelLatchedErrorV1, RuntimePanelPersistenceErrorV1, RuntimePanelSessionIdV1,
 };
-use automation_state::PanelSpec;
+use automation_state::{InteractionRuleSet, PanelSpec};
 use chrono::{DateTime, TimeDelta, Utc};
 use desired_state::ResourceKey;
-use discord_model::{ChannelId, GuildId, MessageId};
-use resource_resolution::ResourceBindingFingerprint;
+use discord_model::{ChannelId, GuildId, MessageId, UserId};
+use resource_resolution::{ResourceBindingFingerprint, ResourceBindingMap};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::types::Json;
@@ -313,11 +314,27 @@ async fn advance_to_panel_reconciliation(
         session.snapshot().phase,
         RuntimeDeploymentPhaseV1::ReconcilingPanels
     ));
-    let execution = session.current_execution_receipt().unwrap();
-    let exact = PostgresRuntimeExactTargetReader::new(pool.clone())
-        .load_for_execution(&execution)
-        .await
-        .unwrap();
+    let exact = RuntimeExactTargetV1 {
+        snapshot: session.snapshot().clone(),
+        installation_authority_revision: 1,
+        current_authority_revision: 1,
+        artifact: RuleSetVersion {
+            guild_id: GUILD,
+            ruleset_key: RULESET.parse().unwrap(),
+            version: RuleSetVersionId::FIRST,
+            schema_version: CURRENT_RULESET_SCHEMA_VERSION,
+            definition: serde_json::from_value::<InteractionRuleSet>(json!({
+                "version": 1,
+                "panels": [],
+                "modals": [],
+                "rules": []
+            }))
+            .unwrap(),
+            content_hash: RuleSetContentHash::parse_hex(CONTENT_HASH).unwrap(),
+            created_by: UserId(9_200_201),
+        },
+        bindings: ResourceBindingMap::default(),
+    };
     (adapter, session, exact)
 }
 

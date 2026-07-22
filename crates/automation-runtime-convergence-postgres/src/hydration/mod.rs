@@ -1,21 +1,33 @@
 mod bindings;
+mod connection;
 mod contract;
+mod database;
 mod row;
-
-use std::time::Duration;
 
 use automation_ruleset::RuleSetVersion;
 use automation_runtime_controller::RuntimeExecutionReceiptV1;
 use automation_runtime_convergence::{ControllerId, FencingToken, RuntimeDeploymentSnapshotV1};
 use resource_resolution::ResourceBindingMap;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool};
 
 use crate::error::database;
 use crate::model::ClaimExecutionReceiptV1;
 use crate::row::runtime_i64;
 use crate::RuntimeConvergenceStoreError;
 
-use self::contract::{DATABASE_IDENTITY_QUERY, EXACT_TARGET_QUERY};
+pub use self::database::{
+    verify_runtime_exact_target_database_v1, verify_runtime_exact_target_database_with_timeouts_v1,
+    RuntimeExactTargetDatabaseExpectationV1, RuntimeExactTargetDatabaseReadinessV1,
+    RuntimeExactTargetDatabaseTimeoutsV1, DEFAULT_RUNTIME_EXACT_TARGET_LOCK_TIMEOUT,
+    DEFAULT_RUNTIME_EXACT_TARGET_STATEMENT_TIMEOUT, MAX_RUNTIME_EXACT_TARGET_DATABASE_TIMEOUT,
+};
+
+use self::connection::ExactTargetConnectionGuardV1;
+use self::contract::EXACT_TARGET_QUERY;
+use self::database::{
+    begin_exact_target_transaction, verify_runtime_exact_target_binding_v1,
+    verify_runtime_exact_target_database_with_timeouts_v1 as verify_database_with_timeouts,
+};
 use self::row::RuntimeExactTargetRow;
 
 pub(super) struct RuntimeExactTargetExecutionV1<'a> {
@@ -59,55 +71,47 @@ pub struct RuntimeExactTargetV1 {
 #[derive(Clone)]
 pub struct PostgresRuntimeExactTargetReader {
     pool: PgPool,
-    statement_timeout: Duration,
-    lock_timeout: Duration,
+    expectation: RuntimeExactTargetDatabaseExpectationV1,
+    timeouts: RuntimeExactTargetDatabaseTimeoutsV1,
+    initial_readiness: RuntimeExactTargetDatabaseReadinessV1,
 }
 
 impl PostgresRuntimeExactTargetReader {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            statement_timeout: Duration::from_secs(2),
-            lock_timeout: Duration::from_secs(1),
-        }
-    }
-
-    pub fn with_timeouts(
+    pub async fn connect_verified(
         pool: PgPool,
-        statement_timeout: Duration,
-        lock_timeout: Duration,
+        expectation: RuntimeExactTargetDatabaseExpectationV1,
+        timeouts: RuntimeExactTargetDatabaseTimeoutsV1,
     ) -> Result<Self, RuntimeConvergenceStoreError> {
-        if statement_timeout.is_zero()
-            || lock_timeout.is_zero()
-            || statement_timeout.as_millis() == 0
-            || lock_timeout.as_millis() == 0
-            || statement_timeout > Duration::from_secs(30)
-            || lock_timeout > statement_timeout
-        {
-            return Err(RuntimeConvergenceStoreError::InvalidInput(
-                "runtime hydration timeouts",
-            ));
-        }
+        let initial_readiness =
+            verify_database_with_timeouts(&pool, &expectation, timeouts).await?;
         Ok(Self {
             pool,
-            statement_timeout,
-            lock_timeout,
+            expectation,
+            timeouts,
+            initial_readiness,
         })
     }
 
-    pub async fn database_identity(&self) -> Result<String, RuntimeConvergenceStoreError> {
-        let mut transaction = self.begin().await?;
-        let identities = sqlx::query_scalar::<_, String>(DATABASE_IDENTITY_QUERY)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(database)?;
-        let [identity] = identities.as_slice() else {
-            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
-                "runtime hydration database identity",
-            ));
-        };
-        transaction.commit().await.map_err(database)?;
-        Ok(identity.clone())
+    pub async fn connect_verified_default(
+        pool: PgPool,
+        expectation: RuntimeExactTargetDatabaseExpectationV1,
+    ) -> Result<Self, RuntimeConvergenceStoreError> {
+        Self::connect_verified(
+            pool,
+            expectation,
+            RuntimeExactTargetDatabaseTimeoutsV1::default(),
+        )
+        .await
+    }
+
+    pub fn initial_readiness(&self) -> &RuntimeExactTargetDatabaseReadinessV1 {
+        &self.initial_readiness
+    }
+
+    pub async fn verify_database_v1(
+        &self,
+    ) -> Result<RuntimeExactTargetDatabaseReadinessV1, RuntimeConvergenceStoreError> {
+        verify_database_with_timeouts(&self.pool, &self.expectation, self.timeouts).await
     }
 
     pub async fn load_for_claim(
@@ -129,10 +133,41 @@ impl PostgresRuntimeExactTargetReader {
         &self,
         execution: RuntimeExactTargetExecutionV1<'_>,
     ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
+        let deadline = tokio::time::Instant::now() + self.timeouts.statement_timeout();
+        let connection = tokio::time::timeout_at(deadline, self.pool.acquire())
+            .await
+            .map_err(|_| RuntimeConvergenceStoreError::DatabaseTimeout)?
+            .map_err(database)?;
+        let mut connection = ExactTargetConnectionGuardV1::new(connection);
+        let Some(database_connection) = connection.connection_mut() else {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime exact target database connection",
+            ));
+        };
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.load_on_connection(database_connection, execution),
+        )
+        .await;
+        match result {
+            Ok(result) => {
+                connection.release_to_pool();
+                result
+            }
+            Err(_) => Err(RuntimeConvergenceStoreError::DatabaseTimeout),
+        }
+    }
+
+    async fn load_on_connection(
+        &self,
+        connection: &mut PgConnection,
+        execution: RuntimeExactTargetExecutionV1<'_>,
+    ) -> Result<RuntimeExactTargetV1, RuntimeConvergenceStoreError> {
         let snapshot = execution.snapshot;
         let identity = &snapshot.identity;
         let target = &snapshot.target;
-        let mut transaction = self.begin().await?;
+        let mut transaction = begin_exact_target_transaction(connection, self.timeouts).await?;
+        verify_runtime_exact_target_binding_v1(&mut transaction, &self.expectation).await?;
         let rows = sqlx::query_as::<_, RuntimeExactTargetRow>(EXACT_TARGET_QUERY)
             .bind(identity.tenant_id.as_str())
             .bind(identity.installation_id.as_str())
@@ -166,28 +201,5 @@ impl PostgresRuntimeExactTargetReader {
         let hydrated = row.decode(&execution)?;
         transaction.commit().await.map_err(database)?;
         Ok(hydrated)
-    }
-
-    async fn begin(&self) -> Result<Transaction<'_, Postgres>, RuntimeConvergenceStoreError> {
-        let mut transaction = self.pool.begin().await.map_err(database)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
-            .await
-            .map_err(database)?;
-        let idle_timeout = self.statement_timeout.checked_mul(2).ok_or(
-            RuntimeConvergenceStoreError::InvalidInput("runtime hydration idle timeout"),
-        )?;
-        sqlx::query(
-            "SELECT pg_catalog.set_config('statement_timeout', $1, TRUE), \
-                    pg_catalog.set_config('lock_timeout', $2, TRUE), \
-                    pg_catalog.set_config('idle_in_transaction_session_timeout', $3, TRUE)",
-        )
-        .bind(format!("{}ms", self.statement_timeout.as_millis()))
-        .bind(format!("{}ms", self.lock_timeout.as_millis()))
-        .bind(format!("{}ms", idle_timeout.as_millis()))
-        .execute(&mut *transaction)
-        .await
-        .map_err(database)?;
-        Ok(transaction)
     }
 }

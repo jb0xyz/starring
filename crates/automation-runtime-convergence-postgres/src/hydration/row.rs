@@ -14,6 +14,9 @@ use crate::RuntimeConvergenceStoreError;
 use super::bindings::decode_resource_bindings;
 use super::{RuntimeExactTargetExecutionV1, RuntimeExactTargetV1};
 
+const MAX_RUNTIME_EXACT_TARGET_RULESET_DEFINITION_BYTES: usize = 524_288;
+const MAX_RUNTIME_EXACT_TARGET_RESOURCE_BINDINGS_BYTES: usize = 262_144;
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub(super) struct RuntimeExactTargetRow {
     deployment_revision: i64,
@@ -55,7 +58,7 @@ impl RuntimeExactTargetRow {
             u64::try_from(self.installation_authority_revision).map_err(|_| invalid())?;
         let current_authority_revision =
             u64::try_from(self.current_authority_revision).map_err(|_| invalid())?;
-        let guild_id = self.guild_id.parse::<GuildId>().map_err(|_| invalid())?;
+        let guild_id = canonical_guild_id(&self.guild_id).ok_or_else(invalid)?;
         let ruleset_key = RuleSetKey::parse(&self.ruleset_key).map_err(|_| invalid())?;
         let version = u32::try_from(self.target_version)
             .ok()
@@ -70,11 +73,13 @@ impl RuntimeExactTargetRow {
             .as_ref()
             .ok_or_else(invalid)
             .and_then(|value| {
+                validate_json_size(&value.0, MAX_RUNTIME_EXACT_TARGET_RULESET_DEFINITION_BYTES)
+                    .map_err(|_| invalid())?;
                 serde_json::from_value::<InteractionRuleSet>(value.0.clone()).map_err(|_| invalid())
             })?;
         let persisted_hash =
             RuleSetContentHash::parse_hex(&self.content_hash).ok_or_else(invalid)?;
-        let created_by = self.created_by.parse::<UserId>().map_err(|_| invalid())?;
+        let created_by = canonical_user_id(&self.created_by).ok_or_else(invalid)?;
         let binding_revision = u64::try_from(self.binding_revision)
             .ok()
             .and_then(|value| BindingRevision::new(value).ok())
@@ -85,7 +90,11 @@ impl RuntimeExactTargetRow {
             .resource_bindings
             .as_ref()
             .ok_or_else(invalid)
-            .and_then(|value| decode_resource_bindings(value.0.clone()).map_err(|_| invalid()))?;
+            .and_then(|value| {
+                validate_json_size(&value.0, MAX_RUNTIME_EXACT_TARGET_RESOURCE_BINDINGS_BYTES)
+                    .map_err(|_| invalid())?;
+                decode_resource_bindings(value.0.clone()).map_err(|_| invalid())
+            })?;
         let calculated_hash = content_hash(schema_version, &definition).map_err(|_| invalid())?;
         let calculated_fingerprint = resource_binding_fingerprint_v2(&bindings);
         if deployment_revision != snapshot.revision
@@ -121,5 +130,46 @@ impl RuntimeExactTargetRow {
             },
             bindings,
         })
+    }
+}
+
+fn canonical_guild_id(value: &str) -> Option<GuildId> {
+    canonical_snowflake(value).map(GuildId)
+}
+
+fn canonical_user_id(value: &str) -> Option<UserId> {
+    canonical_snowflake(value).map(UserId)
+}
+
+fn canonical_snowflake(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed != 0 && parsed.to_string() == value).then_some(parsed)
+}
+
+fn validate_json_size(value: &Value, maximum: usize) -> Result<(), ()> {
+    let encoded = serde_json::to_vec(value).map_err(|_| ())?;
+    (encoded.len() <= maximum).then_some(()).ok_or(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn discord_identifiers_must_be_nonzero_canonical_snowflakes() {
+        assert_eq!(canonical_guild_id("42"), Some(GuildId(42)));
+        assert_eq!(canonical_user_id("99"), Some(UserId(99)));
+        for value in ["", "0", "01", "+1", " 1", "18446744073709551616"] {
+            assert_eq!(canonical_guild_id(value), None);
+            assert_eq!(canonical_user_id(value), None);
+        }
+    }
+
+    #[test]
+    fn exact_target_json_payloads_are_bounded_by_encoded_bytes() {
+        assert!(validate_json_size(&json!({"value": "small"}), 32).is_ok());
+        assert!(validate_json_size(&json!({"value": "oversized"}), 8).is_err());
     }
 }

@@ -376,6 +376,7 @@ fn classify_error(error: &RuntimeConvergenceStoreError) -> RuntimeConvergenceErr
         | RuntimeConvergenceStoreError::InvalidInput(_)
         | RuntimeConvergenceStoreError::InvalidPersistedState(_)
         | RuntimeConvergenceStoreError::DatabaseFailure
+        | RuntimeConvergenceStoreError::DatabaseAuthorityMismatch
         | RuntimeConvergenceStoreError::Domain(_) => RuntimeConvergenceErrorClassV1::InvalidState,
     }
 }
@@ -409,6 +410,10 @@ mod tests {
             ),
             (
                 RuntimeConvergenceStoreError::InvalidPersistedState("test"),
+                RuntimeConvergenceErrorClassV1::InvalidState,
+            ),
+            (
+                RuntimeConvergenceStoreError::DatabaseAuthorityMismatch,
                 RuntimeConvergenceErrorClassV1::InvalidState,
             ),
         ];
