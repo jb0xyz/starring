@@ -15,6 +15,7 @@ mod v2_binding;
     )
 )]
 mod v2_canonical_value;
+mod v2_certification;
 #[cfg_attr(
     not(test),
     expect(
@@ -71,6 +72,7 @@ pub use v2_binding::RuntimeBindingPinV1;
 pub use v2_canonical_value::{
     RuntimeCanonicalValueErrorV2, RuntimeServingLeaseMillisecondsV2, RuntimeUnixMicrosecondsV2,
 };
+pub use v2_certification::{RuntimeCertificationIntentV2, RuntimeCertificationRequestV2};
 pub use v2_digest::{
     RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,
     RuntimeDrainIntentDigestV2, RuntimeLiveAttestationDigestV2, RuntimeProductMutationDigestV2,

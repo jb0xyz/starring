@@ -171,6 +171,97 @@ fn v2_canonical_values_stay_checked_and_nonserializable() {
 }
 
 #[test]
+fn v2_certification_inputs_stay_inert_and_exact() {
+    let source = include_str!("../src/v2_certification.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "RuntimeLiveAttestation",
+        "RuntimeCertificationReceipt",
+        "RuntimeCertificationPort",
+        "sqlx",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden inert V2 certification surface: {forbidden}"
+        );
+    }
+
+    let intent = source
+        .split("pub struct RuntimeCertificationIntentV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert!(source.contains(concat!(
+        "pub struct RuntimeCertificationIntentV2 {\n",
+        "    pub action_id: RuntimeSessionActionIdV1,\n",
+        "    pub operation_id: RuntimeCertificationOperationIdV2,\n",
+        "    pub guard: RuntimeExecutionGuardV1,\n",
+        "    pub target: RuntimeDeploymentTargetV1,\n",
+        "    pub binding_pin: RuntimeBindingPinV1,\n",
+        "    pub process_identity: RuntimeProcessIdentityV1,\n",
+        "    pub gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,\n",
+        "    pub observed_owner_revision: NonZeroU64,\n",
+        "    pub runtime_build_revision: RuntimeBuildRevisionV1,\n",
+        "    pub panel: RuntimePanelEvidenceV2,\n",
+        "    pub serving_lease_for: Duration,\n",
+        "}"
+    )));
+    for (field, field_type) in [
+        ("action_id", "RuntimeSessionActionIdV1"),
+        ("operation_id", "RuntimeCertificationOperationIdV2"),
+        ("guard", "RuntimeExecutionGuardV1"),
+        ("target", "RuntimeDeploymentTargetV1"),
+        ("binding_pin", "RuntimeBindingPinV1"),
+        ("process_identity", "RuntimeProcessIdentityV1"),
+        ("gateway_owner_lease_id", "RuntimeGatewayOwnerLeaseIdV1"),
+        ("observed_owner_revision", "NonZeroU64"),
+        ("runtime_build_revision", "RuntimeBuildRevisionV1"),
+        ("panel", "RuntimePanelEvidenceV2"),
+        ("serving_lease_for", "Duration"),
+    ] {
+        assert!(intent.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(intent.matches("    pub ").count(), 11);
+
+    let request = source
+        .split("pub struct RuntimeCertificationRequestV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[cfg(test)]").next())
+        .unwrap();
+    assert!(source.contains(concat!(
+        "pub struct RuntimeCertificationRequestV2 {\n",
+        "    pub intent: RuntimeCertificationIntentV2,\n",
+        "    pub intent_fingerprint: RuntimeCertificationIntentFingerprintV2,\n",
+        "    pub must_commit_before: DateTime<Utc>,\n",
+        "    pub route_admission: RuntimeRouteAdmissionAttestationV2,\n",
+        "}"
+    )));
+    for (field, field_type) in [
+        ("intent", "RuntimeCertificationIntentV2"),
+        (
+            "intent_fingerprint",
+            "RuntimeCertificationIntentFingerprintV2",
+        ),
+        ("must_commit_before", "DateTime<Utc>"),
+        ("route_admission", "RuntimeRouteAdmissionAttestationV2"),
+    ] {
+        assert!(request.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(request.matches("    pub ").count(), 4);
+    assert_eq!(source.matches("pub struct RuntimeCertification").count(), 2);
+
+    let library = include_str!("../src/lib.rs");
+    assert!(library.contains("RuntimeCertificationIntentV2"));
+    assert!(library.contains("RuntimeCertificationRequestV2"));
+}
+
+#[test]
 fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
     for (path, source) in [
         ("v2_product.rs", include_str!("../src/v2_product.rs")),
@@ -351,6 +442,10 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_canonical_value.rs",
             include_str!("../src/v2_canonical_value.rs"),
+        ),
+        (
+            "src/v2_certification.rs",
+            include_str!("../src/v2_certification.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
