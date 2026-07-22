@@ -1,6 +1,7 @@
 mod attempt;
 mod deployment;
 mod operator;
+mod previous_serving;
 mod serving;
 mod status;
 
@@ -108,6 +109,23 @@ impl PostgresRuntimeConvergence {
             .fetch_one(&mut **transaction)
             .await
             .map_err(database)
+    }
+
+    async fn lock_serving_slot(
+        transaction: &mut Transaction<'_, Postgres>,
+        guild_id: &str,
+        ruleset_key: &str,
+    ) -> Result<(), RuntimeConvergenceStoreError> {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(\
+             pg_catalog.concat('starring-runtime-serving-slot-v1:', $1::TEXT, ':', $2::TEXT), 0))",
+        )
+        .bind(guild_id)
+        .bind(ruleset_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database)?;
+        Ok(())
     }
 
     fn bounded_duration(
@@ -433,6 +451,12 @@ impl PostgresRuntimeConvergence {
         transaction: &mut Transaction<'_, Postgres>,
         snapshot: &RuntimeDeploymentSnapshotV1,
     ) -> Result<DateTime<Utc>, RuntimeConvergenceStoreError> {
+        Self::lock_serving_slot(
+            transaction,
+            &snapshot.target.guild_id.to_string(),
+            snapshot.target.ruleset_key.as_str(),
+        )
+        .await?;
         let serving = sqlx::query_as::<_, ServingLeaseRow>(&format!(
             "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
              WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"

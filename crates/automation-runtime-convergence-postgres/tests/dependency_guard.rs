@@ -43,6 +43,9 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/store/deployment.rs"),
         include_str!("../src/store/mod.rs"),
         include_str!("../src/store/operator.rs"),
+        include_str!("../src/store/previous_serving/contract.rs"),
+        include_str!("../src/store/previous_serving/mod.rs"),
+        include_str!("../src/store/previous_serving/row.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
     ];
@@ -53,6 +56,46 @@ fn adapter_sources_contain_no_comments() {
             assert!(!trimmed.starts_with("/*"));
             assert!(!trimmed.starts_with('*'));
         }
+    }
+}
+
+#[test]
+fn previous_serving_observation_is_a_private_fenced_capability() {
+    let migration =
+        include_str!("../../../migrations/202607220023_observe_previous_runtime_serving.sql");
+    assert!(
+        migration.contains("CREATE FUNCTION public.starring_runtime_observe_previous_serving_v1(")
+    );
+    assert!(migration.contains("SECURITY DEFINER\nSET search_path = pg_catalog"));
+    assert!(migration.contains(
+        "REVOKE ALL PRIVILEGES ON FUNCTION public.starring_runtime_observe_previous_serving_v1("
+    ));
+    assert!(migration.contains("FROM public.runtime_deployments"));
+    assert!(migration.contains("FOR UPDATE;"));
+    assert!(migration.contains("pg_catalog.pg_advisory_xact_lock"));
+    assert!(migration.contains("starring-runtime-serving-slot-v1:"));
+    assert!(migration.contains("database_now := pg_catalog.clock_timestamp();"));
+    assert!(migration.contains("deployment_row.phase <> 'drain_requested'"));
+    assert!(migration.contains(
+        "deployment_row.controller_fencing_token\n            IS DISTINCT FROM expected_controller_fencing_token"
+    ));
+    assert!(migration
+        .contains("deployment_row.previous_runtime IS DISTINCT FROM expected_previous_runtime"));
+    assert!(migration.contains("serving_row.acquired_at > deployment_row.requested_at"));
+    assert!(migration.contains("serving_row.last_heartbeat_at < deployment_row.requested_at"));
+    assert!(migration.contains("serving_row.expires_at <= deployment_row.requested_at"));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT SELECT"));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let contract = include_str!("../src/store/previous_serving/contract.rs");
+    assert!(contract.contains("starring_runtime_observe_previous_serving_v1"));
+    for relation in ["runtime_deployments", "runtime_serving_leases"] {
+        assert!(!contract.contains(relation));
     }
 }
 

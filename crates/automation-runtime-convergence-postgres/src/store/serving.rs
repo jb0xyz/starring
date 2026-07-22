@@ -749,6 +749,7 @@ impl PostgresRuntimeConvergence {
         guild_id: String,
         ruleset_key: &str,
     ) -> Result<Option<ServingLeaseRow>, RuntimeConvergenceStoreError> {
+        Self::lock_serving_slot(transaction, &guild_id, ruleset_key).await?;
         sqlx::query_as::<_, ServingLeaseRow>(&format!(
             "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
              WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"

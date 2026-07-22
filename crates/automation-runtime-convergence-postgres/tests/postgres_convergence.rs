@@ -4,7 +4,10 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetVersionId};
-use automation_runtime_controller::RuntimeExecutionReceiptV1;
+use automation_runtime_controller::{
+    RuntimeConvergenceSessionV1, RuntimeExecutionReceiptV1, RuntimePreviousServingObservationPort,
+    RuntimePreviousServingStateV1,
+};
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
     ControllerId, ControllerLeaseV1, DeploymentId, DrainAttestationV1, FencingToken,
@@ -54,4 +57,5 @@ include!("postgres_convergence/binding_authority.rs");
 include!("postgres_convergence/convergence_attempt.rs");
 include!("postgres_convergence/lifecycle.rs");
 include!("postgres_convergence/hydration.rs");
+include!("postgres_convergence/previous_serving.rs");
 include!("postgres_convergence/support.rs");

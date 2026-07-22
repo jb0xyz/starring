@@ -9,7 +9,9 @@ use automation_runtime_controller::{
     RuntimeDeploymentScopeV1 as ControllerScopeV1, RuntimeDisconnectServingV1,
     RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1,
     RuntimeLiveMetadataV1, RuntimeMutationReceiptV1, RuntimeMutationRequestV1,
-    RuntimeRenewExecutionV1, RuntimeServingIdentityV1 as ControllerServingIdentityV1,
+    RuntimeObservePreviousServingV1, RuntimePreviousServingObservationPort,
+    RuntimePreviousServingObservationReceiptV1, RuntimeRenewExecutionV1,
+    RuntimeServingIdentityV1 as ControllerServingIdentityV1,
     RuntimeServingReceiptV1 as ControllerServingReceiptV1, RuntimeServingUpdateReceiptV1,
     RuntimeStaleLiveRecoveryReceiptV1,
 };
@@ -162,6 +164,15 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
 
     fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1 {
         classify_error(error)
+    }
+}
+
+impl RuntimePreviousServingObservationPort for PostgresRuntimeConvergence {
+    async fn observe_previous_serving(
+        &self,
+        request: RuntimeObservePreviousServingV1,
+    ) -> Result<RuntimePreviousServingObservationReceiptV1, Self::Error> {
+        self.observe_previous_serving_capability(request).await
     }
 }
 

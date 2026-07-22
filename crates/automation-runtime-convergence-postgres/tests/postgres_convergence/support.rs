@@ -472,6 +472,24 @@ async fn converge_claimed(
     automation_runtime_convergence_postgres::MutationReceiptV1,
     automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
 ) {
+    converge_claimed_with_lease(
+        adapter,
+        claim,
+        process_instance_id,
+        Duration::from_secs(45),
+    )
+    .await
+}
+
+async fn converge_claimed_with_lease(
+    adapter: &PostgresRuntimeConvergence,
+    claim: automation_runtime_convergence_postgres::ClaimReceiptV1,
+    process_instance_id: ProcessInstanceId,
+    serving_lease_for: Duration,
+) -> (
+    automation_runtime_convergence_postgres::MutationReceiptV1,
+    automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
+) {
     let controller_id = claim.controller_id.clone();
     let fencing_token = claim.fencing_token;
     let mut revision = mutate(
@@ -584,7 +602,7 @@ async fn converge_claimed(
                 panel_report_digest: PanelReportDigestV1::parse("7".repeat(64)).unwrap(),
                 gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
             },
-            serving_lease_for: Duration::from_secs(45),
+            serving_lease_for,
         })
         .await
         .unwrap()
