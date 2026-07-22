@@ -4,15 +4,20 @@ Date: 2026-07-22
 
 Status: accepted implementation contract
 
+Canonical addendum date: 2026-07-22
+
+Canonical addendum audit: accepted 2026-07-22
+
 Extends: `2026-07-19-production-control-api-runtime-convergence-design.md`
 
-This document is authoritative only after its independent safety audit passes.
-It defines the remaining production contract for `tools/starring-runtime`, the
-pure runtime worker, gateway admission, local route replacement, V2 Live
-certification, restart reconstruction, and historical instance bindings. The
-approval, Product Apply, immutable artifact, exact target, strict panel,
-PostgreSQL authority, and false-Live boundaries from the earlier design remain
-unchanged.
+The worker-composition contract and independently audited canonical V2
+persistence addendum are authoritative. This document defines the remaining
+production contract for `tools/starring-runtime`, the pure runtime worker,
+gateway admission, local route replacement, V2 Live certification, restart
+reconstruction, and historical instance bindings. The approval, Product Apply,
+immutable artifact, exact target, strict panel, PostgreSQL authority, and
+false-Live boundaries
+from the earlier design remain unchanged.
 
 ## Outcome and non-goals
 
@@ -681,7 +686,8 @@ pub struct RuntimeRouteAdmissionAttestationV2 {
 containing exactly 32 lowercase hexadecimal characters generated from 128
 CSPRNG bits. Parsing rejects every other length or alphabet, and there is no
 unchecked public constructor. Both are included in canonical wire, digest,
-golden-vector, and public-surface tests.
+golden-vector, and public-surface tests when contained by one of the six
+canonical roots; neither creates a seventh digest domain.
 
 Barrier B creates typed causal receipts. The concrete adapter first returns a
 non-cloneable `GatewayBarrierPauseReceiptV2` that owns the opaque pause token,
@@ -733,6 +739,438 @@ commits `reconciled_at`; it does not bind the raw timestamp again or compare it
 with gateway, activation, or commit timestamps. No V1 timestamp-ordering check
 is reused. Golden vectors target the exact V2 projection and request wire
 types.
+
+## Canonical V2 persistence addendum
+
+This independently audited section supersedes any less precise reference
+elsewhere in this document to a canonical domain, canonical JSON, direct DTO
+serialization, timestamp formatting, duration
+formatting, or Live attestation record shape.
+
+### Identifier ownership and database shape
+
+This is the exhaustive CSPRNG identifier inventory for this contract. Every ID
+contains exactly 32 lowercase ASCII hexadecimal characters encoding 128 random
+bits. Checked parsing rejects every other byte length, alphabet, case, prefix,
+separator, or textual form. Parsing never generates an ID.
+
+| Identifier | Exact scope | Sole generation owner | Unknown, crash, and replay rule |
+| --- | --- | --- | --- |
+| `RuntimeBarrierIdV1` | gateway shard, process instance, coordinator generation | The worker requests one ID from the injected generator immediately before the first pause dispatch for one barrier. | Lost pause or resume acknowledgement exact-observes the same control lifetime, generation, and ID. It neither reuses the ID with another generation nor mints a competing barrier until the old control lifetime is proven closed. |
+| `RuntimeRecoveryIdV2` | gateway shard, process instance, recovery generation | The closed-recovery supervisor requests one ID from the injected generator when it creates the recovery permit. | Every recovery retry uses that ID. Restart exact-observes gateway ownership, coordinator generation, and durable/local recovery evidence before adopting it; a successor is legal only after the old recovery authority is proven closed. |
+| `RuntimeCertificationOperationIdV2` | `RuntimeDeploymentScopeV1` plus deployment revision and convergence attempt | `tools/starring-runtime` generates it once before certification-intent reservation. | Reservation, prepare, commit-unknown observation, and restart use scope-only observation and adopt any persisted ID. A known row with different canonical bytes or digest is typed divergence. |
+| `RuntimeDrainIntentIdV2` | `RuntimeDeploymentScopeV1` plus serving slot and expected revision | The Product mutation boundary generates it once before first drain-intent create. | Create uncertainty observes the exact natural scope and adopts a persisted ID and preimage. Claim, refence, acknowledgement, consumption, and restart never replace it. |
+| `RuntimeProductOperationIdV2` | `RuntimeDeploymentScopeV1` plus expected revision | The Product mutation boundary generates it once before the first Product mutation. | Product retries and runtime handoff use scope-only observation and adopt any persisted operation. Runtime cannot mint or substitute it; changed semantic or canonical input is typed divergence. |
+| `RuntimeSuspensionIdV2` | `RuntimeDeploymentScopeV1` plus deployment revision and convergence attempt | The worker requests one ID from the injected generator immediately before the first sidecar create. | Unknown create, drain progress, restart, and resume observe and adopt the persisted sidecar ID. They never replace it while that scoped sidecar may exist. |
+
+Every durable first-apply call owns its dedicated database connection. If its
+result is unknown, no new ID is legal until a transaction-ended proof exists
+and a scope-only observation under the same natural lock proves exact absence.
+If a row exists, the caller adopts its ID, canonical bytes, and digest. If the
+row differs from the expected immutable values, the result is a typed
+divergence, not replay. Only proven absence permits a new CSPRNG ID and a new
+first apply. Observation by a caller-proposed ID alone is insufficient.
+
+Each persisted ID is immutably bound to its exact scope. Physical tables have
+one `UNIQUE` constraint over the complete natural scope and a separate
+`UNIQUE` or primary-key constraint over the ID. A composite uniqueness rule on
+scope plus ID is not a substitute because it would admit two IDs for one
+natural scope. No update may move a scope or ID member. Embedded barrier and
+recovery evidence carries and checks its complete gateway scope. Scope-only
+observation returns at most one live or reserved immutable operation for the
+natural scope; more than one is `PersistenceCorrupt`.
+
+Every persisted column for one of these identifiers is `text NOT NULL` and has
+an inline PostgreSQL constraint equivalent to:
+
+```sql
+CHECK (octet_length(identifier) = 32 AND identifier ~ '^[0-9a-f]{32}$')
+```
+
+The constraint applies to each of the six ID kinds on every physical column in
+which that kind appears rather than relying on Rust, a trigger, or a calling
+role. Persisted SHA-256 hexadecimal columns likewise require exactly 64
+lowercase hexadecimal ASCII characters. Migration and real-PostgreSQL tests
+exercise every physical constraint, natural-scope uniqueness rule, and separate
+ID uniqueness rule directly.
+
+### Private versioned wire projections
+
+Domain DTOs are not canonical merely because they implement Serde. Each
+persisted or digested top-level value uses a private, purpose-specific wire
+projection owned by `automation-runtime-controller`. The following six roots
+are exhaustive; adding another root requires a versioned design change.
+
+```rust
+pub struct RuntimeProductSemanticRequestDigestV2(String);
+
+pub struct RuntimeProductMutationPreimageV2 {
+    pub operation_id: RuntimeProductOperationIdV2,
+    pub scope: RuntimeDeploymentScopeV1,
+    pub expected_revision: DeploymentRevision,
+    pub slot: RuntimeServingSlotV2,
+    pub expected_target: RuntimeDeploymentTargetV1,
+    pub mutation_kind: RuntimeProductMutationKindV2,
+    pub product_semantic_request_digest: RuntimeProductSemanticRequestDigestV2,
+}
+
+pub struct RuntimeDrainIntentPreimageV2 {
+    pub key: RuntimeDrainIntentKeyV2,
+}
+```
+
+`RuntimeProductSemanticRequestDigestV2` is supplied by the Product boundary,
+contains exactly 64 lowercase hexadecimal SHA-256 characters, and commits the
+Product-owned semantic request. Runtime validates and binds it but cannot
+compute or replace it. `RuntimeDrainIntentPreimageV2` contains only the key. It
+excludes `intent_digest`, revision, state, claims, progress, acknowledgements,
+and timestamps, so neither preimage is self-referential or mutable.
+Checked constructors compute `RuntimeProductMutationDigestV2` only from the
+Product preimage and `RuntimeDrainIntentDigestV2` only from
+`RuntimeDrainIntentPreimageV2::from_key(key)`. Neither constructor accepts its
+resulting digest as input; decode is the only path that reads and recomputes an
+embedded or separately persisted digest.
+
+Product drain creation accepts the Product preimage, its recomputed mutation
+digest, and the drain preimage as one checked aggregate. The drain key's
+`product_operation_id`, `scope`, `expected_revision`, `slot`,
+`expected_target`, and `mutation_kind` must equal the corresponding Product
+preimage fields, and its `product_mutation_digest` must equal the digest just
+recomputed from the exact Product bytes. Their slot must equal
+`RuntimeServingSlotV2::from_target(expected_target)`, and scope, revision, and
+target must exactly match the deployment row locked by the authorized Product
+mutation. The Product boundary cannot supply two independently valid but
+cross-mismatched or consistently wrong roots. Rust has no public unchecked
+aggregate constructor, and the atomic PostgreSQL first-apply procedure repeats
+every equality against both the roots and locked deployment before storing
+either root.
+
+| Root and exact ordered fields after `format_version` | Immutable `bytea` column | Typed digest | Sole private decoder | Maximum octets |
+| --- | --- | --- | --- | --- |
+| Certification intent: `action_id`, `operation_id`, `guard`, `target`, `binding_pin`, `process_identity`, `gateway_owner_lease_id`, `observed_owner_revision`, `runtime_build_revision`, `panel`, `serving_lease_milliseconds` | `certification_intent_bytes` | `RuntimeCertificationIntentFingerprintV2` | `decode_certification_intent_v2` | 32768 |
+| Certification request: `intent`, `intent_fingerprint`, `must_commit_before_unix_microseconds`, `route_admission` | `certification_request_bytes` | `RuntimeCertificationRequestDigestV2` | `decode_certification_request_v2` | 65536 |
+| Live record: `request_digest`, `request` | `live_attestation_record_bytes` | `RuntimeLiveAttestationDigestV2` | `decode_live_attestation_record_v2` | 131072 |
+| Product mutation preimage: `operation_id`, `scope`, `expected_revision`, `slot`, `expected_target`, `mutation_kind`, `product_semantic_request_digest` | `product_mutation_request_bytes` | `RuntimeProductMutationDigestV2` | `decode_product_mutation_preimage_v2` | 32768 |
+| Drain intent preimage: `key` | `drain_intent_request_bytes` | `RuntimeDrainIntentDigestV2` | `decode_drain_intent_preimage_v2` | 65536 |
+| Suspend-attempt request: `suspension_id`, `action_id`, `guard`, `source_phase`, `failure`, `disposition`, `checkpoint`, `local_effect`, `drain_obligation` | `suspend_attempt_request_bytes` | `RuntimeSuspendAttemptDigestV2` | `decode_suspend_attempt_request_v2` | 131072 |
+
+All six columns are `bytea NOT NULL` with `octet_length` bounded by the table.
+Rust rejects oversize input before JSON parsing or allocation proportional to a
+declared length. PostgreSQL repeats the bound. Public APIs accept and return
+checked domain DTOs, canonical bytes, and digest newtypes; wire structs and
+decoders remain private.
+
+Every top-level projection follows all of these rules:
+
+- The first field is numeric `"format_version":2`. A string version, missing
+  version, duplicate version, or any other number is rejected.
+- Encoding is compact UTF-8 JSON with no insignificant whitespace. Struct field
+  order is the wire order and is covered by exact-byte golden tests.
+- Every declared field is present. An optional value is encoded as either its
+  value or JSON `null`; no `skip_serializing_if` behavior is permitted.
+- Unknown, duplicate, and missing fields are rejected at every projection
+  level. Decoding must re-encode and require byte-for-byte equality with the
+  input, so reordered fields, alternate escapes, and whitespace are not a
+  second accepted representation.
+- `flatten`, untagged enums, aliases, defaults, and implicit variant renaming
+  are forbidden in every canonical projection.
+- Canonical projections contain no floating-point numbers, `HashMap`,
+  `BTreeMap`, `serde_json::Value`, or other unordered or dynamically keyed
+  object. Collections whose order is meaningful use an explicitly defined
+  vector order. No set-like collection is admitted until its projection fixes
+  a byte-level sort key and duplicate rejection rule.
+- Integer fields use JSON decimal integers within their declared Rust range.
+  Byte identities use their one checked lowercase hexadecimal representation.
+  A `Debug` string, platform formatter, locale, or database JSON rendering is
+  never canonical input.
+
+Every persistence-bound `u64` and `NonZeroU64`, including values nested in V1
+domain objects, is restricted to `0..=9223372036854775807` or
+`1..=9223372036854775807` respectively. Rust constructors and canonical
+decoders reject larger values before SQLx binding. PostgreSQL stores them as
+`bigint` with matching checks. Golden and real-database tests cover
+`i64::MAX`, `i64::MAX + 1`, zero, and one.
+
+Fieldless enums encode as one fixed lowercase snake-case JSON string. Enums
+with any payload encode as an object whose first field is `"kind"` and whose
+remaining fixed fields are the named payload projection in declared order.
+The V2 tags covered by persistence and digests are fixed as follows:
+
+| Enum | Exact tags |
+| --- | --- |
+| `RuntimeGatewayReadyKindV2` | `ready`, `resumed` |
+| `RuntimeFailureKindV1` in a V2 root | `environment_unavailable`, `activation_not_observable`, `panel_reconciliation`, `gateway_start`, `gateway_ready_timeout`, `invariant_violation` |
+| `RuntimeCertificationRecoveryDispositionV2` | `stop_ownership`, `drain_and_replan`, `drain_and_stop`, `emergency_halt` |
+| `RuntimeProductMutationKindV2` | `apply`, `supersede`, `cancel`, `authority_change`, `teardown` |
+| `RuntimeDrainIntentMutationOutcomeV2` | `inserted`, `replayed`, `claimed`, `refenced`, `acknowledged`, `consumed`, `cancelled` |
+| `RuntimeResumeCheckpointV2` | `verify_preflight`, `request_drain`, `complete_drain`, `begin_activation`, `observe_activation`, `begin_panels`, `reconcile_panels` |
+| `RuntimeSuspensionSourcePhaseV2` | `requested`, `preflight_ready`, `drain_requested`, `drained`, `activation_applying`, `runtime_pending_ready`, `reconciling_panels` |
+| `RuntimeSuspendedRouteLifecycleV2` | `staged`, `draining` |
+| `RuntimeSuspendAttemptMutationOutcomeV2` | `inserted`, `replayed`, `drain_progressed`, `resumed` |
+| `RuntimeRouteMutationProvenanceV2` | `ordinary`, `closed_recovery`, `shutdown` |
+| `RuntimeCertificationDivergenceV2` | `ownership_lost`, `deployment_advanced`, `authority_changed`, `superseded`, `terminal`, `reservation_mismatch`, `committed_request_mismatch`, `persistence_corrupt` |
+| `RuntimeCertificationObservationV2` | `not_committed`, `committed`, `diverged` |
+| `RuntimeDrainClaimProgressV2` | `claimed`, `refenced` |
+| `RuntimeDrainCertificationResolutionV2` | `no_operation_reserved`, `no_attestation_for_reserved_operation`, `committed_and_disconnected` |
+| `RuntimeDrainIntentStateV2` | `pending`, `route_absent_acknowledged`, `consumed`, `cancelled` |
+| `RuntimeAttemptDispositionV2` | `retryable`, `blocked` |
+| `RuntimeDrainObligationV2` | `none`, `exact_local_route`, `previous_serving`, `local_and_previous` |
+| `RuntimeLocalRouteEffectV2` | `none`, `exact_route`, `route_absent` |
+
+Payload variants use these exact semantic field names and order after `kind`:
+
+| Enum variant | Ordered payload fields |
+| --- | --- |
+| `RuntimeRouteMutationProvenanceV2::Ordinary` | `barrier_id`, `pause` |
+| `RuntimeRouteMutationProvenanceV2::ClosedRecovery` | `witness` |
+| `RuntimeRouteMutationProvenanceV2::Shutdown` | `witness` |
+| `RuntimeCertificationDivergenceV2::{DeploymentAdvanced,AuthorityChanged,Superseded,Terminal}` | `snapshot` |
+| Other `RuntimeCertificationDivergenceV2` variants | no payload fields |
+| `RuntimeCertificationObservationV2::NotCommitted` | `snapshot`, `convergence_attempt`, `operation_id`, `request_digest`, `observed_deployment_revision`, `observed_at_unix_microseconds` |
+| `RuntimeCertificationObservationV2::Committed` | `receipt` |
+| `RuntimeCertificationObservationV2::Diverged` | `divergence` |
+| `RuntimeDrainClaimProgressV2::Claimed` | `seal` |
+| `RuntimeDrainClaimProgressV2::Refenced` | `seal`, `provenance`, `old_route`, `removal_target`, `registry_observation_sequence`, `refenced_at_unix_microseconds` |
+| `RuntimeDrainCertificationResolutionV2::NoOperationReserved` | no payload fields |
+| `RuntimeDrainCertificationResolutionV2::NoAttestationForReservedOperation` | `operation_id`, `intent_fingerprint` |
+| `RuntimeDrainCertificationResolutionV2::CommittedAndDisconnected` | `operation_id`, `serving_identity`, `disconnected_revision` |
+| `RuntimeDrainIntentStateV2::Pending` | `claim` |
+| `RuntimeDrainIntentStateV2::RouteAbsentAcknowledged` | `acknowledgement` |
+| `RuntimeDrainIntentStateV2::Consumed` | `resulting_revision`, `consumed_at_unix_microseconds` |
+| `RuntimeDrainIntentStateV2::Cancelled` | `cancelled_at_unix_microseconds` |
+| `RuntimeAttemptDispositionV2::Retryable` | `retry_not_before_unix_microseconds` |
+| `RuntimeAttemptDispositionV2::Blocked` | no payload fields |
+| `RuntimeDrainObligationV2::None` | no payload fields |
+| `RuntimeDrainObligationV2::ExactLocalRoute` | `route` |
+| `RuntimeDrainObligationV2::PreviousServing` | `previous` |
+| `RuntimeDrainObligationV2::LocalAndPrevious` | `local`, `previous` |
+| `RuntimeLocalRouteEffectV2::None` | no payload fields |
+| `RuntimeLocalRouteEffectV2::ExactRoute` | `route`, `lifecycle` |
+| `RuntimeLocalRouteEffectV2::RouteAbsent` | `slot`, `expected_route`, `provenance`, `observed_sequence` |
+
+No tuple payload, flattened payload, inferred field name, or alternate tag is
+accepted. The private V2 projection spells out every nested field rather than
+deriving order from a public domain DTO; exact-byte goldens freeze each shape.
+`RuntimeFailureV1` is
+projected as `failure_id`, `kind`, `code`, `message`,
+`recorded_at_unix_microseconds`; its kind uses only the tags listed above.
+
+Nested V1 domain values used by a V2 payload are expanded through private
+V2-owned wire projections as well. They do not inherit a current Serde,
+chrono, or Rust variant representation. Reuse is allowed only when an existing
+versioned byte contract is explicitly named and exact-byte tests prove it is
+identical; otherwise the consuming V2 projection fixes the nested fields,
+order, and tags. No V2 projection obtains a nested tag from a Rust variant name
+implicitly.
+
+### Time and duration normalization
+
+Every `DateTime<Utc>` in a V2 canonical projection is a signed 64-bit Unix
+microsecond JSON integer in a field ending `_unix_microseconds`. Encoding
+rejects a domain value with nonzero sub-microsecond nanoseconds. The inclusive
+canonical range is
+`-62135596800000000..=253402300799999999`, covering UTC years 0001 through
+9999. Rust checked conversion rejects every value outside that range.
+
+The adapter binds the checked `DateTime<Utc>` to SQLx in binary
+`timestamptz(6)` form and also binds its canonical signed `bigint` Unix
+microseconds. The procedure requires a finite timestamp in the same range and
+compares the bigint with `extract(epoch from value) * 1000000` using exact
+PostgreSQL `numeric`, never floating point or text formatting. Negative values
+use Unix floor semantics. PostgreSQL already stores microsecond precision and
+cannot prove whether a caller originally supplied discarded nanoseconds;
+sub-microsecond rejection is therefore a Rust boundary obligation, not a
+database claim. Real-PostgreSQL parity tests cover both range endpoints,
+adjacent rejection, negative fractions, epoch, and database clock values.
+Every physical V2 timestamp column also has a database `CHECK` requiring
+`isfinite(value)` and the inclusive UTC range from
+`0001-01-01 00:00:00.000000+00` through
+`9999-12-31 23:59:59.999999+00`; its paired canonical bigint has the numeric
+range check above.
+
+`RuntimeCertificationIntentV2::serving_lease_for` is encoded only as the
+unsigned integer field `serving_lease_milliseconds`. It must be an exact whole
+number of milliseconds in `1000..=300000`. Encoding rejects a `Duration` with
+sub-millisecond remainder; decoding rejects zero, 999, 300001, overflow, and
+non-integers. Its persisted normalized column is an integer with the same
+inclusive PostgreSQL check. An interval string or floating-point seconds is
+never canonical input.
+
+### Framed digest domains
+
+For exact domain bytes `D` and canonical payload bytes `P`, every V2 digest is:
+
+```text
+SHA256(u64be(octet_length(D)) || D || u64be(octet_length(P)) || P)
+```
+
+Lengths are unsigned 64-bit big-endian octet counts. Each domain below includes
+the final NUL byte shown as `\0`; the same text without that byte is a different
+and invalid domain for this contract.
+
+| Digest or fingerprint | Exact domain bytes | Canonical payload |
+| --- | --- | --- |
+| `RuntimeCertificationIntentFingerprintV2` | `starring.runtime.certification_intent.v2\0` | certification intent wire |
+| `RuntimeCertificationRequestDigestV2` | `starring.runtime.certification_request.v2\0` | certification request wire |
+| `RuntimeLiveAttestationDigestV2` | `starring.runtime.live_attestation.v2\0` | Live attestation record wire |
+| `RuntimeProductMutationDigestV2` | `starring.runtime.product_mutation.v2\0` | Product mutation wire |
+| `RuntimeDrainIntentDigestV2` | `starring.runtime.drain_intent.v2\0` | drain intent wire |
+| `RuntimeSuspendAttemptDigestV2` | `starring.runtime.suspend_attempt.v2\0` | suspend-attempt request wire |
+
+Rust exposes six internal typed digest helpers and no function accepting a
+caller-supplied domain. PostgreSQL has six fixed-domain wrappers over one
+owner-only framing helper. The private schema and every helper revoke all from
+`PUBLIC`; application, Product, and runtime login roles receive no direct
+execute. High-level procedures are owned by a non-login role, schema-qualify
+all relations and functions, and fix `search_path` to `pg_catalog` plus the
+private runtime schema. They persist exact canonical `bytea` and never digest a
+`jsonb` rendering. SQL privilege and hostile-`search_path` tests prove a caller
+cannot select another domain, shadow a helper, or call it directly.
+
+For the framing payload bytes `{"format_version":2}`, the mandatory SHA-256
+goldens are:
+
+| Domain suffix | Exact lowercase hexadecimal digest |
+| --- | --- |
+| `certification_intent` | `2065f317b4f1ff6e4b66dfc47ea8d77db8e825984c00c3acc8dd24681cf40bd6` |
+| `certification_request` | `d50aa91c84f365fa336357c307b8f2613c1be377cee6f5db82510ffc195c0a6d` |
+| `live_attestation` | `8216ef56961340a2f4220a43bded1079fed038af95261bbd46f91e4df8ecc759` |
+| `product_mutation` | `558cb8a7f9190dfc7a7784750bf4e0d053ed7c2bb6c36c6ba6b7fd80c39bff81` |
+| `drain_intent` | `08ae4fb2781f1d8f841912af5b0397468ba19fb2f41278933cce30f229943564` |
+| `suspend_attempt` | `4d36fe1ee130959adbf77dd0df4ae5c49b36b188a12bfeb25fa0325a63e72c85` |
+
+### Non-self-referential Live attestation
+
+The sole preimage for `RuntimeLiveAttestationDigestV2` is the private-field
+domain record:
+
+```rust
+pub struct RuntimeLiveAttestationRecordV2 {
+    request_digest: RuntimeCertificationRequestDigestV2,
+    request: RuntimeCertificationRequestV2,
+}
+```
+
+Its sole public constructor is
+`RuntimeLiveAttestationRecordV2::from_request(request)`. It accepts no digest.
+Before hashing, it recomputes and verifies the intent fingerprint, validates
+route admission, and requires exact equality across scope, target, serving
+slot, process identity, controller fence, gateway-owner lease and revision,
+runtime build revision, panel process and fence, route process and fence, and
+binding-pin scope and target. It then canonicalizes the request and computes
+the request digest internally. Decode alone reads an embedded request digest,
+recomputes it, performs the same cross-field validation, and rejects mismatch.
+The record exposes read-only accessors only. The Live record and its wire projection
+contain neither their own attestation digest nor a serving identity, serving
+receipt, `certified_at`, deployment snapshot, or transition receipt. Those
+values are outputs of the atomic commit and may bind the resulting attestation
+digest, but cannot enter that digest's own preimage. The database stores the
+canonical record bytes, request digest, and resulting attestation digest and
+checks them before committing Live. The commit procedure recomputes the framed
+request digest from the exact request `bytea`, requires the record `bytea` to
+equal the fixed record projection built from that request and recomputed digest,
+then recomputes and compares the framed Live digest. It never trusts a caller's
+digest or a parsed `jsonb` rendering.
+
+The exact record bytes are the concatenation of these ASCII and byte segments,
+with no whitespace or escaping substitution:
+
+```text
+{"format_version":2,"request_digest":"
+<64 lowercase ASCII hexadecimal request-digest bytes>
+","request":
+<exact canonical certification-request object bytes>
+}
+```
+
+The line breaks above separate segments and are not bytes. The actual prefix is
+`{"format_version":2,"request_digest":"`, the middle delimiter is
+`","request":`, and the suffix is `}`. Because the digest alphabet is fixed
+and the request is one canonical JSON object, direct concatenation is the sole
+record encoder in Rust and PostgreSQL.
+
+### Immutable byte persistence
+
+Every high-level first-apply or commit procedure independently constructs each
+affected canonical root from its already validated typed arguments with one
+owner-only, fixed-version projection builder. It compares that expected bytea
+with the caller's canonical bytea before hashing or storing it. Reordered
+fields, whitespace, alternate escaping, a cross-field mismatch, or any other
+byte difference rejects the transaction even if the caller also supplies the
+matching hash of those noncanonical bytes. The certification reserve builds
+the intent; Live commit builds request and record; Product first apply builds
+the Product and drain preimages; suspension create builds its request.
+
+Projection builders are fixed-schema functions, not a generic JSON or
+caller-selected domain facility. They assemble reviewed constant UTF-8
+segments and typed field projections, use one private byte-exact JSON string
+escape primitive, and never feed `jsonb::text` or another database JSON object
+rendering into a digest. Rust and PostgreSQL goldens cover empty strings,
+quotes, reverse solidus, control bytes, BMP and non-BMP Unicode, every nested
+variant, and all six complete roots. High-level procedures are the only
+granted entry points; login roles cannot execute builders or the escape
+primitive directly.
+
+Certification reservation atomically stores operation scope and ID,
+`certification_intent_bytes`, and its fingerprint. Live commit atomically adds
+`certification_request_bytes`, request digest,
+`live_attestation_record_bytes`, Live digest, and the typed attestation and
+serving outputs. No procedure reconstructs a missing root from mutable columns
+or writes only a digest.
+
+Product first apply atomically stores Product scope and operation ID,
+`product_mutation_request_bytes`, its digest, drain scope and intent ID,
+`drain_intent_request_bytes`, its digest, and initial drain state. Product
+status and drain revision, claim, progress, acknowledgement, and timestamps are
+separate mutable columns and cannot alter either root. Suspension create
+atomically stores scope and suspension ID, `suspend_attempt_request_bytes`, its
+digest, and initial sidecar state; current local effect, obligation, sidecar
+revision, and completion are separate mutable columns.
+
+Each immutable root record has `NOT NULL` bytes, typed digest, ID, and scope
+fields in the transaction that first makes that record visible; no partially
+filled root record exists. Certification intent is one insert-only record, and
+the request plus Live record are an insert-only child created by Live commit.
+Updates deny changes to either. Exact replay compares stored bytes before
+mutable processing; the same scope and ID with different bytes or digest is
+typed divergence. Row ACLs deny direct DML to every login role.
+
+### Required conformance tests
+
+Rust release gates include exact-byte goldens and decode/re-encode equality for
+all six top-level projections; the six framing goldens above; domain-separation
+tests using the same payload; and compile-time or public-surface guards proving
+the wire structs and unchecked constructors are inaccessible. Negative tests
+cover unknown, duplicate, missing, reordered, and wrong-version fields;
+noncanonical JSON; every invalid ID class; every fixed enum tag; omitted versus
+explicit-null options; pre-epoch, epoch, maximum supported, and
+sub-microsecond timestamps; and 999, 1000, 300000, 300001, overflow, and
+sub-millisecond leases. Changing any request field must change its request
+digest and checked Live record digest. Injecting an attestation digest,
+serving output, commit timestamp, or snapshot into the Live preimage must be
+impossible through the typed API. Root-size limits, `i64::MAX` integer bounds,
+all payload variant shapes, no-flatten guards, Product semantic digest format,
+Product and drain non-self-reference, `from_request` cross-field mismatches,
+and exact Live-record concatenation are mandatory cases.
+
+Real PostgreSQL 16 release gates create the migrated schema and directly prove
+all identifier and digest checks, including uppercase and wrong-length
+rejection. They compare the database framing helper with all six Rust goldens,
+persist and reload exact canonical `bytea`, and prove no `jsonb` round trip is
+used. Direct hostile calls submit reordered, whitespace-padded,
+alternate-escaped, and cross-field-mismatched roots together with the correct
+hash of those hostile bytes; every procedure must reject without a write.
+Timestamp parity covers negative microseconds, epoch, positive values,
+database-produced `clock_timestamp()`, boundary rejection, and exact
+microsecond round trips. Lease parity covers both accepted boundaries and each
+adjacent rejection. Certification, Product drain, and suspension procedure
+tests prove exact replay preserves the original ID and bytes while any changed
+ID, digest, canonical payload, fixed tag, or normalized time/duration is a
+closed divergence or constraint failure. Fault injection loses every
+first-apply acknowledgement and proves transaction-ended plus scope-only
+observation adopts a committed ID, creates a new ID only after exact absence,
+and rejects two rows for one natural scope. ACL tests cover direct DML, helper
+execution, hostile `search_path`, and all six immutable byte columns.
 
 ## Prepared V2 Live certification
 
@@ -937,13 +1375,14 @@ pub struct RuntimeRecoveryPendingV2<E, R> {
 }
 ```
 
-The serializable intent, request, digest, fingerprint, receipt, lookup,
-observation, divergence, and recovery-disposition DTOs live in the pure
-controller contract. Only those plain data types receive versioned,
-deny-unknown-fields canonical wire projections and golden-byte and digest
-tests. The receipt carries every identity needed by heartbeat, exact
-observation, and conditional disconnect; adapters never reconstruct one from
-the current slot row.
+The intent, request, digest, fingerprint, receipt, lookup, observation,
+divergence, and recovery-disposition domain DTOs live in the pure controller
+contract. Only the six roots named by the canonical V2 addendum have canonical
+`bytea` projections and digest domains. Other DTOs use typed columns or are
+nested by an explicitly listed root; deriving Serde is not a substitute. The
+receipt carries every identity needed by heartbeat, exact observation, and
+conditional disconnect; adapters never reconstruct one from the current slot
+row.
 All digest and fingerprint newtypes accept only 64 lowercase hexadecimal
 SHA-256 characters and expose no unchecked constructor.
 
@@ -1011,23 +1450,25 @@ intent with the inner request before sending SQL.
 
 After both authority freezes settle and before opening the prepared transaction,
 `ReserveCertificationIntentV2` locks the slot and Awaiting row and persists one
-operation ID plus the canonical intent fingerprint in a separate insert-only
-operation row keyed by the unchanged Awaiting deployment revision and
-convergence attempt. It does not mutate the deployment phase, revision, guard,
-or mutation clock. A unique constraint permits only exact replay of the same
-operation ID and fingerprint; replay returns the identical reservation receipt,
-while any different value is divergence. Awaiting reset terminally consumes
-that reservation in the same transaction that advances deployment revision.
-Its domain is
-`starring.runtime.certification_intent.v2`. The versioned, deny-unknown-fields
-wire projection binds every field shown in `RuntimeCertificationIntentV2` in a
-fixed order; golden bytes and digest vectors are release gates. The authorized
+operation ID, immutable canonical intent bytes, and fingerprint in a separate
+insert-only operation row keyed by the unchanged Awaiting deployment revision
+and convergence attempt. It does not mutate the deployment phase, revision,
+guard, or mutation clock. A unique constraint permits only byte-exact replay;
+replay returns the identical reservation receipt, while any different ID,
+bytes, or fingerprint is divergence. Awaiting reset terminally consumes that
+reservation in the same transaction that advances deployment revision.
+Its fingerprint uses the framed
+`starring.runtime.certification_intent.v2\0` domain from the canonical V2
+addendum. The private versioned wire projection binds every field shown in
+`RuntimeCertificationIntentV2` in a fixed order; golden bytes and digest
+vectors are release gates. The authorized
 post-resume request carries that exact intent projection and fingerprint
-byte-for-byte, then adds prepared deadline, barrier, route, and gateway evidence.
-The post-resume request digest is persisted atomically only with a successful
-Live commit. A crash before intent reservation leaves an Awaiting row with no
-operation, which the exact scope observer may reset only after route absence.
-No API can replay or first-apply a commit request after uncertainty.
+byte-for-byte, then adds prepared deadline, barrier, route, and gateway
+evidence. Canonical request bytes, request digest, canonical Live record bytes,
+and Live digest are persisted atomically only with a successful Live commit. A
+crash before intent reservation uses transaction-ended proof and scope-only
+observation before a new ID; reset also requires route absence. No API can
+replay or first-apply a commit request after commit uncertainty.
 
 `prepare_live_v2` runs only while holding all three finalization and authority
 reservations. It starts one bounded transaction and locks the exact
@@ -1092,8 +1533,9 @@ registry effects in the runtime process. Under the serving-slot advisory lock,
 an authorized Product mutation encountering `AwaitingGatewayReady` or a durable
 local effect creates or exactly replays a correlated
 `RuntimeDrainIntentV2`. The intent binds a CSPRNG intent ID, Product operation
-ID and digest, exact deployment revision, slot, expected target, and requested
-lifecycle mutation. Its durable `Pending` or `RouteAbsentAcknowledged` state
+ID, Product semantic-request and mutation digests, exact deployment revision,
+slot, expected target, and requested lifecycle mutation through the two
+immutable preimages. Its durable `Pending` or `RouteAbsentAcknowledged` state
 freezes new runtime claim, refence, staging, and certification for that slot.
 The Product call returns pending without applying the lifecycle mutation.
 
@@ -1106,9 +1548,13 @@ sequence. The Product retry must use the same Product operation ID and digest;
 under the same serving-slot lock it verifies and consumes that acknowledgement
 atomically with the requested lifecycle mutation. Only that transaction lifts
 the slot freeze. An explicit authorized cancellation may consume the intent
-only while route absence is still proven. Application roles retain no direct
-table mutation authority, and the runtime cannot reclaim the slot between the
-acknowledgement and Product consumption.
+only while route absence is still proven. Cancellation preserves the current
+target but atomically advances the deployment revision and mutation clock while
+terminally consuming the intent. A later Product operation therefore uses the
+successor revision and cannot collide with or revive the cancelled natural
+scope. Application roles retain no direct table mutation authority, and the
+runtime cannot reclaim the slot between the acknowledgement and Product
+consumption.
 
 `RuntimeDrainClaimV2` is a dedicated drain-intent claim, not an ordinary
 convergence controller claim. Under the serving-slot advisory lock, it is legal
@@ -1410,23 +1856,29 @@ proves process-local absence after gateway teardown. A successor claim derives
 its expected route from the prior durable removal target and uses a still newer
 fence. Consumption requires the exact Product operation and route-absence
 acknowledgement. Tests restart at claim commit, local admission seal, refence,
-refence persistence, drain, removal, and acknowledgement. The canonical domain is
-`starring.runtime.drain_intent.v2`; public-contract and golden vectors cover
-every state and mutation.
+refence persistence, drain, removal, and acknowledgement. Product mutation and
+drain intent digests use their distinct framed
+`starring.runtime.product_mutation.v2\0` and
+`starring.runtime.drain_intent.v2\0` domains from the canonical V2 addendum;
+golden vectors cover the two immutable preimages. Separate state-machine tests
+cover mutable drain states and mutations without placing them in either digest.
 
 ## Exact certification observation
 
-V2 persists a certification operation ID, canonical request digest, and record
-format version 2. The digest domain is
-`starring.runtime.live_attestation.v2`. Its canonical request and record bind
-the operation ID, convergence attempt, deployment revision, controller ID and
+V2 persists a certification operation ID, canonical request digest, private
+Live attestation record bytes, and record format version 2. Certification
+request and Live attestation digests use their distinct framed domains from the
+canonical V2 addendum. The request binds the operation ID, convergence attempt,
+deployment revision, controller ID and
 fence, complete target and historical authority, process identity, stable
 owner lease ID and observed revision, build revision, panel evidence
 projection, exact intent fingerprint, prepared `must_commit_before`, barrier and pause witness, route
 identity/fence/incarnation/activation sequence, connection epoch/kind/admission
 revision/connected sequence/resume sequence, normalized binding pin, and
-serving lease duration. Golden serialization and digest vectors are release
-gates; map order and platform formatting cannot change the bytes.
+serving lease duration. The Live record contains only that request and its
+checked request digest, never its own digest or commit outputs. Golden
+serialization and digest vectors are release gates; map order and platform
+formatting cannot change the bytes.
 
 ```rust
 pub enum RuntimeCertificationObservationV2 {
@@ -1559,6 +2011,16 @@ pub enum RuntimeResumeCheckpointV2 {
     ReconcilePanels,
 }
 
+pub enum RuntimeSuspensionSourcePhaseV2 {
+    Requested,
+    PreflightReady,
+    DrainRequested,
+    Drained,
+    ActivationApplying,
+    RuntimePendingReady,
+    ReconcilingPanels,
+}
+
 pub struct RuntimeExactLocalRouteIdentityV2 {
     pub identity: RuntimeProcessIdentityV1,
     pub controller_fencing_token: FencingToken,
@@ -1607,7 +2069,7 @@ pub struct RuntimeSuspendAttemptRequestV2 {
     pub suspension_id: RuntimeSuspensionIdV2,
     pub action_id: RuntimeSessionActionIdV1,
     pub guard: RuntimeExecutionGuardV1,
-    pub source_phase: RuntimeDeploymentPhaseV1,
+    pub source_phase: RuntimeSuspensionSourcePhaseV2,
     pub failure: RuntimeFailureV1,
     pub disposition: RuntimeAttemptDispositionV2,
     pub checkpoint: RuntimeResumeCheckpointV2,
@@ -1619,7 +2081,7 @@ pub struct RuntimeSuspendedAttemptV2 {
     pub suspension_id: RuntimeSuspensionIdV2,
     pub request_digest: RuntimeSuspendAttemptDigestV2,
     pub source_guard: RuntimeExecutionGuardV1,
-    pub source_phase: RuntimeDeploymentPhaseV1,
+    pub source_phase: RuntimeSuspensionSourcePhaseV2,
     pub failure: RuntimeFailureV1,
     pub disposition: RuntimeAttemptDispositionV2,
     pub checkpoint: RuntimeResumeCheckpointV2,
@@ -1644,6 +2106,12 @@ pub struct RuntimeSuspendAttemptReceiptV2 {
 }
 ```
 
+`RuntimeSuspensionSourcePhaseV2` is the only phase admitted to the suspension
+root. `RuntimePendingReady` means exactly `RuntimePending { condition: Ready }`;
+retryable or blocked V1 pending payloads are rejected. This closed seven-value
+projection prevents arbitrary `RuntimeDeploymentPhaseV1` payloads, terminal
+phases, and embedded timestamps from entering the digest.
+
 The suspension ID, request digest, source guard, complete source phase,
 failure, disposition, and checkpoint are immutable. Only the sidecar revision,
 local effect, and drain obligation advance through exact old-revision CAS.
@@ -1658,11 +2126,12 @@ and present successor execution whose snapshot, controller identity, fence,
 attempt, acquisition time, and expiry were produced by the same transaction.
 Constructors and wire tests reject every other outcome and presence
 combination.
-The canonical domain is `starring.runtime.suspend_attempt.v2`. Versioned,
-deny-unknown-field public-contract tests and golden vectors cover every source
-phase, checkpoint, effect, obligation, and disposition. Suspension IDs use the
-bounded canonical identifier constructor. Digests are lowercase 64-character
-SHA-256 values with no unchecked public constructor.
+The suspend-attempt digest uses the framed
+`starring.runtime.suspend_attempt.v2\0` domain from the canonical V2 addendum.
+Versioned, deny-unknown-field public-contract tests and golden vectors cover
+every source phase, checkpoint, effect, obligation, and disposition. Suspension
+IDs use the bounded canonical identifier constructor. Digests are lowercase
+64-character SHA-256 values with no unchecked public constructor.
 
 Constructors require every obligation and route effect to identify one slot and
 compatible process. Any local route is drained and recorded absent before the
