@@ -10,6 +10,7 @@ use crate::model::{AutomationInstance, InstanceStatus};
 pub enum InstanceStoreError {
     DuplicateInstance,
     NotFound,
+    TimedOut,
     Backend(String),
 }
 

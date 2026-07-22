@@ -28,6 +28,7 @@ fn adapter_dependency_surface_is_narrow() {
         "automation-ruleset",
         "automation-ruleset-dispatch",
         "sqlx",
+        "tokio",
     ] {
         assert!(regular.contains(required), "missing dependency: {required}");
     }
@@ -174,7 +175,9 @@ fn adapter_implements_only_the_narrow_interaction_traits() {
 #[test]
 fn adapter_cannot_be_constructed_without_readiness_verification() {
     let store = include_str!("../src/store.rs");
-    let constructor = store.find("pub async fn connect_verified(").unwrap();
+    let constructor = store
+        .find("pub async fn connect_verified_with_route_timeout(")
+        .unwrap();
     let verification = store[constructor..]
         .find("verify_runtime_interaction_database_with_timeouts_v1")
         .unwrap();
@@ -192,6 +195,35 @@ fn adapter_cannot_be_constructed_without_readiness_verification() {
             "unverified surface: {forbidden}"
         );
     }
+}
+
+#[test]
+fn route_read_deadline_wraps_the_complete_database_operation() {
+    let store = include_str!("../src/store.rs");
+    let timeout = store.find("tokio::time::timeout_at(").unwrap();
+    let operation = store[timeout..]
+        .find("self.read_instance_route_operation_v1")
+        .unwrap();
+    let helper = store
+        .find("async fn read_instance_route_operation_v1(")
+        .unwrap();
+    let begin = store[helper..]
+        .find("begin_interaction_transaction_on_connection")
+        .unwrap();
+    let query = store[helper..].find("ROUTE_READ_QUERY").unwrap();
+    let decode = store[helper..]
+        .find(".decode(guild_id, instance_id)")
+        .unwrap();
+    let commit = store[helper..].find(".commit()").unwrap();
+    assert!(operation > 0);
+    assert!(begin < query && query < decode && decode < commit);
+    assert!(store.contains("RouteConnectionGuardV1::new"));
+    assert!(store.contains("InstanceStoreError::TimedOut"));
+
+    let guard = include_str!("../src/route_connection.rs");
+    assert!(guard.contains("impl Drop for RouteConnectionGuardV1"));
+    assert!(guard.contains("drop(connection.detach())"));
+    assert!(guard.contains("release_to_pool"));
 }
 
 #[test]

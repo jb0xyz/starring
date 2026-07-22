@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceKind, InstanceRegistrarV1, InstanceResources,
@@ -8,7 +8,8 @@ use automation_instance::{
 use automation_ruleset_dispatch::{PinnedInstanceResolverErrorV1, PinnedInstanceResolverV1};
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
-    RuntimeInteractionPersistenceErrorV1, MIGRATOR,
+    RuntimeInteractionDatabaseTimeoutsV1, RuntimeInteractionPersistenceErrorV1,
+    RuntimeInteractionRouteTimeoutV1, MIGRATOR,
 };
 use discord_model::{GuildId, RoleId, UserId};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
@@ -26,6 +27,7 @@ struct IsolatedDatabase {
     administrator: PgConnection,
     owner_pool: PgPool,
     executor_pool: PgPool,
+    deadline_pool: PgPool,
 }
 
 fn function_grant(function: &str, role: &str) -> String {
@@ -102,9 +104,15 @@ async fn isolated_database() -> IsolatedDatabase {
         owner_pool.execute(statement.as_str()).await.unwrap();
     }
 
+    let executor_options = base.database(&name).username(&role).password(&password);
     let executor_pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect_with(base.database(&name).username(&role).password(&password))
+        .connect_with(executor_options.clone())
+        .await
+        .unwrap();
+    let deadline_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(executor_options)
         .await
         .unwrap();
     IsolatedDatabase {
@@ -113,10 +121,12 @@ async fn isolated_database() -> IsolatedDatabase {
         administrator,
         owner_pool,
         executor_pool,
+        deadline_pool,
     }
 }
 
 async fn cleanup(mut database: IsolatedDatabase) {
+    database.deadline_pool.close().await;
     database.executor_pool.close().await;
     database.owner_pool.close().await;
     database
@@ -226,6 +236,7 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
     let database = isolated_database().await;
     let owner_pool = database.owner_pool.clone();
     let executor_pool = database.executor_pool.clone();
+    let deadline_pool = database.deadline_pool.clone();
     let database_name = database.name.clone();
     let executor_role = database.role.clone();
     let task = tokio::spawn(async move {
@@ -260,12 +271,19 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
             executor_role.clone(),
         )
         .unwrap();
-        let store = PostgresRuntimeInteractionV1::connect_verified_default(
-            executor_pool.clone(),
-            expectation,
-        )
-        .await
-        .unwrap();
+        let deadline_store =
+            PostgresRuntimeInteractionV1::connect_verified_with_route_timeout(
+                deadline_pool.clone(),
+                expectation.clone(),
+                RuntimeInteractionDatabaseTimeoutsV1::default(),
+                RuntimeInteractionRouteTimeoutV1::new(Duration::from_millis(400)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let store =
+            PostgresRuntimeInteractionV1::connect_verified_default(executor_pool.clone(), expectation)
+                .await
+                .unwrap();
         let (same_left, same_right) = tokio::join!(
             store.register_instance_v1(instance("study_room")),
             store.register_instance_v1(instance("study_room"))
@@ -315,6 +333,60 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
             .await
             .unwrap()
             .is_none());
+
+        let held_connection = deadline_pool.acquire().await.unwrap();
+        let deadline_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            deadline_store.read_instance_route_v1(GuildId(7), &room),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deadline_result,
+            Err(InstanceStoreError::TimedOut)
+        );
+        drop(held_connection);
+        assert!(deadline_store
+            .read_instance_route_v1(GuildId(7), &room)
+            .await
+            .unwrap()
+            .is_some());
+
+        let mut table_lock = owner_pool.begin().await.unwrap();
+        table_lock
+            .execute("LOCK TABLE public.automation_instances IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let cancelled_result = tokio::time::timeout(
+            Duration::from_millis(100),
+            deadline_store.read_instance_route_v1(GuildId(7), &room),
+        )
+        .await;
+        assert!(cancelled_result.is_err());
+        let replacement_after_cancellation =
+            tokio::time::timeout(Duration::from_secs(1), deadline_pool.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+        drop(replacement_after_cancellation);
+        let locked_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            deadline_store.read_instance_route_v1(GuildId(7), &room),
+        )
+        .await
+        .unwrap();
+        assert_eq!(locked_result, Err(InstanceStoreError::TimedOut));
+        let replacement = tokio::time::timeout(Duration::from_secs(1), deadline_pool.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(replacement);
+        table_lock.rollback().await.unwrap();
+        assert!(deadline_store
+            .read_instance_route_v1(GuildId(7), &room)
+            .await
+            .unwrap()
+            .is_some());
 
         let resolved = store
             .resolve_pinned_instance_v1(GuildId(7), &InstanceId::parse("room").unwrap())

@@ -6,7 +6,9 @@ use automation_ruleset_dispatch::PinnedInstanceResolverV1;
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
     RuntimeInteractionDatabaseTimeoutsV1, RuntimeInteractionErrorClassV1,
-    RuntimeInteractionPersistenceErrorV1, MIGRATOR,
+    RuntimeInteractionPersistenceErrorV1, RuntimeInteractionRouteTimeoutV1,
+    DEFAULT_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT, MAX_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT,
+    MIGRATOR, MIN_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT,
 };
 
 fn assert_interaction_capabilities<T>()
@@ -90,6 +92,38 @@ fn timeout_contract_accepts_only_bounded_whole_milliseconds() {
     ] {
         assert_eq!(
             RuntimeInteractionDatabaseTimeoutsV1::new(statement, lock),
+            Err(RuntimeInteractionPersistenceErrorV1::InvalidInput)
+        );
+    }
+}
+
+#[test]
+fn route_timeout_contract_is_bounded_and_observable() {
+    let defaults = RuntimeInteractionRouteTimeoutV1::default();
+    assert_eq!(
+        defaults.duration(),
+        DEFAULT_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT
+    );
+    assert_eq!(
+        RuntimeInteractionRouteTimeoutV1::new(MIN_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT)
+            .unwrap()
+            .duration(),
+        MIN_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT
+    );
+    assert_eq!(
+        RuntimeInteractionRouteTimeoutV1::new(MAX_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT)
+            .unwrap()
+            .duration(),
+        MAX_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT
+    );
+    for invalid in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        MIN_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT - Duration::from_millis(1),
+        MAX_RUNTIME_INTERACTION_ROUTE_READ_TIMEOUT + Duration::from_millis(1),
+    ] {
+        assert_eq!(
+            RuntimeInteractionRouteTimeoutV1::new(invalid),
             Err(RuntimeInteractionPersistenceErrorV1::InvalidInput)
         );
     }

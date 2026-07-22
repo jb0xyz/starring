@@ -187,6 +187,7 @@ pub async fn admit_shared_gateway_route_with_config_v1(
 fn map_instance_lookup_error(error: InstanceStoreError) -> SharedGatewayRouteErrorV1 {
     match error {
         InstanceStoreError::NotFound => SharedGatewayRouteErrorV1::InstanceNotFound,
+        InstanceStoreError::TimedOut => SharedGatewayRouteErrorV1::InstanceLookupTimedOut,
         InstanceStoreError::DuplicateInstance | InstanceStoreError::Backend(_) => {
             SharedGatewayRouteErrorV1::InstanceLookupFailed
         }
@@ -520,6 +521,25 @@ mod tests {
         .await
         .unwrap();
         assert!(admitted.is_some());
+        assert_eq!(instances.get_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_store_timeout_preserves_gateway_timeout_classification() {
+        let guild_id = GuildId(7);
+        let registry = serving_registry(guild_id, "study");
+        let instances = FakeInstanceStoreV1::failed(InstanceStoreError::TimedOut);
+        let error = admit_shared_gateway_route_v1(
+            &registry,
+            &instances,
+            guild_id,
+            "starring:i:room_001:join",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, SharedGatewayRouteErrorV1::InstanceLookupTimedOut);
+        assert_eq!(error.code(), "shared_gateway_instance_lookup_timed_out");
         assert_eq!(instances.get_calls(), 1);
     }
 

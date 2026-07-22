@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
 
 use crate::contract::DATABASE_READINESS_QUERY;
 use crate::error::{map_query_error, validate_millisecond_duration};
@@ -168,6 +168,26 @@ pub(crate) async fn begin_interaction_transaction(
         .begin()
         .await
         .map_err(|error| map_query_error(&error))?;
+    configure_interaction_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
+pub(crate) async fn begin_interaction_transaction_on_connection<'a>(
+    connection: &'a mut PgConnection,
+    timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+) -> Result<Transaction<'a, Postgres>, RuntimeInteractionPersistenceErrorV1> {
+    let mut transaction = connection
+        .begin()
+        .await
+        .map_err(|error| map_query_error(&error))?;
+    configure_interaction_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
+async fn configure_interaction_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+) -> Result<(), RuntimeInteractionPersistenceErrorV1> {
     let idle_timeout = timeouts
         .statement_timeout
         .checked_mul(2)
@@ -181,10 +201,10 @@ pub(crate) async fn begin_interaction_transaction(
     .bind(format!("{}ms", timeouts.statement_timeout.as_millis()))
     .bind(format!("{}ms", timeouts.lock_timeout.as_millis()))
     .bind(format!("{}ms", idle_timeout.as_millis()))
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await
     .map_err(|error| map_query_error(&error))?;
-    Ok(transaction)
+    Ok(())
 }
 
 fn canonical_database_identity(value: &str) -> bool {

@@ -9,19 +9,22 @@ use automation_ruleset_dispatch::{
 use discord_model::GuildId;
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::contract::{INSTANCE_REGISTER_QUERY, PINNED_READ_QUERY, ROUTE_READ_QUERY};
 use crate::database::{
-    begin_interaction_transaction, verify_runtime_interaction_database_with_timeouts_v1,
+    begin_interaction_transaction, begin_interaction_transaction_on_connection,
+    verify_runtime_interaction_database_with_timeouts_v1,
 };
 use crate::error::{map_mutation_commit_error, map_mutation_error, map_query_error};
+use crate::route_connection::RouteConnectionGuardV1;
 use crate::row::{
     InstanceRowV1, PinnedInstanceRowErrorV1, PinnedInstanceRowOutcomeV1, PinnedInstanceRowV1,
 };
 use crate::{
     RuntimeInteractionDatabaseExpectationV1, RuntimeInteractionDatabaseReadinessV1,
     RuntimeInteractionDatabaseTimeoutsV1, RuntimeInteractionPersistenceErrorV1,
+    RuntimeInteractionRouteTimeoutV1,
 };
 
 #[derive(Clone)]
@@ -29,6 +32,8 @@ pub struct PostgresRuntimeInteractionV1 {
     pool: PgPool,
     expectation: RuntimeInteractionDatabaseExpectationV1,
     timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+    route_database_timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+    route_timeout: RuntimeInteractionRouteTimeoutV1,
     initial_readiness: RuntimeInteractionDatabaseReadinessV1,
 }
 
@@ -43,6 +48,22 @@ impl PostgresRuntimeInteractionV1 {
         expectation: RuntimeInteractionDatabaseExpectationV1,
         timeouts: RuntimeInteractionDatabaseTimeoutsV1,
     ) -> Result<Self, RuntimeInteractionPersistenceErrorV1> {
+        Self::connect_verified_with_route_timeout(
+            pool,
+            expectation,
+            timeouts,
+            RuntimeInteractionRouteTimeoutV1::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_verified_with_route_timeout(
+        pool: PgPool,
+        expectation: RuntimeInteractionDatabaseExpectationV1,
+        timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+        route_timeout: RuntimeInteractionRouteTimeoutV1,
+    ) -> Result<Self, RuntimeInteractionPersistenceErrorV1> {
+        let route_database_timeouts = route_timeout.database_timeouts(timeouts)?;
         let initial_readiness =
             verify_runtime_interaction_database_with_timeouts_v1(&pool, &expectation, timeouts)
                 .await?;
@@ -50,6 +71,8 @@ impl PostgresRuntimeInteractionV1 {
             pool,
             expectation,
             timeouts,
+            route_database_timeouts,
+            route_timeout,
             initial_readiness,
         })
     }
@@ -70,6 +93,14 @@ impl PostgresRuntimeInteractionV1 {
         &self.initial_readiness
     }
 
+    pub fn route_timeout(&self) -> RuntimeInteractionRouteTimeoutV1 {
+        self.route_timeout
+    }
+
+    pub fn route_database_timeouts(&self) -> RuntimeInteractionDatabaseTimeoutsV1 {
+        self.route_database_timeouts
+    }
+
     pub async fn verify_database_v1(
         &self,
     ) -> Result<RuntimeInteractionDatabaseReadinessV1, RuntimeInteractionPersistenceErrorV1> {
@@ -80,6 +111,40 @@ impl PostgresRuntimeInteractionV1 {
         )
         .await
     }
+
+    async fn read_instance_route_operation_v1(
+        &self,
+        connection: &mut PgConnection,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, RuntimeInteractionPersistenceErrorV1> {
+        let mut transaction =
+            begin_interaction_transaction_on_connection(connection, self.route_database_timeouts)
+                .await?;
+        let rows = sqlx::query_as::<_, InstanceRowV1>(ROUTE_READ_QUERY)
+            .bind(guild_id.to_string())
+            .bind(instance_id.as_str())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| map_query_error(&error))?;
+        let instance = match rows.len() {
+            0 => None,
+            1 => Some(
+                rows.into_iter()
+                    .next()
+                    .ok_or(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)?
+                    .decode(guild_id, instance_id)?,
+            ),
+            _ => {
+                return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt);
+            }
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|error| map_query_error(&error))?;
+        Ok(instance)
+    }
 }
 
 impl InstanceRouteReaderV1 for PostgresRuntimeInteractionV1 {
@@ -88,31 +153,27 @@ impl InstanceRouteReaderV1 for PostgresRuntimeInteractionV1 {
         guild_id: GuildId,
         instance_id: &InstanceId,
     ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
-        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+        let deadline = tokio::time::Instant::now() + self.route_timeout.duration();
+        let connection = tokio::time::timeout_at(deadline, self.pool.acquire())
             .await
-            .map_err(instance_backend)?;
-        let rows = sqlx::query_as::<_, InstanceRowV1>(ROUTE_READ_QUERY)
-            .bind(guild_id.to_string())
-            .bind(instance_id.as_str())
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|error| instance_backend(map_query_error(&error)))?;
-        let instance = match rows.len() {
-            0 => None,
-            1 => Some(
-                rows.into_iter()
-                    .next()
-                    .ok_or_else(instance_corrupt)?
-                    .decode(guild_id, instance_id)
-                    .map_err(instance_backend)?,
-            ),
-            _ => return Err(instance_corrupt()),
+            .map_err(|_| InstanceStoreError::TimedOut)?
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        let mut connection = RouteConnectionGuardV1::new(connection);
+        let Some(route_connection) = connection.connection_mut() else {
+            return Err(instance_corrupt());
         };
-        transaction
-            .commit()
-            .await
-            .map_err(|error| instance_backend(map_query_error(&error)))?;
-        Ok(instance)
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.read_instance_route_operation_v1(route_connection, guild_id, instance_id),
+        )
+        .await;
+        match result {
+            Ok(result) => {
+                connection.release_to_pool();
+                result.map_err(instance_route_error)
+            }
+            Err(_) => Err(InstanceStoreError::TimedOut),
+        }
     }
 }
 
@@ -205,6 +266,13 @@ impl PinnedInstanceResolverV1 for PostgresRuntimeInteractionV1 {
 
 fn instance_backend(error: RuntimeInteractionPersistenceErrorV1) -> InstanceStoreError {
     InstanceStoreError::Backend(error.code().to_string())
+}
+
+fn instance_route_error(error: RuntimeInteractionPersistenceErrorV1) -> InstanceStoreError {
+    match error {
+        RuntimeInteractionPersistenceErrorV1::Timeout => InstanceStoreError::TimedOut,
+        error => instance_backend(error),
+    }
 }
 
 fn instance_corrupt() -> InstanceStoreError {
