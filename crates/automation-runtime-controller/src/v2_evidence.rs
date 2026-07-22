@@ -212,6 +212,10 @@ mod tests {
     fn route_admission_accepts_only_closed_causal_evidence() {
         assert_eq!(admission().validate(), Ok(()));
 
+        let mut ready_after_explicit_resume = admission();
+        ready_after_explicit_resume.gateway.kind = RuntimeGatewayReadyKindV2::Ready;
+        assert_eq!(ready_after_explicit_resume.validate(), Ok(()));
+
         let mut gateway_process = admission();
         gateway_process.gateway.process_instance_id = ProcessInstanceId::parse("other").unwrap();
         assert_eq!(

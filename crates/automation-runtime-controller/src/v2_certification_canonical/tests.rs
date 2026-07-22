@@ -643,6 +643,11 @@ fn request_correlations_are_closed_before_digesting() {
 fn route_admission_requires_explicit_causal_resume_evidence() {
     let (_, mut request) = reserved_and_request();
     request.route_admission.gateway.kind = RuntimeGatewayReadyKindV2::Ready;
+    assert!(RuntimeLiveAttestationRecordV2::from_request(request).is_ok());
+
+    let (_, mut request) = reserved_and_request();
+    request.route_admission.gateway.resume_sequence =
+        request.route_admission.gateway.connected_event_sequence;
     assert_eq!(
         RuntimeLiveAttestationRecordV2::from_request(request),
         Err(RuntimeCertificationCanonicalErrorV2::RouteAdmission {
