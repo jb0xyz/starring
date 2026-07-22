@@ -780,19 +780,19 @@ fn validate_previous_serving_observation(
             lease,
             disconnected_at,
         } => {
-            previous_serving_lease_matches(request, lease)
+            previous_serving_lease_matches(snapshot, request, lease)
                 && lease.acquired_at <= lease.last_heartbeat_at
                 && lease.last_heartbeat_at == *disconnected_at
                 && *disconnected_at <= receipt.observed_at
         }
         RuntimePreviousServingStateV1::Expired { lease, expires_at } => {
-            previous_serving_lease_matches(request, lease)
+            previous_serving_lease_matches(snapshot, request, lease)
                 && lease.acquired_at <= lease.last_heartbeat_at
                 && lease.last_heartbeat_at < *expires_at
                 && *expires_at <= receipt.observed_at
         }
         RuntimePreviousServingStateV1::Serving { lease, expires_at } => {
-            previous_serving_lease_matches(request, lease)
+            previous_serving_lease_matches(snapshot, request, lease)
                 && lease.acquired_at <= lease.last_heartbeat_at
                 && lease.last_heartbeat_at <= receipt.observed_at
                 && receipt.observed_at < *expires_at
@@ -806,10 +806,12 @@ fn validate_previous_serving_observation(
 }
 
 fn previous_serving_lease_matches(
+    snapshot: &RuntimeDeploymentSnapshotV1,
     request: &RuntimeObservePreviousServingV1,
     lease: &RuntimePreviousServingLeaseEvidenceV1,
 ) -> bool {
     request.expected_previous_runtime.as_ref() == Some(&lease.identity.process)
+        && lease.acquired_at <= snapshot.requested_at
         && lease.identity.scope.tenant_id == request.guard.scope.tenant_id
         && lease.identity.scope.installation_id == request.guard.scope.installation_id
         && lease.identity.scope.deployment_id != request.guard.scope.deployment_id
@@ -1338,7 +1340,7 @@ mod tests {
                 lease_epoch: NonZeroU64::new(3).unwrap(),
                 revision: NonZeroU64::new(7).unwrap(),
             },
-            acquired_at: at(2),
+            acquired_at: at(0),
             last_heartbeat_at: at(18),
         }
     }
@@ -1927,6 +1929,42 @@ mod tests {
             session.apply_previous_serving_observation(serving_at_expiry),
             Err(RuntimeConvergenceSessionError::ReceiptMismatch)
         );
+    }
+
+    #[test]
+    fn previous_serving_observation_rejects_a_lease_acquired_after_the_request() {
+        let previous = previous_runtime();
+        let mut session = RuntimeConvergenceSessionV1::from_claim(claimed_with(
+            RuntimeGeneration::FIRST.next().unwrap(),
+            Some(previous),
+        ))
+        .unwrap();
+        advance_to_drain_requested(&mut session);
+
+        for state_kind in 0..3 {
+            let request = session.begin_previous_serving_observation().unwrap();
+            let mut lease = previous_lease(&request);
+            lease.acquired_at = at(2);
+            let state = match state_kind {
+                0 => RuntimePreviousServingStateV1::Disconnected {
+                    lease,
+                    disconnected_at: at(18),
+                },
+                1 => RuntimePreviousServingStateV1::Expired {
+                    lease,
+                    expires_at: at(19),
+                },
+                _ => RuntimePreviousServingStateV1::Serving {
+                    lease,
+                    expires_at: at(30),
+                },
+            };
+            assert_eq!(
+                session.apply_previous_serving_observation(observation_receipt(&request, state)),
+                Err(RuntimeConvergenceSessionError::ReceiptMismatch)
+            );
+            session.abort_action(request.action_id).unwrap();
+        }
     }
 
     #[test]
