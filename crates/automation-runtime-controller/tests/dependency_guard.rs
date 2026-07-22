@@ -243,6 +243,99 @@ fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
 }
 
 #[test]
+fn v2_product_drain_canonical_surface_stays_closed_and_purpose_specific() {
+    let canonical = include_str!("../src/v2_product_drain_canonical.rs");
+    let wire = include_str!("../src/v2_product_drain_canonical/wire.rs");
+
+    for forbidden in [
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "pub product_preimage:",
+        "pub product_bytes:",
+        "pub product_digest:",
+        "pub drain_preimage:",
+        "pub drain_bytes:",
+        "pub drain_digest:",
+        "pub fn encode_product_mutation",
+        "pub fn decode_product_mutation",
+        "pub fn encode_drain_intent",
+        "pub fn decode_drain_intent",
+    ] {
+        assert!(
+            !canonical.contains(forbidden),
+            "forbidden public canonical aggregate surface: {forbidden}"
+        );
+    }
+    assert!(canonical.contains("pub struct RuntimeCanonicalProductDrainV2"));
+    assert!(canonical.contains("product_preimage: RuntimeProductMutationPreimageV2"));
+    assert!(canonical.contains("intent_id: RuntimeDrainIntentIdV2"));
+    assert!(!canonical.contains(
+        "pub fn new(\n        product_preimage: RuntimeProductMutationPreimageV2,\n        drain"
+    ));
+    assert!(canonical.contains("pub fn from_persisted("));
+
+    for forbidden in [
+        "pub struct",
+        "serde_json::Value",
+        "HashMap",
+        "BTreeMap",
+        "flatten",
+        "untagged",
+        "rename_all",
+        "skip_serializing_if",
+        "serde(default",
+        "to_vec(preimage)",
+        "from_slice::<RuntimeProductMutationPreimageV2>",
+        "from_slice::<RuntimeDrainIntentPreimageV2>",
+    ] {
+        assert!(
+            !wire.contains(forbidden),
+            "forbidden V2 Product/drain wire surface: {forbidden}"
+        );
+    }
+    for projection in [
+        "struct ProductMutationWireV2",
+        "struct DrainIntentWireV2",
+        "struct DrainIntentKeyWireV2",
+        "struct DeploymentScopeWireV2",
+        "struct ServingSlotWireV2",
+        "struct DeploymentTargetWireV2",
+    ] {
+        assert!(wire.contains(projection));
+    }
+    assert_eq!(wire.matches("#[serde(deny_unknown_fields)]").count(), 6);
+
+    let product_wire = wire
+        .split("struct ProductMutationWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for field in [
+        "format_version",
+        "operation_id",
+        "scope",
+        "expected_revision",
+        "slot",
+        "expected_target",
+        "mutation_kind",
+        "product_semantic_request_digest",
+    ] {
+        assert!(product_wire.contains(&format!("    {field}:")));
+    }
+    assert_eq!(product_wire.matches("    ").count(), 8);
+
+    let drain_wire = wire
+        .split("struct DrainIntentWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert!(drain_wire.contains("    format_version:"));
+    assert!(drain_wire.contains("    key:"));
+    assert_eq!(drain_wire.matches("    ").count(), 2);
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -265,6 +358,18 @@ fn source_files_contain_no_comments() {
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
         ("src/v2_product.rs", include_str!("../src/v2_product.rs")),
+        (
+            "src/v2_product_drain_canonical.rs",
+            include_str!("../src/v2_product_drain_canonical.rs"),
+        ),
+        (
+            "src/v2_product_drain_canonical/wire.rs",
+            include_str!("../src/v2_product_drain_canonical/wire.rs"),
+        ),
+        (
+            "src/v2_product_drain_canonical/tests.rs",
+            include_str!("../src/v2_product_drain_canonical/tests.rs"),
+        ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
             "tests/dependency_guard.rs",
