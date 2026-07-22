@@ -1,5 +1,6 @@
 mod config;
 mod database;
+mod gateway;
 mod secret;
 
 pub use config::{
@@ -11,6 +12,10 @@ pub use database::{
     compose_runtime_database_dependencies_v1, RuntimeDatabaseCompositionErrorV1,
     RuntimeDatabaseDependenciesV1, RuntimeDatabasePoolShutdownErrorV1,
     RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,
+};
+pub use gateway::{
+    compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,
+    RuntimeGatewayBootstrapV1, RuntimeGatewayReadyObservationErrorV1,
 };
 pub use secret::{
     resolve_runtime_secrets_v1, ResolvedRuntimeSecretsV1, RuntimeDatabaseConnectionSecretV1,

@@ -3277,11 +3277,15 @@ dependencies = [
 name = "starring-runtime"
 version = "0.1.0"
 dependencies = [
+ "automation-runtime",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "automation-runtime-execution-postgres",
  "automation-runtime-interaction-postgres",
  "automation-runtime-panel-postgres",
  "automation-runtime-serving-postgres",
+ "automation-runtime-worker",
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",

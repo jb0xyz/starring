@@ -198,7 +198,7 @@ fn comment_scanner_cannot_be_masked_by_character_literals() {
 }
 
 #[test]
-fn package_is_registered_once_and_has_only_the_bounded_database_slice() {
+fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
     assert_eq!(WORKSPACE.matches("\"tools/starring-runtime\"").count(), 1);
     let sources = source_files();
     assert_eq!(
@@ -209,6 +209,7 @@ fn package_is_registered_once_and_has_only_the_bounded_database_slice() {
         [
             "src/config.rs",
             "src/database.rs",
+            "src/gateway.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/secret.rs",
@@ -219,7 +220,7 @@ fn package_is_registered_once_and_has_only_the_bounded_database_slice() {
 }
 
 #[test]
-fn direct_dependencies_are_the_exact_database_composition_surface() {
+fn direct_dependencies_are_the_exact_runtime_composition_surface() {
     let mut dependencies = package_dependencies()
         .into_iter()
         .map(|dependency| {
@@ -234,11 +235,15 @@ fn direct_dependencies_are_the_exact_database_composition_surface() {
     assert_eq!(
         dependencies,
         [
+            ("automation-runtime".to_string(), None),
+            ("automation-runtime-controller".to_string(), None),
+            ("automation-runtime-convergence".to_string(), None),
             ("automation-runtime-convergence-postgres".to_string(), None),
             ("automation-runtime-execution-postgres".to_string(), None),
             ("automation-runtime-interaction-postgres".to_string(), None),
             ("automation-runtime-panel-postgres".to_string(), None),
             ("automation-runtime-serving-postgres".to_string(), None),
+            ("automation-runtime-worker".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
@@ -274,7 +279,6 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         if path != Path::new("src/database.rs") {
             for forbidden in [
                 "sqlx",
-                "tokio",
                 "PgPool",
                 "PostgresRuntimeExecutionV1",
                 "PostgresRuntimeExactTargetReader",
@@ -289,7 +293,90 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 );
             }
         }
+        if path != Path::new("src/database.rs") && path != Path::new("src/gateway.rs") {
+            assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
+        }
     }
+}
+
+#[test]
+fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
+    let sources = source_files();
+    let gateway = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/gateway.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        if path == Path::new("src/gateway.rs") {
+            continue;
+        }
+        for identifier in source
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .filter(|identifier| !identifier.is_empty())
+        {
+            assert!(
+                !identifier.ends_with("V3")
+                    && !matches!(
+                        identifier,
+                        "automation_runtime"
+                            | "automation_runtime_controller"
+                            | "automation_runtime_convergence"
+                            | "automation_runtime_worker"
+                    ),
+                "{}: {identifier}",
+                path.display()
+            );
+        }
+    }
+    for required in [
+        "shared_gateway_control_channel_with_policy_v3",
+        "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
+        "RuntimeGatewayClosedLifecycleV2::starting()",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+    for forbidden in [
+        "shared_gateway_control_channel_v3",
+        "GatewayAdmissionPolicyV3::ResumeOnConnect",
+        "run_shared_gateway_v3",
+        "twilight_gateway",
+        "twilight_http",
+    ] {
+        assert!(!gateway.contains(forbidden), "{forbidden}");
+    }
+    let production = gateway.split("#[cfg(test)]").next().unwrap();
+    let mut remainder = production;
+    while let Some((_, public)) = remainder.split_once("pub ") {
+        let header_end = public
+            .find(['{', ';'])
+            .unwrap_or_else(|| panic!("unterminated public declaration"));
+        let header = &public[..header_end];
+        for identifier in header
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .filter(|identifier| !identifier.is_empty())
+        {
+            assert!(
+                !identifier.ends_with("V3")
+                    && !matches!(
+                        identifier,
+                        "automation_runtime"
+                            | "automation_runtime_controller"
+                            | "automation_runtime_convergence"
+                            | "automation_runtime_worker"
+                    ),
+                "public gateway declaration: {identifier}"
+            );
+        }
+        remainder = &public[header_end + 1..];
+    }
+    let library = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/lib.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert!(library.contains("mod gateway;"));
+    assert!(!library.contains("pub mod gateway;"));
 }
 
 #[test]
@@ -394,7 +481,13 @@ fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
     assert!(main.contains("resolve_runtime_secrets_v1"));
     assert!(main.contains("runtime_not_composed"));
     assert!(!main.contains("compose_runtime_database_dependencies_v1"));
-    for forbidden in ["health_ready", "ready_to_serve", "gateway_connected"] {
+    for forbidden in [
+        "health_ready",
+        "ready_to_serve",
+        "gateway_connected",
+        "compose_runtime_gateway_bootstrap_v1",
+        "RuntimeGatewayBootstrapV1",
+    ] {
         assert!(!main.contains(forbidden));
     }
 }
