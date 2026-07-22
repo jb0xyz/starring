@@ -501,6 +501,22 @@ impl SharedGatewayRuntimeControlV3 {
         self.state
     }
 
+    pub(crate) fn connection_observer(&self) -> GatewayConnectionObserverV3 {
+        GatewayConnectionObserverV3 {
+            connection: self.connection.subscribe(),
+            admission_revision: self.admission_revision.subscribe(),
+        }
+    }
+
+    pub(crate) fn begin_runtime_failure_drain(&mut self) {
+        if !matches!(
+            self.state,
+            GatewayConnectionStateV3::Draining { .. } | GatewayConnectionStateV3::Stopped { .. }
+        ) {
+            self.fail_closed(GatewayDrainCauseV3::RuntimeFailure);
+        }
+    }
+
     pub fn mark_connected(
         &mut self,
         kind: GatewayReadyKindV3,
@@ -1108,9 +1124,9 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_observer_issues_and_invalidates_leases_without_command_ownership() {
-        let (control, mut runtime) =
+        let (_control, mut runtime) =
             shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
-        let observer = control.connection_observer();
+        let observer = runtime.connection_observer();
         let mut second = observer.clone();
         let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
         assert_eq!(

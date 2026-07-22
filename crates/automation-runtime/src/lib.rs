@@ -14,6 +14,7 @@ pub mod shared_gateway_admission;
 pub mod shared_gateway_control;
 pub mod shared_gateway_executor;
 pub mod shared_gateway_router;
+pub mod shared_gateway_runtime;
 pub mod snapshot;
 pub mod strict_panel_installer;
 
@@ -63,6 +64,11 @@ pub use shared_gateway_router::{
     admit_shared_gateway_route_v1, admit_shared_gateway_route_with_config_v1,
     parse_shared_gateway_route_v1, SharedGatewayRouteConfigV1,
     SharedGatewayRouteConfigurationErrorV1, SharedGatewayRouteErrorV1, SharedGatewayRouteHintV1,
+};
+pub use shared_gateway_runtime::{
+    run_shared_gateway_v3, SharedGatewayDrainOutcomeV3, SharedGatewayExitReasonV3,
+    SharedGatewayExitV3, SharedGatewayRuntimeConfigV3, SharedGatewayRuntimeConfigurationErrorV3,
+    SharedGatewayRuntimeReportV3,
 };
 pub use snapshot::{OwnedTwilightGuildRoleSnapshotProvider, TwilightGuildRoleSnapshotProvider};
 pub use strict_panel_installer::{render_strict_declared_panel_v1, TwilightStrictPanelInstaller};
