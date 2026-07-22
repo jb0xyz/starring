@@ -104,6 +104,12 @@ fn exact_target_hydration_is_scoped_to_private_capabilities() {
     let migration =
         include_str!("../../../migrations/202607220001_scope_runtime_exact_target_hydration.sql");
     assert_eq!(
+        migration
+            .matches("CREATE FUNCTION public.starring_runtime_exact_target_")
+            .count(),
+        2
+    );
+    assert_eq!(
         migration.matches("SECURITY DEFINER").count(),
         migration.matches("SET search_path = pg_catalog").count()
     );
@@ -114,6 +120,14 @@ fn exact_target_hydration_is_scoped_to_private_capabilities() {
         assert!(migration.contains(&format!("CREATE FUNCTION public.{function}(")));
     }
     assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE"));
+    assert!(migration.contains("privilege.grantee <> common_owner"));
+    assert!(migration.contains("privilege.grantee <> 0"));
+    assert!(migration.contains("function_row.proconfig"));
+    assert!(migration.contains("ARRAY['search_path=pg_catalog']::TEXT[]"));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT EXECUTE"));
+    assert!(!migration.contains("GRANT SELECT"));
+    assert!(!migration.contains("WITH GRANT OPTION"));
     assert!(migration
         .contains("deployment.controller_fencing_token = expected_controller_fencing_token"));
     assert!(
