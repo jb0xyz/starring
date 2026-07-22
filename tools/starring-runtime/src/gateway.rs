@@ -1,16 +1,21 @@
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 
 use automation_runtime::{
-    shared_gateway_control_channel_with_policy_v3, GatewayAdmissionPolicyV3,
+    shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
     GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
-    GatewayControlTransitionErrorV3, GatewayReadyKindV3, SharedGatewayControlV3,
+    GatewayControlTransitionErrorV3, GatewayDrainCauseV3, GatewayInvalidationSignalV3,
+    GatewayReadyKindV3, GatewaySynchronousInvalidatorV3, SharedGatewayControlV3,
     SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
-use automation_runtime_worker::{RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2};
+use automation_runtime_worker::{
+    RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
+    RuntimeGatewayInvalidationCauseV2,
+};
 
 use crate::GatewayResourceConfigV1;
 
@@ -98,7 +103,7 @@ impl RuntimeGatewayReadyObservationErrorV1 {
 struct SharedGatewayControlAdapterV2 {
     process_instance_id: ProcessInstanceId,
     control: SharedGatewayControlV3,
-    closed_lifecycle: RuntimeGatewayClosedLifecycleV2,
+    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
 
 struct SharedGatewayRuntimeHalfV3 {
@@ -110,9 +115,59 @@ pub struct RuntimeGatewayBootstrapV1 {
     _runtime: SharedGatewayRuntimeHalfV3,
 }
 
+struct RuntimeGatewayInvalidationBridgeV2 {
+    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+}
+
+impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
+    fn invalidate(&self, signal: GatewayInvalidationSignalV3) {
+        let mut lifecycle = self
+            .closed_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match signal {
+            GatewayInvalidationSignalV3::AdmissionPaused => invalidate_closed_lifecycle(
+                &mut lifecycle,
+                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
+            ),
+            GatewayInvalidationSignalV3::Disconnected(_) => invalidate_closed_lifecycle(
+                &mut lifecycle,
+                RuntimeGatewayInvalidationCauseV2::TransportDisconnected,
+            ),
+            GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::Commanded)
+            | GatewayInvalidationSignalV3::Stopped(_) => shutdown_closed_lifecycle(&mut lifecycle),
+            GatewayInvalidationSignalV3::Draining(
+                GatewayDrainCauseV3::ControlOrphaned | GatewayDrainCauseV3::LifecycleClosed,
+            )
+            | GatewayInvalidationSignalV3::ControlOrphaned => invalidate_closed_lifecycle(
+                &mut lifecycle,
+                RuntimeGatewayInvalidationCauseV2::ControlOrphaned,
+            ),
+            GatewayInvalidationSignalV3::Draining(
+                GatewayDrainCauseV3::ConnectionEpochOverflow
+                | GatewayDrainCauseV3::AdmissionRevisionOverflow
+                | GatewayDrainCauseV3::AdmissionSequenceOverflow,
+            ) => invalidate_closed_lifecycle(
+                &mut lifecycle,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            ),
+            GatewayInvalidationSignalV3::Draining(
+                GatewayDrainCauseV3::LifecycleOverflow | GatewayDrainCauseV3::RuntimeFailure,
+            ) => invalidate_closed_lifecycle(
+                &mut lifecycle,
+                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
+            ),
+        }
+    }
+}
+
 impl RuntimeGatewayBootstrapV1 {
     pub fn closed_snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
-        self.adapter.closed_lifecycle.snapshot()
+        self.adapter
+            .closed_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
     }
 
     pub fn observe_current_ready_attestation(
@@ -147,18 +202,36 @@ fn compose_with_control_config(
     process_instance_id: ProcessInstanceId,
     config: GatewayControlConfigV3,
 ) -> RuntimeGatewayBootstrapV1 {
-    let (control, runtime) = shared_gateway_control_channel_with_policy_v3(
+    let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+    let invalidation = RuntimeGatewayInvalidationBridgeV2 {
+        closed_lifecycle: closed_lifecycle.clone(),
+    };
+    let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
         config,
         GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        invalidation,
     );
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
             process_instance_id,
             control,
-            closed_lifecycle: RuntimeGatewayClosedLifecycleV2::starting(),
+            closed_lifecycle,
         },
         _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
     }
+}
+
+fn invalidate_closed_lifecycle(
+    lifecycle: &mut RuntimeGatewayClosedLifecycleV2,
+    cause: RuntimeGatewayInvalidationCauseV2,
+) {
+    let generation = lifecycle.snapshot().generation();
+    let _ = lifecycle.invalidate(generation, cause);
+}
+
+fn shutdown_closed_lifecycle(lifecycle: &mut RuntimeGatewayClosedLifecycleV2) {
+    let generation = lifecycle.snapshot().generation();
+    let _ = lifecycle.shutdown(generation);
 }
 
 impl SharedGatewayControlAdapterV2 {
@@ -284,19 +357,23 @@ fn map_transition_error(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+    use std::sync::{Arc, Mutex};
+
     use automation_runtime::{
         GatewayCommandAckV3, GatewayControlConfigV3, GatewayControlErrorV3,
-        GatewayControlTransitionErrorV3, GatewayDisconnectKindV3, GatewayPauseTokenV3,
-        GatewayReadyKindV3, GatewayRuntimeCommandOutcomeV3,
+        GatewayControlTransitionErrorV3, GatewayDisconnectKindV3, GatewayDrainCauseV3,
+        GatewayInvalidationSignalV3, GatewayPauseTokenV3, GatewayReadyKindV3,
+        GatewayRuntimeCommandOutcomeV3, GatewaySynchronousInvalidatorV3,
     };
     use automation_runtime_convergence::ProcessInstanceId;
     use automation_runtime_worker::{
-        RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
-        RuntimeGatewayInvalidationCauseV2,
+        RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
+        RuntimeGatewayEmergencyCauseV2,
     };
 
     use super::{
-        compose_with_control_config, RuntimeGatewayBootstrapV1,
+        compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayInvalidationBridgeV2,
         RuntimeGatewayReadyObservationErrorV1,
     };
 
@@ -363,20 +440,104 @@ mod tests {
     }
 
     fn disconnect(bootstrap: &mut RuntimeGatewayBootstrapV1) {
-        let generation = bootstrap.closed_snapshot().generation();
-        bootstrap
-            .adapter
-            .closed_lifecycle
-            .invalidate(
-                generation,
-                RuntimeGatewayInvalidationCauseV2::TransportDisconnected,
-            )
-            .unwrap();
         bootstrap
             ._runtime
             ._inner
             .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
             .unwrap();
+    }
+
+    #[test]
+    fn invalidation_bridge_maps_every_signal_and_shutdown_is_terminal() {
+        let closed = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+        let bridge = RuntimeGatewayInvalidationBridgeV2 {
+            closed_lifecycle: closed.clone(),
+        };
+        for (index, (signal, cause)) in [
+            (
+                GatewayInvalidationSignalV3::AdmissionPaused,
+                RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+            ),
+            (
+                GatewayInvalidationSignalV3::Disconnected(GatewayDisconnectKindV3::Close),
+                RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+            ),
+            (
+                GatewayInvalidationSignalV3::ControlOrphaned,
+                RuntimeGatewayEmergencyCauseV2::ControlOrphaned,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::ControlOrphaned),
+                RuntimeGatewayEmergencyCauseV2::ControlOrphaned,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::LifecycleClosed),
+                RuntimeGatewayEmergencyCauseV2::ControlOrphaned,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::ConnectionEpochOverflow),
+                RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(
+                    GatewayDrainCauseV3::AdmissionRevisionOverflow,
+                ),
+                RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(
+                    GatewayDrainCauseV3::AdmissionSequenceOverflow,
+                ),
+                RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::LifecycleOverflow),
+                RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+            ),
+            (
+                GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::RuntimeFailure),
+                RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bridge.invalidate(signal);
+            assert_eq!(
+                closed.lock().unwrap().snapshot(),
+                RuntimeGatewayClosedSnapshotV2::Emergency {
+                    generation:
+                        automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2::new(
+                            NonZeroU64::new(index as u64 + 2).unwrap(),
+                        ),
+                    cause,
+                }
+            );
+        }
+        bridge.invalidate(GatewayInvalidationSignalV3::Draining(
+            GatewayDrainCauseV3::Commanded,
+        ));
+        let shutdown = closed.lock().unwrap().snapshot();
+        assert!(matches!(
+            shutdown,
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+        ));
+        bridge.invalidate(GatewayInvalidationSignalV3::Stopped(
+            GatewayDrainCauseV3::RuntimeFailure,
+        ));
+        assert_eq!(closed.lock().unwrap().snapshot(), shutdown);
+
+        let stopped = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+        RuntimeGatewayInvalidationBridgeV2 {
+            closed_lifecycle: stopped.clone(),
+        }
+        .invalidate(GatewayInvalidationSignalV3::Stopped(
+            GatewayDrainCauseV3::RuntimeFailure,
+        ));
+        assert!(matches!(
+            stopped.lock().unwrap().snapshot(),
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+        ));
     }
 
     #[test]
@@ -514,7 +675,15 @@ mod tests {
             adapter,
             mut _runtime,
         } = bootstrap();
+        let closed = adapter.closed_lifecycle.clone();
         drop(adapter);
+        assert!(matches!(
+            closed.lock().unwrap().snapshot(),
+            RuntimeGatewayClosedSnapshotV2::Emergency {
+                cause: RuntimeGatewayEmergencyCauseV2::ControlOrphaned,
+                ..
+            }
+        ));
         assert_eq!(
             _runtime._inner.process_next_command().await,
             GatewayRuntimeCommandOutcomeV3::ControlOrphaned
@@ -522,6 +691,11 @@ mod tests {
         assert!(matches!(
             _runtime._inner.current_connection(),
             automation_runtime::GatewayConnectionStateV3::Draining { .. }
+        ));
+        drop(_runtime);
+        assert!(matches!(
+            closed.lock().unwrap().snapshot(),
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ));
     }
 }

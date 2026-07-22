@@ -330,14 +330,16 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         }
     }
     for required in [
-        "shared_gateway_control_channel_with_policy_v3",
+        "shared_gateway_control_channel_with_policy_and_invalidator_v3",
         "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
         "RuntimeGatewayClosedLifecycleV2::starting()",
+        "impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2",
     ] {
         assert!(gateway.contains(required), "{required}");
     }
     for forbidden in [
         "shared_gateway_control_channel_v3",
+        "shared_gateway_control_channel_with_policy_v3",
         "GatewayAdmissionPolicyV3::ResumeOnConnect",
         "run_shared_gateway_v3",
         "twilight_gateway",
