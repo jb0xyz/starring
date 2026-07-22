@@ -26,6 +26,8 @@ const MAX_LIFECYCLE_CAPACITY: usize = 1_024;
 const MAX_REJECTION_ACKNOWLEDGEMENT_CAPACITY: usize = 1_024;
 const MAX_GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_INSTANCE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MIN_GATEWAY_OWNER_LEASE: Duration = Duration::from_secs(1);
+const MAX_GATEWAY_OWNER_LEASE: Duration = Duration::from_secs(300);
 const FORBIDDEN_POSTGRES_ENVIRONMENT: [&str; 13] = [
     "PGAPPNAME",
     "PGDATABASE",
@@ -101,6 +103,9 @@ pub enum RuntimeConfigurationFieldV1 {
     GatewayRejectionAcknowledgementCapacity,
     GatewayDrainTimeout,
     InstanceLookupTimeout,
+    GatewayOwnerLease,
+    GatewayOwnerRenewBefore,
+    GatewayOwnerSafetyMargin,
     DatabaseUrlSecretReference(DatabaseCapabilityV1),
     DiscordBotTokenSecretReference,
 }
@@ -129,6 +134,13 @@ impl RuntimeConfigurationFieldV1 {
             }
             Self::GatewayDrainTimeout => "STARRING_RUNTIME_GATEWAY_DRAIN_TIMEOUT_SECONDS",
             Self::InstanceLookupTimeout => "STARRING_RUNTIME_INSTANCE_LOOKUP_TIMEOUT_MILLISECONDS",
+            Self::GatewayOwnerLease => "STARRING_RUNTIME_GATEWAY_OWNER_LEASE_MILLISECONDS",
+            Self::GatewayOwnerRenewBefore => {
+                "STARRING_RUNTIME_GATEWAY_OWNER_RENEW_BEFORE_MILLISECONDS"
+            }
+            Self::GatewayOwnerSafetyMargin => {
+                "STARRING_RUNTIME_GATEWAY_OWNER_SAFETY_MARGIN_MILLISECONDS"
+            }
             Self::DatabaseUrlSecretReference(capability) => capability.reference_environment_name(),
             Self::DiscordBotTokenSecretReference => {
                 "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE"
@@ -153,6 +165,9 @@ impl RuntimeConfigurationFieldV1 {
             }
             Self::GatewayDrainTimeout => "gateway_drain_timeout",
             Self::InstanceLookupTimeout => "instance_lookup_timeout",
+            Self::GatewayOwnerLease => "gateway_owner_lease",
+            Self::GatewayOwnerRenewBefore => "gateway_owner_renew_before",
+            Self::GatewayOwnerSafetyMargin => "gateway_owner_safety_margin",
             Self::DatabaseUrlSecretReference(capability) => match capability {
                 DatabaseCapabilityV1::Convergence => "convergence_database_url_secret_reference",
                 DatabaseCapabilityV1::ExactTarget => "exact_target_database_url_secret_reference",
@@ -370,6 +385,27 @@ impl GatewayResourceConfigV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayOwnerTimingConfigV1 {
+    lease_for: Duration,
+    renew_before: Duration,
+    safety_margin: Duration,
+}
+
+impl GatewayOwnerTimingConfigV1 {
+    pub fn lease_for(self) -> Duration {
+        self.lease_for
+    }
+
+    pub fn renew_before(self) -> Duration {
+        self.renew_before
+    }
+
+    pub fn safety_margin(self) -> Duration {
+        self.safety_margin
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeSecretReferencesV1 {
     database_urls: [RuntimeSecretReferenceV1; 5],
@@ -408,6 +444,7 @@ pub struct RuntimeConfigV1 {
     database_pool: DatabasePoolConfigV1,
     database_operation: DatabaseOperationConfigV1,
     gateway: GatewayResourceConfigV1,
+    gateway_owner: GatewayOwnerTimingConfigV1,
     secret_references: RuntimeSecretReferencesV1,
 }
 
@@ -427,12 +464,14 @@ impl RuntimeConfigV1 {
         let database_pool = parse_database_pool(source)?;
         let database_operation = parse_database_operation(source)?;
         let gateway = parse_gateway_resources(source)?;
+        let gateway_owner = parse_gateway_owner_timing(source, database_operation)?;
         let secret_references = parse_secret_references(source)?;
         Ok(Self {
             health_bind_addr,
             database_pool,
             database_operation,
             gateway,
+            gateway_owner,
             secret_references,
         })
     }
@@ -453,6 +492,10 @@ impl RuntimeConfigV1 {
         self.gateway
     }
 
+    pub fn gateway_owner(&self) -> GatewayOwnerTimingConfigV1 {
+        self.gateway_owner
+    }
+
     pub fn secret_references(&self) -> &RuntimeSecretReferencesV1 {
         &self.secret_references
     }
@@ -466,6 +509,7 @@ impl Debug for RuntimeConfigV1 {
             .field("database_pool", &self.database_pool)
             .field("database_operation", &self.database_operation)
             .field("gateway", &self.gateway)
+            .field("gateway_owner", &self.gateway_owner)
             .field("secret_references", &"<redacted>")
             .finish()
     }
@@ -595,6 +639,41 @@ fn parse_gateway_resources(
         rejection_acknowledgement_capacity,
         drain_timeout,
         instance_lookup_timeout,
+    })
+}
+
+fn parse_gateway_owner_timing(
+    source: &impl ConfigurationSourceV1,
+    database_operation: DatabaseOperationConfigV1,
+) -> Result<GatewayOwnerTimingConfigV1, RuntimeConfigErrorV1> {
+    let lease_field = RuntimeConfigurationFieldV1::GatewayOwnerLease;
+    let lease_for =
+        Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 30_000)?);
+    if !(MIN_GATEWAY_OWNER_LEASE..=MAX_GATEWAY_OWNER_LEASE).contains(&lease_for) {
+        return Err(RuntimeConfigErrorV1::InvalidValue(lease_field));
+    }
+    let renew_field = RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore;
+    let renew_before =
+        Duration::from_millis(parse_optional_number::<u64>(source, renew_field, 10_000)?);
+    if renew_before.is_zero() || renew_before >= lease_for {
+        return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
+    }
+    let safety_field = RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin;
+    let safety_margin =
+        Duration::from_millis(parse_optional_number::<u64>(source, safety_field, 3_000)?);
+    if safety_margin <= database_operation.statement_timeout() || safety_margin >= renew_before {
+        return Err(RuntimeConfigErrorV1::InvalidValue(safety_field));
+    }
+    let renewal_window = renew_before
+        .checked_sub(safety_margin)
+        .ok_or(RuntimeConfigErrorV1::InvalidValue(renew_field))?;
+    if renewal_window <= database_operation.statement_timeout() {
+        return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
+    }
+    Ok(GatewayOwnerTimingConfigV1 {
+        lease_for,
+        renew_before,
+        safety_margin,
     })
 }
 
@@ -811,6 +890,15 @@ mod tests {
             config.gateway().instance_lookup_timeout(),
             Duration::from_millis(500)
         );
+        assert_eq!(config.gateway_owner().lease_for(), Duration::from_secs(30));
+        assert_eq!(
+            config.gateway_owner().renew_before(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.gateway_owner().safety_margin(),
+            Duration::from_secs(3)
+        );
     }
 
     #[test]
@@ -1016,6 +1104,65 @@ mod tests {
                 RuntimeConfigErrorV1::InvalidValue(field)
             );
         }
+    }
+
+    #[test]
+    fn gateway_owner_timing_is_bounded_ordered_and_covers_database_latency() {
+        for (field, rejected) in [
+            (RuntimeConfigurationFieldV1::GatewayOwnerLease, "999"),
+            (RuntimeConfigurationFieldV1::GatewayOwnerLease, "300001"),
+            (RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore, "0"),
+            (
+                RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+                "30000",
+            ),
+            (RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin, "0"),
+            (
+                RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+                "2000",
+            ),
+            (
+                RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+                "10000",
+            ),
+        ] {
+            let mut source = valid_source();
+            source.insert(field, rejected);
+            assert_eq!(
+                RuntimeConfigV1::from_source(&source).unwrap_err(),
+                RuntimeConfigErrorV1::InvalidValue(field)
+            );
+        }
+
+        let mut short_window = valid_source();
+        short_window.insert(RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore, "5000");
+        short_window.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+            "3000",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&short_window).unwrap_err(),
+            RuntimeConfigErrorV1::InvalidValue(
+                RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
+            )
+        );
+
+        let mut custom = valid_source();
+        custom.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "60000");
+        custom.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+            "20000",
+        );
+        custom.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+            "5000",
+        );
+        let timing = RuntimeConfigV1::from_source(&custom)
+            .unwrap()
+            .gateway_owner();
+        assert_eq!(timing.lease_for(), Duration::from_secs(60));
+        assert_eq!(timing.renew_before(), Duration::from_secs(20));
+        assert_eq!(timing.safety_margin(), Duration::from_secs(5));
     }
 
     #[test]

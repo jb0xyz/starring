@@ -4,9 +4,9 @@ mod gateway;
 mod secret;
 
 pub use config::{
-    DatabaseCapabilityV1, DatabaseOperationConfigV1, DatabasePoolConfigV1, GatewayResourceConfigV1,
-    RuntimeConfigErrorV1, RuntimeConfigV1, RuntimeConfigurationFieldV1, RuntimeSecretReferenceV1,
-    RuntimeSecretReferencesV1,
+    DatabaseCapabilityV1, DatabaseOperationConfigV1, DatabasePoolConfigV1,
+    GatewayOwnerTimingConfigV1, GatewayResourceConfigV1, RuntimeConfigErrorV1, RuntimeConfigV1,
+    RuntimeConfigurationFieldV1, RuntimeSecretReferenceV1, RuntimeSecretReferencesV1,
 };
 pub use database::{
     compose_runtime_database_dependencies_v1, RuntimeDatabaseCompositionErrorV1,
