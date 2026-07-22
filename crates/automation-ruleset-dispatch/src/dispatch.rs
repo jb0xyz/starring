@@ -6,7 +6,8 @@ use automation_core::{
     RuntimeContext, RuntimeEvent, SanitizeContext, TemplateString,
 };
 use automation_instance::{
-    AutomationInstance, InstanceId, InstanceIdGenerator, InstanceStatus, InstanceStore,
+    AutomationInstance, InstanceId, InstanceIdGenerator, InstanceRegistrarV1, InstanceStatus,
+    InstanceStore, LegacyInstanceStoreCapabilitiesV1,
 };
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::{RuleSetKey, RuleSetStore, RuleSetVersionId};
@@ -17,6 +18,10 @@ use discord_model::RoleId;
 use resource_resolution::ResourceBindingMap;
 
 use crate::error::{DispatchError, DispatchFailure, FailureResponseOutcome};
+use crate::resolver::{
+    LegacyStoreBackedPinnedInstanceResolverV1, PinnedInstanceResolverErrorV1,
+    PinnedInstanceResolverV1,
+};
 use crate::snapshot::GuildRoleSnapshotProvider;
 
 #[allow(clippy::too_many_arguments)]
@@ -39,6 +44,85 @@ where
     RS: RuleSetStore,
     P: GuildRoleSnapshotProvider,
 {
+    let instances = LegacyInstanceStoreCapabilitiesV1::new(services.instances);
+    let resolver = LegacyStoreBackedPinnedInstanceResolverV1::new(&instances, ruleset_store);
+    let services = AutomationServices {
+        mutation: services.mutation,
+        responder: services.responder,
+        instances: &instances,
+        instance_ids: services.instance_ids,
+        teardown: services.teardown,
+    };
+    dispatch_instance_action_with_route_v1(
+        event,
+        instance_id,
+        action,
+        None,
+        &resolver,
+        snapshot_provider,
+        bindings,
+        &services,
+        failure_message,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_instance_action_with_resolver_v1<M, R, S, G, T, PR, P>(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    action: &str,
+    expected_ruleset_key: &str,
+    resolver: &PR,
+    snapshot_provider: &P,
+    bindings: &ResourceBindingMap,
+    services: &AutomationServices<'_, M, R, S, G, T>,
+    failure_message: &str,
+) -> Result<HandleOutcome, DispatchFailure>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceRegistrarV1,
+    G: InstanceIdGenerator,
+    T: InstanceTeardownService,
+    PR: PinnedInstanceResolverV1,
+    P: GuildRoleSnapshotProvider,
+{
+    dispatch_instance_action_with_route_v1(
+        event,
+        instance_id,
+        action,
+        Some(expected_ruleset_key),
+        resolver,
+        snapshot_provider,
+        bindings,
+        services,
+        failure_message,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_instance_action_with_route_v1<M, R, S, G, T, PR, P>(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    action: &str,
+    expected_ruleset_key: Option<&str>,
+    resolver: &PR,
+    snapshot_provider: &P,
+    bindings: &ResourceBindingMap,
+    services: &AutomationServices<'_, M, R, S, G, T>,
+    failure_message: &str,
+) -> Result<HandleOutcome, DispatchFailure>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceRegistrarV1,
+    G: InstanceIdGenerator,
+    T: InstanceTeardownService,
+    PR: PinnedInstanceResolverV1,
+    P: GuildRoleSnapshotProvider,
+{
     if let Err(error) = services.responder.defer_ephemeral().await {
         return Err(DispatchFailure {
             cause: DispatchError::DeferFailed(error),
@@ -49,7 +133,8 @@ where
         event,
         instance_id,
         action,
-        ruleset_store,
+        expected_ruleset_key,
+        resolver,
         snapshot_provider,
         bindings,
         services,
@@ -67,11 +152,13 @@ where
     }
 }
 
-async fn run_pinned<M, R, S, G, T, RS, P>(
+#[allow(clippy::too_many_arguments)]
+async fn run_pinned<M, R, S, G, T, PR, P>(
     event: &RuntimeEvent,
     instance_id: &InstanceId,
     action: &str,
-    ruleset_store: &RS,
+    expected_ruleset_key: Option<&str>,
+    resolver: &PR,
     snapshot_provider: &P,
     bindings: &ResourceBindingMap,
     services: &AutomationServices<'_, M, R, S, G, T>,
@@ -79,40 +166,42 @@ async fn run_pinned<M, R, S, G, T, RS, P>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
-    RS: RuleSetStore,
+    PR: PinnedInstanceResolverV1,
     P: GuildRoleSnapshotProvider,
 {
-    let instance = services
-        .instances
-        .get(event.guild_id, instance_id)
+    let expected_ruleset_key = expected_ruleset_key
+        .map(RuleSetKey::parse)
+        .transpose()
+        .map_err(|_| DispatchError::PinnedKeyInvalid)?;
+    let resolved = resolver
+        .resolve_pinned_instance_v1(event.guild_id, instance_id)
         .await
-        .map_err(DispatchError::InstanceLookup)?
-        .ok_or(DispatchError::InstanceNotFound)?;
+        .map_err(map_resolver_error)?;
+    let instance = resolved.instance;
     ensure_active(&instance)?;
-
     let key =
         RuleSetKey::parse(&instance.ruleset_key).map_err(|_| DispatchError::PinnedKeyInvalid)?;
-    let version_id = RuleSetVersionId::new(instance.ruleset_version.get())
+    let version = RuleSetVersionId::new(instance.ruleset_version.get())
         .map_err(|_| DispatchError::PinnedKeyInvalid)?;
+    if instance.guild_id != event.guild_id
+        || instance.id != *instance_id
+        || expected_ruleset_key
+            .as_ref()
+            .is_some_and(|expected| expected != &key)
+        || resolved.artifact.guild_id != event.guild_id
+        || resolved.artifact.ruleset_key != key
+        || resolved.artifact.version != version
+    {
+        return Err(DispatchError::PinnedVersionMissing);
+    }
     let identity = RunningRuleSetIdentity {
         key: instance.ruleset_key.clone(),
         version: instance.ruleset_version,
     };
-
-    let artifact = ruleset_store
-        .get_version(event.guild_id, &key, version_id)
-        .await
-        .map_err(DispatchError::VersionLookup)?
-        .ok_or(DispatchError::PinnedVersionMissing)?;
-    if artifact.guild_id != event.guild_id
-        || artifact.ruleset_key != key
-        || artifact.version != version_id
-    {
-        return Err(DispatchError::PinnedVersionMissing);
-    }
+    let artifact = resolved.artifact;
 
     let snapshot = snapshot_provider
         .snapshot(event.guild_id)
@@ -152,6 +241,21 @@ where
     Ok(HandleOutcome::Executed)
 }
 
+fn map_resolver_error(error: PinnedInstanceResolverErrorV1) -> DispatchError {
+    match error {
+        PinnedInstanceResolverErrorV1::InstanceLookup(error) => {
+            DispatchError::InstanceLookup(error)
+        }
+        PinnedInstanceResolverErrorV1::InstanceNotFound => DispatchError::InstanceNotFound,
+        PinnedInstanceResolverErrorV1::InstanceInactive(status) => {
+            DispatchError::InstanceInactive(status)
+        }
+        PinnedInstanceResolverErrorV1::PinnedKeyInvalid => DispatchError::PinnedKeyInvalid,
+        PinnedInstanceResolverErrorV1::VersionLookup(error) => DispatchError::VersionLookup(error),
+        PinnedInstanceResolverErrorV1::PinnedVersionMissing => DispatchError::PinnedVersionMissing,
+    }
+}
+
 fn ensure_active(instance: &AutomationInstance) -> Result<(), DispatchError> {
     if instance.status != InstanceStatus::Active {
         return Err(DispatchError::InstanceInactive(instance.status));
@@ -166,7 +270,7 @@ async fn emit_failure<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {

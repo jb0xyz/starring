@@ -10,8 +10,8 @@ use automation_core::run::run;
 use automation_core::validate::{validate_structural, CreatedKind, ValidationError};
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdGenerationError,
-    InstanceIdGenerator, InstanceKind, InstanceResources, InstanceRuleSetVersion, InstanceStatus,
-    InstanceStore, InstanceStoreError,
+    InstanceIdGenerator, InstanceKind, InstanceRegistrarV1, InstanceResources,
+    InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
 };
 use automation_state::{
     ActionSpec, ButtonRoute, ButtonSpec, ChannelRef, CreatedRef, InstanceRef, InstanceResourceRefs,
@@ -193,6 +193,15 @@ impl InstanceStore for CountingStore {
         guild_id: GuildId,
     ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
         self.inner.list_deleting(guild_id).await
+    }
+}
+
+impl InstanceRegistrarV1 for CountingStore {
+    async fn register_instance_v1(
+        &self,
+        instance: AutomationInstance,
+    ) -> Result<(), InstanceStoreError> {
+        InstanceStore::register(self, instance).await
     }
 }
 

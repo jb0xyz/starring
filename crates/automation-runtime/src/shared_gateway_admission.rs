@@ -1,7 +1,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
-use automation_instance::InstanceStore;
+use automation_instance::InstanceRouteReaderV1;
 use automation_runtime_registry::{
     AdmittedInteractionV1, ExactServingRouteV1, ServingSlotRegistryV1, SlotMutationTokenV1,
 };
@@ -12,13 +13,17 @@ use crate::shared_gateway_control::{
     GatewayConnectionEpochV3, GatewayConnectionObserverV3, GatewayReadyLeaseV3,
     SharedGatewayControlV3,
 };
-use crate::shared_gateway_router::{admit_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
+use crate::shared_gateway_router::{
+    admit_shared_gateway_route_with_config_v1, SharedGatewayRouteConfigV1,
+    SharedGatewayRouteConfigurationErrorV1, SharedGatewayRouteErrorV1,
+};
 
 pub const MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedGatewayAdmissionConfigV3 {
     global_capacity: NonZeroUsize,
+    route: SharedGatewayRouteConfigV1,
 }
 
 impl SharedGatewayAdmissionConfigV3 {
@@ -28,11 +33,26 @@ impl SharedGatewayAdmissionConfigV3 {
         if global_capacity.get() > MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3 {
             return Err(SharedGatewayAdmissionConfigurationErrorV3::GlobalCapacity);
         }
-        Ok(Self { global_capacity })
+        Ok(Self {
+            global_capacity,
+            route: SharedGatewayRouteConfigV1::default(),
+        })
     }
 
     pub fn global_capacity(self) -> NonZeroUsize {
         self.global_capacity
+    }
+
+    pub fn with_instance_lookup_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, SharedGatewayRouteConfigurationErrorV1> {
+        self.route = SharedGatewayRouteConfigV1::new(timeout)?;
+        Ok(self)
+    }
+
+    pub fn instance_lookup_timeout(self) -> Duration {
+        self.route.instance_lookup_timeout()
     }
 }
 
@@ -41,6 +61,7 @@ impl Default for SharedGatewayAdmissionConfigV3 {
         Self {
             global_capacity: NonZeroUsize::new(256)
                 .expect("default global admission capacity is non-zero"),
+            route: SharedGatewayRouteConfigV1::default(),
         }
     }
 }
@@ -74,6 +95,7 @@ impl SharedGatewayAdmissionErrorV3 {
 #[derive(Clone)]
 pub struct SharedGatewayAdmissionBudgetV3 {
     capacity: NonZeroUsize,
+    route: SharedGatewayRouteConfigV1,
     permits: Arc<Semaphore>,
 }
 
@@ -81,6 +103,7 @@ impl SharedGatewayAdmissionBudgetV3 {
     pub fn new(config: SharedGatewayAdmissionConfigV3) -> Self {
         Self {
             capacity: config.global_capacity,
+            route: config.route,
             permits: Arc::new(Semaphore::new(config.global_capacity.get())),
         }
     }
@@ -94,7 +117,7 @@ impl SharedGatewayAdmissionBudgetV3 {
         control: &SharedGatewayControlV3,
         ready_lease: &GatewayReadyLeaseV3,
         registry: &ServingSlotRegistryV1,
-        instances: &impl InstanceStore,
+        instances: &impl InstanceRouteReaderV1,
         guild_id: GuildId,
         custom_id: &str,
     ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
@@ -114,7 +137,7 @@ impl SharedGatewayAdmissionBudgetV3 {
         observer: &GatewayConnectionObserverV3,
         ready_lease: &GatewayReadyLeaseV3,
         registry: &ServingSlotRegistryV1,
-        instances: &impl InstanceStore,
+        instances: &impl InstanceRouteReaderV1,
         guild_id: GuildId,
         custom_id: &str,
     ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
@@ -142,6 +165,7 @@ impl SharedGatewayAdmissionBudgetV3 {
         Ok(SharedGatewayAdmissionReservationV3 {
             observer: observer.clone(),
             ready_lease: *ready_lease,
+            route: self.route,
             global_permit,
         })
     }
@@ -150,6 +174,7 @@ impl SharedGatewayAdmissionBudgetV3 {
 pub struct SharedGatewayAdmissionReservationV3 {
     observer: GatewayConnectionObserverV3,
     ready_lease: GatewayReadyLeaseV3,
+    route: SharedGatewayRouteConfigV1,
     global_permit: OwnedSemaphorePermit,
 }
 
@@ -161,17 +186,18 @@ impl SharedGatewayAdmissionReservationV3 {
     pub async fn admit(
         self,
         registry: &ServingSlotRegistryV1,
-        instances: &impl InstanceStore,
+        instances: &impl InstanceRouteReaderV1,
         guild_id: GuildId,
         custom_id: &str,
     ) -> Result<Option<SharedGatewayAdmittedInteractionV3>, SharedGatewayAdmissionErrorV3> {
         if !self.observer.ready_lease_is_current(&self.ready_lease) {
             return Err(SharedGatewayAdmissionErrorV3::NotReady);
         }
-        let Some(admitted) =
-            admit_shared_gateway_route_v1(registry, instances, guild_id, custom_id)
-                .await
-                .map_err(SharedGatewayAdmissionErrorV3::Router)?
+        let Some(admitted) = admit_shared_gateway_route_with_config_v1(
+            registry, instances, guild_id, custom_id, self.route,
+        )
+        .await
+        .map_err(SharedGatewayAdmissionErrorV3::Router)?
         else {
             return Ok(None);
         };
@@ -312,6 +338,16 @@ mod tests {
         }
     }
 
+    impl InstanceRouteReaderV1 for ControlledInstanceStore {
+        async fn read_instance_route_v1(
+            &self,
+            guild_id: GuildId,
+            instance_id: &InstanceId,
+        ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+            InstanceStore::get(self, guild_id, instance_id).await
+        }
+    }
+
     fn registry(per_slot_capacity: u32) -> ServingSlotRegistryV1 {
         ServingSlotRegistryV1::new(ServingSlotRegistryConfigV1 {
             max_slots: NonZeroU32::new(4).unwrap(),
@@ -429,6 +465,48 @@ mod tests {
                 NonZeroUsize::new(MAX_SHARED_GATEWAY_GLOBAL_ADMISSIONS_V3 + 1).unwrap()
             ),
             Err(SharedGatewayAdmissionConfigurationErrorV3::GlobalCapacity)
+        );
+        let configured = SharedGatewayAdmissionConfigV3::default()
+            .with_instance_lookup_timeout(Duration::from_millis(25))
+            .unwrap();
+        assert_eq!(
+            configured.instance_lookup_timeout(),
+            Duration::from_millis(25)
+        );
+        assert!(SharedGatewayAdmissionConfigV3::default()
+            .with_instance_lookup_timeout(Duration::ZERO)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_instance_lookup_timeout_reaches_route_admission() {
+        let guild_id = GuildId(7);
+        let registry = registry(1);
+        install_route(&registry, guild_id, "study");
+        let instances = ControlledInstanceStore::new();
+        let (control, _runtime, lease) = connected_control();
+        let config = SharedGatewayAdmissionConfigV3::new(NonZeroUsize::new(1).unwrap())
+            .unwrap()
+            .with_instance_lookup_timeout(Duration::from_millis(1))
+            .unwrap();
+        let budget = SharedGatewayAdmissionBudgetV3::new(config);
+        let error = admission_error(
+            budget
+                .admit(
+                    &control,
+                    &lease,
+                    &registry,
+                    &instances,
+                    guild_id,
+                    "starring:i:room_001:join",
+                )
+                .await,
+        );
+        assert_eq!(
+            error,
+            SharedGatewayAdmissionErrorV3::Router(
+                SharedGatewayRouteErrorV1::InstanceLookupTimedOut
+            )
         );
     }
 

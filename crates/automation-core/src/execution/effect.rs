@@ -1,4 +1,4 @@
-use automation_instance::{InstanceIdGenerator, InstanceMessageRef, InstanceStore};
+use automation_instance::{InstanceIdGenerator, InstanceMessageRef, InstanceRegistrarV1};
 use automation_instance_teardown::InstanceTeardownService;
 use discord_model::GuildId;
 
@@ -36,7 +36,7 @@ pub(super) async fn execute_action<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {
@@ -136,7 +136,7 @@ where
         } => {
             services
                 .instances
-                .register(instance)
+                .register_instance_v1(instance)
                 .await
                 .map_err(|error| {
                     AdapterError::new(

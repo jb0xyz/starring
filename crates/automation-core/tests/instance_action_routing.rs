@@ -3,8 +3,8 @@ use automation_core::{
     MockMutationAdapter, RunningRuleSetIdentity, RuntimeEvent,
 };
 use automation_instance::{
-    AutomationInstance, InstanceId, InstanceRuleSetVersion, InstanceStatus, InstanceStore,
-    InstanceStoreError, SequenceInstanceIdGenerator,
+    AutomationInstance, InstanceId, InstanceRegistrarV1, InstanceRuleSetVersion, InstanceStatus,
+    InstanceStore, InstanceStoreError, SequenceInstanceIdGenerator,
 };
 use automation_state::InteractionRuleSet;
 use discord_model::{GuildId, UserId};
@@ -59,6 +59,12 @@ impl InstanceStore for PanicInstances {
         _: GuildId,
     ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
         panic!("list_deleting must not be called on a misrouted InstanceAction")
+    }
+}
+
+impl InstanceRegistrarV1 for PanicInstances {
+    async fn register_instance_v1(&self, _: AutomationInstance) -> Result<(), InstanceStoreError> {
+        panic!("register must not be called on a misrouted InstanceAction")
     }
 }
 

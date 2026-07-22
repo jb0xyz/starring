@@ -1,11 +1,14 @@
 use automation_core::{
     handle_event, AutomationServices, EventKind, HandleOutcome, RunningRuleSetIdentity,
 };
-use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance::{
+    InstanceIdGenerator, InstanceRegistrarV1, InstanceStore, LegacyInstanceStoreCapabilitiesV1,
+};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetStore;
 use automation_ruleset_dispatch::{
-    dispatch_instance_action, DispatchFailure, GuildRoleSnapshotProvider,
+    dispatch_instance_action_with_resolver_v1, DispatchFailure, GuildRoleSnapshotProvider,
+    LegacyStoreBackedPinnedInstanceResolverV1, PinnedInstanceResolverV1,
 };
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
@@ -75,6 +78,40 @@ pub async fn handle_interaction(
     ruleset_store: &impl RuleSetStore,
     snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) -> InteractionExecutionOutcomeV3 {
+    let instances = LegacyInstanceStoreCapabilitiesV1::new(instances);
+    let resolver = LegacyStoreBackedPinnedInstanceResolverV1::new(&instances, ruleset_store);
+    handle_interaction_with_resolver_v1(
+        http,
+        identity,
+        mutation,
+        ruleset,
+        bindings,
+        interaction,
+        failure_message,
+        &instances,
+        instance_ids,
+        teardown,
+        &resolver,
+        snapshot_provider,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_interaction_with_resolver_v1(
+    http: &Client,
+    identity: &RunningRuleSetIdentity,
+    mutation: &TwilightMutationAdapter<'_>,
+    ruleset: &InteractionRuleSet,
+    bindings: &ResourceBindingMap,
+    interaction: &Interaction,
+    failure_message: &str,
+    instances: &impl InstanceRegistrarV1,
+    instance_ids: &impl InstanceIdGenerator,
+    teardown: &impl InstanceTeardownService,
+    pinned_resolver: &impl PinnedInstanceResolverV1,
+    snapshot_provider: &impl GuildRoleSnapshotProvider,
+) -> InteractionExecutionOutcomeV3 {
     let Some(event) = interaction_to_event(interaction, &identity.key) else {
         return InteractionExecutionOutcomeV3::Ignored;
     };
@@ -103,11 +140,12 @@ pub async fn handle_interaction(
             instance_id,
             action,
         } => instance_outcome(
-            dispatch_instance_action(
+            dispatch_instance_action_with_resolver_v1(
                 &event,
                 instance_id,
                 action,
-                ruleset_store,
+                &identity.key,
+                pinned_resolver,
                 snapshot_provider,
                 bindings,
                 &services,

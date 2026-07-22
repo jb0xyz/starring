@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use automation_instance::{InstanceId, InstanceStatus, InstanceStore, InstanceStoreError};
+use automation_instance::{InstanceId, InstanceRouteReaderV1, InstanceStatus, InstanceStoreError};
 use automation_ruleset::{RuleSetKey, RuleSetKeyError};
 use automation_runtime_registry::{
     AdmittedInteractionV1, ServingSlotKeyV1, ServingSlotRegistryError, ServingSlotRegistryV1,
@@ -132,7 +132,7 @@ pub fn parse_shared_gateway_route_v1(
 
 pub async fn admit_shared_gateway_route_v1(
     registry: &ServingSlotRegistryV1,
-    instances: &impl InstanceStore,
+    instances: &impl InstanceRouteReaderV1,
     guild_id: GuildId,
     custom_id: &str,
 ) -> Result<Option<AdmittedInteractionV1>, SharedGatewayRouteErrorV1> {
@@ -148,7 +148,7 @@ pub async fn admit_shared_gateway_route_v1(
 
 pub async fn admit_shared_gateway_route_with_config_v1(
     registry: &ServingSlotRegistryV1,
-    instances: &impl InstanceStore,
+    instances: &impl InstanceRouteReaderV1,
     guild_id: GuildId,
     custom_id: &str,
     config: SharedGatewayRouteConfigV1,
@@ -161,7 +161,7 @@ pub async fn admit_shared_gateway_route_with_config_v1(
         SharedGatewayRouteHintV1::Instance(instance_id) => {
             let instance = tokio::time::timeout(
                 config.instance_lookup_timeout(),
-                instances.get(guild_id, &instance_id),
+                instances.read_instance_route_v1(guild_id, &instance_id),
             )
             .await
             .map_err(|_| SharedGatewayRouteErrorV1::InstanceLookupTimedOut)?
@@ -201,7 +201,7 @@ mod tests {
 
     use automation_instance::{
         AutomationInstance, InMemoryInstanceStore, InstanceKind, InstanceResources,
-        InstanceRuleSetVersion, InstanceStatus,
+        InstanceRuleSetVersion, InstanceStatus, InstanceStore,
     };
     use automation_ruleset::{
         content_hash, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
@@ -318,6 +318,16 @@ mod tests {
             _guild_id: GuildId,
         ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
             Self::unsupported()
+        }
+    }
+
+    impl InstanceRouteReaderV1 for FakeInstanceStoreV1 {
+        async fn read_instance_route_v1(
+            &self,
+            guild_id: GuildId,
+            instance_id: &InstanceId,
+        ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+            InstanceStore::get(self, guild_id, instance_id).await
         }
     }
 

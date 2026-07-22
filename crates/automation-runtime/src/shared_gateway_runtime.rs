@@ -4,10 +4,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use automation_core::InteractionResponder;
-use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1};
 use automation_instance_teardown::InstanceTeardownService;
-use automation_ruleset::RuleSetStore;
-use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
+use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ServingSlotRegistryV1;
 use discord_model::GuildId;
 use futures::stream::FuturesUnordered;
@@ -225,10 +224,10 @@ pub async fn run_shared_gateway_v3(
     failure_message: &str,
     registry: &ServingSlotRegistryV1,
     admission_budget: &SharedGatewayAdmissionBudgetV3,
-    instances: &impl InstanceStore,
+    instances: &(impl InstanceRouteReaderV1 + InstanceRegistrarV1),
     instance_ids: &impl InstanceIdGenerator,
     teardown: &impl InstanceTeardownService,
-    ruleset_store: &impl RuleSetStore,
+    pinned_resolver: &impl PinnedInstanceResolverV1,
     snapshot_provider: &impl GuildRoleSnapshotProvider,
     mut control: SharedGatewayRuntimeControlV3,
     config: SharedGatewayRuntimeConfigV3,
@@ -471,7 +470,7 @@ pub async fn run_shared_gateway_v3(
                             instances,
                             instance_ids,
                             teardown,
-                            ruleset_store,
+                            pinned_resolver,
                             snapshot_provider,
                             http,
                             &interaction_http,
@@ -497,7 +496,7 @@ fn current_ready_lease(observer: &GatewayConnectionObserverV3) -> Option<Gateway
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_interaction<'a, I, G, T, R, S>(
+fn enqueue_interaction<'a, I, G, T, PR, S>(
     interaction: Interaction,
     ready_lease: Option<GatewayReadyLeaseV3>,
     observer: &GatewayConnectionObserverV3,
@@ -506,7 +505,7 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
     instances: &'a I,
     instance_ids: &'a G,
     teardown: &'a T,
-    ruleset_store: &'a R,
+    pinned_resolver: &'a PR,
     snapshot_provider: &'a S,
     mutation_http: &'a Client,
     interaction_http: &'a Client,
@@ -518,10 +517,10 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
     rejection_acknowledgement_capacity: NonZeroUsize,
     report: &mut SharedGatewayRuntimeReportV3,
 ) where
-    I: InstanceStore,
+    I: InstanceRouteReaderV1 + InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
-    R: RuleSetStore,
+    PR: PinnedInstanceResolverV1,
     S: GuildRoleSnapshotProvider,
 {
     let Some((guild_id, custom_id)) = interaction_route(&interaction) else {
@@ -580,7 +579,7 @@ fn enqueue_interaction<'a, I, G, T, R, S>(
         instances,
         instance_ids,
         teardown,
-        ruleset_store,
+        pinned_resolver,
         snapshot_provider,
         mutation_http,
         interaction_http,
@@ -650,13 +649,13 @@ fn interaction_route(interaction: &Interaction) -> Option<(GuildId, String)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_reserved<I, G, T, R, S>(
+async fn dispatch_reserved<I, G, T, PR, S>(
     reservation: SharedGatewayAdmissionReservationV3,
     registry: &ServingSlotRegistryV1,
     instances: &I,
     instance_ids: &G,
     teardown: &T,
-    ruleset_store: &R,
+    pinned_resolver: &PR,
     snapshot_provider: &S,
     mutation_http: &Client,
     interaction_http: &Client,
@@ -666,10 +665,10 @@ async fn dispatch_reserved<I, G, T, R, S>(
     interaction: Interaction,
 ) -> SharedGatewayDispatchOutcomeV3
 where
-    I: InstanceStore,
+    I: InstanceRouteReaderV1 + InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
-    R: RuleSetStore,
+    PR: PinnedInstanceResolverV1,
     S: GuildRoleSnapshotProvider,
 {
     match reservation
@@ -686,7 +685,7 @@ where
                 instances,
                 instance_ids,
                 teardown,
-                ruleset_store,
+                pinned_resolver,
                 snapshot_provider,
             )
             .await,

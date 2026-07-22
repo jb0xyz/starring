@@ -2,17 +2,17 @@ use std::future::Future;
 use std::sync::Arc;
 
 use automation_core::RunningRuleSetIdentity;
-use automation_instance::{InstanceIdGenerator, InstanceRuleSetVersion, InstanceStore};
+use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRuleSetVersion};
 use automation_instance_teardown::InstanceTeardownService;
-use automation_ruleset::{RuleSetStore, RuleSetVersion};
-use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
+use automation_ruleset::RuleSetVersion;
+use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ExactServingRouteV1;
 use resource_resolution::ResourceBindingMap;
 use twilight_http::Client;
 use twilight_model::application::interaction::Interaction;
 
 use crate::mutation::TwilightMutationAdapter;
-use crate::runner::{handle_interaction, InteractionExecutionOutcomeV3};
+use crate::runner::{handle_interaction_with_resolver_v1, InteractionExecutionOutcomeV3};
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 
 #[allow(clippy::too_many_arguments)]
@@ -22,15 +22,15 @@ pub async fn execute_admitted_interaction_v3(
     admitted: SharedGatewayAdmittedInteractionV3,
     interaction: &Interaction,
     failure_message: &str,
-    instances: &impl InstanceStore,
+    instances: &impl InstanceRegistrarV1,
     instance_ids: &impl InstanceIdGenerator,
     teardown: &impl InstanceTeardownService,
-    ruleset_store: &impl RuleSetStore,
+    pinned_resolver: &impl PinnedInstanceResolverV1,
     snapshot_provider: &impl GuildRoleSnapshotProvider,
 ) -> InteractionExecutionOutcomeV3 {
     let (identity, ruleset, bindings) = execution_inputs(admitted.route());
     let mutation = TwilightMutationAdapter::new(mutation_http, identity.key.clone());
-    let handler = handle_interaction(
+    let handler = handle_interaction_with_resolver_v1(
         interaction_http,
         &identity,
         &mutation,
@@ -41,7 +41,7 @@ pub async fn execute_admitted_interaction_v3(
         instances,
         instance_ids,
         teardown,
-        ruleset_store,
+        pinned_resolver,
         snapshot_provider,
     );
     hold_admission_while(admitted, handler).await

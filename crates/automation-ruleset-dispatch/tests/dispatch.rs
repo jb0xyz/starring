@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use automation_core::{
     AutomationServices, EventKind, HandleOutcome, MockMutationAdapter, RuntimeEvent,
 };
 use automation_instance::{
-    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
-    InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
+    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceRegistrarV1,
+    InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
     SequenceInstanceIdGenerator,
 };
 use automation_ruleset::{
@@ -14,8 +15,10 @@ use automation_ruleset::{
     RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
 };
 use automation_ruleset_dispatch::{
-    dispatch_instance_action, DispatchError, FailureResponseOutcome, GuildRoleSnapshot,
-    GuildRoleSnapshotProvider, SnapshotError,
+    dispatch_instance_action, dispatch_instance_action_with_resolver_v1, DispatchError,
+    FailureResponseOutcome, GuildRoleSnapshot, GuildRoleSnapshotProvider,
+    PinnedInstanceResolverErrorV1, PinnedInstanceResolverV1, ResolvedPinnedInstanceV1,
+    SnapshotError,
 };
 use automation_state::{
     ActionSpec, ActionTarget, InstanceRef, InteractionRule, InteractionRuleSet, RoleRef,
@@ -136,6 +139,15 @@ impl InstanceStore for TracingInstances {
     }
 }
 
+impl InstanceRegistrarV1 for TracingInstances {
+    async fn register_instance_v1(
+        &self,
+        instance: AutomationInstance,
+    ) -> Result<(), InstanceStoreError> {
+        InstanceStore::register(self, instance).await
+    }
+}
+
 struct TracingRulesets {
     inner: InMemoryRuleSetStore,
     trace: Trace,
@@ -188,6 +200,22 @@ impl RuleSetStore for TracingRulesets {
 struct StubSnapshot {
     trace: Trace,
     result: Result<GuildRoleSnapshot, SnapshotError>,
+}
+
+struct CountingPinnedResolver {
+    calls: AtomicUsize,
+    resolved: ResolvedPinnedInstanceV1,
+}
+
+impl PinnedInstanceResolverV1 for CountingPinnedResolver {
+    async fn resolve_pinned_instance_v1(
+        &self,
+        _guild_id: GuildId,
+        _instance_id: &InstanceId,
+    ) -> Result<ResolvedPinnedInstanceV1, PinnedInstanceResolverErrorV1> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.resolved.clone())
+    }
 }
 
 impl GuildRoleSnapshotProvider for StubSnapshot {
@@ -382,6 +410,113 @@ fn pinned_v1_runs_while_active_is_v2() {
 }
 
 #[test]
+fn narrow_dispatch_resolves_the_exact_pin_once() {
+    let fixture = fixture(false, false, None);
+    let version = publish(&fixture.rulesets.inner, join_rule("v1"));
+    let artifact = block_on(fixture.rulesets.inner.get_version(GUILD, &key(), version))
+        .unwrap()
+        .unwrap();
+    let resolver = CountingPinnedResolver {
+        calls: AtomicUsize::new(0),
+        resolved: ResolvedPinnedInstanceV1 {
+            instance: instance("room_a", version.get(), InstanceStatus::Active),
+            artifact,
+        },
+    };
+    let snapshot = StubSnapshot {
+        trace: fixture.trace.clone(),
+        result: Ok(admin_snapshot()),
+    };
+    let outcome = block_on(dispatch_instance_action_with_resolver_v1(
+        &join_event("room_a"),
+        &InstanceId::parse("room_a").unwrap(),
+        "join",
+        "studyroom_demo",
+        &resolver,
+        &snapshot,
+        &ResourceBindingMap::default(),
+        &services(&fixture),
+        "failed",
+    ))
+    .unwrap();
+    assert_eq!(outcome, HandleOutcome::Executed);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.trace.lock().unwrap()[..2], ["defer", "snapshot"]);
+}
+
+#[test]
+fn narrow_dispatch_binds_the_admitted_ruleset_key() {
+    let fixture = fixture(false, false, None);
+    let version = publish(&fixture.rulesets.inner, join_rule("v1"));
+    let artifact = block_on(fixture.rulesets.inner.get_version(GUILD, &key(), version))
+        .unwrap()
+        .unwrap();
+    let resolver = CountingPinnedResolver {
+        calls: AtomicUsize::new(0),
+        resolved: ResolvedPinnedInstanceV1 {
+            instance: instance("room_a", version.get(), InstanceStatus::Active),
+            artifact,
+        },
+    };
+    let snapshot = StubSnapshot {
+        trace: fixture.trace.clone(),
+        result: Ok(admin_snapshot()),
+    };
+    let failure = block_on(dispatch_instance_action_with_resolver_v1(
+        &join_event("room_a"),
+        &InstanceId::parse("room_a").unwrap(),
+        "join",
+        "different_route",
+        &resolver,
+        &snapshot,
+        &ResourceBindingMap::default(),
+        &services(&fixture),
+        "failed",
+    ))
+    .unwrap_err();
+    assert_eq!(failure.cause, DispatchError::PinnedVersionMissing);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(!fixture.trace.lock().unwrap().contains(&"snapshot"));
+    assert!(fixture.mutation.calls().is_empty());
+}
+
+#[test]
+fn narrow_dispatch_binds_the_requested_instance_id() {
+    let fixture = fixture(false, false, None);
+    let version = publish(&fixture.rulesets.inner, join_rule("v1"));
+    let artifact = block_on(fixture.rulesets.inner.get_version(GUILD, &key(), version))
+        .unwrap()
+        .unwrap();
+    let resolver = CountingPinnedResolver {
+        calls: AtomicUsize::new(0),
+        resolved: ResolvedPinnedInstanceV1 {
+            instance: instance("room_b", version.get(), InstanceStatus::Active),
+            artifact,
+        },
+    };
+    let snapshot = StubSnapshot {
+        trace: fixture.trace.clone(),
+        result: Ok(admin_snapshot()),
+    };
+    let failure = block_on(dispatch_instance_action_with_resolver_v1(
+        &join_event("room_a"),
+        &InstanceId::parse("room_a").unwrap(),
+        "join",
+        "studyroom_demo",
+        &resolver,
+        &snapshot,
+        &ResourceBindingMap::default(),
+        &services(&fixture),
+        "failed",
+    ))
+    .unwrap_err();
+    assert_eq!(failure.cause, DispatchError::PinnedVersionMissing);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(!fixture.trace.lock().unwrap().contains(&"snapshot"));
+    assert!(fixture.mutation.calls().is_empty());
+}
+
+#[test]
 fn defer_failure_stops_before_any_lookup() {
     let fixture = fixture(true, false, None);
     publish(&fixture.rulesets.inner, join_rule("v1"));
@@ -555,6 +690,44 @@ fn inactive_instance_is_rejected() {
         assert_eq!(failure.cause, DispatchError::InstanceInactive(status));
         assert!(fixture.mutation.calls().is_empty());
     }
+}
+
+#[test]
+fn inactive_instance_precedes_missing_pinned_version() {
+    let fixture = fixture(false, false, None);
+    block_on(
+        fixture
+            .instances
+            .inner
+            .register(instance("room_a", 99, InstanceStatus::Disabled)),
+    )
+    .unwrap();
+    let snapshot = StubSnapshot {
+        trace: fixture.trace.clone(),
+        result: Ok(admin_snapshot()),
+    };
+    let failure = block_on(dispatch_instance_action(
+        &join_event("room_a"),
+        &InstanceId::parse("room_a").unwrap(),
+        "join",
+        &fixture.rulesets,
+        &snapshot,
+        &ResourceBindingMap::default(),
+        &services(&fixture),
+        "failed",
+    ))
+    .unwrap_err();
+    assert_eq!(
+        failure.cause,
+        DispatchError::InstanceInactive(InstanceStatus::Disabled)
+    );
+    assert!(!fixture
+        .trace
+        .lock()
+        .unwrap()
+        .contains(&"ruleset.get_version"));
+    assert!(!fixture.trace.lock().unwrap().contains(&"snapshot"));
+    assert!(fixture.mutation.calls().is_empty());
 }
 
 #[test]
