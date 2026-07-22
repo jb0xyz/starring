@@ -393,25 +393,18 @@ async fn operational_status_tracks_pristine_retry_blocked_and_recovered_attempts
         .await
         .unwrap();
     assert_eq!(second_claim.convergence_attempt.get(), 2);
+    let mutation_guard = ProductRuntimeMutationGuard::from_claim(&scope, &second_claim);
     let resumed_revision = mutate_product_runtime(
         &runtime,
-        &scope,
+        &mutation_guard,
         second_claim.snapshot.revision,
-        &second_controller,
-        second_claim.fencing_token,
-        second_claim.convergence_attempt,
-        second_claim.snapshot.runtime_generation,
         DeploymentMutationV1::ResumeRuntimePending,
     )
     .await;
     let panels_revision = mutate_product_runtime(
         &runtime,
-        &scope,
+        &mutation_guard,
         resumed_revision,
-        &second_controller,
-        second_claim.fencing_token,
-        second_claim.convergence_attempt,
-        second_claim.snapshot.runtime_generation,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
