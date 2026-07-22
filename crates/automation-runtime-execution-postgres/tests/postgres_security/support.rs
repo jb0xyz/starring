@@ -22,7 +22,8 @@ use automation_runtime_convergence::{
     RuntimeGeneration, RuntimePendingConditionV1, SupersedingDeploymentV1, TransitionOutcomeV1,
 };
 use automation_runtime_execution_postgres::{
-    PostgresRuntimeExecutionV1, RuntimeExecutionDatabaseExpectationV1,
+    observe_runtime_execution_database_identity_v1, PostgresRuntimeExecutionV1,
+    RuntimeExecutionDatabaseExpectationV1,
     RuntimeExecutionPersistenceErrorV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};

@@ -118,10 +118,10 @@ struct RuntimeExecutionDatabaseReadinessRowV1 {
 }
 
 #[derive(sqlx::FromRow)]
-struct RuntimeExecutionDatabaseBindingRowV1 {
-    database_identity: String,
-    database_name: String,
-    executor_role: String,
+pub(crate) struct RuntimeExecutionDatabaseBindingRowV1 {
+    pub(crate) database_identity: String,
+    pub(crate) database_name: String,
+    pub(crate) executor_role: String,
 }
 
 pub async fn verify_runtime_execution_database_v1(
@@ -229,7 +229,7 @@ async fn verify_runtime_execution_database_on_connection_v1(
     Ok(readiness)
 }
 
-async fn configure_read_transaction(
+pub(crate) async fn configure_read_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     timeouts: RuntimeExecutionDatabaseTimeoutsV1,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
@@ -299,7 +299,7 @@ pub(crate) async fn verify_runtime_execution_binding_v1(
     )
 }
 
-fn verify_database_authority(
+pub(crate) fn verify_database_authority(
     database_identity: &str,
     database_name: &str,
     executor_role: &str,

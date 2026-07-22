@@ -250,6 +250,35 @@ fn readiness_uses_one_absolute_deadline_and_cancellation_fencing() {
 }
 
 #[test]
+fn database_identity_observation_is_bounded_read_only_and_adapter_owned() {
+    let bootstrap = include_str!("../src/bootstrap.rs");
+    let production = bootstrap.split("#[cfg(test)]").next().unwrap();
+    let deadline = bootstrap
+        .find("let deadline = tokio::time::Instant::now()")
+        .unwrap();
+    let acquire = bootstrap.find("pool.acquire()").unwrap();
+    let operation = bootstrap.find("identify_on_connection").unwrap();
+    assert!(deadline < acquire && acquire < operation);
+    assert!(bootstrap.contains("REPEATABLE READ READ ONLY"));
+    assert!(bootstrap.contains("DATABASE_BINDING_QUERY"));
+    assert!(bootstrap.contains("configure_read_transaction"));
+    assert!(bootstrap.contains("RuntimeExecutionDatabaseBindingRowV1"));
+    assert!(bootstrap.contains("verify_database_authority"));
+    for forbidden in [
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "RuntimeExecutionConvergencePort",
+        "RuntimeServingLeasePort",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "bootstrap edge: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn readiness_transaction_is_bounded_and_canonical() {
     let database = include_str!("../src/database.rs");
     let statement = database

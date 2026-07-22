@@ -68,6 +68,19 @@ async fn assert_verified_adapter(
     let expectation =
         RuntimeExecutionDatabaseExpectationV1::new(database_identity.clone(), database_name, role)
             .unwrap();
+    let binding = observe_runtime_execution_database_identity_v1(executor_pool, database_name, role)
+        .await
+        .unwrap();
+    assert_eq!(binding.database_identity(), database_identity);
+    assert!(matches!(
+        observe_runtime_execution_database_identity_v1(
+            executor_pool,
+            database_name,
+            "starring_wrong_execution_role",
+        )
+        .await,
+        Err(RuntimeExecutionPersistenceErrorV1::DatabaseAuthorityMismatch)
+    ));
     let adapter = PostgresRuntimeExecutionV1::connect_verified_default(
         executor_pool.clone(),
         expectation.clone(),
@@ -776,4 +789,3 @@ async fn assert_readiness_definition_sha(owner_pool: &PgPool) {
     assert_ne!(EXPECTED_READINESS_DEFINITION_SHA256_V1, "PENDING");
     assert_eq!(digest, EXPECTED_READINESS_DEFINITION_SHA256_V1);
 }
-

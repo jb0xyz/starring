@@ -1,3 +1,4 @@
+mod bootstrap;
 mod certification;
 mod connection;
 mod contract;
@@ -12,6 +13,11 @@ mod recovery;
 mod row;
 mod store;
 
+pub use bootstrap::{
+    observe_runtime_execution_database_identity_v1,
+    observe_runtime_execution_database_identity_with_timeouts_v1,
+    RuntimeExecutionDatabaseIdentityObservationV1,
+};
 pub use certification::{
     MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
     MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,

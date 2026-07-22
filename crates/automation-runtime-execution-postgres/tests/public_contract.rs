@@ -7,7 +7,9 @@ use automation_runtime_controller::{
     RuntimePreviousServingObservationPort,
 };
 use automation_runtime_execution_postgres::{
-    PostgresRuntimeExecutionV1, RuntimeExecutionDatabaseExpectationV1,
+    observe_runtime_execution_database_identity_v1,
+    observe_runtime_execution_database_identity_with_timeouts_v1, PostgresRuntimeExecutionV1,
+    RuntimeExecutionDatabaseExpectationV1, RuntimeExecutionDatabaseIdentityObservationV1,
     RuntimeExecutionDatabaseTimeoutsV1, RuntimeExecutionPersistenceErrorV1,
     MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
     MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
@@ -202,4 +204,11 @@ fn verified_adapter_exposes_the_scoped_execution_contract() {
         MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
         Duration::from_secs(300)
     );
+}
+
+#[test]
+fn execution_database_identity_observation_is_public_and_read_only() {
+    let _ = observe_runtime_execution_database_identity_v1;
+    let _ = observe_runtime_execution_database_identity_with_timeouts_v1;
+    let _ = std::mem::size_of::<RuntimeExecutionDatabaseIdentityObservationV1>();
 }
