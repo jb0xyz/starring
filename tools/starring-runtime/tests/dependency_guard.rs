@@ -198,7 +198,7 @@ fn comment_scanner_cannot_be_masked_by_character_literals() {
 }
 
 #[test]
-fn package_is_registered_once_and_has_only_the_bounded_first_slice() {
+fn package_is_registered_once_and_has_only_the_bounded_database_slice() {
     assert_eq!(WORKSPACE.matches("\"tools/starring-runtime\"").count(), 1);
     let sources = source_files();
     assert_eq!(
@@ -208,6 +208,7 @@ fn package_is_registered_once_and_has_only_the_bounded_first_slice() {
             .collect::<Vec<_>>(),
         [
             "src/config.rs",
+            "src/database.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/secret.rs",
@@ -218,7 +219,7 @@ fn package_is_registered_once_and_has_only_the_bounded_first_slice() {
 }
 
 #[test]
-fn direct_dependencies_exclude_runtime_adapters_ai_and_environment_loaders() {
+fn direct_dependencies_are_the_exact_database_composition_surface() {
     let mut dependencies = package_dependencies()
         .into_iter()
         .map(|dependency| {
@@ -233,14 +234,22 @@ fn direct_dependencies_exclude_runtime_adapters_ai_and_environment_loaders() {
     assert_eq!(
         dependencies,
         [
+            ("automation-runtime-convergence-postgres".to_string(), None),
+            ("automation-runtime-execution-postgres".to_string(), None),
+            ("automation-runtime-interaction-postgres".to_string(), None),
+            ("automation-runtime-panel-postgres".to_string(), None),
+            ("automation-runtime-serving-postgres".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
+            ("sqlx".to_string(), None),
+            ("thiserror".to_string(), None),
+            ("tokio".to_string(), None),
             ("zeroize".to_string(), None),
         ]
     );
 }
 
 #[test]
-fn source_is_comment_free_and_cannot_compose_external_systems() {
+fn source_is_comment_free_and_external_composition_is_bounded() {
     for (path, source) in source_files() {
         assert!(!has_rust_comment(&source), "{}", path.display());
         if !path.starts_with("src") {
@@ -252,11 +261,8 @@ fn source_is_comment_free_and_cannot_compose_external_systems() {
             "design_harness",
             "dotenv",
             "reqwest",
-            "sqlx",
-            "tokio",
             "twilight_gateway",
             "twilight_http",
-            "PgPool",
             "TcpListener",
         ] {
             assert!(
@@ -265,11 +271,75 @@ fn source_is_comment_free_and_cannot_compose_external_systems() {
                 path.display()
             );
         }
+        if path != Path::new("src/database.rs") {
+            for forbidden in [
+                "sqlx",
+                "tokio",
+                "PgPool",
+                "PostgresRuntimeExecutionV1",
+                "PostgresRuntimeExactTargetReader",
+                "PostgresRuntimePanelV1",
+                "PostgresRuntimeServingLeaseV1",
+                "PostgresRuntimeInteractionV1",
+            ] {
+                assert!(
+                    !contains_identifier(&source, forbidden),
+                    "{}: {forbidden}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
 #[test]
-fn secret_resolution_is_bounded_redacted_and_stops_before_pool_composition() {
+fn database_composition_is_five_pool_function_only_and_fail_closed() {
+    let sources = source_files();
+    let database = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/database.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    for required in [
+        "PgConnectOptions::new_without_pgpass()",
+        ".disable_statement_logging()",
+        "tokio::join!",
+        "timeout_at(startup_deadline",
+        "PERIODIC_READINESS_TIMEOUT",
+        "verify_expected_database_authority_v1",
+        "observe_runtime_execution_database_identity_with_timeouts_v1",
+        "PostgresRuntimeExecutionV1::connect_verified",
+        "PostgresRuntimeExactTargetReader::connect_verified",
+        "PostgresRuntimePanelV1::connect_verified",
+        "PostgresRuntimeServingLeaseV1::connect_verified",
+        "PostgresRuntimeInteractionV1::connect_verified_with_route_timeout",
+        "close_pool_refs_with_deadline",
+        "DatabaseCapabilityV1::ALL",
+        "BTreeSet",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx::query",
+        "sqlx::query_as",
+        "sqlx::query_scalar",
+        "PostgresRuntimeConvergenceDatabaseIdentityReader",
+        "PostgresRuntimeConvergence",
+        "pub fn panel_pool",
+        "pub fn database_identity",
+        "pub fn database_name",
+        "pub fn executor_role",
+        "SELECT ",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+    ] {
+        assert!(!database.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
     let sources = source_files();
     let secret = sources
         .iter()
@@ -323,6 +393,7 @@ fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
     assert!(main.contains("RuntimeConfigV1::from_process_environment"));
     assert!(main.contains("resolve_runtime_secrets_v1"));
     assert!(main.contains("runtime_not_composed"));
+    assert!(!main.contains("compose_runtime_database_dependencies_v1"));
     for forbidden in ["health_ready", "ready_to_serve", "gateway_connected"] {
         assert!(!main.contains(forbidden));
     }
