@@ -31,11 +31,12 @@ async fn gateway_owner_lifecycle_scenario(database: &IsolatedDatabase) {
     )
     .await
     .unwrap();
-    let RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(observed_receipt) =
+    let RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(observed_authority) =
         classify_unknown_gateway_owner_acquire_v1(&first_request, observed)
     else {
         panic!("unknown acquisition must adopt its exact current lease")
     };
+    let observed_receipt = observed_authority.receipt();
     assert_eq!(observed_receipt.lease_id, first_receipt.lease_id);
     assert_eq!(observed_receipt.owner_revision, first_receipt.owner_revision);
     assert_eq!(observed_receipt.expires_at, first_receipt.expires_at);

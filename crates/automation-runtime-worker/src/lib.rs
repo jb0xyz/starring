@@ -1,5 +1,6 @@
 mod gateway_lifecycle;
 mod gateway_owner;
+mod gateway_owner_watchdog;
 mod writer_fence;
 
 pub use gateway_lifecycle::{
@@ -12,9 +13,17 @@ pub use gateway_owner::{
     accept_gateway_owner_release_v1, accept_gateway_owner_renew_v1,
     classify_unknown_gateway_owner_acquire_v1, classify_unknown_gateway_owner_release_v1,
     classify_unknown_gateway_owner_renew_v1, RuntimeAcceptedGatewayOwnerAcquireV1,
-    RuntimeAcceptedGatewayOwnerReleaseV1, RuntimeAcceptedGatewayOwnerRenewV1,
-    RuntimeGatewayOwnerAcquireRecoveryV1, RuntimeGatewayOwnerLeasePortV1,
-    RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerProtocolViolationV1,
-    RuntimeGatewayOwnerReleaseRecoveryV1, RuntimeGatewayOwnerRenewRecoveryV1,
+    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedGatewayOwnerReleaseV1,
+    RuntimeAcceptedGatewayOwnerRenewV1, RuntimeGatewayOwnerAcquireRecoveryV1,
+    RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerMutationErrorV1,
+    RuntimeGatewayOwnerProtocolViolationV1, RuntimeGatewayOwnerReleaseRecoveryV1,
+    RuntimeGatewayOwnerRenewRecoveryV1,
+};
+pub use gateway_owner_watchdog::{
+    RuntimeGatewayOwnerRenewalCompletionV1, RuntimeGatewayOwnerRenewalInFlightV1,
+    RuntimeGatewayOwnerRenewalPolicyErrorV1, RuntimeGatewayOwnerRenewalPolicyV1,
+    RuntimeGatewayOwnerRenewalScheduleErrorV1, RuntimeGatewayOwnerRenewalScheduleV1,
+    RuntimeGatewayOwnerUnknownRenewalV1, RuntimeGatewayOwnerWatchdogActionV1,
+    RuntimeGatewayOwnerWatchdogErrorV1, RuntimeGatewayOwnerWatchdogV1,
 };
 pub use writer_fence::RuntimeWriterFenceObservationPortV1;

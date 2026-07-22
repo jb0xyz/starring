@@ -95,13 +95,14 @@ fn unowned(shard: &str) -> RuntimeGatewayOwnerLeaseObservationV1 {
 fn unknown_acquire_adopts_only_the_exact_process_and_build() {
     let request = acquire();
     let exact = receipt(lease_id("process:1", "build:1", 7), 1);
-    assert_eq!(
-        classify_unknown_gateway_owner_acquire_v1(
-            &request,
-            owned(exact.lease_id.clone(), exact.owner_revision.get()),
-        ),
-        RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(exact)
+    let recovery = classify_unknown_gateway_owner_acquire_v1(
+        &request,
+        owned(exact.lease_id.clone(), exact.owner_revision.get()),
     );
+    let RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(authority) = recovery else {
+        panic!("expected recovered gateway owner authority")
+    };
+    assert_eq!(authority.receipt(), &exact);
     assert_eq!(
         classify_unknown_gateway_owner_acquire_v1(&request, unowned("shard:0")),
         RuntimeGatewayOwnerAcquireRecoveryV1::ReplaySameRequest
@@ -238,13 +239,15 @@ fn unknown_release_replays_only_while_the_exact_lease_is_current() {
 fn ordinary_acquire_acceptance_rejects_forged_or_inconsistent_acknowledgements() {
     let request = acquire();
     let exact = receipt(lease_id("process:1", "build:1", 7), 1);
-    assert_eq!(
-        accept_gateway_owner_acquire_v1(
-            &request,
-            RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Acquired(exact.clone()),
-        ),
-        Ok(RuntimeAcceptedGatewayOwnerAcquireV1::Acquired(exact))
-    );
+    let accepted = accept_gateway_owner_acquire_v1(
+        &request,
+        RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Acquired(exact.clone()),
+    )
+    .unwrap();
+    let RuntimeAcceptedGatewayOwnerAcquireV1::Acquired(authority) = accepted else {
+        panic!("expected acquired gateway owner authority")
+    };
+    assert_eq!(authority.receipt(), &exact);
 
     let wrong_build = receipt(lease_id("process:1", "build:2", 7), 1);
     assert_eq!(

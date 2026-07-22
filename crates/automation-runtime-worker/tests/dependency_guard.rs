@@ -37,6 +37,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         [
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_owner.rs"),
+            PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/writer_fence.rs"),
         ]
@@ -163,4 +164,34 @@ fn worker_writer_fence_surface_is_observe_only() {
             "forbidden writer fence authority: {forbidden}"
         );
     }
+}
+
+#[test]
+fn worker_gateway_owner_watchdog_state_is_nonclone_and_monotonic() {
+    let source = include_str!("../src/gateway_owner_watchdog.rs");
+    let owner_source = include_str!("../src/gateway_owner.rs");
+
+    for authority in [
+        "RuntimeGatewayOwnerRenewalScheduleV1",
+        "RuntimeGatewayOwnerWatchdogV1",
+        "RuntimeGatewayOwnerRenewalInFlightV1",
+        "RuntimeGatewayOwnerUnknownRenewalV1",
+    ] {
+        assert!(source.contains(&format!(
+            "#[derive(Debug, PartialEq, Eq)]\npub struct {authority}"
+        )));
+    }
+    assert!(!source.contains("SystemTime"));
+    assert!(!source.contains("Utc::now"));
+    assert!(!source.contains("pub fn from_receipt"));
+    assert!(source.contains("pub fn from_accepted_receipt"));
+    assert!(source.contains(".checked_add(lease_duration)"));
+    assert!(source.contains("response_observed_at >= safety_deadline"));
+    assert!(owner_source.contains(concat!(
+        "#[derive(Debug, PartialEq, Eq)]\n",
+        "pub struct RuntimeAcceptedGatewayOwnerReceiptV1 {\n",
+        "    receipt: RuntimeGatewayOwnerLeaseReceiptV1,\n",
+        "}"
+    )));
+    assert!(!owner_source.contains("impl Clone for RuntimeAcceptedGatewayOwnerReceiptV1"));
 }

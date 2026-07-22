@@ -65,9 +65,9 @@ pub trait RuntimeGatewayOwnerLeasePortV1 {
     > + Send;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RuntimeGatewayOwnerAcquireRecoveryV1 {
-    Adopt(RuntimeGatewayOwnerLeaseReceiptV1),
+    Adopt(RuntimeAcceptedGatewayOwnerReceiptV1),
     ReplaySameRequest,
     Contended(RuntimeGatewayOwnerLeaseReceiptV1),
     ProtocolViolation,
@@ -88,10 +88,25 @@ pub enum RuntimeGatewayOwnerReleaseRecoveryV1 {
     ProtocolViolation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RuntimeAcceptedGatewayOwnerAcquireV1 {
-    Acquired(RuntimeGatewayOwnerLeaseReceiptV1),
+    Acquired(RuntimeAcceptedGatewayOwnerReceiptV1),
     Contended(RuntimeGatewayOwnerLeaseReceiptV1),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RuntimeAcceptedGatewayOwnerReceiptV1 {
+    receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+}
+
+impl RuntimeAcceptedGatewayOwnerReceiptV1 {
+    pub fn receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.receipt
+    }
+
+    pub(crate) fn into_receipt(self) -> RuntimeGatewayOwnerLeaseReceiptV1 {
+        self.receipt
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +156,9 @@ pub fn accept_gateway_owner_acquire_v1(
             if receipt.lease_id.expected_build_revision != request.expected_build_revision {
                 return Err(RuntimeGatewayOwnerProtocolViolationV1::BuildMismatch);
             }
-            Ok(RuntimeAcceptedGatewayOwnerAcquireV1::Acquired(receipt))
+            Ok(RuntimeAcceptedGatewayOwnerAcquireV1::Acquired(
+                RuntimeAcceptedGatewayOwnerReceiptV1 { receipt },
+            ))
         }
         RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Contended(receipt) => {
             validate_receipt_shard(&receipt, &request.gateway_shard_id)?;
@@ -239,7 +256,9 @@ pub fn classify_unknown_gateway_owner_acquire_v1(
             }
             if receipt.lease_id.process_instance_id == request.process_instance_id {
                 if receipt.lease_id.expected_build_revision == request.expected_build_revision {
-                    RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(receipt)
+                    RuntimeGatewayOwnerAcquireRecoveryV1::Adopt(
+                        RuntimeAcceptedGatewayOwnerReceiptV1 { receipt },
+                    )
                 } else {
                     RuntimeGatewayOwnerAcquireRecoveryV1::ProtocolViolation
                 }
