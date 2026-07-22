@@ -9,6 +9,9 @@ pub(crate) const CLAIM_NEXT_QUERY: &str =
 pub(crate) const RENEW_QUERY: &str = "SELECT * FROM public.starring_runtime_execution_renew_v1(\
         $1, $2, $3, $4, $5, $6, $7, $8, $9)";
 
+pub(crate) const MUTATE_QUERY: &str = "SELECT * FROM public.starring_runtime_execution_mutate_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17,7 +20,13 @@ mod tests {
     fn operation_queries_are_function_only_and_positionally_exact() {
         assert_eq!(CLAIM_NEXT_QUERY.matches('$').count(), 2);
         assert_eq!(RENEW_QUERY.matches('$').count(), 9);
-        for query in [DATABASE_BINDING_QUERY, CLAIM_NEXT_QUERY, RENEW_QUERY] {
+        assert_eq!(MUTATE_QUERY.matches('$').count(), 10);
+        for query in [
+            DATABASE_BINDING_QUERY,
+            CLAIM_NEXT_QUERY,
+            RENEW_QUERY,
+            MUTATE_QUERY,
+        ] {
             for forbidden in [
                 "runtime_deployments",
                 "runtime_attestations",

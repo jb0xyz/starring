@@ -2,16 +2,20 @@ use std::time::Duration;
 
 use automation_runtime_controller::{
     RuntimeClaimNextExecutionV1, RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1,
-    RuntimeRenewExecutionV1,
+    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeRenewExecutionV1,
 };
+use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 
 use crate::connection::ExecutionConnectionGuardV1;
 use crate::database::{begin_execution_mutation_transaction, verify_runtime_execution_binding_v1};
 use crate::error::{map_mutation_commit_error, map_query_error, validate_millisecond_duration};
-use crate::proof::{prove_claim_next_v1, prove_renew_v1};
-use crate::query::{CLAIM_NEXT_QUERY, RENEW_QUERY};
-use crate::row::RuntimeExecutionOperationRowV1;
+use crate::mutation::{encode_runtime_mutation_v1, EncodedRuntimeMutationV1};
+use crate::proof::{prove_claim_next_v1, prove_mutation_v1, prove_renew_v1};
+use crate::query::{CLAIM_NEXT_QUERY, MUTATE_QUERY, RENEW_QUERY};
+use crate::row::{
+    RuntimeClaimOperationRowV1, RuntimeExecutionOperationRowV1, RuntimeMutationOperationRowV1,
+};
 use crate::{
     verify_runtime_execution_database_with_timeouts_v1, RuntimeExecutionDatabaseExpectationV1,
     RuntimeExecutionDatabaseReadinessV1, RuntimeExecutionDatabaseTimeoutsV1,
@@ -86,7 +90,8 @@ impl PostgresRuntimeExecutionV1 {
             .await?
         {
             RuntimeExecutionOperationReceiptV1::ClaimNext(receipt) => Ok(receipt),
-            RuntimeExecutionOperationReceiptV1::Renew(_) => {
+            RuntimeExecutionOperationReceiptV1::Renew(_)
+            | RuntimeExecutionOperationReceiptV1::Mutate(_) => {
                 Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
             }
         }
@@ -113,7 +118,30 @@ impl PostgresRuntimeExecutionV1 {
                     execution,
                 })
             }
-            RuntimeExecutionOperationReceiptV1::ClaimNext(_) => {
+            RuntimeExecutionOperationReceiptV1::ClaimNext(_)
+            | RuntimeExecutionOperationReceiptV1::Mutate(_) => {
+                Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            }
+        }
+    }
+
+    pub async fn mutate(
+        &self,
+        request: RuntimeMutationRequestV1,
+    ) -> Result<RuntimeMutationReceiptV1, RuntimeExecutionPersistenceErrorV1> {
+        let bindings = RuntimeMutationBindingsV1::from_request(&request)?;
+        let mutation = encode_runtime_mutation_v1(&request.mutation, &request.guard)?;
+        match self
+            .execute_operation(RuntimeExecutionOperationV1::Mutate {
+                request: &request,
+                mutation: &mutation,
+                bindings,
+            })
+            .await?
+        {
+            RuntimeExecutionOperationReceiptV1::Mutate(receipt) => Ok(receipt),
+            RuntimeExecutionOperationReceiptV1::ClaimNext(_)
+            | RuntimeExecutionOperationReceiptV1::Renew(_) => {
                 Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
             }
         }
@@ -159,7 +187,7 @@ impl PostgresRuntimeExecutionV1 {
                 request,
                 lease_milliseconds,
             } => {
-                let rows = sqlx::query_as::<_, RuntimeExecutionOperationRowV1>(CLAIM_NEXT_QUERY)
+                let rows = sqlx::query_as::<_, RuntimeClaimOperationRowV1>(CLAIM_NEXT_QUERY)
                     .bind(request.controller_id.as_str())
                     .bind(lease_milliseconds)
                     .fetch_all(&mut *transaction)
@@ -209,6 +237,37 @@ impl PostgresRuntimeExecutionV1 {
                 )?;
                 RuntimeExecutionOperationReceiptV1::Renew(receipt)
             }
+            RuntimeExecutionOperationV1::Mutate {
+                request,
+                mutation,
+                bindings,
+            } => {
+                let guard = &request.guard;
+                let mut rows = sqlx::query_as::<_, RuntimeMutationOperationRowV1>(MUTATE_QUERY)
+                    .bind(guard.scope.tenant_id.as_str())
+                    .bind(guard.scope.installation_id.as_str())
+                    .bind(guard.scope.deployment_id.as_str())
+                    .bind(bindings.expected_revision)
+                    .bind(guard.controller_id.as_str())
+                    .bind(bindings.fencing_token)
+                    .bind(bindings.convergence_attempt)
+                    .bind(bindings.runtime_generation)
+                    .bind(mutation.kind)
+                    .bind(Json(mutation.payload.clone()))
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(map_query_error)?;
+                if rows.len() != 1 {
+                    return Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt);
+                }
+                let receipt = prove_mutation_v1(
+                    rows.pop()
+                        .ok_or(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)?
+                        .decode()?,
+                    request,
+                )?;
+                RuntimeExecutionOperationReceiptV1::Mutate(receipt)
+            }
         };
         transaction
             .commit()
@@ -227,6 +286,11 @@ enum RuntimeExecutionOperationV1<'a> {
         request: &'a RuntimeRenewExecutionV1,
         lease_milliseconds: i64,
         bindings: RuntimeRenewBindingsV1,
+    },
+    Mutate {
+        request: &'a RuntimeMutationRequestV1,
+        mutation: &'a EncodedRuntimeMutationV1,
+        bindings: RuntimeMutationBindingsV1,
     },
 }
 
@@ -251,9 +315,31 @@ impl RuntimeRenewBindingsV1 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeMutationBindingsV1 {
+    expected_revision: i64,
+    fencing_token: i64,
+    convergence_attempt: i64,
+    runtime_generation: i64,
+}
+
+impl RuntimeMutationBindingsV1 {
+    fn from_request(
+        request: &RuntimeMutationRequestV1,
+    ) -> Result<Self, RuntimeExecutionPersistenceErrorV1> {
+        Ok(Self {
+            expected_revision: runtime_incrementable_i64(request.guard.expected_revision.get())?,
+            fencing_token: runtime_i64(request.guard.fencing_token.get())?,
+            convergence_attempt: i64::from(request.guard.convergence_attempt.get()),
+            runtime_generation: runtime_i64(request.guard.runtime_generation.get())?,
+        })
+    }
+}
+
 enum RuntimeExecutionOperationReceiptV1 {
     ClaimNext(Option<RuntimeExecutionReceiptV1>),
     Renew(RuntimeExecutionReceiptV1),
+    Mutate(RuntimeMutationReceiptV1),
 }
 
 fn validate_lease_duration(duration: Duration) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {

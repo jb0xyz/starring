@@ -2,6 +2,7 @@ mod connection;
 mod contract;
 mod database;
 mod error;
+mod mutation;
 mod proof;
 mod query;
 mod row;

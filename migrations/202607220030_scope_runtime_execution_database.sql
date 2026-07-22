@@ -108,8 +108,51 @@ BEGIN
             ERRCODE = 'RE001',
             MESSAGE = 'runtime_execution_database_function_drift';
     END IF;
+
+    IF pg_catalog.to_regclass(
+            'public.runtime_execution_mutation_markers'
+        ) IS NOT NULL
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RE001',
+            MESSAGE = 'runtime_execution_database_relation_drift';
+    END IF;
 END;
 $preflight$;
+
+CREATE TABLE public.runtime_execution_mutation_markers (
+    deployment_id TEXT PRIMARY KEY,
+    mutation_revision BIGINT NOT NULL,
+    mutation_kind TEXT NOT NULL,
+    mutation_payload JSONB NOT NULL,
+    CONSTRAINT runtime_execution_mutation_markers_deployment_fk
+        FOREIGN KEY (deployment_id)
+        REFERENCES public.runtime_deployments (deployment_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT runtime_execution_mutation_markers_revision_check CHECK (
+        mutation_revision BETWEEN 2 AND 9223372036854775807
+    ),
+    CONSTRAINT runtime_execution_mutation_markers_kind_check CHECK (
+        mutation_kind IN (
+            'accept_preflight',
+            'request_drain',
+            'accept_drain',
+            'begin_activation',
+            'accept_activation',
+            'record_retryable_failure',
+            'record_blocked_failure',
+            'resume_runtime_pending',
+            'begin_panel_reconciliation',
+            'accept_panel_certificate',
+            'supersede',
+            'cancel'
+        )
+    ),
+    CONSTRAINT runtime_execution_mutation_markers_payload_check CHECK (
+        pg_catalog.jsonb_typeof(mutation_payload) = 'object'
+        AND pg_catalog.octet_length(mutation_payload::TEXT) <= 262144
+    )
+);
 
 CREATE FUNCTION public.starring_runtime_execution_database_identity_v1()
 RETURNS TEXT
@@ -139,6 +182,7 @@ RETURNS TABLE(
     snapshot JSONB,
     controller_id TEXT,
     fencing_token BIGINT,
+    previous_convergence_attempt_no BIGINT,
     convergence_attempt_no BIGINT,
     acquired_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ
@@ -163,6 +207,7 @@ DECLARE
     next_attempt BIGINT;
     next_expiry TIMESTAMPTZ;
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
     IF expected_controller_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR requested_lease_milliseconds NOT BETWEEN 1000 AND 600000
     THEN
@@ -243,11 +288,36 @@ BEGIN
                     MESSAGE = 'runtime_execution_claim_replay_mismatch';
             END IF;
 
+            authority_outcome := public.starring_runtime_lock_current_authority(
+                deployment_row.activation_request_id,
+                deployment_row.promotion_id,
+                deployment_row.tenant_id,
+                deployment_row.installation_id,
+                deployment_row.installation_authority_revision,
+                deployment_row.guild_id,
+                deployment_row.ruleset_key,
+                deployment_row.target_version,
+                deployment_row.target_content_hash,
+                deployment_row.binding_revision,
+                deployment_row.binding_fingerprint
+            );
+            IF authority_outcome = 'active_mismatch' THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'RX006',
+                    MESSAGE = 'runtime_execution_claim_target_superseded';
+            ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'RX003',
+                    MESSAGE = 'runtime_execution_claim_authority_changed';
+            END IF;
+
             outcome_name := 'replayed';
             previous_snapshot := deployment_row.snapshot;
             snapshot := deployment_row.snapshot;
             controller_id := deployment_row.controller_id;
             fencing_token := deployment_row.controller_fencing_token;
+            previous_convergence_attempt_no :=
+                deployment_row.convergence_attempt_no - 1;
             convergence_attempt_no :=
                 deployment_row.convergence_attempt_no;
             acquired_at := deployment_row.controller_acquired_at;
@@ -477,6 +547,8 @@ BEGIN
     snapshot := next_snapshot;
     controller_id := expected_controller_id;
     fencing_token := next_fencing_token;
+    previous_convergence_attempt_no :=
+        deployment_row.convergence_attempt_no;
     convergence_attempt_no := next_attempt;
     acquired_at := mutation_clock;
     expires_at := next_expiry;
@@ -524,6 +596,7 @@ DECLARE
     next_fencing_token BIGINT;
     next_expiry TIMESTAMPTZ;
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
     IF expected_tenant_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_installation_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_deployment_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
@@ -655,6 +728,29 @@ BEGIN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX001',
                 MESSAGE = 'runtime_execution_renew_ownership_lost';
+        END IF;
+
+        authority_outcome := public.starring_runtime_lock_current_authority(
+            deployment_row.activation_request_id,
+            deployment_row.promotion_id,
+            deployment_row.tenant_id,
+            deployment_row.installation_id,
+            deployment_row.installation_authority_revision,
+            deployment_row.guild_id,
+            deployment_row.ruleset_key,
+            deployment_row.target_version,
+            deployment_row.target_content_hash,
+            deployment_row.binding_revision,
+            deployment_row.binding_fingerprint
+        );
+        IF authority_outcome = 'active_mismatch' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX006',
+                MESSAGE = 'runtime_execution_renew_target_superseded';
+        ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX003',
+                MESSAGE = 'runtime_execution_renew_authority_changed';
         END IF;
 
         outcome_name := 'replayed';
@@ -819,6 +915,7 @@ ROWS 1
 AS $function$
 DECLARE
     deployment_row public.runtime_deployments%ROWTYPE;
+    marker_row public.runtime_execution_mutation_markers%ROWTYPE;
     serving_row public.runtime_serving_leases%ROWTYPE;
     previous_snapshot_value JSONB;
     next_snapshot JSONB;
@@ -868,6 +965,7 @@ DECLARE
         || pg_catalog.chr(8287)
         || pg_catalog.chr(12288);
 BEGIN
+    PERFORM pg_catalog.set_config('TimeZone', 'UTC', TRUE);
     IF expected_tenant_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_installation_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
         OR expected_deployment_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
@@ -929,12 +1027,32 @@ BEGIN
         AND deployment_row.convergence_attempt_no
             IS NOT DISTINCT FROM expected_convergence_attempt_no
     THEN
+        SELECT marker.*
+        INTO marker_row
+        FROM public.runtime_execution_mutation_markers AS marker
+        WHERE marker.deployment_id = expected_deployment_id;
+
+        IF NOT FOUND
+            OR marker_row.mutation_revision
+                IS DISTINCT FROM deployment_row.revision
+            OR marker_row.mutation_kind IS DISTINCT FROM mutation_kind
+            OR marker_row.mutation_payload IS DISTINCT FROM mutation_payload
+            OR marker_row.mutation_payload::TEXT
+                IS DISTINCT FROM mutation_payload::TEXT
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX004',
+                MESSAGE = 'runtime_execution_mutation_replay_mismatch';
+        END IF;
+
         replay_exact := CASE mutation_kind
             WHEN 'accept_preflight' THEN
                 payload_key_count = 4
                 AND deployment_row.phase = 'preflight_ready'
                 AND deployment_row.snapshot -> 'preflight'
                     IS NOT DISTINCT FROM mutation_payload
+                AND (deployment_row.snapshot -> 'preflight')::TEXT
+                    IS NOT DISTINCT FROM mutation_payload::TEXT
             WHEN 'request_drain' THEN
                 deployment_row.phase = 'drain_requested'
                 AND mutation_payload = '{}'::JSONB
@@ -943,6 +1061,8 @@ BEGIN
                 AND deployment_row.phase = 'drained'
                 AND deployment_row.snapshot -> 'drain'
                     IS NOT DISTINCT FROM mutation_payload
+                AND (deployment_row.snapshot -> 'drain')::TEXT
+                    IS NOT DISTINCT FROM mutation_payload::TEXT
             WHEN 'begin_activation' THEN
                 deployment_row.phase = 'activation_applying'
                 AND mutation_payload = '{}'::JSONB
@@ -953,6 +1073,8 @@ BEGIN
                     = 'ready'
                 AND deployment_row.snapshot -> 'activation'
                     IS NOT DISTINCT FROM mutation_payload
+                AND (deployment_row.snapshot -> 'activation')::TEXT
+                    IS NOT DISTINCT FROM mutation_payload::TEXT
             WHEN 'record_retryable_failure' THEN
                 payload_key_count = 5
                 AND deployment_row.phase = 'runtime_pending'
@@ -1011,6 +1133,8 @@ BEGIN
                 AND deployment_row.phase = 'awaiting_gateway_ready'
                 AND deployment_row.snapshot -> 'panel_certificate'
                     IS NOT DISTINCT FROM mutation_payload
+                AND (deployment_row.snapshot -> 'panel_certificate')::TEXT
+                    IS NOT DISTINCT FROM mutation_payload::TEXT
             WHEN 'supersede' THEN
                 payload_key_count = 2
                 AND pg_catalog.octet_length(
@@ -1024,6 +1148,8 @@ BEGIN
                 AND deployment_row.phase = 'superseded'
                 AND deployment_row.snapshot #> '{phase,by}'
                     IS NOT DISTINCT FROM mutation_payload -> 'by'
+                AND (deployment_row.snapshot #> '{phase,by}')::TEXT
+                    IS NOT DISTINCT FROM (mutation_payload -> 'by')::TEXT
                 AND deployment_row.snapshot #>> '{phase,reason}'
                     IS NOT DISTINCT FROM mutation_payload ->> 'reason'
             WHEN 'cancel' THEN
@@ -1043,12 +1169,92 @@ BEGIN
         END;
 
         IF replay_exact THEN
+            mutation_clock := GREATEST(
+                pg_catalog.clock_timestamp(),
+                deployment_row.updated_at
+            );
+            IF mutation_kind NOT IN (
+                'record_retryable_failure',
+                'record_blocked_failure',
+                'supersede',
+                'cancel'
+            ) THEN
+                IF deployment_row.controller_id
+                        IS DISTINCT FROM expected_controller_id
+                    OR deployment_row.controller_fencing_token
+                        IS DISTINCT FROM expected_controller_fencing_token
+                    OR deployment_row.controller_acquired_at IS NULL
+                    OR deployment_row.controller_lease_expires_at IS NULL
+                    OR deployment_row.controller_lease_expires_at
+                        <= mutation_clock
+                    OR deployment_row.snapshot
+                        #>> '{controller_lease,controller_id}'
+                        IS DISTINCT FROM expected_controller_id
+                    OR deployment_row.snapshot
+                        #>> '{controller_lease,fencing_token}'
+                        IS DISTINCT FROM expected_controller_fencing_token::TEXT
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'RX001',
+                        MESSAGE = 'runtime_execution_mutation_replay_ownership_lost';
+                END IF;
+                IF NOT pg_catalog.pg_input_is_valid(
+                        deployment_row.snapshot
+                            #>> '{controller_lease,acquired_at}',
+                        'timestamp with time zone'
+                    )
+                    OR NOT pg_catalog.pg_input_is_valid(
+                        deployment_row.snapshot
+                            #>> '{controller_lease,expires_at}',
+                        'timestamp with time zone'
+                    )
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'RX004',
+                        MESSAGE = 'runtime_execution_mutation_replay_lease_invalid';
+                END IF;
+                IF (deployment_row.snapshot
+                        #>> '{controller_lease,acquired_at}')::TIMESTAMPTZ
+                        IS DISTINCT FROM deployment_row.controller_acquired_at
+                    OR (deployment_row.snapshot
+                        #>> '{controller_lease,expires_at}')::TIMESTAMPTZ
+                        IS DISTINCT FROM deployment_row.controller_lease_expires_at
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'RX004',
+                        MESSAGE = 'runtime_execution_mutation_replay_lease_invalid';
+                END IF;
+
+                authority_outcome := public.starring_runtime_lock_current_authority(
+                    deployment_row.activation_request_id,
+                    deployment_row.promotion_id,
+                    deployment_row.tenant_id,
+                    deployment_row.installation_id,
+                    deployment_row.installation_authority_revision,
+                    deployment_row.guild_id,
+                    deployment_row.ruleset_key,
+                    deployment_row.target_version,
+                    deployment_row.target_content_hash,
+                    deployment_row.binding_revision,
+                    deployment_row.binding_fingerprint
+                );
+                IF authority_outcome = 'active_mismatch' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'RX006',
+                        MESSAGE = 'runtime_execution_mutation_target_superseded';
+                ELSIF authority_outcome IS DISTINCT FROM 'exact' THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'RX003',
+                        MESSAGE = 'runtime_execution_mutation_authority_changed';
+                END IF;
+            END IF;
+
             outcome_name := 'replayed';
             previous_snapshot := deployment_row.snapshot;
             snapshot := deployment_row.snapshot;
             convergence_attempt_no :=
                 deployment_row.convergence_attempt_no;
-            mutated_at := deployment_row.updated_at;
+            mutated_at := mutation_clock;
             RETURN NEXT;
             RETURN;
         END IF;
@@ -1163,7 +1369,9 @@ BEGIN
                 'timestamp with time zone'
             )
             OR mutation_payload ->> 'checked_at'
-                !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+                !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            OR mutation_payload ->> 'checked_at'
+                ~ '[.][0-9]*000Z$'
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX002',
@@ -1171,10 +1379,16 @@ BEGIN
         END IF;
         IF mutation_payload -> 'target'
                 IS DISTINCT FROM deployment_row.snapshot -> 'target'
+            OR (mutation_payload -> 'target')::TEXT
+                IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
             OR mutation_payload ->> 'runtime_generation'
                 IS DISTINCT FROM expected_runtime_generation::TEXT
             OR mutation_payload -> 'observed_runtime'
                 IS DISTINCT FROM deployment_row.snapshot -> 'previous_runtime'
+            OR (mutation_payload -> 'observed_runtime')::TEXT
+                IS DISTINCT FROM (
+                    deployment_row.snapshot -> 'previous_runtime'
+                )::TEXT
             OR (mutation_payload ->> 'checked_at')::TIMESTAMPTZ
                 < deployment_row.requested_at
             OR (mutation_payload ->> 'checked_at')::TIMESTAMPTZ
@@ -1232,7 +1446,9 @@ BEGIN
                 'timestamp with time zone'
             )
             OR mutation_payload ->> 'drained_at'
-                !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+                !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            OR mutation_payload ->> 'drained_at'
+                ~ '[.][0-9]*000Z$'
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX002',
@@ -1240,6 +1456,10 @@ BEGIN
         END IF;
         IF mutation_payload -> 'previous_runtime'
                 IS DISTINCT FROM deployment_row.snapshot -> 'previous_runtime'
+            OR (mutation_payload -> 'previous_runtime')::TEXT
+                IS DISTINCT FROM (
+                    deployment_row.snapshot -> 'previous_runtime'
+                )::TEXT
             OR mutation_payload ->> 'target_runtime_generation'
                 IS DISTINCT FROM expected_runtime_generation::TEXT
             OR deployment_row.phase <> 'drain_requested'
@@ -1391,7 +1611,9 @@ BEGIN
                 'timestamp with time zone'
             )
             OR mutation_payload ->> 'activated_at'
-                !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+                !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            OR mutation_payload ->> 'activated_at'
+                ~ '[.][0-9]*000Z$'
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX002',
@@ -1401,6 +1623,8 @@ BEGIN
                 IS DISTINCT FROM deployment_row.activation_request_id
             OR mutation_payload -> 'target'
                 IS DISTINCT FROM deployment_row.snapshot -> 'target'
+            OR (mutation_payload -> 'target')::TEXT
+                IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
             OR mutation_payload ->> 'runtime_generation'
                 IS DISTINCT FROM expected_runtime_generation::TEXT
             OR mutation_payload ->> 'kind'
@@ -1464,6 +1688,52 @@ BEGIN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX002',
                 MESSAGE = 'runtime_execution_failure_invalid';
+        END IF;
+
+        IF pg_catalog.jsonb_typeof(
+                deployment_row.snapshot -> 'activation'
+            ) <> 'object'
+            OR NOT pg_catalog.pg_input_is_valid(
+                deployment_row.snapshot #>> '{activation,activated_at}',
+                'timestamp with time zone'
+            )
+            OR (
+                pg_catalog.jsonb_typeof(
+                    deployment_row.snapshot -> 'last_live_recovery'
+                ) IS DISTINCT FROM 'null'
+                AND (
+                    pg_catalog.jsonb_typeof(
+                        deployment_row.snapshot -> 'last_live_recovery'
+                    ) <> 'object'
+                    OR NOT pg_catalog.pg_input_is_valid(
+                        deployment_row.snapshot
+                            #>> '{last_live_recovery,recovered_at}',
+                        'timestamp with time zone'
+                    )
+                )
+            )
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX004',
+                MESSAGE = 'runtime_execution_failure_evidence_invalid';
+        END IF;
+
+        IF mutation_clock < (
+                deployment_row.snapshot #>> '{activation,activated_at}'
+            )::TIMESTAMPTZ
+            OR (
+                pg_catalog.jsonb_typeof(
+                    deployment_row.snapshot -> 'last_live_recovery'
+                ) = 'object'
+                AND mutation_clock < (
+                    deployment_row.snapshot
+                        #>> '{last_live_recovery,recovered_at}'
+                )::TIMESTAMPTZ
+            )
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RX005',
+                MESSAGE = 'runtime_execution_failure_evidence_not_ready';
         END IF;
 
         stable_message := CASE mutation_payload ->> 'kind'
@@ -1713,7 +1983,9 @@ BEGIN
                 'timestamp with time zone'
             )
             OR mutation_payload ->> 'reconciled_at'
-                !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+                !~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)([.][0-9]{3}|[.][0-9]{6}|[.][0-9]{9})?Z$'
+            OR mutation_payload ->> 'reconciled_at'
+                ~ '[.][0-9]*000Z$'
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'RX002',
@@ -1743,6 +2015,8 @@ BEGIN
             OR mutation_payload ->> 'report_digest' !~ '^[0-9a-f]{64}$'
             OR mutation_payload -> 'target'
                 IS DISTINCT FROM deployment_row.snapshot -> 'target'
+            OR (mutation_payload -> 'target')::TEXT
+                IS DISTINCT FROM (deployment_row.snapshot -> 'target')::TEXT
             OR mutation_payload ->> 'runtime_generation'
                 IS DISTINCT FROM expected_runtime_generation::TEXT
             OR mutation_payload ->> 'process_instance_id'
@@ -2078,6 +2352,29 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = 'RX001',
             MESSAGE = 'runtime_execution_mutation_ownership_lost';
+    END IF;
+
+    INSERT INTO public.runtime_execution_mutation_markers AS marker (
+        deployment_id,
+        mutation_revision,
+        mutation_kind,
+        mutation_payload
+    ) VALUES (
+        expected_deployment_id,
+        next_revision,
+        mutation_kind,
+        mutation_payload
+    )
+    ON CONFLICT (deployment_id) DO UPDATE
+    SET mutation_revision = EXCLUDED.mutation_revision,
+        mutation_kind = EXCLUDED.mutation_kind,
+        mutation_payload = EXCLUDED.mutation_payload
+    WHERE marker.mutation_revision < EXCLUDED.mutation_revision;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RX004',
+            MESSAGE = 'runtime_execution_mutation_marker_mismatch';
     END IF;
 
     outcome_name := 'applied';
@@ -3747,6 +4044,7 @@ BEGIN
         VALUES
             (pg_catalog.to_regclass('public.product_control_plane_identity')),
             (pg_catalog.to_regclass('public.runtime_deployments')),
+            (pg_catalog.to_regclass('public.runtime_execution_mutation_markers')),
             (pg_catalog.to_regclass('public.runtime_attestations')),
             (pg_catalog.to_regclass('public.runtime_serving_leases')),
             (pg_catalog.to_regclass('public.activation_requests')),
@@ -4051,9 +4349,9 @@ BEGIN
     INTO observed_count, observed_digest
     FROM manifest;
 
-    RETURN observed_count = 456
+    RETURN observed_count = 467
         AND observed_digest
-            = '1986ad043937afcd2964652041046cf2b2005c19d924176b12f9e8c93ded24a8';
+            = 'c353cc69c545bfdefdfaf17bb6cc55af1f0076961a1dd282c02e50043281d016';
 END;
 $function$;
 
@@ -4146,6 +4444,7 @@ BEGIN
     FOREACH relation_identity IN ARRAY ARRAY[
         'public.product_control_plane_identity',
         'public.runtime_deployments',
+        'public.runtime_execution_mutation_markers',
         'public.runtime_attestations',
         'public.runtime_serving_leases',
         'public.activation_requests',
@@ -4291,6 +4590,7 @@ BEGIN
         VALUES
             ('public.product_control_plane_identity'),
             ('public.runtime_deployments'),
+            ('public.runtime_execution_mutation_markers'),
             ('public.runtime_attestations'),
             ('public.runtime_serving_leases'),
             ('public.activation_requests'),
@@ -4352,7 +4652,7 @@ BEGIN
             (
                 'public.starring_runtime_execution_claim_next_v1(text,bigint)',
                 'expected_controller_id text, requested_lease_milliseconds bigint'::TEXT,
-                'TABLE(outcome_name text, previous_snapshot jsonb, snapshot jsonb, controller_id text, fencing_token bigint, convergence_attempt_no bigint, acquired_at timestamp with time zone, expires_at timestamp with time zone)'::TEXT,
+                'TABLE(outcome_name text, previous_snapshot jsonb, snapshot jsonb, controller_id text, fencing_token bigint, previous_convergence_attempt_no bigint, convergence_attempt_no bigint, acquired_at timestamp with time zone, expires_at timestamp with time zone)'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
                 TRUE,
@@ -4619,6 +4919,7 @@ BEGIN
         VALUES
             ('public.product_control_plane_identity'),
             ('public.runtime_deployments'),
+            ('public.runtime_execution_mutation_markers'),
             ('public.runtime_attestations'),
             ('public.runtime_serving_leases'),
             ('public.activation_requests'),
@@ -4688,7 +4989,7 @@ BEGIN
             (
                 'public.starring_runtime_execution_claim_next_v1(text,bigint)',
                 'expected_controller_id text, requested_lease_milliseconds bigint'::TEXT,
-                'TABLE(outcome_name text, previous_snapshot jsonb, snapshot jsonb, controller_id text, fencing_token bigint, convergence_attempt_no bigint, acquired_at timestamp with time zone, expires_at timestamp with time zone)'::TEXT,
+                'TABLE(outcome_name text, previous_snapshot jsonb, snapshot jsonb, controller_id text, fencing_token bigint, previous_convergence_attempt_no bigint, convergence_attempt_no bigint, acquired_at timestamp with time zone, expires_at timestamp with time zone)'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
                 TRUE,
@@ -4813,7 +5114,7 @@ BEGIN
                 'boolean'::TEXT,
                 'plpgsql'::TEXT,
                 TRUE,
-                '3840097f9731faa6f41228a817cde7e1015b0b1df1dde2714948cf9f53da332e'::TEXT
+                '8559a5ee0f57d9fc1d7f009fdc8d788edd162d4ae86f60e6f2f93488e135ff1d'::TEXT
             )
     ) AS expected(
         identity,

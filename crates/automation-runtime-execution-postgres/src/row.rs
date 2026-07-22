@@ -27,6 +27,13 @@ pub(crate) struct RuntimeExecutionOperationRowV1 {
     expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct RuntimeClaimOperationRowV1 {
+    #[sqlx(flatten)]
+    execution: RuntimeExecutionOperationRowV1,
+    previous_convergence_attempt_no: Option<i64>,
+}
+
 pub(crate) struct DecodedRuntimeExecutionRowV1 {
     pub(crate) outcome: RuntimeExecutionOutcomeV1,
     pub(crate) previous: RuntimeDeployment,
@@ -36,6 +43,28 @@ pub(crate) struct DecodedRuntimeExecutionRowV1 {
     pub(crate) convergence_attempt: NonZeroU32,
     pub(crate) acquired_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
+}
+
+pub(crate) struct DecodedRuntimeClaimRowV1 {
+    pub(crate) execution: DecodedRuntimeExecutionRowV1,
+    pub(crate) previous_convergence_attempt: u32,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct RuntimeMutationOperationRowV1 {
+    outcome_name: Option<String>,
+    previous_snapshot: Option<Json<Value>>,
+    snapshot: Option<Json<Value>>,
+    convergence_attempt_no: Option<i64>,
+    mutated_at: Option<DateTime<Utc>>,
+}
+
+pub(crate) struct DecodedRuntimeMutationRowV1 {
+    pub(crate) outcome: RuntimeExecutionOutcomeV1,
+    pub(crate) previous: RuntimeDeployment,
+    pub(crate) current: RuntimeDeployment,
+    pub(crate) convergence_attempt: NonZeroU32,
+    pub(crate) mutated_at: DateTime<Utc>,
 }
 
 impl RuntimeExecutionOperationRowV1 {
@@ -75,6 +104,45 @@ impl RuntimeExecutionOperationRowV1 {
     }
 }
 
+impl RuntimeClaimOperationRowV1 {
+    pub(crate) fn decode(
+        self,
+    ) -> Result<DecodedRuntimeClaimRowV1, RuntimeExecutionPersistenceErrorV1> {
+        let invalid = || RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt;
+        Ok(DecodedRuntimeClaimRowV1 {
+            execution: self.execution.decode()?,
+            previous_convergence_attempt: nonnegative_u32(
+                self.previous_convergence_attempt_no.ok_or_else(invalid)?,
+            )
+            .ok_or_else(invalid)?,
+        })
+    }
+}
+
+impl RuntimeMutationOperationRowV1 {
+    pub(crate) fn decode(
+        self,
+    ) -> Result<DecodedRuntimeMutationRowV1, RuntimeExecutionPersistenceErrorV1> {
+        let invalid = || RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt;
+        Ok(DecodedRuntimeMutationRowV1 {
+            outcome: decode_outcome(self.outcome_name.as_deref()).ok_or_else(invalid)?,
+            previous: decode_deployment(self.previous_snapshot.ok_or_else(invalid)?.0)?,
+            current: decode_deployment(self.snapshot.ok_or_else(invalid)?.0)?,
+            convergence_attempt: positive_u32(self.convergence_attempt_no.ok_or_else(invalid)?)
+                .ok_or_else(invalid)?,
+            mutated_at: self.mutated_at.ok_or_else(invalid)?,
+        })
+    }
+}
+
+fn decode_outcome(value: Option<&str>) -> Option<RuntimeExecutionOutcomeV1> {
+    match value {
+        Some("applied") => Some(RuntimeExecutionOutcomeV1::Applied),
+        Some("replayed") => Some(RuntimeExecutionOutcomeV1::Replayed),
+        _ => None,
+    }
+}
+
 fn decode_deployment(
     value: Value,
 ) -> Result<RuntimeDeployment, RuntimeExecutionPersistenceErrorV1> {
@@ -90,6 +158,10 @@ fn positive_u64(value: i64) -> Option<u64> {
 
 fn positive_u32(value: i64) -> Option<NonZeroU32> {
     u32::try_from(value).ok().and_then(NonZeroU32::new)
+}
+
+fn nonnegative_u32(value: i64) -> Option<u32> {
+    u32::try_from(value).ok()
 }
 
 #[cfg(test)]
@@ -150,6 +222,25 @@ mod tests {
         }
     }
 
+    fn mutation_row() -> RuntimeMutationOperationRowV1 {
+        RuntimeMutationOperationRowV1 {
+            outcome_name: Some("applied".to_string()),
+            previous_snapshot: Some(Json(snapshot())),
+            snapshot: Some(Json(snapshot())),
+            convergence_attempt_no: Some(1),
+            mutated_at: DateTime::parse_from_rfc3339("2026-07-22T00:00:02Z")
+                .ok()
+                .map(|value| value.with_timezone(&Utc)),
+        }
+    }
+
+    fn claim_row() -> RuntimeClaimOperationRowV1 {
+        RuntimeClaimOperationRowV1 {
+            execution: row(),
+            previous_convergence_attempt_no: Some(0),
+        }
+    }
+
     #[test]
     fn row_decoder_accepts_only_closed_outcomes_and_positive_evidence() {
         assert!(row().decode().is_ok());
@@ -199,6 +290,59 @@ mod tests {
         inverted.expires_at = inverted.acquired_at;
         assert_eq!(
             inverted.decode().err(),
+            Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+        );
+    }
+
+    #[test]
+    fn claim_row_decoder_accepts_zero_and_rejects_invalid_predecessors() {
+        let decoded = claim_row().decode().unwrap();
+        assert_eq!(decoded.previous_convergence_attempt, 0);
+        assert_eq!(decoded.execution.convergence_attempt, NonZeroU32::MIN);
+
+        for previous_attempt in [None, Some(-1), Some(i64::from(u32::MAX) + 1)] {
+            let mut candidate = claim_row();
+            candidate.previous_convergence_attempt_no = previous_attempt;
+            assert_eq!(
+                candidate.decode().err(),
+                Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_row_decoder_is_closed_and_restores_both_snapshots() {
+        let decoded = mutation_row().decode().unwrap();
+        assert_eq!(decoded.outcome, RuntimeExecutionOutcomeV1::Applied);
+        assert_eq!(decoded.convergence_attempt, NonZeroU32::MIN);
+        assert_eq!(decoded.previous.snapshot(), decoded.current.snapshot());
+
+        for outcome in [None, Some("APPLIED"), Some("unknown")] {
+            let mut candidate = mutation_row();
+            candidate.outcome_name = outcome.map(str::to_string);
+            assert_eq!(
+                candidate.decode().err(),
+                Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            );
+        }
+        for attempt in [None, Some(-1), Some(0), Some(i64::from(u32::MAX) + 1)] {
+            let mut candidate = mutation_row();
+            candidate.convergence_attempt_no = attempt;
+            assert_eq!(
+                candidate.decode().err(),
+                Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+            );
+        }
+        let mut malformed_previous = mutation_row();
+        malformed_previous.previous_snapshot.as_mut().unwrap().0["revision"] = json!(0);
+        assert_eq!(
+            malformed_previous.decode().err(),
+            Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
+        );
+        let mut missing_clock = mutation_row();
+        missing_clock.mutated_at = None;
+        assert_eq!(
+            missing_clock.decode().err(),
             Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt)
         );
     }

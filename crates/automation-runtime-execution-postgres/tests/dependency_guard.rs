@@ -101,6 +101,39 @@ fn adapter_contract_is_function_only_and_manifest_is_isolated() {
 }
 
 #[test]
+fn mutation_operation_uses_only_the_scoped_function_and_verified_transaction_path() {
+    let query = include_str!("../src/query.rs");
+    let store = include_str!("../src/store.rs");
+    assert!(query.contains("starring_runtime_execution_mutate_v1"));
+    assert!(query.contains("$10"));
+    assert!(store.contains("pub async fn mutate("));
+    assert!(store.contains("begin_execution_mutation_transaction"));
+    assert!(store.contains("verify_runtime_execution_binding_v1"));
+    assert!(store.contains("map_mutation_commit_error"));
+    assert!(store.contains("RuntimeMutationOperationRowV1"));
+    for forbidden in [
+        "INSERT INTO public.runtime_deployments",
+        "UPDATE public.runtime_deployments",
+        "DELETE FROM public.runtime_deployments",
+    ] {
+        assert!(!store.contains(forbidden));
+    }
+}
+
+#[test]
+fn mutation_replay_marker_is_execution_owned_and_preserves_shared_schema() {
+    let migration =
+        include_str!("../../../migrations/202607220030_scope_runtime_execution_database.sql");
+    assert!(migration.contains("CREATE TABLE public.runtime_execution_mutation_markers"));
+    assert!(migration.contains("FROM public.runtime_execution_mutation_markers AS marker"));
+    assert!(migration.contains("INSERT INTO public.runtime_execution_mutation_markers AS marker"));
+    assert!(!migration.contains("last_execution_mutation_revision"));
+    assert!(!migration.contains("last_execution_mutation_kind"));
+    assert!(!migration.contains("last_execution_mutation_payload"));
+    assert!(!migration.contains("runtime_deployments_active_controller_index"));
+}
+
+#[test]
 fn adapter_exposes_no_runtime_port_implementation_yet() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");

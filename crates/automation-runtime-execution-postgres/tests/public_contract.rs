@@ -2,10 +2,18 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use automation_runtime_controller::RuntimeConvergenceErrorClassV1;
+use automation_runtime_controller::RuntimeMutationRequestV1;
 use automation_runtime_execution_postgres::{
-    RuntimeExecutionDatabaseExpectationV1, RuntimeExecutionDatabaseTimeoutsV1,
-    RuntimeExecutionPersistenceErrorV1,
+    PostgresRuntimeExecutionV1, RuntimeExecutionDatabaseExpectationV1,
+    RuntimeExecutionDatabaseTimeoutsV1, RuntimeExecutionPersistenceErrorV1,
 };
+
+fn assert_mutate_signature(
+    adapter: &PostgresRuntimeExecutionV1,
+    request: RuntimeMutationRequestV1,
+) {
+    std::mem::drop(adapter.mutate(request));
+}
 
 #[test]
 fn persistence_error_codes_and_classes_are_stable_and_unique() {
@@ -151,4 +159,9 @@ fn database_expectation_accepts_only_canonical_authority() {
             Err(RuntimeExecutionPersistenceErrorV1::DatabaseAuthorityMismatch)
         );
     }
+}
+
+#[test]
+fn verified_adapter_exposes_the_inherent_mutation_operation() {
+    let _ = assert_mutate_signature;
 }
