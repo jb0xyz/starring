@@ -39,6 +39,7 @@ fn pure_crates_do_not_depend_on_runtime_panel_postgres() {
 #[test]
 fn adapter_sources_contain_no_comments() {
     let sources = [
+        include_str!("../src/adapter.rs"),
         include_str!("../src/authority.rs"),
         include_str!("../src/contract.rs"),
         include_str!("../src/database.rs"),
@@ -56,6 +57,22 @@ fn adapter_sources_contain_no_comments() {
             assert!(!trimmed.starts_with("/*"));
             assert!(!trimmed.starts_with('*'));
         }
+    }
+}
+
+#[test]
+fn verified_adapter_keeps_the_pool_private() {
+    let adapter = include_str!("../src/adapter.rs");
+    for required in [
+        "PostgresRuntimePanelV1",
+        "verify_runtime_panel_database_with_timeouts_v1",
+        "PostgresFencedStrictPanelStoreV1::claim_with_timeouts",
+        "PostgresFencedStrictPanelStoreV1::claim_with_session_id_and_timeouts",
+    ] {
+        assert!(adapter.contains(required), "{required}");
+    }
+    for forbidden in ["pub fn pool", "pub fn connection", "pub fn connect_options"] {
+        assert!(!adapter.contains(forbidden), "{forbidden}");
     }
 }
 

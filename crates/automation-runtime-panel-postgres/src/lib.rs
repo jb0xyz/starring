@@ -1,3 +1,4 @@
+mod adapter;
 mod authority;
 mod contract;
 mod database;
@@ -7,6 +8,7 @@ mod row;
 mod session;
 mod store;
 
+pub use adapter::PostgresRuntimePanelV1;
 pub use database::{
     verify_runtime_panel_database_v1, verify_runtime_panel_database_with_timeouts_v1,
     RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseReadinessV1,
