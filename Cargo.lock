@@ -575,6 +575,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-runtime-worker"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "automation-state"
 version = "0.1.0"
 dependencies = [
