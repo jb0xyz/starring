@@ -48,6 +48,7 @@ members = [
     "tools/interaction-smoke",
     "tools/design-harness",
     "tools/starring-api",
+    "tools/starring-runtime",
 ]
 resolver = "2"
 
