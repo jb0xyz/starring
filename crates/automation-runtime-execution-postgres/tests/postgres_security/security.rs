@@ -177,7 +177,7 @@ async fn assert_exact_executor_capabilities(
         .fetch_one(owner_pool)
         .await
         .unwrap();
-    assert_eq!(direct_execute_count, 9);
+    assert_eq!(direct_execute_count, EXECUTOR_FUNCTIONS.len() as i64);
     assert_eq!(grantable_execute_count, 0);
     assert_eq!(public_execute_count, 0);
 

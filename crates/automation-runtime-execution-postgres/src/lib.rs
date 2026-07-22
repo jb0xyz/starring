@@ -5,6 +5,7 @@ mod contract;
 mod controller;
 mod database;
 mod error;
+mod gateway_owner;
 mod mutation;
 mod observation;
 mod proof;
@@ -29,6 +30,9 @@ pub use database::{
     DEFAULT_RUNTIME_EXECUTION_STATEMENT_TIMEOUT, MAX_RUNTIME_EXECUTION_DATABASE_TIMEOUT,
 };
 pub use error::RuntimeExecutionPersistenceErrorV1;
+pub use gateway_owner::{
+    MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION, MIN_RUNTIME_GATEWAY_OWNER_LEASE_DURATION,
+};
 pub use store::{
     PostgresRuntimeExecutionV1, MAX_RUNTIME_EXECUTION_LEASE_DURATION,
     MIN_RUNTIME_EXECUTION_LEASE_DURATION,

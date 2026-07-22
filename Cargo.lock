@@ -485,6 +485,7 @@ version = "0.1.0"
 dependencies = [
  "automation-runtime-controller",
  "automation-runtime-convergence",
+ "automation-runtime-worker",
  "chrono",
  "serde_json",
  "sqlx",

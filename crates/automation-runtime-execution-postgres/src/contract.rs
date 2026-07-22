@@ -12,7 +12,7 @@ pub(crate) const FOUNDATIONAL_CAPABILITY_IDENTITIES_V1: [&str; 2] = [
     "public.starring_runtime_execution_database_identity_v1()",
 ];
 
-pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 7] = [
+pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 11] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
@@ -20,16 +20,20 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 7] = [
     "public.starring_runtime_execution_certify_commit_v1(text,text,text,bigint,text,bigint,bigint,bigint,jsonb,text,text,text,bigint,timestamp with time zone,jsonb,text,jsonb,text)",
     "public.starring_runtime_execution_recover_stale_live_v1()",
     "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",
+    "public.starring_runtime_gateway_owner_observe_v1(text)",
+    "public.starring_runtime_gateway_owner_acquire_v1(text,text,text,bigint)",
+    "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
+    "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("bcf5881f5b3ae919a3d6e29570b270dba1777627e4c16e3fa058750e2786a311");
+    Some("003baab6fe5443a3bcf6dc6356cd5595434ac68c507a56151a65874397432ff1");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
         .iter()
         .chain(OPERATION_CAPABILITY_IDENTITIES_V1.iter());
-    if capabilities.clone().count() != 9 {
+    if capabilities.clone().count() != 13 {
         return false;
     }
     for (index, capability) in capabilities.clone().enumerate() {

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 automation-runtime-controller = { path = "../automation-runtime-controller" }
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+automation-runtime-worker = { path = "../automation-runtime-worker" }
 chrono = "0.4"
 serde_json = { workspace = true }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "derive", "macros", "migrate"] }

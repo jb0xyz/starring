@@ -29,7 +29,12 @@ fn rust_sources(directory: &Path) -> Vec<String> {
 fn adapter_dependency_surface_is_narrow() {
     let manifest = include_str!("../Cargo.toml");
     let regular = regular_dependencies(manifest);
-    for required in ["automation-runtime-controller", "sqlx", "tokio"] {
+    for required in [
+        "automation-runtime-controller",
+        "automation-runtime-worker",
+        "sqlx",
+        "tokio",
+    ] {
         assert!(regular.contains(required), "missing dependency: {required}");
     }
     for forbidden in [
@@ -85,6 +90,10 @@ fn adapter_contract_is_function_only_and_manifest_is_isolated() {
         "starring_runtime_execution_certify_commit_v1",
         "starring_runtime_execution_recover_stale_live_v1",
         "starring_runtime_observe_previous_serving_v1",
+        "starring_runtime_gateway_owner_observe_v1",
+        "starring_runtime_gateway_owner_acquire_v1",
+        "starring_runtime_gateway_owner_renew_v1",
+        "starring_runtime_gateway_owner_release_v1",
     ] {
         assert!(contract.contains(capability));
     }
@@ -189,12 +198,13 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_only_execution_and_observation_ports() {
+fn adapter_exposes_only_execution_observation_and_gateway_owner_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
     for required in [
         "impl RuntimeExecutionConvergencePort",
         "impl RuntimePreviousServingObservationPort",
+        "impl RuntimeGatewayOwnerLeasePortV1",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -203,6 +213,40 @@ fn adapter_exposes_only_execution_and_observation_ports() {
     assert!(source.contains("execute_observe_previous_serving_v1"));
     assert!(source.contains("execute_recover_next_stale_live_v1"));
     assert!(source.contains("!matches!(self, Self::Observe { .. })"));
+}
+
+#[test]
+fn gateway_owner_operations_use_only_scoped_functions_and_verified_transactions() {
+    let gateway_owner = include_str!("../src/gateway_owner/mod.rs");
+    let query = include_str!("../src/gateway_owner/query.rs");
+    for capability in [
+        "starring_runtime_gateway_owner_observe_v1",
+        "starring_runtime_gateway_owner_acquire_v1",
+        "starring_runtime_gateway_owner_renew_v1",
+        "starring_runtime_gateway_owner_release_v1",
+    ] {
+        assert!(query.contains(capability));
+    }
+    for required in [
+        "begin_execution_mutation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "accept_gateway_owner_observation_v1",
+        "accept_gateway_owner_acquire_v1",
+        "accept_gateway_owner_renew_v1",
+        "accept_gateway_owner_release_v1",
+        "DefinitelyNotApplied",
+        "OutcomeUnknown",
+    ] {
+        assert!(gateway_owner.contains(required));
+    }
+    for forbidden in [
+        "runtime_gateway_owner_slots",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+    ] {
+        assert!(!gateway_owner.contains(forbidden));
+    }
 }
 
 #[test]
