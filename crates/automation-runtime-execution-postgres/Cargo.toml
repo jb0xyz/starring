@@ -1,0 +1,16 @@
+[package]
+name = "automation-runtime-execution-postgres"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-runtime-controller = { path = "../automation-runtime-controller" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+chrono = "0.4"
+serde_json = { workspace = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "derive", "macros", "migrate"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

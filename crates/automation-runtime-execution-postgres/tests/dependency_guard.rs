@@ -1,0 +1,197 @@
+use std::fs;
+use std::path::Path;
+
+fn regular_dependencies(manifest: &str) -> &str {
+    manifest
+        .split("[dev-dependencies]")
+        .next()
+        .unwrap_or(manifest)
+}
+
+fn rust_sources(directory: &Path) -> Vec<String> {
+    let mut sources = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>();
+    sources.sort_unstable();
+    sources
+}
+
+#[test]
+fn adapter_dependency_surface_is_narrow() {
+    let manifest = include_str!("../Cargo.toml");
+    let regular = regular_dependencies(manifest);
+    for required in ["automation-runtime-controller", "sqlx", "tokio"] {
+        assert!(regular.contains(required), "missing dependency: {required}");
+    }
+    for forbidden in [
+        "automation-runtime =",
+        "automation-runtime-convergence-postgres",
+        "automation-runtime-serving-postgres",
+        "automation-runtime-interaction-postgres",
+        "automation-runtime-panel-postgres",
+        "axum",
+        "reqwest",
+        "rusqlite",
+        "twilight",
+    ] {
+        assert!(
+            !regular.contains(forbidden),
+            "forbidden dependency: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn pure_controller_does_not_depend_on_the_postgres_adapter() {
+    let manifest = include_str!("../../automation-runtime-controller/Cargo.toml");
+    assert!(!regular_dependencies(manifest).contains("automation-runtime-execution-postgres"));
+}
+
+#[test]
+fn adapter_sources_contain_no_comments() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = rust_sources(&root.join("src"));
+    sources.push(include_str!("../build.rs").to_string());
+    for source in sources {
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            assert!(!trimmed.starts_with("//"));
+            assert!(!trimmed.starts_with("/*"));
+            assert!(!trimmed.starts_with('*'));
+            assert!(!trimmed.ends_with("*/"));
+        }
+    }
+}
+
+#[test]
+fn adapter_contract_is_function_only_and_manifest_is_isolated() {
+    let contract = include_str!("../src/contract.rs");
+    for capability in [
+        "starring_runtime_execution_database_readiness_v1",
+        "starring_runtime_execution_database_identity_v1",
+        "starring_runtime_execution_claim_next_v1",
+        "starring_runtime_execution_renew_v1",
+        "starring_runtime_execution_mutate_v1",
+        "starring_runtime_execution_certify_prepare_v1",
+        "starring_runtime_execution_certify_commit_v1",
+        "starring_runtime_execution_recover_stale_live_v1",
+        "starring_runtime_observe_previous_serving_v1",
+    ] {
+        assert!(contract.contains(capability));
+    }
+    for forbidden in [
+        "runtime_deployments",
+        "runtime_attestations",
+        "runtime_serving_leases",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "TRUNCATE ",
+        "CREATE ",
+        "ALTER ",
+        "DROP ",
+    ] {
+        assert!(!contract.contains(forbidden), "raw SQL edge: {forbidden}");
+    }
+    assert!(contract.contains("FOUNDATIONAL_CAPABILITY_IDENTITIES_V1"));
+    assert!(contract.contains("OPERATION_CAPABILITY_IDENTITIES_V1"));
+}
+
+#[test]
+fn adapter_exposes_no_runtime_port_implementation_yet() {
+    let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let source = sources.join("\n");
+    for forbidden in [
+        "impl RuntimeExecutionConvergencePort",
+        "impl RuntimePreviousServingObservationPort",
+        "impl RuntimeServingLeasePort",
+    ] {
+        assert!(!source.contains(forbidden), "premature port: {forbidden}");
+    }
+}
+
+#[test]
+fn adapter_cannot_be_constructed_without_readiness_verification() {
+    let store = include_str!("../src/store.rs");
+    let constructor = store.find("pub async fn connect_verified(").unwrap();
+    let verification = store[constructor..]
+        .find("verify_runtime_execution_database_with_timeouts_v1")
+        .unwrap();
+    let construction = store[constructor..].find("Ok(Self {").unwrap();
+    assert!(verification < construction);
+    for forbidden in [
+        "pub fn new(",
+        "pub fn from_pool(",
+        "pub fn pool(",
+        "pub fn pool_mut(",
+        "pub pool:",
+    ] {
+        assert!(
+            !store.contains(forbidden),
+            "unverified surface: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn readiness_uses_one_absolute_deadline_and_cancellation_fencing() {
+    let database = include_str!("../src/database.rs");
+    let deadline = database
+        .find("let deadline = tokio::time::Instant::now()")
+        .unwrap();
+    let acquire = database.find("pool.acquire()").unwrap();
+    let operation = database
+        .find("verify_runtime_execution_database_on_connection_v1")
+        .unwrap();
+    assert!(deadline < acquire && acquire < operation);
+    assert!(database.contains("REPEATABLE READ READ ONLY"));
+    assert!(database.contains("DATABASE_READINESS_DEFINITION_QUERY"));
+    assert!(database.contains("RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1"));
+    assert!(database.contains("DATABASE_READINESS_QUERY"));
+    let guard = include_str!("../src/connection.rs");
+    assert!(guard.contains("impl Drop for ExecutionConnectionGuardV1"));
+    assert!(guard.contains("drop(connection.detach())"));
+    assert!(guard.contains("release_to_pool"));
+}
+
+#[test]
+fn readiness_transaction_is_bounded_and_canonical() {
+    let database = include_str!("../src/database.rs");
+    let statement = database
+        .find("pg_catalog.set_config('statement_timeout'")
+        .unwrap();
+    let lock = database
+        .find("pg_catalog.set_config('lock_timeout'")
+        .unwrap();
+    let idle = database
+        .find("pg_catalog.set_config('idle_in_transaction_session_timeout'")
+        .unwrap();
+    let search_path = database
+        .find("pg_catalog.set_config('search_path'")
+        .unwrap();
+    assert!(statement < lock && lock < idle && idle < search_path);
+    assert!(database.contains("lock_timeout >= statement_timeout"));
+}
+
+#[test]
+fn errors_are_redacted_at_the_adapter_boundary() {
+    let sources = [
+        include_str!("../src/database.rs"),
+        include_str!("../src/error.rs"),
+        include_str!("../src/store.rs"),
+    ];
+    for source in sources {
+        for leak in [
+            "error.to_string()",
+            "format!(\"{error}",
+            "format!(\"{error:?}",
+            "database.message()",
+            "database.detail()",
+        ] {
+            assert!(!source.contains(leak), "database detail leak: {leak}");
+        }
+    }
+}
