@@ -255,6 +255,13 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         DeploymentMutationV1::RequestDrain,
     )
     .await;
+    let disconnected = adapter
+        .mark_serving_disconnected(MarkServingDisconnectedV1 {
+            identity: current_serving.identity.clone(),
+        })
+        .await
+        .unwrap();
+    let transition_at = disconnected.last_heartbeat_at;
     revision = mutate_scoped(
         adapter,
         next_scope(),
@@ -265,7 +272,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: Some(previous_runtime),
             target_runtime_generation: next_generation,
-            drained_at: claim.acquired_at,
+            drained_at: transition_at,
         }),
     )
     .await;
@@ -291,7 +298,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
             target: target(),
             runtime_generation: next_generation,
             kind: ActivationOutcomeKindV1::AlreadyActive,
-            activated_at: claim.acquired_at,
+            activated_at: transition_at,
         }),
     )
     .await;
@@ -332,7 +339,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
             stale_message_cleanup_pending_count: 0,
             orphan_message_cleanup_pending_count: 0,
             reposted_old_message_cleanup_pending_count: 0,
-            reconciled_at: claim.acquired_at,
+            reconciled_at: transition_at,
         }),
     )
     .await;
@@ -347,7 +354,7 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
             runtime_generation: next_generation,
             process_instance_id: next_process,
             kind: GatewayReadyKindV1::DiscordReady,
-            ready_at: claim.acquired_at,
+            ready_at: transition_at,
         },
         metadata: LiveMetadataV1 {
             runtime_build_revision: RuntimeBuildRevisionV1::parse("test-build-next").unwrap(),
@@ -356,12 +363,6 @@ async fn assert_recovery_and_newer_certification_do_not_deadlock(
         },
         serving_lease_for: Duration::from_secs(45),
     };
-    let disconnected = adapter
-        .mark_serving_disconnected(MarkServingDisconnectedV1 {
-            identity: current_serving.identity.clone(),
-        })
-        .await
-        .unwrap();
     let recovery = RecoverStaleLiveV1 {
         identity: disconnected.identity,
         expected_deployment_revision: current_live.snapshot.revision,

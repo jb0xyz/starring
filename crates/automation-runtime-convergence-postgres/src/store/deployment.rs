@@ -14,7 +14,8 @@ use crate::model::{
 };
 use crate::prepare::prepare_requested_deployment_v1;
 use crate::row::{
-    runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, DEPLOYMENT_COLUMNS,
+    runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, ServingLeaseRow,
+    DEPLOYMENT_COLUMNS, SERVING_LEASE_COLUMNS,
 };
 use crate::{PostgresRuntimeConvergence, RuntimeConvergenceStoreError};
 
@@ -474,7 +475,20 @@ impl PostgresRuntimeConvergence {
             return Ok(MutationReceiptV1 { outcome, snapshot });
         }
         Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
-        let now = Self::mutation_now(&mut transaction).await?;
+        let now = match (&mutation, persisted.deployment.phase()) {
+            (
+                DeploymentMutationV1::AcceptDrain(attestation),
+                RuntimeDeploymentPhaseV1::DrainRequested,
+            ) => {
+                Self::assert_accept_drain_previous_serving(
+                    &mut transaction,
+                    &persisted,
+                    attestation.drained_at,
+                )
+                .await?
+            }
+            _ => Self::mutation_now(&mut transaction).await?,
+        };
         let convergence_attempt = persisted
             .exact_convergence_attempt()?
             .started()
@@ -657,6 +671,106 @@ impl PostgresRuntimeConvergence {
             }
             _ => Ok(()),
         }
+    }
+
+    async fn assert_accept_drain_previous_serving(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        persisted: &PersistedDeployment,
+        drained_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, RuntimeConvergenceStoreError> {
+        let snapshot = persisted.deployment.snapshot();
+        Self::lock_serving_slot(
+            transaction,
+            &snapshot.target.guild_id.to_string(),
+            snapshot.target.ruleset_key.as_str(),
+        )
+        .await?;
+        let serving = sqlx::query_as::<_, ServingLeaseRow>(&format!(
+            "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
+             WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"
+        ))
+        .bind(snapshot.target.guild_id.to_string())
+        .bind(snapshot.target.ruleset_key.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        let now = Self::mutation_now(transaction).await?;
+        let closure = match (snapshot.previous_runtime.as_ref(), serving.as_ref()) {
+            (None, None) => DrainClosureV1::Absent,
+            (None, Some(serving)) => {
+                validate_drain_serving_state(serving, now)?;
+                DrainClosureV1::Closed(
+                    serving_closure_boundary(serving, now)
+                        .ok_or(RuntimeConvergenceStoreError::ServingLeaseConflict)?,
+                )
+            }
+            (Some(_), None) => return Err(RuntimeConvergenceStoreError::ServingLeaseConflict),
+            (Some(previous), Some(serving)) => {
+                validate_drain_serving_state(serving, now)?;
+                let exact = serving.tenant_id == snapshot.identity.tenant_id.as_str()
+                    && serving.installation_id == snapshot.identity.installation_id.as_str()
+                    && serving.deployment_id != snapshot.identity.deployment_id.as_str()
+                    && serving.guild_id == previous.target.guild_id.to_string()
+                    && serving.ruleset_key == previous.target.ruleset_key.as_str()
+                    && serving.target_version == i64::from(previous.target.version.get())
+                    && serving.target_content_hash == previous.target.content_hash.to_hex()
+                    && serving.binding_revision
+                        == runtime_i64(previous.target.binding_revision.get())?
+                    && serving.binding_fingerprint == previous.target.binding_fingerprint.as_str()
+                    && serving.runtime_generation
+                        == runtime_i64(previous.runtime_generation.get())?
+                    && serving.process_instance_id == previous.process_instance_id.as_str()
+                    && serving.acquired_at <= snapshot.requested_at;
+                let boundary = serving_closure_boundary(serving, now)
+                    .filter(|boundary| exact && *boundary >= snapshot.requested_at)
+                    .ok_or(RuntimeConvergenceStoreError::ServingLeaseConflict)?;
+                DrainClosureV1::Closed(boundary)
+            }
+        };
+        match closure {
+            DrainClosureV1::Closed(boundary) if drained_at < boundary => Err(
+                automation_runtime_convergence::RuntimeDeploymentError::AttestationTimeRegression
+                    .into(),
+            ),
+            DrainClosureV1::Absent | DrainClosureV1::Closed(_) => Ok(now),
+        }
+    }
+}
+
+enum DrainClosureV1 {
+    Absent,
+    Closed(chrono::DateTime<chrono::Utc>),
+}
+
+fn serving_closure_boundary(
+    serving: &ServingLeaseRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !serving.connected {
+        Some(serving.last_heartbeat_at)
+    } else if serving.expires_at <= now {
+        Some(serving.expires_at)
+    } else {
+        None
+    }
+}
+
+fn validate_drain_serving_state(
+    serving: &ServingLeaseRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    serving.validate()?;
+    let temporal_state_valid = if serving.connected {
+        serving.last_heartbeat_at < serving.expires_at && serving.last_heartbeat_at <= now
+    } else {
+        serving.last_heartbeat_at == serving.expires_at && serving.expires_at <= now
+    };
+    if serving.acquired_at <= now && temporal_state_valid {
+        Ok(())
+    } else {
+        Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "accept drain serving lease projections",
+        ))
     }
 }
 

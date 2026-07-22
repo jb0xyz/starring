@@ -58,4 +58,5 @@ include!("postgres_convergence/convergence_attempt.rs");
 include!("postgres_convergence/lifecycle.rs");
 include!("postgres_convergence/hydration.rs");
 include!("postgres_convergence/previous_serving.rs");
+include!("postgres_convergence/accept_drain.rs");
 include!("postgres_convergence/support.rs");
