@@ -91,8 +91,13 @@ pub use v2_evidence::{
     RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,
 };
 pub use v2_gateway::{
-    RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseReceiptV1,
-    RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
+    RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
+    RuntimeGatewayOwnerLeaseDurationV1, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
+    RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2, RuntimeObserveGatewayOwnerLeaseV1,
+    RuntimeObservedGatewayOwnerLeaseV1, RuntimeReleaseGatewayOwnerLeaseOutcomeV1,
+    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseOutcomeV1,
+    RuntimeRenewGatewayOwnerLeaseV1,
 };
 pub use v2_identity::{
     RuntimeBarrierIdV1, RuntimeCertificationOperationIdV2, RuntimeDrainIntentIdV2,

@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::time::Duration;
 
 use automation_runtime_convergence::ProcessInstanceId;
 use chrono::{DateTime, Utc};
@@ -19,6 +20,113 @@ pub struct RuntimeGatewayOwnerLeaseReceiptV1 {
     pub owner_revision: NonZeroU64,
     pub database_now: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+impl RuntimeGatewayOwnerLeaseReceiptV1 {
+    pub fn database_lease_duration(&self) -> Option<Duration> {
+        let duration = self
+            .expires_at
+            .signed_duration_since(self.database_now)
+            .to_std()
+            .ok()?;
+        if duration.is_zero() {
+            None
+        } else {
+            Some(duration)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RuntimeGatewayOwnerLeaseDurationV1(Duration);
+
+impl RuntimeGatewayOwnerLeaseDurationV1 {
+    pub fn new(value: Duration) -> Option<Self> {
+        if value.is_zero() {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeAcquireGatewayOwnerLeaseV1 {
+    pub gateway_shard_id: GatewayShardIdV1,
+    pub process_instance_id: ProcessInstanceId,
+    pub expected_build_revision: RuntimeBuildRevisionV1,
+    pub lease_for: RuntimeGatewayOwnerLeaseDurationV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeRenewGatewayOwnerLeaseV1 {
+    pub lease_id: RuntimeGatewayOwnerLeaseIdV1,
+    pub expected_owner_revision: NonZeroU64,
+    pub lease_for: RuntimeGatewayOwnerLeaseDurationV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeReleaseGatewayOwnerLeaseV1 {
+    pub lease_id: RuntimeGatewayOwnerLeaseIdV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeObserveGatewayOwnerLeaseV1 {
+    pub gateway_shard_id: GatewayShardIdV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeObservedGatewayOwnerLeaseV1 {
+    pub lease_id: RuntimeGatewayOwnerLeaseIdV1,
+    pub owner_revision: NonZeroU64,
+    pub observed_database_now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl RuntimeObservedGatewayOwnerLeaseV1 {
+    pub fn current_receipt(&self) -> Option<RuntimeGatewayOwnerLeaseReceiptV1> {
+        let receipt = RuntimeGatewayOwnerLeaseReceiptV1 {
+            lease_id: self.lease_id.clone(),
+            owner_revision: self.owner_revision,
+            database_now: self.observed_database_now,
+            expires_at: self.expires_at,
+        };
+        receipt.database_lease_duration().map(|_| receipt)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeGatewayOwnerLeaseObservationV1 {
+    Unowned {
+        gateway_shard_id: GatewayShardIdV1,
+        database_now: DateTime<Utc>,
+    },
+    Owned(RuntimeObservedGatewayOwnerLeaseV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeAcquireGatewayOwnerLeaseOutcomeV1 {
+    Acquired(RuntimeGatewayOwnerLeaseReceiptV1),
+    Contended(RuntimeGatewayOwnerLeaseReceiptV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeRenewGatewayOwnerLeaseOutcomeV1 {
+    Renewed(RuntimeGatewayOwnerLeaseReceiptV1),
+    NotCurrent(RuntimeGatewayOwnerLeaseObservationV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeReleaseGatewayOwnerLeaseOutcomeV1 {
+    Released {
+        lease_id: RuntimeGatewayOwnerLeaseIdV1,
+        database_now: DateTime<Utc>,
+    },
+    NotHeld(RuntimeGatewayOwnerLeaseObservationV1),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,8 +159,13 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{
-        RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseReceiptV1,
+        RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
+        RuntimeGatewayOwnerLeaseDurationV1, RuntimeGatewayOwnerLeaseIdV1,
+        RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
         RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
+        RuntimeObserveGatewayOwnerLeaseV1, RuntimeObservedGatewayOwnerLeaseV1,
+        RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
+        RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
     };
     use crate::{GatewayShardIdV1, RuntimeBuildRevisionV1, RuntimeGatewayAdmissionSequenceV2};
 
@@ -84,6 +197,23 @@ mod tests {
             database_now: at(database_now),
             expires_at: at(expires_at),
         }
+    }
+
+    fn observed(
+        owner_revision: u64,
+        observed_database_now: i64,
+        expires_at: i64,
+    ) -> RuntimeObservedGatewayOwnerLeaseV1 {
+        RuntimeObservedGatewayOwnerLeaseV1 {
+            lease_id: lease_id(),
+            owner_revision: non_zero(owner_revision),
+            observed_database_now: at(observed_database_now),
+            expires_at: at(expires_at),
+        }
+    }
+
+    fn lease_for(seconds: u64) -> RuntimeGatewayOwnerLeaseDurationV1 {
+        RuntimeGatewayOwnerLeaseDurationV1::new(std::time::Duration::from_secs(seconds)).unwrap()
     }
 
     fn ready() -> RuntimeGatewayReadyAttestationV2 {
@@ -129,6 +259,81 @@ mod tests {
         assert!(renewed.owner_revision > initial.owner_revision);
         assert_ne!(initial.database_now, renewed.database_now);
         assert_ne!(initial.expires_at, renewed.expires_at);
+    }
+
+    #[test]
+    fn owner_lease_duration_uses_only_the_database_interval() {
+        assert_eq!(
+            receipt(3, 100, 120).database_lease_duration(),
+            Some(std::time::Duration::from_secs(20))
+        );
+        assert_eq!(receipt(3, 100, 100).database_lease_duration(), None);
+        assert_eq!(receipt(3, 101, 100).database_lease_duration(), None);
+        assert_eq!(
+            observed(3, 100, 120).current_receipt(),
+            Some(receipt(3, 100, 120))
+        );
+        assert_eq!(observed(3, 120, 120).current_receipt(), None);
+    }
+
+    #[test]
+    fn owner_lease_duration_rejects_zero_at_construction() {
+        assert_eq!(
+            RuntimeGatewayOwnerLeaseDurationV1::new(std::time::Duration::ZERO),
+            None
+        );
+        assert_eq!(lease_for(30).get(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn owner_persistence_requests_bind_the_exact_authority_fields() {
+        let acquire = RuntimeAcquireGatewayOwnerLeaseV1 {
+            gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+            process_instance_id: ProcessInstanceId::parse("process:1").unwrap(),
+            expected_build_revision: RuntimeBuildRevisionV1::parse("build:1").unwrap(),
+            lease_for: lease_for(30),
+        };
+        let renew = RuntimeRenewGatewayOwnerLeaseV1 {
+            lease_id: lease_id(),
+            expected_owner_revision: non_zero(3),
+            lease_for: lease_for(30),
+        };
+        let release = RuntimeReleaseGatewayOwnerLeaseV1 {
+            lease_id: lease_id(),
+        };
+        let observe = RuntimeObserveGatewayOwnerLeaseV1 {
+            gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+        };
+
+        assert_eq!(acquire.process_instance_id.as_str(), "process:1");
+        assert_eq!(renew.expected_owner_revision, non_zero(3));
+        assert_eq!(release.lease_id, lease_id());
+        assert_eq!(observe.gateway_shard_id.as_str(), "shard:0");
+    }
+
+    #[test]
+    fn owner_mutation_outcomes_are_closed_and_preserve_observation() {
+        let receipt = receipt(3, 100, 120);
+        let unowned = RuntimeGatewayOwnerLeaseObservationV1::Unowned {
+            gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+            database_now: at(100),
+        };
+        let acquire = RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Contended(receipt.clone());
+        let renew = RuntimeRenewGatewayOwnerLeaseOutcomeV1::NotCurrent(unowned.clone());
+        let release = RuntimeReleaseGatewayOwnerLeaseOutcomeV1::NotHeld(unowned.clone());
+
+        assert_eq!(
+            acquire,
+            RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Contended(receipt)
+        );
+        assert_eq!(
+            renew,
+            RuntimeRenewGatewayOwnerLeaseOutcomeV1::NotCurrent(unowned.clone())
+        );
+        assert_eq!(
+            release,
+            RuntimeReleaseGatewayOwnerLeaseOutcomeV1::NotHeld(unowned)
+        );
     }
 
     #[test]

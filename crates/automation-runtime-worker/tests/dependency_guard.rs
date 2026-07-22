@@ -36,6 +36,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/gateway_lifecycle.rs"),
+            PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/lib.rs"),
         ]
     );
@@ -64,7 +65,15 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         .lines()
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    assert_eq!(dependencies, ["thiserror.workspace = true"]);
+    assert_eq!(
+        dependencies,
+        [
+            "automation-runtime-controller = { path = \"../automation-runtime-controller\" }",
+            "automation-runtime-convergence = { path = \"../automation-runtime-convergence\" }",
+            "chrono = \"0.4\"",
+            "thiserror.workspace = true",
+        ]
+    );
 
     for path in sources {
         let source = fs::read_to_string(&path).unwrap();

@@ -578,6 +578,9 @@ dependencies = [
 name = "automation-runtime-worker"
 version = "0.1.0"
 dependencies = [
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "chrono",
  "thiserror 1.0.69",
 ]
 
