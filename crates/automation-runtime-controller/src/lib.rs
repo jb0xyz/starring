@@ -75,9 +75,10 @@ pub use v2_canonical_value::{
 };
 pub use v2_certification::{RuntimeCertificationIntentV2, RuntimeCertificationRequestV2};
 pub use v2_certification_canonical::{
-    RuntimeCanonicalCertificationIntentV2, RuntimeCertificationCanonicalErrorV2,
-    RuntimeCertificationCanonicalFieldV2, RuntimeCertificationCanonicalRootV2,
-    RuntimeCertificationIntentCorrelationV2,
+    RuntimeCanonicalCertificationIntentV2, RuntimeCanonicalLiveAttestationV2,
+    RuntimeCertificationCanonicalErrorV2, RuntimeCertificationCanonicalFieldV2,
+    RuntimeCertificationCanonicalRootV2, RuntimeCertificationIntentCorrelationV2,
+    RuntimeCertificationRequestCorrelationV2, RuntimeLiveAttestationRecordV2,
 };
 pub use v2_digest::{
     RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,

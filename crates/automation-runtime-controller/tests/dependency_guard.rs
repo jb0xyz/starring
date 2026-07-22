@@ -262,7 +262,7 @@ fn v2_certification_inputs_stay_inert_and_exact() {
 }
 
 #[test]
-fn v2_certification_intent_canonical_surface_stays_closed() {
+fn v2_certification_canonical_surface_stays_closed() {
     let canonical = include_str!("../src/v2_certification_canonical.rs");
     let wire = include_str!("../src/v2_certification_canonical/wire.rs");
 
@@ -273,6 +273,10 @@ fn v2_certification_intent_canonical_surface_stays_closed() {
         "pub intent:",
         "pub bytes:",
         "pub fingerprint:",
+        "pub request_digest:",
+        "pub request:",
+        "pub live_digest:",
+        "pub live_record_bytes:",
         "pub fn decode_certification_intent",
         "pub fn encode_certification_intent",
         "pub fn from_parts",
@@ -289,6 +293,57 @@ fn v2_certification_intent_canonical_surface_stays_closed() {
     assert!(canonical.contains("fingerprint: RuntimeCertificationIntentFingerprintV2"));
     assert!(canonical.contains("pub fn new("));
     assert!(canonical.contains("pub fn from_persisted("));
+    assert!(canonical.contains("pub struct RuntimeLiveAttestationRecordV2"));
+    assert!(canonical.contains("pub struct RuntimeCanonicalLiveAttestationV2"));
+    assert!(canonical.contains("pub fn bind_live_record("));
+    assert_eq!(canonical.matches("pub fn from_request(").count(), 1);
+    for forbidden in [
+        "RuntimeServingIdentityV2",
+        "RuntimeServingReceiptV2",
+        "RuntimeCertificationReceiptV2",
+        "certified_at:",
+        "snapshot:",
+        "transition:",
+        "attestation_digest:",
+    ] {
+        assert!(
+            !canonical.contains(forbidden),
+            "forbidden Live preimage field: {forbidden}"
+        );
+    }
+
+    let record = canonical
+        .split("pub struct RuntimeLiveAttestationRecordV2 {")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("}\n\nimpl RuntimeLiveAttestationRecordV2")
+                .next()
+        })
+        .unwrap();
+    assert!(record.contains("request_digest: RuntimeCertificationRequestDigestV2"));
+    assert!(record.contains("request: RuntimeCertificationRequestV2"));
+    assert_eq!(record.matches("    ").count(), 2);
+
+    let live = canonical
+        .split("pub struct RuntimeCanonicalLiveAttestationV2 {")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("}\n\nimpl RuntimeCanonicalLiveAttestationV2")
+                .next()
+        })
+        .unwrap();
+    for field in [
+        "reserved_intent",
+        "record",
+        "request_bytes",
+        "live_record_bytes",
+        "live_digest",
+    ] {
+        assert!(live.contains(&format!("    {field}:")));
+    }
+    assert_eq!(live.matches("    ").count(), 5);
 
     for forbidden in [
         "pub struct",
@@ -317,10 +372,16 @@ fn v2_certification_intent_canonical_surface_stays_closed() {
         "struct ProcessIdentityWireV2",
         "struct GatewayOwnerLeaseIdWireV2",
         "struct PanelEvidenceWireV2",
+        "struct CertificationRequestWireV2",
+        "struct RouteAdmissionWireV2",
+        "struct BarrierPauseWireV2",
+        "struct GatewayReadyWireV2",
+        "struct ServingRouteWireV2",
+        "struct LiveAttestationRecordWireV2",
     ] {
         assert!(wire.contains(projection));
     }
-    assert_eq!(wire.matches("#[serde(deny_unknown_fields)]").count(), 8);
+    assert_eq!(wire.matches("#[serde(deny_unknown_fields)]").count(), 14);
 
     let intent_wire = wire
         .split("struct CertificationIntentWireV2 {")
@@ -347,6 +408,39 @@ fn v2_certification_intent_canonical_surface_stays_closed() {
         previous = position;
     }
     assert_eq!(intent_wire.matches("    ").count(), 12);
+
+    let request_wire = wire
+        .split("struct CertificationRequestWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    let mut previous = 0;
+    for field in [
+        "format_version",
+        "intent",
+        "intent_fingerprint",
+        "must_commit_before_unix_microseconds",
+        "route_admission",
+    ] {
+        let position = request_wire.find(&format!("    {field}:")).unwrap();
+        assert!(position >= previous);
+        previous = position;
+    }
+    assert_eq!(request_wire.matches("    ").count(), 5);
+
+    let live_wire = wire
+        .split("struct LiveAttestationRecordWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert!(live_wire.contains("    format_version:"));
+    assert!(live_wire.contains("    request_digest:"));
+    assert!(live_wire.contains("    request:"));
+    assert_eq!(live_wire.matches("    ").count(), 3);
+    assert!(wire.contains(
+        "encoded.extend_from_slice(b\"{\\\"format_version\\\":2,\\\"request_digest\\\":\\\"\")"
+    ));
+    assert!(wire.contains("encoded.extend_from_slice(b\"\\\",\\\"request\\\":\")"));
 }
 
 #[test]

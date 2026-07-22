@@ -12,15 +12,22 @@ use resource_resolution::ResourceBindingFingerprint;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    validate_intent, RuntimeCertificationCanonicalErrorV2, RuntimeCertificationCanonicalFieldV2,
-    RuntimeCertificationCanonicalRootV2, CERTIFICATION_INTENT_MAX_OCTETS,
+    validate_intent, validate_request, RuntimeCertificationCanonicalErrorV2,
+    RuntimeCertificationCanonicalFieldV2, RuntimeCertificationCanonicalRootV2,
+    RuntimeCertificationRequestCorrelationV2, RuntimeLiveAttestationRecordV2,
+    CERTIFICATION_INTENT_MAX_OCTETS, CERTIFICATION_REQUEST_MAX_OCTETS, LIVE_ATTESTATION_MAX_OCTETS,
 };
 use crate::v2_canonical_value::{RuntimeDiscordSnowflakeV2, RuntimePersistenceU64V2};
+use crate::v2_digest::certification_request_digest_v2;
 use crate::{
-    GatewayShardIdV1, RuntimeBindingPinV1, RuntimeBuildRevisionV1, RuntimeCanonicalValueErrorV2,
-    RuntimeCertificationIntentV2, RuntimeCertificationOperationIdV2, RuntimeDeploymentScopeV1,
-    RuntimeExecutionGuardV1, RuntimeGatewayOwnerLeaseIdV1, RuntimePanelEvidenceV2,
-    RuntimeServingLeaseMillisecondsV2, RuntimeSessionActionIdV1,
+    GatewayShardIdV1, RuntimeBarrierIdV1, RuntimeBarrierPauseWitnessV2, RuntimeBindingPinV1,
+    RuntimeBuildRevisionV1, RuntimeCanonicalValueErrorV2, RuntimeCertificationIntentFingerprintV2,
+    RuntimeCertificationIntentV2, RuntimeCertificationOperationIdV2,
+    RuntimeCertificationRequestDigestV2, RuntimeCertificationRequestV2, RuntimeDeploymentScopeV1,
+    RuntimeExecutionGuardV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2, RuntimePanelEvidenceV2,
+    RuntimeRouteAdmissionAttestationV2, RuntimeServingLeaseMillisecondsV2,
+    RuntimeServingRouteAttestationV2, RuntimeSessionActionIdV1, RuntimeUnixMicrosecondsV2,
 };
 
 const FORMAT_VERSION: u8 = 2;
@@ -108,6 +115,64 @@ struct PanelEvidenceWireV2 {
     controller_fencing_token: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificationRequestWireV2 {
+    format_version: u8,
+    intent: CertificationIntentWireV2,
+    intent_fingerprint: String,
+    must_commit_before_unix_microseconds: i64,
+    route_admission: RouteAdmissionWireV2,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteAdmissionWireV2 {
+    barrier_id: String,
+    pause: BarrierPauseWireV2,
+    gateway: GatewayReadyWireV2,
+    gateway_owner_lease_id: GatewayOwnerLeaseIdWireV2,
+    attested_owner_revision: u64,
+    route: ServingRouteWireV2,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BarrierPauseWireV2 {
+    coordinator_generation: u64,
+    connection_epoch: u64,
+    paused_admission_revision: u64,
+    pause_sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayReadyWireV2 {
+    process_instance_id: String,
+    connection_epoch: u64,
+    kind: String,
+    admission_revision: u64,
+    connected_event_sequence: u64,
+    resume_sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServingRouteWireV2 {
+    identity: ProcessIdentityWireV2,
+    controller_fencing_token: u64,
+    route_incarnation: u64,
+    activation_sequence: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveAttestationRecordWireV2 {
+    format_version: u8,
+    request_digest: String,
+    request: CertificationRequestWireV2,
+}
+
 #[derive(Clone, Copy)]
 struct TargetFields {
     guild_id: RuntimeCertificationCanonicalFieldV2,
@@ -143,6 +208,15 @@ const PANEL_PROCESS_TARGET_FIELDS: TargetFields = TargetFields {
     content_hash: RuntimeCertificationCanonicalFieldV2::PanelProcessTargetContentHash,
     binding_revision: RuntimeCertificationCanonicalFieldV2::PanelProcessTargetBindingRevision,
     binding_fingerprint: RuntimeCertificationCanonicalFieldV2::PanelProcessTargetBindingFingerprint,
+};
+
+const ROUTE_TARGET_FIELDS: TargetFields = TargetFields {
+    guild_id: RuntimeCertificationCanonicalFieldV2::RouteTargetGuildId,
+    ruleset_key: RuntimeCertificationCanonicalFieldV2::RouteTargetRuleSetKey,
+    version: RuntimeCertificationCanonicalFieldV2::RouteTargetVersion,
+    content_hash: RuntimeCertificationCanonicalFieldV2::RouteTargetContentHash,
+    binding_revision: RuntimeCertificationCanonicalFieldV2::RouteTargetBindingRevision,
+    binding_fingerprint: RuntimeCertificationCanonicalFieldV2::RouteTargetBindingFingerprint,
 };
 
 pub(super) fn encode_certification_intent(
@@ -238,6 +312,148 @@ pub(super) fn decode_certification_intent(
         return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
     }
     Ok(intent)
+}
+
+pub(super) fn encode_certification_request(
+    request: &RuntimeCertificationRequestV2,
+) -> Result<Vec<u8>, RuntimeCertificationCanonicalErrorV2> {
+    validate_request(request)?;
+    let root = RuntimeCertificationCanonicalRootV2::Request;
+    let wire = encode_request_wire(request)?;
+    let encoded = serde_json::to_vec(&wire)
+        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Encoding { root })?;
+    ensure_root_size(&encoded, root, CERTIFICATION_REQUEST_MAX_OCTETS)?;
+    Ok(encoded)
+}
+
+pub(super) fn decode_certification_request(
+    encoded: &[u8],
+) -> Result<RuntimeCertificationRequestV2, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::Request;
+    ensure_root_size(encoded, root, CERTIFICATION_REQUEST_MAX_OCTETS)?;
+    let wire = serde_json::from_slice::<CertificationRequestWireV2>(encoded)
+        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Decoding { root })?;
+    let request = decode_request_wire(wire)?;
+    validate_request(&request)?;
+    if encode_certification_request(&request)? != encoded {
+        return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
+    }
+    Ok(request)
+}
+
+pub(super) fn encode_live_attestation_record(
+    record: &RuntimeLiveAttestationRecordV2,
+    request_bytes: &[u8],
+) -> Result<Vec<u8>, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::LiveAttestation;
+    if encode_certification_request(record.request())? != request_bytes {
+        return Err(
+            RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
+                field: RuntimeCertificationRequestCorrelationV2::LiveRequestRoot,
+            },
+        );
+    }
+    if certification_request_digest_v2(request_bytes) != *record.request_digest() {
+        return Err(
+            RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
+                field: RuntimeCertificationRequestCorrelationV2::LiveRequestDigest,
+            },
+        );
+    }
+    let mut encoded = Vec::with_capacity(115 + request_bytes.len());
+    encoded.extend_from_slice(b"{\"format_version\":2,\"request_digest\":\"");
+    encoded.extend_from_slice(record.request_digest().as_str().as_bytes());
+    encoded.extend_from_slice(b"\",\"request\":");
+    encoded.extend_from_slice(request_bytes);
+    encoded.push(b'}');
+    ensure_root_size(&encoded, root, LIVE_ATTESTATION_MAX_OCTETS)?;
+    Ok(encoded)
+}
+
+pub(super) fn decode_live_attestation_record(
+    encoded: &[u8],
+) -> Result<RuntimeLiveAttestationRecordV2, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::LiveAttestation;
+    ensure_root_size(encoded, root, LIVE_ATTESTATION_MAX_OCTETS)?;
+    let wire = serde_json::from_slice::<LiveAttestationRecordWireV2>(encoded)
+        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Decoding { root })?;
+    if wire.format_version != FORMAT_VERSION {
+        return Err(RuntimeCertificationCanonicalErrorV2::UnsupportedFormatVersion { root });
+    }
+    let request_digest = RuntimeCertificationRequestDigestV2::parse(wire.request_digest)
+        .map_err(|_| live_invalid(RuntimeCertificationCanonicalFieldV2::RequestDigest))?;
+    let request = decode_request_wire(wire.request)?;
+    validate_request(&request)?;
+    let request_bytes = encode_certification_request(&request)?;
+    if certification_request_digest_v2(&request_bytes) != request_digest {
+        return Err(
+            RuntimeCertificationCanonicalErrorV2::RequestCorrelationMismatch {
+                field: RuntimeCertificationRequestCorrelationV2::LiveRequestDigest,
+            },
+        );
+    }
+    let record = RuntimeLiveAttestationRecordV2 {
+        request_digest,
+        request,
+    };
+    if encode_live_attestation_record(&record, &request_bytes)? != encoded {
+        return Err(RuntimeCertificationCanonicalErrorV2::NonCanonicalEncoding { root });
+    }
+    Ok(record)
+}
+
+fn encode_request_wire(
+    request: &RuntimeCertificationRequestV2,
+) -> Result<CertificationRequestWireV2, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::Request;
+    let intent_bytes = encode_certification_intent(&request.intent)?;
+    let intent = serde_json::from_slice::<CertificationIntentWireV2>(&intent_bytes)
+        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Encoding { root })?;
+    let must_commit_before = RuntimeUnixMicrosecondsV2::from_datetime(request.must_commit_before)
+        .map_err(|reason| {
+        request_canonical(
+            RuntimeCertificationCanonicalFieldV2::MustCommitBeforeUnixMicroseconds,
+            reason,
+        )
+    })?;
+    Ok(CertificationRequestWireV2 {
+        format_version: FORMAT_VERSION,
+        intent,
+        intent_fingerprint: request.intent_fingerprint.as_str().to_owned(),
+        must_commit_before_unix_microseconds: must_commit_before.get(),
+        route_admission: encode_route_admission(&request.route_admission)?,
+    })
+}
+
+fn decode_request_wire(
+    wire: CertificationRequestWireV2,
+) -> Result<RuntimeCertificationRequestV2, RuntimeCertificationCanonicalErrorV2> {
+    let root = RuntimeCertificationCanonicalRootV2::Request;
+    if wire.format_version != FORMAT_VERSION {
+        return Err(RuntimeCertificationCanonicalErrorV2::UnsupportedFormatVersion { root });
+    }
+    let intent_bytes = serde_json::to_vec(&wire.intent)
+        .map_err(|_| RuntimeCertificationCanonicalErrorV2::Decoding { root })?;
+    let intent = decode_certification_intent(&intent_bytes)?;
+    let intent_fingerprint =
+        RuntimeCertificationIntentFingerprintV2::parse(wire.intent_fingerprint).map_err(|_| {
+            request_invalid(RuntimeCertificationCanonicalFieldV2::IntentFingerprint)
+        })?;
+    let must_commit_before =
+        RuntimeUnixMicrosecondsV2::from_i64(wire.must_commit_before_unix_microseconds)
+            .map_err(|reason| {
+                request_canonical(
+                    RuntimeCertificationCanonicalFieldV2::MustCommitBeforeUnixMicroseconds,
+                    reason,
+                )
+            })?
+            .to_datetime();
+    Ok(RuntimeCertificationRequestV2 {
+        intent,
+        intent_fingerprint,
+        must_commit_before,
+        route_admission: decode_route_admission(wire.route_admission)?,
+    })
 }
 
 fn encode_guard(
@@ -444,6 +660,275 @@ fn decode_owner_lease(
     })
 }
 
+fn encode_route_admission(
+    admission: &RuntimeRouteAdmissionAttestationV2,
+) -> Result<RouteAdmissionWireV2, RuntimeCertificationCanonicalErrorV2> {
+    Ok(RouteAdmissionWireV2 {
+        barrier_id: admission.barrier_id.as_str().to_owned(),
+        pause: BarrierPauseWireV2 {
+            coordinator_generation: request_persistence_u64(
+                admission.pause.coordinator_generation.get(),
+                RuntimeCertificationCanonicalFieldV2::PauseCoordinatorGeneration,
+            )?,
+            connection_epoch: request_persistence_u64(
+                admission.pause.connection_epoch.get(),
+                RuntimeCertificationCanonicalFieldV2::PauseConnectionEpoch,
+            )?,
+            paused_admission_revision: request_persistence_u64(
+                admission.pause.paused_admission_revision.get(),
+                RuntimeCertificationCanonicalFieldV2::PauseAdmissionRevision,
+            )?,
+            pause_sequence: request_persistence_u64(
+                admission.pause.pause_sequence.get(),
+                RuntimeCertificationCanonicalFieldV2::PauseSequence,
+            )?,
+        },
+        gateway: GatewayReadyWireV2 {
+            process_instance_id: admission.gateway.process_instance_id.as_str().to_owned(),
+            connection_epoch: request_persistence_u64(
+                admission.gateway.connection_epoch.get(),
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyConnectionEpoch,
+            )?,
+            kind: gateway_kind_tag(admission.gateway.kind).to_owned(),
+            admission_revision: request_persistence_u64(
+                admission.gateway.admission_revision.get(),
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyAdmissionRevision,
+            )?,
+            connected_event_sequence: request_persistence_u64(
+                admission.gateway.connected_event_sequence.get(),
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyConnectedEventSequence,
+            )?,
+            resume_sequence: request_persistence_u64(
+                admission.gateway.resume_sequence.get(),
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyResumeSequence,
+            )?,
+        },
+        gateway_owner_lease_id: encode_request_owner_lease(&admission.gateway_owner_lease_id)?,
+        attested_owner_revision: request_persistence_u64(
+            admission.attested_owner_revision.get(),
+            RuntimeCertificationCanonicalFieldV2::AttestedOwnerRevision,
+        )?,
+        route: ServingRouteWireV2 {
+            identity: encode_request_process_identity(&admission.route.identity)?,
+            controller_fencing_token: request_persistence_u64(
+                admission.route.controller_fencing_token.get(),
+                RuntimeCertificationCanonicalFieldV2::RouteControllerFencingToken,
+            )?,
+            route_incarnation: request_persistence_u64(
+                admission.route.route_incarnation.get(),
+                RuntimeCertificationCanonicalFieldV2::RouteIncarnation,
+            )?,
+            activation_sequence: request_persistence_u64(
+                admission.route.activation_sequence.get(),
+                RuntimeCertificationCanonicalFieldV2::RouteActivationSequence,
+            )?,
+        },
+    })
+}
+
+fn decode_route_admission(
+    wire: RouteAdmissionWireV2,
+) -> Result<RuntimeRouteAdmissionAttestationV2, RuntimeCertificationCanonicalErrorV2> {
+    Ok(RuntimeRouteAdmissionAttestationV2 {
+        barrier_id: RuntimeBarrierIdV1::parse(wire.barrier_id)
+            .map_err(|_| request_invalid(RuntimeCertificationCanonicalFieldV2::BarrierId))?,
+        pause: RuntimeBarrierPauseWitnessV2 {
+            coordinator_generation: request_non_zero_u64(
+                wire.pause.coordinator_generation,
+                RuntimeCertificationCanonicalFieldV2::PauseCoordinatorGeneration,
+            )?,
+            connection_epoch: request_non_zero_u64(
+                wire.pause.connection_epoch,
+                RuntimeCertificationCanonicalFieldV2::PauseConnectionEpoch,
+            )?,
+            paused_admission_revision: request_non_zero_u64(
+                wire.pause.paused_admission_revision,
+                RuntimeCertificationCanonicalFieldV2::PauseAdmissionRevision,
+            )?,
+            pause_sequence: RuntimeGatewayAdmissionSequenceV2::new(request_non_zero_u64(
+                wire.pause.pause_sequence,
+                RuntimeCertificationCanonicalFieldV2::PauseSequence,
+            )?),
+        },
+        gateway: RuntimeGatewayReadyAttestationV2 {
+            process_instance_id: ProcessInstanceId::parse(wire.gateway.process_instance_id)
+                .map_err(|_| {
+                    request_invalid(
+                        RuntimeCertificationCanonicalFieldV2::GatewayReadyProcessInstanceId,
+                    )
+                })?,
+            connection_epoch: request_non_zero_u64(
+                wire.gateway.connection_epoch,
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyConnectionEpoch,
+            )?,
+            kind: decode_gateway_kind(&wire.gateway.kind)?,
+            admission_revision: request_non_zero_u64(
+                wire.gateway.admission_revision,
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyAdmissionRevision,
+            )?,
+            connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(request_non_zero_u64(
+                wire.gateway.connected_event_sequence,
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyConnectedEventSequence,
+            )?),
+            resume_sequence: RuntimeGatewayAdmissionSequenceV2::new(request_non_zero_u64(
+                wire.gateway.resume_sequence,
+                RuntimeCertificationCanonicalFieldV2::GatewayReadyResumeSequence,
+            )?),
+        },
+        gateway_owner_lease_id: decode_request_owner_lease(wire.gateway_owner_lease_id)?,
+        attested_owner_revision: request_non_zero_u64(
+            wire.attested_owner_revision,
+            RuntimeCertificationCanonicalFieldV2::AttestedOwnerRevision,
+        )?,
+        route: RuntimeServingRouteAttestationV2 {
+            identity: decode_request_process_identity(wire.route.identity)?,
+            controller_fencing_token: FencingToken::new(request_persistence_u64(
+                wire.route.controller_fencing_token,
+                RuntimeCertificationCanonicalFieldV2::RouteControllerFencingToken,
+            )?)
+            .map_err(|_| {
+                request_invalid(RuntimeCertificationCanonicalFieldV2::RouteControllerFencingToken)
+            })?,
+            route_incarnation: request_non_zero_u64(
+                wire.route.route_incarnation,
+                RuntimeCertificationCanonicalFieldV2::RouteIncarnation,
+            )?,
+            activation_sequence: request_non_zero_u64(
+                wire.route.activation_sequence,
+                RuntimeCertificationCanonicalFieldV2::RouteActivationSequence,
+            )?,
+        },
+    })
+}
+
+fn encode_request_process_identity(
+    process: &RuntimeProcessIdentityV1,
+) -> Result<ProcessIdentityWireV2, RuntimeCertificationCanonicalErrorV2> {
+    Ok(ProcessIdentityWireV2 {
+        target: encode_request_target(&process.target)?,
+        runtime_generation: request_persistence_u64(
+            process.runtime_generation.get(),
+            RuntimeCertificationCanonicalFieldV2::RouteRuntimeGeneration,
+        )?,
+        process_instance_id: process.process_instance_id.as_str().to_owned(),
+    })
+}
+
+fn decode_request_process_identity(
+    wire: ProcessIdentityWireV2,
+) -> Result<RuntimeProcessIdentityV1, RuntimeCertificationCanonicalErrorV2> {
+    Ok(RuntimeProcessIdentityV1 {
+        target: decode_request_target(wire.target)?,
+        runtime_generation: RuntimeGeneration::new(request_persistence_u64(
+            wire.runtime_generation,
+            RuntimeCertificationCanonicalFieldV2::RouteRuntimeGeneration,
+        )?)
+        .map_err(|_| {
+            request_invalid(RuntimeCertificationCanonicalFieldV2::RouteRuntimeGeneration)
+        })?,
+        process_instance_id: ProcessInstanceId::parse(wire.process_instance_id).map_err(|_| {
+            request_invalid(RuntimeCertificationCanonicalFieldV2::RouteProcessInstanceId)
+        })?,
+    })
+}
+
+fn encode_request_target(
+    target: &RuntimeDeploymentTargetV1,
+) -> Result<DeploymentTargetWireV2, RuntimeCertificationCanonicalErrorV2> {
+    let guild_id = RuntimeDiscordSnowflakeV2::from_u64(target.guild_id.0)
+        .map_err(|reason| request_canonical(ROUTE_TARGET_FIELDS.guild_id, reason))?;
+    Ok(DeploymentTargetWireV2 {
+        guild_id: guild_id.canonical_text(),
+        ruleset_key: target.ruleset_key.as_str().to_owned(),
+        version: target.version.get(),
+        content_hash: target.content_hash.to_hex(),
+        binding_revision: request_persistence_u64(
+            target.binding_revision.get(),
+            ROUTE_TARGET_FIELDS.binding_revision,
+        )?,
+        binding_fingerprint: target.binding_fingerprint.as_str().to_owned(),
+    })
+}
+
+fn decode_request_target(
+    wire: DeploymentTargetWireV2,
+) -> Result<RuntimeDeploymentTargetV1, RuntimeCertificationCanonicalErrorV2> {
+    let guild_id = RuntimeDiscordSnowflakeV2::parse_text(&wire.guild_id)
+        .map_err(|reason| request_canonical(ROUTE_TARGET_FIELDS.guild_id, reason))?;
+    Ok(RuntimeDeploymentTargetV1 {
+        guild_id: GuildId(guild_id.get_u64()),
+        ruleset_key: RuleSetKey::parse(&wire.ruleset_key)
+            .map_err(|_| request_invalid(ROUTE_TARGET_FIELDS.ruleset_key))?,
+        version: RuleSetVersionId::new(wire.version)
+            .map_err(|_| request_invalid(ROUTE_TARGET_FIELDS.version))?,
+        content_hash: RuleSetContentHash::parse_hex(&wire.content_hash)
+            .ok_or_else(|| request_invalid(ROUTE_TARGET_FIELDS.content_hash))?,
+        binding_revision: BindingRevision::new(request_persistence_u64(
+            wire.binding_revision,
+            ROUTE_TARGET_FIELDS.binding_revision,
+        )?)
+        .map_err(|_| request_invalid(ROUTE_TARGET_FIELDS.binding_revision))?,
+        binding_fingerprint: ResourceBindingFingerprint::parse(&wire.binding_fingerprint)
+            .map_err(|_| request_invalid(ROUTE_TARGET_FIELDS.binding_fingerprint))?,
+    })
+}
+
+fn encode_request_owner_lease(
+    lease: &RuntimeGatewayOwnerLeaseIdV1,
+) -> Result<GatewayOwnerLeaseIdWireV2, RuntimeCertificationCanonicalErrorV2> {
+    Ok(GatewayOwnerLeaseIdWireV2 {
+        gateway_shard_id: lease.gateway_shard_id.as_str().to_owned(),
+        process_instance_id: lease.process_instance_id.as_str().to_owned(),
+        lease_epoch: request_persistence_u64(
+            lease.lease_epoch.get(),
+            RuntimeCertificationCanonicalFieldV2::RouteGatewayLeaseEpoch,
+        )?,
+        expected_build_revision: lease.expected_build_revision.as_str().to_owned(),
+    })
+}
+
+fn decode_request_owner_lease(
+    wire: GatewayOwnerLeaseIdWireV2,
+) -> Result<RuntimeGatewayOwnerLeaseIdV1, RuntimeCertificationCanonicalErrorV2> {
+    Ok(RuntimeGatewayOwnerLeaseIdV1 {
+        gateway_shard_id: GatewayShardIdV1::parse(wire.gateway_shard_id).map_err(|_| {
+            request_invalid(RuntimeCertificationCanonicalFieldV2::RouteGatewayShardId)
+        })?,
+        process_instance_id: ProcessInstanceId::parse(wire.process_instance_id).map_err(|_| {
+            request_invalid(RuntimeCertificationCanonicalFieldV2::RouteGatewayProcessInstanceId)
+        })?,
+        lease_epoch: request_non_zero_u64(
+            wire.lease_epoch,
+            RuntimeCertificationCanonicalFieldV2::RouteGatewayLeaseEpoch,
+        )?,
+        expected_build_revision: RuntimeBuildRevisionV1::parse(wire.expected_build_revision)
+            .map_err(|_| {
+                request_invalid(
+                    RuntimeCertificationCanonicalFieldV2::RouteGatewayExpectedBuildRevision,
+                )
+            })?,
+    })
+}
+
+fn gateway_kind_tag(kind: RuntimeGatewayReadyKindV2) -> &'static str {
+    match kind {
+        RuntimeGatewayReadyKindV2::Ready => "ready",
+        RuntimeGatewayReadyKindV2::Resumed => "resumed",
+    }
+}
+
+fn decode_gateway_kind(
+    value: &str,
+) -> Result<RuntimeGatewayReadyKindV2, RuntimeCertificationCanonicalErrorV2> {
+    match value {
+        "ready" => Ok(RuntimeGatewayReadyKindV2::Ready),
+        "resumed" => Ok(RuntimeGatewayReadyKindV2::Resumed),
+        _ => Err(request_invalid(
+            RuntimeCertificationCanonicalFieldV2::GatewayReadyKind,
+        )),
+    }
+}
+
 fn encode_panel(
     panel: &RuntimePanelEvidenceV2,
 ) -> Result<PanelEvidenceWireV2, RuntimeCertificationCanonicalErrorV2> {
@@ -501,10 +986,20 @@ fn decode_non_zero_u64(
 }
 
 fn ensure_size(encoded: &[u8]) -> Result<(), RuntimeCertificationCanonicalErrorV2> {
-    if encoded.len() > CERTIFICATION_INTENT_MAX_OCTETS {
-        return Err(RuntimeCertificationCanonicalErrorV2::PayloadTooLarge {
-            root: RuntimeCertificationCanonicalRootV2::Intent,
-        });
+    ensure_root_size(
+        encoded,
+        RuntimeCertificationCanonicalRootV2::Intent,
+        CERTIFICATION_INTENT_MAX_OCTETS,
+    )
+}
+
+fn ensure_root_size(
+    encoded: &[u8],
+    root: RuntimeCertificationCanonicalRootV2,
+    maximum: usize,
+) -> Result<(), RuntimeCertificationCanonicalErrorV2> {
+    if encoded.len() > maximum {
+        return Err(RuntimeCertificationCanonicalErrorV2::PayloadTooLarge { root });
     }
     Ok(())
 }
@@ -524,5 +1019,50 @@ fn canonical(
         root: RuntimeCertificationCanonicalRootV2::Intent,
         field,
         reason,
+    }
+}
+
+fn request_persistence_u64(
+    value: u64,
+    field: RuntimeCertificationCanonicalFieldV2,
+) -> Result<u64, RuntimeCertificationCanonicalErrorV2> {
+    RuntimePersistenceU64V2::from_u64(value)
+        .map(RuntimePersistenceU64V2::get_u64)
+        .map_err(|reason| request_canonical(field, reason))
+}
+
+fn request_non_zero_u64(
+    value: u64,
+    field: RuntimeCertificationCanonicalFieldV2,
+) -> Result<NonZeroU64, RuntimeCertificationCanonicalErrorV2> {
+    NonZeroU64::new(request_persistence_u64(value, field)?).ok_or_else(|| request_invalid(field))
+}
+
+fn request_invalid(
+    field: RuntimeCertificationCanonicalFieldV2,
+) -> RuntimeCertificationCanonicalErrorV2 {
+    RuntimeCertificationCanonicalErrorV2::InvalidField {
+        root: RuntimeCertificationCanonicalRootV2::Request,
+        field,
+    }
+}
+
+fn request_canonical(
+    field: RuntimeCertificationCanonicalFieldV2,
+    reason: RuntimeCanonicalValueErrorV2,
+) -> RuntimeCertificationCanonicalErrorV2 {
+    RuntimeCertificationCanonicalErrorV2::CanonicalValue {
+        root: RuntimeCertificationCanonicalRootV2::Request,
+        field,
+        reason,
+    }
+}
+
+fn live_invalid(
+    field: RuntimeCertificationCanonicalFieldV2,
+) -> RuntimeCertificationCanonicalErrorV2 {
+    RuntimeCertificationCanonicalErrorV2::InvalidField {
+        root: RuntimeCertificationCanonicalRootV2::LiveAttestation,
+        field,
     }
 }
