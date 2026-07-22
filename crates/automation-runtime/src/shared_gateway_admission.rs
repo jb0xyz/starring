@@ -9,6 +9,8 @@ use automation_runtime_registry::{
 use discord_model::GuildId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[cfg(test)]
+use crate::shared_gateway_control::GatewayCommandAckV3;
 use crate::shared_gateway_control::{
     GatewayConnectionEpochV3, GatewayConnectionObserverV3, GatewayReadyLeaseV3,
     SharedGatewayControlV3,
@@ -565,9 +567,12 @@ mod tests {
         let budget = budget(1);
         let reservation = budget.try_reserve(&observer, &lease).unwrap();
         let (paused, _) = tokio::join!(control.pause_admission(), runtime.process_next_command());
-        assert!(paused.is_ok());
+        let pause_token = match paused.unwrap() {
+            GatewayCommandAckV3::Paused { resume_token, .. } => resume_token,
+            _ => panic!("expected paused acknowledgement"),
+        };
         let (resumed, _) = tokio::join!(
-            control.resume_admission(lease.epoch()),
+            control.resume_admission(&pause_token),
             runtime.process_next_command()
         );
         assert!(resumed.is_ok());

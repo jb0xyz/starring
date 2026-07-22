@@ -1,4 +1,7 @@
+use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -23,6 +26,15 @@ impl GatewayAdmissionRevisionV3 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GatewayAdmissionSequenceV3(u64);
+
+impl GatewayAdmissionSequenceV3 {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayReadyKindV3 {
     Ready,
@@ -43,6 +55,7 @@ pub enum GatewayDrainCauseV3 {
     ControlOrphaned,
     ConnectionEpochOverflow,
     AdmissionRevisionOverflow,
+    AdmissionSequenceOverflow,
     LifecycleOverflow,
     LifecycleClosed,
     RuntimeFailure,
@@ -192,6 +205,10 @@ pub enum GatewayControlConfigurationErrorV3 {
 pub enum GatewayControlTransitionErrorV3 {
     #[error("gateway connection epoch is stale")]
     StaleConnectionEpoch,
+    #[error("gateway admission snapshot is stale")]
+    StaleAdmissionSnapshot,
+    #[error("gateway control owner is unavailable")]
+    ControlOrphaned,
     #[error("gateway is not connected")]
     NotConnected,
     #[error("gateway admission is paused")]
@@ -206,6 +223,8 @@ pub enum GatewayControlTransitionErrorV3 {
     ConnectionEpochOverflow,
     #[error("gateway admission revision overflowed")]
     AdmissionRevisionOverflow,
+    #[error("gateway admission sequence overflowed")]
+    AdmissionSequenceOverflow,
     #[error("gateway lifecycle queue overflowed")]
     LifecycleOverflow,
     #[error("gateway lifecycle observer is unavailable")]
@@ -222,10 +241,55 @@ pub enum GatewayControlErrorV3 {
     Transition(#[from] GatewayControlTransitionErrorV3),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
+pub struct GatewayPauseTokenV3 {
+    control_alive: Weak<AtomicBool>,
+    epoch: Option<GatewayConnectionEpochV3>,
+    admission_revision: GatewayAdmissionRevisionV3,
+    transition_sequence: GatewayAdmissionSequenceV3,
+}
+
+impl fmt::Debug for GatewayPauseTokenV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayPauseTokenV3")
+            .field("epoch", &self.epoch)
+            .field("admission_revision", &self.admission_revision)
+            .field("transition_sequence", &self.transition_sequence)
+            .finish()
+    }
+}
+
+impl PartialEq for GatewayPauseTokenV3 {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.control_alive, &other.control_alive)
+            && self.epoch == other.epoch
+            && self.admission_revision == other.admission_revision
+            && self.transition_sequence == other.transition_sequence
+    }
+}
+
+impl Eq for GatewayPauseTokenV3 {}
+
+impl GatewayPauseTokenV3 {
+    pub fn epoch(&self) -> Option<GatewayConnectionEpochV3> {
+        self.epoch
+    }
+
+    pub fn admission_revision(&self) -> GatewayAdmissionRevisionV3 {
+        self.admission_revision
+    }
+
+    pub fn transition_sequence(&self) -> GatewayAdmissionSequenceV3 {
+        self.transition_sequence
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayCommandAckV3 {
     Paused {
         epoch: Option<GatewayConnectionEpochV3>,
+        resume_token: GatewayPauseTokenV3,
     },
     AdmissionResumed {
         epoch: GatewayConnectionEpochV3,
@@ -235,7 +299,7 @@ pub enum GatewayCommandAckV3 {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayRuntimeCommandOutcomeV3 {
     Applied(GatewayCommandAckV3),
     Rejected(GatewayControlTransitionErrorV3),
@@ -247,6 +311,8 @@ pub struct GatewayReadyLeaseV3 {
     epoch: GatewayConnectionEpochV3,
     kind: GatewayReadyKindV3,
     admission_revision: GatewayAdmissionRevisionV3,
+    connected_event_sequence: GatewayAdmissionSequenceV3,
+    resume_sequence: GatewayAdmissionSequenceV3,
 }
 
 impl GatewayReadyLeaseV3 {
@@ -261,6 +327,49 @@ impl GatewayReadyLeaseV3 {
     pub fn admission_revision(self) -> GatewayAdmissionRevisionV3 {
         self.admission_revision
     }
+
+    pub fn connected_event_sequence(self) -> GatewayAdmissionSequenceV3 {
+        self.connected_event_sequence
+    }
+
+    pub fn resume_sequence(self) -> GatewayAdmissionSequenceV3 {
+        self.resume_sequence
+    }
+
+    pub fn was_explicitly_resumed(self) -> bool {
+        self.resume_sequence > self.connected_event_sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayAdmissionSnapshotV3 {
+    connection: GatewayConnectionStateV3,
+    admission_revision: GatewayAdmissionRevisionV3,
+    transition_sequence: GatewayAdmissionSequenceV3,
+    connected_event_sequence: Option<GatewayAdmissionSequenceV3>,
+    resume_sequence: Option<GatewayAdmissionSequenceV3>,
+}
+
+impl GatewayAdmissionSnapshotV3 {
+    pub fn connection(self) -> GatewayConnectionStateV3 {
+        self.connection
+    }
+
+    pub fn admission_revision(self) -> GatewayAdmissionRevisionV3 {
+        self.admission_revision
+    }
+
+    pub fn transition_sequence(self) -> GatewayAdmissionSequenceV3 {
+        self.transition_sequence
+    }
+
+    pub fn connected_event_sequence(self) -> Option<GatewayAdmissionSequenceV3> {
+        self.connected_event_sequence
+    }
+
+    pub fn resume_sequence(self) -> Option<GatewayAdmissionSequenceV3> {
+        self.resume_sequence
+    }
 }
 
 enum GatewayCommandV3 {
@@ -269,7 +378,7 @@ enum GatewayCommandV3 {
             oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
     },
     Resume {
-        expected_epoch: GatewayConnectionEpochV3,
+        pause_token: GatewayPauseTokenV3,
         acknowledgement:
             oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
     },
@@ -283,45 +392,52 @@ pub struct SharedGatewayControlV3 {
     commands: mpsc::Sender<GatewayCommandV3>,
     lifecycle: mpsc::Receiver<GatewayLifecycleEventV3>,
     connection: watch::Receiver<GatewayConnectionStateV3>,
-    admission_revision: watch::Receiver<GatewayAdmissionRevisionV3>,
+    admission: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    control_alive: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 pub struct GatewayConnectionObserverV3 {
-    connection: watch::Receiver<GatewayConnectionStateV3>,
-    admission_revision: watch::Receiver<GatewayAdmissionRevisionV3>,
+    admission: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    control_alive: Arc<AtomicBool>,
 }
 
 impl GatewayConnectionObserverV3 {
     pub fn current_connection(&self) -> GatewayConnectionStateV3 {
-        *self.connection.borrow()
+        self.current_admission_snapshot().connection()
+    }
+
+    pub fn current_admission_snapshot(&self) -> GatewayAdmissionSnapshotV3 {
+        *self.admission.borrow()
     }
 
     pub async fn connection_changed(&mut self) -> Option<GatewayConnectionStateV3> {
-        self.connection
+        self.admission_snapshot_changed()
+            .await
+            .map(GatewayAdmissionSnapshotV3::connection)
+    }
+
+    pub async fn admission_snapshot_changed(&mut self) -> Option<GatewayAdmissionSnapshotV3> {
+        self.admission
             .changed()
             .await
             .ok()
-            .map(|()| *self.connection.borrow_and_update())
+            .map(|()| *self.admission.borrow_and_update())
     }
 
     pub fn issue_ready_lease(
         &self,
         expected_epoch: GatewayConnectionEpochV3,
     ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-        issue_ready_lease(
-            self.current_connection(),
-            *self.admission_revision.borrow(),
-            expected_epoch,
-        )
+        if !self.control_alive.load(Ordering::Acquire) {
+            return Err(GatewayControlTransitionErrorV3::ControlOrphaned);
+        }
+        issue_ready_lease(self.current_admission_snapshot(), expected_epoch)
     }
 
     pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
-        ready_lease_is_current(
-            self.current_connection(),
-            *self.admission_revision.borrow(),
-            lease,
-        )
+        self.control_alive.load(Ordering::Acquire)
+            && ready_lease_is_current(self.current_admission_snapshot(), lease)
     }
 }
 
@@ -342,12 +458,18 @@ impl SharedGatewayControlV3 {
 
     pub async fn resume_admission(
         &self,
-        expected_epoch: GatewayConnectionEpochV3,
+        pause_token: &GatewayPauseTokenV3,
     ) -> Result<GatewayCommandAckV3, GatewayControlErrorV3> {
+        if !Weak::ptr_eq(
+            &pause_token.control_alive,
+            &Arc::downgrade(&self.control_alive),
+        ) {
+            return Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot.into());
+        }
         let (sender, receiver) = oneshot::channel();
         self.commands
             .send(GatewayCommandV3::Resume {
-                expected_epoch,
+                pause_token: pause_token.clone(),
                 acknowledgement: sender,
             })
             .await
@@ -373,17 +495,25 @@ impl SharedGatewayControlV3 {
     }
 
     pub fn current_connection(&self) -> GatewayConnectionStateV3 {
-        *self.connection.borrow()
+        self.current_admission_snapshot().connection()
+    }
+
+    pub fn current_admission_snapshot(&self) -> GatewayAdmissionSnapshotV3 {
+        *self.admission.borrow()
     }
 
     pub fn connection_watch(&self) -> watch::Receiver<GatewayConnectionStateV3> {
         self.connection.clone()
     }
 
+    pub fn admission_snapshot_watch(&self) -> watch::Receiver<GatewayAdmissionSnapshotV3> {
+        self.admission.clone()
+    }
+
     pub fn connection_observer(&self) -> GatewayConnectionObserverV3 {
         GatewayConnectionObserverV3 {
-            connection: self.connection.clone(),
-            admission_revision: self.admission_revision.clone(),
+            admission: self.admission.clone(),
+            control_alive: self.control_alive.clone(),
         }
     }
 
@@ -403,37 +533,47 @@ impl SharedGatewayControlV3 {
         &self,
         expected_epoch: GatewayConnectionEpochV3,
     ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-        issue_ready_lease(
-            self.current_connection(),
-            *self.admission_revision.borrow(),
-            expected_epoch,
-        )
+        if !self.control_alive.load(Ordering::Acquire) {
+            return Err(GatewayControlTransitionErrorV3::ControlOrphaned);
+        }
+        issue_ready_lease(self.current_admission_snapshot(), expected_epoch)
     }
 
     pub fn ready_lease_is_current(&self, lease: &GatewayReadyLeaseV3) -> bool {
-        ready_lease_is_current(
-            self.current_connection(),
-            *self.admission_revision.borrow(),
-            lease,
-        )
+        self.control_alive.load(Ordering::Acquire)
+            && ready_lease_is_current(self.current_admission_snapshot(), lease)
+    }
+}
+
+impl Drop for SharedGatewayControlV3 {
+    fn drop(&mut self) {
+        self.control_alive.store(false, Ordering::Release);
     }
 }
 
 fn issue_ready_lease(
-    state: GatewayConnectionStateV3,
-    admission_revision: GatewayAdmissionRevisionV3,
+    snapshot: GatewayAdmissionSnapshotV3,
     expected_epoch: GatewayConnectionEpochV3,
 ) -> Result<GatewayReadyLeaseV3, GatewayControlTransitionErrorV3> {
-    match state {
-        GatewayConnectionStateV3::Connected { epoch, kind } if epoch == expected_epoch => {
+    match snapshot.connection {
+        GatewayConnectionStateV3::Connected { epoch, .. } if epoch != expected_epoch => {
+            Err(GatewayControlTransitionErrorV3::StaleConnectionEpoch)
+        }
+        GatewayConnectionStateV3::Connected { epoch, kind } => {
+            let connected_event_sequence = snapshot
+                .connected_event_sequence
+                .ok_or(GatewayControlTransitionErrorV3::AdmissionPaused)?;
+            let resume_sequence = snapshot
+                .resume_sequence
+                .filter(|resume| *resume >= connected_event_sequence)
+                .ok_or(GatewayControlTransitionErrorV3::AdmissionPaused)?;
             Ok(GatewayReadyLeaseV3 {
                 epoch,
                 kind,
-                admission_revision,
+                admission_revision: snapshot.admission_revision,
+                connected_event_sequence,
+                resume_sequence,
             })
-        }
-        GatewayConnectionStateV3::Connected { .. } => {
-            Err(GatewayControlTransitionErrorV3::StaleConnectionEpoch)
         }
         GatewayConnectionStateV3::Paused { .. } => {
             Err(GatewayControlTransitionErrorV3::AdmissionPaused)
@@ -447,27 +587,36 @@ fn issue_ready_lease(
 }
 
 fn ready_lease_is_current(
-    state: GatewayConnectionStateV3,
-    admission_revision: GatewayAdmissionRevisionV3,
+    snapshot: GatewayAdmissionSnapshotV3,
     lease: &GatewayReadyLeaseV3,
 ) -> bool {
     matches!(
-        state,
+        snapshot.connection,
         GatewayConnectionStateV3::Connected { epoch, kind }
             if epoch == lease.epoch
                 && kind == lease.kind
-                && admission_revision == lease.admission_revision
+                && snapshot.admission_revision == lease.admission_revision
+                && snapshot.connected_event_sequence == Some(lease.connected_event_sequence)
+                && snapshot.resume_sequence == Some(lease.resume_sequence)
     )
+}
+
+#[derive(Clone, Copy)]
+enum GatewayAdmissionEvidenceUpdateV3 {
+    Preserve,
+    Connected { admitted: bool },
+    Resumed,
 }
 
 pub struct SharedGatewayRuntimeControlV3 {
     commands: mpsc::Receiver<GatewayCommandV3>,
     lifecycle: mpsc::Sender<GatewayLifecycleEventV3>,
     connection: watch::Sender<GatewayConnectionStateV3>,
-    admission_revision: watch::Sender<GatewayAdmissionRevisionV3>,
+    admission: watch::Sender<GatewayAdmissionSnapshotV3>,
     state: GatewayConnectionStateV3,
+    admission_snapshot: GatewayAdmissionSnapshotV3,
+    control_alive: Arc<AtomicBool>,
     last_issued_epoch: u64,
-    last_admission_revision: u64,
     admission_policy: GatewayAdmissionPolicyV3,
 }
 
@@ -493,8 +642,15 @@ pub fn shared_gateway_control_channel_with_policy_v3(
     };
     let (connection_sender, connection_receiver) = watch::channel(initial);
     let initial_admission_revision = GatewayAdmissionRevisionV3(NonZeroU64::MIN);
-    let (admission_revision_sender, admission_revision_receiver) =
-        watch::channel(initial_admission_revision);
+    let initial_admission_snapshot = GatewayAdmissionSnapshotV3 {
+        connection: initial,
+        admission_revision: initial_admission_revision,
+        transition_sequence: GatewayAdmissionSequenceV3::default(),
+        connected_event_sequence: None,
+        resume_sequence: None,
+    };
+    let (admission_sender, admission_receiver) = watch::channel(initial_admission_snapshot);
+    let control_alive = Arc::new(AtomicBool::new(true));
     lifecycle_sender
         .try_send(GatewayLifecycleEventV3::Starting)
         .expect("validated lifecycle capacity accepts the initial state");
@@ -503,16 +659,18 @@ pub fn shared_gateway_control_channel_with_policy_v3(
             commands: command_sender,
             lifecycle: lifecycle_receiver,
             connection: connection_receiver,
-            admission_revision: admission_revision_receiver,
+            admission: admission_receiver,
+            control_alive: control_alive.clone(),
         },
         SharedGatewayRuntimeControlV3 {
             commands: command_receiver,
             lifecycle: lifecycle_sender,
             connection: connection_sender,
-            admission_revision: admission_revision_sender,
+            admission: admission_sender,
             state: initial,
+            admission_snapshot: initial_admission_snapshot,
+            control_alive,
             last_issued_epoch: 0,
-            last_admission_revision: initial_admission_revision.get(),
             admission_policy,
         },
     )
@@ -525,8 +683,8 @@ impl SharedGatewayRuntimeControlV3 {
 
     pub(crate) fn connection_observer(&self) -> GatewayConnectionObserverV3 {
         GatewayConnectionObserverV3 {
-            connection: self.connection.subscribe(),
-            admission_revision: self.admission_revision.subscribe(),
+            admission: self.admission.subscribe(),
+            control_alive: self.control_alive.clone(),
         }
     }
 
@@ -564,13 +722,15 @@ impl SharedGatewayRuntimeControlV3 {
         } else {
             GatewayConnectionStateV3::Connected { epoch, kind }
         };
-        self.publish(
+        self.publish_transition(
             state,
             GatewayLifecycleEventV3::Connected {
                 epoch,
                 kind,
                 paused,
             },
+            self.admission_snapshot.admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Connected { admitted: !paused },
         )?;
         self.last_issued_epoch = epoch.get();
         Ok(epoch)
@@ -595,17 +755,21 @@ impl SharedGatewayRuntimeControlV3 {
         } else {
             GatewayConnectionStateV3::Disconnected { last_epoch, kind }
         };
-        self.publish(
+        let admission_revision = if explicit_resume {
+            self.next_admission_revision()?
+        } else {
+            self.admission_snapshot.admission_revision
+        };
+        self.publish_transition(
             state,
             GatewayLifecycleEventV3::Disconnected {
                 last_epoch,
                 kind,
                 paused,
             },
+            admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
         )?;
-        if explicit_resume {
-            self.advance_admission_revision()?;
-        }
         Ok(())
     }
 
@@ -614,25 +778,39 @@ impl SharedGatewayRuntimeControlV3 {
             self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
             return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
         };
+        if !self.control_alive.load(Ordering::Acquire) || self.commands.is_closed() {
+            self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
+            return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
+        }
         match command {
             GatewayCommandV3::Pause { acknowledgement } => {
                 let result = self.pause();
-                let outcome = command_outcome(result);
+                let outcome = command_outcome(&result);
                 let _ = acknowledgement.send(result);
                 outcome
             }
             GatewayCommandV3::Resume {
-                expected_epoch,
+                pause_token,
                 acknowledgement,
             } => {
-                let result = self.resume(expected_epoch);
-                let outcome = command_outcome(result);
+                let result = if acknowledgement.is_closed() {
+                    Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot)
+                } else {
+                    self.resume(&pause_token)
+                };
+                if !self.control_alive.load(Ordering::Acquire) {
+                    self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
+                    let _ =
+                        acknowledgement.send(Err(GatewayControlTransitionErrorV3::ControlOrphaned));
+                    return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
+                }
+                let outcome = command_outcome(&result);
                 let _ = acknowledgement.send(result);
                 outcome
             }
             GatewayCommandV3::Drain { acknowledgement } => {
                 let result = self.drain();
-                let outcome = command_outcome(result);
+                let outcome = command_outcome(&result);
                 let _ = acknowledgement.send(result);
                 outcome
             }
@@ -650,20 +828,38 @@ impl SharedGatewayRuntimeControlV3 {
         };
         let state = GatewayConnectionStateV3::Stopped { last_epoch, cause };
         let event = GatewayLifecycleEventV3::Stopped { last_epoch, cause };
-        match self.lifecycle.try_send(event) {
-            Ok(()) => {
-                self.replace_state(state);
+        let snapshot = match self.next_admission_snapshot(
+            state,
+            self.admission_snapshot.admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let cause = GatewayDrainCauseV3::AdmissionSequenceOverflow;
+                self.replace_without_sequence(GatewayConnectionStateV3::Stopped {
+                    last_epoch,
+                    cause,
+                });
+                return Err(error);
+            }
+        };
+        let lifecycle = self.lifecycle.clone();
+        let result = match lifecycle.try_reserve() {
+            Ok(permit) => {
+                self.replace_snapshot(snapshot);
+                permit.send(event);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.replace_state(state);
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.replace_snapshot(snapshot);
                 Err(GatewayControlTransitionErrorV3::LifecycleOverflow)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.replace_state(state);
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.replace_snapshot(snapshot);
                 Err(GatewayControlTransitionErrorV3::LifecycleClosed)
             }
-        }
+        };
+        result
     }
 
     fn pause(&mut self) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
@@ -675,11 +871,7 @@ impl SharedGatewayRuntimeControlV3 {
             GatewayConnectionStateV3::Disconnected { last_epoch, kind } => {
                 GatewayPausedConnectionV3::Disconnected { last_epoch, kind }
             }
-            GatewayConnectionStateV3::Paused { connection } => {
-                return Ok(GatewayCommandAckV3::Paused {
-                    epoch: connection.current_epoch(),
-                });
-            }
+            GatewayConnectionStateV3::Paused { connection } => connection,
             GatewayConnectionStateV3::Draining { .. } => {
                 return Err(GatewayControlTransitionErrorV3::Draining)
             }
@@ -688,25 +880,47 @@ impl SharedGatewayRuntimeControlV3 {
             }
         };
         let epoch = connection.current_epoch();
-        self.publish(
+        let admission_revision = self.next_admission_revision()?;
+        self.publish_transition(
             GatewayConnectionStateV3::Paused { connection },
             GatewayLifecycleEventV3::Paused { epoch },
+            admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
         )?;
-        self.advance_admission_revision()?;
-        Ok(GatewayCommandAckV3::Paused { epoch })
+        Ok(GatewayCommandAckV3::Paused {
+            epoch,
+            resume_token: GatewayPauseTokenV3 {
+                control_alive: Arc::downgrade(&self.control_alive),
+                epoch,
+                admission_revision: self.admission_snapshot.admission_revision,
+                transition_sequence: self.admission_snapshot.transition_sequence,
+            },
+        })
     }
 
     fn resume(
         &mut self,
-        expected_epoch: GatewayConnectionEpochV3,
+        pause_token: &GatewayPauseTokenV3,
     ) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
+        if !Weak::ptr_eq(
+            &pause_token.control_alive,
+            &Arc::downgrade(&self.control_alive),
+        ) {
+            return Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot);
+        }
+        let expected_epoch = pause_token
+            .epoch
+            .ok_or(GatewayControlTransitionErrorV3::NotConnected)?;
         match self.state {
             GatewayConnectionStateV3::Paused {
                 connection: GatewayPausedConnectionV3::Connected { epoch, kind },
             } if epoch == expected_epoch => {
-                self.publish(
+                self.require_admission_snapshot(pause_token)?;
+                self.publish_transition(
                     GatewayConnectionStateV3::Connected { epoch, kind },
                     GatewayLifecycleEventV3::AdmissionResumed { epoch },
+                    self.admission_snapshot.admission_revision,
+                    GatewayAdmissionEvidenceUpdateV3::Resumed,
                 )?;
                 Ok(GatewayCommandAckV3::AdmissionResumed { epoch })
             }
@@ -717,6 +931,7 @@ impl SharedGatewayRuntimeControlV3 {
                 if self.state.current_epoch() == Some(expected_epoch)
                     && matches!(self.state, GatewayConnectionStateV3::Connected { .. })
                 {
+                    self.require_admission_snapshot(pause_token)?;
                     Ok(GatewayCommandAckV3::AdmissionResumed {
                         epoch: expected_epoch,
                     })
@@ -751,7 +966,7 @@ impl SharedGatewayRuntimeControlV3 {
             return Err(GatewayControlTransitionErrorV3::Stopped);
         }
         let last_epoch = self.state.current_epoch();
-        self.publish(
+        self.publish_transition(
             GatewayConnectionStateV3::Draining {
                 last_epoch,
                 cause: GatewayDrainCauseV3::Commanded,
@@ -760,6 +975,8 @@ impl SharedGatewayRuntimeControlV3 {
                 last_epoch,
                 cause: GatewayDrainCauseV3::Commanded,
             },
+            self.admission_snapshot.admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
         )?;
         Ok(GatewayCommandAckV3::Draining { last_epoch })
     }
@@ -776,11 +993,26 @@ impl SharedGatewayRuntimeControlV3 {
         }
     }
 
-    fn advance_admission_revision(
+    fn require_admission_snapshot(
+        &self,
+        pause_token: &GatewayPauseTokenV3,
+    ) -> Result<(), GatewayControlTransitionErrorV3> {
+        if self.admission_snapshot.admission_revision == pause_token.admission_revision
+            && self.admission_snapshot.transition_sequence == pause_token.transition_sequence
+        {
+            Ok(())
+        } else {
+            Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot)
+        }
+    }
+
+    fn next_admission_revision(
         &mut self,
     ) -> Result<GatewayAdmissionRevisionV3, GatewayControlTransitionErrorV3> {
         let next = self
-            .last_admission_revision
+            .admission_snapshot
+            .admission_revision
+            .get()
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .map(GatewayAdmissionRevisionV3);
@@ -788,51 +1020,129 @@ impl SharedGatewayRuntimeControlV3 {
             self.fail_closed(GatewayDrainCauseV3::AdmissionRevisionOverflow);
             return Err(GatewayControlTransitionErrorV3::AdmissionRevisionOverflow);
         };
-        self.last_admission_revision = revision.get();
-        self.admission_revision.send_replace(revision);
         Ok(revision)
     }
 
-    fn publish(
+    fn next_admission_snapshot(
+        &mut self,
+        state: GatewayConnectionStateV3,
+        admission_revision: GatewayAdmissionRevisionV3,
+        evidence: GatewayAdmissionEvidenceUpdateV3,
+    ) -> Result<GatewayAdmissionSnapshotV3, GatewayControlTransitionErrorV3> {
+        let Some(sequence) = self
+            .admission_snapshot
+            .transition_sequence
+            .get()
+            .checked_add(1)
+            .map(GatewayAdmissionSequenceV3)
+        else {
+            self.fail_closed_without_lifecycle(GatewayDrainCauseV3::AdmissionSequenceOverflow);
+            return Err(GatewayControlTransitionErrorV3::AdmissionSequenceOverflow);
+        };
+        let (connected_event_sequence, resume_sequence) = match evidence {
+            GatewayAdmissionEvidenceUpdateV3::Preserve => (
+                self.admission_snapshot.connected_event_sequence,
+                self.admission_snapshot.resume_sequence,
+            ),
+            GatewayAdmissionEvidenceUpdateV3::Connected { admitted } => {
+                (Some(sequence), admitted.then_some(sequence))
+            }
+            GatewayAdmissionEvidenceUpdateV3::Resumed => (
+                self.admission_snapshot.connected_event_sequence,
+                Some(sequence),
+            ),
+        };
+        Ok(GatewayAdmissionSnapshotV3 {
+            connection: state,
+            admission_revision,
+            transition_sequence: sequence,
+            connected_event_sequence,
+            resume_sequence,
+        })
+    }
+
+    fn publish_transition(
         &mut self,
         state: GatewayConnectionStateV3,
         event: GatewayLifecycleEventV3,
+        admission_revision: GatewayAdmissionRevisionV3,
+        evidence: GatewayAdmissionEvidenceUpdateV3,
     ) -> Result<(), GatewayControlTransitionErrorV3> {
-        match self.lifecycle.try_send(event) {
-            Ok(()) => {
-                self.replace_state(state);
+        let snapshot = self.next_admission_snapshot(state, admission_revision, evidence)?;
+        let lifecycle = self.lifecycle.clone();
+        let result = match lifecycle.try_reserve() {
+            Ok(permit) => {
+                self.replace_snapshot(snapshot);
+                permit.send(event);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.fail_closed_without_lifecycle(GatewayDrainCauseV3::LifecycleOverflow);
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.replace_failed_transition(snapshot, GatewayDrainCauseV3::LifecycleOverflow);
                 Err(GatewayControlTransitionErrorV3::LifecycleOverflow)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.fail_closed_without_lifecycle(GatewayDrainCauseV3::LifecycleClosed);
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.replace_failed_transition(snapshot, GatewayDrainCauseV3::LifecycleClosed);
                 Err(GatewayControlTransitionErrorV3::LifecycleClosed)
             }
-        }
+        };
+        result
     }
 
     fn fail_closed(&mut self, cause: GatewayDrainCauseV3) {
         let last_epoch = self.state.current_epoch();
         let state = GatewayConnectionStateV3::Draining { last_epoch, cause };
         let event = GatewayLifecycleEventV3::Draining { last_epoch, cause };
-        if self.lifecycle.try_send(event).is_ok() {
-            self.replace_state(state);
-        } else {
-            self.fail_closed_without_lifecycle(cause);
+        let Ok(snapshot) = self.next_admission_snapshot(
+            state,
+            self.admission_snapshot.admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
+        ) else {
+            return;
+        };
+        let lifecycle = self.lifecycle.clone();
+        let permit = lifecycle.try_reserve().ok();
+        self.replace_snapshot(snapshot);
+        if let Some(permit) = permit {
+            permit.send(event);
         }
     }
 
     fn fail_closed_without_lifecycle(&mut self, cause: GatewayDrainCauseV3) {
         let last_epoch = self.state.current_epoch();
-        self.replace_state(GatewayConnectionStateV3::Draining { last_epoch, cause });
+        self.replace_without_sequence(GatewayConnectionStateV3::Draining { last_epoch, cause });
     }
 
-    fn replace_state(&mut self, state: GatewayConnectionStateV3) {
-        self.state = state;
-        self.connection.send_replace(state);
+    fn replace_without_sequence(&mut self, state: GatewayConnectionStateV3) {
+        let snapshot = GatewayAdmissionSnapshotV3 {
+            connection: state,
+            ..self.admission_snapshot
+        };
+        self.replace_snapshot(snapshot);
+    }
+
+    fn replace_failed_transition(
+        &mut self,
+        attempted: GatewayAdmissionSnapshotV3,
+        cause: GatewayDrainCauseV3,
+    ) {
+        let snapshot = GatewayAdmissionSnapshotV3 {
+            connection: GatewayConnectionStateV3::Draining {
+                last_epoch: self.state.current_epoch(),
+                cause,
+            },
+            admission_revision: attempted.admission_revision,
+            transition_sequence: attempted.transition_sequence,
+            connected_event_sequence: self.admission_snapshot.connected_event_sequence,
+            resume_sequence: self.admission_snapshot.resume_sequence,
+        };
+        self.replace_snapshot(snapshot);
+    }
+
+    fn replace_snapshot(&mut self, snapshot: GatewayAdmissionSnapshotV3) {
+        self.state = snapshot.connection;
+        self.admission_snapshot = snapshot;
+        self.admission.send_replace(snapshot);
+        self.connection.send_replace(snapshot.connection);
     }
 }
 
@@ -847,19 +1157,39 @@ impl Drop for SharedGatewayRuntimeControlV3 {
             _ => GatewayDrainCauseV3::RuntimeFailure,
         };
         let state = GatewayConnectionStateV3::Stopped { last_epoch, cause };
-        let _ = self
-            .lifecycle
-            .try_send(GatewayLifecycleEventV3::Stopped { last_epoch, cause });
-        self.replace_state(state);
+        let lifecycle = self.lifecycle.clone();
+        let permit = lifecycle.try_reserve().ok();
+        match self.next_admission_snapshot(
+            state,
+            self.admission_snapshot.admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
+        ) {
+            Ok(snapshot) => {
+                self.replace_snapshot(snapshot);
+                if let Some(permit) = permit {
+                    permit.send(GatewayLifecycleEventV3::Stopped { last_epoch, cause });
+                }
+            }
+            Err(_) => {
+                let cause = match self.state {
+                    GatewayConnectionStateV3::Draining { cause, .. } => cause,
+                    _ => GatewayDrainCauseV3::AdmissionSequenceOverflow,
+                };
+                self.replace_without_sequence(GatewayConnectionStateV3::Stopped {
+                    last_epoch,
+                    cause,
+                });
+            }
+        }
     }
 }
 
 fn command_outcome(
-    result: Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>,
+    result: &Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>,
 ) -> GatewayRuntimeCommandOutcomeV3 {
     match result {
-        Ok(acknowledgement) => GatewayRuntimeCommandOutcomeV3::Applied(acknowledgement),
-        Err(error) => GatewayRuntimeCommandOutcomeV3::Rejected(error),
+        Ok(acknowledgement) => GatewayRuntimeCommandOutcomeV3::Applied(acknowledgement.clone()),
+        Err(error) => GatewayRuntimeCommandOutcomeV3::Rejected(*error),
     }
 }
 
@@ -885,13 +1215,35 @@ mod tests {
     async fn resume(
         control: &SharedGatewayControlV3,
         runtime: &mut SharedGatewayRuntimeControlV3,
-        epoch: GatewayConnectionEpochV3,
+        pause_token: &GatewayPauseTokenV3,
     ) -> Result<GatewayCommandAckV3, GatewayControlErrorV3> {
         let (result, _) = tokio::join!(
-            control.resume_admission(epoch),
+            control.resume_admission(pause_token),
             runtime.process_next_command()
         );
         result
+    }
+
+    fn resume_token(acknowledgement: GatewayCommandAckV3) -> GatewayPauseTokenV3 {
+        match acknowledgement {
+            GatewayCommandAckV3::Paused { resume_token, .. } => resume_token,
+            _ => panic!("expected paused acknowledgement"),
+        }
+    }
+
+    fn queue_resume(
+        control: &SharedGatewayControlV3,
+        pause_token: &GatewayPauseTokenV3,
+    ) -> oneshot::Receiver<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>> {
+        let (sender, receiver) = oneshot::channel();
+        control
+            .commands
+            .try_send(GatewayCommandV3::Resume {
+                pause_token: pause_token.clone(),
+                acknowledgement: sender,
+            })
+            .unwrap();
+        receiver
     }
 
     #[tokio::test]
@@ -910,20 +1262,26 @@ mod tests {
         assert!(matches!(
             runtime.process_next_command().await,
             GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::Paused {
-                epoch: Some(value)
+                epoch: Some(value),
+                ..
             }) if value == epoch
         ));
+        let paused = pause_future.await.unwrap();
         assert!(matches!(
-            pause_future.await,
-            Ok(GatewayCommandAckV3::Paused { epoch: Some(value) }) if value == epoch
+            &paused,
+            GatewayCommandAckV3::Paused {
+                epoch: Some(value),
+                ..
+            } if *value == epoch
         ));
+        let pause_token = resume_token(paused);
         assert!(matches!(
             control.current_connection(),
             GatewayConnectionStateV3::Paused { .. }
         ));
 
         let (resumed, outcome) = tokio::join!(
-            control.resume_admission(epoch),
+            control.resume_admission(&pause_token),
             runtime.process_next_command()
         );
         assert_eq!(resumed, Ok(GatewayCommandAckV3::AdmissionResumed { epoch }));
@@ -960,27 +1318,28 @@ mod tests {
         let (control, mut runtime) =
             shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
         let first = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
-        pause(&control, &mut runtime).await.unwrap();
+        let first_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
         runtime
             .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
             .unwrap();
         let second = runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
+        let second_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
         assert!(second > first);
         assert_eq!(
-            resume(&control, &mut runtime, first).await,
+            resume(&control, &mut runtime, &first_pause).await,
             Err(GatewayControlErrorV3::Transition(
                 GatewayControlTransitionErrorV3::StaleConnectionEpoch
             ))
         );
         assert_eq!(
-            resume(&control, &mut runtime, second).await,
+            resume(&control, &mut runtime, &second_pause).await,
             Ok(GatewayCommandAckV3::AdmissionResumed { epoch: second })
         );
         runtime
             .mark_disconnected(GatewayDisconnectKindV3::Close)
             .unwrap();
         assert_eq!(
-            resume(&control, &mut runtime, second).await,
+            resume(&control, &mut runtime, &second_pause).await,
             Err(GatewayControlErrorV3::Transition(
                 GatewayControlTransitionErrorV3::NotConnected
             ))
@@ -994,13 +1353,13 @@ mod tests {
         let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
         let lease = control.issue_ready_lease(epoch).unwrap();
         assert!(control.ready_lease_is_current(&lease));
-        pause(&control, &mut runtime).await.unwrap();
+        let pause_token = resume_token(pause(&control, &mut runtime).await.unwrap());
         assert!(!control.ready_lease_is_current(&lease));
         assert_eq!(
             control.issue_ready_lease(epoch),
             Err(GatewayControlTransitionErrorV3::AdmissionPaused)
         );
-        resume(&control, &mut runtime, epoch).await.unwrap();
+        resume(&control, &mut runtime, &pause_token).await.unwrap();
         runtime
             .mark_disconnected(GatewayDisconnectKindV3::ReceiveError)
             .unwrap();
@@ -1068,6 +1427,10 @@ mod tests {
             }
         ));
         assert_eq!(
+            runtime.admission_snapshot.transition_sequence(),
+            GatewayAdmissionSequenceV3(1)
+        );
+        assert_eq!(
             control.next_lifecycle().await,
             Some(GatewayLifecycleEventV3::Starting)
         );
@@ -1121,8 +1484,8 @@ mod tests {
         let (mut control, mut runtime) =
             shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
         let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
-        pause(&control, &mut runtime).await.unwrap();
-        resume(&control, &mut runtime, epoch).await.unwrap();
+        let pause_token = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &pause_token).await.unwrap();
         let (_, _) = tokio::join!(control.begin_drain(), runtime.process_next_command());
         runtime.mark_stopped().unwrap();
 
@@ -1157,6 +1520,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_delivery_observes_the_already_published_snapshot() {
+        let (mut control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        assert_eq!(
+            control.next_lifecycle().await,
+            Some(GatewayLifecycleEventV3::Starting)
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        assert!(matches!(
+            control.next_lifecycle().await,
+            Some(GatewayLifecycleEventV3::Connected {
+                epoch: value,
+                paused: false,
+                ..
+            }) if value == epoch
+        ));
+        assert!(control.current_connection().admits_interactions());
+
+        runtime.pause().unwrap();
+        assert_eq!(
+            control.next_lifecycle().await,
+            Some(GatewayLifecycleEventV3::Paused { epoch: Some(epoch) })
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn cloned_observer_issues_and_invalidates_leases_without_command_ownership() {
         let (_control, mut runtime) =
             shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
@@ -1185,14 +1578,162 @@ mod tests {
         let observer = control.connection_observer();
         let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
         let before_pause = observer.issue_ready_lease(epoch).unwrap();
-        pause(&control, &mut runtime).await.unwrap();
+        let pause_token = resume_token(pause(&control, &mut runtime).await.unwrap());
         assert!(!observer.ready_lease_is_current(&before_pause));
-        resume(&control, &mut runtime, epoch).await.unwrap();
+        resume(&control, &mut runtime, &pause_token).await.unwrap();
         assert!(!observer.ready_lease_is_current(&before_pause));
         let after_resume = observer.issue_ready_lease(epoch).unwrap();
         assert_eq!(after_resume.epoch(), before_pause.epoch());
         assert!(after_resume.admission_revision() > before_pause.admission_revision());
         assert!(observer.ready_lease_is_current(&after_resume));
+    }
+
+    #[tokio::test]
+    async fn every_acknowledged_pause_fences_an_older_resume_command() {
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let first_token = resume_token(runtime.pause().unwrap());
+        let first_pause = control.current_admission_snapshot();
+        let stale = queue_resume(&control, &first_token);
+
+        runtime.pause().unwrap();
+        let second_pause = control.current_admission_snapshot();
+        assert!(second_pause.admission_revision() > first_pause.admission_revision());
+        assert!(second_pause.transition_sequence() > first_pause.transition_sequence());
+        assert_eq!(
+            runtime.process_next_command().await,
+            GatewayRuntimeCommandOutcomeV3::Rejected(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            )
+        );
+        assert_eq!(
+            stale.await,
+            Ok(Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot))
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_older_workflow_cannot_resume_a_newer_pause() {
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let older = resume_token(pause(&control, &mut runtime).await.unwrap());
+        let newer = resume_token(pause(&control, &mut runtime).await.unwrap());
+
+        assert_eq!(
+            resume(&control, &mut runtime, &older).await,
+            Err(GatewayControlErrorV3::Transition(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            ))
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused { .. }
+        ));
+        resume(&control, &mut runtime, &newer).await.unwrap();
+        assert!(control.current_connection().admits_interactions());
+    }
+
+    #[tokio::test]
+    async fn foreign_pause_token_is_rejected_before_and_inside_the_runtime() {
+        let (control_a, mut runtime_a) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        runtime_a.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let token_a = resume_token(runtime_a.pause().unwrap());
+
+        let (control_b, mut runtime_b) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        runtime_b.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        runtime_b.pause().unwrap();
+        assert_eq!(
+            control_b.resume_admission(&token_a).await,
+            Err(GatewayControlErrorV3::Transition(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            ))
+        );
+
+        let acknowledgement = queue_resume(&control_b, &token_a);
+        assert_eq!(
+            runtime_b.process_next_command().await,
+            GatewayRuntimeCommandOutcomeV3::Rejected(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            )
+        );
+        assert_eq!(
+            acknowledgement.await,
+            Ok(Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot))
+        );
+        assert!(matches!(
+            control_b.current_connection(),
+            GatewayConnectionStateV3::Paused { .. }
+        ));
+        drop(control_a);
+    }
+
+    #[tokio::test]
+    async fn buffered_resume_cannot_outlive_the_control_owner() {
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        let observer = control.connection_observer();
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+        let pause_token = resume_token(runtime.pause().unwrap());
+        let acknowledgement = queue_resume(&control, &pause_token);
+
+        drop(control);
+        assert!(!observer.ready_lease_is_current(&lease));
+        assert_eq!(
+            observer.issue_ready_lease(epoch),
+            Err(GatewayControlTransitionErrorV3::ControlOrphaned)
+        );
+        assert_eq!(
+            runtime.process_next_command().await,
+            GatewayRuntimeCommandOutcomeV3::ControlOrphaned
+        );
+        assert!(acknowledgement.await.is_err());
+        assert!(matches!(
+            runtime.current_connection(),
+            GatewayConnectionStateV3::Draining {
+                cause: GatewayDrainCauseV3::ControlOrphaned,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_cancelled_before_runtime_claim_never_opens_admission() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let pause_token = resume_token(runtime.pause().unwrap());
+        let acknowledgement = queue_resume(&control, &pause_token);
+        drop(acknowledgement);
+
+        assert_eq!(
+            runtime.process_next_command().await,
+            GatewayRuntimeCommandOutcomeV3::Rejected(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            )
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused { .. }
+        ));
+        assert_eq!(
+            control.issue_ready_lease(epoch),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
     }
 
     #[tokio::test]
@@ -1221,7 +1762,8 @@ mod tests {
             control.issue_ready_lease(first),
             Err(GatewayControlTransitionErrorV3::AdmissionPaused)
         );
-        resume(&control, &mut runtime, first).await.unwrap();
+        let first_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &first_pause).await.unwrap();
         let first_lease = control.issue_ready_lease(first).unwrap();
         runtime
             .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
@@ -1242,13 +1784,14 @@ mod tests {
             control.issue_ready_lease(second),
             Err(GatewayControlTransitionErrorV3::AdmissionPaused)
         );
+        let second_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
         assert_eq!(
-            resume(&control, &mut runtime, first).await,
+            resume(&control, &mut runtime, &first_pause).await,
             Err(GatewayControlErrorV3::Transition(
                 GatewayControlTransitionErrorV3::StaleConnectionEpoch
             ))
         );
-        resume(&control, &mut runtime, second).await.unwrap();
+        resume(&control, &mut runtime, &second_pause).await.unwrap();
         let second_lease = control.issue_ready_lease(second).unwrap();
         assert!(second_lease.admission_revision() > first_lease.admission_revision());
         assert!(control.ready_lease_is_current(&second_lease));
@@ -1261,7 +1804,8 @@ mod tests {
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
         );
         runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
-        runtime.last_admission_revision = u64::MAX;
+        runtime.admission_snapshot.admission_revision =
+            GatewayAdmissionRevisionV3(NonZeroU64::new(u64::MAX).unwrap());
         assert_eq!(
             runtime.mark_disconnected(GatewayDisconnectKindV3::ReceiveError),
             Err(GatewayControlTransitionErrorV3::AdmissionRevisionOverflow)
@@ -1282,7 +1826,8 @@ mod tests {
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
         );
         let first = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
-        resume(&control, &mut runtime, first).await.unwrap();
+        let first_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &first_pause).await.unwrap();
         let first_lease = control.issue_ready_lease(first).unwrap();
         let second = runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
         assert!(second > first);
@@ -1300,20 +1845,89 @@ mod tests {
             control.issue_ready_lease(second),
             Err(GatewayControlTransitionErrorV3::AdmissionPaused)
         );
-        resume(&control, &mut runtime, second).await.unwrap();
+        let second_pause = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &second_pause).await.unwrap();
         assert!(control.ready_lease_is_current(&control.issue_ready_lease(second).unwrap()));
     }
 
-    #[test]
-    fn explicit_disconnect_closes_admission_before_advancing_revision() {
-        let source = include_str!("shared_gateway_control.rs");
-        let method = source
-            .split("pub fn mark_disconnected(")
-            .nth(1)
-            .and_then(|tail| tail.split("pub async fn process_next_command").next())
+    #[tokio::test]
+    async fn explicit_disconnect_publishes_one_closed_revision_snapshot() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let pause_token = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &pause_token).await.unwrap();
+        let before = control.current_admission_snapshot();
+        let lease = control.issue_ready_lease(epoch).unwrap();
+
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
             .unwrap();
-        let publish = method.find("self.publish(").unwrap();
-        let advance = method.find("self.advance_admission_revision()?").unwrap();
-        assert!(publish < advance);
+
+        let after = control.current_admission_snapshot();
+        assert!(matches!(
+            after.connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Disconnected {
+                    last_epoch: Some(value),
+                    kind: GatewayDisconnectKindV3::Reconnect,
+                },
+            } if value == epoch
+        ));
+        assert!(after.admission_revision() > before.admission_revision());
+        assert!(after.transition_sequence() > before.transition_sequence());
+        assert!(!control.ready_lease_is_current(&lease));
+        assert_eq!(
+            control.issue_ready_lease(epoch),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ready_lease_binds_the_exact_connect_and_resume_events() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let connected = control.current_admission_snapshot();
+        assert!(connected.connected_event_sequence().is_some());
+        assert_eq!(connected.resume_sequence(), None);
+        assert_eq!(
+            control.issue_ready_lease(epoch),
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused)
+        );
+
+        let pause_token = resume_token(pause(&control, &mut runtime).await.unwrap());
+        resume(&control, &mut runtime, &pause_token).await.unwrap();
+        let resumed = control.current_admission_snapshot();
+        let lease = control.issue_ready_lease(epoch).unwrap();
+        assert_eq!(
+            Some(lease.connected_event_sequence()),
+            resumed.connected_event_sequence()
+        );
+        assert_eq!(Some(lease.resume_sequence()), resumed.resume_sequence());
+        assert!(lease.resume_sequence() > lease.connected_event_sequence());
+        assert!(control.ready_lease_is_current(&lease));
+    }
+
+    #[test]
+    fn admission_sequence_overflow_fails_closed() {
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        runtime.admission_snapshot.transition_sequence = GatewayAdmissionSequenceV3(u64::MAX);
+        assert_eq!(
+            runtime.mark_connected(GatewayReadyKindV3::Ready),
+            Err(GatewayControlTransitionErrorV3::AdmissionSequenceOverflow)
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Draining {
+                cause: GatewayDrainCauseV3::AdmissionSequenceOverflow,
+                ..
+            }
+        ));
     }
 }
