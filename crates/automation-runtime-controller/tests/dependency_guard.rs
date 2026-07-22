@@ -155,6 +155,19 @@ fn v2_digest_surface_stays_typed_and_nonserializable() {
 }
 
 #[test]
+fn v2_canonical_values_stay_checked_and_nonserializable() {
+    let source = include_str!("../src/v2_canonical_value.rs");
+    for forbidden in ["Serialize", "Deserialize", "Default"] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 canonical value surface: {forbidden}"
+        );
+    }
+    assert!(source.contains("pub(crate) struct RuntimePersistenceU64V2"));
+    assert!(!source.contains("pub struct RuntimePersistenceU64V2"));
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -167,6 +180,10 @@ fn source_files_contain_no_comments() {
         ("src/retry.rs", include_str!("../src/retry.rs")),
         ("src/session.rs", include_str!("../src/session.rs")),
         ("src/v2_binding.rs", include_str!("../src/v2_binding.rs")),
+        (
+            "src/v2_canonical_value.rs",
+            include_str!("../src/v2_canonical_value.rs"),
+        ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),

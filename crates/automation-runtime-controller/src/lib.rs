@@ -11,6 +11,14 @@ mod v2_binding;
     not(test),
     expect(
         dead_code,
+        reason = "canonical integer helpers are consumed by staged V2 wire roots"
+    )
+)]
+mod v2_canonical_value;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
         reason = "typed digest helpers are consumed by staged V2 canonical roots"
     )
 )]
@@ -57,6 +65,9 @@ pub use session::{
     RuntimeServingSessionStateV1, RuntimeServingSessionV1,
 };
 pub use v2_binding::RuntimeBindingPinV1;
+pub use v2_canonical_value::{
+    RuntimeCanonicalValueErrorV2, RuntimeServingLeaseMillisecondsV2, RuntimeUnixMicrosecondsV2,
+};
 pub use v2_digest::{
     RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,
     RuntimeDrainIntentDigestV2, RuntimeLiveAttestationDigestV2, RuntimeProductMutationDigestV2,
