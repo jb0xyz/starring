@@ -42,22 +42,38 @@ fn source_files_contain_no_comments() {
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/registry.rs", include_str!("../src/registry.rs")),
         (
-            "tests/dependency_guard.rs",
-            include_str!("dependency_guard.rs"),
+            "src/v2_observation.rs",
+            include_str!("../src/v2_observation.rs"),
         ),
         ("tests/registry.rs", include_str!("registry.rs")),
     ];
     for (path, source) in sources {
-        for (index, line) in source.lines().enumerate() {
-            let trimmed = line.trim_start();
-            assert!(
-                !trimmed.starts_with("//")
-                    && !trimmed.starts_with("/*")
-                    && !trimmed.starts_with('*')
-                    && !trimmed.ends_with("*/"),
-                "source comment at {path}:{}",
-                index + 1
-            );
+        assert!(!source.contains("//"), "line comment in {path}");
+        assert!(!source.contains("/*"), "block comment in {path}");
+        assert!(!source.contains("*/"), "block comment terminator in {path}");
+    }
+}
+
+#[test]
+fn v2_admission_does_not_expose_v1_mutation_authority() {
+    let source = include_str!("../src/registry.rs");
+    let admitted = source
+        .split("pub struct AdmittedInteractionV2")
+        .nth(1)
+        .unwrap_or("")
+        .split("pub struct SlotDrainClaimSealV2")
+        .next()
+        .unwrap_or("");
+    assert!(!admitted.contains("AdmittedInteractionV1"));
+    assert!(!admitted.contains("SlotMutationTokenV1"));
+    assert!(!admitted.contains("ServingSlotSnapshotV1"));
+    assert!(!admitted.contains("into_admitted"));
+    for authority in ["AdmittedInteractionV2", "SlotDrainClaimSealV2"] {
+        let declaration = format!("pub struct {authority}");
+        let prefix = source.split(&declaration).next().unwrap_or("").trim_end();
+        assert!(!prefix.ends_with(")]"));
+        for implemented in ["Clone", "Default", "Serialize", "Deserialize"] {
+            assert!(!source.contains(&format!("impl {implemented} for {authority}")));
         }
     }
 }

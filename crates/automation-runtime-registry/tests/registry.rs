@@ -9,8 +9,8 @@ use automation_runtime_convergence::{
 };
 use automation_runtime_registry::{
     ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryConfigV1, ServingSlotRegistryError,
-    ServingSlotRegistryV1, SlotActivationOutcomeV1, SlotDrainOutcomeV1, SlotInstallOutcomeV1,
-    SlotLifecycleV1, SlotRemovalOutcomeV1,
+    ServingSlotRegistryV1, SlotActivationOutcomeV1, SlotAdmissionStateV2, SlotDrainOutcomeV1,
+    SlotInstallOutcomeV1, SlotLifecycleV1, SlotRemovalOutcomeV1, SlotSealKeyErrorV2, SlotSealKeyV2,
 };
 use automation_state::InteractionRuleSet;
 use desired_state::ResourceKey;
@@ -78,6 +78,10 @@ fn route(
 
 fn fence(value: u64) -> FencingToken {
     FencingToken::new(value).unwrap()
+}
+
+fn seal_key(value: u8) -> SlotSealKeyV2 {
+    SlotSealKeyV2::try_from([value; 16].as_slice()).unwrap()
 }
 
 #[test]
@@ -818,4 +822,489 @@ fn replacement_authority_can_remove_a_refenced_retired_route() {
             .unwrap(),
         SlotRemovalOutcomeV1::RemovedDraining
     );
+}
+
+#[test]
+fn atomic_v2_observation_tracks_only_effective_slot_mutations() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    assert_eq!(registry.atomic_observation_v2(&key).unwrap(), None);
+
+    let installed = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap();
+    let staged = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(staged.admission_state, SlotAdmissionStateV2::Staged);
+    assert_eq!(staged.admission_generation.get(), 1);
+    assert_eq!(staged.observation_sequence.get(), 1);
+    assert_eq!(staged.active_interactions, 0);
+    let staged_route = staged.route.as_ref().unwrap();
+    assert_eq!(staged_route.identity, candidate.identity().clone());
+    assert_eq!(staged_route.fencing_token, fence(1));
+    assert_eq!(staged_route.lifecycle, SlotLifecycleV1::Staged);
+
+    assert_eq!(
+        registry
+            .install(key.clone(), candidate.clone(), fence(1))
+            .unwrap()
+            .outcome,
+        SlotInstallOutcomeV1::AlreadyStaged
+    );
+    assert_eq!(
+        registry.atomic_observation_v2(&key).unwrap().unwrap(),
+        staged
+    );
+
+    let activation = registry
+        .activate_with_sequence_v2(&installed.token, candidate.identity())
+        .unwrap();
+    assert_eq!(activation.outcome(), SlotActivationOutcomeV1::Activated);
+    assert_eq!(activation.activation_sequence().get(), 1);
+    assert_eq!(
+        activation.observation().admission_state,
+        SlotAdmissionStateV2::Serving
+    );
+    assert_eq!(activation.observation().admission_generation.get(), 2);
+    assert_eq!(activation.observation().observation_sequence.get(), 2);
+
+    let replay = registry
+        .activate_with_sequence_v2(&installed.token, candidate.identity())
+        .unwrap();
+    assert_eq!(replay.outcome(), SlotActivationOutcomeV1::AlreadyServing);
+    assert_eq!(
+        replay.activation_sequence(),
+        activation.activation_sequence()
+    );
+    assert_eq!(replay.observation(), activation.observation());
+
+    let renewed = registry
+        .advance_authority(&installed.token, candidate.identity(), fence(2))
+        .unwrap();
+    let refenced = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(refenced.admission_generation.get(), 3);
+    assert_eq!(refenced.observation_sequence.get(), 3);
+    assert_eq!(refenced.route.as_ref().unwrap().fencing_token, fence(2));
+
+    registry.begin_drain(&renewed).unwrap();
+    let draining = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(draining.admission_state, SlotAdmissionStateV2::Draining);
+    assert_eq!(draining.admission_generation.get(), 4);
+    assert_eq!(draining.observation_sequence.get(), 4);
+    registry.begin_drain(&renewed).unwrap();
+    assert_eq!(
+        registry.atomic_observation_v2(&key).unwrap().unwrap(),
+        draining
+    );
+
+    registry.remove(&renewed).unwrap();
+    let empty = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(empty.admission_state, SlotAdmissionStateV2::Empty);
+    assert_eq!(empty.admission_generation.get(), 5);
+    assert_eq!(empty.observation_sequence.get(), 5);
+    assert_eq!(empty.route, None);
+}
+
+#[test]
+fn v2_guard_acquire_and_drop_advance_observation_only() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let token = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&token, candidate.identity()).unwrap();
+    let before = registry.atomic_observation_v2(&key).unwrap().unwrap();
+
+    let admitted = registry
+        .admit_at_generation_v2(&key, before.admission_generation)
+        .unwrap();
+    assert_eq!(
+        admitted.observation().admission_generation,
+        before.admission_generation
+    );
+    assert_eq!(
+        admitted.observation().observation_sequence.get(),
+        before.observation_sequence.get() + 1
+    );
+    assert_eq!(admitted.observation().active_interactions, 1);
+    assert_eq!(admitted.route().identity(), candidate.identity());
+
+    let while_active = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(while_active, admitted.observation().clone());
+    drop(admitted);
+    let after = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(after.admission_generation, before.admission_generation);
+    assert_eq!(
+        after.observation_sequence.get(),
+        before.observation_sequence.get() + 2
+    );
+    assert_eq!(after.active_interactions, 0);
+}
+
+#[test]
+fn v2_admission_rejects_a_generation_invalidated_by_replacement() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let key = first.slot_key();
+    let first_token = registry
+        .install(key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&first_token, first.identity()).unwrap();
+    let before = registry.atomic_observation_v2(&key).unwrap().unwrap();
+
+    let replacement = route(10, "study", 2, 2, "p2", Some(50));
+    registry
+        .install(key.clone(), replacement, fence(2))
+        .unwrap();
+    let after = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(after.admission_state, SlotAdmissionStateV2::Serving);
+    assert_eq!(
+        after.route.as_ref().unwrap().identity,
+        first.identity().clone()
+    );
+    assert_eq!(
+        registry
+            .admit_at_generation_v2(&key, before.admission_generation)
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::AdmissionGenerationMismatch {
+            expected: before.admission_generation,
+            actual: after.admission_generation,
+        }
+    );
+}
+
+#[test]
+fn guard_count_changes_do_not_invalidate_the_admission_generation() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let token = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&token, candidate.identity()).unwrap();
+    let generation = registry
+        .atomic_observation_v2(&key)
+        .unwrap()
+        .unwrap()
+        .admission_generation;
+    let first = registry.admit_at_generation_v2(&key, generation).unwrap();
+    let second = registry.admit_at_generation_v2(&key, generation).unwrap();
+    assert_eq!(first.observation().admission_generation, generation);
+    assert_eq!(second.observation().admission_generation, generation);
+    assert!(second.observation().observation_sequence > first.observation().observation_sequence);
+    drop(first);
+    drop(second);
+    assert_eq!(
+        registry
+            .atomic_observation_v2(&key)
+            .unwrap()
+            .unwrap()
+            .admission_generation,
+        generation
+    );
+}
+
+#[test]
+fn activation_sequence_is_monotonic_and_replay_stable() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let key = first.slot_key();
+    let first_token = registry
+        .install(key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    let first_activation = registry
+        .activate_with_sequence_v2(&first_token, first.identity())
+        .unwrap();
+    assert_eq!(first_activation.activation_sequence().get(), 1);
+    assert_eq!(
+        registry
+            .activate_with_sequence_v2(&first_token, first.identity())
+            .unwrap()
+            .activation_sequence(),
+        first_activation.activation_sequence()
+    );
+
+    let replacement = route(10, "study", 2, 2, "p2", Some(50));
+    let replacement_token = registry
+        .install(key, replacement.clone(), fence(2))
+        .unwrap()
+        .token;
+    let replacement_activation = registry
+        .activate_with_sequence_v2(&replacement_token, replacement.identity())
+        .unwrap();
+    assert_eq!(replacement_activation.activation_sequence().get(), 2);
+    assert_eq!(
+        replacement_activation.route().identity,
+        replacement.identity().clone()
+    );
+}
+
+#[test]
+fn v2_tombstone_counters_are_retained_and_slots_are_isolated() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let first_key = first.slot_key();
+    let first_token = registry
+        .install(first_key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&first_token, first.identity()).unwrap();
+
+    let second = route(20, "study", 1, 1, "p2", None);
+    let second_key = second.slot_key();
+    let second_token = registry
+        .install(second_key.clone(), second.clone(), fence(1))
+        .unwrap()
+        .token;
+    let second_before = registry
+        .atomic_observation_v2(&second_key)
+        .unwrap()
+        .unwrap();
+
+    registry.begin_drain(&first_token).unwrap();
+    registry.remove(&first_token).unwrap();
+    let first_empty = registry.atomic_observation_v2(&first_key).unwrap().unwrap();
+    assert_eq!(first_empty.admission_state, SlotAdmissionStateV2::Empty);
+    assert_eq!(
+        registry
+            .atomic_observation_v2(&second_key)
+            .unwrap()
+            .unwrap(),
+        second_before
+    );
+
+    let first_replacement = route(10, "study", 2, 2, "p3", Some(51));
+    registry
+        .install(first_key.clone(), first_replacement, fence(2))
+        .unwrap();
+    let first_reinstalled = registry.atomic_observation_v2(&first_key).unwrap().unwrap();
+    assert_eq!(
+        first_reinstalled.admission_generation.get(),
+        first_empty.admission_generation.get() + 1
+    );
+    assert_eq!(
+        first_reinstalled.observation_sequence.get(),
+        first_empty.observation_sequence.get() + 1
+    );
+    assert_eq!(
+        registry.route_witness(&second_token).unwrap().identity,
+        second.identity().clone()
+    );
+}
+
+#[test]
+fn slot_seal_key_accepts_only_exact_binary_identity() {
+    let bytes = [7_u8; 16];
+    let key = SlotSealKeyV2::try_from(bytes.as_slice()).unwrap();
+    assert_eq!(key.as_bytes(), &bytes);
+    for invalid in [vec![7_u8; 15], vec![7_u8; 17]] {
+        assert_eq!(
+            SlotSealKeyV2::try_from(invalid.as_slice()),
+            Err(SlotSealKeyErrorV2::InvalidLength)
+        );
+    }
+}
+
+#[test]
+fn drain_claim_seal_blocks_admission_and_ordinary_mutation() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let token = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&token, candidate.identity()).unwrap();
+    let active = registry.admit(&key).unwrap();
+    let before = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    let (seal, sealed) = registry
+        .seal_drain_claim_v2(&key, seal_key(7), Some(&before))
+        .unwrap();
+    assert_eq!(seal.key(), &key);
+    assert_eq!(seal.seal_key(), seal_key(7));
+    assert_eq!(seal.seal_generation().get(), 1);
+    assert_eq!(seal.route(), before.route.as_ref());
+    assert_eq!(
+        sealed.admission_state,
+        SlotAdmissionStateV2::DrainClaimSealed {
+            seal_key: seal_key(7),
+            seal_generation: seal.seal_generation(),
+        }
+    );
+    assert_eq!(
+        sealed.admission_generation.get(),
+        before.admission_generation.get() + 1
+    );
+    assert_eq!(
+        sealed.observation_sequence.get(),
+        before.observation_sequence.get() + 1
+    );
+    assert!(registry.serving_snapshot(&key).unwrap().is_none());
+    assert_eq!(
+        registry.admit(&key).err().unwrap(),
+        ServingSlotRegistryError::SlotSealed
+    );
+    assert_eq!(
+        registry
+            .install(key.clone(), candidate.clone(), fence(1))
+            .unwrap_err(),
+        ServingSlotRegistryError::SlotSealed
+    );
+    assert_eq!(
+        registry.activate(&token, candidate.identity()),
+        Err(ServingSlotRegistryError::SlotSealed)
+    );
+    assert_eq!(
+        registry.begin_drain(&token),
+        Err(ServingSlotRegistryError::SlotSealed)
+    );
+    assert_eq!(
+        registry.advance_authority(&token, candidate.identity(), fence(2)),
+        Err(ServingSlotRegistryError::SlotSealed)
+    );
+    assert_eq!(
+        registry.remove(&token),
+        Err(ServingSlotRegistryError::SlotSealed)
+    );
+
+    drop(active);
+    let after_drop = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(after_drop.active_interactions, 0);
+    assert_eq!(after_drop.admission_generation, sealed.admission_generation);
+    assert_eq!(
+        after_drop.observation_sequence.get(),
+        sealed.observation_sequence.get() + 1
+    );
+    let reopened = registry.unseal_drain_claim_v2(seal).unwrap();
+    assert_eq!(reopened.admission_state, SlotAdmissionStateV2::Serving);
+    assert_eq!(
+        reopened.admission_generation.get(),
+        sealed.admission_generation.get() + 1
+    );
+    assert_eq!(
+        reopened.observation_sequence.get(),
+        after_drop.observation_sequence.get() + 1
+    );
+    assert!(registry.admit(&key).is_ok());
+}
+
+#[test]
+fn empty_slot_seal_materializes_a_fenced_tombstone() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    assert_eq!(registry.atomic_observation_v2(&key).unwrap(), None);
+    let (seal, sealed) = registry
+        .seal_drain_claim_v2(&key, seal_key(8), None)
+        .unwrap();
+    assert_eq!(sealed.route, None);
+    assert_eq!(sealed.active_interactions, 0);
+    assert_eq!(sealed.admission_generation.get(), 1);
+    assert_eq!(sealed.observation_sequence.get(), 1);
+    assert!(matches!(
+        sealed.admission_state,
+        SlotAdmissionStateV2::DrainClaimSealed { .. }
+    ));
+    assert_eq!(
+        registry
+            .install(key.clone(), candidate.clone(), fence(1))
+            .unwrap_err(),
+        ServingSlotRegistryError::SlotSealed
+    );
+    let empty = registry.unseal_drain_claim_v2(seal).unwrap();
+    assert_eq!(empty.admission_state, SlotAdmissionStateV2::Empty);
+    assert_eq!(empty.admission_generation.get(), 2);
+    assert_eq!(empty.observation_sequence.get(), 2);
+    registry.install(key.clone(), candidate, fence(1)).unwrap();
+    let staged = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    assert_eq!(staged.admission_state, SlotAdmissionStateV2::Staged);
+    assert_eq!(staged.admission_generation.get(), 3);
+    assert_eq!(staged.observation_sequence.get(), 3);
+}
+
+#[test]
+fn seal_requires_the_exact_atomic_observation() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let token = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&token, candidate.identity()).unwrap();
+    let stale = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    let admitted = registry.admit(&key).unwrap();
+    assert_eq!(
+        registry
+            .seal_drain_claim_v2(&key, seal_key(9), Some(&stale))
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::StaleSlotObservation
+    );
+    drop(admitted);
+    assert_eq!(
+        registry
+            .seal_drain_claim_v2(&key, seal_key(9), None)
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::StaleSlotObservation
+    );
+}
+
+#[test]
+fn seal_and_admission_race_has_one_linearized_winner() {
+    use std::sync::{Arc, Barrier};
+
+    for iteration in 0..64 {
+        let registry = registry(8);
+        let candidate = route(10, "study", 1, 1, "p1", None);
+        let key = candidate.slot_key();
+        let token = registry
+            .install(key.clone(), candidate.clone(), fence(1))
+            .unwrap()
+            .token;
+        registry.activate(&token, candidate.identity()).unwrap();
+        let before = registry.atomic_observation_v2(&key).unwrap().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let seal_barrier = Arc::clone(&barrier);
+            let seal_registry = &registry;
+            let seal_key_ref = &key;
+            let seal_before = &before;
+            let seal = scope.spawn(move || {
+                seal_barrier.wait();
+                seal_registry.seal_drain_claim_v2(
+                    seal_key_ref,
+                    seal_key((iteration + 1) as u8),
+                    Some(seal_before),
+                )
+            });
+            let admit_barrier = Arc::clone(&barrier);
+            let admit_registry = &registry;
+            let admit_key = &key;
+            let admit_before = &before;
+            let admit = scope.spawn(move || {
+                admit_barrier.wait();
+                admit_registry.admit_at_generation_v2(admit_key, admit_before.admission_generation)
+            });
+            barrier.wait();
+            let seal_result = seal.join().unwrap();
+            let admit_result = admit.join().unwrap();
+            match (seal_result, admit_result) {
+                (Ok((capability, _)), Err(ServingSlotRegistryError::SlotSealed)) => {
+                    registry.unseal_drain_claim_v2(capability).unwrap();
+                }
+                (Err(ServingSlotRegistryError::StaleSlotObservation), Ok(admitted)) => {
+                    drop(admitted);
+                }
+                _ => panic!("seal and admission did not linearize"),
+            }
+        });
+    }
 }

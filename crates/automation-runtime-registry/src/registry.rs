@@ -7,7 +7,10 @@ use automation_runtime_convergence::{
     FencingToken, ProcessInstanceId, RuntimeGeneration, RuntimeProcessIdentityV1,
 };
 
-use crate::{ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryError};
+use crate::{
+    ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryError, SlotAdmissionStateV2,
+    SlotAtomicObservationV2,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServingSlotRegistryConfigV1 {
@@ -158,10 +161,88 @@ pub struct SlotRouteWitnessV1 {
     pub lifecycle: SlotLifecycleV1,
 }
 
+pub struct SlotActivationRecordV2 {
+    outcome: SlotActivationOutcomeV1,
+    route: SlotRouteWitnessV1,
+    activation_sequence: NonZeroU64,
+    observation: SlotAtomicObservationV2,
+}
+
+impl SlotActivationRecordV2 {
+    pub const fn outcome(&self) -> SlotActivationOutcomeV1 {
+        self.outcome
+    }
+
+    pub fn route(&self) -> &SlotRouteWitnessV1 {
+        &self.route
+    }
+
+    pub const fn activation_sequence(&self) -> NonZeroU64 {
+        self.activation_sequence
+    }
+
+    pub fn observation(&self) -> &SlotAtomicObservationV2 {
+        &self.observation
+    }
+}
+
 pub struct AdmittedInteractionV1 {
     route: ExactServingRouteV1,
     snapshot: ServingSlotSnapshotV1,
     guard: ActiveInteractionGuardV1,
+}
+
+pub struct AdmittedInteractionV2 {
+    route: ExactServingRouteV1,
+    guard: ActiveInteractionGuardV1,
+    observation: SlotAtomicObservationV2,
+}
+
+impl AdmittedInteractionV2 {
+    pub fn route(&self) -> &ExactServingRouteV1 {
+        &self.route
+    }
+
+    pub fn active_guard(&self) -> &ActiveInteractionGuardV1 {
+        &self.guard
+    }
+
+    pub fn observation(&self) -> &SlotAtomicObservationV2 {
+        &self.observation
+    }
+}
+
+pub struct SlotDrainClaimSealV2 {
+    registry: Weak<RegistryInner>,
+    key: ServingSlotKeyV1,
+    seal_key: crate::SlotSealKeyV2,
+    seal_generation: NonZeroU64,
+    route: Option<SlotRouteWitnessV1>,
+}
+
+struct AdmittedInteractionPartsV2 {
+    route: ExactServingRouteV1,
+    snapshot: ServingSlotSnapshotV1,
+    guard: ActiveInteractionGuardV1,
+    observation: SlotAtomicObservationV2,
+}
+
+impl SlotDrainClaimSealV2 {
+    pub fn key(&self) -> &ServingSlotKeyV1 {
+        &self.key
+    }
+
+    pub const fn seal_key(&self) -> crate::SlotSealKeyV2 {
+        self.seal_key
+    }
+
+    pub const fn seal_generation(&self) -> NonZeroU64 {
+        self.seal_generation
+    }
+
+    pub fn route(&self) -> Option<&SlotRouteWitnessV1> {
+        self.route.as_ref()
+    }
 }
 
 impl AdmittedInteractionV1 {
@@ -200,14 +281,22 @@ impl Drop for ActiveInteractionGuardV1 {
         let Some(slot) = state.slots.get_mut(&self.key) else {
             return;
         };
-        if let Some(route) = slot.current.as_mut() {
-            if route.incarnation == self.incarnation {
+        let current_matches = slot
+            .current
+            .as_ref()
+            .is_some_and(|route| route.incarnation == self.incarnation);
+        if current_matches {
+            advance_observation_or_close(slot);
+            if let Some(route) = slot.current.as_mut() {
                 route.active_interactions = route.active_interactions.saturating_sub(1);
-                return;
             }
+            return;
         }
-        if let Some(route) = slot.retired.get_mut(&self.incarnation) {
-            route.active_interactions = route.active_interactions.saturating_sub(1);
+        if slot.retired.contains_key(&self.incarnation) {
+            advance_observation_or_close(slot);
+            if let Some(route) = slot.retired.get_mut(&self.incarnation) {
+                route.active_interactions = route.active_interactions.saturating_sub(1);
+            }
         }
     }
 }
@@ -228,12 +317,40 @@ struct RegistryState {
     next_incarnation: u64,
 }
 
-#[derive(Default)]
 struct SlotCell {
     high_water: Option<FenceHighWater>,
     current: Option<RouteRecord>,
     staged: Option<RouteRecord>,
     retired: HashMap<NonZeroU64, RouteRecord>,
+    admission_generation: NonZeroU64,
+    observation_sequence: NonZeroU64,
+    next_activation_sequence: u64,
+    next_seal_generation: u64,
+    seal: Option<SlotSealState>,
+    failed_closed: bool,
+}
+
+impl Default for SlotCell {
+    fn default() -> Self {
+        Self {
+            high_water: None,
+            current: None,
+            staged: None,
+            retired: HashMap::new(),
+            admission_generation: NonZeroU64::MIN,
+            observation_sequence: NonZeroU64::MIN,
+            next_activation_sequence: 0,
+            next_seal_generation: 0,
+            seal: None,
+            failed_closed: false,
+        }
+    }
+}
+
+struct SlotSealState {
+    seal_key: crate::SlotSealKeyV2,
+    seal_generation: NonZeroU64,
+    route: Option<SlotRouteWitnessV1>,
 }
 
 struct FenceHighWater {
@@ -248,6 +365,7 @@ struct RouteRecord {
     incarnation: NonZeroU64,
     lifecycle: SlotLifecycleV1,
     active_interactions: u32,
+    activation_sequence: Option<NonZeroU64>,
 }
 
 impl RouteRecord {
@@ -292,10 +410,13 @@ impl ServingSlotRegistryV1 {
             return Err(ServingSlotRegistryError::TargetSlotMismatch);
         }
         let mut state = self.lock_state()?;
-        if !state.slots.contains_key(&key)
-            && state.slots.len() >= self.inner.config.max_slots.get() as usize
-        {
+        let slot_is_new = !state.slots.contains_key(&key);
+        if slot_is_new && state.slots.len() >= self.inner.config.max_slots.get() as usize {
             return Err(ServingSlotRegistryError::SlotCapacityExceeded);
+        }
+        if let Some(slot) = state.slots.get(&key) {
+            ensure_slot_open(slot)?;
+            ensure_slot_unsealed(slot)?;
         }
         if let Some(existing) = state.slots.get(&key).and_then(|slot| {
             find_exact_installed(slot, route.identity(), fencing_token).map(|(record, outcome)| {
@@ -312,7 +433,15 @@ impl ServingSlotRegistryV1 {
             });
         }
         validate_new_fence(state.slots.get(&key), route.identity(), fencing_token)?;
-        let incarnation = next_incarnation(&mut state)?;
+        let incarnation = next_incarnation(&state)?;
+        if !slot_is_new {
+            let slot = state
+                .slots
+                .get_mut(&key)
+                .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+            advance_slot_mutation(slot)?;
+        }
+        state.next_incarnation = incarnation.get();
         let slot = state.slots.entry(key.clone()).or_default();
         slot.high_water = Some(FenceHighWater {
             generation: route.identity().runtime_generation,
@@ -325,6 +454,7 @@ impl ServingSlotRegistryV1 {
             incarnation,
             lifecycle: SlotLifecycleV1::Staged,
             active_interactions: 0,
+            activation_sequence: None,
         };
         let token = record.mutation_token(Arc::downgrade(&self.inner), &key);
         slot.staged = Some(record);
@@ -339,6 +469,15 @@ impl ServingSlotRegistryV1 {
         token: &SlotMutationTokenV1,
         expected_identity: &RuntimeProcessIdentityV1,
     ) -> Result<SlotActivationOutcomeV1, ServingSlotRegistryError> {
+        self.activate_with_sequence_v2(token, expected_identity)
+            .map(|receipt| receipt.outcome())
+    }
+
+    pub fn activate_with_sequence_v2(
+        &self,
+        token: &SlotMutationTokenV1,
+        expected_identity: &RuntimeProcessIdentityV1,
+    ) -> Result<SlotActivationRecordV2, ServingSlotRegistryError> {
         if token.identity() != expected_identity {
             return Err(ServingSlotRegistryError::ActivationTargetMismatch);
         }
@@ -349,10 +488,16 @@ impl ServingSlotRegistryV1 {
             .slots
             .get_mut(token.key())
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
         if let Some(current) = &slot.current {
             if current.matches(token) && current.lifecycle == SlotLifecycleV1::Serving {
                 ensure_high_water(Some(slot), token)?;
-                return Ok(SlotActivationOutcomeV1::AlreadyServing);
+                return activation_record_v2(
+                    slot,
+                    current,
+                    SlotActivationOutcomeV1::AlreadyServing,
+                );
             }
         }
         let staged_matches = slot
@@ -371,6 +516,7 @@ impl ServingSlotRegistryV1 {
         if retiring_active && slot.retired.len() >= max_retired {
             return Err(ServingSlotRegistryError::RetiredRouteCapacityExceeded);
         }
+        let activation_sequence = advance_slot_activation(slot)?;
         if let Some(mut current) = slot.current.take() {
             current.lifecycle = SlotLifecycleV1::Draining;
             if current.active_interactions > 0 {
@@ -382,8 +528,13 @@ impl ServingSlotRegistryV1 {
             .take()
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
         staged.lifecycle = SlotLifecycleV1::Serving;
+        staged.activation_sequence = Some(activation_sequence);
         slot.current = Some(staged);
-        Ok(SlotActivationOutcomeV1::Activated)
+        let current = slot
+            .current
+            .as_ref()
+            .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        activation_record_v2(slot, current, SlotActivationOutcomeV1::Activated)
     }
 
     pub fn begin_drain(
@@ -408,6 +559,8 @@ impl ServingSlotRegistryV1 {
             .slots
             .get_mut(target.key())
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
         if authority == target {
             if let Some(retired) = slot.retired.get(&target.incarnation) {
                 if retired.matches(target) {
@@ -423,20 +576,33 @@ impl ServingSlotRegistryV1 {
             .as_ref()
             .is_some_and(|current| current.matches(target));
         if current_matches {
-            let current = slot
+            let lifecycle = slot
                 .current
-                .as_mut()
-                .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
-            return match current.lifecycle {
+                .as_ref()
+                .ok_or(ServingSlotRegistryError::StaleMutationToken)?
+                .lifecycle;
+            return match lifecycle {
                 SlotLifecycleV1::Serving => {
+                    advance_slot_mutation(slot)?;
+                    let current = slot
+                        .current
+                        .as_mut()
+                        .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
                     current.lifecycle = SlotLifecycleV1::Draining;
                     Ok(SlotDrainOutcomeV1::DrainStarted {
                         active_interactions: current.active_interactions,
                     })
                 }
-                SlotLifecycleV1::Draining => Ok(SlotDrainOutcomeV1::AlreadyDraining {
-                    active_interactions: current.active_interactions,
-                }),
+                SlotLifecycleV1::Draining => {
+                    let active_interactions = slot
+                        .current
+                        .as_ref()
+                        .ok_or(ServingSlotRegistryError::StaleMutationToken)?
+                        .active_interactions;
+                    Ok(SlotDrainOutcomeV1::AlreadyDraining {
+                        active_interactions,
+                    })
+                }
                 SlotLifecycleV1::Staged => Err(ServingSlotRegistryError::NotServing),
             };
         }
@@ -480,12 +646,15 @@ impl ServingSlotRegistryV1 {
             .slots
             .get_mut(token.key())
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
         if slot
             .staged
             .as_ref()
             .is_some_and(|staged| staged.matches(token))
         {
             ensure_high_water(Some(slot), token)?;
+            advance_slot_mutation(slot)?;
             slot.staged = None;
             return Ok(SlotRemovalOutcomeV1::RemovedStaged);
         }
@@ -500,12 +669,14 @@ impl ServingSlotRegistryV1 {
                 .as_ref()
                 .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
             validate_removable(current)?;
+            advance_slot_mutation(slot)?;
             slot.current = None;
             return Ok(SlotRemovalOutcomeV1::RemovedDraining);
         }
         if let Some(retired) = slot.retired.get(&token.incarnation) {
             if retired.matches(token) {
                 validate_removable(retired)?;
+                advance_slot_mutation(slot)?;
                 slot.retired.remove(&token.incarnation);
                 return Ok(SlotRemovalOutcomeV1::RemovedDraining);
             }
@@ -528,12 +699,15 @@ impl ServingSlotRegistryV1 {
             .slots
             .get_mut(target.key())
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
         ensure_high_water(Some(slot), authority)?;
         if slot
             .staged
             .as_ref()
             .is_some_and(|staged| staged.matches(target))
         {
+            advance_slot_mutation(slot)?;
             slot.staged = None;
             return Ok(SlotRemovalOutcomeV1::RemovedStaged);
         }
@@ -547,12 +721,14 @@ impl ServingSlotRegistryV1 {
                 .as_ref()
                 .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
             validate_removable(current)?;
+            advance_slot_mutation(slot)?;
             slot.current = None;
             return Ok(SlotRemovalOutcomeV1::RemovedDraining);
         }
         if let Some(retired) = slot.retired.get(&target.incarnation) {
             if retired.matches(target) {
                 validate_removable(retired)?;
+                advance_slot_mutation(slot)?;
                 slot.retired.remove(&target.incarnation);
                 return Ok(SlotRemovalOutcomeV1::RemovedDraining);
             }
@@ -565,7 +741,14 @@ impl ServingSlotRegistryV1 {
         key: &ServingSlotKeyV1,
     ) -> Result<Option<ServingSlotSnapshotV1>, ServingSlotRegistryError> {
         let state = self.lock_state()?;
-        let Some(current) = state.slots.get(key).and_then(|slot| slot.current.as_ref()) else {
+        let Some(slot) = state.slots.get(key) else {
+            return Ok(None);
+        };
+        ensure_slot_open(slot)?;
+        if slot.seal.is_some() {
+            return Ok(None);
+        }
+        let Some(current) = slot.current.as_ref() else {
             return Ok(None);
         };
         if current.lifecycle != SlotLifecycleV1::Serving {
@@ -580,11 +763,47 @@ impl ServingSlotRegistryV1 {
         &self,
         key: &ServingSlotKeyV1,
     ) -> Result<AdmittedInteractionV1, ServingSlotRegistryError> {
+        self.admit_internal_v2(key, None)
+            .map(|parts| AdmittedInteractionV1 {
+                route: parts.route,
+                snapshot: parts.snapshot,
+                guard: parts.guard,
+            })
+    }
+
+    pub fn admit_at_generation_v2(
+        &self,
+        key: &ServingSlotKeyV1,
+        expected_admission_generation: NonZeroU64,
+    ) -> Result<AdmittedInteractionV2, ServingSlotRegistryError> {
+        self.admit_internal_v2(key, Some(expected_admission_generation))
+            .map(|parts| AdmittedInteractionV2 {
+                route: parts.route,
+                guard: parts.guard,
+                observation: parts.observation,
+            })
+    }
+
+    fn admit_internal_v2(
+        &self,
+        key: &ServingSlotKeyV1,
+        expected_admission_generation: Option<NonZeroU64>,
+    ) -> Result<AdmittedInteractionPartsV2, ServingSlotRegistryError> {
         let mut state = self.lock_state()?;
         let slot = state
             .slots
             .get_mut(key)
             .ok_or(ServingSlotRegistryError::NotServing)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
+        if let Some(expected) = expected_admission_generation {
+            if slot.admission_generation != expected {
+                return Err(ServingSlotRegistryError::AdmissionGenerationMismatch {
+                    expected,
+                    actual: slot.admission_generation,
+                });
+            }
+        }
         let current = slot
             .current
             .as_ref()
@@ -601,6 +820,7 @@ impl ServingSlotRegistryV1 {
         if total_active >= u64::from(self.inner.config.max_active_interactions_per_slot.get()) {
             return Err(ServingSlotRegistryError::ActiveInteractionCapacityExceeded);
         }
+        advance_slot_observation(slot)?;
         let current = slot
             .current
             .as_mut()
@@ -615,11 +835,90 @@ impl ServingSlotRegistryV1 {
             key: key.clone(),
             incarnation: current.incarnation,
         };
-        Ok(AdmittedInteractionV1 {
+        Ok(AdmittedInteractionPartsV2 {
             route,
             snapshot,
             guard,
+            observation: atomic_observation_v2(slot)?,
         })
+    }
+
+    pub fn atomic_observation_v2(
+        &self,
+        key: &ServingSlotKeyV1,
+    ) -> Result<Option<SlotAtomicObservationV2>, ServingSlotRegistryError> {
+        let state = self.lock_state()?;
+        state.slots.get(key).map(atomic_observation_v2).transpose()
+    }
+
+    pub fn seal_drain_claim_v2(
+        &self,
+        key: &ServingSlotKeyV1,
+        seal_key: crate::SlotSealKeyV2,
+        expected: Option<&SlotAtomicObservationV2>,
+    ) -> Result<(SlotDrainClaimSealV2, SlotAtomicObservationV2), ServingSlotRegistryError> {
+        let mut state = self.lock_state()?;
+        let slot_is_new = !state.slots.contains_key(key);
+        if slot_is_new && state.slots.len() >= self.inner.config.max_slots.get() as usize {
+            return Err(ServingSlotRegistryError::SlotCapacityExceeded);
+        }
+        if slot_is_new {
+            if expected.is_some() {
+                return Err(ServingSlotRegistryError::StaleSlotObservation);
+            }
+        } else {
+            let slot = state
+                .slots
+                .get(key)
+                .ok_or(ServingSlotRegistryError::StaleSlotObservation)?;
+            ensure_slot_open(slot)?;
+            ensure_slot_unsealed(slot)?;
+            if expected != Some(&atomic_observation_v2(slot)?) {
+                return Err(ServingSlotRegistryError::StaleSlotObservation);
+            }
+        }
+        let slot = state.slots.entry(key.clone()).or_default();
+        let route = selected_route(slot).map(route_witness_v1);
+        let seal_generation = advance_slot_seal(slot, slot_is_new)?;
+        slot.seal = Some(SlotSealState {
+            seal_key,
+            seal_generation,
+            route: route.clone(),
+        });
+        let capability = SlotDrainClaimSealV2 {
+            registry: Arc::downgrade(&self.inner),
+            key: key.clone(),
+            seal_key,
+            seal_generation,
+            route,
+        };
+        Ok((capability, atomic_observation_v2(slot)?))
+    }
+
+    pub fn unseal_drain_claim_v2(
+        &self,
+        capability: SlotDrainClaimSealV2,
+    ) -> Result<SlotAtomicObservationV2, ServingSlotRegistryError> {
+        if !Weak::ptr_eq(&capability.registry, &Arc::downgrade(&self.inner)) {
+            return Err(ServingSlotRegistryError::StaleSlotSeal);
+        }
+        let mut state = self.lock_state()?;
+        let slot = state
+            .slots
+            .get_mut(&capability.key)
+            .ok_or(ServingSlotRegistryError::StaleSlotSeal)?;
+        ensure_slot_open(slot)?;
+        let seal_matches = slot.seal.as_ref().is_some_and(|seal| {
+            seal.seal_key == capability.seal_key
+                && seal.seal_generation == capability.seal_generation
+                && seal.route == capability.route
+        });
+        if !seal_matches || selected_route(slot).map(route_witness_v1) != capability.route {
+            return Err(ServingSlotRegistryError::StaleSlotSeal);
+        }
+        advance_slot_mutation(slot)?;
+        slot.seal = None;
+        atomic_observation_v2(slot)
     }
 
     pub fn route_status(
@@ -671,6 +970,8 @@ impl ServingSlotRegistryV1 {
             .slots
             .get_mut(token.key())
             .ok_or(ServingSlotRegistryError::StaleMutationToken)?;
+        ensure_slot_open(slot)?;
+        ensure_slot_unsealed(slot)?;
         ensure_high_water(Some(slot), token)?;
         let staged_matches = slot
             .staged
@@ -696,6 +997,7 @@ impl ServingSlotRegistryV1 {
                 actual: next_fencing_token,
             });
         }
+        advance_slot_mutation(slot)?;
         let (route, high_water) = if staged_matches {
             match (&mut slot.staged, &mut slot.high_water) {
                 (Some(staged), Some(high_water)) => (staged, high_water),
@@ -729,6 +1031,166 @@ impl ServingSlotRegistryV1 {
             .lock()
             .map_err(|_| ServingSlotRegistryError::RegistryPoisoned)
     }
+}
+
+fn ensure_slot_open(slot: &SlotCell) -> Result<(), ServingSlotRegistryError> {
+    if slot.failed_closed {
+        Err(ServingSlotRegistryError::SlotSequenceExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_slot_unsealed(slot: &SlotCell) -> Result<(), ServingSlotRegistryError> {
+    if slot.seal.is_some() {
+        Err(ServingSlotRegistryError::SlotSealed)
+    } else {
+        Ok(())
+    }
+}
+
+fn successor(value: NonZeroU64) -> Option<NonZeroU64> {
+    value.get().checked_add(1).and_then(NonZeroU64::new)
+}
+
+fn close_slot(slot: &mut SlotCell) -> ServingSlotRegistryError {
+    slot.failed_closed = true;
+    ServingSlotRegistryError::SlotSequenceExhausted
+}
+
+fn advance_slot_mutation(slot: &mut SlotCell) -> Result<(), ServingSlotRegistryError> {
+    ensure_slot_open(slot)?;
+    let Some(admission_generation) = successor(slot.admission_generation) else {
+        return Err(close_slot(slot));
+    };
+    let Some(observation_sequence) = successor(slot.observation_sequence) else {
+        return Err(close_slot(slot));
+    };
+    slot.admission_generation = admission_generation;
+    slot.observation_sequence = observation_sequence;
+    Ok(())
+}
+
+fn advance_slot_activation(slot: &mut SlotCell) -> Result<NonZeroU64, ServingSlotRegistryError> {
+    ensure_slot_open(slot)?;
+    let Some(admission_generation) = successor(slot.admission_generation) else {
+        return Err(close_slot(slot));
+    };
+    let Some(observation_sequence) = successor(slot.observation_sequence) else {
+        return Err(close_slot(slot));
+    };
+    let Some(next_activation_sequence) = slot.next_activation_sequence.checked_add(1) else {
+        return Err(close_slot(slot));
+    };
+    let Some(activation_sequence) = NonZeroU64::new(next_activation_sequence) else {
+        return Err(close_slot(slot));
+    };
+    slot.admission_generation = admission_generation;
+    slot.observation_sequence = observation_sequence;
+    slot.next_activation_sequence = next_activation_sequence;
+    Ok(activation_sequence)
+}
+
+fn advance_slot_seal(
+    slot: &mut SlotCell,
+    materializing: bool,
+) -> Result<NonZeroU64, ServingSlotRegistryError> {
+    ensure_slot_open(slot)?;
+    let admission_generation = if materializing {
+        slot.admission_generation
+    } else {
+        successor(slot.admission_generation).ok_or_else(|| close_slot(slot))?
+    };
+    let observation_sequence = if materializing {
+        slot.observation_sequence
+    } else {
+        successor(slot.observation_sequence).ok_or_else(|| close_slot(slot))?
+    };
+    let Some(next_seal_generation) = slot.next_seal_generation.checked_add(1) else {
+        return Err(close_slot(slot));
+    };
+    let Some(seal_generation) = NonZeroU64::new(next_seal_generation) else {
+        return Err(close_slot(slot));
+    };
+    slot.admission_generation = admission_generation;
+    slot.observation_sequence = observation_sequence;
+    slot.next_seal_generation = next_seal_generation;
+    Ok(seal_generation)
+}
+
+fn advance_slot_observation(slot: &mut SlotCell) -> Result<(), ServingSlotRegistryError> {
+    ensure_slot_open(slot)?;
+    let Some(observation_sequence) = successor(slot.observation_sequence) else {
+        return Err(close_slot(slot));
+    };
+    slot.observation_sequence = observation_sequence;
+    Ok(())
+}
+
+fn advance_observation_or_close(slot: &mut SlotCell) {
+    if slot.failed_closed {
+        return;
+    }
+    let Some(observation_sequence) = successor(slot.observation_sequence) else {
+        slot.failed_closed = true;
+        return;
+    };
+    slot.observation_sequence = observation_sequence;
+}
+
+fn route_witness_v1(route: &RouteRecord) -> SlotRouteWitnessV1 {
+    SlotRouteWitnessV1 {
+        identity: route.route.identity().clone(),
+        fencing_token: route.fencing_token,
+        incarnation: route.incarnation,
+        lifecycle: route.lifecycle,
+    }
+}
+
+fn selected_route(slot: &SlotCell) -> Option<&RouteRecord> {
+    slot.current.as_ref().or(slot.staged.as_ref())
+}
+
+fn atomic_observation_v2(
+    slot: &SlotCell,
+) -> Result<SlotAtomicObservationV2, ServingSlotRegistryError> {
+    ensure_slot_open(slot)?;
+    let route = selected_route(slot);
+    let admission_state = match &slot.seal {
+        Some(seal) => SlotAdmissionStateV2::DrainClaimSealed {
+            seal_key: seal.seal_key,
+            seal_generation: seal.seal_generation,
+        },
+        None => match route.map(|route| route.lifecycle) {
+            Some(SlotLifecycleV1::Staged) => SlotAdmissionStateV2::Staged,
+            Some(SlotLifecycleV1::Serving) => SlotAdmissionStateV2::Serving,
+            Some(SlotLifecycleV1::Draining) => SlotAdmissionStateV2::Draining,
+            None => SlotAdmissionStateV2::Empty,
+        },
+    };
+    Ok(SlotAtomicObservationV2 {
+        route: route.map(route_witness_v1),
+        admission_state,
+        active_interactions: route.map_or(0, |route| route.active_interactions),
+        admission_generation: slot.admission_generation,
+        observation_sequence: slot.observation_sequence,
+    })
+}
+
+fn activation_record_v2(
+    slot: &SlotCell,
+    route: &RouteRecord,
+    outcome: SlotActivationOutcomeV1,
+) -> Result<SlotActivationRecordV2, ServingSlotRegistryError> {
+    let activation_sequence = route
+        .activation_sequence
+        .ok_or(ServingSlotRegistryError::SlotSequenceExhausted)?;
+    Ok(SlotActivationRecordV2 {
+        outcome,
+        route: route_witness_v1(route),
+        activation_sequence,
+        observation: atomic_observation_v2(slot)?,
+    })
 }
 
 fn find_exact_installed<'a>(
@@ -783,12 +1245,12 @@ fn validate_new_fence(
     Ok(())
 }
 
-fn next_incarnation(state: &mut RegistryState) -> Result<NonZeroU64, ServingSlotRegistryError> {
-    state.next_incarnation = state
+fn next_incarnation(state: &RegistryState) -> Result<NonZeroU64, ServingSlotRegistryError> {
+    let next = state
         .next_incarnation
         .checked_add(1)
         .ok_or(ServingSlotRegistryError::IncarnationExhausted)?;
-    NonZeroU64::new(state.next_incarnation).ok_or(ServingSlotRegistryError::IncarnationExhausted)
+    NonZeroU64::new(next).ok_or(ServingSlotRegistryError::IncarnationExhausted)
 }
 
 fn ensure_high_water(
@@ -831,4 +1293,63 @@ fn validate_removable(route: &RouteRecord) -> Result<(), ServingSlotRegistryErro
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        advance_observation_or_close, advance_slot_activation, advance_slot_mutation,
+        atomic_observation_v2, SlotCell,
+    };
+    use crate::ServingSlotRegistryError;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn slot_counter_overflow_is_terminal_and_non_mutating() {
+        let mut slot = SlotCell {
+            admission_generation: NonZeroU64::MAX,
+            ..SlotCell::default()
+        };
+        let observation_sequence = slot.observation_sequence;
+        assert_eq!(
+            advance_slot_mutation(&mut slot),
+            Err(ServingSlotRegistryError::SlotSequenceExhausted)
+        );
+        assert_eq!(slot.admission_generation, NonZeroU64::MAX);
+        assert_eq!(slot.observation_sequence, observation_sequence);
+        assert_eq!(
+            advance_slot_mutation(&mut slot),
+            Err(ServingSlotRegistryError::SlotSequenceExhausted)
+        );
+        assert_eq!(
+            atomic_observation_v2(&slot),
+            Err(ServingSlotRegistryError::SlotSequenceExhausted)
+        );
+    }
+
+    #[test]
+    fn activation_and_guard_sequence_overflow_close_the_slot() {
+        let mut activation = SlotCell {
+            next_activation_sequence: u64::MAX,
+            ..SlotCell::default()
+        };
+        let admission_generation = activation.admission_generation;
+        let observation_sequence = activation.observation_sequence;
+        assert_eq!(
+            advance_slot_activation(&mut activation),
+            Err(ServingSlotRegistryError::SlotSequenceExhausted)
+        );
+        assert_eq!(activation.admission_generation, admission_generation);
+        assert_eq!(activation.observation_sequence, observation_sequence);
+
+        let mut guard = SlotCell {
+            observation_sequence: NonZeroU64::MAX,
+            ..SlotCell::default()
+        };
+        advance_observation_or_close(&mut guard);
+        assert_eq!(
+            advance_slot_mutation(&mut guard),
+            Err(ServingSlotRegistryError::SlotSequenceExhausted)
+        );
+    }
 }

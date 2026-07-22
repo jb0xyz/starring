@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use automation_runtime_convergence::{FencingToken, RuntimeGeneration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -57,6 +59,19 @@ pub enum ServingSlotRegistryError {
     SlotCapacityExceeded,
     #[error("serving slot registry incarnation space is exhausted")]
     IncarnationExhausted,
+    #[error("serving slot monotonic state is exhausted")]
+    SlotSequenceExhausted,
+    #[error("serving slot admission generation changed from {expected} to {actual}")]
+    AdmissionGenerationMismatch {
+        expected: NonZeroU64,
+        actual: NonZeroU64,
+    },
+    #[error("serving slot observation is stale")]
+    StaleSlotObservation,
+    #[error("serving slot is sealed against admission and ordinary mutation")]
+    SlotSealed,
+    #[error("serving slot seal capability is stale")]
+    StaleSlotSeal,
     #[error("serving slot registry lock is poisoned")]
     RegistryPoisoned,
 }
