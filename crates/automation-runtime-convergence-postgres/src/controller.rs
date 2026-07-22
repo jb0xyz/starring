@@ -5,15 +5,14 @@ use automation_runtime_controller::{
     RuntimeAttestationIdV1 as ControllerAttestationIdV1,
     RuntimeBuildRevisionV1 as ControllerBuildV1, RuntimeCertificationReceiptV1,
     RuntimeCertificationRequestV1, RuntimeClaimNextExecutionV1, RuntimeConvergenceErrorClassV1,
-    RuntimeConvergenceMutationV1, RuntimeConvergencePort,
-    RuntimeDeploymentScopeV1 as ControllerScopeV1, RuntimeDisconnectServingV1,
-    RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1,
-    RuntimeLiveMetadataV1, RuntimeMutationReceiptV1, RuntimeMutationRequestV1,
-    RuntimeObservePreviousServingV1, RuntimePreviousServingObservationPort,
-    RuntimePreviousServingObservationReceiptV1, RuntimeRenewExecutionV1,
-    RuntimeServingIdentityV1 as ControllerServingIdentityV1,
-    RuntimeServingReceiptV1 as ControllerServingReceiptV1, RuntimeServingUpdateReceiptV1,
-    RuntimeStaleLiveRecoveryReceiptV1,
+    RuntimeConvergenceMutationV1, RuntimeDeploymentScopeV1 as ControllerScopeV1,
+    RuntimeDisconnectServingV1, RuntimeExecutionConvergencePort, RuntimeExecutionReceiptV1,
+    RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1, RuntimeLiveMetadataV1,
+    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingObservationPort, RuntimePreviousServingObservationReceiptV1,
+    RuntimeRenewExecutionV1, RuntimeServingIdentityV1 as ControllerServingIdentityV1,
+    RuntimeServingLeasePort, RuntimeServingReceiptV1 as ControllerServingReceiptV1,
+    RuntimeServingUpdateReceiptV1, RuntimeStaleLiveRecoveryReceiptV1,
 };
 use automation_runtime_convergence::{RuntimeDeploymentError, RuntimeFailureKindV1};
 
@@ -26,7 +25,7 @@ use crate::{
     SubmitLiveAttestationV1,
 };
 
-impl RuntimeConvergencePort for PostgresRuntimeConvergence {
+impl RuntimeExecutionConvergencePort for PostgresRuntimeConvergence {
     type Error = RuntimeConvergenceStoreError;
 
     async fn claim_next_execution(
@@ -122,6 +121,22 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
         })
     }
 
+    async fn recover_next_stale_live(
+        &self,
+    ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, Self::Error> {
+        PostgresRuntimeConvergence::recover_next_stale_live(self)
+            .await
+            .map(|receipt| receipt.map(stale_live_receipt))
+    }
+
+    fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1 {
+        classify_error(error)
+    }
+}
+
+impl RuntimeServingLeasePort for PostgresRuntimeConvergence {
+    type Error = RuntimeConvergenceStoreError;
+
     async fn heartbeat_serving(
         &self,
         request: RuntimeHeartbeatServingV1,
@@ -159,14 +174,6 @@ impl RuntimeConvergencePort for PostgresRuntimeConvergence {
         })
     }
 
-    async fn recover_next_stale_live(
-        &self,
-    ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, Self::Error> {
-        PostgresRuntimeConvergence::recover_next_stale_live(self)
-            .await
-            .map(|receipt| receipt.map(stale_live_receipt))
-    }
-
     fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1 {
         classify_error(error)
     }
@@ -176,7 +183,10 @@ impl RuntimePreviousServingObservationPort for PostgresRuntimeConvergence {
     async fn observe_previous_serving(
         &self,
         request: RuntimeObservePreviousServingV1,
-    ) -> Result<RuntimePreviousServingObservationReceiptV1, Self::Error> {
+    ) -> Result<
+        RuntimePreviousServingObservationReceiptV1,
+        <Self as RuntimeExecutionConvergencePort>::Error,
+    > {
         self.observe_previous_serving_capability(request).await
     }
 }
@@ -419,6 +429,16 @@ mod tests {
         ];
         for (error, expected) in cases {
             assert_eq!(classify_error(&error), expected);
+            assert_eq!(
+                <PostgresRuntimeConvergence as RuntimeExecutionConvergencePort>::classify_error(
+                    &error,
+                ),
+                expected
+            );
+            assert_eq!(
+                <PostgresRuntimeConvergence as RuntimeServingLeasePort>::classify_error(&error),
+                expected
+            );
         }
     }
 

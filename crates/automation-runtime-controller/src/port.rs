@@ -17,7 +17,7 @@ pub enum RuntimeConvergenceErrorClassV1 {
 }
 
 #[allow(async_fn_in_trait)]
-pub trait RuntimeConvergencePort {
+pub trait RuntimeExecutionConvergencePort {
     type Error;
 
     async fn claim_next_execution(
@@ -40,6 +40,17 @@ pub trait RuntimeConvergencePort {
         request: RuntimeCertificationRequestV1,
     ) -> Result<RuntimeCertificationReceiptV1, Self::Error>;
 
+    async fn recover_next_stale_live(
+        &self,
+    ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, Self::Error>;
+
+    fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RuntimeServingLeasePort {
+    type Error;
+
     async fn heartbeat_serving(
         &self,
         request: RuntimeHeartbeatServingV1,
@@ -50,17 +61,16 @@ pub trait RuntimeConvergencePort {
         request: RuntimeDisconnectServingV1,
     ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error>;
 
-    async fn recover_next_stale_live(
-        &self,
-    ) -> Result<Option<RuntimeStaleLiveRecoveryReceiptV1>, Self::Error>;
-
     fn classify_error(error: &Self::Error) -> RuntimeConvergenceErrorClassV1;
 }
 
 #[allow(async_fn_in_trait)]
-pub trait RuntimePreviousServingObservationPort: RuntimeConvergencePort {
+pub trait RuntimePreviousServingObservationPort: RuntimeExecutionConvergencePort {
     async fn observe_previous_serving(
         &self,
         request: RuntimeObservePreviousServingV1,
-    ) -> Result<RuntimePreviousServingObservationReceiptV1, <Self as RuntimeConvergencePort>::Error>;
+    ) -> Result<
+        RuntimePreviousServingObservationReceiptV1,
+        <Self as RuntimeExecutionConvergencePort>::Error,
+    >;
 }

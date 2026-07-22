@@ -15,7 +15,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     seed_product_target(&pool).await;
     let adapter = PostgresRuntimeConvergence::new(pool.clone());
     adapter.enqueue(enqueue_request()).await.unwrap();
-    let execution = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::claim_next_execution(
+    let execution = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::claim_next_execution(
         &adapter,
         automation_runtime_controller::RuntimeClaimNextExecutionV1 {
             controller_id: ControllerId::parse("guard-exact-controller").unwrap(),
@@ -42,7 +42,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
             .unwrap(),
     )
     .unwrap();
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
         &adapter,
         wrong_attempt,
     )
@@ -64,7 +64,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
             .unwrap(),
     )
     .unwrap();
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
         &adapter,
         wrong_fence,
     )
@@ -80,7 +80,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
 
     let mut wrong_generation = renewal.clone();
     wrong_generation.guard.runtime_generation = RuntimeGeneration::new(2).unwrap();
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
         &adapter,
         wrong_generation,
     )
@@ -99,7 +99,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     let first_adapter = adapter.clone();
     let first_request = renewal.clone();
     let first = tokio::spawn(async move {
-        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
             &first_adapter,
             first_request,
         )
@@ -108,7 +108,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     let second_adapter = adapter.clone();
     let second_request = renewal.clone();
     let second = tokio::spawn(async move {
-        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
             &second_adapter,
             second_request,
         )
@@ -129,7 +129,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     let renewed_projection = execution_projection(&pool).await;
     let mut altered_replay = renewal;
     altered_replay.lease_for = Duration::from_secs(91);
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
         &adapter,
         altered_replay,
     )
@@ -166,7 +166,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
             .unwrap(),
     )
     .unwrap();
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
         &adapter,
         stale_attempt,
     )
@@ -180,7 +180,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
 
     let mut stale_fence = mutation.clone();
     stale_fence.guard.fencing_token = execution.fencing_token;
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
         &adapter,
         stale_fence,
     )
@@ -196,7 +196,7 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
 
     let mut stale_generation = mutation.clone();
     stale_generation.guard.runtime_generation = RuntimeGeneration::new(2).unwrap();
-    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+    let error = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
         &adapter,
         stale_generation,
     )
@@ -212,14 +212,14 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     ));
     assert_eq!(execution_projection(&pool).await, mutation_baseline);
 
-    let receipt = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+    let receipt = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
         &adapter,
         mutation.clone(),
     )
     .await
     .unwrap();
     assert_eq!(receipt.convergence_attempt, execution.convergence_attempt);
-    let replay = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+    let replay = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
         &adapter,
         mutation,
     )
@@ -303,7 +303,7 @@ async fn renewal_and_mutation_from_one_guard_cannot_both_commit_scenario(
     seed_product_target(&pool).await;
     let adapter = PostgresRuntimeConvergence::new(pool.clone());
     adapter.enqueue(enqueue_request()).await.unwrap();
-    let execution = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::claim_next_execution(
+    let execution = <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::claim_next_execution(
         &adapter,
         automation_runtime_controller::RuntimeClaimNextExecutionV1 {
             controller_id: ControllerId::parse("guard-race-controller").unwrap(),
@@ -342,7 +342,7 @@ async fn renewal_and_mutation_from_one_guard_cannot_both_commit_scenario(
     .unwrap();
     let renewal_adapter = adapter.clone();
     let renewal_task = tokio::spawn(async move {
-        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::renew_execution(
+        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::renew_execution(
             &renewal_adapter,
             renewal,
         )
@@ -351,7 +351,7 @@ async fn renewal_and_mutation_from_one_guard_cannot_both_commit_scenario(
     });
     let mutation_adapter = adapter.clone();
     let mutation_task = tokio::spawn(async move {
-        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeConvergencePort>::mutate(
+        <PostgresRuntimeConvergence as automation_runtime_controller::RuntimeExecutionConvergencePort>::mutate(
             &mutation_adapter,
             mutation,
         )

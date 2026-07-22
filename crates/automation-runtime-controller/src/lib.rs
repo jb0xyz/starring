@@ -25,7 +25,8 @@ pub use planner::{
     RuntimeControllerStopReasonV1,
 };
 pub use port::{
-    RuntimeConvergenceErrorClassV1, RuntimeConvergencePort, RuntimePreviousServingObservationPort,
+    RuntimeConvergenceErrorClassV1, RuntimeExecutionConvergencePort,
+    RuntimePreviousServingObservationPort, RuntimeServingLeasePort,
 };
 pub use retry::{RetryPolicyError, RetryPolicyV1};
 pub use session::{

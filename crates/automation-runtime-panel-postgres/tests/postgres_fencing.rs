@@ -18,8 +18,8 @@ use automation_ruleset::{
     RuleSetContentHash, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_runtime_controller::{
-    RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergencePort,
-    RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
+    RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergenceSessionV1,
+    RuntimeExecutionConvergencePort, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
@@ -232,9 +232,10 @@ async fn controller_mutate(
     mutation: RuntimeConvergenceMutationV1,
 ) {
     let request = session.begin_mutation(mutation).unwrap();
-    let receipt = <PostgresRuntimeConvergence as RuntimeConvergencePort>::mutate(adapter, request)
-        .await
-        .unwrap();
+    let receipt =
+        <PostgresRuntimeConvergence as RuntimeExecutionConvergencePort>::mutate(adapter, request)
+            .await
+            .unwrap();
     session.apply_mutation(receipt).unwrap();
 }
 
@@ -247,16 +248,17 @@ async fn advance_to_panel_reconciliation(
 ) {
     seed_product_target(pool).await;
     let adapter = PostgresRuntimeConvergence::new(pool.clone());
-    let execution = <PostgresRuntimeConvergence as RuntimeConvergencePort>::claim_next_execution(
-        &adapter,
-        RuntimeClaimNextExecutionV1 {
-            controller_id: ControllerId::parse("runtime-panel-controller").unwrap(),
-            lease_for: Duration::from_secs(90),
-        },
-    )
-    .await
-    .unwrap()
-    .expect("seeded deployment must be claimable");
+    let execution =
+        <PostgresRuntimeConvergence as RuntimeExecutionConvergencePort>::claim_next_execution(
+            &adapter,
+            RuntimeClaimNextExecutionV1 {
+                controller_id: ControllerId::parse("runtime-panel-controller").unwrap(),
+                lease_for: Duration::from_secs(90),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("seeded deployment must be claimable");
     let mut session = RuntimeConvergenceSessionV1::from_claim(execution).unwrap();
     let observed_at = session.acquired_at();
     controller_mutate(
@@ -473,11 +475,12 @@ async fn claim_replay_busy_post_dispatch_conflict_and_stale_fence_are_enforced()
             Some(RuntimePanelLatchedErrorV1::Conflict)
         );
         let renewal = controller.begin_renewal(Duration::from_secs(120)).unwrap();
-        let renewed = <PostgresRuntimeConvergence as RuntimeConvergencePort>::renew_execution(
-            &adapter, renewal,
-        )
-        .await
-        .unwrap();
+        let renewed =
+            <PostgresRuntimeConvergence as RuntimeExecutionConvergencePort>::renew_execution(
+                &adapter, renewal,
+            )
+            .await
+            .unwrap();
         controller.apply_renewal(renewed).unwrap();
         assert_eq!(
             replay

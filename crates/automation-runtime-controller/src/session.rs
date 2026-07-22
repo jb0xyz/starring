@@ -1375,7 +1375,7 @@ mod tests {
         receipt: RuntimePreviousServingObservationReceiptV1,
     }
 
-    impl crate::RuntimeConvergencePort for FakeObservationPort {
+    impl crate::RuntimeExecutionConvergencePort for FakeObservationPort {
         type Error = ();
 
         async fn claim_next_execution(
@@ -1404,20 +1404,6 @@ mod tests {
             _request: RuntimeCertificationRequestV1,
         ) -> Result<RuntimeCertificationReceiptV1, Self::Error> {
             panic!("unexpected certification")
-        }
-
-        async fn heartbeat_serving(
-            &self,
-            _request: RuntimeHeartbeatServingV1,
-        ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
-            panic!("unexpected heartbeat")
-        }
-
-        async fn mark_serving_disconnected(
-            &self,
-            _request: RuntimeDisconnectServingV1,
-        ) -> Result<RuntimeServingUpdateReceiptV1, Self::Error> {
-            panic!("unexpected disconnect")
         }
 
         async fn recover_next_stale_live(

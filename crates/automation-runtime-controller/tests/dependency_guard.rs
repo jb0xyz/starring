@@ -37,6 +37,49 @@ fn crate_is_library_only() {
 }
 
 #[test]
+fn execution_and_serving_ports_stay_independent() {
+    let source = include_str!("../src/port.rs");
+    let execution = source
+        .split("pub trait RuntimeExecutionConvergencePort {")
+        .nth(1)
+        .and_then(|tail| tail.split("pub trait RuntimeServingLeasePort {").next())
+        .unwrap();
+    for method in [
+        "claim_next_execution",
+        "renew_execution",
+        "mutate",
+        "certify_live",
+        "recover_next_stale_live",
+        "classify_error",
+    ] {
+        assert!(execution.contains(method));
+    }
+    assert!(!execution.contains("heartbeat_serving"));
+    assert!(!execution.contains("mark_serving_disconnected"));
+
+    let serving = source
+        .split("pub trait RuntimeServingLeasePort {")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub trait RuntimePreviousServingObservationPort:")
+                .next()
+        })
+        .unwrap();
+    for method in [
+        "heartbeat_serving",
+        "mark_serving_disconnected",
+        "classify_error",
+    ] {
+        assert!(serving.contains(method));
+    }
+    assert!(!serving.contains("claim_next_execution"));
+    assert!(!serving.contains("recover_next_stale_live"));
+    assert!(source.contains(
+        "pub trait RuntimePreviousServingObservationPort: RuntimeExecutionConvergencePort"
+    ));
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
