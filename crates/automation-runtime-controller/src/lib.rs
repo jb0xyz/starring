@@ -7,6 +7,7 @@ mod port;
 mod retry;
 mod session;
 mod v2_binding;
+mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
 mod v2_route;
@@ -48,6 +49,10 @@ pub use session::{
     RuntimeServingSessionStateV1, RuntimeServingSessionV1,
 };
 pub use v2_binding::RuntimeBindingPinV1;
+pub use v2_evidence::{
+    RuntimeBarrierPauseWitnessV2, RuntimeEvidenceErrorV2, RuntimePanelEvidenceV2,
+    RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,
+};
 pub use v2_gateway::{
     RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseReceiptV1,
     RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
