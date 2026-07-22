@@ -72,7 +72,7 @@ fn migration_and_adapter_contract_names_match() {
     let expected_parameters = [17_usize, 19, 18, 25, 20, 23, 20];
     for (query, expected) in contract
         .split("pub(crate) const ")
-        .skip(2)
+        .skip(3)
         .zip(expected_parameters)
     {
         let maximum = query
@@ -101,10 +101,13 @@ fn runtime_panel_database_readiness_is_private_and_schema_pinned() {
     assert!(
         migration.contains("CREATE FUNCTION public.starring_runtime_panel_database_readiness_v1()")
     );
+    assert!(
+        migration.contains("CREATE FUNCTION public.starring_runtime_panel_database_identity_v1()")
+    );
     assert!(migration.contains("SECURITY DEFINER"));
     assert!(migration.contains("SET search_path = pg_catalog"));
     assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE"));
-    assert!(migration.contains("pg_get_function_identity_arguments(function_row.oid) = ''"));
+    assert!(migration.contains("pg_get_function_identity_arguments(function_row.oid) <> ''"));
     assert!(migration.contains(
         "TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)"
     ));
@@ -202,6 +205,8 @@ fn runtime_panel_database_migration_and_adapter_contract_match() {
     let contract = include_str!("../src/contract.rs");
     assert!(migration.contains("starring_runtime_panel_database_readiness_v1"));
     assert!(contract.contains("starring_runtime_panel_database_readiness_v1"));
+    assert!(migration.contains("starring_runtime_panel_database_identity_v1"));
+    assert!(contract.contains("starring_runtime_panel_database_identity_v1"));
 }
 
 #[test]

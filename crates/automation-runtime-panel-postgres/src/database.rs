@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 
-use crate::contract::DATABASE_READINESS_QUERY;
+use crate::contract::{DATABASE_BINDING_QUERY, DATABASE_READINESS_QUERY};
 use crate::error::{map_query_error, validate_millisecond_duration};
 use crate::RuntimePanelPersistenceErrorV1;
 
@@ -112,6 +112,13 @@ struct RuntimePanelDatabaseReadinessRowV1 {
     checked_at: DateTime<Utc>,
 }
 
+#[derive(sqlx::FromRow)]
+struct RuntimePanelDatabaseBindingRowV1 {
+    database_identity: String,
+    database_name: String,
+    executor_role: String,
+}
+
 pub async fn verify_runtime_panel_database_v1(
     pool: &PgPool,
     expectation: &RuntimePanelDatabaseExpectationV1,
@@ -130,7 +137,25 @@ pub async fn verify_runtime_panel_database_with_timeouts_v1(
     timeouts: RuntimePanelDatabaseTimeoutsV1,
 ) -> Result<RuntimePanelDatabaseReadinessV1, RuntimePanelPersistenceErrorV1> {
     let mut transaction = begin_panel_transaction(pool, timeouts).await?;
-    let readiness = verify_runtime_panel_binding_v1(&mut transaction, expectation).await?;
+    let rows = sqlx::query_as::<_, RuntimePanelDatabaseReadinessRowV1>(DATABASE_READINESS_QUERY)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| map_query_error(&error))?;
+    let [row] = rows.as_slice() else {
+        return Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt);
+    };
+    verify_database_authority(
+        &row.database_identity,
+        &row.database_name,
+        &row.executor_role,
+        expectation,
+    )?;
+    let readiness = RuntimePanelDatabaseReadinessV1 {
+        database_identity: row.database_identity.clone(),
+        database_name: row.database_name.clone(),
+        executor_role: row.executor_role.clone(),
+        checked_at: row.checked_at,
+    };
     transaction
         .commit()
         .await
@@ -141,29 +166,38 @@ pub async fn verify_runtime_panel_database_with_timeouts_v1(
 pub(crate) async fn verify_runtime_panel_binding_v1(
     transaction: &mut Transaction<'_, Postgres>,
     expectation: &RuntimePanelDatabaseExpectationV1,
-) -> Result<RuntimePanelDatabaseReadinessV1, RuntimePanelPersistenceErrorV1> {
-    let rows = sqlx::query_as::<_, RuntimePanelDatabaseReadinessRowV1>(DATABASE_READINESS_QUERY)
+) -> Result<(), RuntimePanelPersistenceErrorV1> {
+    let rows = sqlx::query_as::<_, RuntimePanelDatabaseBindingRowV1>(DATABASE_BINDING_QUERY)
         .fetch_all(&mut **transaction)
         .await
         .map_err(|error| map_query_error(&error))?;
     let [row] = rows.as_slice() else {
         return Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt);
     };
-    if row.database_identity != expectation.database_identity
-        || row.database_name != expectation.database_name
-        || row.executor_role != expectation.executor_role
-        || !canonical_database_identity(&row.database_identity)
-        || !valid_database_identifier(&row.database_name)
-        || !valid_database_identifier(&row.executor_role)
+    verify_database_authority(
+        &row.database_identity,
+        &row.database_name,
+        &row.executor_role,
+        expectation,
+    )
+}
+
+fn verify_database_authority(
+    database_identity: &str,
+    database_name: &str,
+    executor_role: &str,
+    expectation: &RuntimePanelDatabaseExpectationV1,
+) -> Result<(), RuntimePanelPersistenceErrorV1> {
+    if database_identity != expectation.database_identity
+        || database_name != expectation.database_name
+        || executor_role != expectation.executor_role
+        || !canonical_database_identity(database_identity)
+        || !valid_database_identifier(database_name)
+        || !valid_database_identifier(executor_role)
     {
         return Err(RuntimePanelPersistenceErrorV1::InvalidAuthority);
     }
-    Ok(RuntimePanelDatabaseReadinessV1 {
-        database_identity: row.database_identity.clone(),
-        database_name: row.database_name.clone(),
-        executor_role: row.executor_role.clone(),
-        checked_at: row.checked_at,
-    })
+    Ok(())
 }
 
 pub(crate) async fn begin_panel_transaction(

@@ -1,6 +1,11 @@
 pub(crate) const DATABASE_READINESS_QUERY: &str =
     "SELECT * FROM public.starring_runtime_panel_database_readiness_v1()";
 
+pub(crate) const DATABASE_BINDING_QUERY: &str =
+    "SELECT public.starring_runtime_panel_database_identity_v1() \
+        AS database_identity, pg_catalog.current_database()::TEXT AS database_name, \
+        session_user::TEXT AS executor_role";
+
 pub(crate) const CLAIM_QUERY: &str =
     "SELECT * FROM public.starring_runtime_panel_reconciliation_claim_v1(\
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";

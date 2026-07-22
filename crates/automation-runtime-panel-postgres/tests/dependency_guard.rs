@@ -95,6 +95,7 @@ fn verified_panel_sessions_recheck_database_binding_for_every_transaction() {
 fn adapter_contract_uses_only_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     for capability in [
+        "starring_runtime_panel_database_identity_v1",
         "starring_runtime_panel_database_readiness_v1",
         "starring_runtime_panel_reconciliation_claim_v1",
         "starring_runtime_panel_reconciliation_check_v1",
@@ -116,6 +117,27 @@ fn adapter_contract_uses_only_private_capabilities() {
     ] {
         assert!(!contract.contains(forbidden));
     }
+}
+
+#[test]
+fn operation_binding_is_lightweight_and_authority_only() {
+    let contract = include_str!("../src/contract.rs");
+    let database = include_str!("../src/database.rs");
+    let binding = contract
+        .split("const DATABASE_BINDING_QUERY")
+        .nth(1)
+        .and_then(|tail| tail.split(';').next())
+        .unwrap();
+    assert!(binding.contains("starring_runtime_panel_database_identity_v1"));
+    for forbidden in [
+        "database_readiness",
+        "runtime_panel_reconciliation_sessions",
+        "ruleset_panel_installations",
+        "strict_panel_operation_journal",
+    ] {
+        assert!(!binding.contains(forbidden), "{forbidden}");
+    }
+    assert!(database.contains("RuntimePanelDatabaseBindingRowV1"));
 }
 
 #[test]

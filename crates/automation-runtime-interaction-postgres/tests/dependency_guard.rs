@@ -81,16 +81,17 @@ fn adapter_sources_contain_no_comments() {
 }
 
 #[test]
-fn adapter_contract_uses_only_four_private_capabilities() {
+fn adapter_contract_uses_only_five_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     let capabilities = [
+        "starring_runtime_interaction_database_identity_v1",
         "starring_runtime_interaction_database_readiness_v1",
         "starring_runtime_interaction_route_read_v1",
         "starring_runtime_interaction_pinned_read_v1",
         "starring_runtime_interaction_instance_register_v1",
     ];
-    assert_eq!(contract.matches("pub(crate) const ").count(), 4);
-    assert_eq!(contract.matches("SELECT ").count(), 4);
+    assert_eq!(contract.matches("pub(crate) const ").count(), 5);
+    assert_eq!(contract.matches("SELECT ").count(), 5);
     for capability in capabilities {
         assert_eq!(
             contract.matches(capability).count(),
@@ -119,6 +120,7 @@ fn adapter_contract_placeholder_shapes_are_exact() {
     let contract = include_str!("../src/contract.rs");
     let expected = [
         ("DATABASE_READINESS_QUERY", 0_usize),
+        ("DATABASE_BINDING_QUERY", 0),
         ("ROUTE_READ_QUERY", 2),
         ("PINNED_READ_QUERY", 2),
         ("INSTANCE_REGISTER_QUERY", 7),
@@ -238,6 +240,26 @@ fn every_interaction_operation_rechecks_database_binding() {
             .count(),
         3
     );
+}
+
+#[test]
+fn operation_binding_is_lightweight_and_authority_only() {
+    let contract = include_str!("../src/contract.rs");
+    let database = include_str!("../src/database.rs");
+    let binding = contract
+        .split("const DATABASE_BINDING_QUERY")
+        .nth(1)
+        .and_then(|tail| tail.split(';').next())
+        .unwrap();
+    assert!(binding.contains("starring_runtime_interaction_database_identity_v1"));
+    for forbidden in [
+        "database_readiness",
+        "automation_instances",
+        "automation_ruleset_versions",
+    ] {
+        assert!(!binding.contains(forbidden), "{forbidden}");
+    }
+    assert!(database.contains("RuntimeInteractionDatabaseBindingRowV1"));
 }
 
 #[test]

@@ -16,6 +16,7 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, Executor, PgPool};
 
 const READINESS_FUNCTION: &str = "public.starring_runtime_interaction_database_readiness_v1()";
+const IDENTITY_FUNCTION: &str = "public.starring_runtime_interaction_database_identity_v1()";
 const ROUTE_FUNCTION: &str = "public.starring_runtime_interaction_route_read_v1(TEXT,TEXT)";
 const PINNED_FUNCTION: &str = "public.starring_runtime_interaction_pinned_read_v1(TEXT,TEXT)";
 const REGISTER_FUNCTION: &str =
@@ -96,6 +97,7 @@ async fn isolated_database() -> IsolatedDatabase {
         "REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC".to_string(),
         format!("GRANT CONNECT ON DATABASE {name} TO {role}"),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
+        function_grant(IDENTITY_FUNCTION, &role),
         function_grant(READINESS_FUNCTION, &role),
         function_grant(ROUTE_FUNCTION, &role),
         function_grant(PINNED_FUNCTION, &role),
@@ -189,6 +191,7 @@ fn interaction_migration_is_private_bounded_and_comment_free() {
     let migration =
         include_str!("../../../migrations/202607220027_scope_runtime_interaction_database.sql");
     for function in [
+        "starring_runtime_interaction_database_identity_v1",
         "starring_runtime_interaction_database_readiness_v1",
         "starring_runtime_interaction_route_read_v1",
         "starring_runtime_interaction_pinned_read_v1",
@@ -522,9 +525,53 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
                 store.verify_database_v1().await,
                 Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority)
             );
+            assert!(store
+                .read_instance_route_v1(
+                    GuildId(7),
+                    &InstanceId::parse("race_room").unwrap(),
+                )
+                .await
+                .unwrap()
+                .is_some());
             owner_pool.execute(revoke.as_str()).await.unwrap();
             store.verify_database_v1().await.unwrap();
         }
+
+        owner_pool
+            .execute(
+                format!("REVOKE EXECUTE ON FUNCTION {IDENTITY_FUNCTION} FROM {executor_role}")
+                    .as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.verify_database_v1().await,
+            Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority)
+        );
+        assert_eq!(
+            store
+                .read_instance_route_v1(
+                    GuildId(7),
+                    &InstanceId::parse("race_room").unwrap(),
+                )
+                .await,
+            Err(InstanceStoreError::Backend(
+                "runtime_interaction_unavailable".to_string()
+            ))
+        );
+        owner_pool
+            .execute(function_grant(IDENTITY_FUNCTION, &executor_role).as_str())
+            .await
+            .unwrap();
+        store.verify_database_v1().await.unwrap();
+        assert!(store
+            .read_instance_route_v1(
+                GuildId(7),
+                &InstanceId::parse("race_room").unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some());
 
         let large_object: i32 = sqlx::query_scalar("SELECT pg_catalog.lo_create(0)::INTEGER")
             .fetch_one(&owner_pool)

@@ -74,7 +74,8 @@ const ROTATED_BINDING_FINGERPRINT: &str =
 const PANEL_KEY: &str = "entry";
 const SPEC_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-const PANEL_CAPABILITIES: [&str; 8] = [
+const PANEL_CAPABILITIES: [&str; 9] = [
+    "public.starring_runtime_panel_database_identity_v1()",
     "public.starring_runtime_panel_database_readiness_v1()",
     "public.starring_runtime_panel_reconciliation_claim_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text)",
     "public.starring_runtime_panel_reconciliation_check_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text,bigint,bigint)",
@@ -1027,12 +1028,48 @@ async fn restricted_login_readiness_enforces_exact_panel_boundary() {
             .await,
             Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt)
         );
-        assert_eq!(
-            verified_store.check_session(Duration::from_millis(1)).await,
-            Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt)
-        );
+        verified_store
+            .check_session(Duration::from_millis(1))
+            .await
+            .unwrap();
         sqlx::query(&format!(
             "REVOKE SELECT ON TABLE pg_catalog.pg_authid FROM {role}"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        verify_runtime_panel_database_with_timeouts_v1(
+            &restricted_pool,
+            &expectation,
+            RuntimePanelDatabaseTimeoutsV1::default(),
+        )
+        .await
+        .unwrap();
+        verified_store
+            .check_session(Duration::from_millis(1))
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "REVOKE EXECUTE ON FUNCTION public.starring_runtime_panel_database_identity_v1() FROM {role}"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            verify_runtime_panel_database_with_timeouts_v1(
+                &restricted_pool,
+                &expectation,
+                RuntimePanelDatabaseTimeoutsV1::default(),
+            )
+            .await,
+            Err(RuntimePanelPersistenceErrorV1::PersistenceCorrupt)
+        );
+        assert_eq!(
+            verified_store.check_session(Duration::from_millis(1)).await,
+            Err(RuntimePanelPersistenceErrorV1::Unavailable)
+        );
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION public.starring_runtime_panel_database_identity_v1() TO {role}"
         ))
         .execute(&pool)
         .await

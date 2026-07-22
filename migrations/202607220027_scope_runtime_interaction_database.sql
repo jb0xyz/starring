@@ -257,6 +257,7 @@ BEGIN
         AND function_row.proname IN (
             'guard_runtime_interaction_instance_mutation_v1',
             'starring_runtime_interaction_schema_manifest_v1',
+            'starring_runtime_interaction_database_identity_v1',
             'starring_runtime_interaction_database_readiness_v1',
             'starring_runtime_interaction_route_read_v1',
             'starring_runtime_interaction_pinned_read_v1',
@@ -954,6 +955,24 @@ BEGIN
 END;
 $function$;
 
+CREATE FUNCTION public.starring_runtime_interaction_database_identity_v1()
+RETURNS TEXT
+LANGUAGE sql
+VOLATILE
+STRICT
+PARALLEL UNSAFE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+    SELECT identity.database_identity::TEXT
+    FROM public.product_control_plane_identity AS identity
+    WHERE identity.singleton
+        AND identity.database_identity IS NOT NULL
+        AND identity.database_identity
+            <> '00000000-0000-0000-0000-000000000000'::UUID
+        AND identity.created_at IS NOT NULL;
+$function$;
+
 CREATE FUNCTION public.starring_runtime_interaction_database_readiness_v1()
 RETURNS TABLE(
     database_identity TEXT,
@@ -1155,6 +1174,13 @@ BEGIN
     FROM (
         VALUES
             (
+                'public.starring_runtime_interaction_database_identity_v1()',
+                '',
+                'text',
+                FALSE,
+                0::REAL
+            ),
+            (
                 'public.starring_runtime_interaction_database_readiness_v1()',
                 '',
                 'TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)',
@@ -1201,7 +1227,12 @@ BEGIN
         OR function_row.proleakproof
         OR function_row.pronargdefaults <> 0
         OR function_row.provariadic <> 0
-        OR language_row.lanname IS DISTINCT FROM 'plpgsql'
+        OR language_row.lanname IS DISTINCT FROM CASE
+            WHEN expected.identity
+                = 'public.starring_runtime_interaction_database_identity_v1()'
+            THEN 'sql'
+            ELSE 'plpgsql'
+        END
         OR pg_catalog.pg_get_function_arguments(function_row.oid)
             IS DISTINCT FROM expected.arguments
         OR pg_catalog.pg_get_function_result(function_row.oid)
@@ -1377,6 +1408,9 @@ BEGIN
     WHERE function_row.oid >= 16384
         AND pg_catalog.has_function_privilege(invoker_oid, function_row.oid, 'EXECUTE')
         AND function_row.oid NOT IN (
+            pg_catalog.to_regprocedure(
+                'public.starring_runtime_interaction_database_identity_v1()'
+            ),
             pg_catalog.to_regprocedure(
                 'public.starring_runtime_interaction_database_readiness_v1()'
             ),
@@ -1908,6 +1942,7 @@ BEGIN
         'public.guard_runtime_interaction_instance_mutation_v1()',
         'public.reject_ruleset_artifact_mutation()',
         'public.starring_runtime_interaction_schema_manifest_v1()',
+        'public.starring_runtime_interaction_database_identity_v1()',
         'public.starring_runtime_interaction_database_readiness_v1()',
         'public.starring_runtime_interaction_route_read_v1(TEXT,TEXT)',
         'public.starring_runtime_interaction_pinned_read_v1(TEXT,TEXT)',
@@ -2060,6 +2095,14 @@ BEGIN
                 0::REAL
             ),
             (
+                'public.starring_runtime_interaction_database_identity_v1()',
+                '',
+                'text',
+                TRUE,
+                FALSE,
+                0::REAL
+            ),
+            (
                 'public.starring_runtime_interaction_database_readiness_v1()',
                 '',
                 'TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)',
@@ -2110,7 +2153,12 @@ BEGIN
         OR function_row.proleakproof
         OR function_row.pronargdefaults <> 0
         OR function_row.provariadic <> 0
-        OR language_row.lanname IS DISTINCT FROM 'plpgsql'
+        OR language_row.lanname IS DISTINCT FROM CASE
+            WHEN expected.identity
+                = 'public.starring_runtime_interaction_database_identity_v1()'
+            THEN 'sql'
+            ELSE 'plpgsql'
+        END
         OR pg_catalog.pg_get_function_arguments(function_row.oid)
             IS DISTINCT FROM expected.arguments
         OR pg_catalog.pg_get_function_result(function_row.oid)

@@ -108,14 +108,35 @@ BEGIN
     INNER JOIN pg_catalog.pg_namespace AS namespace
         ON namespace.oid = function_row.pronamespace
     WHERE namespace.nspname = 'public'
-        AND function_row.proname = 'starring_runtime_panel_database_readiness_v1';
+        AND function_row.proname IN (
+            'starring_runtime_panel_database_readiness_v1',
+            'starring_runtime_panel_database_identity_v1'
+        );
 
     IF collision_count <> 0 THEN
-        RAISE EXCEPTION 'runtime panel database readiness function already exists'
+        RAISE EXCEPTION 'runtime panel database function already exists'
             USING ERRCODE = '55000';
     END IF;
 END;
 $preflight$;
+
+CREATE FUNCTION public.starring_runtime_panel_database_identity_v1()
+RETURNS TEXT
+LANGUAGE sql
+VOLATILE
+STRICT
+PARALLEL UNSAFE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+    SELECT identity.database_identity::TEXT
+    FROM public.product_control_plane_identity AS identity
+    WHERE identity.singleton
+        AND identity.database_identity IS NOT NULL
+        AND identity.database_identity
+            <> '00000000-0000-0000-0000-000000000000'::UUID
+        AND identity.created_at IS NOT NULL;
+$function$;
 
 CREATE FUNCTION public.starring_runtime_panel_database_readiness_v1()
 RETURNS TABLE(
@@ -254,6 +275,7 @@ BEGIN
     INTO invalid_function_count
     FROM (
         VALUES
+            ('public.starring_runtime_panel_database_identity_v1()', 'text', FALSE, 0::REAL),
             ('public.starring_runtime_panel_database_readiness_v1()', 'TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)', TRUE, 1::REAL),
             ('public.starring_runtime_panel_execution_lock_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint)', 'TABLE(checked_at timestamp with time zone, controller_lease_expires_at timestamp with time zone)', TRUE, 1::REAL),
             ('public.starring_runtime_panel_reconciliation_lock_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text,bigint)', 'TABLE(checked_at timestamp with time zone, controller_lease_expires_at timestamp with time zone)', TRUE, 1::REAL),
@@ -282,7 +304,12 @@ BEGIN
         OR function_row.proleakproof
         OR function_row.pronargdefaults <> 0
         OR function_row.provariadic <> 0
-        OR language_row.lanname IS DISTINCT FROM 'plpgsql'
+        OR language_row.lanname IS DISTINCT FROM CASE
+            WHEN expected.identity
+                = 'public.starring_runtime_panel_database_identity_v1()'
+            THEN 'sql'
+            ELSE 'plpgsql'
+        END
         OR pg_catalog.pg_get_function_result(function_row.oid)
             IS DISTINCT FROM expected.result_name;
 
@@ -293,6 +320,7 @@ BEGIN
         ON namespace.oid = function_row.pronamespace
     WHERE namespace.nspname = 'public'
         AND function_row.proname IN (
+            'starring_runtime_panel_database_identity_v1',
             'starring_runtime_panel_database_readiness_v1',
             'starring_runtime_panel_execution_lock_v1',
             'starring_runtime_panel_reconciliation_lock_v1',
@@ -305,7 +333,7 @@ BEGIN
             'starring_runtime_panel_reconciliation_journal_remove_v1'
         );
 
-    IF invalid_function_count <> 0 OR function_set_count <> 10 THEN
+    IF invalid_function_count <> 0 OR function_set_count <> 11 THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RP004',
             MESSAGE = 'runtime_panel_database_schema_drift';
@@ -403,6 +431,7 @@ BEGIN
     INTO invalid_capability_count
     FROM (
         VALUES
+            ('public.starring_runtime_panel_database_identity_v1()'),
             ('public.starring_runtime_panel_database_readiness_v1()'),
             ('public.starring_runtime_panel_reconciliation_claim_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text)'),
             ('public.starring_runtime_panel_reconciliation_check_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text,bigint,bigint)'),
@@ -438,6 +467,7 @@ BEGIN
                 AND pg_catalog.left(namespace.nspname::TEXT, 3) <> 'pg_'
                 AND pg_catalog.has_function_privilege(invoker_oid, function_row.oid, 'EXECUTE')
                 AND function_row.oid NOT IN (
+                    pg_catalog.to_regprocedure('public.starring_runtime_panel_database_identity_v1()'),
                     pg_catalog.to_regprocedure('public.starring_runtime_panel_database_readiness_v1()'),
                     pg_catalog.to_regprocedure('public.starring_runtime_panel_reconciliation_claim_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text)'),
                     pg_catalog.to_regprocedure('public.starring_runtime_panel_reconciliation_check_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text,bigint,bigint)'),
@@ -459,6 +489,7 @@ BEGIN
             )) AS privilege
             WHERE namespace.nspname = 'public'
                 AND function_row.proname IN (
+                    'starring_runtime_panel_database_identity_v1',
                     'starring_runtime_panel_database_readiness_v1',
                     'starring_runtime_panel_execution_lock_v1',
                     'starring_runtime_panel_reconciliation_lock_v1',
@@ -940,7 +971,7 @@ $function$;
 
 DO $privileges$
 DECLARE
-    function_identity TEXT := 'public.starring_runtime_panel_database_readiness_v1()';
+    function_identity TEXT;
     function_oid OID;
     common_owner OID;
     common_owner_name NAME;
@@ -952,41 +983,51 @@ BEGIN
     FROM pg_catalog.pg_class AS relation
     WHERE relation.oid = pg_catalog.to_regclass('public.product_control_plane_identity');
     common_owner_name := pg_catalog.pg_get_userbyid(common_owner);
-    function_oid := pg_catalog.to_regprocedure(function_identity);
-    IF common_owner_name IS NULL OR function_oid IS NULL THEN
-        RAISE EXCEPTION 'runtime panel database readiness owner is unavailable'
+    IF common_owner_name IS NULL THEN
+        RAISE EXCEPTION 'runtime panel database function owner is unavailable'
             USING ERRCODE = '55000';
     END IF;
-    EXECUTE pg_catalog.format(
-        'ALTER FUNCTION %s OWNER TO %I',
-        function_identity,
-        common_owner_name
-    );
-    EXECUTE pg_catalog.format(
-        'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE',
-        function_identity
-    );
-    FOR grantee IN
-        SELECT DISTINCT privilege.grantee
-        FROM pg_catalog.pg_proc AS function_row
-        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
-            function_row.proacl,
-            pg_catalog.acldefault('f', function_row.proowner)
-        )) AS privilege
-        WHERE function_row.oid = function_oid
-            AND privilege.grantee <> 0
-            AND privilege.grantee <> common_owner
+    FOREACH function_identity IN ARRAY ARRAY[
+        'public.starring_runtime_panel_database_identity_v1()',
+        'public.starring_runtime_panel_database_readiness_v1()'
+    ]::TEXT[]
     LOOP
-        grantee_name := pg_catalog.pg_get_userbyid(grantee);
-        IF grantee_name IS NULL THEN
-            RAISE EXCEPTION 'runtime panel database readiness grantee is unavailable'
+        function_oid := pg_catalog.to_regprocedure(function_identity);
+        IF function_oid IS NULL THEN
+            RAISE EXCEPTION 'runtime panel database function is unavailable'
                 USING ERRCODE = '55000';
         END IF;
         EXECUTE pg_catalog.format(
-            'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE',
+            'ALTER FUNCTION %s OWNER TO %I',
             function_identity,
-            grantee_name
+            common_owner_name
         );
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE',
+            function_identity
+        );
+        FOR grantee IN
+            SELECT DISTINCT privilege.grantee
+            FROM pg_catalog.pg_proc AS function_row
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                function_row.proacl,
+                pg_catalog.acldefault('f', function_row.proowner)
+            )) AS privilege
+            WHERE function_row.oid = function_oid
+                AND privilege.grantee <> 0
+                AND privilege.grantee <> common_owner
+        LOOP
+            grantee_name := pg_catalog.pg_get_userbyid(grantee);
+            IF grantee_name IS NULL THEN
+                RAISE EXCEPTION 'runtime panel database function grantee is unavailable'
+                    USING ERRCODE = '55000';
+            END IF;
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM %I CASCADE',
+                function_identity,
+                grantee_name
+            );
+        END LOOP;
     END LOOP;
 END;
 $privileges$;
@@ -994,51 +1035,51 @@ $privileges$;
 DO $postflight$
 DECLARE
     common_owner OID;
-    function_oid OID;
+    invalid_function_count BIGINT;
 BEGIN
     SELECT relation.relowner
     INTO common_owner
     FROM pg_catalog.pg_class AS relation
     WHERE relation.oid = pg_catalog.to_regclass('public.product_control_plane_identity');
-    function_oid := pg_catalog.to_regprocedure(
-        'public.starring_runtime_panel_database_readiness_v1()'
-    );
-    IF function_oid IS NULL
-        OR NOT EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_proc AS function_row
-            INNER JOIN pg_catalog.pg_language AS language_row
-                ON language_row.oid = function_row.prolang
-            WHERE function_row.oid = function_oid
-                AND function_row.proowner = common_owner
-                AND function_row.prokind = 'f'
-                AND function_row.provolatile = 'v'
-                AND function_row.proisstrict
-                AND function_row.proparallel = 'u'
-                AND function_row.prosecdef
-                AND function_row.proretset
-                AND function_row.prorows = 1::REAL
-                AND function_row.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]
-                AND NOT function_row.proleakproof
-                AND function_row.pronargdefaults = 0
-                AND function_row.provariadic = 0
-                AND language_row.lanname = 'plpgsql'
-                AND pg_catalog.pg_get_function_identity_arguments(function_row.oid) = ''
-                AND pg_catalog.pg_get_function_result(function_row.oid)
-                    = 'TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)'
-        )
+    SELECT pg_catalog.count(*)
+    INTO invalid_function_count
+    FROM (
+        VALUES
+            ('public.starring_runtime_panel_database_identity_v1()', 'text', FALSE, 0::REAL, 'sql'),
+            ('public.starring_runtime_panel_database_readiness_v1()', 'TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)', TRUE, 1::REAL, 'plpgsql')
+    ) AS expected(identity, result_name, returns_set, rows_estimate, language_name)
+    LEFT JOIN pg_catalog.pg_proc AS function_row
+        ON function_row.oid = pg_catalog.to_regprocedure(expected.identity)
+    LEFT JOIN pg_catalog.pg_language AS language_row
+        ON language_row.oid = function_row.prolang
+    WHERE function_row.oid IS NULL
+        OR function_row.proowner <> common_owner
+        OR function_row.prokind <> 'f'
+        OR function_row.provolatile <> 'v'
+        OR NOT function_row.proisstrict
+        OR function_row.proparallel <> 'u'
+        OR NOT function_row.prosecdef
+        OR function_row.proretset IS DISTINCT FROM expected.returns_set
+        OR function_row.prorows IS DISTINCT FROM expected.rows_estimate
+        OR function_row.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::TEXT[]
+        OR function_row.proleakproof
+        OR function_row.pronargdefaults <> 0
+        OR function_row.provariadic <> 0
+        OR language_row.lanname IS DISTINCT FROM expected.language_name
+        OR pg_catalog.pg_get_function_identity_arguments(function_row.oid) <> ''
+        OR pg_catalog.pg_get_function_result(function_row.oid)
+            IS DISTINCT FROM expected.result_name
         OR EXISTS (
             SELECT 1
-            FROM pg_catalog.pg_proc AS function_row
-            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+            FROM pg_catalog.aclexplode(COALESCE(
                 function_row.proacl,
                 pg_catalog.acldefault('f', function_row.proowner)
             )) AS privilege
-            WHERE function_row.oid = function_oid
-                AND privilege.grantee <> common_owner
-        )
-    THEN
-        RAISE EXCEPTION 'runtime panel database readiness contract is invalid'
+            WHERE privilege.grantee <> common_owner
+        );
+
+    IF invalid_function_count <> 0 THEN
+        RAISE EXCEPTION 'runtime panel database function contract is invalid'
             USING ERRCODE = '55000';
     END IF;
 END;
