@@ -135,6 +135,51 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
 }
 
 #[test]
+fn startup_recovery_observation_dtos_are_exact_and_non_authorizing() {
+    let source = include_str!("../src/v2_startup_recovery.rs");
+
+    for expected in [
+        "pub struct RuntimeStartupRecoveryObservationCorrelationV2 {",
+        "pub recovery_id: RuntimeRecoveryIdV2,",
+        "pub originating_emergency_generation: NonZeroU64,",
+        "pub coordinator_generation: NonZeroU64,",
+        "pub authority_revision: NonZeroU64,",
+        "pub struct RuntimeStartupRecoveryObservationRequestV2 {",
+        "pub correlation: RuntimeStartupRecoveryObservationCorrelationV2,",
+        "pub gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,",
+        "pub expected_owner_revision: NonZeroU64,",
+        "pub expected_owner_expires_at: DateTime<Utc>,",
+        "pub struct RuntimeStartupRecoveryObservationReceiptV2 {",
+        "pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,",
+        "pub state: RuntimeStartupRecoveryStateV2,",
+    ] {
+        assert!(source.contains(expected), "{expected}");
+    }
+    for forbidden in [
+        "Permit",
+        "Authority",
+        "Port",
+        "Future",
+        "Instant",
+        "sqlx",
+        "tokio",
+        "Serialize",
+        "Deserialize",
+        "Default",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeStartupRecoveryObservationCorrelationV2",
+        "RuntimeStartupRecoveryObservationReceiptV2",
+        "RuntimeStartupRecoveryObservationRequestV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_digest_surface_stays_typed_and_nonserializable() {
     let source = include_str!("../src/v2_digest.rs");
     for forbidden in [

@@ -49,9 +49,14 @@ pub use registry_recovery::{
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
     RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
 };
+pub(crate) use startup_recovery::{
+    authorize_startup_recovery_observation_v2, validate_startup_recovery_observation_v2,
+};
 pub use startup_recovery::{
-    plan_runtime_startup_recovery_v2, RuntimeStartupRecoveryClassV2,
-    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationFixedPointV2,
+    plan_runtime_startup_recovery_v2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeCompletedStartupRecoveryObservationV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+    RuntimeStartupRecoveryObservationFixedPointV2, RuntimeStartupRecoveryObservationPortV2,
     RuntimeStartupRecoveryPlanErrorV2,
 };
 pub use writer_fence::RuntimeWriterFenceObservationPortV1;

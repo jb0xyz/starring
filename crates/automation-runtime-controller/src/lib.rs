@@ -113,7 +113,11 @@ pub use v2_product_drain_canonical::{
     RuntimeProductDrainCorrelationV2,
 };
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
-pub use v2_startup_recovery::{RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2};
+pub use v2_startup_recovery::{
+    RuntimeStartupRecoveryObservationCorrelationV2, RuntimeStartupRecoveryObservationReceiptV2,
+    RuntimeStartupRecoveryObservationRequestV2, RuntimeStartupRecoveryStateV2,
+    RuntimeStartupServingStateV2,
+};
 pub use v2_writer_fence::{
     RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,
     RuntimeWriterFenceClosedLeaseIdV1, RuntimeWriterFenceGenerationV1,

@@ -2,6 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{RuntimeGatewayOwnerLeaseReceiptV1, RuntimeRecoveryIdV2};
+use chrono::{DateTime, Utc};
 
 use crate::{
     RuntimeCapabilityReadinessSetV2, RuntimeGatewayCoordinatorGenerationV2,
@@ -25,6 +26,11 @@ impl RuntimeClosedRecoveryAuthorityRevisionV2 {
             .and_then(NonZeroU64::new)
             .map(Self)
     }
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct RuntimeClosedRecoveryOperationAuthorityV2 {
+    _private: (),
 }
 
 #[derive(PartialEq, Eq)]
@@ -113,6 +119,8 @@ pub struct RuntimeClosedDrainRecoveryPermitV2 {
     readiness: RuntimeCapabilityReadinessSetV2,
     paused_gateway: RuntimePausedGatewayObservationV2,
     registry_evidence: RuntimeClosedRecoveryRegistryEvidenceV2,
+    operation_authority: Option<RuntimeClosedRecoveryOperationAuthorityV2>,
+    last_startup_observation_database_now: Option<DateTime<Utc>>,
 }
 
 impl RuntimeClosedDrainRecoveryPermitV2 {
@@ -134,6 +142,8 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
             readiness,
             paused_gateway,
             registry_evidence,
+            operation_authority: Some(RuntimeClosedRecoveryOperationAuthorityV2 { _private: () }),
+            last_startup_observation_database_now: None,
         }
     }
 
@@ -167,6 +177,35 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
 
     pub fn registry_evidence(&self) -> &RuntimeClosedRecoveryRegistryEvidenceV2 {
         &self.registry_evidence
+    }
+
+    pub(crate) fn operation_authority_is_available(&self) -> bool {
+        self.operation_authority.is_some()
+    }
+
+    pub(crate) fn take_operation_authority(
+        &mut self,
+    ) -> Option<RuntimeClosedRecoveryOperationAuthorityV2> {
+        self.operation_authority.take()
+    }
+
+    pub(crate) fn last_startup_observation_database_now(&self) -> Option<DateTime<Utc>> {
+        self.last_startup_observation_database_now
+    }
+
+    pub(crate) fn restore_operation_authority(
+        &mut self,
+        authority: RuntimeClosedRecoveryOperationAuthorityV2,
+        database_now: DateTime<Utc>,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        if self.operation_authority.is_some() {
+            return None;
+        }
+        let authority_revision = self.authority_revision.successor()?;
+        self.operation_authority = Some(authority);
+        self.last_startup_observation_database_now = Some(database_now);
+        self.authority_revision = authority_revision;
+        Some(authority_revision)
     }
 
     pub(crate) fn refresh_readiness(

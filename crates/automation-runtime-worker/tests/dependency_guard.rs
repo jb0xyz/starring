@@ -246,6 +246,8 @@ fn readiness_evidence_is_exact_redacted_and_nonserializable() {
 #[test]
 fn startup_fixed_point_is_narrow_noncloneable_and_not_serializable() {
     let source = include_str!("../src/startup_recovery.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let lifecycle = include_str!("../src/gateway_lifecycle.rs");
     let declaration = source
         .split("pub struct RuntimeStartupRecoveryObservationFixedPointV2 {")
         .next()
@@ -267,6 +269,231 @@ fn startup_fixed_point_is_narrow_noncloneable_and_not_serializable() {
         3
     );
     assert!(!source.contains("pub acknowledged_product_handoff_count"));
+    assert!(!closed.contains("RuntimeStartupRecoveryObservationFixedPointV2"));
+    assert!(!lifecycle.contains("RuntimeStartupRecoveryObservationFixedPointV2"));
+    assert!(!lifecycle.contains("FixedPoint("));
+}
+
+#[test]
+fn startup_observation_authority_is_linear_owner_bound_and_observe_only() {
+    let startup = include_str!("../src/startup_recovery.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let lifecycle = include_str!("../src/gateway_lifecycle.rs");
+
+    for authority in [
+        "RuntimeAuthorizedStartupRecoveryObservationV2",
+        "RuntimeCompletedStartupRecoveryObservationV2",
+    ] {
+        let declaration = startup
+            .split(&format!("pub struct {authority} {{"))
+            .next()
+            .unwrap();
+        let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden));
+            assert!(!implements_trait(startup, authority, forbidden));
+        }
+        let fields = startup
+            .split(&format!("pub struct {authority} {{"))
+            .nth(1)
+            .and_then(|source| source.split("}\n\nimpl").next())
+            .unwrap();
+        assert!(!fields.contains("pub "));
+        assert!(startup.contains(&format!("{authority}(<redacted>)")));
+    }
+
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        let token_attributes = closed
+            .split("pub(crate) struct RuntimeClosedRecoveryOperationAuthorityV2 {")
+            .next()
+            .unwrap()
+            .rsplit_once("\n\n")
+            .unwrap()
+            .1;
+        assert!(!token_attributes.contains(forbidden));
+        assert!(!implements_trait(
+            closed,
+            "RuntimeClosedRecoveryOperationAuthorityV2",
+            forbidden
+        ));
+    }
+    assert!(closed.contains(concat!(
+        "operation_authority: Option<RuntimeClosedRecoveryOperationAuthorityV2>,\n",
+        "    last_startup_observation_database_now: Option<DateTime<Utc>>,"
+    )));
+    assert_eq!(
+        closed
+            .matches("Some(RuntimeClosedRecoveryOperationAuthorityV2 { _private: () })")
+            .count(),
+        1
+    );
+    assert_eq!(closed.matches("fn take_operation_authority(").count(), 1);
+    assert_eq!(closed.matches("fn restore_operation_authority(").count(), 1);
+    assert!(startup.contains(concat!(
+        "pub struct RuntimeAuthorizedStartupRecoveryObservationV2 {\n",
+        "    request: RuntimeStartupRecoveryObservationRequestV2,\n",
+        "    minimum_database_now: DateTime<Utc>,\n",
+        "    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,\n",
+        "}"
+    )));
+    assert!(startup.contains(concat!(
+        "pub struct RuntimeCompletedStartupRecoveryObservationV2 {\n",
+        "    authorization: RuntimeAuthorizedStartupRecoveryObservationV2,\n",
+        "    receipt: RuntimeStartupRecoveryObservationReceiptV2,\n",
+        "}"
+    )));
+    assert!(startup.contains(concat!(
+        "pub(crate) struct RuntimeValidatedStartupRecoveryObservationV2 {\n",
+        "    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,\n",
+        "    database_now: DateTime<Utc>,\n",
+        "    decision: RuntimeStartupRecoveryDecisionV2,\n",
+        "}"
+    )));
+    assert!(startup.contains(concat!(
+        "RuntimeCompletedStartupRecoveryObservationV2 {\n",
+        "        authorization,\n",
+        "        receipt,\n",
+        "    } = completed;\n",
+        "    let RuntimeAuthorizedStartupRecoveryObservationV2 {\n",
+        "        request,\n",
+        "        minimum_database_now,\n",
+        "        operation_authority,\n",
+        "    } = authorization;"
+    )));
+    let authorization = startup
+        .split("pub(crate) fn authorize_startup_recovery_observation_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\npub(crate) fn validate_startup_recovery_observation_v2(")
+                .next()
+        })
+        .unwrap();
+    let request = authorization
+        .find("let request = startup_recovery_observation_request_v2(permit)")
+        .unwrap();
+    let minimum_database_now = authorization.find("let minimum_database_now").unwrap();
+    let take = authorization
+        .find("let operation_authority = permit.take_operation_authority()?")
+        .unwrap();
+    let authorized = authorization
+        .find("Some(RuntimeAuthorizedStartupRecoveryObservationV2")
+        .unwrap();
+    assert!(request < minimum_database_now && minimum_database_now < take && take < authorized);
+    let validation = startup
+        .split("pub(crate) fn validate_startup_recovery_observation_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\nfn startup_recovery_observation_request_v2(")
+                .next()
+        })
+        .unwrap();
+    let completion = validation
+        .find("RuntimeCompletedStartupRecoveryObservationV2")
+        .unwrap();
+    let authorization = validation
+        .find("let RuntimeAuthorizedStartupRecoveryObservationV2")
+        .unwrap();
+    let decision = validation
+        .find("let decision =\n        plan_runtime_startup_recovery_v2")
+        .unwrap();
+    let validated = validation
+        .find("Ok(RuntimeValidatedStartupRecoveryObservationV2")
+        .unwrap();
+    assert!(completion < authorization && authorization < decision && decision < validated);
+
+    let restore = closed
+        .split("pub(crate) fn restore_operation_authority(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub(crate) fn refresh_readiness(")
+                .next()
+        })
+        .unwrap();
+    let revision = restore
+        .find("let authority_revision = self.authority_revision.successor()?")
+        .unwrap();
+    let token = restore
+        .find("self.operation_authority = Some(authority)")
+        .unwrap();
+    let database_now = restore
+        .find("self.last_startup_observation_database_now = Some(database_now)")
+        .unwrap();
+    let publication = restore
+        .find("self.authority_revision = authority_revision")
+        .unwrap();
+    assert!(revision < token && token < database_now && database_now < publication);
+
+    let port = startup
+        .split("pub trait RuntimeStartupRecoveryObservationPortV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert_eq!(port.matches("fn observe_startup_recovery(").count(), 1);
+    assert!(port.contains("authorization: RuntimeAuthorizedStartupRecoveryObservationV2"));
+    assert!(port.contains("operation_cutoff: Instant"));
+    for forbidden in [
+        "recover_next_stale_live",
+        "resume",
+        "deploy",
+        "activate",
+        "mutate",
+        "retry",
+    ] {
+        assert!(!port.contains(forbidden));
+    }
+
+    let begin = lifecycle
+        .split("pub fn begin_startup_recovery_observation(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub fn complete_startup_recovery_observation(")
+                .next()
+        })
+        .unwrap();
+    assert!(
+        begin
+            .find("self.validate_recovery_permit(permit)?")
+            .unwrap()
+            < begin
+                .find("authorize_startup_recovery_observation_v2(permit)")
+                .unwrap()
+    );
+    let complete = lifecycle
+        .split("pub fn complete_startup_recovery_observation(")
+        .nth(1)
+        .and_then(|source| source.split("\n    pub fn invalidate(").next())
+        .unwrap();
+    let predecessor = complete
+        .find("self.validate_recovery_permit(permit)?")
+        .unwrap();
+    let unavailable = complete
+        .find("permit.operation_authority_is_available()")
+        .unwrap();
+    let receipt = complete
+        .find("validate_startup_recovery_observation_v2(permit, completed)")
+        .unwrap();
+    let successor = complete
+        .find("permit.restore_operation_authority(operation_authority, database_now)")
+        .unwrap();
+    let publication = complete
+        .find("self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending")
+        .unwrap();
+    assert!(predecessor < unavailable && unavailable < receipt);
+    assert!(receipt < successor && successor < publication);
+    let refresh = lifecycle
+        .split("pub fn refresh_recovery_readiness(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub fn begin_startup_recovery_observation(")
+                .next()
+        })
+        .unwrap();
+    assert!(refresh.contains("!permit.operation_authority_is_available()"));
 }
 
 #[test]

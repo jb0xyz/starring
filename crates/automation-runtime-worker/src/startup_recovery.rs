@@ -1,6 +1,199 @@
-use std::time::Duration;
+use std::fmt::{Debug, Formatter};
+use std::future::Future;
+use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
 
-use automation_runtime_controller::{RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2};
+use automation_runtime_controller::{
+    RuntimeStartupRecoveryObservationCorrelationV2, RuntimeStartupRecoveryObservationReceiptV2,
+    RuntimeStartupRecoveryObservationRequestV2, RuntimeStartupRecoveryStateV2,
+    RuntimeStartupServingStateV2,
+};
+use chrono::{DateTime, Utc};
+
+use crate::closed_recovery::RuntimeClosedRecoveryOperationAuthorityV2;
+use crate::{RuntimeClosedDrainRecoveryPermitV2, RuntimeGatewayCoordinatorGenerationV2};
+
+pub struct RuntimeAuthorizedStartupRecoveryObservationV2 {
+    request: RuntimeStartupRecoveryObservationRequestV2,
+    minimum_database_now: DateTime<Utc>,
+    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
+}
+
+impl RuntimeAuthorizedStartupRecoveryObservationV2 {
+    pub fn request(&self) -> &RuntimeStartupRecoveryObservationRequestV2 {
+        &self.request
+    }
+
+    pub fn complete(
+        self,
+        receipt: RuntimeStartupRecoveryObservationReceiptV2,
+    ) -> RuntimeCompletedStartupRecoveryObservationV2 {
+        RuntimeCompletedStartupRecoveryObservationV2 {
+            authorization: self,
+            receipt,
+        }
+    }
+}
+
+impl Debug for RuntimeAuthorizedStartupRecoveryObservationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeAuthorizedStartupRecoveryObservationV2(<redacted>)")
+    }
+}
+
+pub struct RuntimeCompletedStartupRecoveryObservationV2 {
+    authorization: RuntimeAuthorizedStartupRecoveryObservationV2,
+    receipt: RuntimeStartupRecoveryObservationReceiptV2,
+}
+
+impl Debug for RuntimeCompletedStartupRecoveryObservationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeCompletedStartupRecoveryObservationV2(<redacted>)")
+    }
+}
+
+pub trait RuntimeStartupRecoveryObservationPortV2 {
+    type Error;
+
+    fn observe_startup_recovery(
+        &self,
+        authorization: RuntimeAuthorizedStartupRecoveryObservationV2,
+        operation_cutoff: Instant,
+    ) -> impl Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, Self::Error>> + Send;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeStartupRecoveryObservationAcceptanceErrorV2 {
+    #[error("runtime startup recovery observation call correlation does not match")]
+    CorrelationMismatch,
+    #[error("runtime startup recovery observation owner does not match")]
+    OwnerMismatch,
+    #[error("runtime startup recovery observation database clock regressed")]
+    DatabaseClockRegressed,
+    #[error("runtime startup recovery observation owner is not current")]
+    OwnerNotCurrent,
+    #[error("runtime startup recovery observation database time does not match")]
+    DatabaseTimeMismatch,
+    #[error("runtime startup recovery observation is ambiguous")]
+    Ambiguous,
+    #[error("runtime startup recovery observation is invalid")]
+    InvalidObservation,
+}
+
+pub(crate) struct RuntimeValidatedStartupRecoveryObservationV2 {
+    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
+    database_now: DateTime<Utc>,
+    decision: RuntimeStartupRecoveryDecisionV2,
+}
+
+impl RuntimeValidatedStartupRecoveryObservationV2 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RuntimeClosedRecoveryOperationAuthorityV2,
+        DateTime<Utc>,
+        RuntimeStartupRecoveryDecisionV2,
+    ) {
+        (self.operation_authority, self.database_now, self.decision)
+    }
+}
+
+pub(crate) fn authorize_startup_recovery_observation_v2(
+    permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+) -> Option<RuntimeAuthorizedStartupRecoveryObservationV2> {
+    let request = startup_recovery_observation_request_v2(permit);
+    let minimum_database_now = permit
+        .last_startup_observation_database_now()
+        .unwrap_or(permit.owner_receipt().database_now)
+        .max(permit.owner_receipt().database_now);
+    let operation_authority = permit.take_operation_authority()?;
+    Some(RuntimeAuthorizedStartupRecoveryObservationV2 {
+        request,
+        minimum_database_now,
+        operation_authority,
+    })
+}
+
+pub(crate) fn validate_startup_recovery_observation_v2(
+    permit: &RuntimeClosedDrainRecoveryPermitV2,
+    completed: RuntimeCompletedStartupRecoveryObservationV2,
+) -> Result<
+    RuntimeValidatedStartupRecoveryObservationV2,
+    RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+> {
+    let RuntimeCompletedStartupRecoveryObservationV2 {
+        authorization,
+        receipt,
+    } = completed;
+    let RuntimeAuthorizedStartupRecoveryObservationV2 {
+        request,
+        minimum_database_now,
+        operation_authority,
+    } = authorization;
+    if request != startup_recovery_observation_request_v2(permit)
+        || receipt.correlation != request.correlation
+    {
+        return Err(RuntimeStartupRecoveryObservationAcceptanceErrorV2::CorrelationMismatch);
+    }
+    let observed_owner = &receipt.owner_receipt;
+    if observed_owner.lease_id != request.gateway_owner_lease_id
+        || observed_owner.owner_revision != request.expected_owner_revision
+        || observed_owner.expires_at != request.expected_owner_expires_at
+    {
+        return Err(RuntimeStartupRecoveryObservationAcceptanceErrorV2::OwnerMismatch);
+    }
+    if observed_owner.database_now < minimum_database_now {
+        return Err(RuntimeStartupRecoveryObservationAcceptanceErrorV2::DatabaseClockRegressed);
+    }
+    if observed_owner.database_lease_duration().is_none() {
+        return Err(RuntimeStartupRecoveryObservationAcceptanceErrorV2::OwnerNotCurrent);
+    }
+    if matches!(
+        &receipt.state.serving,
+        RuntimeStartupServingStateV2::ForeignFresh { database_now, .. }
+            if *database_now != observed_owner.database_now
+    ) {
+        return Err(RuntimeStartupRecoveryObservationAcceptanceErrorV2::DatabaseTimeMismatch);
+    }
+    let decision =
+        plan_runtime_startup_recovery_v2(receipt.state).map_err(|error| match error {
+            RuntimeStartupRecoveryPlanErrorV2::Ambiguous => {
+                RuntimeStartupRecoveryObservationAcceptanceErrorV2::Ambiguous
+            }
+            RuntimeStartupRecoveryPlanErrorV2::InvalidObservation => {
+                RuntimeStartupRecoveryObservationAcceptanceErrorV2::InvalidObservation
+            }
+        })?;
+    Ok(RuntimeValidatedStartupRecoveryObservationV2 {
+        operation_authority,
+        database_now: observed_owner.database_now,
+        decision,
+    })
+}
+
+fn startup_recovery_observation_request_v2(
+    permit: &RuntimeClosedDrainRecoveryPermitV2,
+) -> RuntimeStartupRecoveryObservationRequestV2 {
+    let owner = permit.owner_receipt();
+    RuntimeStartupRecoveryObservationRequestV2 {
+        correlation: RuntimeStartupRecoveryObservationCorrelationV2 {
+            recovery_id: permit.recovery_id().clone(),
+            originating_emergency_generation: generation_value(
+                permit.originating_emergency_generation(),
+            ),
+            coordinator_generation: generation_value(permit.coordinator_generation()),
+            authority_revision: NonZeroU64::new(permit.authority_revision().get())
+                .expect("closed recovery authority revision is nonzero"),
+        },
+        gateway_owner_lease_id: owner.lease_id.clone(),
+        expected_owner_revision: owner.owner_revision,
+        expected_owner_expires_at: owner.expires_at,
+    }
+}
+
+fn generation_value(generation: RuntimeGatewayCoordinatorGenerationV2) -> NonZeroU64 {
+    NonZeroU64::new(generation.get()).expect("gateway coordinator generation is nonzero")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeStartupRecoveryClassV2 {

@@ -1,6 +1,11 @@
 use std::num::NonZeroU64;
 
-use crate::{RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2};
+use crate::{
+    authorize_startup_recovery_observation_v2, validate_startup_recovery_observation_v2,
+    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeCompletedStartupRecoveryObservationV2,
+    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeGatewayCoordinatorGenerationV2(NonZeroU64);
@@ -107,6 +112,12 @@ pub enum RuntimeGatewayClosedTransitionErrorV2 {
     CapabilityReadinessNotSuccessor,
     #[error("runtime closed recovery authority revision overflowed")]
     AuthorityRevisionOverflow,
+    #[error("runtime closed recovery operation is already in flight")]
+    RecoveryOperationInFlight,
+    #[error("runtime closed recovery operation is not in flight")]
+    RecoveryOperationNotInFlight,
+    #[error("runtime startup recovery observation was rejected")]
+    StartupRecoveryObservation(RuntimeStartupRecoveryObservationAcceptanceErrorV2),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -234,6 +245,14 @@ impl RuntimeGatewayClosedLifecycleV2 {
         readiness: crate::RuntimeCapabilityReadinessSetV2,
     ) -> Result<(), RuntimeGatewayClosedTransitionErrorV2> {
         self.validate_recovery_permit(permit)?;
+        if !permit.operation_authority_is_available() {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight);
+        }
         if !permit.readiness().has_same_authority_as(&readiness) {
             let generation = permit.coordinator_generation();
             self.invalidate(
@@ -264,6 +283,64 @@ impl RuntimeGatewayClosedLifecycleV2 {
             authority_revision,
         };
         Ok(())
+    }
+
+    pub fn begin_startup_recovery_observation(
+        &mut self,
+        permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeGatewayClosedTransitionErrorV2>
+    {
+        self.validate_recovery_permit(permit)?;
+        let Some(authorization) = authorize_startup_recovery_observation_v2(permit) else {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight);
+        };
+        Ok(authorization)
+    }
+
+    pub fn complete_startup_recovery_observation(
+        &mut self,
+        permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+        completed: RuntimeCompletedStartupRecoveryObservationV2,
+    ) -> Result<RuntimeStartupRecoveryDecisionV2, RuntimeGatewayClosedTransitionErrorV2> {
+        self.validate_recovery_permit(permit)?;
+        if permit.operation_authority_is_available() {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationNotInFlight);
+        }
+        let validated = match validate_startup_recovery_observation_v2(permit, completed) {
+            Ok(validated) => validated,
+            Err(error) => {
+                let generation = permit.coordinator_generation();
+                self.invalidate(generation, startup_observation_invalidation_cause(error))?;
+                return Err(
+                    RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryObservation(error),
+                );
+            }
+        };
+        let generation = permit.coordinator_generation();
+        let recovery_id = permit.recovery_id().clone();
+        let (operation_authority, database_now, decision) = validated.into_parts();
+        let Some(authority_revision) =
+            permit.restore_operation_authority(operation_authority, database_now)
+        else {
+            self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
+            return Err(RuntimeGatewayClosedTransitionErrorV2::AuthorityRevisionOverflow);
+        };
+        self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            authority_revision,
+        };
+        Ok(decision)
     }
 
     pub fn invalidate(
@@ -323,6 +400,26 @@ impl RuntimeGatewayClosedLifecycleV2 {
             return Err(RuntimeGatewayClosedTransitionErrorV2::GenerationOverflow);
         };
         Ok(successor)
+    }
+}
+
+fn startup_observation_invalidation_cause(
+    error: RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+) -> RuntimeGatewayInvalidationCauseV2 {
+    match error {
+        RuntimeStartupRecoveryObservationAcceptanceErrorV2::OwnerMismatch
+        | RuntimeStartupRecoveryObservationAcceptanceErrorV2::OwnerNotCurrent => {
+            RuntimeGatewayInvalidationCauseV2::OwnershipUncertain
+        }
+        RuntimeStartupRecoveryObservationAcceptanceErrorV2::Ambiguous
+        | RuntimeStartupRecoveryObservationAcceptanceErrorV2::InvalidObservation => {
+            RuntimeGatewayInvalidationCauseV2::CapabilityNotReady
+        }
+        RuntimeStartupRecoveryObservationAcceptanceErrorV2::CorrelationMismatch
+        | RuntimeStartupRecoveryObservationAcceptanceErrorV2::DatabaseClockRegressed
+        | RuntimeStartupRecoveryObservationAcceptanceErrorV2::DatabaseTimeMismatch => {
+            RuntimeGatewayInvalidationCauseV2::ProtocolViolation
+        }
     }
 }
 
