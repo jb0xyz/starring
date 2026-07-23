@@ -778,6 +778,76 @@ async fn product_apply_waits_at_writer_fence_before_product_row_locks() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn stale_product_apply_snapshot_retries_into_closed_writer_fence() {
+    let database = isolated_database("apply_writer_fence_snapshot").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await.unwrap();
+        let fixture = seed_fixture(&database.pool).await;
+        let operation = Operation::new("writer-fence-snapshot");
+        let mut stale = begin_serializable(&database.pool).await;
+        sqlx::query(
+            "SELECT pg_catalog.set_config('statement_timeout', '10s', TRUE), \
+              pg_catalog.set_config('lock_timeout', '5s', TRUE), \
+              pg_catalog.set_config('idle_in_transaction_session_timeout', '10s', TRUE), \
+              pg_catalog.set_config('search_path', 'pg_catalog', TRUE), \
+              pg_catalog.set_config('quote_all_identifiers', 'off', TRUE)",
+        )
+        .execute(&mut *stale)
+        .await?;
+
+        let mut writer = database.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+             pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0))",
+        )
+        .execute(&mut *writer)
+        .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&mut *writer)
+            .await?;
+        sqlx::query(
+            "UPDATE public.runtime_writer_fence \
+             SET fence_state = 'closed', fence_generation = 2, \
+              cutover_lease_epoch_high_water = 1, \
+              cutover_coordinator_id = '0123456789abcdef0123456789abcdef', \
+              cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+             WHERE singleton",
+        )
+        .execute(&mut *writer)
+        .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&mut *writer)
+            .await?;
+        writer.commit().await?;
+
+        let stale_error = lock_apply(&mut stale, &fixture, &operation, &Call::valid(&fixture))
+            .await
+            .expect_err("stale Product Apply snapshot must be retried");
+        assert!(matches!(
+            stale_error,
+            sqlx::Error::Database(database)
+                if database.code().as_deref() == Some("40001")
+        ));
+        stale.rollback().await?;
+
+        let mut retry = begin_serializable(&database.pool).await;
+        let retry_result =
+            lock_apply(&mut retry, &fixture, &operation, &Call::valid(&fixture)).await?;
+        assert_eq!(retry_result.outcome, "runtime_writer_fenced");
+        retry.rollback().await?;
+
+        let mut durable = database.pool.begin().await?;
+        assert_apply_unmutated(&mut durable, &fixture, &operation).await;
+        durable.rollback().await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
 async fn product_apply_writer_fence_closed_and_missing_are_stable_failures() {
     let database = isolated_database("apply_writer_fence_state").await;
     let outcome = async {
