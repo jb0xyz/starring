@@ -37,6 +37,7 @@ mod v2_product_drain_canonical;
 mod v2_route;
 mod v2_route_provenance;
 mod v2_startup_recovery;
+mod v2_suspension;
 mod v2_writer_fence;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
@@ -144,6 +145,11 @@ pub use v2_startup_recovery::{
     RuntimeStartupRecoveryObservationCorrelationV2, RuntimeStartupRecoveryObservationReceiptV2,
     RuntimeStartupRecoveryObservationRequestV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2,
+};
+pub use v2_suspension::{
+    RuntimeAttemptDispositionV2, RuntimeDrainObligationV2, RuntimeLocalRouteEffectV2,
+    RuntimeResumeCheckpointV2, RuntimeSuspendAttemptRequestV2, RuntimeSuspendedRouteLifecycleV2,
+    RuntimeSuspensionSourcePhaseV2,
 };
 pub use v2_writer_fence::{
     RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,

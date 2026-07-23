@@ -256,6 +256,225 @@ fn v2_route_mutation_provenance_is_exact_inert_evidence() {
 }
 
 #[test]
+fn v2_suspension_request_vocabulary_is_closed_and_inert() {
+    let source = include_str!("../src/v2_suspension.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "RuntimeSuspendAttemptDigestV2",
+        "RuntimeFailureDispositionV1",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "automation_runtime::",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension request surface: {forbidden}"
+        );
+    }
+
+    let disposition = source
+        .split("pub enum RuntimeAttemptDispositionV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert!(disposition.contains("Retryable { retry_not_before: DateTime<Utc> },"));
+    assert!(disposition.contains("Blocked,"));
+    assert_eq!(
+        disposition
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .count(),
+        2
+    );
+
+    let checkpoint = source
+        .split("pub enum RuntimeResumeCheckpointV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for variant in [
+        "VerifyPreflight,",
+        "RequestDrain,",
+        "CompleteDrain,",
+        "BeginActivation,",
+        "ObserveActivation,",
+        "BeginPanels,",
+        "ReconcilePanels,",
+    ] {
+        assert!(checkpoint.contains(variant), "{variant}");
+    }
+    assert_eq!(
+        checkpoint
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .count(),
+        7
+    );
+
+    let source_phase = source
+        .split("pub enum RuntimeSuspensionSourcePhaseV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for variant in [
+        "Requested,",
+        "PreflightReady,",
+        "DrainRequested,",
+        "Drained,",
+        "ActivationApplying,",
+        "RuntimePendingReady,",
+        "ReconcilingPanels,",
+    ] {
+        assert!(source_phase.contains(variant), "{variant}");
+    }
+    assert_eq!(
+        source_phase
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .count(),
+        7
+    );
+    for mapping in [
+        "Self::Requested => RuntimeResumeCheckpointV2::VerifyPreflight",
+        "Self::PreflightReady => RuntimeResumeCheckpointV2::RequestDrain",
+        "Self::DrainRequested => RuntimeResumeCheckpointV2::CompleteDrain",
+        "Self::Drained => RuntimeResumeCheckpointV2::BeginActivation",
+        "Self::ActivationApplying => RuntimeResumeCheckpointV2::ObserveActivation",
+        "Self::RuntimePendingReady => RuntimeResumeCheckpointV2::BeginPanels",
+        "Self::ReconcilingPanels => RuntimeResumeCheckpointV2::ReconcilePanels",
+    ] {
+        assert!(source.contains(mapping), "{mapping}");
+    }
+    for rejected in [
+        "RuntimeDeploymentPhaseV1::RuntimePending { .. }",
+        "RuntimeDeploymentPhaseV1::AwaitingGatewayReady",
+        "RuntimeDeploymentPhaseV1::Live",
+        "RuntimeDeploymentPhaseV1::Superseded { .. }",
+        "RuntimeDeploymentPhaseV1::Cancelled { .. }",
+    ] {
+        assert!(source.contains(rejected), "{rejected}");
+    }
+    assert!(source.contains("condition: RuntimePendingConditionV1::Ready"));
+
+    let lifecycle = source
+        .split("pub enum RuntimeSuspendedRouteLifecycleV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert!(lifecycle.contains("Staged,"));
+    assert!(lifecycle.contains("Draining,"));
+    assert_eq!(
+        lifecycle
+            .lines()
+            .filter(|line| line.starts_with("    "))
+            .count(),
+        2
+    );
+
+    let obligation = source
+        .split("pub enum RuntimeDrainObligationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "None,",
+        "ExactLocalRoute(RuntimeExactLocalRouteIdentityV2),",
+        "PreviousServing(RuntimePreviousServingLeaseIdentityV1),",
+        "LocalAndPrevious {",
+        "local: RuntimeExactLocalRouteIdentityV2,",
+        "previous: RuntimePreviousServingLeaseIdentityV1,",
+    ] {
+        assert!(obligation.contains(member), "{member}");
+    }
+    assert_eq!(
+        obligation
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        4
+    );
+
+    let local_effect = source
+        .split("pub enum RuntimeLocalRouteEffectV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "None,",
+        "ExactRoute {",
+        "route: RuntimeExactLocalRouteIdentityV2,",
+        "lifecycle: RuntimeSuspendedRouteLifecycleV2,",
+        "RouteAbsent {",
+        "slot: RuntimeServingSlotV2,",
+        "expected_route: Option<RuntimeExactLocalRouteIdentityV2>,",
+        "provenance: RuntimeRouteMutationProvenanceV2,",
+        "observed_sequence: NonZeroU64,",
+    ] {
+        assert!(local_effect.contains(member), "{member}");
+    }
+    assert_eq!(
+        local_effect
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        3
+    );
+
+    let request = source
+        .split("pub struct RuntimeSuspendAttemptRequestV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[cfg(test)]").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("suspension_id", "RuntimeSuspensionIdV2"),
+        ("action_id", "RuntimeSessionActionIdV1"),
+        ("guard", "RuntimeExecutionGuardV1"),
+        ("source_phase", "RuntimeSuspensionSourcePhaseV2"),
+        ("failure", "RuntimeFailureV1"),
+        ("disposition", "RuntimeAttemptDispositionV2"),
+        ("checkpoint", "RuntimeResumeCheckpointV2"),
+        ("local_effect", "RuntimeLocalRouteEffectV2"),
+        ("drain_obligation", "RuntimeDrainObligationV2"),
+    ] {
+        assert!(request.contains(&format!("pub {field}: {field_type},")));
+    }
+    assert_eq!(request.matches("    pub ").count(), 9);
+    assert!(!request.contains("RuntimeDeploymentPhaseV1"));
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeAttemptDispositionV2",
+        "RuntimeDrainObligationV2",
+        "RuntimeLocalRouteEffectV2",
+        "RuntimeResumeCheckpointV2",
+        "RuntimeSuspendAttemptRequestV2",
+        "RuntimeSuspendedRouteLifecycleV2",
+        "RuntimeSuspensionSourcePhaseV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn startup_recovery_observation_dtos_are_exact_and_non_authorizing() {
     let source = include_str!("../src/v2_startup_recovery.rs");
 
@@ -1560,6 +1779,10 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_startup_recovery.rs",
             include_str!("../src/v2_startup_recovery.rs"),
+        ),
+        (
+            "src/v2_suspension.rs",
+            include_str!("../src/v2_suspension.rs"),
         ),
         (
             "src/v2_writer_fence.rs",
