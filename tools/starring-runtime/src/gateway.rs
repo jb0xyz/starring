@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use automation_runtime::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
-    GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
-    GatewayControlTransitionErrorV3, GatewayDrainCauseV3, GatewayInvalidationSignalV3,
-    GatewayReadyKindV3, GatewaySynchronousInvalidatorV3, SharedGatewayControlV3,
-    SharedGatewayRuntimeControlV3,
+    GatewayAdmissionSnapshotV3, GatewayConnectionStateV3, GatewayControlConfigV3,
+    GatewayControlConfigurationErrorV3, GatewayControlTransitionErrorV3, GatewayDrainCauseV3,
+    GatewayInvalidationSignalV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
+    GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
@@ -17,7 +17,8 @@ use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
     RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeGatewayClosedLifecycleV2,
     RuntimeGatewayClosedSnapshotV2, RuntimeGatewayInvalidationCauseV2,
-    RuntimeGatewayOwnerLeasePortV1,
+    RuntimeGatewayOwnerLeasePortV1, RuntimePausedGatewayObservationV2,
+    RuntimePausedGatewaySequenceV2,
 };
 
 use crate::gateway_owner_startup_watchdog::{
@@ -215,6 +216,37 @@ impl RuntimeGatewayBootstrapV1 {
             .is_ok_and(|current| current == *candidate)
     }
 
+    pub fn observe_paused_connected_gateway_v2(
+        &self,
+    ) -> Result<RuntimePausedGatewayObservationV2, RuntimeGatewayReadyObservationErrorV1> {
+        self.require_current_gateway_ownership()?;
+        let closed = self.closed_snapshot();
+        let RuntimeGatewayClosedSnapshotV2::Emergency { generation, .. } = closed else {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+        };
+        let snapshot = self.adapter.control.current_admission_snapshot();
+        let (observation, epoch) = self
+            .adapter
+            .map_paused_connected_observation(generation, snapshot)?;
+        self.adapter.require_healthy_paused_control(epoch)?;
+        if self.adapter.control.current_admission_snapshot() != snapshot {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        self.require_current_gateway_ownership()?;
+        if self.closed_snapshot() != closed {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        self.adapter.require_healthy_paused_control(epoch)?;
+        if self.adapter.control.current_admission_snapshot() != snapshot {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        if self.closed_snapshot() != closed {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        self.require_current_gateway_ownership()?;
+        Ok(observation)
+    }
+
     pub fn start_gateway_owner_startup_watchdog_v1<P>(
         &mut self,
         port: P,
@@ -356,6 +388,80 @@ fn shutdown_closed_lifecycle(lifecycle: &mut RuntimeGatewayClosedLifecycleV2) {
 }
 
 impl SharedGatewayControlAdapterV2 {
+    fn map_paused_connected_observation(
+        &self,
+        coordinator_generation: automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2,
+        snapshot: GatewayAdmissionSnapshotV3,
+    ) -> Result<
+        (
+            RuntimePausedGatewayObservationV2,
+            automation_runtime::GatewayConnectionEpochV3,
+        ),
+        RuntimeGatewayReadyObservationErrorV1,
+    > {
+        let (epoch, kind) = match snapshot.connection() {
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Connected { epoch, kind },
+            } => (epoch, kind),
+            GatewayConnectionStateV3::Starting
+            | GatewayConnectionStateV3::Disconnected { .. }
+            | GatewayConnectionStateV3::Paused {
+                connection:
+                    GatewayPausedConnectionV3::Starting | GatewayPausedConnectionV3::Disconnected { .. },
+            } => return Err(RuntimeGatewayReadyObservationErrorV1::NotConnected),
+            GatewayConnectionStateV3::Connected { .. } => {
+                return Err(RuntimeGatewayReadyObservationErrorV1::AdmissionNotPaused)
+            }
+            GatewayConnectionStateV3::Draining { .. } => {
+                return Err(RuntimeGatewayReadyObservationErrorV1::Draining)
+            }
+            GatewayConnectionStateV3::Stopped { .. } => {
+                return Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
+            }
+        };
+        let kind = match kind {
+            GatewayReadyKindV3::Ready => RuntimeGatewayReadyKindV2::Ready,
+            GatewayReadyKindV3::Resumed => RuntimeGatewayReadyKindV2::Resumed,
+        };
+        let transition_sequence = bounded_sequence(snapshot.transition_sequence().get())?;
+        let connected_event_sequence = snapshot
+            .connected_event_sequence()
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceSequenceZero)
+            .and_then(|sequence| bounded_sequence(sequence.get()))?;
+        let last_resume_sequence = snapshot
+            .resume_sequence()
+            .map(|sequence| bounded_sequence(sequence.get()))
+            .transpose()?;
+        let sequence = RuntimePausedGatewaySequenceV2::new(
+            transition_sequence,
+            connected_event_sequence,
+            last_resume_sequence,
+        )
+        .map_err(|_| RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)?;
+        Ok((
+            RuntimePausedGatewayObservationV2::new(
+                coordinator_generation,
+                self.process_instance_id.clone(),
+                bounded_non_zero(epoch.get())?,
+                kind,
+                bounded_non_zero(snapshot.admission_revision().get())?,
+                sequence,
+            ),
+            epoch,
+        ))
+    }
+
+    fn require_healthy_paused_control(
+        &self,
+        epoch: automation_runtime::GatewayConnectionEpochV3,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        match self.control.issue_ready_lease(epoch) {
+            Err(GatewayControlTransitionErrorV3::AdmissionPaused) => Ok(()),
+            Err(error) => Err(map_transition_error(error)),
+            Ok(_) => Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot),
+        }
+    }
+
     fn observe_current_ready_attestation(
         &self,
     ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
@@ -479,9 +585,11 @@ fn map_transition_error(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use automation_runtime::{
+        shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
         GatewayCommandAckV3, GatewayControlConfigV3, GatewayControlErrorV3,
         GatewayControlTransitionErrorV3, GatewayDisconnectKindV3, GatewayDrainCauseV3,
         GatewayInvalidationSignalV3, GatewayPauseTokenV3, GatewayReadyKindV3,
@@ -497,16 +605,48 @@ mod tests {
 
     use super::{
         compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayInvalidationBridgeV2,
-        RuntimeGatewayReadyObservationErrorV1,
+        RuntimeGatewayOwnerInvalidationBridgeV2, RuntimeGatewayReadyObservationErrorV1,
+        SharedGatewayControlAdapterV2, SharedGatewayRuntimeHalfV3,
     };
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
+
+    struct PanickingInvalidatorV3;
+
+    impl GatewaySynchronousInvalidatorV3 for PanickingInvalidatorV3 {
+        fn invalidate(&self, _signal: GatewayInvalidationSignalV3) {
+            panic!("test invalidation failure")
+        }
+    }
 
     fn bootstrap() -> RuntimeGatewayBootstrapV1 {
         compose_with_control_config(
             ProcessInstanceId::parse("runtime-process:1").unwrap(),
             GatewayControlConfigV3::default(),
         )
+    }
+
+    fn bootstrap_with_panicking_invalidator() -> RuntimeGatewayBootstrapV1 {
+        let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+        let owner_invalidated = Arc::new(AtomicBool::new(false));
+        let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+            PanickingInvalidatorV3,
+        );
+        RuntimeGatewayBootstrapV1 {
+            adapter: SharedGatewayControlAdapterV2 {
+                process_instance_id: ProcessInstanceId::parse("runtime-process:1").unwrap(),
+                control,
+                closed_lifecycle: closed_lifecycle.clone(),
+            },
+            _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+            owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
+                closed_lifecycle,
+                invalidated: owner_invalidated.clone(),
+            }),
+            owner_invalidated,
+        }
     }
 
     fn connect(bootstrap: &mut RuntimeGatewayBootstrapV1, kind: GatewayReadyKindV3) -> u64 {
@@ -677,6 +817,10 @@ mod tests {
             bootstrap.observe_current_ready_attestation(),
             Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
         );
+        assert_eq!(
+            bootstrap.observe_paused_connected_gateway_v2(),
+            Err(RuntimeGatewayReadyObservationErrorV1::NotConnected)
+        );
     }
 
     #[test]
@@ -697,6 +841,10 @@ mod tests {
             bootstrap.observe_current_ready_attestation(),
             Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
         );
+        assert_eq!(
+            bootstrap.observe_paused_connected_gateway_v2(),
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        );
     }
 
     #[test]
@@ -706,6 +854,50 @@ mod tests {
         assert_eq!(
             bootstrap.observe_current_ready_attestation(),
             Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
+        );
+        let paused = bootstrap.observe_paused_connected_gateway_v2().unwrap();
+        assert_eq!(paused.coordinator_generation().get(), 1);
+        assert_eq!(paused.process_instance_id().as_str(), "runtime-process:1");
+        assert_eq!(paused.connection_epoch().get(), 1);
+        assert_eq!(paused.admission_revision().get(), 1);
+        assert_eq!(paused.transition_sequence().get(), 1);
+        assert_eq!(paused.connected_event_sequence().get(), 1);
+        assert_eq!(paused.last_resume_sequence(), None);
+    }
+
+    #[tokio::test]
+    async fn repeated_pause_and_prior_resume_are_preserved_in_exact_observation() {
+        let mut bootstrap = bootstrap();
+        connect(&mut bootstrap, GatewayReadyKindV3::Ready);
+        let first = pause(&mut bootstrap).await;
+        let first_observation = bootstrap.observe_paused_connected_gateway_v2().unwrap();
+        assert_eq!(first_observation.admission_revision().get(), 2);
+        assert_eq!(first_observation.transition_sequence().get(), 2);
+        assert_eq!(first_observation.last_resume_sequence(), None);
+
+        resume(&mut bootstrap, &first).await.unwrap();
+        assert_eq!(
+            bootstrap.observe_paused_connected_gateway_v2(),
+            Err(RuntimeGatewayReadyObservationErrorV1::AdmissionNotPaused)
+        );
+        let _second = pause(&mut bootstrap).await;
+        let second_observation = bootstrap.observe_paused_connected_gateway_v2().unwrap();
+        assert_eq!(second_observation.admission_revision().get(), 3);
+        assert_eq!(second_observation.transition_sequence().get(), 4);
+        assert_eq!(second_observation.last_resume_sequence().unwrap().get(), 3);
+    }
+
+    #[tokio::test]
+    async fn paused_observation_rejects_an_unhealthy_invalidation_hook() {
+        let mut bootstrap = bootstrap_with_panicking_invalidator();
+        connect(&mut bootstrap, GatewayReadyKindV3::Ready);
+        let first = pause(&mut bootstrap).await;
+        resume(&mut bootstrap, &first).await.unwrap();
+        let _second = pause(&mut bootstrap).await;
+
+        assert_eq!(
+            bootstrap.observe_paused_connected_gateway_v2(),
+            Err(RuntimeGatewayReadyObservationErrorV1::ControlOrphaned)
         );
     }
 
@@ -748,6 +940,10 @@ mod tests {
         assert_eq!(
             bootstrap.observe_current_ready_attestation(),
             Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
+        );
+        assert_eq!(
+            bootstrap.observe_paused_connected_gateway_v2(),
+            Err(RuntimeGatewayReadyObservationErrorV1::NotConnected)
         );
         let closed = bootstrap.closed_snapshot();
         assert_eq!(closed.generation().get(), 2);

@@ -464,6 +464,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "const SUPPORTED_GATEWAY_SHARD_ID: &str = \"shard:0\";",
         "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ProcessMismatch",
         "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ShardMismatch",
+        "pub fn observe_paused_connected_gateway_v2(",
+        "require_healthy_paused_control",
+        "self.control.issue_ready_lease(epoch)",
+        "RuntimePausedGatewayObservationV2::new(",
+        "RuntimePausedGatewaySequenceV2::new(",
     ] {
         assert!(gateway.contains(required), "{required}");
     }

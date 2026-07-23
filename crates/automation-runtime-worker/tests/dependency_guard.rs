@@ -40,6 +40,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/paused_gateway.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/writer_fence.rs"),
         ]
@@ -117,6 +118,27 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
                 path.display()
             );
         }
+    }
+}
+
+#[test]
+fn paused_gateway_evidence_is_redacted_and_nonserializable() {
+    let source = include_str!("../src/paused_gateway.rs");
+
+    for forbidden in ["Serialize", "Deserialize", "Default"] {
+        assert!(!source.contains(forbidden));
+    }
+    assert!(source.contains("RuntimePausedGatewayObservationV2(<redacted>)"));
+    for field in [
+        "coordinator_generation",
+        "process_instance_id",
+        "connection_epoch",
+        "admission_revision",
+        "transition_sequence",
+        "connected_event_sequence",
+        "last_resume_sequence",
+    ] {
+        assert!(!source.contains(&format!("pub {field}:")));
     }
 }
 
