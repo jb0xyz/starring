@@ -22,6 +22,7 @@ mod v2_certification_operation;
 mod v2_certification_outcome;
 mod v2_digest;
 mod v2_drain;
+mod v2_drain_claim;
 mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
@@ -112,6 +113,12 @@ pub use v2_digest::{
     RuntimeProductSemanticRequestDigestV2, RuntimeSuspendAttemptDigestV2,
 };
 pub use v2_drain::{RuntimeDrainIntentKeyV2, RuntimeDrainIntentPreimageV2};
+pub use v2_drain_claim::{
+    RuntimeDrainCertificationResolutionKindV2, RuntimeDrainCertificationResolutionV2,
+    RuntimeDrainClaimErrorV2, RuntimeDrainClaimFieldV2, RuntimeDrainClaimProgressKindV2,
+    RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
+    RuntimeRouteAbsentAcknowledgementV2,
+};
 pub use v2_evidence::{
     RuntimeBarrierPauseWitnessV2, RuntimeEvidenceErrorV2, RuntimePanelEvidenceV2,
     RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,

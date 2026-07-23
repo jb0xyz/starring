@@ -1616,6 +1616,86 @@ fn v2_product_and_drain_preimages_stay_inert_and_nonserializable() {
 }
 
 #[test]
+fn v2_drain_claim_evidence_stays_checked_and_non_authorizing() {
+    let source = include_str!("../src/v2_drain_claim.rs");
+    let tests = include_str!("../src/v2_drain_claim/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "automation_runtime_registry",
+        "RuntimeAuthorizedDrainClaimV2",
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "RuntimeShutdownDrainCompletionPermitV2",
+        "pub struct RuntimeDrainClaimSealWitnessV2 {\n    pub ",
+        "pub struct RuntimeDrainClaimV2 {\n    pub ",
+        "pub struct RuntimeRouteAbsentAcknowledgementV2 {\n    pub ",
+        "impl Future",
+        "async fn",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 drain-claim evidence surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub struct RuntimeDrainClaimSealWitnessV2",
+        "pub struct RuntimeDrainClaimProgressV2",
+        "pub struct RuntimeDrainClaimV2",
+        "pub struct RuntimeDrainCertificationResolutionV2",
+        "pub struct RuntimeRouteAbsentAcknowledgementV2",
+    ] {
+        assert!(source.contains(declaration));
+    }
+
+    for exact_check in [
+        "route.slot() != key.slot",
+        "route.identity.target != key.expected_target",
+        "route.identity.process_instance_id != process_instance_id",
+        "seal.expected_route() != Some(&old_route)",
+        "old_route.identity != removal_target.identity",
+        "old_route.route_incarnation != removal_target.route_incarnation",
+        "removal_target.controller_fencing_token <= old_route.controller_fencing_token",
+        "registry_observation_sequence <= seal.registry_observation_sequence()",
+        "removal_target.controller_fencing_token != controller_fencing_token",
+        "provenance_revision != observed_owner_revision",
+        "disconnected_revision == expected",
+        "route.identity != serving_identity.process_identity",
+        "expected_route.as_ref() != claim.progress().removal_target()",
+        "registry_observation_sequence <= refence_sequence",
+    ] {
+        assert!(
+            source.contains(exact_check),
+            "missing V2 drain-claim exact check: {exact_check}"
+        );
+    }
+
+    for test_name in [
+        "seal_binds_the_exact_intent_slot_process_and_route",
+        "seal_rejects_wrong_route_slot_target_and_process",
+        "refenced_progress_changes_only_to_a_strictly_newer_fence",
+        "claim_binds_owner_process_fence_and_progress",
+        "claim_rejects_foreign_owner_process_and_wrong_claim_fence",
+        "certification_resolution_binds_operation_scope_target_and_process",
+        "all_certification_resolution_variants_have_closed_views",
+        "acknowledgement_accepts_refenced_and_initially_absent_claims",
+        "acknowledgement_rejects_wrong_route_and_accepts_a_distinct_removal_barrier",
+        "persistence_numbers_and_timestamps_reject_noncanonical_values",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 drain-claim behavior test: {test_name}"
+        );
+    }
+}
+
+#[test]
 fn v2_product_drain_canonical_surface_stays_closed_and_purpose_specific() {
     let canonical = include_str!("../src/v2_product_drain_canonical.rs");
     let wire = include_str!("../src/v2_product_drain_canonical/wire.rs");
@@ -2742,6 +2822,14 @@ fn source_files_contain_no_comments() {
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
+        (
+            "src/v2_drain_claim.rs",
+            include_str!("../src/v2_drain_claim.rs"),
+        ),
+        (
+            "src/v2_drain_claim/tests.rs",
+            include_str!("../src/v2_drain_claim/tests.rs"),
+        ),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
