@@ -479,6 +479,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/main.rs",
             "src/registry.rs",
             "src/secret.rs",
+            "src/startup_recovery_observation.rs",
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
             "tests/process_contract.rs"
@@ -566,6 +567,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+            && path != Path::new("src/startup_recovery_observation.rs")
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
@@ -617,11 +619,15 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     identifier,
                     "automation_runtime_controller" | "automation_runtime_worker"
                 );
+            let allowed_startup_observation = path
+                == Path::new("src/startup_recovery_observation.rs")
+                && identifier == "automation_runtime_worker";
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
+                        || allowed_startup_observation
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1321,7 +1327,21 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             if contains_identifier(source, method) {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
-                        || path == Path::new("src/gateway.rs"),
+                        || path == Path::new("src/gateway.rs")
+                        || path == Path::new("src/startup_recovery_observation.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        for method in [
+            "begin_startup_recovery_observation_v2",
+            "into_startup_recovery_observation_successor_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/gateway.rs")
+                        || path == Path::new("src/startup_recovery_observation.rs"),
                     "{}: {method}",
                     path.display()
                 );
@@ -1346,6 +1366,141 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedRecoveryCommitErrorV2",
         "RuntimeClosedRecoveryReadinessRefreshErrorV2",
         "RuntimeDatabaseReadinessRefreshV2",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authorizing() {
+    let sources = source_files();
+    let observation = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/startup_recovery_observation.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let closed = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/closed_recovery.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let gateway = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/gateway.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+
+    for required in [
+        "pub(crate) enum RuntimeClosedRecoveryStartupObservationErrorV2<E>",
+        "pub(crate) async fn observe_startup_recovery_v2<P>(",
+        "async fn observe_startup_recovery_with_v2<",
+        ".operation_cutoff",
+        ".min(self.owner.observation().safety_deadline())",
+        ".begin_startup_recovery_observation_v2(&owner)",
+        "biased;",
+        "sleep_until(TokioInstant::from_std(observation_cutoff))",
+        "result = observe(authorization, observation_cutoff)",
+        ".invalidate_capability_not_ready_v2()",
+        ".into_startup_recovery_observation_successor_v2(&owner, completed)",
+        "post_complete();",
+        "post_revalidate();",
+        "RuntimeClosedRecoveryStartupObservationErrorV2(<redacted>)",
+        "RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed",
+    ] {
+        assert!(observation.contains(required), "{required}");
+    }
+    let public_method = braced_declaration(
+        observation,
+        "pub(crate) async fn observe_startup_recovery_v2<P>(",
+    );
+    let signature = public_method.split("where").next().unwrap();
+    assert!(!signature.contains("operation_cutoff"));
+    assert!(!signature.contains("Instant"));
+    assert_eq!(
+        observation
+            .matches("observe(authorization, observation_cutoff)")
+            .count(),
+        1
+    );
+    assert_eq!(observation.matches("biased;").count(), 1);
+    assert_eq!(
+        observation
+            .matches("Instant::now() >= observation_cutoff")
+            .count(),
+        7
+    );
+    let inner = braced_declaration(observation, "async fn observe_startup_recovery_with_v2<");
+    let initial_revalidation = inner.find("self.revalidate_v2()").unwrap();
+    let cutoff = inner.find("let observation_cutoff").unwrap();
+    let begin = inner
+        .find(".begin_startup_recovery_observation_v2(&owner)")
+        .unwrap();
+    let await_observation = inner
+        .find("result = observe(authorization, observation_cutoff)")
+        .unwrap();
+    let successor = inner
+        .find(".into_startup_recovery_observation_successor_v2(&owner, completed)")
+        .unwrap();
+    let post_complete = inner.find("post_complete();").unwrap();
+    let final_revalidation = inner
+        .rfind("session\n            .revalidate_v2()")
+        .unwrap();
+    let post_revalidate = inner.rfind("post_revalidate();").unwrap();
+    let final_cutoff = final_revalidation
+        + inner[final_revalidation..]
+            .find("Instant::now() >= observation_cutoff")
+            .unwrap();
+    assert!(initial_revalidation < cutoff && cutoff < begin && begin < await_observation);
+    assert!(await_observation < successor && successor < post_complete);
+    assert!(
+        post_complete < final_revalidation
+            && final_revalidation < post_revalidate
+            && post_revalidate < final_cutoff
+    );
+    for forbidden in [
+        "recover_next_stale_live",
+        "activate",
+        "deploy",
+        "resume",
+        "RuntimeExecutionConvergencePort",
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "sqlx",
+        "PgPool",
+        "MutexGuard",
+        "RegistryRecoveryObservationGuardV2",
+    ] {
+        assert!(!contains_identifier(observation, forbidden), "{forbidden}");
+    }
+
+    let begin_gateway = braced_declaration(
+        gateway,
+        "pub(crate) fn begin_startup_recovery_observation_v2(",
+    );
+    let begin_preflight = begin_gateway
+        .find("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    let begin_transition = begin_gateway
+        .find("coordinator.begin_startup_recovery_observation(&mut self.permit)")
+        .unwrap();
+    let begin_postflight = begin_gateway
+        .rfind("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    assert!(begin_preflight < begin_transition && begin_transition < begin_postflight);
+    let complete_gateway = braced_declaration(
+        gateway,
+        "pub(crate) fn into_startup_recovery_observation_successor_v2(",
+    );
+    assert!(complete_gateway
+        .contains(".complete_startup_recovery_observation(&mut self.permit, completed)"));
+    assert!(complete_gateway.contains("self.owner_invalidated.store(true, Ordering::Release)"));
+
+    let library = include_str!("../src/lib.rs");
+    assert!(closed.contains("mod startup_recovery_observation;"));
+    assert!(!closed.contains("pub mod startup_recovery_observation;"));
+    assert!(!library.contains("mod startup_recovery_observation;"));
+    for forbidden in [
+        "RuntimeClosedRecoveryStartupObservationErrorV2",
+        "observe_startup_recovery_v2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }

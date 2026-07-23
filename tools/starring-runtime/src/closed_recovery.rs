@@ -21,6 +21,9 @@ use crate::registry::{
     RuntimeRegistryRecoveryObservationErrorV1,
 };
 
+#[path = "startup_recovery_observation.rs"]
+mod startup_recovery_observation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RuntimeClosedRecoveryBeginErrorV2 {
     #[error("runtime closed recovery operation deadline elapsed")]
@@ -359,6 +362,9 @@ pub(crate) fn begin_initial_empty_recovery_v2(
     pending.revalidate_v2()?;
     Ok(pending)
 }
+
+#[cfg(test)]
+pub(crate) use startup_recovery_observation::RuntimeClosedRecoveryStartupObservationErrorV2;
 
 #[cfg(test)]
 impl RuntimeClosedRecoveryPendingPhaseV2 {
