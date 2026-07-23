@@ -30,6 +30,7 @@ mod v2_gateway;
 mod v2_identity;
 mod v2_product;
 mod v2_product_drain_canonical;
+mod v2_product_drain_observation;
 mod v2_product_drain_operation;
 mod v2_route;
 mod v2_route_provenance;
@@ -153,6 +154,12 @@ pub use v2_product_drain_canonical::{
     RuntimeCanonicalProductDrainV2, RuntimeProductDrainCanonicalErrorV2,
     RuntimeProductDrainCanonicalFieldV2, RuntimeProductDrainCanonicalRootV2,
     RuntimeProductDrainCorrelationV2,
+};
+pub use v2_product_drain_observation::{
+    RuntimeObservedProductDrainV2, RuntimeProductDrainNaturalScopeV2,
+    RuntimeProductDrainScopeCorruptionV2, RuntimeProductDrainScopeObservationErrorV2,
+    RuntimeProductDrainScopeObservationFieldV2, RuntimeProductDrainScopeObservationKindV2,
+    RuntimeProductDrainScopeObservationV2,
 };
 pub use v2_product_drain_operation::{
     RuntimeDrainIntentOperationScopeV2, RuntimePersistedProductDrainRootV2,

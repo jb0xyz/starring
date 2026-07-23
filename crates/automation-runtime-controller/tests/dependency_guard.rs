@@ -2105,6 +2105,139 @@ fn v2_product_drain_operations_bind_natural_scopes_and_byte_exact_replay() {
 }
 
 #[test]
+fn v2_product_drain_scope_observation_is_combined_exact_and_non_authorizing() {
+    let source = include_str!("../src/v2_product_drain_observation.rs");
+    let tests = include_str!("../src/v2_product_drain_observation/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "Port",
+        "Authority",
+        "Permit",
+        "Authorized",
+        "RuntimeProductOperationIdV2",
+        "RuntimeDrainIntentIdV2",
+        "pub root:",
+        "pub intent:",
+        "pub lookup:",
+        "pub locked_snapshot:",
+        "pub observed_at:",
+        "pub state:",
+        "pub fn new(",
+        "retry",
+        "Retry",
+        "transaction",
+        "Transaction",
+        "SystemTime",
+        "Instant",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+        "rand",
+        "Uuid",
+        "CSPRNG",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 Product drain observation surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub enum RuntimeProductDrainNaturalScopeV2",
+        "pub enum RuntimeProductDrainScopeCorruptionV2",
+        "pub enum RuntimeProductDrainScopeObservationKindV2",
+        "pub enum RuntimeProductDrainScopeObservationFieldV2",
+        "pub enum RuntimeProductDrainScopeObservationErrorV2",
+        "pub struct RuntimeObservedProductDrainV2",
+        "pub struct RuntimeProductDrainScopeObservationV2",
+        "pub fn from_exact_parts(",
+        "pub fn require_byte_exact_replay(",
+        "pub fn absent(",
+        "pub fn present(",
+        "pub fn persistence_corrupt(",
+        "pub fn into_persisted(",
+    ] {
+        assert!(source.contains(declaration), "missing {declaration}");
+    }
+
+    for exact_check in [
+        "root.canonical() != intent.canonical()",
+        "RuntimeDeployment::restore(snapshot.clone())",
+        "product.scope() != &expected_scope",
+        "product.expected_revision() != snapshot.revision",
+        "drain.scope() != &expected_scope",
+        "drain.slot() != &RuntimeServingSlotV2::from_target(&snapshot.target)",
+        "drain.expected_revision() != snapshot.revision",
+        "root.product_operation_scope().scope()",
+        "!= lookup.product_operation_scope().scope()",
+        "root.product_operation_scope().expected_revision()",
+        "!= lookup.product_operation_scope().expected_revision()",
+        "root.drain_intent_scope().scope() != lookup.drain_intent_scope().scope()",
+        "root.drain_intent_scope().slot() != lookup.drain_intent_scope().slot()",
+        "root.drain_intent_scope().expected_revision()",
+        "!= lookup.drain_intent_scope().expected_revision()",
+        "root.canonical().product_preimage().expected_target != snapshot.target",
+        "RuntimeUnixMicrosecondsV2::from_datetime(observed_at)",
+        "Ambiguous(RuntimeProductDrainNaturalScopeV2)",
+        "RuntimeProductDrainScopeObservationKindV2::PersistenceCorrupt",
+    ] {
+        assert!(
+            source.contains(exact_check),
+            "missing V2 Product drain observation check: {exact_check}"
+        );
+    }
+
+    for test_name in [
+        "observed_pair_requires_exact_root_and_intent_canonical_identity",
+        "absent_observation_binds_the_combined_lookup_snapshot_and_database_time",
+        "present_observation_adopts_all_four_persisted_mutable_states",
+        "lookup_validation_rejects_invalid_or_different_locked_snapshots",
+        "present_observation_rejects_each_reachable_root_snapshot_mismatch",
+        "every_physical_corruption_classification_is_closed_and_inert",
+        "ambiguous_scope_classification_never_selects_a_first_row",
+        "observed_time_is_canonical_without_host_clock_ordering",
+        "observed_pair_replay_is_exact_and_does_not_change_the_adopted_identity",
+        "combined_observation_surface_has_no_retry_or_persistence_authority",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 Product drain observation behavior test: {test_name}"
+        );
+    }
+
+    let ambiguous_test = tests
+        .split("fn ambiguous_scope_classification_never_selects_a_first_row()")
+        .nth(1)
+        .and_then(|source| source.split("#[test]").next())
+        .unwrap();
+    assert!(ambiguous_test.contains("RuntimeProductDrainNaturalScopeV2::ProductOperation"));
+    assert!(ambiguous_test.contains("RuntimeProductDrainNaturalScopeV2::DrainIntent"));
+    assert!(ambiguous_test.contains("RuntimeProductDrainScopeCorruptionV2::Ambiguous(scope)"));
+    assert!(ambiguous_test.contains("observation.persisted().is_none()"));
+    assert!(ambiguous_test.contains("observation.into_persisted().is_none()"));
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeObservedProductDrainV2",
+        "RuntimeProductDrainNaturalScopeV2",
+        "RuntimeProductDrainScopeCorruptionV2",
+        "RuntimeProductDrainScopeObservationErrorV2",
+        "RuntimeProductDrainScopeObservationFieldV2",
+        "RuntimeProductDrainScopeObservationKindV2",
+        "RuntimeProductDrainScopeObservationV2",
+    ] {
+        assert!(library.contains(exported), "missing export {exported}");
+    }
+}
+
+#[test]
 fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
     let canonical = include_str!("../src/v2_suspension_canonical.rs");
     let wire = include_str!("../src/v2_suspension_canonical/wire.rs");
@@ -3079,6 +3212,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_product_drain_operation/tests.rs",
             include_str!("../src/v2_product_drain_operation/tests.rs"),
+        ),
+        (
+            "src/v2_product_drain_observation.rs",
+            include_str!("../src/v2_product_drain_observation.rs"),
+        ),
+        (
+            "src/v2_product_drain_observation/tests.rs",
+            include_str!("../src/v2_product_drain_observation/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
