@@ -932,9 +932,28 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         production,
         "impl RuntimeRecoveryPendingGatewaySectionV2<'_>",
     );
-    assert_no_watch_reborrow(
-        braced_declaration(pending, "fn require_current_v2(&self)"),
-        "pending section validation",
+    let exact_registry = braced_declaration(
+        pending,
+        "pub(crate) fn validate_empty_registry_projection_v2(",
+    );
+    let evidence_match = exact_registry
+        .find("self.binding.permit.registry_evidence().empty_observation() != observation")
+        .unwrap();
+    let final_revalidation = exact_registry.find("self.require_current_v2()").unwrap();
+    assert!(evidence_match < final_revalidation);
+    let pending_current = braced_declaration(pending, "fn require_current_v2(&self)");
+    assert_no_watch_reborrow(pending_current, "pending section validation");
+    assert_eq!(
+        pending_current
+            .matches("require_recovery_owner_lifetime_v2(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        pending_current
+            .matches(".validate_recovery_permit(&self.binding.permit)")
+            .count(),
+        2
     );
 }
 
