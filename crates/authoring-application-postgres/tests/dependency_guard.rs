@@ -164,7 +164,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     }
     for required in [
         "FUNCTIONS: [ScopedFunctionContractV1<'static>; 5]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 18]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 19]",
         "ScopedFunctionContractV1::set_named(",
         "ScopedFunctionContractV1::set_plpgsql_named(",
         "verify_apply_executor_readiness",
@@ -175,11 +175,15 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "verify_approval_support_contract",
         "verify_apply_support_contract",
         "starring_product_ruleset_slot_exact_v1",
+        "starring_product_apply_lock_core_unfenced_v1",
+        "pg_catalog.count(*) = 12",
         "runtime_serving_leases",
+        "runtime_writer_fence",
         "runtime_attestations",
         "ScopedDatabaseProbeModeV1::SerializableReadWrite",
         "idempotency_keyring_incomplete",
-        "outcome: \"invalid_input\"",
+        "lock_probe_row_is_exact(row, \"invalid_input\")",
+        "lock_probe_row_is_exact(row, \"runtime_writer_fenced\")",
         "outcome: \"lock_required\"",
     ] {
         assert!(
@@ -194,6 +198,10 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
     assert!(readiness.contains("verify_scoped_global_user_object_deny"));
+    assert!(apply.contains("\"runtime_writer_fenced\""));
+    assert!(apply.contains("\"runtime_writer_fence_invalid\""));
+    assert!(apply.contains("product apply is temporarily unavailable"));
+    assert!(apply.contains("runtime writer fence is unavailable"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
     assert!(database_capability.contains("function_row.proleakproof"));
@@ -1588,6 +1596,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/postgres_product_apply/migration_security.rs",
             include_str!("postgres_product_apply/migration_security.rs"),
+        ),
+        (
+            "tests/product_apply_writer_fence_migration_guard.rs",
+            include_str!("product_apply_writer_fence_migration_guard.rs"),
         ),
         (
             "tests/postgres_product_control_e2e.rs",

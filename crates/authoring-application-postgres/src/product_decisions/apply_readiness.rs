@@ -39,7 +39,7 @@ const FUNCTIONS: [ScopedFunctionContractV1<'static>; 5] = [
         KEYRING_COVERAGE_ARGUMENTS,
     ),
 ];
-const RELATIONS: [ScopedRelationContractV1<'static>; 18] = [
+const RELATIONS: [ScopedRelationContractV1<'static>; 19] = [
     ScopedRelationContractV1::ordinary_without_rls("public.product_control_plane_identity"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_requests"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_request_approvals"),
@@ -60,6 +60,7 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 18] = [
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_activations"),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_versions"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_deployments"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_writer_fence"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_serving_leases"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_attestations"),
 ];
@@ -201,6 +202,9 @@ WITH common_owner AS (
         ('public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)',
             'plpgsql', 'v', TRUE, TRUE, TRUE, 1::REAL,
             'TABLE(outcome text, exact_replay boolean, requires_commit boolean, resulting_revision bigint, resulting_state text, deployment_id text, desired_target_digest text, locked_projection jsonb)'),
+        ('public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)',
+            'plpgsql', 'v', TRUE, TRUE, TRUE, 1::REAL,
+            'TABLE(outcome text, exact_replay boolean, requires_commit boolean, resulting_revision bigint, resulting_state text, deployment_id text, desired_target_digest text, locked_projection jsonb)'),
         ('public.starring_product_apply_authority_projection_v1(text,text,text,text,bytea,text,text,text,text,bigint,text,timestamp with time zone,timestamp with time zone,text,boolean,text)',
             'plpgsql', 'v', TRUE, TRUE, FALSE, 0::REAL, 'jsonb'),
         ('public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)',
@@ -223,7 +227,7 @@ WITH common_owner AS (
         ('public.validate_runtime_convergence_attempt_projection()',
             'plpgsql', 'v', FALSE, TRUE, FALSE, 0::REAL, 'trigger')
 ), routine_contract AS (
-    SELECT pg_catalog.count(*) = 11
+    SELECT pg_catalog.count(*) = 12
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -389,18 +393,12 @@ async fn run_apply_probes(
         .fetch_all(&mut **transaction)
         .await
         .map_err(readiness_database)?;
-    if lock_rows
-        != [ApplyLockProbeRow {
-            outcome: "invalid_input".to_string(),
-            exact_replay: false,
-            requires_commit: false,
-            resulting_revision: None,
-            resulting_state: None,
-            deployment_id: None,
-            desired_target_digest: None,
-            locked_projection: None,
-        }]
-    {
+    if !matches!(
+        lock_rows.as_slice(),
+        [row]
+            if lock_probe_row_is_exact(row, "invalid_input")
+                || lock_probe_row_is_exact(row, "runtime_writer_fenced")
+    ) {
         return Err(ProductDecisionReadinessErrorV1::ContractMismatch);
     }
     let artifact_count = sqlx::query_scalar::<_, i64>(ARTIFACT_PROBE_QUERY)
@@ -433,6 +431,19 @@ async fn run_apply_probes(
     Ok(())
 }
 
+fn lock_probe_row_is_exact(row: &ApplyLockProbeRow, outcome: &str) -> bool {
+    row == &ApplyLockProbeRow {
+        outcome: outcome.to_string(),
+        exact_replay: false,
+        requires_commit: false,
+        resulting_revision: None,
+        resulting_state: None,
+        deployment_id: None,
+        desired_target_digest: None,
+        locked_projection: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +451,7 @@ mod tests {
     #[test]
     fn apply_manifest_is_exact_and_nonempty() {
         assert_eq!(FUNCTIONS.len(), 5);
-        assert_eq!(RELATIONS.len(), 18);
+        assert_eq!(RELATIONS.len(), 19);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 32);
         assert_eq!(PROBE_SUBJECT_DIGEST.len(), 32);
     }

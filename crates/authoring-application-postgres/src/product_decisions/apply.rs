@@ -369,6 +369,12 @@ fn map_lock_outcome(outcome: &str) -> ProductControlPortError {
         "idempotency_keyring_incomplete" => ProductControlPortError::Backend(
             "product apply idempotency keyring does not cover live receipts".to_string(),
         ),
+        "runtime_writer_fenced" => {
+            ProductControlPortError::Backend("product apply is temporarily unavailable".to_string())
+        }
+        "runtime_writer_fence_invalid" => {
+            ProductControlPortError::Backend("runtime writer fence is unavailable".to_string())
+        }
         _ => invalid_apply_result(),
     }
 }
@@ -458,8 +464,8 @@ mod tests {
     use sqlx::types::Json;
 
     use super::{
-        is_terminal_supersession, target_artifact_is_valid, ApplyFinalizeRow,
-        ApplyTargetArtifactRow,
+        is_terminal_supersession, map_lock_outcome, target_artifact_is_valid, ApplyFinalizeRow,
+        ApplyTargetArtifactRow, ProductControlPortError,
     };
 
     fn artifact(schema_version: RuleSetSchemaVersion) -> ApplyTargetArtifactRow {
@@ -504,5 +510,19 @@ mod tests {
         assert!(!target_artifact_is_valid(&artifact(
             RuleSetSchemaVersion::new(CURRENT_RULESET_SCHEMA_VERSION.get() + 1).unwrap()
         )));
+    }
+
+    #[test]
+    fn writer_fence_outcomes_fail_closed_with_stable_product_errors() {
+        assert_eq!(
+            map_lock_outcome("runtime_writer_fenced"),
+            ProductControlPortError::Backend(
+                "product apply is temporarily unavailable".to_string()
+            )
+        );
+        assert_eq!(
+            map_lock_outcome("runtime_writer_fence_invalid"),
+            ProductControlPortError::Backend("runtime writer fence is unavailable".to_string())
+        );
     }
 }
