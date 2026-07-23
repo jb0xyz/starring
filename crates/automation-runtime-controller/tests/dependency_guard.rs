@@ -784,6 +784,230 @@ fn v2_certification_reservation_derives_and_closes_its_natural_scope() {
 }
 
 #[test]
+fn v2_awaiting_reset_is_checked_closed_and_non_authorizing() {
+    let source = include_str!("../src/v2_awaiting_reset.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "RuntimeConvergenceMutationV1",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "drain_intent_absent",
+        "pending_drain_count",
+        "NoDrainIntentProof",
+        "reset_at <",
+        "observed_at <",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden Awaiting reset surface: {forbidden}"
+        );
+    }
+    assert!(!source.contains("bool"));
+
+    let basis_kind = source
+        .split("pub enum RuntimeAwaitingGatewayReadyResetBasisKindV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "NoOperationReserved {",
+        "NoAttestationForReservedOperation {",
+        "snapshot: RuntimeDeploymentSnapshotV1,",
+        "reserved_operation_id: RuntimeCertificationOperationIdV2,",
+        "observed_at: DateTime<Utc>,",
+    ] {
+        assert!(basis_kind.contains(member), "{member}");
+    }
+    assert_eq!(
+        basis_kind
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        basis_kind
+            .matches("snapshot: RuntimeDeploymentSnapshotV1")
+            .count(),
+        2
+    );
+    assert_eq!(basis_kind.matches("observed_at: DateTime<Utc>").count(), 2);
+
+    let basis = source
+        .split("pub struct RuntimeAwaitingGatewayReadyResetBasisV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(basis.contains("kind: RuntimeAwaitingGatewayReadyResetBasisKindV2,"));
+    assert_eq!(basis.matches("    ").count(), 1);
+    assert!(!basis.contains("pub "));
+
+    let classification = source
+        .split("pub enum RuntimeAwaitingGatewayReadyResetClassificationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for member in [
+        "Eligible(RuntimeAwaitingGatewayReadyResetBasisV2),",
+        "Committed(RuntimeCertificationReceiptV2),",
+        "Diverged(RuntimeCertificationDivergenceV2),",
+    ] {
+        assert!(classification.contains(member), "{member}");
+    }
+    assert_eq!(
+        classification
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("        "))
+            .count(),
+        3
+    );
+    for source_observation in [
+        "AwaitingCertificationScopeObservationV2::Committed(receipt)",
+        "AwaitingCertificationScopeObservationV2::NoOperationReserved",
+        "AwaitingCertificationScopeObservationV2::NoAttestationForReservedOperation",
+        "AwaitingCertificationScopeObservationV2::Diverged(divergence)",
+    ] {
+        assert!(source.contains(source_observation), "{source_observation}");
+    }
+
+    let request = source
+        .split("pub struct RuntimeResetAwaitingGatewayReadyV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(request.contains("basis: RuntimeAwaitingGatewayReadyResetBasisV2,"));
+    assert_eq!(request.matches("    ").count(), 1);
+    assert!(!request.contains("pub "));
+
+    let reservation = source
+        .split("pub enum RuntimeCertificationReservationResetReceiptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "NotReserved,",
+        "Consumed {",
+        "operation_id: RuntimeCertificationOperationIdV2,",
+        "resulting_revision: DeploymentRevision,",
+        "consumed_at: DateTime<Utc>,",
+    ] {
+        assert!(reservation.contains(member), "{member}");
+    }
+    assert_eq!(
+        reservation
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        2
+    );
+
+    let receipt = source
+        .split("pub struct RuntimeAwaitingGatewayReadyResetReceiptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "outcome: TransitionOutcomeV1,",
+        "source_revision: DeploymentRevision,",
+        "snapshot: RuntimeDeploymentSnapshotV1,",
+        "reservation: RuntimeCertificationReservationResetReceiptV2,",
+        "reset_at: DateTime<Utc>,",
+    ] {
+        assert!(receipt.contains(field), "{field}");
+    }
+    assert_eq!(receipt.matches("    ").count(), 5);
+    assert!(!receipt.contains("pub "));
+
+    let outcome = source
+        .split("pub enum RuntimeAwaitingGatewayReadyResetOutcomeV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nfn").next())
+        .unwrap();
+    for member in [
+        "Reset(RuntimeAwaitingGatewayReadyResetReceiptV2),",
+        "Committed(RuntimeCertificationReceiptV2),",
+        "ProductDrainIntentPresent {",
+        "intent_id: RuntimeDrainIntentIdV2",
+        "Diverged(RuntimeCertificationDivergenceV2),",
+    ] {
+        assert!(outcome.contains(member), "{member}");
+    }
+    assert_eq!(
+        outcome
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        4
+    );
+
+    for validation in [
+        "RuntimeDeployment::restore(snapshot.clone()).is_err()",
+        "RuntimeDeploymentPhaseV1::AwaitingGatewayReady",
+        "let fenced_awaiting = snapshot",
+        ".is_some_and(|lease|",
+        "snapshot.last_fencing_token == Some(lease.fencing_token)",
+        "RuntimeDeployment::restore(successor.clone())",
+        "source.revision.next()",
+        "outcome.revision() != successor.revision",
+        "RuntimeDeploymentPhaseV1::ReconcilingPanels",
+        "successor.identity != source.identity",
+        "successor.target != source.target",
+        "successor.runtime_generation != source.runtime_generation",
+        "successor.previous_runtime != source.previous_runtime",
+        "successor.requested_at != source.requested_at",
+        "successor.last_fencing_token != source.last_fencing_token",
+        "successor.preflight != source.preflight",
+        "successor.drain != source.drain",
+        "successor.activation != source.activation",
+        "successor.last_live_recovery != source.last_live_recovery",
+        "successor.last_runtime_failure != source.last_runtime_failure",
+        "successor.panel_certificate.is_some()",
+        "successor.gateway_ready.is_some()",
+        "successor.live.is_some()",
+        "successor.controller_lease.is_some()",
+        "operation_id == expected_operation_id",
+        "*resulting_revision == successor.revision",
+        "*consumed_at == reset_at",
+        "RuntimeCertificationDivergenceV2::PersistenceCorrupt",
+    ] {
+        assert!(source.contains(validation), "{validation}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeAwaitingGatewayReadyResetBasisKindV2",
+        "RuntimeAwaitingGatewayReadyResetBasisV2",
+        "RuntimeAwaitingGatewayReadyResetClassificationV2",
+        "RuntimeAwaitingGatewayReadyResetOutcomeV2",
+        "RuntimeAwaitingGatewayReadyResetReceiptErrorV2",
+        "RuntimeAwaitingGatewayReadyResetReceiptV2",
+        "RuntimeCertificationReservationResetReceiptV2",
+        "RuntimeResetAwaitingGatewayReadyV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_certification_canonical_surface_stays_closed() {
     let canonical = include_str!("../src/v2_certification_canonical.rs");
     let wire = include_str!("../src/v2_certification_canonical/wire.rs");
@@ -1184,6 +1408,10 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_certification_operation.rs",
             include_str!("../src/v2_certification_operation.rs"),
+        ),
+        (
+            "src/v2_awaiting_reset.rs",
+            include_str!("../src/v2_awaiting_reset.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),

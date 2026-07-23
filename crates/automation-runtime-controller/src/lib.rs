@@ -6,6 +6,7 @@ mod planner;
 mod port;
 mod retry;
 mod session;
+mod v2_awaiting_reset;
 mod v2_binding;
 #[cfg_attr(
     not(test),
@@ -72,6 +73,12 @@ pub use retry::{RetryPolicyError, RetryPolicyV1};
 pub use session::{
     RuntimeConvergenceSessionError, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
     RuntimeServingSessionStateV1, RuntimeServingSessionV1,
+};
+pub use v2_awaiting_reset::{
+    RuntimeAwaitingGatewayReadyResetBasisKindV2, RuntimeAwaitingGatewayReadyResetBasisV2,
+    RuntimeAwaitingGatewayReadyResetClassificationV2, RuntimeAwaitingGatewayReadyResetOutcomeV2,
+    RuntimeAwaitingGatewayReadyResetReceiptErrorV2, RuntimeAwaitingGatewayReadyResetReceiptV2,
+    RuntimeCertificationReservationResetReceiptV2, RuntimeResetAwaitingGatewayReadyV2,
 };
 pub use v2_binding::RuntimeBindingPinV1;
 pub use v2_canonical_value::{
