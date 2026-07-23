@@ -849,7 +849,9 @@ async fn product_apply_writer_fence_closed_and_missing_are_stable_failures() {
     outcome.unwrap();
 }
 
-async fn product_apply_writer_fence_catalog_state(pool: &PgPool) -> (String, bool, i64) {
+async fn product_apply_writer_fence_catalog_state(
+    pool: &PgPool,
+) -> (String, bool, i64, i64, i64) {
     sqlx::query_as(
         "SELECT \
           pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
@@ -859,7 +861,8 @@ async fn product_apply_writer_fence_catalog_state(pool: &PgPool) -> (String, boo
           (SELECT pg_catalog.count(*) \
            FROM pg_catalog.aclexplode(active.proacl) AS privilege \
            WHERE privilege.grantee = 0 \
-            AND privilege.privilege_type = 'EXECUTE') \
+            AND privilege.privilege_type = 'EXECUTE'), \
+          active.proowner::BIGINT, core.proowner::BIGINT \
          FROM pg_catalog.pg_proc AS core \
          CROSS JOIN pg_catalog.pg_proc AS active \
          WHERE core.oid = pg_catalog.to_regprocedure(\
@@ -922,6 +925,68 @@ async fn product_apply_writer_fence_migration_rejects_public_capability_atomical
     }
     .await;
     drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_writer_fence_migration_rejects_split_active_owner_atomically() {
+    let database = isolated_database("apply_writer_owner").await;
+    let split_owner = format!("starring_apply_split_{}", suffix());
+    sqlx::query(&format!("CREATE ROLE {split_owner} NOLOGIN"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 202_607_240_001)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        sqlx::query(&format!(
+            "ALTER FUNCTION public.starring_product_apply_lock_v1(\
+             text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,\
+             timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],\
+             text[],text[],text,text,text,text,text,text) OWNER TO {split_owner}"
+        ))
+        .execute(&database.pool)
+        .await?;
+        let before = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert!(before.1);
+        assert_ne!(before.3, before.4);
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_240_002)
+            .unwrap();
+        let error = sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .expect_err("split active Apply owner must reject writer fence migration");
+        assert!(matches!(
+            error,
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("PA001")
+                    && database_error.message()
+                        == "product_apply_writer_fence_preflight_drift"
+        ));
+        let after = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert_eq!(after, before);
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {split_owner}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
     outcome.unwrap();
 }
 

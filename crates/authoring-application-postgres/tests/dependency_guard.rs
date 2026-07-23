@@ -198,6 +198,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(readiness.contains("self.check_decision_reader_readiness().await?"));
     assert!(readiness.contains("verify_scoped_executable_allowlist"));
     assert!(readiness.contains("verify_scoped_global_user_object_deny"));
+    assert!(readiness.contains("starring_product_apply_lock_core_unfenced_v1"));
+    assert!(readiness.contains("pg_catalog.count(*) = 4"));
     assert!(apply.contains("\"runtime_writer_fenced\""));
     assert!(apply.contains("\"runtime_writer_fence_invalid\""));
     assert!(apply.contains("product apply is temporarily unavailable"));

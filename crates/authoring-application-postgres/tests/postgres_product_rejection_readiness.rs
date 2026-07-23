@@ -43,7 +43,7 @@ const RELATIONS: [&str; 16] = [
     "automation_ruleset_versions",
     "runtime_deployments",
 ];
-const SUPPORT_FUNCTIONS: [&str; 22] = [
+const SUPPORT_FUNCTIONS: [&str; 23] = [
     "public.assert_atomic_product_apply_runtime_request()",
     "public.assert_no_committed_product_activation_applying()",
     "public.assert_product_approval_receipt_alias()",
@@ -65,6 +65,7 @@ const SUPPORT_FUNCTIONS: [&str; 22] = [
     "public.starring_runtime_desired_target_digest_v1(jsonb,bigint)",
     "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
+    "public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
 ];
 const PROBE_SESSION_DIGEST: [u8; 32] = [61_u8; 32];

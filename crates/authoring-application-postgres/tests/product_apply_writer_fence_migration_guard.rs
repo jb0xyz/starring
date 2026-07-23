@@ -48,6 +48,8 @@ fn product_apply_writer_fence_migration_is_additive_and_comment_free() {
     assert!(MIGRATION.contains("4b01ced1c2b493a04ee4745be6593c10b493ffc06d73cf62f895c9ed46e21c0b"));
     assert!(MIGRATION.contains("collision_count <> 0"));
     assert!(MIGRATION.contains("helper_collision_count <> 2"));
+    assert!(MIGRATION.contains("active_row.proowner <> common_owner"));
+    assert!(MIGRATION.contains("invalid_active_function_count <> 0"));
 }
 
 #[test]

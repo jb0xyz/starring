@@ -12,6 +12,10 @@ DECLARE
     common_owner OID;
     collision_count BIGINT;
     definition_digest TEXT;
+    active_digest TEXT;
+    active_language NAME;
+    active_row pg_catalog.pg_proc%ROWTYPE;
+    core_language NAME;
     core_row pg_catalog.pg_proc%ROWTYPE;
 BEGIN
     SELECT relation.relowner
@@ -25,6 +29,23 @@ BEGIN
     WHERE function_row.oid = pg_catalog.to_regprocedure(
         'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)'
     );
+
+    SELECT function_row.*
+    INTO active_row
+    FROM pg_catalog.pg_proc AS function_row
+    WHERE function_row.oid = pg_catalog.to_regprocedure(
+        'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)'
+    );
+
+    SELECT language_row.lanname
+    INTO active_language
+    FROM pg_catalog.pg_language AS language_row
+    WHERE language_row.oid = active_row.prolang;
+
+    SELECT language_row.lanname
+    INTO core_language
+    FROM pg_catalog.pg_language AS language_row
+    WHERE language_row.oid = core_row.prolang;
 
     SELECT pg_catalog.count(*)
     INTO collision_count
@@ -44,8 +65,34 @@ BEGIN
     )
     INTO definition_digest;
 
+    SELECT pg_catalog.encode(
+        pg_catalog.sha256(pg_catalog.convert_to(
+            pg_catalog.pg_get_functiondef(active_row.oid),
+            'UTF8'
+        )),
+        'hex'
+    )
+    INTO active_digest;
+
     IF common_owner IS NULL
         OR pg_catalog.to_regrole(current_user) <> common_owner
+        OR active_row.oid IS NULL
+        OR active_row.proowner <> common_owner
+        OR active_row.prokind <> 'f'
+        OR active_row.provolatile <> 'v'
+        OR NOT active_row.proisstrict
+        OR active_row.proparallel <> 'u'
+        OR NOT active_row.prosecdef
+        OR NOT active_row.proretset
+        OR active_row.prorows <> 1::REAL
+        OR active_row.proconfig
+            IS DISTINCT FROM ARRAY['search_path=pg_catalog']::TEXT[]
+        OR active_row.proleakproof
+        OR active_row.pronargdefaults <> 0
+        OR active_row.provariadic <> 0
+        OR active_language IS DISTINCT FROM 'plpgsql'
+        OR active_digest IS DISTINCT FROM
+            '35dff4eac9780b1cea497459ac513c54e5151fc752c290228951fadd6a4c2c2d'
         OR core_row.oid IS NULL
         OR core_row.proowner <> common_owner
         OR core_row.prokind <> 'f'
@@ -60,6 +107,7 @@ BEGIN
         OR core_row.proleakproof
         OR core_row.pronargdefaults <> 0
         OR core_row.provariadic <> 0
+        OR core_language IS DISTINCT FROM 'plpgsql'
         OR EXISTS (
             SELECT 1
             FROM pg_catalog.aclexplode(COALESCE(
@@ -310,6 +358,7 @@ DECLARE
     unfenced_digest TEXT;
     wrapper_source TEXT;
     invalid_function_count BIGINT;
+    invalid_active_function_count BIGINT;
     helper_collision_count BIGINT;
     external_grantee_count BIGINT;
     invalid_external_acl_count BIGINT;
@@ -398,6 +447,32 @@ BEGIN
         );
 
     SELECT pg_catalog.count(*)
+    INTO invalid_active_function_count
+    FROM (
+        VALUES
+            ('public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)')
+    ) AS expected(identity)
+    LEFT JOIN pg_catalog.pg_proc AS function_row
+        ON function_row.oid = pg_catalog.to_regprocedure(expected.identity)
+    LEFT JOIN pg_catalog.pg_language AS language_row
+        ON language_row.oid = function_row.prolang
+    WHERE function_row.oid IS NULL
+        OR function_row.proowner <> common_owner
+        OR function_row.prokind <> 'f'
+        OR function_row.provolatile <> 'v'
+        OR NOT function_row.proisstrict
+        OR function_row.proparallel <> 'u'
+        OR NOT function_row.prosecdef
+        OR NOT function_row.proretset
+        OR function_row.prorows <> 1::REAL
+        OR function_row.proconfig
+            IS DISTINCT FROM ARRAY['search_path=pg_catalog']::TEXT[]
+        OR function_row.proleakproof
+        OR function_row.pronargdefaults <> 0
+        OR function_row.provariadic <> 0
+        OR language_row.lanname IS DISTINCT FROM 'plpgsql';
+
+    SELECT pg_catalog.count(*)
     INTO helper_collision_count
     FROM pg_catalog.pg_proc AS function_row
     INNER JOIN pg_catalog.pg_namespace AS namespace
@@ -469,6 +544,7 @@ BEGIN
 
     IF common_owner IS NULL
         OR invalid_function_count <> 0
+        OR invalid_active_function_count <> 0
         OR helper_collision_count <> 2
         OR external_grantee_count > 1
         OR (external_grantee_count = 1 AND external_grantee = 0)

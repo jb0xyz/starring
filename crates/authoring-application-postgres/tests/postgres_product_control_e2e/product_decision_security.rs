@@ -9,9 +9,10 @@ const PRODUCT_APPROVAL_TOPOLOGY_FUNCTION: &str =
     "public.starring_product_approval_executor_database_identity_v1()";
 const PRODUCT_APPLY_TOPOLOGY_FUNCTION: &str =
     "public.starring_product_apply_executor_database_identity_v1()";
-const PRODUCT_APPLY_SHARED_FUNCTIONS: [&str; 3] = [
+const PRODUCT_APPLY_SHARED_FUNCTIONS: [&str; 4] = [
     "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
+    "public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
 ];
 const PRODUCT_APPROVAL_IMMUTABLE_FUNCTION: &str =
