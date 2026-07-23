@@ -18,7 +18,7 @@ use automation_runtime_execution_postgres::{
 };
 use automation_runtime_worker::{
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerObservationErrorClassV1,
-    RuntimeWriterFenceObservationPortV1,
+    RuntimeProductDrainObservationPortV2, RuntimeWriterFenceObservationPortV1,
 };
 
 fn assert_mutate_signature(
@@ -58,6 +58,12 @@ where
 fn assert_writer_fence_port<T>()
 where
     T: RuntimeWriterFenceObservationPortV1<Error = RuntimeExecutionPersistenceErrorV1>,
+{
+}
+
+fn assert_product_drain_port<T>()
+where
+    T: RuntimeProductDrainObservationPortV2<Error = RuntimeExecutionPersistenceErrorV1>,
 {
 }
 
@@ -271,6 +277,7 @@ fn verified_adapter_exposes_the_scoped_execution_contract() {
     assert_execution_port::<PostgresRuntimeExecutionV1>();
     assert_gateway_owner_port::<PostgresRuntimeExecutionV1>();
     assert_writer_fence_port::<PostgresRuntimeExecutionV1>();
+    assert_product_drain_port::<PostgresRuntimeExecutionV1>();
     let _ = assert_gateway_owner_signatures;
     let _ = assert_writer_fence_signature;
     assert_eq!(

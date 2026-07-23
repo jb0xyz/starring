@@ -56,7 +56,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 14] = [
+const EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -71,9 +71,10 @@ const EXECUTOR_FUNCTIONS: [&str; 14] = [
     "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
     "public.starring_runtime_writer_fence_observe_v1()",
+    "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "cf84d5a445c591cd11802e9d956c2f03ae7f9c4205134aa1511d4cc40d88fbc3";
+    "746a7e3ac38bf588665063c9b3d79df4fc18e278e2a4edf4d1e3ea97e723827d";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

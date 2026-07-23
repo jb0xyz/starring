@@ -58,6 +58,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
+            PathBuf::from("src/product_drain.rs"),
             PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/writer_fence.rs"),

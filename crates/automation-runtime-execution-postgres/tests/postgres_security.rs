@@ -5,3 +5,4 @@ include!("postgres_security/certification.rs");
 include!("postgres_security/adapter.rs");
 include!("postgres_security/gateway_owner.rs");
 include!("postgres_security/writer_fence.rs");
+include!("postgres_security/product_drain.rs");

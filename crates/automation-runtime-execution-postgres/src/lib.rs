@@ -8,6 +8,7 @@ mod error;
 mod gateway_owner;
 mod mutation;
 mod observation;
+mod product_drain;
 mod proof;
 mod query;
 mod recovery;

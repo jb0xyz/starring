@@ -12,7 +12,7 @@ pub(crate) const FOUNDATIONAL_CAPABILITY_IDENTITIES_V1: [&str; 2] = [
     "public.starring_runtime_execution_database_identity_v1()",
 ];
 
-pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 12] = [
+pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 13] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
@@ -25,16 +25,17 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 12] = [
     "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
     "public.starring_runtime_writer_fence_observe_v1()",
+    "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("cf84d5a445c591cd11802e9d956c2f03ae7f9c4205134aa1511d4cc40d88fbc3");
+    Some("746a7e3ac38bf588665063c9b3d79df4fc18e278e2a4edf4d1e3ea97e723827d");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
         .iter()
         .chain(OPERATION_CAPABILITY_IDENTITIES_V1.iter());
-    if capabilities.clone().count() != 14 {
+    if capabilities.clone().count() != 15 {
         return false;
     }
     for (index, capability) in capabilities.clone().enumerate() {

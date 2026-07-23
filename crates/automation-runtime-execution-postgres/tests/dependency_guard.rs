@@ -95,6 +95,7 @@ fn adapter_contract_is_function_only_and_manifest_is_isolated() {
         "starring_runtime_gateway_owner_renew_v1",
         "starring_runtime_gateway_owner_release_v1",
         "starring_runtime_writer_fence_observe_v1",
+        "starring_runtime_product_drain_observe_v2",
     ] {
         assert!(contract.contains(capability));
     }
@@ -199,7 +200,7 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_only_execution_observation_gateway_owner_and_writer_fence_ports() {
+fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_product_drain_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
     for required in [
@@ -207,6 +208,7 @@ fn adapter_exposes_only_execution_observation_gateway_owner_and_writer_fence_por
         "impl RuntimePreviousServingObservationPort",
         "impl RuntimeGatewayOwnerLeasePortV1",
         "impl RuntimeWriterFenceObservationPortV1",
+        "impl RuntimeProductDrainObservationPortV2",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -232,6 +234,27 @@ fn writer_fence_observation_uses_only_its_scoped_function_and_verified_transacti
     }
     for forbidden in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE "] {
         assert!(!writer_fence.contains(forbidden));
+    }
+}
+
+#[test]
+fn product_drain_observation_uses_a_fresh_locked_scope_transaction() {
+    let product_drain = include_str!("../src/product_drain/mod.rs");
+    let query = include_str!("../src/product_drain/query.rs");
+    let database = include_str!("../src/database.rs");
+    assert!(query.contains("starring_runtime_product_drain_observe_v2"));
+    for required in [
+        "begin_execution_locked_observation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "RuntimeProductDrainScopeLookupV2",
+        "RuntimeProductDrainObservationPortV2",
+    ] {
+        assert!(product_drain.contains(required));
+    }
+    assert!(!product_drain.contains("begin_execution_mutation_transaction"));
+    assert!(database.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE"));
+    for forbidden in ["INSERT ", "UPDATE ", "DELETE ", "TRUNCATE "] {
+        assert!(!product_drain.contains(forbidden));
     }
 }
 

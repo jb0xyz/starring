@@ -261,6 +261,27 @@ pub(crate) async fn begin_execution_mutation_transaction(
         .execute(&mut *transaction)
         .await
         .map_err(map_query_error)?;
+    configure_execution_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
+pub(crate) async fn begin_execution_locked_observation_transaction(
+    connection: &mut PgConnection,
+    timeouts: RuntimeExecutionDatabaseTimeoutsV1,
+) -> Result<Transaction<'_, Postgres>, RuntimeExecutionPersistenceErrorV1> {
+    let mut transaction = connection.begin().await.map_err(map_query_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_query_error)?;
+    configure_execution_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
+async fn configure_execution_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    timeouts: RuntimeExecutionDatabaseTimeoutsV1,
+) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
     let idle_timeout = timeouts
         .statement_timeout
         .checked_mul(2)
@@ -274,10 +295,10 @@ pub(crate) async fn begin_execution_mutation_transaction(
     .bind(format!("{}ms", timeouts.statement_timeout.as_millis()))
     .bind(format!("{}ms", timeouts.lock_timeout.as_millis()))
     .bind(format!("{}ms", idle_timeout.as_millis()))
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await
     .map_err(map_query_error)?;
-    Ok(transaction)
+    Ok(())
 }
 
 pub(crate) async fn verify_runtime_execution_binding_v1(
@@ -414,7 +435,7 @@ mod tests {
         assert!(canonical_sha256_digest(digest));
         assert_eq!(
             digest,
-            "cf84d5a445c591cd11802e9d956c2f03ae7f9c4205134aa1511d4cc40d88fbc3"
+            "746a7e3ac38bf588665063c9b3d79df4fc18e278e2a4edf4d1e3ea97e723827d"
         );
     }
 }
