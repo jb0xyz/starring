@@ -435,6 +435,28 @@ fn database_readiness_retains_five_exact_receipts_without_serialization() {
     );
     assert!(!database.contains("Serialize"));
     assert!(!database.contains("Deserialize"));
+    let refresh = braced_declaration(
+        database,
+        "pub(crate) struct RuntimeDatabaseReadinessRefreshV2",
+    );
+    assert!(refresh.contains("readiness: RuntimeDatabaseReadinessV1"));
+    let attributes = declaration_attribute_block(database, "RuntimeDatabaseReadinessRefreshV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
+        assert!(!implements_trait(
+            database,
+            "RuntimeDatabaseReadinessRefreshV2",
+            forbidden,
+        ));
+    }
+    assert!(database.contains("RuntimeDatabaseReadinessRefreshV2(<redacted>)"));
+    let verifier = braced_declaration(
+        database,
+        "pub(crate) async fn verify_readiness_refresh_until_v2(",
+    );
+    assert!(verifier.contains("self.verify_readiness_v1()"));
+    assert!(verifier.contains("Instant::from_std(operation_cutoff)"));
+    assert!(verifier.contains("RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut"));
 }
 
 #[test]
@@ -912,21 +934,65 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         pending_binding,
         "pub(crate) async fn commit_prepared_owner_v2(",
     );
+    assert!(owner_commit.contains("commit_cutoff: Instant"));
     let preflight = owner_commit
         .find(".pending_section_v2(&prepared_owner)")
         .unwrap();
     let section_drop = owner_commit.find("drop(section)").unwrap();
-    let commit = owner_commit
-        .find(".commit_closed_recovery_v2(&self.permit)")
+    let cutoff_guard = owner_commit
+        .find("if Instant::now() >= commit_cutoff")
         .unwrap();
-    let awaited = owner_commit.find(".await").unwrap();
-    assert!(preflight < section_drop && section_drop < commit && commit < awaited);
+    let select = owner_commit.find("tokio::select!").unwrap();
+    let biased = owner_commit.find("biased;").unwrap();
+    let timer = owner_commit
+        .find("sleep_until(TokioInstant::from_std(commit_cutoff))")
+        .unwrap();
+    let commit = owner_commit
+        .find("prepared_owner.commit_closed_recovery_v2(&self.permit)")
+        .unwrap();
+    assert!(
+        preflight < section_drop
+            && section_drop < cutoff_guard
+            && cutoff_guard < select
+            && select < biased
+            && biased < timer
+            && timer < commit
+    );
+    assert_eq!(owner_commit.matches("tokio::select!").count(), 1);
+    assert!(!owner_commit.contains(".await"));
     assert_eq!(
         production
-            .matches(".commit_closed_recovery_v2(&self.permit)")
+            .matches("prepared_owner.commit_closed_recovery_v2(&self.permit)")
             .count(),
         1
     );
+    let readiness = braced_declaration(
+        pending_binding,
+        "pub(crate) fn into_readiness_successor_v2(",
+    );
+    let readiness_preflight = readiness
+        .find(".committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    let readiness_preflight_drop = readiness.find("drop(section)").unwrap();
+    let readiness_transition = readiness
+        .find("coordinator.refresh_recovery_readiness(")
+        .unwrap();
+    let readiness_postflight = readiness
+        .rfind(".committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    assert!(
+        readiness_preflight < readiness_preflight_drop
+            && readiness_preflight_drop < readiness_transition
+            && readiness_transition < readiness_postflight
+    );
+    assert!(!readiness.contains(".await"));
+    let capability_failure = braced_declaration(
+        pending_binding,
+        "pub(crate) fn invalidate_capability_not_ready_v2(&self)",
+    );
+    assert!(capability_failure.contains(
+        "self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady)"
+    ));
 
     let pending = braced_declaration(
         production,
@@ -974,7 +1040,16 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedRecoverySessionV2(<redacted>)",
         "pub(crate) async fn commit_owner_v2(",
         "async fn commit_owner_with_post_commit_v2(",
-        ".commit_prepared_owner_v2(&authority, owner)",
+        "pub(crate) async fn refresh_iteration_readiness_v2(",
+        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+        ".verify_readiness_refresh_until_v2(cutoff)",
+        "operation_cutoff: Instant",
+        ".operation_cutoff",
+        ".min(self.owner.observation().safety_deadline())",
+        "Instant::now() >= verification_cutoff",
+        ".invalidate_capability_not_ready_v2()",
+        ".into_readiness_successor_v2(",
+        ".commit_prepared_owner_v2(&authority, owner, commit_cutoff)",
         "post_commit();",
         ".committed_pending_section_v2(&self.owner)",
         "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
@@ -999,6 +1074,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,\n",
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    operation_cutoff: Instant,\n",
         "}"
     )));
     assert!(production.contains(concat!(
@@ -1006,6 +1082,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,\n",
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    operation_cutoff: Instant,\n",
         "}"
     )));
     let initial_gateway = production
@@ -1034,23 +1111,46 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     assert!(final_gateway < final_registry);
     let owner_commit = braced_declaration(production, "async fn commit_owner_with_post_commit_v2(");
     let precommit = owner_commit.find("self.revalidate_v2()").unwrap();
+    let cutoff = owner_commit
+        .find(".min(self.owner.observation().safety_deadline())")
+        .unwrap();
+    let cutoff_guard = owner_commit
+        .find("if Instant::now() >= commit_cutoff")
+        .unwrap();
     let commit = owner_commit
-        .find(".commit_prepared_owner_v2(&authority, owner)")
+        .find(".commit_prepared_owner_v2(&authority, owner, commit_cutoff)")
         .unwrap();
     let hook = owner_commit.find("post_commit();").unwrap();
     let session = owner_commit
         .find("let session = RuntimeClosedRecoverySessionV2")
         .unwrap();
     let postcommit = owner_commit.find("session.revalidate_v2()?").unwrap();
-    assert!(precommit < commit && commit < hook && hook < session && session < postcommit);
+    assert!(
+        precommit < cutoff
+            && cutoff < cutoff_guard
+            && cutoff_guard < commit
+            && commit < hook
+            && hook < session
+            && session < postcommit
+    );
     assert_eq!(
         production
             .matches("commit_owner_with_post_commit_v2(")
             .count(),
         2
     );
+    let owner_commit_mapper =
+        braced_declaration(production, "fn map_gateway_owner_commit_error_v2(");
+    assert!(owner_commit_mapper.contains(concat!(
+        "RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed => {\n",
+        "            RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed\n",
+        "        }"
+    )));
     let committed_session = braced_declaration(production, "impl RuntimeClosedRecoverySessionV2");
     let committed_revalidation = braced_declaration(committed_session, "fn revalidate_v2(&self)");
+    let committed_deadline = committed_revalidation
+        .find("Instant::now() >= self.operation_cutoff")
+        .unwrap();
     let committed_gateway = committed_revalidation
         .find(".committed_pending_section_v2(&self.owner)")
         .unwrap();
@@ -1060,10 +1160,69 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     let committed_final = committed_revalidation
         .find(".validate_empty_registry_projection_v2(&registry)")
         .unwrap();
-    assert!(committed_gateway < committed_registry && committed_registry < committed_final);
+    assert!(
+        committed_deadline < committed_gateway
+            && committed_gateway < committed_registry
+            && committed_registry < committed_final
+    );
+    let readiness_refresh = braced_declaration(
+        committed_session,
+        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+    );
+    let refresh_prevalidation = readiness_refresh.find("self.revalidate_v2()").unwrap();
+    let refresh_cutoff = readiness_refresh
+        .find(".min(self.owner.observation().safety_deadline())")
+        .unwrap();
+    let refresh_await = readiness_refresh
+        .find("verify(verification_cutoff).await")
+        .unwrap();
+    let refresh_pre_deadline = readiness_refresh
+        .find("if Instant::now() >= verification_cutoff")
+        .unwrap();
+    let refresh_post_deadline = readiness_refresh
+        .rfind("if Instant::now() >= verification_cutoff")
+        .unwrap();
+    let refresh_postvalidation = readiness_refresh[refresh_await + 1..]
+        .find("self.revalidate_v2()")
+        .map(|offset| offset + refresh_await + 1)
+        .unwrap();
+    let refresh_successor = readiness_refresh
+        .find(".into_readiness_successor_v2(")
+        .unwrap();
+    let refresh_hook = readiness_refresh.find("post_refresh();").unwrap();
+    let refresh_final = readiness_refresh
+        .rfind("session\n            .revalidate_v2()")
+        .unwrap();
+    assert!(
+        refresh_prevalidation < refresh_cutoff
+            && refresh_cutoff < refresh_pre_deadline
+            && refresh_pre_deadline < refresh_await
+            && refresh_await < refresh_post_deadline
+            && refresh_post_deadline < refresh_postvalidation
+            && refresh_postvalidation < refresh_successor
+            && refresh_successor < refresh_hook
+            && refresh_hook < refresh_final
+    );
+    assert_eq!(
+        readiness_refresh
+            .matches("if Instant::now() >= verification_cutoff")
+            .count(),
+        3
+    );
+    assert!(!readiness_refresh.contains("initial_readiness"));
+    let public_refresh = braced_declaration(
+        committed_session,
+        "pub(crate) async fn refresh_iteration_readiness_v2(",
+    );
+    assert!(!public_refresh.contains("operation_cutoff:"));
     let begin = braced_declaration(production, "pub(crate) fn begin_initial_empty_recovery_v2(");
     assert!(!begin.contains(".await"));
-    assert_eq!(production.matches(".await").count(), 2);
+    let begin_deadline = begin.find("Instant::now() >= operation_cutoff").unwrap();
+    let begin_gateway = begin
+        .find(".initial_emergency_gateway_section_v2(&owner)")
+        .unwrap();
+    assert!(begin_deadline < begin_gateway);
+    assert_eq!(production.matches(".await").count(), 4);
     for forbidden in [
         "pub fn permit",
         "pub fn owner",
@@ -1142,6 +1301,32 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
                 );
             }
         }
+        for method in [
+            "verify_readiness_refresh_until_v2",
+            "into_exact_capability_receipts",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/database.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        for method in [
+            "into_readiness_successor_v2",
+            "invalidate_capability_not_ready_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/gateway.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
     }
     assert!(!production.contains("pub(crate) fn new"));
     assert_eq!(
@@ -1159,6 +1344,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedRecoveryBeginErrorV2",
         "RuntimeClosedRecoverySessionV2",
         "RuntimeClosedRecoveryCommitErrorV2",
+        "RuntimeClosedRecoveryReadinessRefreshErrorV2",
+        "RuntimeDatabaseReadinessRefreshV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }

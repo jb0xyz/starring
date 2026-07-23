@@ -136,9 +136,30 @@ impl RuntimeDatabaseReadinessV1 {
     }
 }
 
+pub(crate) struct RuntimeDatabaseReadinessRefreshV2 {
+    readiness: RuntimeDatabaseReadinessV1,
+}
+
+impl RuntimeDatabaseReadinessRefreshV2 {
+    pub(crate) fn into_exact_capability_receipts(self) -> RuntimeCapabilityReadinessSetV2 {
+        self.readiness.capability_receipts
+    }
+}
+
+impl Debug for RuntimeDatabaseReadinessRefreshV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDatabaseReadinessRefreshV2(<redacted>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn runtime_database_readiness_for_test_v1() -> RuntimeDatabaseReadinessV1 {
-    let checked_at = chrono::DateTime::from_timestamp_millis(1_000_000).unwrap();
+    runtime_database_readiness_for_test_at_v1(1_000_000)
+}
+
+#[cfg(test)]
+fn runtime_database_readiness_for_test_at_v1(checked_at_millis: i64) -> RuntimeDatabaseReadinessV1 {
+    let checked_at = chrono::DateTime::from_timestamp_millis(checked_at_millis).unwrap();
     aggregate_readiness_v1(
         RuntimeExecutionDatabaseReadinessV1 {
             database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
@@ -172,6 +193,21 @@ pub(crate) fn runtime_database_readiness_for_test_v1() -> RuntimeDatabaseReadine
         },
     )
     .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_database_readiness_refresh_for_test_v2() -> RuntimeDatabaseReadinessRefreshV2
+{
+    runtime_database_readiness_refresh_at_for_test_v2(2_000_000)
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_database_readiness_refresh_at_for_test_v2(
+    checked_at_millis: i64,
+) -> RuntimeDatabaseReadinessRefreshV2 {
+    RuntimeDatabaseReadinessRefreshV2 {
+        readiness: runtime_database_readiness_for_test_at_v1(checked_at_millis),
+    }
 }
 
 impl Debug for RuntimeDatabaseReadinessV1 {
@@ -257,6 +293,20 @@ impl RuntimeDatabaseDependenciesV1 {
         timeout(PERIODIC_READINESS_TIMEOUT, readiness)
             .await
             .map_err(|_| RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)?
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) async fn verify_readiness_refresh_until_v2(
+        &self,
+        operation_cutoff: std::time::Instant,
+    ) -> Result<RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseCompositionErrorV1> {
+        let readiness = timeout_at(
+            Instant::from_std(operation_cutoff),
+            self.verify_readiness_v1(),
+        )
+        .await
+        .map_err(|_| RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)??;
+        Ok(RuntimeDatabaseReadinessRefreshV2 { readiness })
     }
 }
 

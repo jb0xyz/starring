@@ -518,6 +518,19 @@ async fn initial_pending_recovery_fixture_v2(
     crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
     FakePortV1,
 ) {
+    initial_pending_recovery_fixture_until_v2(recovery_id, Instant::now() + Duration::from_secs(4))
+        .await
+}
+
+async fn initial_pending_recovery_fixture_until_v2(
+    recovery_id: &str,
+    operation_cutoff: Instant,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
+    FakePortV1,
+) {
     let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
     let mut gateway = crate::compose_runtime_gateway_bootstrap_v1(
         process_instance_id.clone(),
@@ -560,9 +573,38 @@ async fn initial_pending_recovery_fixture_v2(
         owner,
         RuntimeRecoveryIdV2::parse(recovery_id).unwrap(),
         &readiness,
+        operation_cutoff,
     )
     .unwrap();
     (gateway, registry, pending, port)
+}
+
+async fn initial_committed_recovery_fixture_v2(
+    recovery_id: &str,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    FakePortV1,
+) {
+    let (gateway, registry, pending, port) = initial_pending_recovery_fixture_v2(recovery_id).await;
+    let session = pending.commit_owner_v2().await.unwrap();
+    (gateway, registry, session, port)
+}
+
+async fn initial_committed_recovery_fixture_until_v2(
+    recovery_id: &str,
+    operation_cutoff: Instant,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    FakePortV1,
+) {
+    let (gateway, registry, pending, port) =
+        initial_pending_recovery_fixture_until_v2(recovery_id, operation_cutoff).await;
+    let session = pending.commit_owner_v2().await.unwrap();
+    (gateway, registry, session, port)
 }
 
 #[tokio::test]
@@ -620,6 +662,7 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         prepared,
         RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
         &readiness,
+        Instant::now() + Duration::from_secs(4),
     )
     .unwrap();
 
@@ -725,6 +768,40 @@ async fn compound_owner_commit_ack_wait_cancels_closed_and_releases_once() {
     assert_eq!(port.renew_calls(), 0);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn compound_owner_commit_cannot_cross_the_operation_cutoff() {
+    let (gateway, _registry, pending, port) =
+        initial_pending_recovery_fixture_v2("14141414141414141414141414141414").await;
+    let operation_cutoff = Instant::now() + Duration::from_millis(100);
+    let pending = pending.with_operation_cutoff_for_test_v2(operation_cutoff);
+    let mut commit = Box::pin(pending.commit_owner_v2());
+
+    std::future::poll_fn(|context| {
+        assert!(commit.as_mut().poll(context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    std::thread::sleep(
+        operation_cutoff.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+    );
+    tokio::task::yield_now().await;
+    let error = commit.await.unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
 #[tokio::test]
 async fn post_commit_registry_aba_refuses_the_compound_session() {
     let (gateway, registry, pending, port) =
@@ -787,6 +864,444 @@ async fn post_commit_disconnect_refuses_the_compound_session() {
     ));
     wait_for(|| port.release_calls() == 1).await;
     assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn committed_recovery_readiness_refresh_advances_one_linear_revision() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("55555555555555555555555555555555").await;
+
+    let session = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            )),
+            || {},
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            authority_revision,
+        } if generation.get() == 2
+            && recovery_id.as_str() == "55555555555555555555555555555555"
+            && authority_revision.get() == 2
+    ));
+    assert_eq!(port.renew_calls(), 0);
+    drop(session);
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn readiness_verifier_receives_the_session_bound_operation_cutoff() {
+    let operation_cutoff = Instant::now() + Duration::from_secs(2);
+    let (gateway, _registry, session, port) = initial_committed_recovery_fixture_until_v2(
+        "12121212121212121212121212121212",
+        operation_cutoff,
+    )
+    .await;
+    let observed = Arc::new(Mutex::new(None));
+    let verification_observed = observed.clone();
+
+    let session = session
+        .refresh_iteration_readiness_with_test_verifier_v2(move |cutoff| {
+            *verification_observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cutoff);
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            ))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some(operation_cutoff)
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 2
+    ));
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn owner_safety_deadline_limits_readiness_verification_before_session_cutoff() {
+    let operation_cutoff = Instant::now() + Duration::from_secs(10);
+    let (gateway, _registry, session, port) = initial_committed_recovery_fixture_until_v2(
+        "13131313131313131313131313131313",
+        operation_cutoff,
+    )
+    .await;
+    let observed = Arc::new(Mutex::new(None));
+    let verification_observed = observed.clone();
+
+    let session = session
+        .refresh_iteration_readiness_with_test_verifier_v2(move |cutoff| {
+            *verification_observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cutoff);
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            ))
+        })
+        .await
+        .unwrap();
+
+    let verification_cutoff = observed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap();
+    assert!(verification_cutoff < operation_cutoff);
+    assert!(verification_cutoff > Instant::now());
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 2
+    ));
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn readiness_verification_failure_invalidates_capability_authority() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("66666666666666666666666666666666").await;
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Err(
+                crate::RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut,
+            )),
+            || {},
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Database(
+            crate::RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut,
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn elapsed_readiness_cutoff_never_polls_database_verification() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("dddddddddddddddddddddddddddddddd").await;
+    let session = session.with_operation_cutoff_for_test_v2(
+        Instant::now().checked_sub(Duration::from_nanos(1)).unwrap(),
+    );
+    let polls = Arc::new(AtomicUsize::new(0));
+    let verification_polls = polls.clone();
+    let verification = std::future::poll_fn(move |_| {
+        verification_polls.fetch_add(1, Ordering::AcqRel);
+        std::task::Poll::Ready(Ok(
+            crate::database::runtime_database_readiness_refresh_for_test_v2(),
+        ))
+    });
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(verification, || {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::DeadlineElapsed
+    );
+    assert_eq!(polls.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn successful_readiness_result_after_cutoff_cannot_advance_authority() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").await;
+    let operation_cutoff = Instant::now() + Duration::from_millis(50);
+    let session = session.with_operation_cutoff_for_test_v2(operation_cutoff);
+    let verification = async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            operation_cutoff + Duration::from_millis(10),
+        ))
+        .await;
+        Ok(crate::database::runtime_database_readiness_refresh_for_test_v2())
+    };
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(verification, || {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::DeadlineElapsed
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn replayed_readiness_evidence_invalidates_capability_authority() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").await;
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_at_for_test_v2(1_000_000),
+            )),
+            || {},
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
+                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::CapabilityReadinessNotSuccessor,
+            ),
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn unpolled_readiness_refresh_cancels_the_committed_session_closed() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("77777777777777777777777777777777").await;
+
+    let refresh = session.refresh_iteration_readiness_after_test_hook_v2(
+        ready(Ok(
+            crate::database::runtime_database_readiness_refresh_for_test_v2(),
+        )),
+        || {},
+    );
+    drop(refresh);
+
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn pending_readiness_refresh_cancellation_cannot_leave_current_authority() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("88888888888888888888888888888888").await;
+    let verification = std::future::pending::<
+        Result<
+            crate::database::RuntimeDatabaseReadinessRefreshV2,
+            crate::RuntimeDatabaseCompositionErrorV1,
+        >,
+    >();
+    let mut refresh =
+        Box::pin(session.refresh_iteration_readiness_after_test_hook_v2(verification, || {}));
+    let mut polled = false;
+    std::future::poll_fn(|context| {
+        if !polled {
+            polled = true;
+            assert!(refresh.as_mut().poll(context).is_pending());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(refresh);
+
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn registry_aba_during_readiness_wait_prevents_authority_advance() {
+    let (gateway, registry, session, port) =
+        initial_committed_recovery_fixture_v2("99999999999999999999999999999999").await;
+    let verification = async {
+        registry.advance_empty_sequence_for_test_v2();
+        Ok(crate::database::runtime_database_readiness_refresh_for_test_v2())
+    };
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(verification, || {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Registry(
+            crate::RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding,
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn disconnect_during_readiness_wait_prevents_authority_advance() {
+    let (mut gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("ffffffffffffffffffffffffffffffff").await;
+    let verification = async {
+        gateway.disconnect_for_gateway_section_test_v2();
+        Ok(crate::database::runtime_database_readiness_refresh_for_test_v2())
+    };
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(verification, || {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
+                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            ),
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 4
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn registry_aba_after_readiness_advance_refuses_the_successor_session() {
+    let (gateway, registry, session, port) =
+        initial_committed_recovery_fixture_v2("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            )),
+            || registry.advance_empty_sequence_for_test_v2(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Registry(
+            crate::RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding,
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn disconnect_after_readiness_advance_refuses_the_successor_session() {
+    let (mut gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("cccccccccccccccccccccccccccccccc").await;
+
+    let error = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            )),
+            || gateway.disconnect_for_gateway_section_test_v2(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
+                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            ),
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 4
+    ));
+    wait_for(|| port.release_calls() == 1).await;
 }
 
 #[test]

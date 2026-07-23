@@ -28,6 +28,7 @@ use automation_runtime_worker::{
     RuntimeRegistryRecoveryEmptyObservationV2,
 };
 use tokio::sync::watch;
+use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
 use crate::gateway_owner_startup_watchdog::{
@@ -191,6 +192,8 @@ pub(crate) enum RuntimeGatewayRecoverySectionErrorV2 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RuntimeGatewayRecoveryOwnerCommitErrorV2 {
+    #[error("runtime gateway recovery owner commit deadline elapsed")]
+    DeadlineElapsed,
     #[error("runtime gateway recovery owner commit precondition failed")]
     Section(RuntimeGatewayRecoverySectionErrorV2),
     #[error("runtime gateway recovery owner commit failed")]
@@ -654,6 +657,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         &self,
         _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
         prepared_owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        commit_cutoff: Instant,
     ) -> Result<
         RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         RuntimeGatewayRecoveryOwnerCommitErrorV2,
@@ -662,10 +666,53 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             .pending_section_v2(&prepared_owner)
             .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Section)?;
         drop(section);
-        prepared_owner
-            .commit_closed_recovery_v2(&self.permit)
-            .await
-            .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
+        if Instant::now() >= commit_cutoff {
+            return Err(RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed);
+        }
+        tokio::select! {
+            biased;
+            _ = sleep_until(TokioInstant::from_std(commit_cutoff)) => {
+                Err(RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed)
+            }
+            result = prepared_owner.commit_closed_recovery_v2(&self.permit) => {
+                result.map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
+            }
+        }
+    }
+
+    pub(crate) fn into_readiness_successor_v2(
+        mut self,
+        committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        readiness: RuntimeCapabilityReadinessSetV2,
+    ) -> Result<Self, RuntimeGatewayRecoverySectionErrorV2> {
+        let section = self.committed_pending_section_v2(committed_owner)?;
+        drop(section);
+        let transition = {
+            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
+                RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+                )
+            })?;
+            let transition = coordinator.refresh_recovery_readiness(&mut self.permit, readiness);
+            if transition.is_err()
+                && matches!(
+                    coordinator.snapshot(),
+                    RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+                        | RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+                )
+            {
+                self.owner_invalidated.store(true, Ordering::Release);
+            }
+            transition
+        };
+        transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let section = self.committed_pending_section_v2(committed_owner)?;
+        drop(section);
+        Ok(self)
+    }
+
+    pub(crate) fn invalidate_capability_not_ready_v2(&self) {
+        self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady);
     }
 
     fn pending_section_with_owner_v2<'a>(
