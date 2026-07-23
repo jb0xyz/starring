@@ -19,6 +19,7 @@ pub use gateway::{
     RuntimeGatewayBootstrapV1, RuntimeGatewayReadyObservationErrorV1,
 };
 pub use gateway_owner_startup_watchdog::{
+    RuntimeGatewayOwnerCurrentObservationErrorV1, RuntimeGatewayOwnerCurrentObservationV1,
     RuntimeGatewayOwnerReleaseStatusV1, RuntimeGatewayOwnerStartupWatchdogConfigErrorV1,
     RuntimeGatewayOwnerStartupWatchdogConfigV1, RuntimeGatewayOwnerStartupWatchdogExitV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,

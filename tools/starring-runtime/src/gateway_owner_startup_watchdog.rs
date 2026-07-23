@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
     RuntimeGatewayOwnerLeaseDurationV1, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimeReleaseGatewayOwnerLeaseV1,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeReleaseGatewayOwnerLeaseV1,
 };
 use automation_runtime_worker::{
     accept_gateway_owner_release_v1, classify_unknown_gateway_owner_release_v1,
     RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedGatewayOwnerReleaseV1,
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerMutationErrorV1,
+    RuntimeGatewayOwnerObservationCompletionV1, RuntimeGatewayOwnerObservationErrorClassV1,
     RuntimeGatewayOwnerReleaseRecoveryV1, RuntimeGatewayOwnerRenewalCompletionV1,
     RuntimeGatewayOwnerRenewalPolicyV1, RuntimeGatewayOwnerRenewalScheduleErrorV1,
     RuntimeGatewayOwnerWatchdogActionV1, RuntimeGatewayOwnerWatchdogErrorV1,
@@ -21,7 +22,8 @@ use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
 use crate::GatewayOwnerTimingConfigV1;
 
-const COMMAND_CAPACITY: usize = 1;
+const SHUTDOWN_COMMAND_CAPACITY: usize = 1;
+const OBSERVATION_COMMAND_CAPACITY: usize = 1;
 const RELEASE_ATTEMPTS: usize = 2;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -144,6 +146,43 @@ pub enum RuntimeGatewayOwnerReleaseStatusV1 {
     ProtocolViolation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeGatewayOwnerCurrentObservationV1 {
+    receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    safety_deadline: Instant,
+}
+
+impl RuntimeGatewayOwnerCurrentObservationV1 {
+    fn from_watchdog(watchdog: &RuntimeGatewayOwnerWatchdogV1) -> Self {
+        Self {
+            receipt: watchdog.schedule().receipt().clone(),
+            safety_deadline: watchdog.schedule().safety_deadline(),
+        }
+    }
+
+    pub fn receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.receipt
+    }
+
+    pub fn safety_deadline(&self) -> Instant {
+        self.safety_deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeGatewayOwnerCurrentObservationErrorV1 {
+    #[error("runtime gateway owner observation can be retried")]
+    Retryable,
+    #[error("runtime gateway owner observation safety deadline elapsed")]
+    SafetyElapsed,
+    #[error("runtime gateway owner observation found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner observation violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner observation supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
 pub struct RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P> {
     reason: RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     port: P,
@@ -194,7 +233,8 @@ impl<P> RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P> {
 }
 
 pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
-    commands: mpsc::Sender<RuntimeGatewayOwnerStartupWatchdogCommandV1>,
+    shutdown_commands: mpsc::Sender<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    observation_commands: mpsc::Sender<RuntimeGatewayOwnerStartupObservationCommandV1>,
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
 }
@@ -221,11 +261,31 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         }
     }
 
+    pub async fn observe_current_gateway_owner_v1(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        if self
+            .observation_commands
+            .send(RuntimeGatewayOwnerStartupObservationCommandV1 { response })
+            .await
+            .is_err()
+        {
+            return Err(wait_for_observation_terminal_v1(terminal).await);
+        }
+        match acknowledgement.await {
+            Ok(result) => result,
+            Err(_) => Err(wait_for_observation_terminal_v1(terminal).await),
+        }
+    }
+
     pub async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         let (response, acknowledgement) = oneshot::channel();
         if self
-            .commands
-            .send(RuntimeGatewayOwnerStartupWatchdogCommandV1::Shutdown { response })
+            .shutdown_commands
+            .send(RuntimeGatewayOwnerStartupShutdownCommandV1 { response })
             .await
             .is_ok()
         {
@@ -237,10 +297,52 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     }
 }
 
-enum RuntimeGatewayOwnerStartupWatchdogCommandV1 {
-    Shutdown {
-        response: oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
-    },
+struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
+    response: oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
+}
+
+struct RuntimeGatewayOwnerStartupObservationCommandV1 {
+    response: oneshot::Sender<
+        Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerCurrentObservationErrorV1,
+        >,
+    >,
+}
+
+async fn wait_for_observation_terminal_v1(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerCurrentObservationErrorV1 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_observation_error_v1(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerCurrentObservationErrorV1::SupervisorUnavailable;
+        }
+    }
+}
+
+fn map_terminal_observation_error_v1(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerCurrentObservationErrorV1 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerCurrentObservationErrorV1::SafetyElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerCurrentObservationErrorV1::SupervisorUnavailable
+        }
+    }
 }
 
 pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1<P, I>(
@@ -299,17 +401,25 @@ where
             ));
         }
     };
-    let (commands, command_receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let (shutdown_commands, shutdown_receiver) = mpsc::channel(SHUTDOWN_COMMAND_CAPACITY);
+    let (observation_commands, observation_receiver) = mpsc::channel(OBSERVATION_COMMAND_CAPACITY);
     let (terminal_sender, terminal) = watch::channel(None);
     let guard = RuntimeGatewayOwnerStartupWatchdogGuardV1::new(invalidation.clone());
     runtime.spawn(async move {
-        let exit =
-            run_gateway_owner_startup_watchdog_v1(port, watchdog, config, command_receiver, guard)
-                .await;
+        let exit = run_gateway_owner_startup_watchdog_v1(
+            port,
+            watchdog,
+            config,
+            shutdown_receiver,
+            observation_receiver,
+            guard,
+        )
+        .await;
         let _result = terminal_sender.send(Some(exit));
     });
     Ok(RuntimeGatewayOwnerStartupWatchdogHandleV1 {
-        commands,
+        shutdown_commands,
+        observation_commands,
         terminal,
         invalidation,
     })
@@ -335,7 +445,8 @@ async fn run_gateway_owner_startup_watchdog_v1<P>(
     port: P,
     watchdog: RuntimeGatewayOwnerWatchdogV1,
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
-    mut commands: mpsc::Receiver<RuntimeGatewayOwnerStartupWatchdogCommandV1>,
+    mut shutdown_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    mut observation_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupObservationCommandV1>,
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
@@ -346,7 +457,7 @@ where
     let mut current = Some(watchdog);
     let mut shutdown_acknowledgement = None;
     let stop = 'supervisor: loop {
-        match commands.try_recv() {
+        match shutdown_commands.try_recv() {
             Ok(command) => {
                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                     receive_shutdown(Some(command), &mut shutdown_acknowledgement),
@@ -366,7 +477,7 @@ where
             RuntimeGatewayOwnerWatchdogActionV1::WaitUntil(renew_at) => {
                 tokio::select! {
                     biased;
-                    command = commands.recv() => {
+                    command = shutdown_commands.recv() => {
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             receive_shutdown(command, &mut shutdown_acknowledgement),
                             config.cleanup_timeout,
@@ -374,6 +485,39 @@ where
                     }
                     _ = sleep_until(TokioInstant::from_std(renew_at)) => {
                         current = Some(watchdog);
+                    }
+                    command = observation_commands.recv() => {
+                        let Some(command) = command else {
+                            break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                config.cleanup_timeout,
+                            );
+                        };
+                        if command.response.is_closed() {
+                            current = Some(watchdog);
+                            continue 'supervisor;
+                        }
+                        match observe_current_gateway_owner_v1(
+                            &port,
+                            watchdog,
+                            command,
+                            &mut shutdown_commands,
+                            &mut shutdown_acknowledgement,
+                            &mut guard,
+                            config.cleanup_timeout,
+                        ).await {
+                            RuntimeGatewayOwnerStartupObservationStepV1::Continue {
+                                successor,
+                                response,
+                                result,
+                            } => {
+                                current = Some(*successor);
+                                let _result = response.send(result);
+                            }
+                            RuntimeGatewayOwnerStartupObservationStepV1::Stop(stop) => {
+                                break 'supervisor stop;
+                            }
+                        }
                     }
                 }
             }
@@ -394,19 +538,19 @@ where
                 tokio::pin!(renewal);
                 let result = tokio::select! {
                     biased;
-                    _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
+                    command = shutdown_commands.recv() => {
                         guard.invalidate_now();
                         let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                            RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                            receive_shutdown(command, &mut shutdown_acknowledgement),
                             config.cleanup_timeout,
                         );
                         let _joined_result = timeout_at(stop.cleanup_deadline, &mut renewal).await;
                         break 'supervisor stop;
                     }
-                    command = commands.recv() => {
+                    _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
                         guard.invalidate_now();
                         let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                            receive_shutdown(command, &mut shutdown_acknowledgement),
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
                             config.cleanup_timeout,
                         );
                         let _joined_result = timeout_at(stop.cleanup_deadline, &mut renewal).await;
@@ -449,7 +593,7 @@ where
                             .unwrap_or(restored.schedule().safety_deadline());
                         tokio::select! {
                             biased;
-                            command = commands.recv() => {
+                            command = shutdown_commands.recv() => {
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     receive_shutdown(command, &mut shutdown_acknowledgement),
                                     config.cleanup_timeout,
@@ -488,6 +632,180 @@ where
     exit
 }
 
+enum RuntimeGatewayOwnerStartupObservationStepV1 {
+    Continue {
+        successor: Box<RuntimeGatewayOwnerWatchdogV1>,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerCurrentObservationErrorV1,
+            >,
+        >,
+        result: Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerCurrentObservationErrorV1,
+        >,
+    },
+    Stop(RuntimeGatewayOwnerStartupWatchdogStopV1),
+}
+
+async fn observe_current_gateway_owner_v1<P>(
+    port: &P,
+    watchdog: RuntimeGatewayOwnerWatchdogV1,
+    command: RuntimeGatewayOwnerStartupObservationCommandV1,
+    shutdown_commands: &mut mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    shutdown_acknowledgement: &mut Option<
+        oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
+    >,
+    guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup_timeout: Duration,
+) -> RuntimeGatewayOwnerStartupObservationStepV1
+where
+    P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
+    P::Error: Send,
+{
+    let request_started_at = Instant::now();
+    let inflight = match watchdog.begin_current_observation(request_started_at) {
+        Ok(inflight) => inflight,
+        Err(error) => {
+            return stop_after_observation_error_v1(
+                command,
+                map_current_observation_error(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup_timeout,
+            );
+        }
+    };
+    let renew_at = inflight.previous_schedule().renew_at();
+    let safety_deadline = inflight.previous_schedule().safety_deadline();
+    let request = inflight.request().clone();
+    let observation = port.observe_gateway_owner(request);
+    tokio::pin!(observation);
+    let result = tokio::select! {
+        biased;
+        shutdown = shutdown_commands.recv() => {
+            guard.invalidate_now();
+            let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                receive_shutdown(shutdown, shutdown_acknowledgement),
+                cleanup_timeout,
+            );
+            let _result = command.response.send(Err(
+                RuntimeGatewayOwnerCurrentObservationErrorV1::SupervisorUnavailable,
+            ));
+            return RuntimeGatewayOwnerStartupObservationStepV1::Stop(stop);
+        }
+        _ = sleep_until(TokioInstant::from_std(renew_at)) => {
+            let response_observed_at = Instant::now();
+            return match inflight.observation_failed(response_observed_at) {
+                Ok(restored) => RuntimeGatewayOwnerStartupObservationStepV1::Continue {
+                    successor: Box::new(restored),
+                    response: command.response,
+                    result: Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable),
+                },
+                Err(error) => stop_after_observation_error_v1(
+                    command,
+                    map_current_observation_error(error),
+                    map_watchdog_error(error),
+                    guard,
+                    cleanup_timeout,
+                ),
+            };
+        }
+        _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
+            guard.invalidate_now();
+            let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                cleanup_timeout,
+            );
+            let _result = command.response.send(Err(
+                RuntimeGatewayOwnerCurrentObservationErrorV1::SafetyElapsed,
+            ));
+            return RuntimeGatewayOwnerStartupObservationStepV1::Stop(stop);
+        }
+        result = &mut observation => result,
+    };
+    let response_observed_at = Instant::now();
+    match result {
+        Ok(observation) => match inflight.complete(observation, response_observed_at) {
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::Current(successor)) => {
+                let projection = RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&successor);
+                RuntimeGatewayOwnerStartupObservationStepV1::Continue {
+                    successor,
+                    response: command.response,
+                    result: Ok(projection),
+                }
+            }
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::OwnershipLost(_)) => {
+                stop_after_observation_error_v1(
+                    command,
+                    RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+            Err(error) => stop_after_observation_error_v1(
+                command,
+                map_current_observation_error(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup_timeout,
+            ),
+        },
+        Err(error) => match P::classify_observation_error(&error) {
+            RuntimeGatewayOwnerObservationErrorClassV1::Retryable => {
+                match inflight.observation_failed(response_observed_at) {
+                    Ok(restored) => RuntimeGatewayOwnerStartupObservationStepV1::Continue {
+                        successor: Box::new(restored),
+                        response: command.response,
+                        result: Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable),
+                    },
+                    Err(error) => stop_after_observation_error_v1(
+                        command,
+                        map_current_observation_error(error),
+                        map_watchdog_error(error),
+                        guard,
+                        cleanup_timeout,
+                    ),
+                }
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost => {
+                stop_after_observation_error_v1(
+                    command,
+                    RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation => {
+                stop_after_observation_error_v1(
+                    command,
+                    RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+        },
+    }
+}
+
+fn stop_after_observation_error_v1(
+    command: RuntimeGatewayOwnerStartupObservationCommandV1,
+    response_error: RuntimeGatewayOwnerCurrentObservationErrorV1,
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+    guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup_timeout: Duration,
+) -> RuntimeGatewayOwnerStartupObservationStepV1 {
+    guard.invalidate_now();
+    let _result = command.response.send(Err(response_error));
+    RuntimeGatewayOwnerStartupObservationStepV1::Stop(
+        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup_timeout),
+    )
+}
+
 struct RuntimeGatewayOwnerStartupWatchdogStopV1 {
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
     cleanup_deadline: TokioInstant,
@@ -503,13 +821,31 @@ impl RuntimeGatewayOwnerStartupWatchdogStopV1 {
 }
 
 fn receive_shutdown(
-    command: Option<RuntimeGatewayOwnerStartupWatchdogCommandV1>,
+    command: Option<RuntimeGatewayOwnerStartupShutdownCommandV1>,
     acknowledgement: &mut Option<oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
-    if let Some(RuntimeGatewayOwnerStartupWatchdogCommandV1::Shutdown { response }) = command {
+    if let Some(RuntimeGatewayOwnerStartupShutdownCommandV1 { response }) = command {
         *acknowledgement = Some(response);
     }
     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+}
+
+fn map_current_observation_error(
+    error: RuntimeGatewayOwnerWatchdogErrorV1,
+) -> RuntimeGatewayOwnerCurrentObservationErrorV1 {
+    match error {
+        RuntimeGatewayOwnerWatchdogErrorV1::SafetyElapsed
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(
+            RuntimeGatewayOwnerRenewalScheduleErrorV1::SafetyElapsed,
+        ) => RuntimeGatewayOwnerCurrentObservationErrorV1::SafetyElapsed,
+        RuntimeGatewayOwnerWatchdogErrorV1::ClockReversed
+        | RuntimeGatewayOwnerWatchdogErrorV1::RequestedLeaseTooShort
+        | RuntimeGatewayOwnerWatchdogErrorV1::RevisionExhausted
+        | RuntimeGatewayOwnerWatchdogErrorV1::ProtocolViolation { .. }
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(_) => {
+            RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation
+        }
+    }
 }
 
 fn map_watchdog_error(

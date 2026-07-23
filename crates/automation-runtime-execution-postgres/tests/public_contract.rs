@@ -17,7 +17,8 @@ use automation_runtime_execution_postgres::{
     MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION, MIN_RUNTIME_GATEWAY_OWNER_LEASE_DURATION,
 };
 use automation_runtime_worker::{
-    RuntimeGatewayOwnerLeasePortV1, RuntimeWriterFenceObservationPortV1,
+    RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerObservationErrorClassV1,
+    RuntimeWriterFenceObservationPortV1,
 };
 
 fn assert_mutate_signature(
@@ -152,6 +153,41 @@ fn persistence_error_codes_and_classes_are_stable_and_unique() {
         assert!(codes.insert(code));
     }
     assert_eq!(codes.len(), cases.len());
+}
+
+#[test]
+fn gateway_owner_observation_error_classes_fail_closed() {
+    for error in [
+        RuntimeExecutionPersistenceErrorV1::Timeout,
+        RuntimeExecutionPersistenceErrorV1::Concurrency,
+        RuntimeExecutionPersistenceErrorV1::Unavailable,
+        RuntimeExecutionPersistenceErrorV1::Indeterminate,
+    ] {
+        assert_eq!(
+            PostgresRuntimeExecutionV1::classify_observation_error(&error),
+            RuntimeGatewayOwnerObservationErrorClassV1::Retryable
+        );
+    }
+    assert_eq!(
+        PostgresRuntimeExecutionV1::classify_observation_error(
+            &RuntimeExecutionPersistenceErrorV1::OwnershipLost,
+        ),
+        RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost
+    );
+    for error in [
+        RuntimeExecutionPersistenceErrorV1::InvalidInput,
+        RuntimeExecutionPersistenceErrorV1::DatabaseAuthorityMismatch,
+        RuntimeExecutionPersistenceErrorV1::AuthorityChanged,
+        RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt,
+        RuntimeExecutionPersistenceErrorV1::RetryNotReady,
+        RuntimeExecutionPersistenceErrorV1::Superseded,
+        RuntimeExecutionPersistenceErrorV1::DatabaseFailure,
+    ] {
+        assert_eq!(
+            PostgresRuntimeExecutionV1::classify_observation_error(&error),
+            RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation
+        );
+    }
 }
 
 #[test]

@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use automation_runtime_controller::{
     RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeGatewayOwnerLeaseObservationV1, RuntimeObserveGatewayOwnerLeaseV1,
-    RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeConvergenceErrorClassV1, RuntimeGatewayOwnerLeaseObservationV1,
+    RuntimeObserveGatewayOwnerLeaseV1, RuntimeReleaseGatewayOwnerLeaseOutcomeV1,
+    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseOutcomeV1,
+    RuntimeRenewGatewayOwnerLeaseV1,
 };
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_gateway_owner_observation_v1,
     accept_gateway_owner_release_v1, accept_gateway_owner_renew_v1, RuntimeGatewayOwnerLeasePortV1,
-    RuntimeGatewayOwnerMutationErrorV1,
+    RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -267,6 +268,25 @@ impl PostgresRuntimeExecutionV1 {
 
 impl RuntimeGatewayOwnerLeasePortV1 for PostgresRuntimeExecutionV1 {
     type Error = RuntimeExecutionPersistenceErrorV1;
+
+    fn classify_observation_error(
+        error: &Self::Error,
+    ) -> RuntimeGatewayOwnerObservationErrorClassV1 {
+        match error.class() {
+            RuntimeConvergenceErrorClassV1::Retryable => {
+                RuntimeGatewayOwnerObservationErrorClassV1::Retryable
+            }
+            RuntimeConvergenceErrorClassV1::OwnershipLost => {
+                RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost
+            }
+            RuntimeConvergenceErrorClassV1::RetryNotReady
+            | RuntimeConvergenceErrorClassV1::Superseded
+            | RuntimeConvergenceErrorClassV1::AuthorityBlocked
+            | RuntimeConvergenceErrorClassV1::InvalidState => {
+                RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation
+            }
+        }
+    }
 
     fn observe_gateway_owner(
         &self,

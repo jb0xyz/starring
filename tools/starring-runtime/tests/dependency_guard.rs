@@ -416,6 +416,24 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     );
     assert!(!owner_supervisor.contains("pub trait RuntimeGatewayOwnerEmergencyInvalidatorV1"));
     assert!(!owner_supervisor.contains("pub fn start_runtime_gateway_owner_startup_watchdog_v1"));
+    assert!(owner_supervisor.contains(concat!(
+        "pub struct RuntimeGatewayOwnerCurrentObservationV1 {\n",
+        "    receipt: RuntimeGatewayOwnerLeaseReceiptV1,\n",
+        "    safety_deadline: Instant,\n",
+        "}"
+    )));
+    assert!(owner_supervisor.contains("shutdown_commands: mpsc::Sender<"));
+    assert!(owner_supervisor.contains("observation_commands: mpsc::Sender<"));
+    assert!(owner_supervisor.contains("RuntimeGatewayOwnerObservationCompletionV1::Current"));
+    assert!(!owner_supervisor.contains("impl Clone for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
+    for forbidden in [
+        "pub fn watchdog",
+        "pub fn schedule",
+        "pub fn port",
+        "RuntimeGatewayOwnerObservedWatchdogV1",
+    ] {
+        assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
+    }
 }
 
 #[test]

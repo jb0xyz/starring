@@ -16,8 +16,8 @@ pub use gateway_owner::{
     RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedGatewayOwnerReleaseV1,
     RuntimeAcceptedGatewayOwnerRenewV1, RuntimeGatewayOwnerAcquireRecoveryV1,
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerMutationErrorV1,
-    RuntimeGatewayOwnerProtocolViolationV1, RuntimeGatewayOwnerReleaseRecoveryV1,
-    RuntimeGatewayOwnerRenewRecoveryV1,
+    RuntimeGatewayOwnerObservationErrorClassV1, RuntimeGatewayOwnerProtocolViolationV1,
+    RuntimeGatewayOwnerReleaseRecoveryV1, RuntimeGatewayOwnerRenewRecoveryV1,
 };
 pub use gateway_owner_watchdog::{
     RuntimeGatewayOwnerObservationCompletionV1, RuntimeGatewayOwnerObservationInFlightV1,

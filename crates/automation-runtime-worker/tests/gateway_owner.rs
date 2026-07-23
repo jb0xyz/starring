@@ -393,6 +393,12 @@ struct FakeOwnerPort;
 impl RuntimeGatewayOwnerLeasePortV1 for FakeOwnerPort {
     type Error = &'static str;
 
+    fn classify_observation_error(
+        _error: &Self::Error,
+    ) -> automation_runtime_worker::RuntimeGatewayOwnerObservationErrorClassV1 {
+        automation_runtime_worker::RuntimeGatewayOwnerObservationErrorClassV1::Retryable
+    }
+
     fn observe_gateway_owner(
         &self,
         request: RuntimeObserveGatewayOwnerLeaseV1,

@@ -26,8 +26,19 @@ pub enum RuntimeGatewayOwnerProtocolViolationV1 {
     RevisionExhausted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeGatewayOwnerObservationErrorClassV1 {
+    Retryable,
+    OwnershipLost,
+    ProtocolViolation,
+}
+
 pub trait RuntimeGatewayOwnerLeasePortV1 {
     type Error;
+
+    fn classify_observation_error(
+        error: &Self::Error,
+    ) -> RuntimeGatewayOwnerObservationErrorClassV1;
 
     fn observe_gateway_owner(
         &self,
