@@ -1942,6 +1942,184 @@ fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
 }
 
 #[test]
+fn v2_suspension_operation_binds_one_exact_execution_without_authority() {
+    let source = include_str!("../src/v2_suspension_operation.rs");
+    let tests = include_str!("../src/v2_suspension_operation/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "pub fn from_parts",
+        "pub fn from_guard",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension operation surface: {forbidden}"
+        );
+    }
+
+    let scope = source
+        .split("pub struct RuntimeSuspendAttemptOperationScopeV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "scope: RuntimeDeploymentScopeV1,",
+        "deployment_revision: DeploymentRevision,",
+        "convergence_attempt: NonZeroU32,",
+    ] {
+        assert!(scope.contains(field), "{field}");
+    }
+    assert_eq!(scope.matches("    ").count(), 3);
+    assert!(!scope.contains("pub "));
+
+    let operation = source
+        .split("pub struct RuntimeSuspendAttemptOperationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "operation_scope: RuntimeSuspendAttemptOperationScopeV2,",
+        "source_target: RuntimeDeploymentTargetV1,",
+        "source_previous_runtime: Option<RuntimeProcessIdentityV1>,",
+        "source_evidence_at: DateTime<Utc>,",
+        "canonical_attempt: RuntimeCanonicalSuspendAttemptV2,",
+    ] {
+        assert!(operation.contains(field), "{field}");
+    }
+    assert_eq!(operation.matches("    ").count(), 5);
+    assert!(!operation.contains("pub "));
+
+    let persisted = source
+        .split("pub struct RuntimePersistedSuspendAttemptRootV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "operation_scope: RuntimeSuspendAttemptOperationScopeV2,",
+        "canonical_attempt: RuntimeCanonicalSuspendAttemptV2,",
+    ] {
+        assert!(persisted.contains(field), "{field}");
+    }
+    assert_eq!(persisted.matches("    ").count(), 2);
+    assert!(!persisted.contains("pub "));
+
+    let lookup = source
+        .split("pub struct RuntimeSuspendAttemptScopeLookupV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(lookup.contains("operation_scope: RuntimeSuspendAttemptOperationScopeV2,"));
+    assert_eq!(lookup.matches("    ").count(), 1);
+    for forbidden in ["suspension_id", "digest", "bytes", "canonical_attempt"] {
+        assert!(!lookup.contains(forbidden), "{forbidden}");
+    }
+
+    assert!(source.contains(concat!(
+        "pub fn new(\n",
+        "        execution: &RuntimeExecutionReceiptV1,\n",
+        "        canonical_attempt: RuntimeCanonicalSuspendAttemptV2,\n",
+        "    ) -> Result<Self, RuntimeSuspendAttemptOperationBuildErrorV2> {"
+    )));
+    assert!(source.contains(concat!(
+        "pub fn from_persisted(\n",
+        "        persisted_scope: RuntimeDeploymentScopeV1,\n",
+        "        persisted_deployment_revision: DeploymentRevision,\n",
+        "        persisted_convergence_attempt: NonZeroU32,\n",
+        "        persisted_suspension_id: &RuntimeSuspensionIdV2,"
+    )));
+    assert!(source.contains("RuntimeDeployment::restore(execution.snapshot.clone())"));
+    for receipt_check in [
+        "lease.controller_id != execution.controller_id",
+        "lease.fencing_token != execution.fencing_token",
+        "lease.acquired_at != execution.acquired_at",
+        "lease.expires_at != execution.expires_at",
+        "execution.snapshot.last_fencing_token != Some(execution.fencing_token)",
+        "execution.expires_at <= execution.acquired_at",
+    ] {
+        assert!(source.contains(receipt_check), "{receipt_check}");
+    }
+
+    for phase in [
+        "RuntimeSuspensionSourcePhaseV2::Requested",
+        "RuntimeSuspensionSourcePhaseV2::PreflightReady",
+        "RuntimeSuspensionSourcePhaseV2::DrainRequested",
+        "RuntimeSuspensionSourcePhaseV2::Drained",
+        "RuntimeSuspensionSourcePhaseV2::ActivationApplying",
+        "RuntimeSuspensionSourcePhaseV2::RuntimePendingReady",
+        "RuntimeSuspensionSourcePhaseV2::ReconcilingPanels",
+    ] {
+        assert!(source.contains(phase), "{phase}");
+    }
+    assert!(source.contains("guard.scope != expected_scope"));
+    assert!(source.contains("guard.expected_revision != execution.snapshot.revision"));
+    assert!(source.contains("guard.convergence_attempt != execution.convergence_attempt"));
+    assert!(source.contains("guard.controller_id != execution.controller_id"));
+    assert!(source.contains("guard.fencing_token != execution.fencing_token"));
+    assert!(source.contains("guard.runtime_generation != execution.snapshot.runtime_generation"));
+    assert!(source.contains("route.identity.target == *target"));
+    assert!(source.contains("source_previous_runtime == Some(&previous.process)"));
+    assert!(source.contains("request.failure.recorded_at < evidence_at"));
+    assert!(source.contains("snapshot.requested_at"));
+    assert!(source.contains("preflight.checked_at"));
+    assert!(source.contains("drain.drained_at"));
+    assert!(source.contains("activation.activated_at.max(recovery.recovered_at)"));
+    assert!(source.contains(".last_live_recovery"));
+
+    for persisted_check in [
+        "persisted_scope != request.guard.scope",
+        "persisted_deployment_revision != request.guard.expected_revision",
+        "persisted_convergence_attempt != request.guard.convergence_attempt",
+        "persisted_suspension_id != &request.suspension_id",
+        "RuntimeCanonicalSuspendAttemptV2::from_persisted",
+    ] {
+        assert!(source.contains(persisted_check), "{persisted_check}");
+    }
+    for replay_check in [
+        "self.operation_scope == *proposed.operation_scope()",
+        "self.suspension_id() == proposed.suspension_id()",
+        "self.suspend_attempt_request_bytes() == proposed.suspend_attempt_request_bytes()",
+        "self.suspend_attempt_digest() == proposed.suspend_attempt_digest()",
+    ] {
+        assert!(source.contains(replay_check), "{replay_check}");
+    }
+
+    for required_test in [
+        "all_suspendable_phases_bind_their_exact_source_evidence",
+        "execution_receipt_and_guard_drift_are_rejected",
+        "current_target_and_previous_runtime_drift_are_rejected",
+        "persisted_root_requires_exact_normalized_scope_and_identity",
+        "byte_exact_replay_rejects_every_creation_identity_difference",
+    ] {
+        assert!(tests.contains(required_test), "{required_test}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimePersistedSuspendAttemptRootV2",
+        "RuntimeSuspendAttemptOperationScopeV2",
+        "RuntimeSuspendAttemptOperationV2",
+        "RuntimeSuspendAttemptScopeLookupV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -2028,6 +2206,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension_canonical/tests.rs",
             include_str!("../src/v2_suspension_canonical/tests.rs"),
+        ),
+        (
+            "src/v2_suspension_operation.rs",
+            include_str!("../src/v2_suspension_operation.rs"),
+        ),
+        (
+            "src/v2_suspension_operation/tests.rs",
+            include_str!("../src/v2_suspension_operation/tests.rs"),
         ),
         (
             "src/v2_writer_fence.rs",

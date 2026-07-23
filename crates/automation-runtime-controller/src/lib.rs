@@ -32,6 +32,7 @@ mod v2_route_provenance;
 mod v2_startup_recovery;
 mod v2_suspension;
 mod v2_suspension_canonical;
+mod v2_suspension_operation;
 mod v2_writer_fence;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
@@ -148,6 +149,12 @@ pub use v2_suspension::{
 pub use v2_suspension_canonical::{
     RuntimeCanonicalSuspendAttemptV2, RuntimeSuspendAttemptCanonicalErrorV2,
     RuntimeSuspendAttemptCanonicalFieldV2, RuntimeSuspendAttemptCorrelationV2,
+};
+pub use v2_suspension_operation::{
+    RuntimePersistedSuspendAttemptRootV2, RuntimeSuspendAttemptOperationBuildErrorV2,
+    RuntimeSuspendAttemptOperationFieldV2, RuntimeSuspendAttemptOperationPersistenceErrorV2,
+    RuntimeSuspendAttemptOperationScopeV2, RuntimeSuspendAttemptOperationV2,
+    RuntimeSuspendAttemptReplayErrorV2, RuntimeSuspendAttemptScopeLookupV2,
 };
 pub use v2_writer_fence::{
     RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,
