@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use automation_runtime_controller::{
     RuntimeAttestationIdV1, RuntimeConvergenceErrorClassV1, RuntimeDeploymentScopeV1,
-    RuntimeServingIdentityV1, RuntimeServingLeasePort, RuntimeServingReceiptV1,
-    RuntimeServingSessionV1,
+    RuntimeHeartbeatServingV1, RuntimeServingIdentityV1, RuntimeServingLeasePort,
+    RuntimeServingReceiptV1, RuntimeServingSessionV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
@@ -451,6 +451,7 @@ async fn serving_scenario(
 
     let mut session = serving_session(&owner_pool).await;
     let first_request = session.begin_heartbeat(Duration::from_secs(60)).unwrap();
+    assert_writer_fence_snapshot_and_fail_closed(&owner_pool, &adapter, &first_request).await;
     let first = adapter
         .heartbeat_serving(first_request.clone())
         .await
@@ -589,6 +590,155 @@ async fn serving_scenario(
         .unwrap();
     assert_eq!(disconnected, disconnected_replay);
     session.apply_disconnect(disconnected).unwrap();
+}
+
+async fn assert_writer_fence_snapshot_and_fail_closed(
+    owner_pool: &PgPool,
+    adapter: &PostgresRuntimeServingLeaseV1,
+    request: &RuntimeHeartbeatServingV1,
+) {
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut stale = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *stale)
+        .await
+        .unwrap();
+    let initial = sqlx::query_scalar::<_, String>(
+        "SELECT fence_state FROM public.runtime_writer_fence WHERE singleton",
+    )
+    .fetch_one(&mut *stale)
+    .await
+    .unwrap();
+    assert_eq!(initial, "open");
+
+    mutate_writer_fence(
+        owner_pool,
+        "UPDATE public.runtime_writer_fence \
+         SET fence_state = 'closed', fence_generation = 2, \
+             cutover_lease_epoch_high_water = 1, \
+             cutover_coordinator_id = '00112233445566778899aabbccddeeff', \
+             cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+         WHERE singleton",
+    )
+    .await;
+
+    let error = raw_heartbeat(&mut stale, request).await.unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("40001")
+    );
+    stale.rollback().await.unwrap();
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT fence_state FROM public.runtime_writer_fence WHERE singleton",
+        )
+        .fetch_one(owner_pool)
+        .await
+        .unwrap(),
+        "closed"
+    );
+
+    let mut fresh_closed = owner_pool.begin().await.unwrap();
+    let error = raw_heartbeat(&mut fresh_closed, request).await.unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("RS005")
+    );
+    fresh_closed.rollback().await.unwrap();
+    let error = adapter
+        .heartbeat_serving(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error, RuntimeServingPersistenceErrorV1::RetryNotReady);
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+
+    mutate_writer_fence(owner_pool, "DELETE FROM public.runtime_writer_fence").await;
+
+    let error = adapter
+        .heartbeat_serving(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error, RuntimeServingPersistenceErrorV1::PersistenceCorrupt);
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+
+    mutate_writer_fence(
+        owner_pool,
+        "INSERT INTO public.runtime_writer_fence (\
+            singleton, fence_state, fence_generation, cutover_lease_epoch_high_water, \
+            cutover_coordinator_id, cutover_expires_at\
+         ) VALUES (TRUE, 'open', 3, 1, NULL, NULL)",
+    )
+    .await;
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+}
+
+async fn mutate_writer_fence(owner_pool: &PgPool, mutation: &str) {
+    let mut transaction = owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(\
+            pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0)\
+         )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(mutation)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn raw_heartbeat(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &RuntimeHeartbeatServingV1,
+) -> Result<(), sqlx::Error> {
+    let identity = &request.identity;
+    sqlx::query(
+        "SELECT * FROM public.starring_runtime_serving_heartbeat_v1(\
+            $1, $2, $3, $4, $5, $6, $7, $8, $9\
+         )",
+    )
+    .bind(identity.scope.tenant_id.as_str())
+    .bind(identity.scope.installation_id.as_str())
+    .bind(identity.scope.deployment_id.as_str())
+    .bind(identity.attestation_id.as_str())
+    .bind(identity.process_instance_id.as_str())
+    .bind(i64::try_from(identity.runtime_generation.get()).unwrap())
+    .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
+    .bind(i64::try_from(identity.expected_revision.get()).unwrap())
+    .bind(i64::try_from(request.lease_for.as_millis()).unwrap())
+    .fetch_all(&mut **transaction)
+    .await
+    .map(|_| ())
+}
+
+async fn serving_lease_image(pool: &PgPool) -> Json<Value> {
+    sqlx::query_scalar(
+        "SELECT pg_catalog.to_jsonb(lease) \
+         FROM public.runtime_serving_leases AS lease \
+         WHERE lease.guild_id = $1 AND lease.ruleset_key = $2",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn assert_readiness_trust_anchor(

@@ -15,6 +15,8 @@ pub enum RuntimeServingPersistenceErrorV1 {
     AuthorityChanged,
     #[error("runtime serving persistence state is corrupt")]
     PersistenceCorrupt,
+    #[error("runtime serving is not ready")]
+    RetryNotReady,
     #[error("runtime serving database operation timed out")]
     Timeout,
     #[error("runtime serving database transaction must be retried")]
@@ -33,6 +35,7 @@ impl RuntimeServingPersistenceErrorV1 {
             Self::Timeout | Self::Concurrency | Self::Unavailable | Self::Indeterminate => {
                 RuntimeConvergenceErrorClassV1::Retryable
             }
+            Self::RetryNotReady => RuntimeConvergenceErrorClassV1::RetryNotReady,
             Self::OwnershipLost => RuntimeConvergenceErrorClassV1::OwnershipLost,
             Self::AuthorityChanged => RuntimeConvergenceErrorClassV1::AuthorityBlocked,
             Self::InvalidInput
@@ -49,6 +52,7 @@ impl RuntimeServingPersistenceErrorV1 {
             Self::OwnershipLost => "runtime_serving_ownership_lost",
             Self::AuthorityChanged => "runtime_serving_authority_changed",
             Self::PersistenceCorrupt => "runtime_serving_persistence_corrupt",
+            Self::RetryNotReady => "runtime_serving_retry_not_ready",
             Self::Timeout => "runtime_serving_timeout",
             Self::Concurrency => "runtime_serving_concurrency",
             Self::Unavailable => "runtime_serving_unavailable",
@@ -82,6 +86,7 @@ pub(crate) fn map_query_error(error: sqlx::Error) -> RuntimeServingPersistenceEr
         Some("RS002") => RuntimeServingPersistenceErrorV1::InvalidInput,
         Some("RS003") => RuntimeServingPersistenceErrorV1::AuthorityChanged,
         Some("RS004") => RuntimeServingPersistenceErrorV1::PersistenceCorrupt,
+        Some("RS005") => RuntimeServingPersistenceErrorV1::RetryNotReady,
         Some("RE001") => RuntimeServingPersistenceErrorV1::DatabaseAuthorityMismatch,
         Some("55P03" | "57014") => RuntimeServingPersistenceErrorV1::Timeout,
         Some("40001" | "40P01") => RuntimeServingPersistenceErrorV1::Concurrency,

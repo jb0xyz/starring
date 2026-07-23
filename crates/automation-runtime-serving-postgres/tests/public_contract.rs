@@ -48,6 +48,11 @@ fn persistence_error_codes_and_classes_are_stable_and_unique() {
             "runtime_serving_persistence_corrupt",
         ),
         (
+            RuntimeServingPersistenceErrorV1::RetryNotReady,
+            RuntimeConvergenceErrorClassV1::RetryNotReady,
+            "runtime_serving_retry_not_ready",
+        ),
+        (
             RuntimeServingPersistenceErrorV1::Timeout,
             RuntimeConvergenceErrorClassV1::Retryable,
             "runtime_serving_timeout",
