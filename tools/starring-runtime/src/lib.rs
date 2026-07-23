@@ -1,3 +1,4 @@
+mod closed_recovery;
 mod config;
 mod database;
 mod gateway;

@@ -136,6 +136,44 @@ impl RuntimeDatabaseReadinessV1 {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn runtime_database_readiness_for_test_v1() -> RuntimeDatabaseReadinessV1 {
+    let checked_at = chrono::DateTime::from_timestamp_millis(1_000_000).unwrap();
+    aggregate_readiness_v1(
+        RuntimeExecutionDatabaseReadinessV1 {
+            database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
+            database_name: "starring".to_string(),
+            executor_role: "role_a".to_string(),
+            checked_at,
+        },
+        RuntimeExactTargetDatabaseReadinessV1 {
+            database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
+            database_name: "starring".to_string(),
+            executor_role: "role_b".to_string(),
+            checked_at,
+        },
+        RuntimePanelDatabaseReadinessV1 {
+            database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
+            database_name: "starring".to_string(),
+            executor_role: "role_c".to_string(),
+            checked_at,
+        },
+        RuntimeServingDatabaseReadinessV1 {
+            database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
+            database_name: "starring".to_string(),
+            executor_role: "role_d".to_string(),
+            checked_at,
+        },
+        RuntimeInteractionDatabaseReadinessV1 {
+            database_identity: "01234567-89ab-cdef-8123-456789abcdef".to_string(),
+            database_name: "starring".to_string(),
+            executor_role: "role_e".to_string(),
+            checked_at,
+        },
+    )
+    .unwrap()
+}
+
 impl Debug for RuntimeDatabaseReadinessV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeDatabaseReadinessV1(<redacted>)")

@@ -212,6 +212,131 @@ fn implements_trait(source: &str, name: &str, trait_name: &str) -> bool {
     })
 }
 
+fn source_before_test_module(source: &str) -> &str {
+    let marker = "#[cfg(test)]\nmod tests {";
+    let (production, tests) = source
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("test module boundary missing"));
+    assert!(!tests.contains(marker), "duplicate test module boundary");
+    production
+}
+
+fn braced_declaration<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("declaration missing: {marker}"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("declaration body missing: {marker}"));
+    let close = matching_closing_brace(source, open)
+        .unwrap_or_else(|| panic!("declaration body unterminated: {marker}"));
+    &source[start..=close]
+}
+
+fn matching_closing_brace(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if *bytes.get(open)? != b'{' {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut index = open + 1;
+    while index < bytes.len() {
+        if let Some(end) = raw_string_literal_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"') {
+            index = quoted_literal_end(bytes, index + 1)?;
+            continue;
+        }
+        if bytes[index] == b'"' {
+            index = quoted_literal_end(bytes, index)?;
+            continue;
+        }
+        if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'\'') {
+            if let Some(end) = character_literal_end(bytes, index + 1) {
+                index = end;
+                continue;
+            }
+        }
+        if bytes[index] == b'\'' {
+            if let Some(end) = character_literal_end(bytes, index) {
+                index = end;
+                continue;
+            }
+        }
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn raw_string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut prefix = start;
+    if bytes.get(prefix) == Some(&b'b') {
+        prefix += 1;
+    }
+    if bytes.get(prefix) != Some(&b'r') {
+        return None;
+    }
+    let mut delimiter = prefix + 1;
+    while bytes.get(delimiter) == Some(&b'#') {
+        delimiter += 1;
+    }
+    if bytes.get(delimiter) != Some(&b'"') {
+        return None;
+    }
+    let hashes = delimiter - prefix - 1;
+    let mut cursor = delimiter + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"'
+            && cursor + hashes < bytes.len()
+            && (hashes == 0
+                || bytes[cursor + 1..=cursor + hashes]
+                    .iter()
+                    .all(|value| *value == b'#'))
+        {
+            return Some(cursor + hashes + 1);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn quoted_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
+    let mut cursor = quote + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = cursor.checked_add(2)?,
+            b'"' => return Some(cursor + 1),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn assert_no_watch_reborrow(source: &str, context: &str) {
+    for forbidden in [
+        "current_admission_snapshot",
+        "issue_ready_lease",
+        "require_healthy_paused",
+        ".control.",
+        ".observer.",
+    ] {
+        assert!(!source.contains(forbidden), "{context}: {forbidden}");
+    }
+}
+
 #[test]
 fn comment_scanner_cannot_be_masked_by_character_literals() {
     for source in [
@@ -240,6 +365,22 @@ fn authority_type_scanner_crosses_blank_attribute_spacing_and_qualified_impls() 
         "}"
     );
     assert!(implements_trait(implemented, "Guarded", "Default"));
+}
+
+#[test]
+fn production_source_scanner_crosses_test_only_items() {
+    let source = concat!(
+        "pub struct Before;\n",
+        "#[cfg(test)]\n",
+        "struct Fixture;\n",
+        "pub struct After;\n",
+        "#[cfg(test)]\n",
+        "mod tests {}",
+    );
+    let production = source_before_test_module(source);
+    assert!(production.contains("pub struct Before;"));
+    assert!(production.contains("pub struct After;"));
+    assert!(!production.contains("mod tests"));
 }
 
 #[test]
@@ -306,6 +447,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             .map(|(path, _)| path.to_str().unwrap())
             .collect::<Vec<_>>(),
         [
+            "src/closed_recovery.rs",
             "src/config.rs",
             "src/database.rs",
             "src/gateway.rs",
@@ -448,10 +590,16 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "automation_runtime_registry"
                         | "automation_runtime_worker"
                 );
+            let allowed_closed_recovery = path == Path::new("src/closed_recovery.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
+                        || allowed_closed_recovery
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -479,6 +627,20 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "self.control.issue_ready_lease(epoch)",
         "RuntimePausedGatewayObservationV2::new(",
         "RuntimePausedGatewaySequenceV2::new(",
+        "control.admission_snapshot_watch()",
+        "pub(crate) struct RuntimeEmergencyGatewaySectionV2<'a>",
+        "pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2",
+        "pub(crate) struct RuntimeRecoveryPendingGatewaySectionV2<'a>",
+        "pub(crate) fn initial_emergency_gateway_section_v2<'a>(",
+        "pub(crate) fn begin_empty_recovery_v2(",
+        "_authority: &RuntimeClosedRecoveryTransitionAuthorityV2",
+        "registry: RuntimeLockedRegistryEmptyEvidenceV2<'_, '_>",
+        "registry.into_observation_v2()",
+        "pub(crate) fn into_recovery_pending_binding_v2(",
+        "pub(crate) fn pending_section_v2<'a>(",
+        "impl Drop for RuntimeEmergencyGatewaySectionV2<'_>",
+        "impl Drop for RuntimeRecoveryPendingGatewayBindingV2",
+        "RuntimeRecoveryPendingGatewayBindingV2(<redacted>)",
     ] {
         assert!(gateway.contains(required), "{required}");
     }
@@ -492,7 +654,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     ] {
         assert!(!gateway.contains(forbidden), "{forbidden}");
     }
-    let production = gateway.split("#[cfg(test)]").next().unwrap();
+    let production = source_before_test_module(gateway);
     let mut remainder = production;
     while let Some((_, public)) = remainder.split_once("pub ") {
         let header_end = public
@@ -573,6 +735,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "watchdog.schedule().receipt() != &expected_receipt",
         "RuntimeGatewayOwnerPreparedClosedRecoveryV2(<redacted>)",
         "RuntimeGatewayOwnerClosedRecoverySupervisorV2(<redacted>)",
+        "gateway_lifetime: Arc<AtomicBool>",
+        "Arc::ptr_eq(&self.gateway_lifetime, expected)",
+        "pub(crate) fn is_bound_to_gateway_lifetime_v2(",
     ] {
         assert!(owner_supervisor.contains(required), "{required}");
     }
@@ -629,6 +794,32 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             );
         }
     }
+    for name in [
+        "RuntimeEmergencyGatewaySectionV2",
+        "RuntimeRecoveryPendingGatewayBindingV2",
+        "RuntimeRecoveryPendingGatewaySectionV2",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for forbidden in [
+        "pub fn permit",
+        "pub fn control",
+        "pub fn coordinator",
+        "pub fn admission_snapshot",
+        "pub fn owner_invalidated",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
     let library = include_str!("../src/lib.rs");
     for forbidden in [
         "RuntimeGatewayOwnerProductionHandoffProofV1",
@@ -638,6 +829,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerClosedRecoverySupervisorV2",
         "RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2",
         "RuntimeGatewayOwnerClosedRecoveryCommitErrorV2",
+        "RuntimeEmergencyGatewaySectionV2",
+        "RuntimeRecoveryPendingGatewayBindingV2",
+        "RuntimeRecoveryPendingGatewaySectionV2",
+        "RuntimeGatewayRecoverySectionErrorV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }
@@ -650,6 +845,189 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "start_gateway_owner_production",
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
+    let gateway = include_str!("../src/gateway.rs");
+    let production = source_before_test_module(gateway);
+    let emergency = braced_declaration(production, "impl<'a> RuntimeEmergencyGatewaySectionV2<'a>");
+    let acquire = braced_declaration(emergency, "fn acquire(");
+    let acquire_borrow = acquire
+        .find("admission_snapshot.borrow()")
+        .unwrap_or_else(|| panic!("initial section watch borrow missing"));
+    assert_no_watch_reborrow(&acquire[acquire_borrow..], "initial section after borrow");
+    for marker in [
+        "fn require_current_v2(&self)",
+        "fn require_pending_current_v2(&self)",
+    ] {
+        assert_no_watch_reborrow(
+            braced_declaration(emergency, marker),
+            "initial section validation",
+        );
+    }
+
+    let pending_binding =
+        braced_declaration(production, "impl RuntimeRecoveryPendingGatewayBindingV2");
+    let pending_section = braced_declaration(pending_binding, "fn pending_section_v2<'a>(");
+    let pending_borrow = pending_section
+        .find("admission_snapshot.borrow()")
+        .unwrap_or_else(|| panic!("pending section watch borrow missing"));
+    assert_no_watch_reborrow(
+        &pending_section[pending_borrow..],
+        "pending section after borrow",
+    );
+
+    let pending = braced_declaration(
+        production,
+        "impl RuntimeRecoveryPendingGatewaySectionV2<'_>",
+    );
+    assert_no_watch_reborrow(
+        braced_declaration(pending, "fn require_current_v2(&self)"),
+        "pending section validation",
+    );
+}
+
+#[test]
+fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
+    let sources = source_files();
+    let closed = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/closed_recovery.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = closed.split("#[cfg(test)]").next().unwrap();
+    for required in [
+        "pub(crate) fn begin_initial_empty_recovery_v2(",
+        "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
+        "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
+        "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
+        "RuntimeClosedRecoveryTransitionAuthorityV2(<redacted>)",
+        "let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };",
+        ".initial_emergency_gateway_section_v2(&owner)",
+        ".recovery_observation_guard_v2(&authority, &gateway_section)",
+        ".locked_empty_evidence_v2()",
+        "readiness: &RuntimeDatabaseReadinessV1",
+        ".begin_empty_recovery_v2(",
+        "readiness.exact_capability_receipts().clone()",
+        ".into_empty_binding_v2()",
+        ".into_recovery_pending_binding_v2()",
+        ".pending_section_v2(&self.owner)",
+        ".revalidate_empty_projection_v2(&section)",
+        ".validate_empty_registry_projection_v2(&registry)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2 {\n",
+        "    owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,\n",
+        "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
+        "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "}"
+    )));
+    let initial_gateway = production
+        .find(".initial_emergency_gateway_section_v2(&owner)")
+        .unwrap();
+    let initial_registry = production
+        .find(".recovery_observation_guard_v2(&authority, &gateway_section)")
+        .unwrap();
+    let locked_evidence = production.find(".locked_empty_evidence_v2()").unwrap();
+    let transition = production.find(".begin_empty_recovery_v2(").unwrap();
+    let registry_binding = production.find(".into_empty_binding_v2()").unwrap();
+    let gateway_binding = production
+        .find(".into_recovery_pending_binding_v2()")
+        .unwrap();
+    assert!(
+        initial_gateway < initial_registry
+            && initial_registry < locked_evidence
+            && locked_evidence < transition
+            && transition < registry_binding
+            && registry_binding < gateway_binding
+    );
+    let final_gateway = production.find(".pending_section_v2(&self.owner)").unwrap();
+    let final_registry = production
+        .find(".revalidate_empty_projection_v2(&section)")
+        .unwrap();
+    assert!(final_gateway < final_registry);
+    for forbidden in [
+        ".await",
+        "pub fn permit",
+        "pub fn owner",
+        "pub fn registry",
+        "pub fn gateway",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "tokio",
+        "SharedGatewayControlV3",
+        "GatewayAdmissionSnapshotV3",
+        "ServingSlotRegistryV1",
+        "RegistryRecoveryObservationGuardV2",
+        "RegistryEmptyRecoveryCursorV2",
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "activate",
+        "deploy",
+    ] {
+        assert!(!contains_identifier(production, forbidden), "{forbidden}");
+    }
+    for name in [
+        "RuntimeClosedRecoveryPendingPhaseV2",
+        "RuntimeClosedRecoveryTransitionAuthorityV2",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        for method in [
+            "recovery_observation_guard_v2",
+            "locked_empty_evidence_v2",
+            "revalidate_empty_projection_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/registry.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        if contains_identifier(source, "begin_empty_recovery_v2") {
+            assert!(
+                path == Path::new("src/closed_recovery.rs") || path == Path::new("src/gateway.rs"),
+                "{}: begin_empty_recovery_v2",
+                path.display()
+            );
+        }
+        if contains_identifier(source, "into_observation_v2") {
+            assert!(
+                path == Path::new("src/gateway.rs") || path == Path::new("src/registry.rs"),
+                "{}: into_observation_v2",
+                path.display()
+            );
+        }
+    }
+    assert!(!production.contains("pub(crate) fn new"));
+    let library = include_str!("../src/lib.rs");
+    assert!(library.contains("mod closed_recovery;"));
+    assert!(!library.contains("pub mod closed_recovery;"));
+    for forbidden in [
+        "begin_initial_empty_recovery_v2",
+        "RuntimeClosedRecoveryPendingPhaseV2",
+        "RuntimeClosedRecoveryBeginErrorV2",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
     }
 }
 
@@ -670,6 +1048,16 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
                 "{}",
                 path.display()
             );
+            for forbidden in [
+                "RegistryRecoveryObservationGuardV2",
+                "RegistryEmptyRecoveryCursorV2",
+            ] {
+                assert!(
+                    !contains_identifier(source, forbidden),
+                    "{}: {forbidden}",
+                    path.display()
+                );
+            }
         }
     }
     for required in [
@@ -678,6 +1066,20 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "max_active_interactions_per_slot",
         "pub fn compose_runtime_registry_bootstrap_v1(",
         "pub fn observe_recovery_empty_projection_v2(",
+        "pub(crate) fn recovery_observation_guard_v2(",
+        "_authority: &RuntimeClosedRecoveryTransitionAuthorityV2",
+        "_section: &RuntimeEmergencyGatewaySectionV2<'_>",
+        "fn recovery_observation_guard_unordered_v2(",
+        "pub(crate) struct RuntimeRegistryRecoveryGuardV1<'a>",
+        "pub(crate) fn locked_empty_evidence_v2<'evidence>(",
+        "pub(crate) struct RuntimeLockedRegistryEmptyEvidenceV2<'evidence, 'registry>",
+        "pub(crate) fn into_observation_v2(self)",
+        "RuntimeLockedRegistryEmptyEvidenceV2(<redacted>)",
+        "pub(crate) fn into_empty_binding_v2(",
+        "pub(crate) struct RuntimeRegistryEmptyRecoveryBindingV2",
+        "pub(crate) fn revalidate_empty_projection_v2(",
+        "_section: &RuntimeRecoveryPendingGatewaySectionV2<'_>",
+        "fn revalidate_empty_projection_unordered_v2(",
         "RuntimeRegistryRecoveryObservationInputV2 {",
         "observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(",
         "retained_slot_count: observation.retained_slot_count()",
@@ -690,6 +1092,7 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "failed_closed_slot_count: observation.failed_closed_slot_count()",
         "registry_failed_closed: observation.registry_failed_closed()",
         "RuntimeRegistryBootstrapV1(<redacted>)",
+        "RuntimeRegistryEmptyRecoveryBindingV2(<redacted>)",
     ] {
         assert!(production.contains(required), "{required}");
     }
@@ -700,6 +1103,8 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "pub fn recovery_observation_guard_v2",
         "pub fn revalidate_empty_recovery_cursor_v2",
         "pub fn into_empty_cursor",
+        "pub(crate) fn recovery_observation_guard_unordered_v2",
+        "pub(crate) fn revalidate_empty_projection_unordered_v2",
         "Serialize",
         "Deserialize",
     ] {
@@ -708,6 +1113,8 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
     for name in [
         "RuntimeRegistryBootstrapV1",
         "RuntimeRegistryRecoveryGuardV1",
+        "RuntimeLockedRegistryEmptyEvidenceV2",
+        "RuntimeRegistryEmptyRecoveryBindingV2",
     ] {
         let attributes = declaration_attribute_block(production, name);
         for forbidden in ["Clone", "Copy", "Default"] {
@@ -727,8 +1134,35 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "    registry: ServingSlotRegistryV1,\n",
         "}"
     )));
-    assert!(production.contains("struct RuntimeRegistryRecoveryGuardV1<'a> {"));
-    assert!(!production.contains("pub struct RuntimeRegistryRecoveryGuardV1<'a> {"));
+    assert!(production.contains("pub(crate) struct RuntimeRegistryRecoveryGuardV1<'a> {"));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeLockedRegistryEmptyEvidenceV2<'evidence, 'registry> {\n",
+        "    observation: RuntimeRegistryRecoveryEmptyObservationV2,\n",
+        "    _guard: &'evidence RuntimeRegistryRecoveryGuardV1<'registry>,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryEmptyRecoveryBindingV2 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    cursor: RegistryEmptyRecoveryCursorV2,\n",
+        "}"
+    )));
+    assert_eq!(
+        production
+            .matches("        Ok(RuntimeRegistryEmptyRecoveryBindingV2 {")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "pub fn cursor",
+        "pub fn registry",
+        "pub fn bootstrap",
+        "pub fn into_cursor",
+        "pub fn into_registry",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
     let mut public_surface = production;
     while let Some((_, public)) = public_surface.split_once("pub ") {
         let header_end = public
@@ -740,6 +1174,7 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
             "RegistryRecoveryObservationGuardV2",
             "RegistryEmptyRecoveryCursorV2",
             "RuntimeRegistryRecoveryGuardV1",
+            "RuntimeRegistryEmptyRecoveryBindingV2",
         ] {
             assert!(
                 !contains_identifier(header, forbidden),
@@ -754,6 +1189,8 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RegistryRecoveryObservationGuardV2",
         "RegistryEmptyRecoveryCursorV2",
         "RuntimeRegistryRecoveryGuardV1",
+        "RuntimeLockedRegistryEmptyEvidenceV2",
+        "RuntimeRegistryEmptyRecoveryBindingV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }

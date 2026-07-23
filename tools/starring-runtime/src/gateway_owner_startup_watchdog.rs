@@ -239,6 +239,7 @@ struct RuntimeGatewayOwnerSupervisorHandleV1 {
     closed_recovery_commands: mpsc::Sender<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
+    gateway_lifetime: Arc<AtomicBool>,
 }
 
 impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -248,6 +249,10 @@ impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
 }
 
 impl RuntimeGatewayOwnerSupervisorHandleV1 {
+    fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.gateway_lifetime, expected)
+    }
+
     fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         *self.terminal.borrow()
     }
@@ -519,6 +524,10 @@ impl std::fmt::Debug for RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
 impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
     pub(crate) fn observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
         &self.observation
+    }
+
+    pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
+        self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }
 
     pub(crate) async fn abort_and_shutdown_v2(
@@ -939,6 +948,7 @@ fn map_terminal_closed_recovery_commit_error_v2(
 pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1<P, I>(
     port: P,
     invalidator: I,
+    gateway_lifetime: Arc<AtomicBool>,
     accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
     request_started_at: Instant,
     response_observed_at: Instant,
@@ -1018,6 +1028,7 @@ where
             closed_recovery_commands,
             terminal,
             invalidation,
+            gateway_lifetime,
         }),
     })
 }

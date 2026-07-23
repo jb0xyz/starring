@@ -370,12 +370,7 @@ fn accepted_receipt(
     receipt
 }
 
-fn closed_recovery_permit(
-    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
-) -> RuntimeClosedDrainRecoveryPermitV2 {
-    let process_instance_id = owner_receipt.lease_id.process_instance_id.clone();
-    let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
-    let emergency_generation = lifecycle.snapshot().generation();
+fn closed_recovery_readiness() -> RuntimeCapabilityReadinessSetV2 {
     let readiness_receipt = |kind, role, checked_at| {
         RuntimeCapabilityReadinessReceiptV2::new(
             kind,
@@ -386,7 +381,7 @@ fn closed_recovery_permit(
         )
         .unwrap()
     };
-    let readiness = RuntimeCapabilityReadinessSetV2::new(
+    RuntimeCapabilityReadinessSetV2::new(
         readiness_receipt(
             RuntimeCapabilityReadinessKindV2::Convergence,
             "role_a",
@@ -409,7 +404,16 @@ fn closed_recovery_permit(
             1_000_005,
         ),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn closed_recovery_permit(
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+) -> RuntimeClosedDrainRecoveryPermitV2 {
+    let process_instance_id = owner_receipt.lease_id.process_instance_id.clone();
+    let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
+    let emergency_generation = lifecycle.snapshot().generation();
+    let readiness = closed_recovery_readiness();
     let paused_gateway = RuntimePausedGatewayObservationV2::new(
         emergency_generation,
         process_instance_id.clone(),
@@ -482,6 +486,7 @@ fn fixture(
     let handle = start_runtime_gateway_owner_startup_watchdog_v1(
         port.clone(),
         invalidator,
+        invalidated.clone(),
         accepted_receipt(receipt),
         started,
         started,
@@ -503,6 +508,100 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_publication() {
+    let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
+    let mut owner_gateway = crate::gateway::compose_runtime_gateway_section_test_bootstrap_v2(
+        process_instance_id.clone(),
+    );
+    let mut foreign_gateway =
+        crate::gateway::compose_runtime_gateway_section_test_bootstrap_v2(process_instance_id);
+    owner_gateway.connect_ready_for_gateway_section_test_v2();
+    foreign_gateway.connect_ready_for_gateway_section_test_v2();
+
+    let lease_for = Duration::from_secs(2);
+    let owner_receipt = receipt(lease_for);
+    let port = FakePortV1::new(owner_receipt.clone(), []);
+    let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
+        lease_for,
+        Duration::from_millis(1_500),
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let handle = owner_gateway
+        .start_gateway_owner_startup_watchdog_v1(
+            port.clone(),
+            accepted_receipt(owner_receipt),
+            started,
+            started,
+            config,
+        )
+        .unwrap();
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+
+    assert!(matches!(
+        foreign_gateway.initial_emergency_gateway_section_v2(&prepared),
+        Err(crate::RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+    ));
+    owner_gateway
+        .held_initial_section_blocks_repeated_pause_test_v2(&prepared)
+        .await
+        .unwrap();
+
+    let registry = crate::compose_runtime_registry_bootstrap_v1(
+        ProcessInstanceId::parse("process:handoff").unwrap(),
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let mut pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
+        &owner_gateway,
+        &registry,
+        prepared,
+        RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        &readiness,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        owner_gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            ..
+        } if generation.get() == 2
+            && recovery_id.as_str() == "0123456789abcdef0123456789abcdef"
+    ));
+    assert_eq!(
+        format!("{pending:?}"),
+        "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)"
+    );
+    pending
+        .stale_predecessor_drop_preserves_successor_v2()
+        .unwrap();
+    assert!(matches!(
+        owner_gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            ..
+        } if generation.get() == 4
+            && recovery_id.as_str() == "fedcba9876543210fedcba9876543210"
+    ));
+    drop(pending);
+    assert!(matches!(
+        owner_gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 5
+    ));
+    wait_for(|| port.release_calls() == 1).await;
 }
 
 #[test]

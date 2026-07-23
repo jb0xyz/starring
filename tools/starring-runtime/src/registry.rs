@@ -3,8 +3,9 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_registry::{
-    RegistryRecoveryObservationGuardV2, RegistryRecoveryObservationV2, ServingSlotRegistryConfigV1,
-    ServingSlotRegistryError, ServingSlotRegistryV1,
+    RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
+    RegistryRecoveryObservationV2, ServingSlotRegistryConfigV1, ServingSlotRegistryError,
+    ServingSlotRegistryV1,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2,
@@ -12,6 +13,8 @@ use automation_runtime_worker::{
     RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
 };
 
+use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
+use crate::gateway::{RuntimeEmergencyGatewaySectionV2, RuntimeRecoveryPendingGatewaySectionV2};
 use crate::GatewayResourceConfigV1;
 
 const REGISTRY_MAX_SLOTS: NonZeroU32 = NonZeroU32::new(4_096).unwrap();
@@ -81,10 +84,19 @@ impl RuntimeRegistryBootstrapV1 {
         &self,
     ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
     {
-        self.recovery_observation_guard_v2()?.empty_projection_v2()
+        self.recovery_observation_guard_unordered_v2()?
+            .empty_projection_v2()
     }
 
-    fn recovery_observation_guard_v2(
+    pub(crate) fn recovery_observation_guard_v2(
+        &self,
+        _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
+        _section: &RuntimeEmergencyGatewaySectionV2<'_>,
+    ) -> Result<RuntimeRegistryRecoveryGuardV1<'_>, RuntimeRegistryRecoveryObservationErrorV1> {
+        self.recovery_observation_guard_unordered_v2()
+    }
+
+    fn recovery_observation_guard_unordered_v2(
         &self,
     ) -> Result<RuntimeRegistryRecoveryGuardV1<'_>, RuntimeRegistryRecoveryObservationErrorV1> {
         let guard = self
@@ -92,7 +104,7 @@ impl RuntimeRegistryBootstrapV1 {
             .recovery_observation_guard_v2()
             .map_err(map_registry_observation_error)?;
         Ok(RuntimeRegistryRecoveryGuardV1 {
-            process_instance_id: &self.process_instance_id,
+            bootstrap: self,
             guard,
         })
     }
@@ -104,17 +116,101 @@ impl Debug for RuntimeRegistryBootstrapV1 {
     }
 }
 
-struct RuntimeRegistryRecoveryGuardV1<'a> {
-    process_instance_id: &'a ProcessInstanceId,
+pub(crate) struct RuntimeRegistryRecoveryGuardV1<'a> {
+    bootstrap: &'a RuntimeRegistryBootstrapV1,
     guard: RegistryRecoveryObservationGuardV2<'a>,
 }
 
-impl RuntimeRegistryRecoveryGuardV1<'_> {
+impl<'a> RuntimeRegistryRecoveryGuardV1<'a> {
     fn empty_projection_v2(
         &self,
     ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
     {
-        project_empty_observation_v2(self.process_instance_id, self.guard.observation())
+        project_empty_observation_v2(
+            &self.bootstrap.process_instance_id,
+            self.guard.observation(),
+        )
+    }
+
+    pub(crate) fn locked_empty_evidence_v2<'evidence>(
+        &'evidence self,
+    ) -> Result<
+        RuntimeLockedRegistryEmptyEvidenceV2<'evidence, 'a>,
+        RuntimeRegistryRecoveryObservationErrorV1,
+    > {
+        let observation = project_empty_observation_v2(
+            &self.bootstrap.process_instance_id,
+            self.guard.observation(),
+        )?;
+        Ok(RuntimeLockedRegistryEmptyEvidenceV2 {
+            observation,
+            _guard: self,
+        })
+    }
+
+    pub(crate) fn into_empty_binding_v2(
+        self,
+    ) -> Result<RuntimeRegistryEmptyRecoveryBindingV2, RuntimeRegistryRecoveryObservationErrorV1>
+    {
+        let cursor = self
+            .guard
+            .into_empty_cursor()
+            .map_err(map_registry_observation_error)?;
+        Ok(RuntimeRegistryEmptyRecoveryBindingV2 {
+            process_instance_id: self.bootstrap.process_instance_id.clone(),
+            registry: self.bootstrap.registry.clone(),
+            cursor,
+        })
+    }
+}
+
+pub(crate) struct RuntimeLockedRegistryEmptyEvidenceV2<'evidence, 'registry> {
+    observation: RuntimeRegistryRecoveryEmptyObservationV2,
+    _guard: &'evidence RuntimeRegistryRecoveryGuardV1<'registry>,
+}
+
+impl RuntimeLockedRegistryEmptyEvidenceV2<'_, '_> {
+    pub(crate) fn into_observation_v2(self) -> RuntimeRegistryRecoveryEmptyObservationV2 {
+        self.observation
+    }
+}
+
+impl Debug for RuntimeLockedRegistryEmptyEvidenceV2<'_, '_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeLockedRegistryEmptyEvidenceV2(<redacted>)")
+    }
+}
+
+pub(crate) struct RuntimeRegistryEmptyRecoveryBindingV2 {
+    process_instance_id: ProcessInstanceId,
+    registry: ServingSlotRegistryV1,
+    cursor: RegistryEmptyRecoveryCursorV2,
+}
+
+impl RuntimeRegistryEmptyRecoveryBindingV2 {
+    pub(crate) fn revalidate_empty_projection_v2(
+        &self,
+        _section: &RuntimeRecoveryPendingGatewaySectionV2<'_>,
+    ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
+    {
+        self.revalidate_empty_projection_unordered_v2()
+    }
+
+    fn revalidate_empty_projection_unordered_v2(
+        &self,
+    ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
+    {
+        let observation = self
+            .registry
+            .revalidate_empty_recovery_cursor_v2(&self.cursor)
+            .map_err(map_registry_observation_error)?;
+        project_empty_observation_v2(&self.process_instance_id, observation)
+    }
+}
+
+impl Debug for RuntimeRegistryEmptyRecoveryBindingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryEmptyRecoveryBindingV2(<redacted>)")
     }
 }
 
@@ -247,7 +343,8 @@ mod tests {
     use super::{
         compose_runtime_registry_bootstrap_v1, map_registry_observation_error,
         map_worker_observation_error, registry_active_interaction_capacity,
-        RuntimeRegistryBootstrapErrorV1, RuntimeRegistryRecoveryObservationErrorV1,
+        RuntimeRegistryBootstrapErrorV1, RuntimeRegistryEmptyRecoveryBindingV2,
+        RuntimeRegistryRecoveryObservationErrorV1,
     };
     use crate::GatewayResourceConfigV1;
 
@@ -288,6 +385,95 @@ mod tests {
         assert_eq!(
             format!("{bootstrap:?}"),
             "RuntimeRegistryBootstrapV1(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn private_empty_binding_revalidates_the_exact_bootstrap_and_sequence() {
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let guard = bootstrap.recovery_observation_guard_unordered_v2().unwrap();
+        let projected = guard.empty_projection_v2().unwrap();
+        let binding = guard.into_empty_binding_v2().unwrap();
+
+        assert_eq!(
+            binding.revalidate_empty_projection_unordered_v2().unwrap(),
+            projected
+        );
+        assert_eq!(
+            format!("{binding:?}"),
+            "RuntimeRegistryEmptyRecoveryBindingV2(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn private_empty_binding_rejects_sequence_aba_and_foreign_registry() {
+        let process_instance_id = ProcessInstanceId::parse("runtime-process:1").unwrap();
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            process_instance_id.clone(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let key = slot_key();
+        let (seal, _) = bootstrap
+            .registry
+            .seal_drain_claim_v2(&key, seal_key(), None)
+            .unwrap();
+        bootstrap.registry.unseal_drain_claim_v2(seal).unwrap();
+        let stale = bootstrap
+            .recovery_observation_guard_unordered_v2()
+            .unwrap()
+            .into_empty_binding_v2()
+            .unwrap();
+        let before = bootstrap.observe_recovery_empty_projection_v2().unwrap();
+        let expected = bootstrap.registry.atomic_observation_v2(&key).unwrap();
+        let (seal, _) = bootstrap
+            .registry
+            .seal_drain_claim_v2(&key, seal_key(), expected.as_ref())
+            .unwrap();
+        bootstrap.registry.unseal_drain_claim_v2(seal).unwrap();
+        let after = bootstrap.observe_recovery_empty_projection_v2().unwrap();
+
+        assert_eq!(before.retained_slot_count(), after.retained_slot_count());
+        assert_eq!(
+            before.retained_empty_tombstone_count(),
+            after.retained_empty_tombstone_count()
+        );
+        assert_ne!(before.observation_sequence(), after.observation_sequence());
+
+        assert_eq!(
+            stale.revalidate_empty_projection_unordered_v2(),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding)
+        );
+
+        let source = compose_runtime_registry_bootstrap_v1(
+            process_instance_id.clone(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let foreign = compose_runtime_registry_bootstrap_v1(
+            process_instance_id,
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let cursor = source
+            .registry
+            .recovery_observation_guard_v2()
+            .unwrap()
+            .into_empty_cursor()
+            .unwrap();
+        let foreign_binding = RuntimeRegistryEmptyRecoveryBindingV2 {
+            process_instance_id: foreign.process_instance_id.clone(),
+            registry: foreign.registry.clone(),
+            cursor,
+        };
+
+        assert_eq!(
+            foreign_binding.revalidate_empty_projection_unordered_v2(),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding)
         );
     }
 

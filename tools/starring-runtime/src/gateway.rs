@@ -1,29 +1,40 @@
+use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use automation_runtime::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
-    GatewayAdmissionSnapshotV3, GatewayConnectionStateV3, GatewayControlConfigV3,
-    GatewayControlConfigurationErrorV3, GatewayControlTransitionErrorV3, GatewayDrainCauseV3,
-    GatewayInvalidationSignalV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
-    GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
+    GatewayAdmissionSnapshotV3, GatewayConnectionEpochV3, GatewayConnectionObserverV3,
+    GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
+    GatewayControlTransitionErrorV3, GatewayDrainCauseV3, GatewayInvalidationSignalV3,
+    GatewayPausedConnectionV3, GatewayReadyKindV3, GatewaySynchronousInvalidatorV3,
+    SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
+    RuntimeRecoveryIdV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
-    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeGatewayClosedLifecycleV2,
-    RuntimeGatewayClosedSnapshotV2, RuntimeGatewayInvalidationCauseV2,
-    RuntimeGatewayOwnerLeasePortV1, RuntimePausedGatewayObservationV2,
-    RuntimePausedGatewaySequenceV2,
+    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeCapabilityReadinessSetV2,
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
+    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeGatewayClosedLifecycleV2,
+    RuntimeGatewayClosedSnapshotV2, RuntimeGatewayClosedTransitionErrorV2,
+    RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayEmergencyCauseV2,
+    RuntimeGatewayInvalidationCauseV2, RuntimeGatewayOwnerLeasePortV1,
+    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
+    RuntimeRegistryRecoveryEmptyObservationV2,
 };
+use tokio::sync::watch;
 
+use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
 use crate::gateway_owner_startup_watchdog::{
     start_runtime_gateway_owner_startup_watchdog_v1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
+    RuntimeGatewayOwnerPreparedClosedRecoveryV2,
 };
+use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
 use crate::{
     GatewayResourceConfigV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
@@ -119,6 +130,7 @@ impl RuntimeGatewayReadyObservationErrorV1 {
 struct SharedGatewayControlAdapterV2 {
     process_instance_id: ProcessInstanceId,
     control: SharedGatewayControlV3,
+    admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
 
@@ -133,6 +145,43 @@ pub struct RuntimeGatewayBootstrapV1 {
     owner_invalidated: Arc<AtomicBool>,
 }
 
+pub(crate) struct RuntimeEmergencyGatewaySectionV2<'a> {
+    gateway: &'a SharedGatewayControlAdapterV2,
+    prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    owner_invalidated: &'a Arc<AtomicBool>,
+    coordinator: MutexGuard<'a, RuntimeGatewayClosedLifecycleV2>,
+    admission_snapshot: watch::Ref<'a, GatewayAdmissionSnapshotV3>,
+    paused_gateway: RuntimePausedGatewayObservationV2,
+    connection_epoch: GatewayConnectionEpochV3,
+    pending_permit: Option<RuntimeClosedDrainRecoveryPermitV2>,
+}
+
+pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2 {
+    process_instance_id: ProcessInstanceId,
+    observer: GatewayConnectionObserverV3,
+    admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    owner_invalidated: Arc<AtomicBool>,
+    permit: RuntimeClosedDrainRecoveryPermitV2,
+}
+
+pub(crate) struct RuntimeRecoveryPendingGatewaySectionV2<'a> {
+    binding: &'a RuntimeRecoveryPendingGatewayBindingV2,
+    prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    coordinator: MutexGuard<'a, RuntimeGatewayClosedLifecycleV2>,
+    admission_snapshot: watch::Ref<'a, GatewayAdmissionSnapshotV3>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayRecoverySectionErrorV2 {
+    #[error("runtime gateway recovery section observation failed")]
+    Gateway(RuntimeGatewayReadyObservationErrorV1),
+    #[error("runtime gateway recovery coordinator transition failed")]
+    Coordinator(RuntimeGatewayClosedTransitionErrorV2),
+    #[error("runtime gateway recovery section protocol was violated")]
+    ProtocolViolation,
+}
+
 struct RuntimeGatewayInvalidationBridgeV2 {
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
@@ -140,6 +189,14 @@ struct RuntimeGatewayInvalidationBridgeV2 {
 struct RuntimeGatewayOwnerInvalidationBridgeV2 {
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
     invalidated: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+struct RuntimeGatewaySnapshotTestInvalidatorV3;
+
+#[cfg(test)]
+impl GatewaySynchronousInvalidatorV3 for RuntimeGatewaySnapshotTestInvalidatorV3 {
+    fn invalidate(&self, _signal: GatewayInvalidationSignalV3) {}
 }
 
 impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidationBridgeV2 {
@@ -247,6 +304,24 @@ impl RuntimeGatewayBootstrapV1 {
         Ok(observation)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "closed recovery composition consumes the synchronous gateway section"
+        )
+    )]
+    pub(crate) fn initial_emergency_gateway_section_v2<'a>(
+        &'a self,
+        prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    ) -> Result<RuntimeEmergencyGatewaySectionV2<'a>, RuntimeGatewayReadyObservationErrorV1> {
+        RuntimeEmergencyGatewaySectionV2::acquire(
+            &self.adapter,
+            &self.owner_invalidated,
+            prepared_owner,
+        )
+    }
+
     pub fn start_gateway_owner_startup_watchdog_v1<P>(
         &mut self,
         port: P,
@@ -298,6 +373,7 @@ impl RuntimeGatewayBootstrapV1 {
         start_runtime_gateway_owner_startup_watchdog_v1(
             port,
             invalidator,
+            self.owner_invalidated.clone(),
             accepted_receipt,
             request_started_at,
             response_observed_at,
@@ -314,6 +390,427 @@ impl RuntimeGatewayBootstrapV1 {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn connect_ready_for_gateway_section_test_v2(&mut self) {
+        self._runtime
+            ._inner
+            .mark_connected(GatewayReadyKindV3::Ready)
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn held_initial_section_blocks_repeated_pause_test_v2(
+        &mut self,
+        prepared_owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        let Self {
+            adapter,
+            _runtime,
+            owner_invalidated,
+            ..
+        } = self;
+        let section =
+            RuntimeEmergencyGatewaySectionV2::acquire(adapter, owner_invalidated, prepared_owner)?;
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(0);
+        let (completed_sender, completed_receiver) = std::sync::mpsc::sync_channel(1);
+        let (dummy_control, dummy_runtime) =
+            shared_gateway_control_channel_with_policy_and_invalidator_v3(
+                GatewayControlConfigV3::default(),
+                GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+                RuntimeGatewaySnapshotTestInvalidatorV3,
+            );
+        let runtime_half = std::mem::replace(&mut _runtime._inner, dummy_runtime);
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            started_sender.send(()).unwrap();
+            let mut runtime_half = runtime_half;
+            let outcome = runtime.block_on(runtime_half.process_next_command());
+            completed_sender.send((runtime_half, outcome)).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            adapter.control.pause_admission(),
+        )
+        .await;
+        assert!(blocked.is_err());
+        assert!(!worker.is_finished());
+        drop(section);
+        let (runtime_half, outcome) = completed_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            outcome,
+            automation_runtime::GatewayRuntimeCommandOutcomeV3::Applied(
+                automation_runtime::GatewayCommandAckV3::Paused { .. }
+            )
+        ));
+        _runtime._inner = runtime_half;
+        drop(dummy_control);
+        Ok(())
+    }
+}
+
+impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
+    fn acquire(
+        gateway: &'a SharedGatewayControlAdapterV2,
+        owner_invalidated: &'a Arc<AtomicBool>,
+        prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    ) -> Result<Self, RuntimeGatewayReadyObservationErrorV1> {
+        require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
+        let coordinator = gateway
+            .closed_lifecycle
+            .lock()
+            .map_err(|_| RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)?;
+        if coordinator.snapshot()
+            != (RuntimeGatewayClosedSnapshotV2::Emergency {
+                generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                cause: RuntimeGatewayEmergencyCauseV2::Starting,
+            })
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+        }
+        require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
+        let snapshot = gateway.control.current_admission_snapshot();
+        let (paused_gateway, connection_epoch) = gateway.map_paused_connected_observation(
+            RuntimeGatewayCoordinatorGenerationV2::FIRST,
+            snapshot,
+        )?;
+        gateway.require_healthy_paused_control(connection_epoch)?;
+        if gateway.control.current_admission_snapshot() != snapshot {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
+        let admission_snapshot = gateway.admission_snapshot.borrow();
+        if *admission_snapshot != snapshot {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
+        let section = Self {
+            gateway,
+            prepared_owner,
+            owner_invalidated,
+            coordinator,
+            admission_snapshot,
+            paused_gateway,
+            connection_epoch,
+            pending_permit: None,
+        };
+        section.require_current_v2()?;
+        Ok(section)
+    }
+
+    pub(crate) fn begin_empty_recovery_v2(
+        &mut self,
+        _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
+        recovery_id: RuntimeRecoveryIdV2,
+        readiness: RuntimeCapabilityReadinessSetV2,
+        registry: RuntimeLockedRegistryEmptyEvidenceV2<'_, '_>,
+    ) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
+        self.require_current_v2()
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if self.pending_permit.is_some() {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        let input = RuntimeClosedRecoveryInputV2::new(
+            recovery_id,
+            self.prepared_owner.observation().receipt().clone(),
+            readiness,
+            self.paused_gateway.clone(),
+            RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry.into_observation_v2()),
+        );
+        let (_, permit) = self
+            .coordinator
+            .begin_recovery(RuntimeGatewayCoordinatorGenerationV2::FIRST, input)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        self.pending_permit = Some(permit);
+        self.require_pending_current_v2()
+    }
+
+    pub(crate) fn into_recovery_pending_binding_v2(
+        mut self,
+    ) -> Result<RuntimeRecoveryPendingGatewayBindingV2, RuntimeGatewayRecoverySectionErrorV2> {
+        self.require_pending_current_v2()?;
+        let permit = self
+            .pending_permit
+            .take()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        Ok(RuntimeRecoveryPendingGatewayBindingV2 {
+            process_instance_id: self.gateway.process_instance_id.clone(),
+            observer: self.gateway.control.connection_observer(),
+            admission_snapshot: self.gateway.admission_snapshot.clone(),
+            closed_lifecycle: self.gateway.closed_lifecycle.clone(),
+            owner_invalidated: self.owner_invalidated.clone(),
+            permit,
+        })
+    }
+
+    fn require_current_v2(&self) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        require_prepared_owner_lifetime_v2(self.owner_invalidated, self.prepared_owner)?;
+        if self.coordinator.snapshot()
+            != (RuntimeGatewayClosedSnapshotV2::Emergency {
+                generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                cause: RuntimeGatewayEmergencyCauseV2::Starting,
+            })
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+        }
+        let snapshot = *self.admission_snapshot;
+        let (paused_gateway, connection_epoch) = self.gateway.map_paused_connected_observation(
+            RuntimeGatewayCoordinatorGenerationV2::FIRST,
+            snapshot,
+        )?;
+        if paused_gateway != self.paused_gateway || connection_epoch != self.connection_epoch {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        require_prepared_owner_lifetime_v2(self.owner_invalidated, self.prepared_owner)
+    }
+
+    fn require_pending_current_v2(&self) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
+        let permit = self
+            .pending_permit
+            .as_ref()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        self.coordinator
+            .validate_recovery_permit(permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        require_prepared_owner_lifetime_v2(self.owner_invalidated, self.prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if self.prepared_owner.observation().receipt() != permit.owner_receipt()
+            || self.paused_gateway != *permit.paused_gateway()
+        {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        self.coordinator
+            .validate_recovery_permit(permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)
+    }
+}
+
+impl Drop for RuntimeEmergencyGatewaySectionV2<'_> {
+    fn drop(&mut self) {
+        let Some(permit) = self.pending_permit.as_ref() else {
+            return;
+        };
+        if self.coordinator.validate_recovery_permit(permit).is_ok() {
+            let _ = self.coordinator.invalidate(
+                permit.coordinator_generation(),
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            );
+        }
+    }
+}
+
+impl RuntimeRecoveryPendingGatewayBindingV2 {
+    pub(crate) fn pending_section_v2<'a>(
+        &'a self,
+        prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    ) -> Result<RuntimeRecoveryPendingGatewaySectionV2<'a>, RuntimeGatewayRecoverySectionErrorV2>
+    {
+        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        let coordinator = self.closed_lifecycle.lock().map_err(|_| {
+            RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+            )
+        })?;
+        coordinator
+            .validate_recovery_permit(&self.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let snapshot = self.observer.current_admission_snapshot();
+        let (paused_gateway, connection_epoch) = map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            self.permit.originating_emergency_generation(),
+            snapshot,
+        )
+        .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if prepared_owner.observation().receipt() != self.permit.owner_receipt()
+            || paused_gateway != *self.permit.paused_gateway()
+        {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        require_healthy_paused_observer_v2(&self.observer, connection_epoch)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if self.observer.current_admission_snapshot() != snapshot {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        coordinator
+            .validate_recovery_permit(&self.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let admission_snapshot = self.admission_snapshot.borrow();
+        if *admission_snapshot != snapshot {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        coordinator
+            .validate_recovery_permit(&self.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        Ok(RuntimeRecoveryPendingGatewaySectionV2 {
+            binding: self,
+            prepared_owner,
+            coordinator,
+            admission_snapshot,
+        })
+    }
+
+    fn invalidate_if_current_v2(&self, cause: RuntimeGatewayInvalidationCauseV2) {
+        let mut coordinator = match self.closed_lifecycle.lock() {
+            Ok(coordinator) => coordinator,
+            Err(poisoned) => {
+                self.owner_invalidated.store(true, Ordering::Release);
+                let mut coordinator = poisoned.into_inner();
+                shutdown_closed_lifecycle(&mut coordinator);
+                return;
+            }
+        };
+        if coordinator.validate_recovery_permit(&self.permit).is_ok() {
+            self.owner_invalidated.store(true, Ordering::Release);
+            let _ = coordinator.invalidate(self.permit.coordinator_generation(), cause);
+        }
+    }
+}
+
+#[cfg(test)]
+impl RuntimeRecoveryPendingGatewayBindingV2 {
+    pub(crate) fn successor_for_stale_drop_test_v2(
+        &self,
+    ) -> Result<Self, RuntimeGatewayRecoverySectionErrorV2> {
+        let snapshot = self.observer.current_admission_snapshot();
+        let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
+            RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+            )
+        })?;
+        coordinator
+            .validate_recovery_permit(&self.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let emergency = coordinator
+            .invalidate(
+                self.permit.coordinator_generation(),
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let (paused_gateway, connection_epoch) = map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            emergency.generation(),
+            snapshot,
+        )
+        .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        require_healthy_paused_observer_v2(&self.observer, connection_epoch)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if self.observer.current_admission_snapshot() != snapshot {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        let previous_registry = self.permit.registry_evidence().empty_observation();
+        let registry =
+            automation_runtime_worker::accept_runtime_registry_recovery_empty_observation_v2(
+                previous_registry.process_instance_id().clone(),
+                automation_runtime_worker::RuntimeRegistryRecoveryObservationInputV2 {
+                    observation_sequence: previous_registry.observation_sequence(),
+                    retained_slot_count: previous_registry.retained_slot_count(),
+                    retained_empty_tombstone_count: previous_registry
+                        .retained_empty_tombstone_count(),
+                    staged_route_count: 0,
+                    serving_route_count: 0,
+                    draining_route_count: 0,
+                    sealed_slot_count: 0,
+                    active_interaction_count: 0,
+                    failed_closed_slot_count: 0,
+                    registry_failed_closed: false,
+                },
+            )
+            .map_err(|_| RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        let input = RuntimeClosedRecoveryInputV2::new(
+            RuntimeRecoveryIdV2::parse("fedcba9876543210fedcba9876543210")
+                .map_err(|_| RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?,
+            self.permit.owner_receipt().clone(),
+            self.permit.readiness().clone(),
+            paused_gateway,
+            RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry),
+        );
+        let (_, permit) = coordinator
+            .begin_recovery(emergency.generation(), input)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        Ok(Self {
+            process_instance_id: self.process_instance_id.clone(),
+            observer: self.observer.clone(),
+            admission_snapshot: self.admission_snapshot.clone(),
+            closed_lifecycle: self.closed_lifecycle.clone(),
+            owner_invalidated: self.owner_invalidated.clone(),
+            permit,
+        })
+    }
+}
+
+impl Debug for RuntimeRecoveryPendingGatewayBindingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRecoveryPendingGatewayBindingV2(<redacted>)")
+    }
+}
+
+impl Drop for RuntimeRecoveryPendingGatewayBindingV2 {
+    fn drop(&mut self) {
+        self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+    }
+}
+
+impl RuntimeRecoveryPendingGatewaySectionV2<'_> {
+    pub(crate) fn validate_empty_registry_projection_v2(
+        &self,
+        observation: &RuntimeRegistryRecoveryEmptyObservationV2,
+    ) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
+        if self.binding.permit.registry_evidence().empty_observation() != observation {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        self.require_current_v2()
+    }
+
+    fn require_current_v2(&self) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
+        require_prepared_owner_lifetime_v2(&self.binding.owner_invalidated, self.prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        self.coordinator
+            .validate_recovery_permit(&self.binding.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let snapshot = *self.admission_snapshot;
+        let (paused_gateway, _) = map_paused_connected_observation_v2(
+            &self.binding.process_instance_id,
+            self.binding.permit.originating_emergency_generation(),
+            snapshot,
+        )
+        .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        if self.prepared_owner.observation().receipt() != self.binding.permit.owner_receipt()
+            || paused_gateway != *self.binding.permit.paused_gateway()
+        {
+            return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
+        }
+        require_prepared_owner_lifetime_v2(&self.binding.owner_invalidated, self.prepared_owner)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        self.coordinator
+            .validate_recovery_permit(&self.binding.permit)
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)
+    }
+}
+
+fn require_prepared_owner_lifetime_v2(
+    owner_invalidated: &Arc<AtomicBool>,
+    prepared_owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+    if owner_invalidated.load(Ordering::Acquire)
+        || !prepared_owner.is_bound_to_gateway_lifetime_v2(owner_invalidated)
+        || prepared_owner.observation().safety_deadline() <= Instant::now()
+    {
+        Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn compose_runtime_gateway_bootstrap_v1(
@@ -327,6 +824,34 @@ pub fn compose_runtime_gateway_bootstrap_v1(
         process_instance_id,
         control_config,
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
+    process_instance_id: ProcessInstanceId,
+) -> RuntimeGatewayBootstrapV1 {
+    let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+    let owner_invalidated = Arc::new(AtomicBool::new(false));
+    let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
+        GatewayControlConfigV3::default(),
+        GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        RuntimeGatewaySnapshotTestInvalidatorV3,
+    );
+    let admission_snapshot = control.admission_snapshot_watch();
+    RuntimeGatewayBootstrapV1 {
+        adapter: SharedGatewayControlAdapterV2 {
+            process_instance_id,
+            control,
+            admission_snapshot,
+            closed_lifecycle: closed_lifecycle.clone(),
+        },
+        _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+        owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
+            closed_lifecycle,
+            invalidated: owner_invalidated.clone(),
+        }),
+        owner_invalidated,
+    }
 }
 
 fn compose_with_control_config(
@@ -343,10 +868,12 @@ fn compose_with_control_config(
         GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
         invalidation,
     );
+    let admission_snapshot = control.admission_snapshot_watch();
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
             process_instance_id,
             control,
+            admission_snapshot,
             closed_lifecycle: closed_lifecycle.clone(),
         },
         _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
@@ -399,56 +926,11 @@ impl SharedGatewayControlAdapterV2 {
         ),
         RuntimeGatewayReadyObservationErrorV1,
     > {
-        let (epoch, kind) = match snapshot.connection() {
-            GatewayConnectionStateV3::Paused {
-                connection: GatewayPausedConnectionV3::Connected { epoch, kind },
-            } => (epoch, kind),
-            GatewayConnectionStateV3::Starting
-            | GatewayConnectionStateV3::Disconnected { .. }
-            | GatewayConnectionStateV3::Paused {
-                connection:
-                    GatewayPausedConnectionV3::Starting | GatewayPausedConnectionV3::Disconnected { .. },
-            } => return Err(RuntimeGatewayReadyObservationErrorV1::NotConnected),
-            GatewayConnectionStateV3::Connected { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::AdmissionNotPaused)
-            }
-            GatewayConnectionStateV3::Draining { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::Draining)
-            }
-            GatewayConnectionStateV3::Stopped { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
-            }
-        };
-        let kind = match kind {
-            GatewayReadyKindV3::Ready => RuntimeGatewayReadyKindV2::Ready,
-            GatewayReadyKindV3::Resumed => RuntimeGatewayReadyKindV2::Resumed,
-        };
-        let transition_sequence = bounded_sequence(snapshot.transition_sequence().get())?;
-        let connected_event_sequence = snapshot
-            .connected_event_sequence()
-            .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceSequenceZero)
-            .and_then(|sequence| bounded_sequence(sequence.get()))?;
-        let last_resume_sequence = snapshot
-            .resume_sequence()
-            .map(|sequence| bounded_sequence(sequence.get()))
-            .transpose()?;
-        let sequence = RuntimePausedGatewaySequenceV2::new(
-            transition_sequence,
-            connected_event_sequence,
-            last_resume_sequence,
+        map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            coordinator_generation,
+            snapshot,
         )
-        .map_err(|_| RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)?;
-        Ok((
-            RuntimePausedGatewayObservationV2::new(
-                coordinator_generation,
-                self.process_instance_id.clone(),
-                bounded_non_zero(epoch.get())?,
-                kind,
-                bounded_non_zero(snapshot.admission_revision().get())?,
-                sequence,
-            ),
-            epoch,
-        ))
     }
 
     fn require_healthy_paused_control(
@@ -507,6 +989,77 @@ impl SharedGatewayControlAdapterV2 {
             connected_event_sequence,
             resume_sequence,
         })
+    }
+}
+
+fn map_paused_connected_observation_v2(
+    process_instance_id: &ProcessInstanceId,
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    snapshot: GatewayAdmissionSnapshotV3,
+) -> Result<
+    (RuntimePausedGatewayObservationV2, GatewayConnectionEpochV3),
+    RuntimeGatewayReadyObservationErrorV1,
+> {
+    let (epoch, kind) = match snapshot.connection() {
+        GatewayConnectionStateV3::Paused {
+            connection: GatewayPausedConnectionV3::Connected { epoch, kind },
+        } => (epoch, kind),
+        GatewayConnectionStateV3::Starting
+        | GatewayConnectionStateV3::Disconnected { .. }
+        | GatewayConnectionStateV3::Paused {
+            connection:
+                GatewayPausedConnectionV3::Starting | GatewayPausedConnectionV3::Disconnected { .. },
+        } => return Err(RuntimeGatewayReadyObservationErrorV1::NotConnected),
+        GatewayConnectionStateV3::Connected { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::AdmissionNotPaused)
+        }
+        GatewayConnectionStateV3::Draining { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Draining)
+        }
+        GatewayConnectionStateV3::Stopped { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
+        }
+    };
+    let kind = match kind {
+        GatewayReadyKindV3::Ready => RuntimeGatewayReadyKindV2::Ready,
+        GatewayReadyKindV3::Resumed => RuntimeGatewayReadyKindV2::Resumed,
+    };
+    let transition_sequence = bounded_sequence(snapshot.transition_sequence().get())?;
+    let connected_event_sequence = snapshot
+        .connected_event_sequence()
+        .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceSequenceZero)
+        .and_then(|sequence| bounded_sequence(sequence.get()))?;
+    let last_resume_sequence = snapshot
+        .resume_sequence()
+        .map(|sequence| bounded_sequence(sequence.get()))
+        .transpose()?;
+    let sequence = RuntimePausedGatewaySequenceV2::new(
+        transition_sequence,
+        connected_event_sequence,
+        last_resume_sequence,
+    )
+    .map_err(|_| RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)?;
+    Ok((
+        RuntimePausedGatewayObservationV2::new(
+            coordinator_generation,
+            process_instance_id.clone(),
+            bounded_non_zero(epoch.get())?,
+            kind,
+            bounded_non_zero(snapshot.admission_revision().get())?,
+            sequence,
+        ),
+        epoch,
+    ))
+}
+
+fn require_healthy_paused_observer_v2(
+    observer: &GatewayConnectionObserverV3,
+    epoch: GatewayConnectionEpochV3,
+) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+    match observer.issue_ready_lease(epoch) {
+        Err(GatewayControlTransitionErrorV3::AdmissionPaused) => Ok(()),
+        Err(error) => Err(map_transition_error(error)),
+        Ok(_) => Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot),
     }
 }
 
@@ -634,10 +1187,12 @@ mod tests {
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
             PanickingInvalidatorV3,
         );
+        let admission_snapshot = control.admission_snapshot_watch();
         RuntimeGatewayBootstrapV1 {
             adapter: SharedGatewayControlAdapterV2 {
                 process_instance_id: ProcessInstanceId::parse("runtime-process:1").unwrap(),
                 control,
+                admission_snapshot,
                 closed_lifecycle: closed_lifecycle.clone(),
             },
             _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
