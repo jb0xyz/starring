@@ -210,10 +210,12 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/config.rs",
             "src/database.rs",
             "src/gateway.rs",
+            "src/gateway_owner_startup_watchdog.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/secret.rs",
             "tests/dependency_guard.rs",
+            "tests/gateway_owner_startup_watchdog.rs",
             "tests/process_contract.rs"
         ]
     );
@@ -244,6 +246,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-panel-postgres".to_string(), None),
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
+            ("chrono".to_string(), Some("dev".to_string())),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
@@ -293,7 +296,10 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 );
             }
         }
-        if path != Path::new("src/database.rs") && path != Path::new("src/gateway.rs") {
+        if path != Path::new("src/database.rs")
+            && path != Path::new("src/gateway.rs")
+            && path != Path::new("src/gateway_owner_startup_watchdog.rs")
+        {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
     }
@@ -309,6 +315,19 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         .unwrap();
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         if path == Path::new("src/gateway.rs") {
+            continue;
+        }
+        if path == Path::new("src/gateway_owner_startup_watchdog.rs") {
+            for identifier in source
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .filter(|identifier| !identifier.is_empty())
+            {
+                assert!(
+                    !identifier.ends_with("V3"),
+                    "{}: {identifier}",
+                    path.display()
+                );
+            }
             continue;
         }
         for identifier in source
@@ -334,6 +353,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
         "RuntimeGatewayClosedLifecycleV2::starting()",
         "impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2",
+        "impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidationBridgeV2",
+        "pub fn start_gateway_owner_startup_watchdog_v1<P>",
+        "const SUPPORTED_GATEWAY_SHARD_ID: &str = \"shard:0\";",
+        "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ProcessMismatch",
+        "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ShardMismatch",
     ] {
         assert!(gateway.contains(required), "{required}");
     }
@@ -379,6 +403,19 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         .unwrap();
     assert!(library.contains("mod gateway;"));
     assert!(!library.contains("pub mod gateway;"));
+    assert!(!library.contains("RuntimeGatewayOwnerEmergencyInvalidatorV1"));
+    assert!(!library.contains("start_runtime_gateway_owner_startup_watchdog_v1"));
+    let owner_supervisor = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/gateway_owner_startup_watchdog.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert!(owner_supervisor.contains("pub(crate) trait RuntimeGatewayOwnerEmergencyInvalidatorV1"));
+    assert!(
+        owner_supervisor.contains("pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1")
+    );
+    assert!(!owner_supervisor.contains("pub trait RuntimeGatewayOwnerEmergencyInvalidatorV1"));
+    assert!(!owner_supervisor.contains("pub fn start_runtime_gateway_owner_startup_watchdog_v1"));
 }
 
 #[test]

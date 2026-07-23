@@ -1,6 +1,7 @@
 mod config;
 mod database;
 mod gateway;
+mod gateway_owner_startup_watchdog;
 mod secret;
 
 pub use config::{
@@ -16,6 +17,12 @@ pub use database::{
 pub use gateway::{
     compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,
     RuntimeGatewayBootstrapV1, RuntimeGatewayReadyObservationErrorV1,
+};
+pub use gateway_owner_startup_watchdog::{
+    RuntimeGatewayOwnerReleaseStatusV1, RuntimeGatewayOwnerStartupWatchdogConfigErrorV1,
+    RuntimeGatewayOwnerStartupWatchdogConfigV1, RuntimeGatewayOwnerStartupWatchdogExitV1,
+    RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
+    RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
 };
 pub use secret::{
     resolve_runtime_secrets_v1, ResolvedRuntimeSecretsV1, RuntimeDatabaseConnectionSecretV1,

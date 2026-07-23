@@ -15,8 +15,9 @@ automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-
 automation-runtime-worker = { path = "../../crates/automation-runtime-worker" }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
-tokio = { version = "1", default-features = false, features = ["macros", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 zeroize = "1"
 
 [dev-dependencies]
+chrono = "0.4"
 serde_json.workspace = true

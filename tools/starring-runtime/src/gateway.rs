@@ -1,5 +1,7 @@
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use automation_runtime::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
@@ -13,11 +15,21 @@ use automation_runtime_controller::{
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
-    RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
-    RuntimeGatewayInvalidationCauseV2,
+    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeGatewayClosedLifecycleV2,
+    RuntimeGatewayClosedSnapshotV2, RuntimeGatewayInvalidationCauseV2,
+    RuntimeGatewayOwnerLeasePortV1,
 };
 
-use crate::GatewayResourceConfigV1;
+use crate::gateway_owner_startup_watchdog::{
+    start_runtime_gateway_owner_startup_watchdog_v1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
+};
+use crate::{
+    GatewayResourceConfigV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
+    RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
+    RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
+};
+
+const SUPPORTED_GATEWAY_SHARD_ID: &str = "shard:0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeGatewayBootstrapErrorV1 {
@@ -72,6 +84,8 @@ pub enum RuntimeGatewayReadyObservationErrorV1 {
     ReadyEvidenceOutOfRange,
     #[error("runtime gateway ready evidence lacks an explicit resume")]
     ReadyEvidenceNotExplicitlyResumed,
+    #[error("runtime gateway ownership is uncertain")]
+    OwnershipUncertain,
 }
 
 impl RuntimeGatewayReadyObservationErrorV1 {
@@ -96,6 +110,7 @@ impl RuntimeGatewayReadyObservationErrorV1 {
             Self::ReadyEvidenceNotExplicitlyResumed => {
                 "runtime_gateway_ready_evidence_not_explicitly_resumed"
             }
+            Self::OwnershipUncertain => "runtime_gateway_ownership_uncertain",
         }
     }
 }
@@ -113,10 +128,23 @@ struct SharedGatewayRuntimeHalfV3 {
 pub struct RuntimeGatewayBootstrapV1 {
     adapter: SharedGatewayControlAdapterV2,
     _runtime: SharedGatewayRuntimeHalfV3,
+    owner_invalidator: Option<RuntimeGatewayOwnerInvalidationBridgeV2>,
+    owner_invalidated: Arc<AtomicBool>,
 }
 
 struct RuntimeGatewayInvalidationBridgeV2 {
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+}
+
+struct RuntimeGatewayOwnerInvalidationBridgeV2 {
+    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    invalidated: Arc<AtomicBool>,
+}
+
+impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidationBridgeV2 {
+    fn invalidate_gateway_ownership(&self) {
+        invalidate_gateway_owner_state(&self.closed_lifecycle, &self.invalidated);
+    }
 }
 
 impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
@@ -173,7 +201,10 @@ impl RuntimeGatewayBootstrapV1 {
     pub fn observe_current_ready_attestation(
         &self,
     ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
-        self.adapter.observe_current_ready_attestation()
+        self.require_current_gateway_ownership()?;
+        let attestation = self.adapter.observe_current_ready_attestation()?;
+        self.require_current_gateway_ownership()?;
+        Ok(attestation)
     }
 
     pub fn ready_attestation_is_current(
@@ -182,6 +213,74 @@ impl RuntimeGatewayBootstrapV1 {
     ) -> bool {
         self.observe_current_ready_attestation()
             .is_ok_and(|current| current == *candidate)
+    }
+
+    pub fn start_gateway_owner_startup_watchdog_v1<P>(
+        &mut self,
+        port: P,
+        accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogHandleV1,
+        RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
+    >
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
+        P::Error: Send + 'static,
+    {
+        let lease_id = accepted_receipt.receipt().lease_id.clone();
+        let Some(invalidator) = self.owner_invalidator.take() else {
+            invalidate_gateway_owner_state(&self.adapter.closed_lifecycle, &self.owner_invalidated);
+            return Err(RuntimeGatewayOwnerStartupWatchdogStartFailureV1::new(
+                RuntimeGatewayOwnerStartupWatchdogStartErrorV1::AlreadyStarted,
+                port,
+                lease_id,
+            ));
+        };
+        if accepted_receipt.receipt().lease_id.process_instance_id
+            != self.adapter.process_instance_id
+        {
+            invalidator.invalidate_gateway_ownership();
+            return Err(RuntimeGatewayOwnerStartupWatchdogStartFailureV1::new(
+                RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ProcessMismatch,
+                port,
+                lease_id,
+            ));
+        }
+        if accepted_receipt
+            .receipt()
+            .lease_id
+            .gateway_shard_id
+            .as_str()
+            != SUPPORTED_GATEWAY_SHARD_ID
+        {
+            invalidator.invalidate_gateway_ownership();
+            return Err(RuntimeGatewayOwnerStartupWatchdogStartFailureV1::new(
+                RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ShardMismatch,
+                port,
+                lease_id,
+            ));
+        }
+        start_runtime_gateway_owner_startup_watchdog_v1(
+            port,
+            invalidator,
+            accepted_receipt,
+            request_started_at,
+            response_observed_at,
+            config,
+        )
+    }
+
+    fn require_current_gateway_ownership(
+        &self,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -203,6 +302,7 @@ fn compose_with_control_config(
     config: GatewayControlConfigV3,
 ) -> RuntimeGatewayBootstrapV1 {
     let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+    let owner_invalidated = Arc::new(AtomicBool::new(false));
     let invalidation = RuntimeGatewayInvalidationBridgeV2 {
         closed_lifecycle: closed_lifecycle.clone(),
     };
@@ -215,10 +315,31 @@ fn compose_with_control_config(
         adapter: SharedGatewayControlAdapterV2 {
             process_instance_id,
             control,
-            closed_lifecycle,
+            closed_lifecycle: closed_lifecycle.clone(),
         },
         _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+        owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
+            closed_lifecycle,
+            invalidated: owner_invalidated.clone(),
+        }),
+        owner_invalidated,
     }
+}
+
+fn invalidate_gateway_owner_state(
+    closed_lifecycle: &Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    invalidated: &AtomicBool,
+) {
+    if invalidated.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut lifecycle = closed_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    invalidate_closed_lifecycle(
+        &mut lifecycle,
+        RuntimeGatewayInvalidationCauseV2::OwnershipUncertain,
+    );
 }
 
 fn invalidate_closed_lifecycle(
@@ -371,6 +492,8 @@ mod tests {
         RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
         RuntimeGatewayEmergencyCauseV2,
     };
+
+    use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerEmergencyInvalidatorV1;
 
     use super::{
         compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayInvalidationBridgeV2,
@@ -557,6 +680,26 @@ mod tests {
     }
 
     #[test]
+    fn owner_invalidation_is_one_way_and_blocks_ready_observation() {
+        let mut bootstrap = bootstrap();
+        let invalidator = bootstrap.owner_invalidator.take().unwrap();
+        invalidator.invalidate_gateway_ownership();
+        invalidator.invalidate_gateway_ownership();
+
+        assert!(matches!(
+            bootstrap.closed_snapshot(),
+            RuntimeGatewayClosedSnapshotV2::Emergency {
+                generation,
+                cause: RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+            } if generation.get() == 2
+        ));
+        assert_eq!(
+            bootstrap.observe_current_ready_attestation(),
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        );
+    }
+
+    #[test]
     fn connect_remains_paused_until_an_explicit_resume() {
         let mut bootstrap = bootstrap();
         assert_eq!(connect(&mut bootstrap, GatewayReadyKindV3::Ready), 1);
@@ -674,6 +817,7 @@ mod tests {
         let RuntimeGatewayBootstrapV1 {
             adapter,
             mut _runtime,
+            ..
         } = bootstrap();
         let closed = adapter.closed_lifecycle.clone();
         drop(adapter);

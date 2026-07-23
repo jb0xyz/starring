@@ -3290,6 +3290,7 @@ dependencies = [
  "automation-runtime-panel-postgres",
  "automation-runtime-serving-postgres",
  "automation-runtime-worker",
+ "chrono",
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",

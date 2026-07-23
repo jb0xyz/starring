@@ -359,6 +359,19 @@ pub struct GatewayResourceConfigV1 {
     instance_lookup_timeout: Duration,
 }
 
+impl Default for GatewayResourceConfigV1 {
+    fn default() -> Self {
+        Self {
+            global_admission_capacity: NonZeroUsize::new(256).expect("nonzero capacity"),
+            command_capacity: NonZeroUsize::new(8).expect("nonzero capacity"),
+            lifecycle_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
+            rejection_acknowledgement_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
+            drain_timeout: Duration::from_secs(15),
+            instance_lookup_timeout: Duration::from_millis(500),
+        }
+    }
+}
+
 impl GatewayResourceConfigV1 {
     pub fn global_admission_capacity(self) -> NonZeroUsize {
         self.global_admission_capacity
