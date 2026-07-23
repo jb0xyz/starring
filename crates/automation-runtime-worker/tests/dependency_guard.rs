@@ -41,6 +41,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
+            PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/writer_fence.rs"),
         ]
@@ -118,6 +119,73 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
                 path.display()
             );
         }
+    }
+}
+
+#[test]
+fn registry_recovery_evidence_is_pure_redacted_and_non_authorizing() {
+    let source = include_str!("../src/registry_recovery.rs");
+    let declaration = source
+        .split("pub struct RuntimeRegistryRecoveryEmptyObservationV2 {")
+        .next()
+        .unwrap();
+    let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+    let evidence_fields = source
+        .split("pub struct RuntimeRegistryRecoveryEmptyObservationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!attributes.contains(forbidden));
+    }
+    for forbidden in [
+        "impl Clone for RuntimeRegistryRecoveryEmptyObservationV2",
+        "impl Copy for RuntimeRegistryRecoveryEmptyObservationV2",
+        "impl Default for RuntimeRegistryRecoveryEmptyObservationV2",
+    ] {
+        assert!(!source.contains(forbidden));
+    }
+    for field in [
+        "process_instance_id",
+        "observation_sequence",
+        "retained_slot_count",
+        "retained_empty_tombstone_count",
+    ] {
+        assert!(evidence_fields.contains(&format!("    {field}:")));
+        assert!(!evidence_fields.contains(&format!("    pub {field}:")));
+    }
+    for expected in [
+        "RuntimeRegistryGlobalObservationSequenceV2(<redacted>)",
+        "RuntimeRegistryRecoveryObservationInputV2(<redacted>)",
+        "RuntimeRegistryRecoveryEmptyObservationV2(<redacted>)",
+        "pub observation_sequence: RuntimeRegistryGlobalObservationSequenceV2",
+        "pub retained_slot_count: u64",
+        "pub retained_empty_tombstone_count: u64",
+        "pub staged_route_count: u64",
+        "pub serving_route_count: u64",
+        "pub draining_route_count: u64",
+        "pub sealed_slot_count: u64",
+        "pub active_interaction_count: u64",
+        "pub failed_closed_slot_count: u64",
+        "pub registry_failed_closed: bool",
+    ] {
+        assert!(source.contains(expected));
+    }
+    for forbidden in [
+        "automation_runtime_registry",
+        "SlotLifecycleV1",
+        "SlotRouteWitnessV1",
+        "Arc<",
+        "Mutex<",
+        "Capability",
+        "Authority",
+        "Permit",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden registry recovery authority surface: {forbidden}"
+        );
     }
 }
 

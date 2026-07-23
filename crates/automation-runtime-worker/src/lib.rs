@@ -3,6 +3,7 @@ mod gateway_lifecycle;
 mod gateway_owner;
 mod gateway_owner_watchdog;
 mod paused_gateway;
+mod registry_recovery;
 mod startup_recovery;
 mod writer_fence;
 
@@ -37,6 +38,11 @@ pub use gateway_owner_watchdog::{
 pub use paused_gateway::{
     RuntimePausedGatewayObservationErrorV2, RuntimePausedGatewayObservationV2,
     RuntimePausedGatewaySequenceV2,
+};
+pub use registry_recovery::{
+    accept_runtime_registry_recovery_empty_observation_v2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
+    RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
 };
 pub use startup_recovery::{
     plan_runtime_startup_recovery_v2, RuntimeStartupRecoveryClassV2,
