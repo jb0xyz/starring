@@ -114,6 +114,10 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
             "v2_writer_fence.rs",
             include_str!("../src/v2_writer_fence.rs"),
         ),
+        (
+            "v2_startup_recovery.rs",
+            include_str!("../src/v2_startup_recovery.rs"),
+        ),
     ] {
         for forbidden in [
             "Serialize",
@@ -678,6 +682,10 @@ fn source_files_contain_no_comments() {
             include_str!("../src/v2_product_drain_canonical/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
+        (
+            "src/v2_startup_recovery.rs",
+            include_str!("../src/v2_startup_recovery.rs"),
+        ),
         (
             "src/v2_writer_fence.rs",
             include_str!("../src/v2_writer_fence.rs"),

@@ -1,6 +1,7 @@
 mod gateway_lifecycle;
 mod gateway_owner;
 mod gateway_owner_watchdog;
+mod startup_recovery;
 mod writer_fence;
 
 pub use gateway_lifecycle::{
@@ -26,5 +27,10 @@ pub use gateway_owner_watchdog::{
     RuntimeGatewayOwnerRenewalScheduleErrorV1, RuntimeGatewayOwnerRenewalScheduleV1,
     RuntimeGatewayOwnerUnknownRenewalV1, RuntimeGatewayOwnerWatchdogActionV1,
     RuntimeGatewayOwnerWatchdogErrorV1, RuntimeGatewayOwnerWatchdogV1,
+};
+pub use startup_recovery::{
+    plan_runtime_startup_recovery_v2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationFixedPointV2,
+    RuntimeStartupRecoveryPlanErrorV2,
 };
 pub use writer_fence::RuntimeWriterFenceObservationPortV1;

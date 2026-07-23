@@ -242,6 +242,14 @@ fn authority_type_scanner_crosses_blank_attribute_spacing_and_qualified_impls() 
 }
 
 #[test]
+fn startup_observation_fixed_point_cannot_mint_gateway_owner_handoff_authority() {
+    let watchdog = include_str!("../src/gateway_owner_startup_watchdog.rs");
+
+    assert!(!watchdog.contains("RuntimeStartupRecoveryObservationFixedPointV2"));
+    assert!(!watchdog.contains("plan_runtime_startup_recovery_v2"));
+}
+
+#[test]
 fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
     assert_eq!(WORKSPACE.matches("\"tools/starring-runtime\"").count(), 1);
     let sources = source_files();

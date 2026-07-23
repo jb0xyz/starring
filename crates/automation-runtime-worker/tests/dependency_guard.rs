@@ -39,6 +39,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/writer_fence.rs"),
         ]
     );
@@ -116,6 +117,32 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             );
         }
     }
+}
+
+#[test]
+fn startup_fixed_point_is_narrow_noncloneable_and_not_serializable() {
+    let source = include_str!("../src/startup_recovery.rs");
+    let declaration = source
+        .split("pub struct RuntimeStartupRecoveryObservationFixedPointV2 {")
+        .next()
+        .unwrap();
+    let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!attributes.contains(forbidden));
+    }
+    assert!(source.contains(concat!(
+        "pub struct RuntimeStartupRecoveryObservationFixedPointV2 {\n",
+        "    acknowledged_product_handoff_count: u32,\n",
+        "}"
+    )));
+    assert_eq!(
+        source
+            .matches("RuntimeStartupRecoveryObservationFixedPointV2 {")
+            .count(),
+        3
+    );
+    assert!(!source.contains("pub acknowledged_product_handoff_count"));
 }
 
 #[test]
