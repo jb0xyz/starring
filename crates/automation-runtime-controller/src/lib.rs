@@ -29,6 +29,7 @@ mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
 mod v2_product;
+mod v2_product_drain_adoption;
 mod v2_product_drain_canonical;
 mod v2_product_drain_observation;
 mod v2_product_drain_operation;
@@ -150,6 +151,11 @@ pub use v2_identity::{
     RuntimeRecoveryIdV2, RuntimeSuspensionIdV2,
 };
 pub use v2_product::{RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2};
+pub use v2_product_drain_adoption::{
+    RuntimeProductDrainAdoptionDivergenceV2, RuntimeProductDrainAdoptionErrorV2,
+    RuntimeProductDrainAdoptionKindV2, RuntimeProductDrainAdoptionV2,
+    RuntimeProductDrainSemanticExpectationV2, RuntimeProductDrainSemanticFieldV2,
+};
 pub use v2_product_drain_canonical::{
     RuntimeCanonicalProductDrainV2, RuntimeProductDrainCanonicalErrorV2,
     RuntimeProductDrainCanonicalFieldV2, RuntimeProductDrainCanonicalRootV2,

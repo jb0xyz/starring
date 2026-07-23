@@ -2238,6 +2238,158 @@ fn v2_product_drain_scope_observation_is_combined_exact_and_non_authorizing() {
 }
 
 #[test]
+fn v2_product_drain_semantic_adoption_is_id_free_closed_and_non_authorizing() {
+    let source = include_str!("../src/v2_product_drain_adoption.rs");
+    let tests = include_str!("../src/v2_product_drain_adoption/tests.rs");
+    let expectation = source
+        .split("pub struct RuntimeProductDrainSemanticExpectationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+
+    for forbidden in [
+        "RuntimeProductOperationIdV2",
+        "RuntimeDrainIntentIdV2",
+        "RuntimeProductMutationDigestV2",
+        "RuntimeDrainIntentDigestV2",
+        "RuntimeCanonicalProductDrainV2",
+        "RuntimePersistedProductDrainRootV2",
+        "request_bytes",
+        "canonical",
+    ] {
+        assert!(
+            !expectation.contains(forbidden),
+            "semantic expectation contains {forbidden}"
+        );
+    }
+    for required in [
+        "lookup: RuntimeProductDrainScopeLookupV2",
+        "expected_target: RuntimeDeploymentTargetV1",
+        "mutation_kind: RuntimeProductMutationKindV2",
+        "product_semantic_request_digest: RuntimeProductSemanticRequestDigestV2",
+    ] {
+        assert!(
+            expectation.contains(required),
+            "semantic expectation is missing {required}"
+        );
+    }
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "Port",
+        "Authority",
+        "Permit",
+        "Authorized",
+        "pub expectation:",
+        "pub observation:",
+        "pub state:",
+        "pub fn new(",
+        "retry",
+        "Retry",
+        "transaction",
+        "Transaction",
+        "SystemTime",
+        "Instant",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+        "rand",
+        "Uuid",
+        "CSPRNG",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 Product drain adoption surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub struct RuntimeProductDrainSemanticExpectationV2",
+        "pub enum RuntimeProductDrainAdoptionKindV2",
+        "pub enum RuntimeProductDrainSemanticFieldV2",
+        "pub enum RuntimeProductDrainAdoptionDivergenceV2",
+        "pub enum RuntimeProductDrainAdoptionErrorV2",
+        "pub struct RuntimeProductDrainAdoptionV2",
+        "pub fn from_locked_snapshot(",
+        "pub fn from_proposed(",
+        "pub fn classify_proposed(",
+        "pub fn classify_semantic_recovery(",
+        "pub fn into_observation(",
+    ] {
+        assert!(source.contains(declaration), "missing {declaration}");
+    }
+
+    for exact_check in [
+        "RuntimeProductDrainScopeLookupV2::from_locked_snapshot(snapshot)?",
+        "lookup: proposed.scope_lookup()",
+        "expected_target: product.expected_target.clone()",
+        "mutation_kind: product.mutation_kind",
+        "product_semantic_request_digest: product.product_semantic_request_digest.clone()",
+        "expectation.lookup() != observation.lookup()",
+        "RuntimeProductDrainAdoptionErrorV2::ObservationLookupMismatch",
+        "RuntimeProductDrainAdoptionDivergenceV2::PersistenceCorrupt { corruption }",
+        "semantic_mismatch(&expectation, persisted)",
+        "persisted.require_byte_exact_replay(proposed).is_err()",
+        "RuntimeProductDrainAdoptionDivergenceV2::CanonicalMismatch",
+        "RuntimeProductDrainAdoptionStateV2::ExactProposedRoot",
+        "RuntimeProductDrainAdoptionStateV2::PersistedRoot",
+        "&product.expected_target != expectation.expected_target()",
+        "product.mutation_kind != expectation.mutation_kind()",
+        "&product.product_semantic_request_digest",
+        "!= expectation.product_semantic_request_digest()",
+    ] {
+        assert!(
+            source.contains(exact_check),
+            "missing V2 Product drain adoption check: {exact_check}"
+        );
+    }
+
+    for test_name in [
+        "semantic_expectation_is_id_free_and_derives_only_locked_product_inputs",
+        "exact_proposed_root_classification_preserves_the_complete_observation",
+        "same_semantics_with_different_proposed_ids_is_canonical_mismatch",
+        "proposed_path_reports_semantic_mismatch_before_canonical_mismatch",
+        "semantic_recovery_adopts_persisted_ids_roots_and_all_current_states",
+        "semantic_recovery_reports_each_id_independent_mismatch_precisely",
+        "classification_rejects_an_observation_from_another_natural_lookup",
+        "absent_observation_stays_absent_in_both_classification_paths",
+        "every_physical_corruption_reason_is_preserved_as_divergence",
+        "semantic_adoption_surface_is_inert_id_free_and_non_authorizing",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 Product drain adoption behavior test: {test_name}"
+        );
+    }
+
+    let semantic_check = source
+        .find("semantic_mismatch(&expectation, persisted)")
+        .unwrap();
+    let canonical_check = source
+        .find("persisted.require_byte_exact_replay(proposed).is_err()")
+        .unwrap();
+    assert!(semantic_check < canonical_check);
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeProductDrainAdoptionDivergenceV2",
+        "RuntimeProductDrainAdoptionErrorV2",
+        "RuntimeProductDrainAdoptionKindV2",
+        "RuntimeProductDrainAdoptionV2",
+        "RuntimeProductDrainSemanticExpectationV2",
+        "RuntimeProductDrainSemanticFieldV2",
+    ] {
+        assert!(library.contains(exported), "missing export {exported}");
+    }
+}
+
+#[test]
 fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
     let canonical = include_str!("../src/v2_suspension_canonical.rs");
     let wire = include_str!("../src/v2_suspension_canonical/wire.rs");
@@ -3220,6 +3372,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_product_drain_observation/tests.rs",
             include_str!("../src/v2_product_drain_observation/tests.rs"),
+        ),
+        (
+            "src/v2_product_drain_adoption.rs",
+            include_str!("../src/v2_product_drain_adoption.rs"),
+        ),
+        (
+            "src/v2_product_drain_adoption/tests.rs",
+            include_str!("../src/v2_product_drain_adoption/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
