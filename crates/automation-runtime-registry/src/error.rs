@@ -61,6 +61,12 @@ pub enum ServingSlotRegistryError {
     IncarnationExhausted,
     #[error("serving slot monotonic state is exhausted")]
     SlotSequenceExhausted,
+    #[error("serving slot registry monotonic state is exhausted")]
+    RegistrySequenceExhausted,
+    #[error("serving slot registry recovery observation is inconsistent")]
+    RegistryObservationInvalid,
+    #[error("serving slot registry recovery observation exceeds its count domain")]
+    RegistryObservationOverflow,
     #[error("serving slot admission generation changed from {expected} to {actual}")]
     AdmissionGenerationMismatch {
         expected: NonZeroU64,

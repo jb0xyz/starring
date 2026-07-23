@@ -559,6 +559,44 @@ change, refence, and removal advance both counters. Active-guard acquire and
 drop advance only observation sequence. Overflow permanently marks that slot
 non-admitting and makes every later mutation fail closed.
 
+The registry also exposes one registry-global startup and recovery observation.
+Its sequence is a distinct typed domain and cannot be substituted with a slot
+sequence.
+
+```rust
+pub struct RegistryGlobalObservationSequenceV2(NonZeroU64);
+
+pub struct RegistryRecoveryObservationV2 {
+    observation_sequence: RegistryGlobalObservationSequenceV2,
+    retained_slot_count: u64,
+    retained_empty_tombstone_count: u64,
+    staged_route_count: u64,
+    serving_route_count: u64,
+    draining_route_count: u64,
+    sealed_slot_count: u64,
+    active_interaction_count: u64,
+    failed_closed_slot_count: u64,
+    registry_failed_closed: bool,
+}
+```
+
+One registry lock returns the sequence and aggregate together. The aggregate
+counts staged, current, and every retired route independently, including
+zero-active retired routes and seals over empty slots. A high-water-only empty
+tombstone is retained but does not prevent recovery emptiness. Every effective
+install, activation, lifecycle mutation, refence, removal, seal, unseal,
+active-guard acquire, active-guard drop, and slot fail-close advances the global
+sequence exactly once. Replay and rejected precondition checks do not advance
+it. The maximum sequence value is reserved for registry-global terminal close;
+the mutation that reaches it is rejected without applying its intended state
+change, all ordinary reads and mutations then fail closed, and only the
+non-authorizing recovery observation may report the terminal diagnostic.
+
+The aggregate proves only local recovery emptiness. It carries no registry
+pointer, mutation capability, owner, readiness, gateway, or coordinator
+authority. A copied aggregate or sequence cannot authorize a seal, refence,
+removal, closed database call, recovery transition, or admission resume.
+
 Public admission reads atomic observation A, requires unsealed `Serving`, and
 acquires its guard against the exact admission generation. Guard acquisition
 returns a non-cloneable capability and its exact successor observation. Final

@@ -816,11 +816,21 @@ fn replacement_authority_can_remove_a_refenced_retired_route() {
     );
     drop(interaction);
     assert!(registry.observe_drain(&first_renewed).unwrap().drained);
+    let before_removal = registry.recovery_observation_v2().unwrap();
     assert_eq!(
         registry
             .remove_with_authority(&replacement_token, &first_renewed)
             .unwrap(),
         SlotRemovalOutcomeV1::RemovedDraining
+    );
+    let after_removal = registry.recovery_observation_v2().unwrap();
+    assert_eq!(
+        after_removal.observation_sequence().get(),
+        before_removal.observation_sequence().get() + 1
+    );
+    assert_eq!(
+        after_removal.draining_route_count() + 1,
+        before_removal.draining_route_count()
     );
 }
 
@@ -1306,5 +1316,270 @@ fn seal_and_admission_race_has_one_linearized_winner() {
                 _ => panic!("seal and admission did not linearize"),
             }
         });
+    }
+}
+
+#[test]
+fn recovery_observation_tracks_every_effective_mutation_and_ignores_replays() {
+    let registry = registry(8);
+    let initial = registry.recovery_observation_v2().unwrap();
+    assert_eq!(initial.observation_sequence().get(), 1);
+    assert_eq!(initial.retained_slot_count(), 0);
+    assert!(initial.is_recovery_empty());
+
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let installed = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap();
+    let staged = registry.recovery_observation_v2().unwrap();
+    assert_eq!(staged.observation_sequence().get(), 2);
+    assert_eq!(staged.staged_route_count(), 1);
+    assert!(!staged.is_recovery_empty());
+
+    registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap();
+    assert_eq!(registry.recovery_observation_v2().unwrap(), staged);
+
+    registry
+        .activate_with_sequence_v2(&installed.token, candidate.identity())
+        .unwrap();
+    let serving = registry.recovery_observation_v2().unwrap();
+    assert_eq!(serving.observation_sequence().get(), 3);
+    assert_eq!(serving.staged_route_count(), 0);
+    assert_eq!(serving.serving_route_count(), 1);
+    registry
+        .activate_with_sequence_v2(&installed.token, candidate.identity())
+        .unwrap();
+    assert_eq!(registry.recovery_observation_v2().unwrap(), serving);
+
+    let renewed = registry
+        .advance_authority(&installed.token, candidate.identity(), fence(2))
+        .unwrap();
+    let refenced = registry.recovery_observation_v2().unwrap();
+    assert_eq!(refenced.observation_sequence().get(), 4);
+    assert_eq!(refenced.serving_route_count(), 1);
+
+    let active = registry.admit(&key).unwrap();
+    let admitted = registry.recovery_observation_v2().unwrap();
+    assert_eq!(admitted.observation_sequence().get(), 5);
+    assert_eq!(admitted.active_interaction_count(), 1);
+    drop(active);
+    let released = registry.recovery_observation_v2().unwrap();
+    assert_eq!(released.observation_sequence().get(), 6);
+    assert_eq!(released.active_interaction_count(), 0);
+
+    registry.begin_drain(&renewed).unwrap();
+    let draining = registry.recovery_observation_v2().unwrap();
+    assert_eq!(draining.observation_sequence().get(), 7);
+    assert_eq!(draining.serving_route_count(), 0);
+    assert_eq!(draining.draining_route_count(), 1);
+    registry.begin_drain(&renewed).unwrap();
+    assert_eq!(registry.recovery_observation_v2().unwrap(), draining);
+
+    registry.remove(&renewed).unwrap();
+    let empty = registry.recovery_observation_v2().unwrap();
+    assert_eq!(empty.observation_sequence().get(), 8);
+    assert_eq!(empty.retained_slot_count(), 1);
+    assert_eq!(empty.retained_empty_tombstone_count(), 1);
+    assert!(empty.is_recovery_empty());
+}
+
+#[test]
+fn recovery_observation_counts_hidden_staged_and_retired_routes() {
+    let registry = registry(8);
+    let first = route(10, "study", 1, 1, "p1", None);
+    let key = first.slot_key();
+    let first_token = registry
+        .install(key.clone(), first.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&first_token, first.identity()).unwrap();
+    let active = registry.admit(&key).unwrap();
+
+    let second = route(10, "study", 2, 2, "p2", Some(50));
+    let second_token = registry
+        .install(key.clone(), second.clone(), fence(2))
+        .unwrap()
+        .token;
+    let replacing = registry.recovery_observation_v2().unwrap();
+    assert_eq!(replacing.observation_sequence().get(), 5);
+    assert_eq!(replacing.staged_route_count(), 1);
+    assert_eq!(replacing.serving_route_count(), 1);
+    assert_eq!(replacing.active_interaction_count(), 1);
+
+    registry.activate(&second_token, second.identity()).unwrap();
+    let third = route(10, "study", 3, 3, "p3", Some(51));
+    registry.install(key, third, fence(3)).unwrap();
+    let complete = registry.recovery_observation_v2().unwrap();
+    assert_eq!(complete.observation_sequence().get(), 7);
+    assert_eq!(complete.staged_route_count(), 1);
+    assert_eq!(complete.serving_route_count(), 1);
+    assert_eq!(complete.draining_route_count(), 1);
+    assert_eq!(complete.active_interaction_count(), 1);
+
+    drop(active);
+    let zero_active_retired = registry.recovery_observation_v2().unwrap();
+    assert_eq!(zero_active_retired.observation_sequence().get(), 8);
+    assert_eq!(zero_active_retired.draining_route_count(), 1);
+    assert_eq!(zero_active_retired.active_interaction_count(), 0);
+    assert!(!zero_active_retired.is_recovery_empty());
+}
+
+#[test]
+fn recovery_observation_treats_empty_seals_as_obligations_and_tombstones_as_empty() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let (seal, _) = registry
+        .seal_drain_claim_v2(&key, seal_key(10), None)
+        .unwrap();
+    let sealed_empty = registry.recovery_observation_v2().unwrap();
+    assert_eq!(sealed_empty.observation_sequence().get(), 2);
+    assert_eq!(sealed_empty.retained_slot_count(), 1);
+    assert_eq!(sealed_empty.sealed_slot_count(), 1);
+    assert!(!sealed_empty.is_recovery_empty());
+
+    registry.unseal_drain_claim_v2(seal).unwrap();
+    let tombstone = registry.recovery_observation_v2().unwrap();
+    assert_eq!(tombstone.observation_sequence().get(), 3);
+    assert_eq!(tombstone.retained_empty_tombstone_count(), 1);
+    assert!(tombstone.is_recovery_empty());
+
+    let token = registry
+        .install(key.clone(), candidate.clone(), fence(1))
+        .unwrap()
+        .token;
+    registry.activate(&token, candidate.identity()).unwrap();
+    let before = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    let (populated_seal, _) = registry
+        .seal_drain_claim_v2(&key, seal_key(11), Some(&before))
+        .unwrap();
+    let sealed_serving = registry.recovery_observation_v2().unwrap();
+    assert_eq!(sealed_serving.observation_sequence().get(), 6);
+    assert_eq!(sealed_serving.sealed_slot_count(), 1);
+    assert_eq!(sealed_serving.serving_route_count(), 1);
+    assert!(!sealed_serving.is_recovery_empty());
+    registry.unseal_drain_claim_v2(populated_seal).unwrap();
+    let reopened_serving = registry.recovery_observation_v2().unwrap();
+    assert_eq!(reopened_serving.observation_sequence().get(), 7);
+    assert_eq!(reopened_serving.sealed_slot_count(), 0);
+    assert_eq!(reopened_serving.serving_route_count(), 1);
+}
+
+#[test]
+fn recovery_empty_aba_and_cross_slot_mutations_have_successor_sequences() {
+    let registry = registry(8);
+    let before = registry.recovery_observation_v2().unwrap();
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let key = candidate.slot_key();
+    let token = registry.install(key, candidate, fence(1)).unwrap().token;
+    registry.remove(&token).unwrap();
+    let after = registry.recovery_observation_v2().unwrap();
+    assert!(before.is_recovery_empty());
+    assert!(after.is_recovery_empty());
+    assert_eq!(before.observation_sequence().get(), 1);
+    assert_eq!(after.observation_sequence().get(), 3);
+
+    let first = route(20, "study", 1, 1, "p2", None);
+    let second = route(30, "study", 1, 1, "p3", None);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        let first_barrier = barrier.clone();
+        let first_registry = &registry;
+        scope.spawn(move || {
+            first_barrier.wait();
+            first_registry
+                .install(first.slot_key(), first, fence(1))
+                .unwrap();
+        });
+        let second_barrier = barrier.clone();
+        let second_registry = &registry;
+        scope.spawn(move || {
+            second_barrier.wait();
+            second_registry
+                .install(second.slot_key(), second, fence(1))
+                .unwrap();
+        });
+        barrier.wait();
+    });
+    let concurrent = registry.recovery_observation_v2().unwrap();
+    assert_eq!(concurrent.observation_sequence().get(), 5);
+    assert_eq!(concurrent.staged_route_count(), 2);
+}
+
+#[test]
+fn recovery_observation_races_are_whole_before_or_after_snapshots() {
+    for iteration in 0..32 {
+        let registry = registry(8);
+        let candidate = route(10, "study", 1, 1, "p1", None);
+        let key = candidate.slot_key();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let observer_barrier = barrier.clone();
+            let observer_registry = &registry;
+            let observer = scope.spawn(move || {
+                observer_barrier.wait();
+                observer_registry.recovery_observation_v2().unwrap()
+            });
+            let install_barrier = barrier.clone();
+            let install_registry = &registry;
+            let install = scope.spawn(move || {
+                install_barrier.wait();
+                install_registry.install(key, candidate, fence(1)).unwrap();
+            });
+            barrier.wait();
+            let observed = observer.join().unwrap();
+            install.join().unwrap();
+            match observed.observation_sequence().get() {
+                1 => assert!(observed.is_recovery_empty()),
+                2 => assert_eq!(observed.staged_route_count(), 1),
+                _ => panic!("registry observation did not linearize in iteration {iteration}"),
+            }
+        });
+        let final_observation = registry.recovery_observation_v2().unwrap();
+        assert_eq!(final_observation.observation_sequence().get(), 2);
+        assert_eq!(final_observation.staged_route_count(), 1);
+    }
+}
+
+#[test]
+fn recovery_observation_and_guard_drop_linearize_as_whole_snapshots() {
+    for iteration in 0..32 {
+        let registry = registry(8);
+        let candidate = route(10, "study", 1, 1, "p1", None);
+        let key = candidate.slot_key();
+        let token = registry
+            .install(key, candidate.clone(), fence(1))
+            .unwrap()
+            .token;
+        registry.activate(&token, candidate.identity()).unwrap();
+        let active = registry.admit(token.key()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let observer_barrier = barrier.clone();
+            let observer_registry = &registry;
+            let observer = scope.spawn(move || {
+                observer_barrier.wait();
+                observer_registry.recovery_observation_v2().unwrap()
+            });
+            let drop_barrier = barrier.clone();
+            let release = scope.spawn(move || {
+                drop_barrier.wait();
+                drop(active);
+            });
+            barrier.wait();
+            let observed = observer.join().unwrap();
+            release.join().unwrap();
+            match observed.observation_sequence().get() {
+                4 => assert_eq!(observed.active_interaction_count(), 1),
+                5 => assert_eq!(observed.active_interaction_count(), 0),
+                _ => panic!("guard observation did not linearize in iteration {iteration}"),
+            }
+        });
+        let final_observation = registry.recovery_observation_v2().unwrap();
+        assert_eq!(final_observation.observation_sequence().get(), 5);
+        assert_eq!(final_observation.active_interaction_count(), 0);
     }
 }

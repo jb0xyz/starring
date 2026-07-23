@@ -2,6 +2,7 @@ mod error;
 mod identity;
 mod registry;
 mod v2_observation;
+mod v2_recovery;
 
 pub use error::{ExactServingRouteError, ServingSlotRegistryError};
 pub use identity::{ExactServingRouteV1, ServingSlotKeyV1};
@@ -15,3 +16,4 @@ pub use registry::{
 pub use v2_observation::{
     SlotAdmissionStateV2, SlotAtomicObservationV2, SlotSealKeyErrorV2, SlotSealKeyV2,
 };
+pub use v2_recovery::{RegistryGlobalObservationSequenceV2, RegistryRecoveryObservationV2};
