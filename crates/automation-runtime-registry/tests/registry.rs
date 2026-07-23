@@ -1583,3 +1583,152 @@ fn recovery_observation_and_guard_drop_linearize_as_whole_snapshots() {
         assert_eq!(final_observation.active_interaction_count(), 0);
     }
 }
+
+#[test]
+fn recovery_guard_mints_and_revalidates_an_initial_empty_recovery_cursor() {
+    let registry = registry(8);
+    let guard = registry.recovery_observation_guard_v2().unwrap();
+    let observed = guard.observation();
+    assert!(observed.is_recovery_empty());
+    assert_eq!(observed.observation_sequence().get(), 1);
+
+    let cursor = guard.into_empty_cursor().unwrap();
+    assert_eq!(
+        format!("{cursor:?}"),
+        "RegistryEmptyRecoveryCursorV2(<redacted>)"
+    );
+    assert_eq!(
+        registry
+            .revalidate_empty_recovery_cursor_v2(&cursor)
+            .unwrap(),
+        observed
+    );
+}
+
+#[test]
+fn empty_recovery_cursor_rejects_a_foreign_registry_at_the_same_sequence() {
+    let source = registry(8);
+    let foreign = registry(8);
+    let cursor = source
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    assert_eq!(
+        foreign
+            .recovery_observation_v2()
+            .unwrap()
+            .observation_sequence(),
+        source
+            .recovery_observation_v2()
+            .unwrap()
+            .observation_sequence()
+    );
+    assert_eq!(
+        foreign.revalidate_empty_recovery_cursor_v2(&cursor),
+        Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor)
+    );
+}
+
+#[test]
+fn every_effective_registry_change_stales_an_empty_cursor_across_empty_aba() {
+    let registry = registry(8);
+    let cursor = registry
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let token = registry
+        .install(candidate.slot_key(), candidate, fence(1))
+        .unwrap()
+        .token;
+    registry.remove(&token).unwrap();
+    assert!(registry
+        .recovery_observation_v2()
+        .unwrap()
+        .is_recovery_empty());
+    assert_eq!(
+        registry.revalidate_empty_recovery_cursor_v2(&cursor),
+        Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor)
+    );
+}
+
+#[test]
+fn recovery_guard_cannot_mint_a_cursor_from_a_nonempty_registry() {
+    let registry = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    registry
+        .install(candidate.slot_key(), candidate, fence(1))
+        .unwrap();
+    let guard = registry.recovery_observation_guard_v2().unwrap();
+    assert!(!guard.observation().is_recovery_empty());
+    assert!(matches!(
+        guard.into_empty_cursor(),
+        Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty)
+    ));
+}
+
+#[test]
+fn recovery_guard_holds_the_registry_lock_until_cursor_mint_finishes() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+
+    let registry = registry(8);
+    let guard = registry.recovery_observation_guard_v2().unwrap();
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let (started_sender, started_receiver) = channel();
+    let (completed_sender, completed_receiver) = channel();
+    std::thread::scope(|scope| {
+        let registry_ref = &registry;
+        scope.spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = registry_ref.install(candidate.slot_key(), candidate, fence(1));
+            completed_sender.send(result).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            completed_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        let cursor = guard.into_empty_cursor().unwrap();
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.revalidate_empty_recovery_cursor_v2(&cursor),
+            Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor)
+        );
+    });
+}
+
+#[test]
+fn dropping_a_recovery_guard_releases_the_registry_lock() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+
+    let registry = registry(8);
+    let guard = registry.recovery_observation_guard_v2().unwrap();
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    let (started_sender, started_receiver) = channel();
+    let (completed_sender, completed_receiver) = channel();
+    std::thread::scope(|scope| {
+        let registry_ref = &registry;
+        scope.spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = registry_ref.install(candidate.slot_key(), candidate, fence(1));
+            completed_sender.send(result).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            completed_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+    });
+}

@@ -67,6 +67,10 @@ pub enum ServingSlotRegistryError {
     RegistryObservationInvalid,
     #[error("serving slot registry recovery observation exceeds its count domain")]
     RegistryObservationOverflow,
+    #[error("serving slot registry is not recovery-empty")]
+    RegistryRecoveryNotEmpty,
+    #[error("serving slot registry empty recovery cursor is stale")]
+    StaleRegistryEmptyRecoveryCursor,
     #[error("serving slot admission generation changed from {expected} to {actual}")]
     AdmissionGenerationMismatch {
         expected: NonZeroU64,

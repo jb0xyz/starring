@@ -317,6 +317,41 @@ struct RegistryInner {
     state: Mutex<RegistryState>,
 }
 
+pub struct RegistryEmptyRecoveryCursorV2 {
+    registry: Weak<RegistryInner>,
+    expected_sequence: RegistryGlobalObservationSequenceV2,
+}
+
+impl fmt::Debug for RegistryEmptyRecoveryCursorV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RegistryEmptyRecoveryCursorV2(<redacted>)")
+    }
+}
+
+pub struct RegistryRecoveryObservationGuardV2<'a> {
+    _state: MutexGuard<'a, RegistryState>,
+    observation: RegistryRecoveryObservationV2,
+    registry: Weak<RegistryInner>,
+}
+
+impl RegistryRecoveryObservationGuardV2<'_> {
+    pub const fn observation(&self) -> RegistryRecoveryObservationV2 {
+        self.observation
+    }
+
+    pub fn into_empty_cursor(
+        self,
+    ) -> Result<RegistryEmptyRecoveryCursorV2, ServingSlotRegistryError> {
+        if !self.observation.is_recovery_empty() {
+            return Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty);
+        }
+        Ok(RegistryEmptyRecoveryCursorV2 {
+            registry: self.registry,
+            expected_sequence: self.observation.observation_sequence(),
+        })
+    }
+}
+
 #[derive(Default)]
 struct RegistryState {
     slots: HashMap<ServingSlotKeyV1, SlotCell>,
@@ -900,6 +935,44 @@ impl ServingSlotRegistryV1 {
             .lock()
             .map_err(|_| ServingSlotRegistryError::RegistryPoisoned)?;
         registry_recovery_observation_v2(&state)
+    }
+
+    pub fn recovery_observation_guard_v2(
+        &self,
+    ) -> Result<RegistryRecoveryObservationGuardV2<'_>, ServingSlotRegistryError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ServingSlotRegistryError::RegistryPoisoned)?;
+        let observation = registry_recovery_observation_v2(&state)?;
+        Ok(RegistryRecoveryObservationGuardV2 {
+            _state: state,
+            observation,
+            registry: Arc::downgrade(&self.inner),
+        })
+    }
+
+    pub fn revalidate_empty_recovery_cursor_v2(
+        &self,
+        cursor: &RegistryEmptyRecoveryCursorV2,
+    ) -> Result<RegistryRecoveryObservationV2, ServingSlotRegistryError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ServingSlotRegistryError::RegistryPoisoned)?;
+        if !Weak::ptr_eq(&cursor.registry, &Arc::downgrade(&self.inner)) {
+            return Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor);
+        }
+        let observation = registry_recovery_observation_v2(&state)?;
+        if observation.observation_sequence() != cursor.expected_sequence {
+            return Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor);
+        }
+        if !observation.is_recovery_empty() {
+            return Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty);
+        }
+        Ok(observation)
     }
 
     pub fn seal_drain_claim_v2(
@@ -1686,6 +1759,30 @@ mod tests {
         assert!(matches!(
             registry.seal_drain_claim_v2(&key, seal_key, None),
             Err(ServingSlotRegistryError::RegistrySequenceExhausted)
+        ));
+    }
+
+    #[test]
+    fn failed_closed_registry_cannot_mint_or_revalidate_an_empty_recovery_cursor() {
+        let registry = ServingSlotRegistryV1::new(ServingSlotRegistryConfigV1::default());
+        let cursor = registry
+            .recovery_observation_guard_v2()
+            .unwrap()
+            .into_empty_cursor()
+            .unwrap();
+        {
+            let mut state = registry.inner.state.lock().unwrap();
+            state.observation.failed_closed = true;
+        }
+        assert_eq!(
+            registry.revalidate_empty_recovery_cursor_v2(&cursor),
+            Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty)
+        );
+        let guard = registry.recovery_observation_guard_v2().unwrap();
+        assert!(guard.observation().registry_failed_closed());
+        assert!(matches!(
+            guard.into_empty_cursor(),
+            Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty)
         ));
     }
 }

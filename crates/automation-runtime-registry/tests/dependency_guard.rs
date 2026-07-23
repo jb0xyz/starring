@@ -123,3 +123,78 @@ fn recovery_observation_is_non_authorizing_typed_and_nonserializable() {
     assert!(registry.contains("registry_recovery_observation_v2(&state)"));
     assert!(registry.contains("advance_observation_or_close(observation, slot)"));
 }
+
+#[test]
+fn empty_recovery_cursor_is_instance_bound_noncloneable_and_nonauthorizing() {
+    let registry = include_str!("../src/registry.rs");
+    let error = include_str!("../src/error.rs");
+    let public = include_str!("../src/lib.rs");
+    let specification = include_str!(
+        "../../../docs/superpowers/specs/2026-07-22-production-runtime-worker-composition-design.md"
+    );
+    let cursor = registry
+        .split("pub struct RegistryEmptyRecoveryCursorV2")
+        .nth(1)
+        .unwrap_or("")
+        .split("impl fmt::Debug for RegistryEmptyRecoveryCursorV2")
+        .next()
+        .unwrap_or("");
+    assert!(cursor.contains("registry: Weak<RegistryInner>"));
+    assert!(cursor.contains("expected_sequence: RegistryGlobalObservationSequenceV2"));
+    assert!(!cursor.contains("pub registry"));
+    assert!(!cursor.contains("pub expected_sequence"));
+
+    let guard = registry
+        .split("pub struct RegistryRecoveryObservationGuardV2")
+        .nth(1)
+        .unwrap_or("")
+        .split("impl RegistryRecoveryObservationGuardV2")
+        .next()
+        .unwrap_or("");
+    assert!(guard.contains("_state: MutexGuard<'a, RegistryState>"));
+    assert!(guard.contains("registry: Weak<RegistryInner>"));
+    assert!(!guard.contains("pub _state"));
+    assert!(!guard.contains("pub registry"));
+
+    for authority in [
+        "RegistryEmptyRecoveryCursorV2",
+        "RegistryRecoveryObservationGuardV2",
+    ] {
+        let declaration = format!("pub struct {authority}");
+        let prefix = registry.split(&declaration).next().unwrap_or("").trim_end();
+        assert!(!prefix.ends_with(")]"));
+        for implemented in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!registry.contains(&format!("impl {implemented} for {authority}")));
+        }
+    }
+
+    assert!(!registry.contains("impl RegistryEmptyRecoveryCursorV2"));
+    assert!(registry.contains("RegistryEmptyRecoveryCursorV2(<redacted>)"));
+    assert!(registry.contains("pub fn recovery_observation_guard_v2("));
+    assert!(registry.contains("pub fn revalidate_empty_recovery_cursor_v2("));
+    assert!(registry.contains("Weak::ptr_eq(&cursor.registry"));
+    assert!(registry.contains("observation.observation_sequence() != cursor.expected_sequence"));
+    for forbidden in [
+        "cursor.seal",
+        "cursor.refence",
+        "cursor.remove",
+        "cursor.install",
+        "cursor.activate",
+        "cursor.admit",
+    ] {
+        assert!(!registry.contains(forbidden), "{forbidden}");
+    }
+    for (source, forbidden) in [
+        (registry, "RegistryRecoveryCursorV2"),
+        (registry, "revalidate_recovery_cursor_v2"),
+        (error, "StaleRegistryRecoveryCursor"),
+        (public, "RegistryRecoveryCursorV2"),
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    assert!(specification.contains("exclusively the startup-empty fast path"));
+    assert!(specification.contains("classified non-empty branch requires"));
+    assert!(specification.contains("separate exact per-slot instance-bound witnesses"));
+    assert!(specification.contains("empty cursor cannot replace those witnesses"));
+    assert!(specification.contains("only when selecting the startup-empty branch"));
+}

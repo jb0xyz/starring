@@ -597,6 +597,33 @@ pointer, mutation capability, owner, readiness, gateway, or coordinator
 authority. A copied aggregate or sequence cannot authorize a seal, refence,
 removal, closed database call, recovery transition, or admission resume.
 
+The registry additionally exposes a short-lived recovery observation guard
+over that same registry lock. The guard returns its exact non-authorizing
+aggregate by value and may be consumed into a non-cloneable
+`RegistryEmptyRecoveryCursorV2` only while the aggregate is recovery-empty.
+This cursor is exclusively the startup-empty fast path. It privately retains a
+weak reference to the exact registry instance and the exact global observation
+sequence. Revalidation takes that registry's one lock and rejects a foreign
+instance, a changed sequence, a non-empty aggregate, or terminal failed-closed
+state. It returns only the current non-authorizing aggregate and exposes no
+mutation operation.
+
+The tools adapter acquires this guard only after the coordinator and gateway
+snapshot sections in the fixed coordinator, gateway snapshot, registry lock
+order. It invokes no coordinator, gateway, database, or user callback while
+the guard is live. The empty cursor is only an instance-bound input to later
+revalidation of the startup-empty branch. For the existing `empty or exactly
+classified` recovery choice, the classified non-empty branch requires
+separate exact per-slot instance-bound witnesses. An aggregate, count, global
+sequence, or empty cursor cannot replace those witnesses. The coordinator's
+compound recovery-session transition may consume a revalidated empty cursor
+only when selecting the startup-empty branch; it must consume the separate
+exact witness set when selecting the classified branch. The empty cursor
+remains non-authorizing throughout. Only the separately minted compound closed
+recovery permit authorizes its bounded operations. A cursor or successful
+revalidation alone never authorizes a registry mutation, database call,
+recovery transition, or admission resume.
+
 Public admission reads atomic observation A, requires unsealed `Serving`, and
 acquires its guard against the exact admission generation. Guard acquisition
 returns a non-cloneable capability and its exact successor observation. Final
