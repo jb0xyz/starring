@@ -1654,6 +1654,14 @@ fn v2_drain_claim_evidence_stays_checked_and_non_authorizing() {
         assert!(source.contains(declaration));
     }
 
+    let claim = source
+        .split("pub struct RuntimeDrainClaimV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(claim.contains("key: RuntimeDrainIntentKeyV2,"));
+    assert!(!claim.contains("pub "));
+
     for exact_check in [
         "route.slot() != key.slot",
         "route.identity.target != key.expected_target",
@@ -1669,6 +1677,7 @@ fn v2_drain_claim_evidence_stays_checked_and_non_authorizing() {
         "route.identity != serving_identity.process_identity",
         "expected_route.as_ref() != claim.progress().removal_target()",
         "registry_observation_sequence <= refence_sequence",
+        "&self.key != key",
     ] {
         assert!(
             source.contains(exact_check),
@@ -1682,6 +1691,7 @@ fn v2_drain_claim_evidence_stays_checked_and_non_authorizing() {
         "refenced_progress_changes_only_to_a_strictly_newer_fence",
         "claim_binds_owner_process_fence_and_progress",
         "claim_rejects_foreign_owner_process_and_wrong_claim_fence",
+        "claim_and_acknowledgement_reject_foreign_full_key_fields_with_an_empty_route",
         "certification_resolution_binds_operation_scope_target_and_process",
         "all_certification_resolution_variants_have_closed_views",
         "acknowledgement_accepts_refenced_and_initially_absent_claims",
@@ -1691,6 +1701,88 @@ fn v2_drain_claim_evidence_stays_checked_and_non_authorizing() {
         assert!(
             tests.contains(&format!("fn {test_name}(")),
             "missing V2 drain-claim behavior test: {test_name}"
+        );
+    }
+}
+
+#[test]
+fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
+    let source = include_str!("../src/v2_drain_intent_state.rs");
+    let tests = include_str!("../src/v2_drain_intent_state/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "RuntimeAuthorizedDrainClaimV2",
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "RuntimeShutdownDrainCompletionPermitV2",
+        "pub value:",
+        "pub canonical:",
+        "pub intent_revision:",
+        "pub state:",
+        "pub fn new(",
+        "pub fn pending(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
+        ".next()",
+        "checked_add",
+        "SystemTime",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 drain-intent state surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub enum RuntimeDrainIntentStateKindV2",
+        "pub struct RuntimeDrainIntentStateV2",
+        "pub struct RuntimeDrainIntentV2",
+        "pub fn from_inserted(",
+        "pub fn pending_from_persisted(",
+        "pub fn route_absent_acknowledged_from_persisted(",
+        "pub fn consumed_from_persisted(",
+        "pub fn cancelled_from_persisted(",
+        "pub fn freezes_serving_slot(&self) -> bool",
+        "pub fn is_runtime_terminal(&self) -> bool",
+    ] {
+        assert!(source.contains(declaration), "missing {declaration}");
+    }
+
+    for exact_check in [
+        "RuntimeDrainIntentStateV2::pending(None)",
+        "operation.canonical().clone()",
+        "root.canonical().clone()",
+        "validate_drain_claim_for_key(claim, key)",
+        "validate_route_absent_acknowledgement_for_key(acknowledgement, key)",
+        "RuntimePersistenceU64V2::from_u64(value)",
+        "RuntimeUnixMicrosecondsV2::from_datetime(value)",
+    ] {
+        assert!(
+            source.contains(exact_check),
+            "missing V2 drain-intent state check: {exact_check}"
+        );
+    }
+
+    for test_name in [
+        "inserted_state_is_unclaimed_pending_and_retains_the_exact_canonical_roots",
+        "persisted_constructors_restore_all_four_closed_state_variants",
+        "persisted_pending_and_acknowledged_states_reject_foreign_evidence",
+        "revisions_use_the_full_database_integer_range_without_successor_assumptions",
+        "terminal_timestamps_are_canonical_without_host_clock_ordering",
+        "state_surface_is_cloneable_data_without_wire_or_mutation_authority",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 drain-intent state behavior test: {test_name}"
         );
     }
 }
@@ -2829,6 +2921,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_drain_claim/tests.rs",
             include_str!("../src/v2_drain_claim/tests.rs"),
+        ),
+        (
+            "src/v2_drain_intent_state.rs",
+            include_str!("../src/v2_drain_intent_state.rs"),
+        ),
+        (
+            "src/v2_drain_intent_state/tests.rs",
+            include_str!("../src/v2_drain_intent_state/tests.rs"),
         ),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),

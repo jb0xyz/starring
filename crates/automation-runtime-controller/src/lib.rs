@@ -23,6 +23,7 @@ mod v2_certification_outcome;
 mod v2_digest;
 mod v2_drain;
 mod v2_drain_claim;
+mod v2_drain_intent_state;
 mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
@@ -118,6 +119,10 @@ pub use v2_drain_claim::{
     RuntimeDrainClaimErrorV2, RuntimeDrainClaimFieldV2, RuntimeDrainClaimProgressKindV2,
     RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
     RuntimeRouteAbsentAcknowledgementV2,
+};
+pub use v2_drain_intent_state::{
+    RuntimeDrainIntentStateErrorV2, RuntimeDrainIntentStateFieldV2, RuntimeDrainIntentStateKindV2,
+    RuntimeDrainIntentStateV2, RuntimeDrainIntentV2,
 };
 pub use v2_evidence::{
     RuntimeBarrierPauseWitnessV2, RuntimeEvidenceErrorV2, RuntimePanelEvidenceV2,

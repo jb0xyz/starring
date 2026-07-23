@@ -325,6 +325,7 @@ impl RuntimeDrainClaimProgressV2 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeDrainClaimV2 {
+    key: RuntimeDrainIntentKeyV2,
     gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,
     observed_owner_revision: NonZeroU64,
     process_instance_id: ProcessInstanceId,
@@ -390,6 +391,7 @@ impl RuntimeDrainClaimV2 {
             )?;
         }
         Ok(Self {
+            key: key.clone(),
             gateway_owner_lease_id,
             observed_owner_revision,
             process_instance_id,
@@ -442,6 +444,9 @@ impl RuntimeDrainClaimV2 {
         &self,
         key: &RuntimeDrainIntentKeyV2,
     ) -> Result<(), RuntimeDrainClaimErrorV2> {
+        if &self.key != key {
+            return Err(RuntimeDrainClaimErrorV2::IntentMismatch);
+        }
         self.progress.seal().validate_for_key(key)?;
         if self.progress.seal().process_instance_id() != &self.process_instance_id
             || self.gateway_owner_lease_id.process_instance_id != self.process_instance_id
@@ -740,6 +745,25 @@ impl RuntimeRouteAbsentAcknowledgementV2 {
     pub fn acknowledged_at(&self) -> DateTime<Utc> {
         self.acknowledged_at
     }
+}
+
+pub(crate) fn validate_drain_claim_for_key(
+    claim: &RuntimeDrainClaimV2,
+    key: &RuntimeDrainIntentKeyV2,
+) -> Result<(), RuntimeDrainClaimErrorV2> {
+    validate_key(key)?;
+    claim.validate_for_key(key)
+}
+
+pub(crate) fn validate_route_absent_acknowledgement_for_key(
+    acknowledgement: &RuntimeRouteAbsentAcknowledgementV2,
+    key: &RuntimeDrainIntentKeyV2,
+) -> Result<(), RuntimeDrainClaimErrorV2> {
+    validate_key(key)?;
+    acknowledgement.claim.validate_for_key(key)?;
+    acknowledgement
+        .certification
+        .validate_for(key, &acknowledgement.claim)
 }
 
 fn validate_key(key: &RuntimeDrainIntentKeyV2) -> Result<(), RuntimeDrainClaimErrorV2> {

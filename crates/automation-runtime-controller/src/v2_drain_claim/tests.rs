@@ -11,6 +11,7 @@ use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
 
 use super::{
+    validate_drain_claim_for_key, validate_route_absent_acknowledgement_for_key,
     RuntimeDrainCertificationResolutionKindV2, RuntimeDrainCertificationResolutionV2,
     RuntimeDrainClaimErrorV2, RuntimeDrainClaimFieldV2, RuntimeDrainClaimProgressKindV2,
     RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
@@ -168,6 +169,37 @@ fn serving_identity() -> RuntimeServingIdentityV2 {
         lease_epoch: non_zero(22),
         revision: non_zero(23),
     }
+}
+
+fn foreign_keys_with_same_intent_and_slot() -> Vec<RuntimeDrainIntentKeyV2> {
+    let mut product_operation = key();
+    product_operation.product_operation_id =
+        RuntimeProductOperationIdV2::parse("22223333444455556666777788889999").unwrap();
+
+    let mut product_digest = key();
+    product_digest.product_mutation_digest =
+        RuntimeProductMutationDigestV2::parse("c".repeat(64)).unwrap();
+
+    let mut deployment_scope = key();
+    deployment_scope.scope.tenant_id = TenantId::parse("tenant:2").unwrap();
+
+    let mut expected_revision = key();
+    expected_revision.expected_revision = DeploymentRevision::new(6).unwrap();
+
+    let mut expected_target = key();
+    expected_target.expected_target.version = RuleSetVersionId::new(2).unwrap();
+
+    let mut mutation_kind = key();
+    mutation_kind.mutation_kind = RuntimeProductMutationKindV2::AuthorityChange;
+
+    vec![
+        product_operation,
+        product_digest,
+        deployment_scope,
+        expected_revision,
+        expected_target,
+        mutation_kind,
+    ]
 }
 
 #[test]
@@ -339,6 +371,35 @@ fn claim_rejects_foreign_owner_process_and_wrong_claim_fence() {
         ),
         Err(RuntimeDrainClaimErrorV2::ClaimFenceMismatch)
     );
+}
+
+#[test]
+fn claim_and_acknowledgement_reject_foreign_full_key_fields_with_an_empty_route() {
+    let claim = claim(claimed(None));
+    assert!(claim.progress().seal().expected_route().is_none());
+    let acknowledgement = RuntimeRouteAbsentAcknowledgementV2::new(
+        &key(),
+        claim.clone(),
+        None,
+        ordinary(),
+        non_zero(15),
+        RuntimeDrainCertificationResolutionV2::no_operation_reserved(),
+        at(120),
+    )
+    .unwrap();
+
+    for foreign_key in foreign_keys_with_same_intent_and_slot() {
+        assert_eq!(foreign_key.intent_id, key().intent_id);
+        assert_eq!(foreign_key.slot, key().slot);
+        assert_eq!(
+            validate_drain_claim_for_key(&claim, &foreign_key),
+            Err(RuntimeDrainClaimErrorV2::IntentMismatch)
+        );
+        assert_eq!(
+            validate_route_absent_acknowledgement_for_key(&acknowledgement, &foreign_key),
+            Err(RuntimeDrainClaimErrorV2::IntentMismatch)
+        );
+    }
 }
 
 #[test]
