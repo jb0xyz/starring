@@ -34,6 +34,7 @@ mod v2_suspension;
 mod v2_suspension_canonical;
 mod v2_suspension_observation;
 mod v2_suspension_operation;
+mod v2_suspension_resume;
 mod v2_suspension_sidecar;
 mod v2_writer_fence;
 
@@ -162,6 +163,11 @@ pub use v2_suspension_operation::{
     RuntimeSuspendAttemptOperationFieldV2, RuntimeSuspendAttemptOperationPersistenceErrorV2,
     RuntimeSuspendAttemptOperationScopeV2, RuntimeSuspendAttemptOperationV2,
     RuntimeSuspendAttemptReplayErrorV2, RuntimeSuspendAttemptScopeLookupV2,
+};
+pub use v2_suspension_resume::{
+    RuntimeControllerLeaseDurationV2, RuntimeResumeSuspendedAttemptErrorV2,
+    RuntimeResumeSuspendedAttemptV2, RuntimeSuspendAttemptResumeBasisErrorV2,
+    RuntimeSuspendAttemptResumeBasisV2, RuntimeSuspendAttemptResumeGateV2,
 };
 pub use v2_suspension_sidecar::{
     RuntimeSuspendAttemptDrainProgressErrorV2, RuntimeSuspendAttemptDrainProgressV2,

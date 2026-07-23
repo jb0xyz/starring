@@ -2377,6 +2377,95 @@ fn v2_suspension_observation_proves_only_checked_local_quiescence() {
 }
 
 #[test]
+fn v2_suspension_resume_basis_closes_database_correlation_without_authority() {
+    let source = include_str!("../src/v2_suspension_resume.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "Utc::now",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension resume surface: {forbidden}"
+        );
+    }
+
+    let basis = source
+        .split("pub struct RuntimeSuspendAttemptResumeBasisV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "locally_quiescent: RuntimeLocallyQuiescentSuspendedAttemptV2,",
+        "persisted_convergence_attempt: NonZeroU32,",
+        "persisted_last_controller_id: ControllerId,",
+        "gate: RuntimeSuspendAttemptResumeGateV2,",
+    ] {
+        assert!(basis.contains(field), "{field}");
+    }
+    assert_eq!(basis.matches("    ").count(), 4);
+    assert!(!basis.contains("pub "));
+
+    let resume = source
+        .split("pub struct RuntimeResumeSuspendedAttemptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "basis: RuntimeSuspendAttemptResumeBasisV2,",
+        "controller_id: ControllerId,",
+        "lease_for: RuntimeControllerLeaseDurationV2,",
+    ] {
+        assert!(resume.contains(field), "{field}");
+    }
+    assert_eq!(resume.matches("    ").count(), 3);
+    assert!(!resume.contains("pub "));
+
+    assert!(source.contains(concat!(
+        "pub fn new(\n",
+        "        locally_quiescent: RuntimeLocallyQuiescentSuspendedAttemptV2,\n",
+        "        persisted_convergence_attempt: NonZeroU32,\n",
+        "        persisted_last_controller_id: ControllerId,\n",
+        "        gate: RuntimeSuspendAttemptResumeGateV2,"
+    )));
+    assert!(source.contains("suspended.operation_scope().convergence_attempt()"));
+    assert!(
+        source.contains("persisted_last_controller_id != suspended.source_guard().controller_id")
+    );
+    assert!(source.contains("RuntimeUnixMicrosecondsV2::from_datetime(*database_observed_at)"));
+    assert!(source.contains("database_observed_at < retry_not_before"));
+    assert!(source.contains("expected_failure_id == &suspended.failure().failure_id"));
+    assert!(source.contains("!value.subsec_nanos().is_multiple_of(1_000_000)"));
+    assert!(source.contains("!(1_000..=600_000).contains(&milliseconds)"));
+    assert!(source.contains("RuntimeControllerLeaseDurationV2::new(lease_for)?"));
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeControllerLeaseDurationV2",
+        "RuntimeResumeSuspendedAttemptErrorV2",
+        "RuntimeResumeSuspendedAttemptV2",
+        "RuntimeSuspendAttemptResumeBasisErrorV2",
+        "RuntimeSuspendAttemptResumeBasisV2",
+        "RuntimeSuspendAttemptResumeGateV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -2479,6 +2568,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension_observation/tests.rs",
             include_str!("../src/v2_suspension_observation/tests.rs"),
+        ),
+        (
+            "src/v2_suspension_resume.rs",
+            include_str!("../src/v2_suspension_resume.rs"),
+        ),
+        (
+            "src/v2_suspension_resume/tests.rs",
+            include_str!("../src/v2_suspension_resume/tests.rs"),
         ),
         (
             "src/v2_suspension_sidecar.rs",
