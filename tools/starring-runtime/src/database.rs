@@ -114,12 +114,16 @@ impl Debug for RuntimeDatabasePoolShutdownErrorV1 {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeDatabaseReadinessV1 {
-    verified: bool,
+    execution: RuntimeExecutionDatabaseReadinessV1,
+    exact_target: RuntimeExactTargetDatabaseReadinessV1,
+    panel: RuntimePanelDatabaseReadinessV1,
+    serving: RuntimeServingDatabaseReadinessV1,
+    interaction: RuntimeInteractionDatabaseReadinessV1,
 }
 
 impl RuntimeDatabaseReadinessV1 {
     pub const fn is_verified(&self) -> bool {
-        self.verified
+        true
     }
 }
 
@@ -399,13 +403,13 @@ async fn build_verified_dependencies_v1(
     let panel = panel.map_err(panel_readiness_error)?;
     let serving = serving.map_err(serving_readiness_error)?;
     let interaction = interaction.map_err(interaction_readiness_error)?;
-    let initial_readiness = aggregate_readiness_v1([
-        execution_authority(execution.initial_readiness()),
-        exact_target_authority(exact_target.initial_readiness()),
-        panel_authority(panel.initial_readiness()),
-        serving_authority(serving.initial_readiness()),
-        interaction_authority(interaction.initial_readiness()),
-    ])?;
+    let initial_readiness = aggregate_readiness_v1(
+        execution.initial_readiness().clone(),
+        exact_target.initial_readiness().clone(),
+        panel.initial_readiness().clone(),
+        serving.initial_readiness().clone(),
+        interaction.initial_readiness().clone(),
+    )?;
     Ok(RuntimeDatabaseDependenciesV1 {
         execution,
         exact_target,
@@ -432,13 +436,7 @@ fn verified_readiness_from_results(
     let panel = panel.map_err(panel_readiness_error)?;
     let serving = serving.map_err(serving_readiness_error)?;
     let interaction = interaction.map_err(interaction_readiness_error)?;
-    aggregate_readiness_v1([
-        execution_authority(&execution),
-        exact_target_authority(&exact_target),
-        panel_authority(&panel),
-        serving_authority(&serving),
-        interaction_authority(&interaction),
-    ])
+    aggregate_readiness_v1(execution, exact_target, panel, serving, interaction)
 }
 
 fn readiness_authority_mismatch(
@@ -607,9 +605,9 @@ fn authority<'a>(
     }
 }
 
-fn aggregate_readiness_v1(
+fn validate_readiness_authorities_v1(
     observations: [RuntimeDatabaseAuthorityObservationV1<'_>; 5],
-) -> Result<RuntimeDatabaseReadinessV1, RuntimeDatabaseCompositionErrorV1> {
+) -> Result<(), RuntimeDatabaseCompositionErrorV1> {
     let expected_identity = observations[0].database_identity;
     let expected_name = observations[0].database_name;
     if observations.iter().any(|observation| {
@@ -625,7 +623,30 @@ fn aggregate_readiness_v1(
     if roles.len() != observations.len() {
         return Err(RuntimeDatabaseCompositionErrorV1::AuthorityMismatch);
     }
-    Ok(RuntimeDatabaseReadinessV1 { verified: true })
+    Ok(())
+}
+
+fn aggregate_readiness_v1(
+    execution: RuntimeExecutionDatabaseReadinessV1,
+    exact_target: RuntimeExactTargetDatabaseReadinessV1,
+    panel: RuntimePanelDatabaseReadinessV1,
+    serving: RuntimeServingDatabaseReadinessV1,
+    interaction: RuntimeInteractionDatabaseReadinessV1,
+) -> Result<RuntimeDatabaseReadinessV1, RuntimeDatabaseCompositionErrorV1> {
+    validate_readiness_authorities_v1([
+        execution_authority(&execution),
+        exact_target_authority(&exact_target),
+        panel_authority(&panel),
+        serving_authority(&serving),
+        interaction_authority(&interaction),
+    ])?;
+    Ok(RuntimeDatabaseReadinessV1 {
+        execution,
+        exact_target,
+        panel,
+        serving,
+        interaction,
+    })
 }
 
 struct ConnectedRuntimeDatabasePoolsV1 {
@@ -945,12 +966,7 @@ mod tests {
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_d"),
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_e"),
         ];
-        let readiness = aggregate_readiness_v1(observations).unwrap();
-        assert!(readiness.is_verified());
-        assert_eq!(
-            format!("{readiness:?}"),
-            "RuntimeDatabaseReadinessV1(<redacted>)"
-        );
+        assert_eq!(validate_readiness_authorities_v1(observations), Ok(()));
         let duplicate = [
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_a"),
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_b"),
@@ -959,7 +975,7 @@ mod tests {
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_a"),
         ];
         assert_eq!(
-            aggregate_readiness_v1(duplicate),
+            validate_readiness_authorities_v1(duplicate),
             Err(RuntimeDatabaseCompositionErrorV1::AuthorityMismatch)
         );
     }
@@ -974,7 +990,7 @@ mod tests {
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_e"),
         ];
         assert_eq!(
-            aggregate_readiness_v1(identity_mix),
+            validate_readiness_authorities_v1(identity_mix),
             Err(RuntimeDatabaseCompositionErrorV1::AuthorityMismatch)
         );
         let name_mix = [
@@ -985,8 +1001,64 @@ mod tests {
             authority("01234567-89ab-cdef-8123-456789abcdef", "starring", "role_e"),
         ];
         assert_eq!(
-            aggregate_readiness_v1(name_mix),
+            validate_readiness_authorities_v1(name_mix),
             Err(RuntimeDatabaseCompositionErrorV1::AuthorityMismatch)
+        );
+    }
+
+    #[test]
+    fn aggregate_preserves_all_five_exact_readiness_receipts() {
+        let identity = "01234567-89ab-cdef-8123-456789abcdef";
+        let database = "starring";
+        let execution = RuntimeExecutionDatabaseReadinessV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            executor_role: "role_a".to_string(),
+            checked_at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+        };
+        let exact_target = RuntimeExactTargetDatabaseReadinessV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            executor_role: "role_b".to_string(),
+            checked_at: chrono::DateTime::from_timestamp(2, 0).unwrap(),
+        };
+        let panel = RuntimePanelDatabaseReadinessV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            executor_role: "role_c".to_string(),
+            checked_at: chrono::DateTime::from_timestamp(3, 0).unwrap(),
+        };
+        let serving = RuntimeServingDatabaseReadinessV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            executor_role: "role_d".to_string(),
+            checked_at: chrono::DateTime::from_timestamp(4, 0).unwrap(),
+        };
+        let interaction = RuntimeInteractionDatabaseReadinessV1 {
+            database_identity: identity.to_string(),
+            database_name: database.to_string(),
+            executor_role: "role_e".to_string(),
+            checked_at: chrono::DateTime::from_timestamp(5, 0).unwrap(),
+        };
+
+        let readiness = aggregate_readiness_v1(
+            execution.clone(),
+            exact_target.clone(),
+            panel.clone(),
+            serving.clone(),
+            interaction.clone(),
+        )
+        .unwrap();
+
+        assert!(readiness.is_verified());
+        assert_eq!(readiness.execution, execution);
+        assert_eq!(readiness.exact_target, exact_target);
+        assert_eq!(readiness.panel, panel);
+        assert_eq!(readiness.serving, serving);
+        assert_eq!(readiness.interaction, interaction);
+        assert_eq!(
+            format!("{readiness:?}"),
+            "RuntimeDatabaseReadinessV1(<redacted>)"
         );
     }
 

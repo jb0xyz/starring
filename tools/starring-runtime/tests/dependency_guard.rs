@@ -250,6 +250,29 @@ fn startup_observation_fixed_point_cannot_mint_gateway_owner_handoff_authority()
 }
 
 #[test]
+fn database_readiness_retains_five_exact_receipts_without_serialization() {
+    let database = include_str!("../src/database.rs");
+    let declaration = database
+        .split("pub struct RuntimeDatabaseReadinessV1 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl RuntimeDatabaseReadinessV1").next())
+        .unwrap();
+
+    for field in [
+        "execution: RuntimeExecutionDatabaseReadinessV1",
+        "exact_target: RuntimeExactTargetDatabaseReadinessV1",
+        "panel: RuntimePanelDatabaseReadinessV1",
+        "serving: RuntimeServingDatabaseReadinessV1",
+        "interaction: RuntimeInteractionDatabaseReadinessV1",
+    ] {
+        assert!(declaration.contains(field));
+    }
+    assert!(!declaration.contains("verified: bool"));
+    assert!(!database.contains("Serialize"));
+    assert!(!database.contains("Deserialize"));
+}
+
+#[test]
 fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
     assert_eq!(WORKSPACE.matches("\"tools/starring-runtime\"").count(), 1);
     let sources = source_files();
