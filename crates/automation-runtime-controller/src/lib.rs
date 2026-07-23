@@ -27,6 +27,7 @@ mod v2_gateway;
 mod v2_identity;
 mod v2_product;
 mod v2_product_drain_canonical;
+mod v2_product_drain_operation;
 mod v2_route;
 mod v2_route_provenance;
 mod v2_startup_recovery;
@@ -134,6 +135,13 @@ pub use v2_product_drain_canonical::{
     RuntimeCanonicalProductDrainV2, RuntimeProductDrainCanonicalErrorV2,
     RuntimeProductDrainCanonicalFieldV2, RuntimeProductDrainCanonicalRootV2,
     RuntimeProductDrainCorrelationV2,
+};
+pub use v2_product_drain_operation::{
+    RuntimeDrainIntentOperationScopeV2, RuntimePersistedProductDrainRootV2,
+    RuntimeProductDrainOperationBuildErrorV2, RuntimeProductDrainOperationFieldV2,
+    RuntimeProductDrainOperationPersistenceErrorV2, RuntimeProductDrainOperationV2,
+    RuntimeProductDrainReplayErrorV2, RuntimeProductDrainScopeLookupV2,
+    RuntimeProductOperationScopeV2,
 };
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
 pub use v2_route_provenance::{

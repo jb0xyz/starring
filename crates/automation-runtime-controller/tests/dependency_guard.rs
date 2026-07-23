@@ -1709,6 +1709,112 @@ fn v2_product_drain_canonical_surface_stays_closed_and_purpose_specific() {
 }
 
 #[test]
+fn v2_product_drain_operations_bind_natural_scopes_and_byte_exact_replay() {
+    let source = include_str!("../src/v2_product_drain_operation.rs");
+    let tests = include_str!("../src/v2_product_drain_operation/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "RuntimeExecutionConvergencePort",
+        "RuntimeServingLeasePort",
+        "RuntimeDrainIntentStateV2",
+        "RuntimeDrainClaimV2",
+        "pub scope:",
+        "pub expected_revision:",
+        "pub slot:",
+        "pub canonical:",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 Product drain operation surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub struct RuntimeProductOperationScopeV2",
+        "pub struct RuntimeDrainIntentOperationScopeV2",
+        "pub struct RuntimeProductDrainOperationV2",
+        "pub struct RuntimePersistedProductDrainRootV2",
+        "pub struct RuntimeProductDrainScopeLookupV2",
+    ] {
+        assert!(source.contains(declaration));
+    }
+    assert!(source.contains("RuntimeDeployment::restore(snapshot.clone())"));
+    assert!(source.contains("RuntimeDeploymentScopeV1::from_identity(&snapshot.identity)"));
+    assert!(source.contains("RuntimeServingSlotV2::from_target(&snapshot.target)"));
+    assert!(source.contains("product.scope != expected_scope"));
+    assert!(source.contains("product.expected_revision != snapshot.revision"));
+    assert!(source.contains("product.slot != expected_slot"));
+    assert!(source.contains("product.expected_target != snapshot.target"));
+    assert!(source.contains("RuntimeCanonicalProductDrainV2::from_persisted("));
+
+    for comparison in [
+        "persisted_product_scope != &product.scope",
+        "persisted_product_expected_revision != product.expected_revision",
+        "persisted_product_operation_id != &product.operation_id",
+        "persisted_drain_scope != &drain.scope",
+        "persisted_drain_slot != &drain.slot",
+        "persisted_drain_expected_revision != drain.expected_revision",
+        "persisted_drain_intent_id != &drain.intent_id",
+        "persisted_expected_target != &product.expected_target",
+        "self.product_operation_scope == *proposed.product_operation_scope()",
+        "self.drain_intent_scope == *proposed.drain_intent_scope()",
+        "self.product_operation_id() == proposed.product_operation_id()",
+        "self.drain_intent_id() == proposed.drain_intent_id()",
+        "self.product_mutation_request_bytes()",
+        "== proposed.product_mutation_request_bytes()",
+        "self.product_mutation_digest() == proposed.product_mutation_digest()",
+        "self.drain_intent_request_bytes() == proposed.drain_intent_request_bytes()",
+        "self.drain_intent_digest() == proposed.drain_intent_digest()",
+    ] {
+        assert!(
+            source.contains(comparison),
+            "missing exact check: {comparison}"
+        );
+    }
+
+    let lookup = source
+        .split("pub struct RuntimeProductDrainScopeLookupV2 {")
+        .nth(1)
+        .and_then(|source| source.split("fn validate_snapshot(").next())
+        .unwrap();
+    for forbidden in [
+        "RuntimeProductOperationIdV2",
+        "RuntimeDrainIntentIdV2",
+        "RuntimeProductMutationDigestV2",
+        "RuntimeDrainIntentDigestV2",
+        "canonical",
+    ] {
+        assert!(
+            !lookup.contains(forbidden),
+            "scope-only lookup contains {forbidden}"
+        );
+    }
+
+    for test_name in [
+        "operation_binds_both_exact_natural_scopes_to_the_locked_snapshot",
+        "operation_rejects_an_invalid_locked_snapshot",
+        "operation_rejects_every_locked_row_root_mismatch",
+        "scope_lookup_contains_only_the_two_natural_scopes",
+        "persisted_root_reconstructs_both_exact_roots_and_normalized_scopes",
+        "persisted_root_rejects_every_normalized_identity_mismatch",
+        "persisted_root_rejects_canonical_corruption_in_either_root",
+        "byte_exact_replay_accepts_only_the_original_scopes_ids_bytes_and_digests",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing Product drain operation behavior test: {test_name}"
+        );
+    }
+}
+
+#[test]
 fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
     let canonical = include_str!("../src/v2_suspension_canonical.rs");
     let wire = include_str!("../src/v2_suspension_canonical/wire.rs");
@@ -2651,6 +2757,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_product_drain_canonical/tests.rs",
             include_str!("../src/v2_product_drain_canonical/tests.rs"),
+        ),
+        (
+            "src/v2_product_drain_operation.rs",
+            include_str!("../src/v2_product_drain_operation.rs"),
+        ),
+        (
+            "src/v2_product_drain_operation/tests.rs",
+            include_str!("../src/v2_product_drain_operation/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
         (
