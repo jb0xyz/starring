@@ -35,6 +35,7 @@ mod v2_identity;
 mod v2_product;
 mod v2_product_drain_canonical;
 mod v2_route;
+mod v2_route_provenance;
 mod v2_startup_recovery;
 mod v2_writer_fence;
 
@@ -135,6 +136,10 @@ pub use v2_product_drain_canonical::{
     RuntimeProductDrainCorrelationV2,
 };
 pub use v2_route::{RuntimeExactLocalRouteIdentityV2, RuntimeServingSlotV2};
+pub use v2_route_provenance::{
+    RuntimeClosedRecoveryRouteWitnessV2, RuntimeRouteMutationProvenanceV2,
+    RuntimeShutdownRouteWitnessV2,
+};
 pub use v2_startup_recovery::{
     RuntimeStartupRecoveryObservationCorrelationV2, RuntimeStartupRecoveryObservationReceiptV2,
     RuntimeStartupRecoveryObservationRequestV2, RuntimeStartupRecoveryStateV2,

@@ -118,6 +118,10 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
             "v2_startup_recovery.rs",
             include_str!("../src/v2_startup_recovery.rs"),
         ),
+        (
+            "v2_route_provenance.rs",
+            include_str!("../src/v2_route_provenance.rs"),
+        ),
     ] {
         for forbidden in [
             "Serialize",
@@ -131,6 +135,123 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
                 "forbidden evidence surface in {path}: {forbidden}"
             );
         }
+    }
+}
+
+#[test]
+fn v2_route_mutation_provenance_is_exact_inert_evidence() {
+    let source = include_str!("../src/v2_route_provenance.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "automation_runtime::",
+        "registry_observation_sequence",
+        "pub fn validate",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden route provenance surface: {forbidden}"
+        );
+    }
+
+    let closed = source
+        .split("pub struct RuntimeClosedRecoveryRouteWitnessV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("recovery_id", "RuntimeRecoveryIdV2"),
+        ("originating_emergency_generation", "NonZeroU64"),
+        ("recovery_generation", "NonZeroU64"),
+        ("recovery_authority_revision", "NonZeroU64"),
+        ("gateway_owner_lease_id", "RuntimeGatewayOwnerLeaseIdV1"),
+        ("observed_owner_revision", "NonZeroU64"),
+        ("owner_expires_at", "DateTime<Utc>"),
+        ("process_instance_id", "ProcessInstanceId"),
+        ("connection_epoch", "NonZeroU64"),
+        ("paused_admission_revision", "NonZeroU64"),
+        (
+            "connected_event_sequence",
+            "RuntimeGatewayAdmissionSequenceV2",
+        ),
+        ("pause_sequence", "RuntimeGatewayAdmissionSequenceV2"),
+    ] {
+        assert!(closed.contains(&format!("pub {field}: {field_type},")));
+    }
+    assert_eq!(closed.matches("    pub ").count(), 12);
+
+    let shutdown = source
+        .split("pub struct RuntimeShutdownRouteWitnessV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("shutdown_generation", "NonZeroU64"),
+        ("gateway_owner_lease_id", "RuntimeGatewayOwnerLeaseIdV1"),
+        ("observed_owner_revision", "NonZeroU64"),
+        ("owner_expires_at", "DateTime<Utc>"),
+        ("process_instance_id", "ProcessInstanceId"),
+        ("connection_epoch", "NonZeroU64"),
+        ("paused_admission_revision", "NonZeroU64"),
+        (
+            "connected_event_sequence",
+            "RuntimeGatewayAdmissionSequenceV2",
+        ),
+        ("pause_sequence", "RuntimeGatewayAdmissionSequenceV2"),
+    ] {
+        assert!(shutdown.contains(&format!("pub {field}: {field_type},")));
+    }
+    assert_eq!(shutdown.matches("    pub ").count(), 9);
+
+    let provenance = source
+        .split("pub enum RuntimeRouteMutationProvenanceV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[cfg(test)]").next())
+        .unwrap();
+    for member in [
+        "Ordinary {",
+        "barrier_id: RuntimeBarrierIdV1,",
+        "pause: RuntimeBarrierPauseWitnessV2,",
+        "ClosedRecovery(RuntimeClosedRecoveryRouteWitnessV2),",
+        "Shutdown(RuntimeShutdownRouteWitnessV2),",
+    ] {
+        assert!(provenance.contains(member), "{member}");
+    }
+    assert_eq!(
+        provenance
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        3
+    );
+    assert_eq!(provenance.matches("barrier_id:").count(), 1);
+    assert_eq!(provenance.matches("pause:").count(), 1);
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeClosedRecoveryRouteWitnessV2",
+        "RuntimeRouteMutationProvenanceV2",
+        "RuntimeShutdownRouteWitnessV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
     }
 }
 
@@ -1432,6 +1553,10 @@ fn source_files_contain_no_comments() {
             include_str!("../src/v2_product_drain_canonical/tests.rs"),
         ),
         ("src/v2_route.rs", include_str!("../src/v2_route.rs")),
+        (
+            "src/v2_route_provenance.rs",
+            include_str!("../src/v2_route_provenance.rs"),
+        ),
         (
             "src/v2_startup_recovery.rs",
             include_str!("../src/v2_startup_recovery.rs"),
