@@ -8,9 +8,12 @@ use automation_runtime_convergence::{
 };
 use chrono::{DateTime, Utc};
 
+use crate::v2_suspension::{
+    suspension_current_target_matches, suspension_previous_runtime_matches,
+    suspension_source_evidence_at,
+};
 use crate::{
-    RuntimeCanonicalSuspendAttemptV2, RuntimeDeploymentScopeV1, RuntimeDrainObligationV2,
-    RuntimeExactLocalRouteIdentityV2, RuntimeExecutionReceiptV1, RuntimeLocalRouteEffectV2,
+    RuntimeCanonicalSuspendAttemptV2, RuntimeDeploymentScopeV1, RuntimeExecutionReceiptV1,
     RuntimeSuspendAttemptCanonicalErrorV2, RuntimeSuspendAttemptDigestV2, RuntimeSuspensionIdV2,
     RuntimeSuspensionSourcePhaseV2,
 };
@@ -304,9 +307,17 @@ fn validate_attempt_against_execution(
         Some(RuntimeSuspendAttemptOperationFieldV2::RuntimeGeneration)
     } else if request.source_phase != expected_phase {
         Some(RuntimeSuspendAttemptOperationFieldV2::SourcePhase)
-    } else if !current_target_matches(request, &execution.snapshot.target) {
+    } else if !suspension_current_target_matches(
+        &request.local_effect,
+        &request.drain_obligation,
+        &execution.snapshot.target,
+    ) {
         Some(RuntimeSuspendAttemptOperationFieldV2::CurrentTarget)
-    } else if !previous_runtime_matches(request, execution.snapshot.previous_runtime.as_ref()) {
+    } else if !suspension_previous_runtime_matches(
+        &request.drain_obligation,
+        execution.snapshot.previous_runtime.as_ref(),
+        &execution.snapshot.target,
+    ) {
         Some(RuntimeSuspendAttemptOperationFieldV2::PreviousRuntime)
     } else {
         None
@@ -316,7 +327,8 @@ fn validate_attempt_against_execution(
             RuntimeSuspendAttemptOperationBuildErrorV2::RequestCorrelationMismatch { field },
         );
     }
-    let evidence_at = source_evidence_at(execution, expected_phase)?;
+    let evidence_at = suspension_source_evidence_at(&execution.snapshot, expected_phase)
+        .ok_or(RuntimeSuspendAttemptOperationBuildErrorV2::InvalidExecutionReceipt)?;
     if request.failure.recorded_at < evidence_at {
         return Err(
             RuntimeSuspendAttemptOperationBuildErrorV2::RequestCorrelationMismatch {
@@ -325,92 +337,6 @@ fn validate_attempt_against_execution(
         );
     }
     Ok(evidence_at)
-}
-
-fn current_target_matches(
-    request: &crate::RuntimeSuspendAttemptRequestV2,
-    target: &RuntimeDeploymentTargetV1,
-) -> bool {
-    let effect_matches = match &request.local_effect {
-        RuntimeLocalRouteEffectV2::None => true,
-        RuntimeLocalRouteEffectV2::ExactRoute { route, .. } => {
-            local_route_target_matches(route, target)
-        }
-        RuntimeLocalRouteEffectV2::RouteAbsent {
-            slot,
-            expected_route,
-            ..
-        } => {
-            slot == &crate::RuntimeServingSlotV2::from_target(target)
-                && expected_route
-                    .as_ref()
-                    .is_none_or(|route| local_route_target_matches(route, target))
-        }
-    };
-    let obligation_matches = match &request.drain_obligation {
-        RuntimeDrainObligationV2::None | RuntimeDrainObligationV2::PreviousServing(_) => true,
-        RuntimeDrainObligationV2::ExactLocalRoute(route) => {
-            local_route_target_matches(route, target)
-        }
-        RuntimeDrainObligationV2::LocalAndPrevious { local, .. } => {
-            local_route_target_matches(local, target)
-        }
-    };
-    effect_matches && obligation_matches
-}
-
-fn local_route_target_matches(
-    route: &RuntimeExactLocalRouteIdentityV2,
-    target: &RuntimeDeploymentTargetV1,
-) -> bool {
-    route.identity.target == *target
-}
-
-fn previous_runtime_matches(
-    request: &crate::RuntimeSuspendAttemptRequestV2,
-    source_previous_runtime: Option<&RuntimeProcessIdentityV1>,
-) -> bool {
-    let previous = match &request.drain_obligation {
-        RuntimeDrainObligationV2::PreviousServing(previous)
-        | RuntimeDrainObligationV2::LocalAndPrevious { previous, .. } => Some(previous),
-        RuntimeDrainObligationV2::None | RuntimeDrainObligationV2::ExactLocalRoute(_) => None,
-    };
-    previous.is_none_or(|previous| source_previous_runtime == Some(&previous.process))
-}
-
-fn source_evidence_at(
-    execution: &RuntimeExecutionReceiptV1,
-    source_phase: RuntimeSuspensionSourcePhaseV2,
-) -> Result<DateTime<Utc>, RuntimeSuspendAttemptOperationBuildErrorV2> {
-    let snapshot = &execution.snapshot;
-    match source_phase {
-        RuntimeSuspensionSourcePhaseV2::Requested => Ok(snapshot.requested_at),
-        RuntimeSuspensionSourcePhaseV2::PreflightReady
-        | RuntimeSuspensionSourcePhaseV2::DrainRequested => snapshot
-            .preflight
-            .as_ref()
-            .map(|preflight| preflight.checked_at)
-            .ok_or(RuntimeSuspendAttemptOperationBuildErrorV2::InvalidExecutionReceipt),
-        RuntimeSuspensionSourcePhaseV2::Drained
-        | RuntimeSuspensionSourcePhaseV2::ActivationApplying => snapshot
-            .drain
-            .as_ref()
-            .map(|drain| drain.drained_at)
-            .ok_or(RuntimeSuspendAttemptOperationBuildErrorV2::InvalidExecutionReceipt),
-        RuntimeSuspensionSourcePhaseV2::RuntimePendingReady
-        | RuntimeSuspensionSourcePhaseV2::ReconcilingPanels => snapshot
-            .activation
-            .as_ref()
-            .map(|activation| {
-                snapshot
-                    .last_live_recovery
-                    .as_ref()
-                    .map_or(activation.activated_at, |recovery| {
-                        activation.activated_at.max(recovery.recovered_at)
-                    })
-            })
-            .ok_or(RuntimeSuspendAttemptOperationBuildErrorV2::InvalidExecutionReceipt),
-    }
 }
 
 fn persistence_mismatch(

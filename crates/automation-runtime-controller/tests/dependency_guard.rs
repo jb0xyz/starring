@@ -1945,6 +1945,7 @@ fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
 fn v2_suspension_operation_binds_one_exact_execution_without_authority() {
     let source = include_str!("../src/v2_suspension_operation.rs");
     let tests = include_str!("../src/v2_suspension_operation/tests.rs");
+    let evidence = include_str!("../src/v2_suspension.rs");
 
     for forbidden in [
         "serde",
@@ -2063,7 +2064,7 @@ fn v2_suspension_operation_binds_one_exact_execution_without_authority() {
         "RuntimeSuspensionSourcePhaseV2::RuntimePendingReady",
         "RuntimeSuspensionSourcePhaseV2::ReconcilingPanels",
     ] {
-        assert!(source.contains(phase), "{phase}");
+        assert!(evidence.contains(phase), "{phase}");
     }
     assert!(source.contains("guard.scope != expected_scope"));
     assert!(source.contains("guard.expected_revision != execution.snapshot.revision"));
@@ -2071,14 +2072,18 @@ fn v2_suspension_operation_binds_one_exact_execution_without_authority() {
     assert!(source.contains("guard.controller_id != execution.controller_id"));
     assert!(source.contains("guard.fencing_token != execution.fencing_token"));
     assert!(source.contains("guard.runtime_generation != execution.snapshot.runtime_generation"));
-    assert!(source.contains("route.identity.target == *target"));
-    assert!(source.contains("source_previous_runtime == Some(&previous.process)"));
+    assert!(source.contains("suspension_current_target_matches("));
+    assert!(source.contains("suspension_previous_runtime_matches("));
+    assert!(evidence.contains("route.identity.target == *target"));
+    assert!(evidence.contains("previous_runtime == Some(&previous.process)"));
+    assert!(evidence.contains("previous.process.target.same_slot(target)"));
     assert!(source.contains("request.failure.recorded_at < evidence_at"));
-    assert!(source.contains("snapshot.requested_at"));
-    assert!(source.contains("preflight.checked_at"));
-    assert!(source.contains("drain.drained_at"));
-    assert!(source.contains("activation.activated_at.max(recovery.recovered_at)"));
-    assert!(source.contains(".last_live_recovery"));
+    assert!(source.contains("suspension_source_evidence_at(&execution.snapshot, expected_phase)"));
+    assert!(evidence.contains("snapshot.requested_at"));
+    assert!(evidence.contains("preflight.checked_at"));
+    assert!(evidence.contains("drain.drained_at"));
+    assert!(evidence.contains("activation.activated_at.max(recovery.recovered_at)"));
+    assert!(evidence.contains(".last_live_recovery"));
 
     for persisted_check in [
         "persisted_scope != request.guard.scope",
@@ -2269,6 +2274,109 @@ fn v2_suspension_sidecar_allows_only_exact_local_absence_progress() {
 }
 
 #[test]
+fn v2_suspension_observation_proves_only_checked_local_quiescence() {
+    let source = include_str!("../src/v2_suspension_observation.rs");
+    let evidence = include_str!("../src/v2_suspension.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "pub fn from_parts",
+        "pub fn into_parts",
+        "RuntimeQuiescentSuspendedAttemptV2",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension observation surface: {forbidden}"
+        );
+    }
+
+    let observation = source
+        .split("pub struct RuntimeSuspendedAttemptObservationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "kind: RuntimeSuspendedAttemptObservationKindV2,",
+        "snapshot: RuntimeDeploymentSnapshotV1,",
+        "suspended: RuntimeSuspendedAttemptV2,",
+    ] {
+        assert!(observation.contains(field), "{field}");
+    }
+    assert_eq!(observation.matches("    ").count(), 3);
+    assert!(!observation.contains("pub "));
+
+    let locally_quiescent = source
+        .split("pub struct RuntimeLocallyQuiescentSuspendedAttemptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(locally_quiescent.contains("observation: RuntimeSuspendedAttemptObservationV2,"));
+    assert_eq!(locally_quiescent.matches("    ").count(), 1);
+    assert!(!locally_quiescent.contains("pub "));
+
+    let kind = source
+        .split("pub enum RuntimeSuspendedAttemptObservationKindV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n").next())
+        .unwrap();
+    for variant in ["LocalRoutePresent", "ReleasePending", "LocallyQuiescent"] {
+        assert!(kind.contains(variant), "{variant}");
+    }
+    assert_eq!(kind.matches("    ").count(), 3);
+
+    assert!(source.contains(concat!(
+        "pub fn new(\n",
+        "        snapshot: RuntimeDeploymentSnapshotV1,\n",
+        "        suspended: RuntimeSuspendedAttemptV2,"
+    )));
+    assert!(source.contains("RuntimeDeployment::restore(snapshot.clone())"));
+    assert!(source.contains("operation_scope.scope().matches(&snapshot.identity)"));
+    assert!(source.contains("operation_scope.deployment_revision() != snapshot.revision"));
+    assert!(source.contains("guard.runtime_generation != snapshot.runtime_generation"));
+    assert!(source.contains("RuntimeSuspensionSourcePhaseV2::from_deployment_phase"));
+    assert!(source.contains("suspension_current_target_matches("));
+    assert!(source.contains("suspension_previous_runtime_matches("));
+    assert!(evidence.contains("previous.process.target.same_slot(target)"));
+    assert!(evidence.contains("previous_runtime == Some(&previous.process)"));
+    assert!(source.contains("suspended.failure().recorded_at"));
+    assert!(source.contains("suspension_source_evidence_at(snapshot, suspended.source_phase())"));
+    assert!(source.contains("snapshot.last_fencing_token != Some(guard.fencing_token)"));
+    assert!(source.contains("lease.controller_id != suspended.source_guard().controller_id"));
+    assert!(source.contains("lease.fencing_token != suspended.source_guard().fencing_token"));
+    assert!(source.contains("LocalRouteLeaseMissing"));
+    assert!(source.contains("RuntimeSuspendedAttemptObservationKindV2::ReleasePending"));
+    assert!(source.contains("RuntimeSuspendedAttemptObservationKindV2::LocallyQuiescent"));
+    assert!(source.contains("pub fn into_locally_quiescent("));
+    assert!(source.contains("impl TryFrom<RuntimeSuspendedAttemptObservationV2>"));
+    assert!(!source.contains("convergence_attempt =="));
+    assert!(!source.contains("expires_at <="));
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeLocallyQuiescentSuspendedAttemptV2",
+        "RuntimeSuspendedAttemptObservationErrorV2",
+        "RuntimeSuspendedAttemptObservationFieldV2",
+        "RuntimeSuspendedAttemptObservationKindV2",
+        "RuntimeSuspendedAttemptObservationV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -2363,6 +2471,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension_operation/tests.rs",
             include_str!("../src/v2_suspension_operation/tests.rs"),
+        ),
+        (
+            "src/v2_suspension_observation.rs",
+            include_str!("../src/v2_suspension_observation.rs"),
+        ),
+        (
+            "src/v2_suspension_observation/tests.rs",
+            include_str!("../src/v2_suspension_observation/tests.rs"),
         ),
         (
             "src/v2_suspension_sidecar.rs",

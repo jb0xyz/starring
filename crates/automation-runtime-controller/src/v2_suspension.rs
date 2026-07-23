@@ -1,7 +1,8 @@
 use std::num::NonZeroU64;
 
 use automation_runtime_convergence::{
-    RuntimeDeploymentPhaseV1, RuntimeFailureV1, RuntimePendingConditionV1,
+    RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1,
+    RuntimeFailureV1, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
 };
 use chrono::{DateTime, Utc};
 
@@ -70,6 +71,77 @@ impl RuntimeSuspensionSourcePhaseV2 {
             Self::ReconcilingPanels => RuntimeResumeCheckpointV2::ReconcilePanels,
         }
     }
+}
+
+pub(crate) fn suspension_source_evidence_at(
+    snapshot: &RuntimeDeploymentSnapshotV1,
+    source_phase: RuntimeSuspensionSourcePhaseV2,
+) -> Option<DateTime<Utc>> {
+    match source_phase {
+        RuntimeSuspensionSourcePhaseV2::Requested => Some(snapshot.requested_at),
+        RuntimeSuspensionSourcePhaseV2::PreflightReady
+        | RuntimeSuspensionSourcePhaseV2::DrainRequested => snapshot
+            .preflight
+            .as_ref()
+            .map(|preflight| preflight.checked_at),
+        RuntimeSuspensionSourcePhaseV2::Drained
+        | RuntimeSuspensionSourcePhaseV2::ActivationApplying => {
+            snapshot.drain.as_ref().map(|drain| drain.drained_at)
+        }
+        RuntimeSuspensionSourcePhaseV2::RuntimePendingReady
+        | RuntimeSuspensionSourcePhaseV2::ReconcilingPanels => {
+            snapshot.activation.as_ref().map(|activation| {
+                snapshot
+                    .last_live_recovery
+                    .as_ref()
+                    .map_or(activation.activated_at, |recovery| {
+                        activation.activated_at.max(recovery.recovered_at)
+                    })
+            })
+        }
+    }
+}
+
+pub(crate) fn suspension_current_target_matches(
+    local_effect: &RuntimeLocalRouteEffectV2,
+    drain_obligation: &RuntimeDrainObligationV2,
+    target: &RuntimeDeploymentTargetV1,
+) -> bool {
+    let local_route_matches =
+        |route: &RuntimeExactLocalRouteIdentityV2| route.identity.target == *target;
+    let effect_matches = match local_effect {
+        RuntimeLocalRouteEffectV2::None => true,
+        RuntimeLocalRouteEffectV2::ExactRoute { route, .. } => local_route_matches(route),
+        RuntimeLocalRouteEffectV2::RouteAbsent {
+            slot,
+            expected_route,
+            ..
+        } => {
+            slot == &RuntimeServingSlotV2::from_target(target)
+                && expected_route.as_ref().is_none_or(local_route_matches)
+        }
+    };
+    let obligation_matches = match drain_obligation {
+        RuntimeDrainObligationV2::None | RuntimeDrainObligationV2::PreviousServing(_) => true,
+        RuntimeDrainObligationV2::ExactLocalRoute(route) => local_route_matches(route),
+        RuntimeDrainObligationV2::LocalAndPrevious { local, .. } => local_route_matches(local),
+    };
+    effect_matches && obligation_matches
+}
+
+pub(crate) fn suspension_previous_runtime_matches(
+    drain_obligation: &RuntimeDrainObligationV2,
+    previous_runtime: Option<&RuntimeProcessIdentityV1>,
+    target: &RuntimeDeploymentTargetV1,
+) -> bool {
+    let represented = match drain_obligation {
+        RuntimeDrainObligationV2::PreviousServing(previous)
+        | RuntimeDrainObligationV2::LocalAndPrevious { previous, .. } => Some(previous),
+        RuntimeDrainObligationV2::None | RuntimeDrainObligationV2::ExactLocalRoute(_) => None,
+    };
+    represented.is_none_or(|previous| {
+        previous.process.target.same_slot(target) && previous_runtime == Some(&previous.process)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

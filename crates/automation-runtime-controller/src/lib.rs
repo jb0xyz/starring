@@ -32,6 +32,7 @@ mod v2_route_provenance;
 mod v2_startup_recovery;
 mod v2_suspension;
 mod v2_suspension_canonical;
+mod v2_suspension_observation;
 mod v2_suspension_operation;
 mod v2_suspension_sidecar;
 mod v2_writer_fence;
@@ -150,6 +151,11 @@ pub use v2_suspension::{
 pub use v2_suspension_canonical::{
     RuntimeCanonicalSuspendAttemptV2, RuntimeSuspendAttemptCanonicalErrorV2,
     RuntimeSuspendAttemptCanonicalFieldV2, RuntimeSuspendAttemptCorrelationV2,
+};
+pub use v2_suspension_observation::{
+    RuntimeLocallyQuiescentSuspendedAttemptV2, RuntimeSuspendedAttemptObservationErrorV2,
+    RuntimeSuspendedAttemptObservationFieldV2, RuntimeSuspendedAttemptObservationKindV2,
+    RuntimeSuspendedAttemptObservationV2,
 };
 pub use v2_suspension_operation::{
     RuntimePersistedSuspendAttemptRootV2, RuntimeSuspendAttemptOperationBuildErrorV2,
