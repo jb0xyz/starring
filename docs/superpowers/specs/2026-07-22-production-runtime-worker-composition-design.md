@@ -272,6 +272,25 @@ performs no I/O. Before any closed operation, the concrete
 registry instance cursor, serialized owner freeze, gateway control lifetime,
 and compound recovery session.
 
+The serialized owner freeze reuses the startup watchdog's single database port
+actor and consumes the startup handle. A prepare command joins at most the one
+renewal already in flight, and a queued prepare after a definitely-not-applied
+renewal is serviced before any second renewal dispatch. Prepare and commit use
+a private capacity-one recovery command lane separate from ordinary read and
+promotion commands, so a canceled read cannot head-of-line block prepare. The
+actor then performs
+a fresh exact database observation of the resulting receipt and enters a
+deadline-bounded prepared state in which automatic renewal is closed. Prepare
+cancellation, acknowledgement loss, observation uncertainty, ownership loss,
+or expiry synchronously invalidates gateway ownership and releases fail closed.
+Abort is the same one-way invalidation and shutdown path and can never recreate
+a renewable startup handle. Commit checks the worker permit's complete owner
+receipt before dispatch and the actor checks it again against its frozen
+receipt, then remains frozen. The resulting private owner supervisor alone
+authorizes no I/O; only the later tools-private compound session may combine it
+with the current worker permit, exact registry binding, and gateway control
+lifetime. There is no second owner renewer or second database port actor.
+
 After the fixed point proves serving empty and every runtime-resolvable count
 zero, consuming the closed permit may mint the separate non-cloneable gateway
 recovery-resume permit. Its runtime-side claim and exact ready observation move

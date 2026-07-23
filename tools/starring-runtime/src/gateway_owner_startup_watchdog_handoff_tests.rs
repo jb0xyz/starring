@@ -7,17 +7,24 @@ use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeBuildRevisionV1, RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseObservationV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeObserveGatewayOwnerLeaseV1,
-    RuntimeObservedGatewayOwnerLeaseV1, RuntimeReleaseGatewayOwnerLeaseOutcomeV1,
-    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseOutcomeV1,
-    RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeBuildRevisionV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
+    RuntimeGatewayReadyKindV2, RuntimeObserveGatewayOwnerLeaseV1,
+    RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
+    RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
+    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
-    accept_gateway_owner_acquire_v1, RuntimeAcceptedGatewayOwnerAcquireV1,
-    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeGatewayOwnerLeasePortV1,
+    accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
+    RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimeGatewayClosedLifecycleV2, RuntimeGatewayOwnerLeasePortV1,
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
+    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Notify;
@@ -26,12 +33,24 @@ use tokio::time::{sleep, timeout};
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FakeErrorV1 {}
+enum FakeErrorV1 {
+    Retryable,
+    OwnershipLost,
+    ProtocolViolation,
+}
+
+#[derive(Clone)]
+enum FakeObservationStepV1 {
+    Error(FakeErrorV1),
+    Unowned,
+    Blocked(Arc<Notify>),
+}
 
 #[derive(Clone)]
 enum FakeRenewStepV1 {
     Renewed,
     OwnershipLost,
+    BlockedDefinitelyNotApplied(Arc<Notify>),
     Blocked(Arc<Notify>),
 }
 
@@ -42,6 +61,7 @@ struct FakePortV1 {
 
 struct FakePortStateV1 {
     receipt: Mutex<RuntimeGatewayOwnerLeaseReceiptV1>,
+    observation_steps: Mutex<VecDeque<FakeObservationStepV1>>,
     renew_steps: Mutex<VecDeque<FakeRenewStepV1>>,
     acquire_calls: AtomicUsize,
     observe_calls: AtomicUsize,
@@ -59,6 +79,7 @@ impl FakePortV1 {
         Self {
             state: Arc::new(FakePortStateV1 {
                 receipt: Mutex::new(receipt),
+                observation_steps: Mutex::new(VecDeque::new()),
                 renew_steps: Mutex::new(renew_steps.into_iter().collect()),
                 acquire_calls: AtomicUsize::new(0),
                 observe_calls: AtomicUsize::new(0),
@@ -89,6 +110,23 @@ impl FakePortV1 {
     fn maximum_active_operations(&self) -> usize {
         self.state.maximum_active_operations.load(Ordering::Acquire)
     }
+
+    fn block_next_observation(&self, gate: Arc<Notify>) {
+        *self
+            .state
+            .observation_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            VecDeque::from([FakeObservationStepV1::Blocked(gate)]);
+    }
+
+    fn push_observation_step(&self, step: FakeObservationStepV1) {
+        self.state
+            .observation_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(step);
+    }
 }
 
 struct FakeOperationGuardV1 {
@@ -117,19 +155,43 @@ impl RuntimeGatewayOwnerLeasePortV1 for FakePortV1 {
     fn classify_observation_error(
         error: &Self::Error,
     ) -> RuntimeGatewayOwnerObservationErrorClassV1 {
-        match *error {}
+        match error {
+            FakeErrorV1::Retryable => RuntimeGatewayOwnerObservationErrorClassV1::Retryable,
+            FakeErrorV1::OwnershipLost => RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost,
+            FakeErrorV1::ProtocolViolation => {
+                RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation
+            }
+        }
     }
 
     fn observe_gateway_owner(
         &self,
-        _request: RuntimeObserveGatewayOwnerLeaseV1,
+        request: RuntimeObserveGatewayOwnerLeaseV1,
     ) -> impl Future<Output = Result<RuntimeGatewayOwnerLeaseObservationV1, Self::Error>> + Send
     {
         let state = self.state.clone();
         async move {
             state.observe_calls.fetch_add(1, Ordering::AcqRel);
             let _guard = FakeOperationGuardV1::begin(state.clone());
-            Ok(current_observation(&state))
+            let step = state
+                .observation_steps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            match step {
+                Some(FakeObservationStepV1::Error(error)) => Err(error),
+                Some(FakeObservationStepV1::Unowned) => {
+                    Ok(RuntimeGatewayOwnerLeaseObservationV1::Unowned {
+                        gateway_shard_id: request.gateway_shard_id,
+                        database_now: at_millis(1_000_001),
+                    })
+                }
+                Some(FakeObservationStepV1::Blocked(gate)) => {
+                    gate.notified().await;
+                    Ok(current_observation(&state))
+                }
+                None => Ok(current_observation(&state)),
+            }
         }
     }
 
@@ -182,6 +244,12 @@ impl RuntimeGatewayOwnerLeasePortV1 for FakePortV1 {
                             database_now: at_millis(1_000_001),
                         },
                     ))
+                }
+                FakeRenewStepV1::BlockedDefinitelyNotApplied(gate) => {
+                    gate.notified().await;
+                    Err(RuntimeGatewayOwnerMutationErrorV1::DefinitelyNotApplied {
+                        source: FakeErrorV1::Retryable,
+                    })
                 }
                 FakeRenewStepV1::Blocked(gate) => {
                     gate.notified().await;
@@ -302,6 +370,90 @@ fn accepted_receipt(
     receipt
 }
 
+fn closed_recovery_permit(
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+) -> RuntimeClosedDrainRecoveryPermitV2 {
+    let process_instance_id = owner_receipt.lease_id.process_instance_id.clone();
+    let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
+    let emergency_generation = lifecycle.snapshot().generation();
+    let readiness_receipt = |kind, role, checked_at| {
+        RuntimeCapabilityReadinessReceiptV2::new(
+            kind,
+            "01234567-89ab-cdef-8123-456789abcdef",
+            "starring",
+            role,
+            at_millis(checked_at),
+        )
+        .unwrap()
+    };
+    let readiness = RuntimeCapabilityReadinessSetV2::new(
+        readiness_receipt(
+            RuntimeCapabilityReadinessKindV2::Convergence,
+            "role_a",
+            1_000_001,
+        ),
+        readiness_receipt(
+            RuntimeCapabilityReadinessKindV2::ExactTarget,
+            "role_b",
+            1_000_002,
+        ),
+        readiness_receipt(RuntimeCapabilityReadinessKindV2::Panel, "role_c", 1_000_003),
+        readiness_receipt(
+            RuntimeCapabilityReadinessKindV2::Serving,
+            "role_d",
+            1_000_004,
+        ),
+        readiness_receipt(
+            RuntimeCapabilityReadinessKindV2::Interaction,
+            "role_e",
+            1_000_005,
+        ),
+    )
+    .unwrap();
+    let paused_gateway = RuntimePausedGatewayObservationV2::new(
+        emergency_generation,
+        process_instance_id.clone(),
+        NonZeroU64::new(13).unwrap(),
+        RuntimeGatewayReadyKindV2::Ready,
+        NonZeroU64::new(17).unwrap(),
+        RuntimePausedGatewaySequenceV2::new(
+            RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(20).unwrap()),
+            RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(18).unwrap()),
+            None,
+        )
+        .unwrap(),
+    );
+    let registry = accept_runtime_registry_recovery_empty_observation_v2(
+        process_instance_id,
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+                NonZeroU64::new(23).unwrap(),
+            ),
+            retained_slot_count: 2,
+            retained_empty_tombstone_count: 2,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    )
+    .unwrap();
+    let input = RuntimeClosedRecoveryInputV2::new(
+        RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        owner_receipt,
+        readiness,
+        paused_gateway,
+        RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry),
+    );
+    lifecycle
+        .begin_recovery(emergency_generation, input)
+        .unwrap()
+        .1
+}
+
 fn fixture(
     lease_for: Duration,
     renew_before: Duration,
@@ -374,6 +526,51 @@ fn handoff_observation_requires_strict_positive_monotonic_safety() {
         safety_deadline: observed_at.checked_add(Duration::from_nanos(1)).unwrap(),
     };
     assert!(accept_production_handoff_observation_v1(observation, observed_at).is_ok());
+}
+
+#[test]
+fn closed_recovery_prepare_ack_requires_strict_positive_monotonic_safety() {
+    let observed_at = Instant::now();
+    for safety_deadline in [
+        observed_at.checked_sub(Duration::from_nanos(1)).unwrap(),
+        observed_at,
+    ] {
+        let observation = RuntimeGatewayOwnerCurrentObservationV1 {
+            receipt: receipt(Duration::from_secs(5)),
+            safety_deadline,
+        };
+        assert_eq!(
+            accept_closed_recovery_prepare_observation_v2(observation, observed_at),
+            Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed)
+        );
+    }
+    let observation = RuntimeGatewayOwnerCurrentObservationV1 {
+        receipt: receipt(Duration::from_secs(5)),
+        safety_deadline: observed_at.checked_add(Duration::from_nanos(1)).unwrap(),
+    };
+    assert!(accept_closed_recovery_prepare_observation_v2(observation, observed_at).is_ok());
+}
+
+#[test]
+fn closed_recovery_commit_ack_classifies_elapsed_before_protocol_mismatch() {
+    let observed_at = Instant::now();
+    let prepared = RuntimeGatewayOwnerCurrentObservationV1 {
+        receipt: receipt(Duration::from_secs(5)),
+        safety_deadline: observed_at,
+    };
+    let mut mismatched_receipt = prepared.receipt().clone();
+    mismatched_receipt.owner_revision =
+        NonZeroU64::new(mismatched_receipt.owner_revision.get() + 1).unwrap();
+
+    assert_eq!(
+        accept_closed_recovery_commit_observation_v2(
+            prepared.clone(),
+            &prepared,
+            &mismatched_receipt,
+            observed_at,
+        ),
+        Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed)
+    );
 }
 
 #[tokio::test]
@@ -619,6 +816,532 @@ async fn shutdown_queued_with_handoff_wins_before_production_transition() {
         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
     );
     assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn closed_recovery_prepare_joins_one_renewal_exact_observes_and_freezes() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+        [FakeRenewStepV1::Blocked(gate.clone())],
+    );
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut prepare = Box::pin(handle.prepare_closed_recovery_v2());
+
+    tokio::select! {
+        _ = &mut prepare => panic!("prepare completed before renewal"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    gate.notify_one();
+    let prepared = prepare.await.unwrap();
+
+    assert_eq!(
+        prepared.observation().receipt().owner_revision,
+        NonZeroU64::new(4).unwrap()
+    );
+    assert_eq!(port.observe_calls(), 1);
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.acquire_calls(), 0);
+    assert_eq!(port.release_calls(), 0);
+    assert_eq!(port.maximum_active_operations(), 1);
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(port.renew_calls(), 1);
+    assert!(!invalidated.load(Ordering::Acquire));
+
+    assert_eq!(
+        prepared.abort_and_shutdown_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn queued_closed_recovery_prepare_beats_second_renewal_after_definite_non_apply() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+        [
+            FakeRenewStepV1::BlockedDefinitelyNotApplied(gate.clone()),
+            FakeRenewStepV1::Renewed,
+        ],
+    );
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut prepare = Box::pin(handle.prepare_closed_recovery_v2());
+    tokio::select! {
+        _ = &mut prepare => panic!("prepare completed while renewal was blocked"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    gate.notify_one();
+
+    let prepared = prepare.await.unwrap();
+
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.observe_calls(), 1);
+    assert_eq!(
+        prepared.observation().receipt().owner_revision,
+        NonZeroU64::new(3).unwrap()
+    );
+    assert_eq!(port.maximum_active_operations(), 1);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        prepared.abort_and_shutdown_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn canceled_observation_cannot_hide_prepare_behind_definite_non_apply() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+        [
+            FakeRenewStepV1::BlockedDefinitelyNotApplied(gate.clone()),
+            FakeRenewStepV1::Renewed,
+        ],
+    );
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut observation = Box::pin(handle.observe_current_gateway_owner_v1());
+    tokio::select! {
+        _ = &mut observation => panic!("observation completed while renewal was blocked"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    drop(observation);
+    let mut prepare = Box::pin(handle.prepare_closed_recovery_v2());
+    tokio::select! {
+        _ = &mut prepare => panic!("prepare completed while renewal was blocked"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    gate.notify_one();
+
+    let prepared = prepare.await.unwrap();
+
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.observe_calls(), 1);
+    assert_eq!(
+        prepared.observation().receipt().owner_revision,
+        NonZeroU64::new(3).unwrap()
+    );
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        prepared.abort_and_shutdown_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn queued_closed_recovery_prepare_beats_due_renewal_after_observation_timeout() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(2_000),
+        Duration::from_millis(1_600),
+        Duration::from_millis(300),
+        [],
+    );
+    port.block_next_observation(gate);
+    let commands = handle.inner().supervisor_commands.clone();
+    let recovery_commands = handle.inner().closed_recovery_commands.clone();
+    let (observation_response, observation_acknowledgement) = oneshot::channel();
+    commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe {
+            response: observation_response,
+        })
+        .await
+        .unwrap();
+    wait_for(|| port.observe_calls() == 1).await;
+    let (prepare_response, prepare_acknowledgement) = oneshot::channel();
+    recovery_commands
+        .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare {
+            response: prepare_response,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observation_acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable)
+    );
+    let prepared_observation = prepare_acknowledgement.await.unwrap().unwrap();
+
+    assert_eq!(
+        prepared_observation.receipt().owner_revision,
+        NonZeroU64::new(3).unwrap()
+    );
+    assert_eq!(port.observe_calls(), 2);
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        handle.shutdown().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn closed_recovery_prepare_observation_failures_are_terminal_and_fail_closed() {
+    let cases = [
+        (
+            FakeObservationStepV1::Error(FakeErrorV1::Retryable),
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ObservationUnavailable,
+        ),
+        (
+            FakeObservationStepV1::Error(FakeErrorV1::OwnershipLost),
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
+        ),
+        (
+            FakeObservationStepV1::Error(FakeErrorV1::ProtocolViolation),
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation,
+        ),
+        (
+            FakeObservationStepV1::Unowned,
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
+        ),
+    ];
+    for (step, expected) in cases {
+        let (handle, port, invalidated) = fixture(
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+            [],
+        );
+        port.push_observation_step(step);
+
+        assert_eq!(
+            handle.prepare_closed_recovery_v2().await.unwrap_err(),
+            expected
+        );
+        assert!(invalidated.load(Ordering::Acquire));
+        wait_for(|| port.release_calls() == 1).await;
+        assert_eq!(port.observe_calls(), 1);
+        assert_eq!(port.renew_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn canceled_closed_recovery_prepare_during_exact_observation_is_fail_closed() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    port.block_next_observation(gate.clone());
+    let mut prepare = Box::pin(handle.prepare_closed_recovery_v2());
+    tokio::select! {
+        _ = &mut prepare => panic!("prepare completed while exact observation was blocked"),
+        _ = wait_for(|| port.observe_calls() == 1) => {}
+    }
+
+    drop(prepare);
+
+    assert!(invalidated.load(Ordering::Acquire));
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn shutdown_during_closed_recovery_exact_observation_is_fail_closed() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    port.block_next_observation(gate);
+    let commands = handle.inner().closed_recovery_commands.clone();
+    let (response, acknowledgement) = oneshot::channel();
+    commands
+        .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response })
+        .await
+        .unwrap();
+    wait_for(|| port.observe_calls() == 1).await;
+
+    assert_eq!(
+        handle.shutdown().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(
+        acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SupervisorUnavailable)
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn safety_deadline_during_closed_recovery_exact_observation_is_fail_closed() {
+    let gate = Arc::new(Notify::new());
+    let (mut handle, port, invalidated) = fixture(
+        Duration::from_millis(1_200),
+        Duration::from_millis(900),
+        Duration::from_millis(200),
+        [],
+    );
+    port.block_next_observation(gate);
+    let (response, acknowledgement) = oneshot::channel();
+    handle
+        .inner()
+        .closed_recovery_commands
+        .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response })
+        .await
+        .unwrap();
+    wait_for(|| port.observe_calls() == 1).await;
+
+    assert_eq!(
+        acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed)
+    );
+    assert_eq!(
+        handle.wait_terminal().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn dropping_prepared_closed_recovery_invalidates_and_releases_once() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+
+    drop(prepared);
+
+    assert!(invalidated.load(Ordering::Acquire));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn canceled_closed_recovery_prepare_invalidates_and_releases_once() {
+    let gate = Arc::new(Notify::new());
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+        [FakeRenewStepV1::Blocked(gate.clone())],
+    );
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut prepare = Box::pin(handle.prepare_closed_recovery_v2());
+    tokio::select! {
+        _ = &mut prepare => panic!("prepare completed while renewal was blocked"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+
+    drop(prepare);
+
+    assert!(invalidated.load(Ordering::Acquire));
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.maximum_active_operations(), 1);
+}
+
+#[tokio::test]
+async fn illegal_command_after_closed_recovery_prepare_is_terminal() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let inner = prepared.inner.as_ref().unwrap();
+    let commands = inner.supervisor_commands.clone();
+    let mut terminal = inner.terminal.clone();
+    let (response, acknowledgement) = oneshot::channel();
+    commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation)
+    );
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            assert_eq!(
+                exit,
+                RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+            );
+            break;
+        }
+        terminal.changed().await.unwrap();
+    }
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn closed_recovery_commit_rechecks_exact_permit_receipt_and_stays_frozen() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+
+    let closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+
+    assert_eq!(closed.observation().receipt(), permit.owner_receipt());
+    assert_eq!(port.observe_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.acquire_calls(), 0);
+    assert_eq!(port.release_calls(), 0);
+    assert_eq!(port.maximum_active_operations(), 1);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        format!("{closed:?}"),
+        "RuntimeGatewayOwnerClosedRecoverySupervisorV2(<redacted>)"
+    );
+    assert_eq!(
+        closed.shutdown().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn closed_recovery_commit_rejects_mismatched_permit_and_invalidates() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let mut mismatched_receipt = prepared.observation().receipt().clone();
+    mismatched_receipt.owner_revision =
+        NonZeroU64::new(mismatched_receipt.owner_revision.get() + 1).unwrap();
+    let permit = closed_recovery_permit(mismatched_receipt);
+
+    assert!(matches!(
+        prepared.commit_closed_recovery_v2(&permit).await,
+        Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::OwnerReceiptMismatch)
+    ));
+    assert!(invalidated.load(Ordering::Acquire));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn lost_closed_recovery_prepare_acknowledgement_is_fail_closed() {
+    let (mut handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    handle
+        .inner()
+        .closed_recovery_commands
+        .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        handle.wait_terminal().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn lost_closed_recovery_commit_acknowledgement_is_fail_closed() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let inner = prepared.inner.as_ref().unwrap();
+    let commands = inner.closed_recovery_commands.clone();
+    let mut terminal = inner.terminal.clone();
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    commands
+        .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit {
+            expected_receipt: prepared.observation().receipt().clone(),
+            response,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            assert_eq!(exit, RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown);
+            break;
+        }
+        terminal.changed().await.unwrap();
+    }
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn prepared_closed_recovery_never_renews_and_expires_fail_closed() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(1_500),
+        Duration::from_millis(1_000),
+        Duration::from_millis(300),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+
+    wait_for(|| invalidated.load(Ordering::Acquire)).await;
+    wait_for(|| port.release_calls() == 1).await;
+
+    assert_eq!(port.renew_calls(), 0);
+    drop(prepared);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn committed_closed_recovery_never_renews_and_expires_fail_closed() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(1_500),
+        Duration::from_millis(1_000),
+        Duration::from_millis(300),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+
+    sleep(Duration::from_millis(700)).await;
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    wait_for(|| invalidated.load(Ordering::Acquire)).await;
+    wait_for(|| port.release_calls() == 1).await;
+
+    assert_eq!(port.renew_calls(), 0);
+    drop(closed);
     assert_eq!(port.release_calls(), 1);
 }
 

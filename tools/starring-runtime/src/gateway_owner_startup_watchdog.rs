@@ -9,12 +9,12 @@ use automation_runtime_controller::{
 use automation_runtime_worker::{
     accept_gateway_owner_release_v1, classify_unknown_gateway_owner_release_v1,
     RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedGatewayOwnerReleaseV1,
-    RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerMutationErrorV1,
-    RuntimeGatewayOwnerObservationCompletionV1, RuntimeGatewayOwnerObservationErrorClassV1,
-    RuntimeGatewayOwnerReleaseRecoveryV1, RuntimeGatewayOwnerRenewalCompletionV1,
-    RuntimeGatewayOwnerRenewalPolicyV1, RuntimeGatewayOwnerRenewalScheduleErrorV1,
-    RuntimeGatewayOwnerWatchdogActionV1, RuntimeGatewayOwnerWatchdogErrorV1,
-    RuntimeGatewayOwnerWatchdogV1,
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeGatewayOwnerLeasePortV1,
+    RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationCompletionV1,
+    RuntimeGatewayOwnerObservationErrorClassV1, RuntimeGatewayOwnerReleaseRecoveryV1,
+    RuntimeGatewayOwnerRenewalCompletionV1, RuntimeGatewayOwnerRenewalPolicyV1,
+    RuntimeGatewayOwnerRenewalScheduleErrorV1, RuntimeGatewayOwnerWatchdogActionV1,
+    RuntimeGatewayOwnerWatchdogErrorV1, RuntimeGatewayOwnerWatchdogV1,
 };
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -24,6 +24,7 @@ use crate::GatewayOwnerTimingConfigV1;
 
 const SHUTDOWN_COMMAND_CAPACITY: usize = 1;
 const SUPERVISOR_COMMAND_CAPACITY: usize = 1;
+const CLOSED_RECOVERY_COMMAND_CAPACITY: usize = 1;
 const RELEASE_ATTEMPTS: usize = 2;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -235,6 +236,7 @@ impl<P> RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P> {
 struct RuntimeGatewayOwnerSupervisorHandleV1 {
     shutdown_commands: mpsc::Sender<RuntimeGatewayOwnerStartupShutdownCommandV1>,
     supervisor_commands: mpsc::Sender<RuntimeGatewayOwnerSupervisorCommandV1>,
+    closed_recovery_commands: mpsc::Sender<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
 }
@@ -309,6 +311,65 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn prepare_closed_recovery_v2(
+        &self,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+    > {
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        if self
+            .closed_recovery_commands
+            .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response })
+            .await
+            .is_err()
+        {
+            return Err(wait_for_closed_recovery_prepare_terminal_v2(terminal).await);
+        }
+        match acknowledgement.await {
+            Ok(Ok(observation)) => {
+                match accept_closed_recovery_prepare_observation_v2(observation, Instant::now()) {
+                    Ok(observation) => Ok(observation),
+                    Err(error) => {
+                        self.invalidation.invalidate();
+                        Err(error)
+                    }
+                }
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(wait_for_closed_recovery_prepare_terminal_v2(terminal).await),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn commit_closed_recovery_v2(
+        &self,
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    > {
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        if self
+            .closed_recovery_commands
+            .send(RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit {
+                expected_receipt,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return Err(wait_for_closed_recovery_commit_terminal_v2(terminal).await);
+        }
+        match acknowledgement.await {
+            Ok(result) => result,
+            Err(_) => Err(wait_for_closed_recovery_commit_terminal_v2(terminal).await),
+        }
+    }
+
     async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         let (response, acknowledgement) = oneshot::channel();
         if self
@@ -334,6 +395,34 @@ fn accept_production_handoff_observation_v1(
     } else {
         Err(RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed)
     }
+}
+
+fn accept_closed_recovery_prepare_observation_v2(
+    observation: RuntimeGatewayOwnerCurrentObservationV1,
+    observed_at: Instant,
+) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2>
+{
+    if observation.safety_deadline() > observed_at {
+        Ok(observation)
+    } else {
+        Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed)
+    }
+}
+
+fn accept_closed_recovery_commit_observation_v2(
+    acknowledged: RuntimeGatewayOwnerCurrentObservationV1,
+    prepared: &RuntimeGatewayOwnerCurrentObservationV1,
+    expected_receipt: &RuntimeGatewayOwnerLeaseReceiptV1,
+    observed_at: Instant,
+) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerClosedRecoveryCommitErrorV2>
+{
+    if acknowledged.safety_deadline() <= observed_at {
+        return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed);
+    }
+    if acknowledged != *prepared || acknowledged.receipt() != expected_receipt {
+        return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation);
+    }
+    Ok(acknowledged)
 }
 
 pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
@@ -382,6 +471,21 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn prepare_closed_recovery_v2(
+        mut self,
+    ) -> Result<
+        RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+    > {
+        let observation = self.inner().prepare_closed_recovery_v2().await?;
+        let inner = self.take_inner();
+        Ok(RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
+            inner: Some(inner),
+            observation,
+        })
+    }
+
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
             .as_ref()
@@ -397,6 +501,139 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner.take().expect("gateway owner supervisor handle")
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    observation: RuntimeGatewayOwnerCurrentObservationV1,
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerPreparedClosedRecoveryV2(<redacted>)")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
+    pub(crate) fn observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.observation
+    }
+
+    pub(crate) async fn abort_and_shutdown_v2(
+        mut self,
+    ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown().await
+    }
+
+    pub(crate) async fn commit_closed_recovery_v2(
+        mut self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<
+        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    > {
+        if Instant::now() >= self.observation.safety_deadline() {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed);
+        }
+        if permit.owner_receipt() != self.observation.receipt() {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::OwnerReceiptMismatch);
+        }
+        let acknowledged = self
+            .inner()
+            .commit_closed_recovery_v2(permit.owner_receipt().clone())
+            .await?;
+        let acknowledged = match accept_closed_recovery_commit_observation_v2(
+            acknowledged,
+            &self.observation,
+            permit.owner_receipt(),
+            Instant::now(),
+        ) {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                self.inner().invalidation.invalidate();
+                return Err(error);
+            }
+        };
+        let inner = self.take_inner();
+        Ok(RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
+            inner: Some(inner),
+            observation: acknowledged,
+        })
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("prepared gateway owner recovery handle")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .take()
+            .expect("prepared gateway owner recovery handle")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    observation: RuntimeGatewayOwnerCurrentObservationV1,
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerClosedRecoverySupervisorV2(<redacted>)")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
+    pub(crate) fn observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.observation
+    }
+
+    pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.take_inner().shutdown().await
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .take()
+            .expect("closed gateway owner recovery handle")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2 {
+    #[error("runtime gateway owner closed recovery prepare safety deadline elapsed")]
+    SafetyElapsed,
+    #[error("runtime gateway owner closed recovery prepare found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner closed recovery prepare observation is unavailable")]
+    ObservationUnavailable,
+    #[error("runtime gateway owner closed recovery prepare violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner closed recovery prepare supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeGatewayOwnerClosedRecoveryCommitErrorV2 {
+    #[error("runtime gateway owner closed recovery commit safety deadline elapsed")]
+    SafetyElapsed,
+    #[error("runtime gateway owner closed recovery commit owner receipt mismatched")]
+    OwnerReceiptMismatch,
+    #[error("runtime gateway owner closed recovery commit violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner closed recovery commit supervisor is unavailable")]
+    SupervisorUnavailable,
 }
 
 #[cfg_attr(
@@ -473,6 +710,8 @@ impl RuntimeGatewayOwnerProductionSupervisorV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuntimeGatewayOwnerSupervisorRoleV1 {
     Startup,
+    PreparedClosedRecovery,
+    ClosedRecovery,
     Production,
 }
 
@@ -503,6 +742,26 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
     },
     Promote {
         response: oneshot::Sender<RuntimeGatewayOwnerCurrentObservationV1>,
+    },
+}
+
+enum RuntimeGatewayOwnerClosedRecoveryCommandV2 {
+    Prepare {
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+            >,
+        >,
+    },
+    Commit {
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+            >,
+        >,
     },
 }
 
@@ -541,10 +800,48 @@ async fn wait_for_handoff_terminal_v1(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+async fn wait_for_closed_recovery_prepare_terminal_v2(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_closed_recovery_prepare_error_v2(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SupervisorUnavailable;
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn wait_for_closed_recovery_commit_terminal_v2(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerClosedRecoveryCommitErrorV2 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_closed_recovery_commit_error_v2(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SupervisorUnavailable;
+        }
+    }
+}
+
 async fn receive_supervisor_command_v1(
     pending: &mut Option<RuntimeGatewayOwnerSupervisorCommandV1>,
     commands: &mut mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
 ) -> Option<RuntimeGatewayOwnerSupervisorCommandV1> {
+    match pending.take() {
+        Some(command) => Some(command),
+        None => commands.recv().await,
+    }
+}
+
+async fn receive_closed_recovery_command_v2(
+    pending: &mut Option<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
+    commands: &mut mpsc::Receiver<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
+) -> Option<RuntimeGatewayOwnerClosedRecoveryCommandV2> {
     match pending.take() {
         Some(command) => Some(command),
         None => commands.recv().await,
@@ -591,6 +888,50 @@ fn map_terminal_handoff_error_v1(
         | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
         | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
             RuntimeGatewayOwnerProductionHandoffErrorV1::SupervisorUnavailable
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_terminal_closed_recovery_prepare_error_v2(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SupervisorUnavailable
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_terminal_closed_recovery_commit_error_v2(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerClosedRecoveryCommitErrorV2 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SupervisorUnavailable
         }
     }
 }
@@ -653,6 +994,8 @@ where
     };
     let (shutdown_commands, shutdown_receiver) = mpsc::channel(SHUTDOWN_COMMAND_CAPACITY);
     let (supervisor_commands, supervisor_receiver) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+    let (closed_recovery_commands, closed_recovery_receiver) =
+        mpsc::channel(CLOSED_RECOVERY_COMMAND_CAPACITY);
     let (terminal_sender, terminal) = watch::channel(None);
     let guard = RuntimeGatewayOwnerStartupWatchdogGuardV1::new(invalidation.clone());
     runtime.spawn(async move {
@@ -662,6 +1005,7 @@ where
             config,
             shutdown_receiver,
             supervisor_receiver,
+            closed_recovery_receiver,
             guard,
         )
         .await;
@@ -671,6 +1015,7 @@ where
         inner: Some(RuntimeGatewayOwnerSupervisorHandleV1 {
             shutdown_commands,
             supervisor_commands,
+            closed_recovery_commands,
             terminal,
             invalidation,
         }),
@@ -699,6 +1044,7 @@ async fn run_gateway_owner_startup_watchdog_v1<P>(
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
     mut shutdown_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
     mut supervisor_commands: mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
+    mut closed_recovery_commands: mpsc::Receiver<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
@@ -709,6 +1055,7 @@ where
     let mut current = Some(watchdog);
     let mut role = RuntimeGatewayOwnerSupervisorRoleV1::Startup;
     let mut pending_supervisor_command = None;
+    let mut pending_closed_recovery_command = None;
     let mut shutdown_acknowledgement = None;
     let stop = 'supervisor: loop {
         match shutdown_commands.try_recv() {
@@ -726,6 +1073,214 @@ where
             }
             Err(TryRecvError::Empty) => {}
         }
+        if pending_closed_recovery_command.is_none() {
+            match closed_recovery_commands.try_recv() {
+                Ok(command) => pending_closed_recovery_command = Some(command),
+                Err(TryRecvError::Disconnected) => {
+                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                        config.cleanup_timeout,
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        loop {
+            if pending_supervisor_command.is_none() {
+                match supervisor_commands.try_recv() {
+                    Ok(command) => pending_supervisor_command = Some(command),
+                    Err(TryRecvError::Disconnected) => {
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                            config.cleanup_timeout,
+                        );
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            let canceled_observation = matches!(
+                &pending_supervisor_command,
+                Some(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+                    if response.is_closed()
+            );
+            if !canceled_observation {
+                break;
+            }
+            pending_supervisor_command = None;
+        }
+        if matches!(
+            role,
+            RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery
+                | RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery
+        ) {
+            let watchdog = current.take().expect("gateway owner watchdog state");
+            let safety_deadline = watchdog.schedule().safety_deadline();
+            tokio::select! {
+                biased;
+                command = shutdown_commands.recv() => {
+                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                        receive_shutdown(command, &mut shutdown_acknowledgement),
+                        config.cleanup_timeout,
+                    );
+                }
+                _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
+                    guard.invalidate_now();
+                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                        config.cleanup_timeout,
+                    );
+                }
+                command = receive_closed_recovery_command_v2(
+                    &mut pending_closed_recovery_command,
+                    &mut closed_recovery_commands,
+                ) => {
+                    let Some(command) = command else {
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                            config.cleanup_timeout,
+                        );
+                    };
+                    match (role, command) {
+                        (
+                            RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery,
+                            RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit {
+                                expected_receipt,
+                                response,
+                            },
+                        ) => {
+                            if response.is_closed() {
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                    config.cleanup_timeout,
+                                );
+                            }
+                            if Instant::now() >= safety_deadline {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                                    config.cleanup_timeout,
+                                );
+                            }
+                            if watchdog.schedule().receipt() != &expected_receipt {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::OwnerReceiptMismatch,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup_timeout,
+                                );
+                            }
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                            role = RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery;
+                            current = Some(watchdog);
+                            if response.send(Ok(observation)).is_err() {
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                    config.cleanup_timeout,
+                                );
+                            }
+                        }
+                        (_, command) => {
+                            reject_frozen_closed_recovery_command_v2(command);
+                            guard.invalidate_now();
+                            break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                config.cleanup_timeout,
+                            );
+                        }
+                    }
+                    continue 'supervisor;
+                }
+                command = receive_supervisor_command_v1(
+                    &mut pending_supervisor_command,
+                    &mut supervisor_commands,
+                ) => {
+                    let Some(command) = command else {
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                            config.cleanup_timeout,
+                        );
+                    };
+                    reject_frozen_supervisor_command_v2(command);
+                    guard.invalidate_now();
+                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                        config.cleanup_timeout,
+                    );
+                }
+            }
+        }
+        if matches!(
+            &pending_closed_recovery_command,
+            Some(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { .. })
+        ) {
+            let Some(RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response }) =
+                pending_closed_recovery_command.take()
+            else {
+                unreachable!("matched closed recovery prepare command")
+            };
+            if role != RuntimeGatewayOwnerSupervisorRoleV1::Startup {
+                let _result = response.send(Err(
+                    RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation,
+                ));
+                guard.invalidate_now();
+                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                    config.cleanup_timeout,
+                );
+            }
+            let watchdog = current.take().expect("gateway owner watchdog state");
+            match prepare_closed_recovery_owner_v2(
+                &port,
+                watchdog,
+                response,
+                &mut shutdown_commands,
+                &mut shutdown_acknowledgement,
+                &mut guard,
+                config.cleanup_timeout,
+            )
+            .await
+            {
+                RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Prepared {
+                    successor,
+                    observation,
+                    response,
+                } => {
+                    role = RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery;
+                    current = Some(*successor);
+                    if response.send(Ok(observation)).is_err() {
+                        guard.invalidate_now();
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                            config.cleanup_timeout,
+                        );
+                    }
+                }
+                RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(stop) => {
+                    break 'supervisor stop;
+                }
+            }
+            continue 'supervisor;
+        }
+        if let Some(RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit { response, .. }) =
+            pending_closed_recovery_command.take()
+        {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation,
+            ));
+            guard.invalidate_now();
+            break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                config.cleanup_timeout,
+            );
+        }
         let watchdog = current.take().expect("gateway owner watchdog state");
         match watchdog.action_at(Instant::now()) {
             RuntimeGatewayOwnerWatchdogActionV1::WaitUntil(renew_at) => {
@@ -736,6 +1291,20 @@ where
                             receive_shutdown(command, &mut shutdown_acknowledgement),
                             config.cleanup_timeout,
                         );
+                    }
+                    command = receive_closed_recovery_command_v2(
+                        &mut pending_closed_recovery_command,
+                        &mut closed_recovery_commands,
+                    ) => {
+                        let Some(command) = command else {
+                            break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                config.cleanup_timeout,
+                            );
+                        };
+                        pending_closed_recovery_command = Some(command);
+                        current = Some(watchdog);
+                        continue 'supervisor;
                     }
                     _ = sleep_until(TokioInstant::from_std(renew_at)) => {
                         current = Some(watchdog);
@@ -927,6 +1496,26 @@ where
                                     config.cleanup_timeout,
                                 );
                             }
+                            command = closed_recovery_commands.recv() => {
+                                let Some(command) = command else {
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                        config.cleanup_timeout,
+                                    );
+                                };
+                                pending_closed_recovery_command = Some(command);
+                                current = Some(restored);
+                            }
+                            command = supervisor_commands.recv() => {
+                                let Some(command) = command else {
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                        config.cleanup_timeout,
+                                    );
+                                };
+                                pending_supervisor_command = Some(command);
+                                current = Some(restored);
+                            }
                             _ = sleep_until(TokioInstant::from_std(retry_at)) => {
                                 current = Some(restored);
                             }
@@ -958,6 +1547,216 @@ where
         let _result = response.send(exit);
     }
     exit
+}
+
+fn reject_frozen_supervisor_command_v2(command: RuntimeGatewayOwnerSupervisorCommandV1) {
+    match command {
+        RuntimeGatewayOwnerSupervisorCommandV1::Observe { response } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerSupervisorCommandV1::Promote { response } => {
+            drop(response);
+        }
+    }
+}
+
+fn reject_frozen_closed_recovery_command_v2(command: RuntimeGatewayOwnerClosedRecoveryCommandV2) {
+    match command {
+        RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare { response } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation,
+            ));
+        }
+    }
+}
+
+enum RuntimeGatewayOwnerClosedRecoveryPrepareStepV2 {
+    Prepared {
+        successor: Box<RuntimeGatewayOwnerWatchdogV1>,
+        observation: RuntimeGatewayOwnerCurrentObservationV1,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+            >,
+        >,
+    },
+    Stop(RuntimeGatewayOwnerStartupWatchdogStopV1),
+}
+
+async fn prepare_closed_recovery_owner_v2<P>(
+    port: &P,
+    watchdog: RuntimeGatewayOwnerWatchdogV1,
+    mut response: oneshot::Sender<
+        Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+        >,
+    >,
+    shutdown_commands: &mut mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    shutdown_acknowledgement: &mut Option<
+        oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
+    >,
+    guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup_timeout: Duration,
+) -> RuntimeGatewayOwnerClosedRecoveryPrepareStepV2
+where
+    P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
+    P::Error: Send,
+{
+    let request_started_at = Instant::now();
+    let inflight = match watchdog.begin_current_observation(request_started_at) {
+        Ok(inflight) => inflight,
+        Err(error) => {
+            return stop_after_closed_recovery_prepare_error_v2(
+                response,
+                map_closed_recovery_prepare_watchdog_error_v2(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup_timeout,
+            );
+        }
+    };
+    let safety_deadline = inflight.previous_schedule().safety_deadline();
+    let request = inflight.request().clone();
+    let observation = port.observe_gateway_owner(request);
+    tokio::pin!(observation);
+    let result = tokio::select! {
+        biased;
+        shutdown = shutdown_commands.recv() => {
+            guard.invalidate_now();
+            let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                receive_shutdown(shutdown, shutdown_acknowledgement),
+                cleanup_timeout,
+            );
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SupervisorUnavailable,
+            ));
+            return RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(stop);
+        }
+        _ = response.closed() => {
+            guard.invalidate_now();
+            return RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(
+                RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                    cleanup_timeout,
+                ),
+            );
+        }
+        _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
+            return stop_after_closed_recovery_prepare_error_v2(
+                response,
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed,
+                RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                guard,
+                cleanup_timeout,
+            );
+        }
+        result = &mut observation => result,
+    };
+    let response_observed_at = Instant::now();
+    match result {
+        Ok(observation) => match inflight.complete(observation, response_observed_at) {
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::Current(successor)) => {
+                let observation =
+                    RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&successor);
+                RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Prepared {
+                    successor,
+                    observation,
+                    response,
+                }
+            }
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::OwnershipLost(_)) => {
+                stop_after_closed_recovery_prepare_error_v2(
+                    response,
+                    RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+            Err(error) => stop_after_closed_recovery_prepare_error_v2(
+                response,
+                map_closed_recovery_prepare_watchdog_error_v2(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup_timeout,
+            ),
+        },
+        Err(error) => match P::classify_observation_error(&error) {
+            RuntimeGatewayOwnerObservationErrorClassV1::Retryable => {
+                stop_after_closed_recovery_prepare_error_v2(
+                    response,
+                    RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ObservationUnavailable,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost => {
+                stop_after_closed_recovery_prepare_error_v2(
+                    response,
+                    RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation => {
+                stop_after_closed_recovery_prepare_error_v2(
+                    response,
+                    RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                    guard,
+                    cleanup_timeout,
+                )
+            }
+        },
+    }
+}
+
+fn stop_after_closed_recovery_prepare_error_v2(
+    response: oneshot::Sender<
+        Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+        >,
+    >,
+    response_error: RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+    guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup_timeout: Duration,
+) -> RuntimeGatewayOwnerClosedRecoveryPrepareStepV2 {
+    guard.invalidate_now();
+    let _result = response.send(Err(response_error));
+    RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(
+        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup_timeout),
+    )
+}
+
+fn map_closed_recovery_prepare_watchdog_error_v2(
+    error: RuntimeGatewayOwnerWatchdogErrorV1,
+) -> RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2 {
+    match error {
+        RuntimeGatewayOwnerWatchdogErrorV1::SafetyElapsed
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(
+            RuntimeGatewayOwnerRenewalScheduleErrorV1::SafetyElapsed,
+        ) => RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed,
+        RuntimeGatewayOwnerWatchdogErrorV1::ClockReversed
+        | RuntimeGatewayOwnerWatchdogErrorV1::RequestedLeaseTooShort
+        | RuntimeGatewayOwnerWatchdogErrorV1::RevisionExhausted
+        | RuntimeGatewayOwnerWatchdogErrorV1::ProtocolViolation { .. }
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(_) => {
+            RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation
+        }
+    }
 }
 
 enum RuntimeGatewayOwnerStartupObservationStepV1 {

@@ -545,6 +545,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     )));
     assert!(owner_supervisor.contains("shutdown_commands: mpsc::Sender<"));
     assert!(owner_supervisor.contains("supervisor_commands: mpsc::Sender<"));
+    assert!(owner_supervisor.contains("closed_recovery_commands: mpsc::Sender<"));
     assert!(owner_supervisor.contains("RuntimeGatewayOwnerObservationCompletionV1::Current"));
     assert!(!owner_supervisor.contains("impl Clone for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
     assert!(owner_supervisor.contains("impl Drop for RuntimeGatewayOwnerSupervisorHandleV1"));
@@ -557,6 +558,24 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         owner_supervisor.contains("pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1")
     );
     assert!(owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Promote"));
+    assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Prepare"));
+    assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Commit"));
+    for required in [
+        "pub(crate) async fn prepare_closed_recovery_v2(\n        mut self,",
+        "pub(crate) async fn abort_and_shutdown_v2(\n        mut self,",
+        "pub(crate) async fn commit_closed_recovery_v2(\n        mut self,",
+        "const CLOSED_RECOVERY_COMMAND_CAPACITY: usize = 1;",
+        "RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare",
+        "RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit",
+        "RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery",
+        "RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery",
+        "permit.owner_receipt() != self.observation.receipt()",
+        "watchdog.schedule().receipt() != &expected_receipt",
+        "RuntimeGatewayOwnerPreparedClosedRecoveryV2(<redacted>)",
+        "RuntimeGatewayOwnerClosedRecoverySupervisorV2(<redacted>)",
+    ] {
+        assert!(owner_supervisor.contains(required), "{required}");
+    }
     assert_eq!(
         owner_supervisor.matches("runtime.spawn(async move").count(),
         1
@@ -595,9 +614,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerStartupWatchdogHandleV1",
         "RuntimeGatewayOwnerProductionHandoffProofV1",
         "RuntimeGatewayOwnerProductionSupervisorV1",
+        "RuntimeGatewayOwnerPreparedClosedRecoveryV2",
+        "RuntimeGatewayOwnerClosedRecoverySupervisorV2",
     ] {
         let attributes = declaration_attribute_block(owner_supervisor, name);
-        for forbidden in ["Clone", "Copy", "Default"] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
             assert!(
                 !contains_identifier(attributes, forbidden),
                 "{name}: {forbidden}"
@@ -613,6 +634,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerProductionHandoffProofV1",
         "RuntimeGatewayOwnerProductionSupervisorV1",
         "RuntimeGatewayOwnerProductionHandoffErrorV1",
+        "RuntimeGatewayOwnerPreparedClosedRecoveryV2",
+        "RuntimeGatewayOwnerClosedRecoverySupervisorV2",
+        "RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2",
+        "RuntimeGatewayOwnerClosedRecoveryCommitErrorV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }
