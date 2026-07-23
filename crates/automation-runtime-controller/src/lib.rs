@@ -17,6 +17,7 @@ mod v2_binding;
 mod v2_canonical_value;
 mod v2_certification;
 mod v2_certification_canonical;
+mod v2_certification_outcome;
 #[cfg_attr(
     not(test),
     expect(
@@ -81,6 +82,11 @@ pub use v2_certification_canonical::{
     RuntimeCertificationCanonicalErrorV2, RuntimeCertificationCanonicalFieldV2,
     RuntimeCertificationCanonicalRootV2, RuntimeCertificationIntentCorrelationV2,
     RuntimeCertificationRequestCorrelationV2, RuntimeLiveAttestationRecordV2,
+};
+pub use v2_certification_outcome::{
+    AwaitingCertificationScopeObservationV2, RuntimeCertificationDivergenceV2,
+    RuntimeCertificationLookupV2, RuntimeCertificationObservationV2, RuntimeCertificationReceiptV2,
+    RuntimeCertificationRecoveryDispositionV2, RuntimeServingIdentityV2, RuntimeServingReceiptV2,
 };
 pub use v2_digest::{
     RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,

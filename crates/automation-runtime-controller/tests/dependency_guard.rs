@@ -315,6 +315,239 @@ fn v2_certification_inputs_stay_inert_and_exact() {
 }
 
 #[test]
+fn v2_certification_outcomes_stay_exact_and_non_authorizing() {
+    let source = include_str!("../src/v2_certification_outcome.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "canonical_bytes",
+        "canonical_json",
+        "RuntimeLiveCertificationPortV2",
+        "RuntimePreparedLiveCertificationPortV2",
+        "RuntimeCertificationCommitAuthorityV2",
+        "Box<RuntimeCertificationReceiptV2>",
+        "Future",
+        "sqlx",
+        "tokio",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 certification outcome surface: {forbidden}"
+        );
+    }
+
+    let serving_identity = source
+        .split("pub struct RuntimeServingIdentityV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("scope", "RuntimeDeploymentScopeV1"),
+        ("operation_id", "RuntimeCertificationOperationIdV2"),
+        ("attestation_digest", "RuntimeLiveAttestationDigestV2"),
+        ("process_identity", "RuntimeProcessIdentityV1"),
+        ("lease_epoch", "NonZeroU64"),
+        ("revision", "NonZeroU64"),
+    ] {
+        assert!(serving_identity.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(serving_identity.matches("    pub ").count(), 6);
+
+    let serving_receipt = source
+        .split("pub struct RuntimeServingReceiptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("identity", "RuntimeServingIdentityV2"),
+        ("acquired_at", "DateTime<Utc>"),
+        ("last_heartbeat_at", "DateTime<Utc>"),
+        ("expires_at", "DateTime<Utc>"),
+        ("connected", "bool"),
+        ("serving", "bool"),
+    ] {
+        assert!(serving_receipt.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(serving_receipt.matches("    pub ").count(), 6);
+
+    let certification_receipt = source
+        .split("pub struct RuntimeCertificationReceiptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("action_id", "RuntimeSessionActionIdV1"),
+        ("outcome", "TransitionOutcomeV1"),
+        ("snapshot", "RuntimeDeploymentSnapshotV1"),
+        ("convergence_attempt", "NonZeroU32"),
+        ("operation_id", "RuntimeCertificationOperationIdV2"),
+        (
+            "intent_fingerprint",
+            "RuntimeCertificationIntentFingerprintV2",
+        ),
+        ("request_digest", "RuntimeCertificationRequestDigestV2"),
+        ("attestation_digest", "RuntimeLiveAttestationDigestV2"),
+        ("route_admission", "RuntimeRouteAdmissionAttestationV2"),
+        ("serving", "RuntimeServingReceiptV2"),
+        ("certified_at", "DateTime<Utc>"),
+    ] {
+        assert!(certification_receipt.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(certification_receipt.matches("    pub ").count(), 11);
+
+    let divergence = source
+        .split("pub enum RuntimeCertificationDivergenceV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for variant in [
+        "OwnershipLost,",
+        "DeploymentAdvanced {",
+        "AuthorityChanged {",
+        "Superseded {",
+        "Terminal {",
+        "ReservationMismatch,",
+        "CommittedRequestMismatch,",
+        "PersistenceCorrupt,",
+    ] {
+        assert!(divergence.contains(variant), "{variant}");
+    }
+    assert_eq!(
+        divergence
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        8
+    );
+    assert_eq!(
+        divergence
+            .matches("snapshot: RuntimeDeploymentSnapshotV1")
+            .count(),
+        4
+    );
+
+    let disposition = source
+        .split("pub enum RuntimeCertificationRecoveryDispositionV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for variant in [
+        "StopOwnership,",
+        "DrainAndReplan,",
+        "DrainAndStop,",
+        "EmergencyHalt,",
+    ] {
+        assert!(disposition.contains(variant), "{variant}");
+    }
+    assert_eq!(
+        disposition
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("        "))
+            .count(),
+        4
+    );
+
+    let lookup = source
+        .split("pub struct RuntimeCertificationLookupV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for (field, field_type) in [
+        ("scope", "RuntimeDeploymentScopeV1"),
+        ("deployment_revision", "DeploymentRevision"),
+        ("convergence_attempt", "NonZeroU32"),
+        ("operation_id", "RuntimeCertificationOperationIdV2"),
+        ("request_digest", "RuntimeCertificationRequestDigestV2"),
+    ] {
+        assert!(lookup.contains(&format!("pub {field}: {field_type}")));
+    }
+    assert_eq!(lookup.matches("    pub ").count(), 5);
+
+    let exact_observation = source
+        .split("pub enum RuntimeCertificationObservationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "NotCommitted {",
+        "snapshot: RuntimeDeploymentSnapshotV1,",
+        "convergence_attempt: NonZeroU32,",
+        "operation_id: RuntimeCertificationOperationIdV2,",
+        "request_digest: RuntimeCertificationRequestDigestV2,",
+        "observed_deployment_revision: DeploymentRevision,",
+        "observed_at: DateTime<Utc>,",
+        "Committed(RuntimeCertificationReceiptV2),",
+        "Diverged(RuntimeCertificationDivergenceV2),",
+    ] {
+        assert!(exact_observation.contains(member), "{member}");
+    }
+    assert_eq!(
+        exact_observation
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        3
+    );
+
+    let scope_observation = source
+        .split("pub enum AwaitingCertificationScopeObservationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[cfg(test)]").next())
+        .unwrap();
+    for member in [
+        "Committed(RuntimeCertificationReceiptV2),",
+        "NoOperationReserved {",
+        "NoAttestationForReservedOperation {",
+        "reserved_operation_id: RuntimeCertificationOperationIdV2,",
+        "Diverged(RuntimeCertificationDivergenceV2),",
+    ] {
+        assert!(scope_observation.contains(member), "{member}");
+    }
+    assert_eq!(
+        scope_observation
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        4
+    );
+    assert_eq!(
+        scope_observation
+            .matches("snapshot: RuntimeDeploymentSnapshotV1")
+            .count(),
+        2
+    );
+    assert_eq!(
+        scope_observation
+            .matches("observed_at: DateTime<Utc>")
+            .count(),
+        2
+    );
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "AwaitingCertificationScopeObservationV2",
+        "RuntimeCertificationDivergenceV2",
+        "RuntimeCertificationLookupV2",
+        "RuntimeCertificationObservationV2",
+        "RuntimeCertificationReceiptV2",
+        "RuntimeCertificationRecoveryDispositionV2",
+        "RuntimeServingIdentityV2",
+        "RuntimeServingReceiptV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_certification_canonical_surface_stays_closed() {
     let canonical = include_str!("../src/v2_certification_canonical.rs");
     let wire = include_str!("../src/v2_certification_canonical/wire.rs");
@@ -707,6 +940,10 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_certification_canonical/tests.rs",
             include_str!("../src/v2_certification_canonical/tests.rs"),
+        ),
+        (
+            "src/v2_certification_outcome.rs",
+            include_str!("../src/v2_certification_outcome.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
