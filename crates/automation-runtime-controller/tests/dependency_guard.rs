@@ -1709,6 +1709,239 @@ fn v2_product_drain_canonical_surface_stays_closed_and_purpose_specific() {
 }
 
 #[test]
+fn v2_suspension_canonical_surface_stays_closed_and_purpose_specific() {
+    let canonical = include_str!("../src/v2_suspension_canonical.rs");
+    let wire = include_str!("../src/v2_suspension_canonical/wire.rs");
+    let tests = include_str!("../src/v2_suspension_canonical/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "RuntimeExecutionConvergencePort",
+        "RuntimeServingLeasePort",
+        "RuntimeCertificationCommitAuthority",
+        "RuntimeSuspendAttemptAuthority",
+        "Permit",
+        "Future",
+        "pub request:",
+        "pub bytes:",
+        "pub digest:",
+        "pub fn encode",
+        "pub fn decode",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !canonical.contains(forbidden),
+            "forbidden suspension canonical surface: {forbidden}"
+        );
+    }
+
+    let aggregate = canonical
+        .split("pub struct RuntimeCanonicalSuspendAttemptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "request: RuntimeSuspendAttemptRequestV2,",
+        "bytes: Box<[u8]>,",
+        "digest: RuntimeSuspendAttemptDigestV2,",
+    ] {
+        assert!(aggregate.contains(field), "{field}");
+    }
+    assert_eq!(aggregate.matches("    ").count(), 3);
+    assert!(!aggregate.contains("pub "));
+
+    assert!(canonical.contains("const SUSPEND_ATTEMPT_MAX_OCTETS: usize = 131_072;"));
+    assert_eq!(canonical.matches("suspend_attempt_digest_v2(").count(), 2);
+    assert!(canonical.contains(concat!(
+        "pub fn new(\n",
+        "        request: RuntimeSuspendAttemptRequestV2,\n",
+        "    ) -> Result<Self, RuntimeSuspendAttemptCanonicalErrorV2> {"
+    )));
+    assert!(canonical.contains(concat!(
+        "pub fn from_persisted(\n",
+        "        bytes: &[u8],\n",
+        "        persisted_digest: &RuntimeSuspendAttemptDigestV2,\n",
+        "    ) -> Result<Self, RuntimeSuspendAttemptCanonicalErrorV2> {"
+    )));
+    assert!(!canonical.contains(
+        "pub fn new(\n        request: RuntimeSuspendAttemptRequestV2,\n        digest:"
+    ));
+    assert!(
+        canonical.contains("if request.source_phase.required_checkpoint() != request.checkpoint")
+    );
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::FailureDispositionTime"));
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::LocalRouteRuntimeGeneration"));
+    assert!(
+        canonical.contains("RuntimeSuspendAttemptCorrelationV2::LocalRouteControllerFencingToken")
+    );
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::PreviousServingProductScope"));
+    assert!(
+        canonical.contains("RuntimeSuspendAttemptCorrelationV2::PreviousServingRuntimeGeneration")
+    );
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::RouteProvenanceProcess"));
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::RouteProvenanceGeneration"));
+    assert!(canonical.contains("RuntimeSuspendAttemptCorrelationV2::RouteProvenanceSequence"));
+    assert_eq!(
+        canonical
+            .matches("RuntimeLocalRouteEffectV2::None,")
+            .count(),
+        2
+    );
+    assert_eq!(
+        canonical
+            .matches("RuntimeLocalRouteEffectV2::ExactRoute")
+            .count(),
+        2
+    );
+    assert_eq!(
+        canonical
+            .matches("RuntimeLocalRouteEffectV2::RouteAbsent")
+            .count(),
+        2
+    );
+    assert!(canonical.contains(concat!(
+        "_ => {\n",
+        "            return Err(correlation(\n",
+        "                RuntimeSuspendAttemptCorrelationV2::LocalEffectDrainObligation,\n",
+        "            ));\n",
+        "        }"
+    )));
+
+    for forbidden in [
+        "pub struct",
+        "pub enum",
+        "serde_json::Value",
+        "HashMap",
+        "BTreeMap",
+        "flatten",
+        "untagged",
+        "rename_all",
+        "alias",
+        "skip_serializing_if",
+        "serde(default",
+        "to_vec(request)",
+        "from_slice::<RuntimeSuspendAttemptRequestV2>",
+    ] {
+        assert!(
+            !wire.contains(forbidden),
+            "forbidden V2 suspension wire surface: {forbidden}"
+        );
+    }
+    for projection in [
+        "struct SuspendAttemptWireV2",
+        "struct ExecutionGuardWireV2",
+        "struct DeploymentScopeWireV2",
+        "struct FailureWireV2",
+        "enum AttemptDispositionWireV2",
+        "struct ExactLocalRouteWireV2",
+        "struct ProcessIdentityWireV2",
+        "struct DeploymentTargetWireV2",
+        "struct ServingSlotWireV2",
+        "struct PreviousServingIdentityWireV2",
+        "enum DrainObligationWireV2",
+        "enum LocalRouteEffectWireV2",
+        "enum RouteMutationProvenanceWireV2",
+        "struct BarrierPauseWireV2",
+        "struct ClosedRecoveryRouteWitnessWireV2",
+        "struct ShutdownRouteWitnessWireV2",
+        "struct GatewayOwnerLeaseIdWireV2",
+    ] {
+        assert!(wire.contains(projection), "{projection}");
+    }
+    assert_eq!(wire.matches("#[serde(deny_unknown_fields)]").count(), 13);
+    assert_eq!(
+        wire.matches("#[serde(tag = \"kind\", deny_unknown_fields)]")
+            .count(),
+        4
+    );
+
+    let root = wire
+        .split("struct SuspendAttemptWireV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for field in [
+        "format_version",
+        "suspension_id",
+        "action_id",
+        "guard",
+        "source_phase",
+        "failure",
+        "disposition",
+        "checkpoint",
+        "local_effect",
+        "drain_obligation",
+    ] {
+        assert!(root.contains(&format!("    {field}:")), "{field}");
+    }
+    assert_eq!(root.matches("    ").count(), 10);
+    assert!(root.find("format_version").unwrap() < root.find("suspension_id").unwrap());
+    assert!(root.find("suspension_id").unwrap() < root.find("action_id").unwrap());
+    assert!(root.find("action_id").unwrap() < root.find("guard").unwrap());
+    assert!(root.find("guard").unwrap() < root.find("source_phase").unwrap());
+    assert!(root.find("source_phase").unwrap() < root.find("failure").unwrap());
+    assert!(root.find("failure").unwrap() < root.find("disposition").unwrap());
+    assert!(root.find("disposition").unwrap() < root.find("checkpoint").unwrap());
+    assert!(root.find("checkpoint").unwrap() < root.find("local_effect").unwrap());
+    assert!(root.find("local_effect").unwrap() < root.find("drain_obligation").unwrap());
+
+    for tag in [
+        "retryable",
+        "blocked",
+        "none",
+        "exact_local_route",
+        "previous_serving",
+        "local_and_previous",
+        "exact_route",
+        "route_absent",
+        "ordinary",
+        "closed_recovery",
+        "shutdown",
+    ] {
+        assert!(
+            wire.contains(&format!("#[serde(rename = \"{tag}\")]")),
+            "{tag}"
+        );
+    }
+    assert_eq!(wire.matches("#[serde(rename = \"none\")]").count(), 2);
+    assert!(wire.contains("#[serde(deserialize_with = \"deserialize_required_option\")]"));
+    assert!(wire.contains("fn deserialize_required_option<'de, D, T>"));
+    assert!(wire.contains("ensure_size(encoded)?;\n    let wire = serde_json::from_slice"));
+    assert!(wire.contains("if canonical != encoded"));
+    assert!(
+        wire.contains("return Err(RuntimeSuspendAttemptCanonicalErrorV2::NonCanonicalEncoding);")
+    );
+    assert!(wire.contains("encoded.len() > SUSPEND_ATTEMPT_MAX_OCTETS"));
+    for required in [
+        "simple_root_matches_the_exact_byte_and_independent_digest_golden",
+        "nested_payload_variants_match_exact_byte_goldens",
+        "string_escaping_has_exact_utf8_json_and_digest_goldens",
+        "independent_suspend_digest",
+        "expected_closed_recovery_provenance_json",
+        "expected_shutdown_provenance_json",
+    ] {
+        assert!(tests.contains(required), "{required}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeCanonicalSuspendAttemptV2",
+        "RuntimeSuspendAttemptCanonicalErrorV2",
+        "RuntimeSuspendAttemptCanonicalFieldV2",
+        "RuntimeSuspendAttemptCorrelationV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -1783,6 +2016,18 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension.rs",
             include_str!("../src/v2_suspension.rs"),
+        ),
+        (
+            "src/v2_suspension_canonical.rs",
+            include_str!("../src/v2_suspension_canonical.rs"),
+        ),
+        (
+            "src/v2_suspension_canonical/wire.rs",
+            include_str!("../src/v2_suspension_canonical/wire.rs"),
+        ),
+        (
+            "src/v2_suspension_canonical/tests.rs",
+            include_str!("../src/v2_suspension_canonical/tests.rs"),
         ),
         (
             "src/v2_writer_fence.rs",
