@@ -262,6 +262,16 @@ ID and mints one non-cloneable `RuntimeClosedDrainRecoveryPermitV2`. That permit
 authorizes only the closed startup/recovery fixed point described below and
 cannot resume admission.
 
+The pure worker coordinator implements the registry evidence input as the
+non-cloneable sum `RuntimeClosedRecoveryRegistryEvidenceV2`. Its first supported
+branch is only `Empty(RuntimeRegistryRecoveryEmptyObservationV2)`. Aggregate
+counts, a copied sequence, or that empty branch cannot stand in for the future
+exactly-classified branch. The worker permit is state authority only and
+performs no I/O. Before any closed operation, the concrete
+`tools/starring-runtime` adapter must still bind and revalidate the exact
+registry instance cursor, serialized owner freeze, gateway control lifetime,
+and compound recovery session.
+
 After the fixed point proves serving empty and every runtime-resolvable count
 zero, consuming the closed permit may mint the separate non-cloneable gateway
 recovery-resume permit. Its runtime-side claim and exact ready observation move

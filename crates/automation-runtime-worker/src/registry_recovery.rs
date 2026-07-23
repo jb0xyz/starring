@@ -82,6 +82,8 @@ impl Debug for RuntimeRegistryRecoveryEmptyObservationV2 {
 pub enum RuntimeRegistryRecoveryObservationErrorV2 {
     #[error("runtime registry recovery observation is failed closed")]
     FailedClosed,
+    #[error("runtime registry recovery observation sequence is outside the persistence domain")]
+    ObservationSequenceOutOfRange,
     #[error("runtime registry recovery observation is not empty")]
     NotEmpty,
     #[error("runtime registry recovery retained counts are inconsistent")]
@@ -97,6 +99,9 @@ pub fn accept_runtime_registry_recovery_empty_observation_v2(
         || observation.observation_sequence.get() == u64::MAX
     {
         return Err(RuntimeRegistryRecoveryObservationErrorV2::FailedClosed);
+    }
+    if observation.observation_sequence.get() > i64::MAX as u64 {
+        return Err(RuntimeRegistryRecoveryObservationErrorV2::ObservationSequenceOutOfRange);
     }
     if observation.staged_route_count != 0
         || observation.serving_route_count != 0
@@ -220,6 +225,35 @@ mod tests {
                 Err(RuntimeRegistryRecoveryObservationErrorV2::FailedClosed)
             );
         }
+    }
+
+    #[test]
+    fn rejects_observation_sequence_outside_the_persistence_domain() {
+        let observation = RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: sequence(i64::MAX as u64 + 1),
+            ..input()
+        };
+
+        assert_eq!(
+            accept_runtime_registry_recovery_empty_observation_v2(process(), observation),
+            Err(RuntimeRegistryRecoveryObservationErrorV2::ObservationSequenceOutOfRange)
+        );
+    }
+
+    #[test]
+    fn accepts_observation_sequence_at_the_persistence_boundary() {
+        let observation = RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: sequence(i64::MAX as u64),
+            ..input()
+        };
+
+        assert_eq!(
+            accept_runtime_registry_recovery_empty_observation_v2(process(), observation)
+                .unwrap()
+                .observation_sequence()
+                .get(),
+            i64::MAX as u64
+        );
     }
 
     #[test]

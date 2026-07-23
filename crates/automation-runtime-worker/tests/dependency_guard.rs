@@ -12,6 +12,21 @@ fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
     }
 }
 
+fn contains_identifier(source: &str, expected: &str) -> bool {
+    source
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|identifier| identifier == expected)
+}
+
+fn implements_trait(source: &str, name: &str, trait_name: &str) -> bool {
+    let marker = format!(" for {name}");
+    source.match_indices(&marker).any(|(end, _)| {
+        source[..end]
+            .rfind("impl ")
+            .is_some_and(|start| contains_identifier(&source[start..end], trait_name))
+    })
+}
+
 #[test]
 fn worker_dependency_surface_is_pure_library_only_and_closed() {
     let manifest = include_str!("../Cargo.toml");
@@ -36,7 +51,9 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/capability_readiness.rs"),
+            PathBuf::from("src/closed_recovery.rs"),
             PathBuf::from("src/gateway_lifecycle.rs"),
+            PathBuf::from("src/gateway_lifecycle_tests.rs"),
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
             PathBuf::from("src/lib.rs"),
@@ -159,6 +176,8 @@ fn registry_recovery_evidence_is_pure_redacted_and_non_authorizing() {
         "RuntimeRegistryGlobalObservationSequenceV2(<redacted>)",
         "RuntimeRegistryRecoveryObservationInputV2(<redacted>)",
         "RuntimeRegistryRecoveryEmptyObservationV2(<redacted>)",
+        "ObservationSequenceOutOfRange",
+        "observation.observation_sequence.get() > i64::MAX as u64",
         "pub observation_sequence: RuntimeRegistryGlobalObservationSequenceV2",
         "pub retained_slot_count: u64",
         "pub retained_empty_tombstone_count: u64",
@@ -269,12 +288,97 @@ fn worker_coordinator_authority_and_state_surface_stay_exact() {
     assert!(!lifecycle.contains("impl Default for RuntimeGatewayClosedLifecycleV2"));
     assert!(lifecycle.contains("pub enum RuntimeGatewayClosedSnapshotV2"));
     assert!(lifecycle.contains("Emergency {"));
+    assert!(lifecycle.contains("RecoveryPending {"));
     assert!(lifecycle.contains("Shutdown {"));
     assert!(!lifecycle.contains("Open"));
-    assert!(!lifecycle.contains("RecoveryPending"));
     assert!(!lifecycle.contains("AdmissionAcknowledging"));
     assert!(!invalidation.contains("Starting"));
     assert_eq!(invalidation.matches("    ").count(), 5);
+}
+
+#[test]
+fn closed_recovery_authority_is_narrow_noncloneable_and_state_only() {
+    let source = include_str!("../src/closed_recovery.rs");
+    let permit_declaration = source
+        .split("pub struct RuntimeClosedDrainRecoveryPermitV2 {")
+        .next()
+        .unwrap();
+    let permit_attributes = permit_declaration.rsplit_once("\n\n").unwrap().1;
+    let input_declaration = source
+        .split("pub struct RuntimeClosedRecoveryInputV2 {")
+        .next()
+        .unwrap();
+    let input_attributes = input_declaration.rsplit_once("\n\n").unwrap().1;
+    let registry_declaration = source
+        .split("pub enum RuntimeClosedRecoveryRegistryEvidenceV2 {")
+        .next()
+        .unwrap();
+    let registry_attributes = registry_declaration.rsplit_once("\n\n").unwrap().1;
+    let permit_fields = source
+        .split("pub struct RuntimeClosedDrainRecoveryPermitV2 {")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("}\n\nimpl RuntimeClosedDrainRecoveryPermitV2")
+                .next()
+        })
+        .unwrap();
+    let permit_impl = source
+        .split("impl RuntimeClosedDrainRecoveryPermitV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl Debug").next())
+        .unwrap();
+
+    for attributes in [permit_attributes, input_attributes, registry_attributes] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden));
+        }
+    }
+    for authority in [
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "RuntimeClosedRecoveryInputV2",
+        "RuntimeClosedRecoveryRegistryEvidenceV2",
+    ] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!implements_trait(source, authority, forbidden));
+        }
+    }
+    assert!(!permit_fields.contains("pub "));
+    assert_eq!(permit_impl.matches("pub(crate) fn new(").count(), 1);
+    for forbidden in ["pub fn new(", "pub fn from_", "pub(crate) fn from_"] {
+        assert!(!permit_impl.contains(forbidden));
+    }
+    for forbidden in [
+        "pub fn new(value: NonZeroU64)",
+        "advance_authority",
+        "resume",
+        "std::future",
+        "async",
+        "RuntimeGatewayControl",
+        "automation_runtime_registry",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden closed recovery authority surface: {forbidden}"
+        );
+    }
+    for expected in [
+        "pub const FIRST: Self = Self(NonZeroU64::MIN);",
+        "RuntimeClosedRecoveryInputV2(<redacted>)",
+        "RuntimeClosedRecoveryRegistryEvidenceV2(<redacted>)",
+        "pub enum RuntimeClosedRecoveryRegistryEvidenceV2 {\n    Empty(",
+        "RuntimeClosedDrainRecoveryPermitV2(<redacted>)",
+        "originating_emergency_generation",
+        "coordinator_generation",
+        "recovery_id",
+        "authority_revision",
+        "owner_receipt",
+        "readiness",
+        "paused_gateway",
+        "registry_evidence",
+    ] {
+        assert!(source.contains(expected));
+    }
 }
 
 #[test]

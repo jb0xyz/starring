@@ -1,5 +1,7 @@
 use std::num::NonZeroU64;
 
+use crate::{RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeGatewayCoordinatorGenerationV2(NonZeroU64);
 
@@ -53,11 +55,16 @@ impl From<RuntimeGatewayInvalidationCauseV2> for RuntimeGatewayEmergencyCauseV2 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeGatewayClosedSnapshotV2 {
     Emergency {
         generation: RuntimeGatewayCoordinatorGenerationV2,
         cause: RuntimeGatewayEmergencyCauseV2,
+    },
+    RecoveryPending {
+        generation: RuntimeGatewayCoordinatorGenerationV2,
+        recovery_id: automation_runtime_controller::RuntimeRecoveryIdV2,
+        authority_revision: crate::RuntimeClosedRecoveryAuthorityRevisionV2,
     },
     Shutdown {
         generation: RuntimeGatewayCoordinatorGenerationV2,
@@ -65,9 +72,11 @@ pub enum RuntimeGatewayClosedSnapshotV2 {
 }
 
 impl RuntimeGatewayClosedSnapshotV2 {
-    pub fn generation(self) -> RuntimeGatewayCoordinatorGenerationV2 {
+    pub fn generation(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
         match self {
-            Self::Emergency { generation, .. } | Self::Shutdown { generation } => generation,
+            Self::Emergency { generation, .. }
+            | Self::RecoveryPending { generation, .. }
+            | Self::Shutdown { generation } => *generation,
         }
     }
 }
@@ -80,6 +89,18 @@ pub enum RuntimeGatewayClosedTransitionErrorV2 {
     GenerationOverflow,
     #[error("runtime gateway coordinator is shut down")]
     Shutdown,
+    #[error("runtime gateway coordinator is not in emergency")]
+    NotEmergency,
+    #[error("runtime paused gateway coordinator generation does not match")]
+    PausedGatewayGenerationMismatch,
+    #[error("runtime closed recovery process identity does not match")]
+    ProcessInstanceMismatch,
+    #[error("runtime gateway owner receipt is not current")]
+    OwnerReceiptNotCurrent,
+    #[error("runtime closed recovery sequence is outside the persistence domain")]
+    EvidenceSequenceOutOfRange,
+    #[error("runtime closed recovery permit is stale")]
+    StaleRecoveryPermit,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,7 +119,107 @@ impl RuntimeGatewayClosedLifecycleV2 {
     }
 
     pub fn snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
-        self.snapshot
+        self.snapshot.clone()
+    }
+
+    pub fn begin_recovery(
+        &mut self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+        input: RuntimeClosedRecoveryInputV2,
+    ) -> Result<
+        (
+            RuntimeGatewayClosedSnapshotV2,
+            RuntimeClosedDrainRecoveryPermitV2,
+        ),
+        RuntimeGatewayClosedTransitionErrorV2,
+    > {
+        self.require_generation(expected_generation)?;
+        match &self.snapshot {
+            RuntimeGatewayClosedSnapshotV2::Emergency { .. } => {}
+            RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. } => {
+                return Err(RuntimeGatewayClosedTransitionErrorV2::NotEmergency);
+            }
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. } => {
+                return Err(RuntimeGatewayClosedTransitionErrorV2::Shutdown);
+            }
+        }
+        let Some(successor_generation) = expected_generation.successor() else {
+            self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown {
+                generation: expected_generation,
+            };
+            return Err(RuntimeGatewayClosedTransitionErrorV2::GenerationOverflow);
+        };
+        let (recovery_id, owner_receipt, readiness, paused_gateway, registry_evidence) =
+            input.into_parts();
+        if paused_gateway.coordinator_generation() != expected_generation {
+            return Err(RuntimeGatewayClosedTransitionErrorV2::PausedGatewayGenerationMismatch);
+        }
+        let process_instance_id = &owner_receipt.lease_id.process_instance_id;
+        if paused_gateway.process_instance_id() != process_instance_id
+            || registry_evidence.process_instance_id() != process_instance_id
+        {
+            return Err(RuntimeGatewayClosedTransitionErrorV2::ProcessInstanceMismatch);
+        }
+        if owner_receipt.database_lease_duration().is_none() {
+            return Err(RuntimeGatewayClosedTransitionErrorV2::OwnerReceiptNotCurrent);
+        }
+        let persistence_max = i64::MAX as u64;
+        if successor_generation.get() > persistence_max
+            || owner_receipt.lease_id.lease_epoch.get() > persistence_max
+            || owner_receipt.owner_revision.get() > persistence_max
+            || paused_gateway.connection_epoch().get() > persistence_max
+            || paused_gateway.admission_revision().get() > persistence_max
+            || paused_gateway.transition_sequence().get() > persistence_max
+            || registry_evidence
+                .empty_observation()
+                .observation_sequence()
+                .get()
+                > persistence_max
+        {
+            return Err(RuntimeGatewayClosedTransitionErrorV2::EvidenceSequenceOutOfRange);
+        }
+        let generation = successor_generation;
+        let authority_revision = crate::RuntimeClosedRecoveryAuthorityRevisionV2::FIRST;
+        self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id: recovery_id.clone(),
+            authority_revision,
+        };
+        let permit = RuntimeClosedDrainRecoveryPermitV2::new(
+            expected_generation,
+            generation,
+            recovery_id,
+            owner_receipt,
+            readiness,
+            paused_gateway,
+            registry_evidence,
+        );
+        Ok((self.snapshot.clone(), permit))
+    }
+
+    pub fn validate_recovery_permit(
+        &self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<(), RuntimeGatewayClosedTransitionErrorV2> {
+        match &self.snapshot {
+            RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+                generation,
+                recovery_id,
+                authority_revision,
+            } if *generation == permit.coordinator_generation()
+                && recovery_id == permit.recovery_id()
+                && *authority_revision == permit.authority_revision() =>
+            {
+                Ok(())
+            }
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. } => {
+                Err(RuntimeGatewayClosedTransitionErrorV2::Shutdown)
+            }
+            RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+            | RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. } => {
+                Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit)
+            }
+        }
     }
 
     pub fn invalidate(
@@ -108,7 +229,7 @@ impl RuntimeGatewayClosedLifecycleV2 {
     ) -> Result<RuntimeGatewayClosedSnapshotV2, RuntimeGatewayClosedTransitionErrorV2> {
         self.require_generation(expected_generation)?;
         if matches!(
-            self.snapshot,
+            &self.snapshot,
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ) {
             return Err(RuntimeGatewayClosedTransitionErrorV2::Shutdown);
@@ -118,7 +239,7 @@ impl RuntimeGatewayClosedLifecycleV2 {
             generation,
             cause: cause.into(),
         };
-        Ok(self.snapshot)
+        Ok(self.snapshot.clone())
     }
 
     pub fn shutdown(
@@ -127,14 +248,14 @@ impl RuntimeGatewayClosedLifecycleV2 {
     ) -> Result<RuntimeGatewayClosedSnapshotV2, RuntimeGatewayClosedTransitionErrorV2> {
         self.require_generation(expected_generation)?;
         if matches!(
-            self.snapshot,
+            &self.snapshot,
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ) {
-            return Ok(self.snapshot);
+            return Ok(self.snapshot.clone());
         }
         let generation = self.advance_generation()?;
         self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
-        Ok(self.snapshot)
+        Ok(self.snapshot.clone())
     }
 
     fn require_generation(
@@ -162,58 +283,5 @@ impl RuntimeGatewayClosedLifecycleV2 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::num::NonZeroU64;
-
-    use super::{
-        RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
-        RuntimeGatewayClosedTransitionErrorV2, RuntimeGatewayCoordinatorGenerationV2,
-        RuntimeGatewayEmergencyCauseV2, RuntimeGatewayInvalidationCauseV2,
-    };
-
-    #[test]
-    fn overflow_becomes_terminally_closed() {
-        let maximum = RuntimeGatewayCoordinatorGenerationV2::new(NonZeroU64::MAX);
-        let mut lifecycle = RuntimeGatewayClosedLifecycleV2 {
-            snapshot: RuntimeGatewayClosedSnapshotV2::Emergency {
-                generation: maximum,
-                cause: RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
-            },
-        };
-
-        assert_eq!(
-            lifecycle.invalidate(
-                maximum,
-                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
-            ),
-            Err(RuntimeGatewayClosedTransitionErrorV2::GenerationOverflow)
-        );
-        assert_eq!(
-            lifecycle.snapshot(),
-            RuntimeGatewayClosedSnapshotV2::Shutdown {
-                generation: maximum,
-            }
-        );
-        assert_eq!(
-            lifecycle.invalidate(maximum, RuntimeGatewayInvalidationCauseV2::ControlOrphaned),
-            Err(RuntimeGatewayClosedTransitionErrorV2::Shutdown)
-        );
-
-        let mut shutdown = RuntimeGatewayClosedLifecycleV2 {
-            snapshot: RuntimeGatewayClosedSnapshotV2::Emergency {
-                generation: maximum,
-                cause: RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-            },
-        };
-        assert_eq!(
-            shutdown.shutdown(maximum),
-            Err(RuntimeGatewayClosedTransitionErrorV2::GenerationOverflow)
-        );
-        assert_eq!(
-            shutdown.snapshot(),
-            RuntimeGatewayClosedSnapshotV2::Shutdown {
-                generation: maximum,
-            }
-        );
-    }
-}
+#[path = "gateway_lifecycle_tests.rs"]
+mod tests;

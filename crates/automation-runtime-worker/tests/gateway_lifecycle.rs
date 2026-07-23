@@ -4,7 +4,7 @@ use automation_runtime_worker::{
     RuntimeGatewayEmergencyCauseV2, RuntimeGatewayInvalidationCauseV2,
 };
 
-fn generation(snapshot: RuntimeGatewayClosedSnapshotV2) -> RuntimeGatewayCoordinatorGenerationV2 {
+fn generation(snapshot: &RuntimeGatewayClosedSnapshotV2) -> RuntimeGatewayCoordinatorGenerationV2 {
     snapshot.generation()
 }
 
@@ -24,14 +24,14 @@ fn initial_state_is_closed_and_cannot_represent_open() {
 #[test]
 fn exact_invalidations_advance_and_stale_or_reordered_calls_fail() {
     let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
-    let first = generation(lifecycle.snapshot());
+    let first = generation(&lifecycle.snapshot());
     let disconnected = lifecycle
         .invalidate(
             first,
             RuntimeGatewayInvalidationCauseV2::TransportDisconnected,
         )
         .unwrap();
-    let second = generation(disconnected);
+    let second = generation(&disconnected);
 
     assert_eq!(second.get(), first.get() + 1);
     assert_eq!(
@@ -45,7 +45,7 @@ fn exact_invalidations_advance_and_stale_or_reordered_calls_fail() {
             RuntimeGatewayInvalidationCauseV2::TransportDisconnected,
         )
         .unwrap();
-    let third = generation(repeated);
+    let third = generation(&repeated);
     assert_eq!(third.get(), second.get() + 1);
     assert_eq!(
         lifecycle.invalidate(
@@ -59,7 +59,7 @@ fn exact_invalidations_advance_and_stale_or_reordered_calls_fail() {
 #[test]
 fn shutdown_is_terminal_idempotent_and_generation_checked() {
     let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
-    let first = generation(lifecycle.snapshot());
+    let first = generation(&lifecycle.snapshot());
 
     assert_eq!(
         lifecycle.shutdown(RuntimeGatewayCoordinatorGenerationV2::new(
@@ -69,7 +69,7 @@ fn shutdown_is_terminal_idempotent_and_generation_checked() {
     );
 
     let shutdown = lifecycle.shutdown(first).unwrap();
-    let terminal = generation(shutdown);
+    let terminal = generation(&shutdown);
     assert_eq!(terminal.get(), first.get() + 1);
     assert_eq!(lifecycle.shutdown(terminal), Ok(shutdown));
     assert_eq!(
