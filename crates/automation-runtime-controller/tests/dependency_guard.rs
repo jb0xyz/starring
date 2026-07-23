@@ -2466,6 +2466,130 @@ fn v2_suspension_resume_basis_closes_database_correlation_without_authority() {
 }
 
 #[test]
+fn v2_suspension_receipts_close_presence_and_exact_successors() {
+    let source = include_str!("../src/v2_suspension_receipt.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "Utc::now",
+        "pub fn new(",
+        "pub fn from_parts",
+        "pub fn into_parts",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension receipt surface: {forbidden}"
+        );
+    }
+
+    let outcome = source
+        .split("pub enum RuntimeSuspendAttemptMutationOutcomeV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n").next())
+        .unwrap();
+    for variant in ["Inserted", "Replayed", "DrainProgressed", "Resumed"] {
+        assert!(outcome.contains(variant), "{variant}");
+    }
+    assert_eq!(outcome.matches("    ").count(), 4);
+
+    let receipt = source
+        .split("pub struct RuntimeSuspendAttemptReceiptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "outcome: RuntimeSuspendAttemptMutationOutcomeV2,",
+        "snapshot: RuntimeDeploymentSnapshotV1,",
+        "suspended: Option<RuntimeSuspendedAttemptV2>,",
+        "successor_execution: Option<RuntimeExecutionReceiptV1>,",
+    ] {
+        assert!(receipt.contains(field), "{field}");
+    }
+    assert_eq!(receipt.matches("    ").count(), 4);
+    assert!(!receipt.contains("pub "));
+
+    for constructor in [
+        "pub fn inserted(",
+        "pub fn replayed(",
+        "pub fn drain_progressed(",
+        "pub fn resumed(",
+    ] {
+        assert!(source.contains(constructor), "{constructor}");
+    }
+    assert!(source.contains("suspended: Some(observation.suspended().clone())"));
+    assert!(source.contains("successor_execution: None"));
+    assert!(source.contains("suspended: None"));
+    assert!(source.contains("successor_execution: Some(successor_execution)"));
+
+    assert!(source.contains("suspended.operation_scope() != operation.operation_scope()"));
+    assert!(source.contains("suspended.canonical_attempt() != operation.canonical_attempt()"));
+    assert!(source.contains("suspended.local_effect() != &request.local_effect"));
+    assert!(source.contains("suspended.drain_obligation() != &request.drain_obligation"));
+    assert!(source.contains("source\n        .sidecar_revision()"));
+    assert!(source.contains(".checked_add(1)"));
+    assert!(source.contains("RuntimePersistenceU64V2::from_non_zero(expected_revision)"));
+    assert!(source.contains("result.sidecar_revision() != expected_revision"));
+    assert!(source.contains("result.local_effect() != progress.replacement_local_effect()"));
+    assert!(source.contains("result.drain_obligation() != progress.replacement_drain_obligation()"));
+    assert!(source.contains("result.suspended_at() != source.suspended_at()"));
+
+    assert!(source.contains("RuntimeDeployment::restore(snapshot.clone())"));
+    assert!(source.contains("RuntimeUnixMicrosecondsV2::from_datetime(successor.acquired_at)"));
+    assert!(source.contains("source\n        .revision\n        .next()"));
+    assert!(source.contains("persisted_convergence_attempt()"));
+    assert!(source.contains(".checked_add(1)"));
+    assert!(source.contains(".fencing_token\n        .next()"));
+    assert!(source.contains("RuntimePersistenceU64V2::from_u64(expected_revision.get())"));
+    assert!(source.contains("RuntimePersistenceU64V2::from_u64(expected_fence.get())"));
+    assert!(source.contains("&successor.controller_id != resume.controller_id()"));
+    assert!(source.contains("snapshot.last_fencing_token != Some(expected_fence)"));
+    assert!(source.contains("lease.controller_id != successor.controller_id"));
+    assert!(source.contains("lease.fencing_token != successor.fencing_token"));
+    assert!(source.contains("lease.acquired_at != successor.acquired_at"));
+    assert!(source.contains("lease.expires_at != successor.expires_at"));
+    assert!(source.contains("Some(resume.lease_for())"));
+    assert!(source.contains("successor.acquired_at < *retry_not_before"));
+    for preserved in [
+        "source.identity == successor.identity",
+        "source.target == successor.target",
+        "source.runtime_generation == successor.runtime_generation",
+        "source.previous_runtime == successor.previous_runtime",
+        "source.requested_at == successor.requested_at",
+        "source.phase == successor.phase",
+        "source.preflight == successor.preflight",
+        "source.drain == successor.drain",
+        "source.activation == successor.activation",
+        "source.panel_certificate == successor.panel_certificate",
+        "source.gateway_ready == successor.gateway_ready",
+        "source.live == successor.live",
+        "source.last_live_recovery == successor.last_live_recovery",
+        "source.last_runtime_failure == successor.last_runtime_failure",
+    ] {
+        assert!(source.contains(preserved), "{preserved}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeSuspendAttemptMutationOutcomeV2",
+        "RuntimeSuspendAttemptReceiptErrorV2",
+        "RuntimeSuspendAttemptReceiptV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -2576,6 +2700,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension_resume/tests.rs",
             include_str!("../src/v2_suspension_resume/tests.rs"),
+        ),
+        (
+            "src/v2_suspension_receipt.rs",
+            include_str!("../src/v2_suspension_receipt.rs"),
+        ),
+        (
+            "src/v2_suspension_receipt/tests.rs",
+            include_str!("../src/v2_suspension_receipt/tests.rs"),
         ),
         (
             "src/v2_suspension_sidecar.rs",
