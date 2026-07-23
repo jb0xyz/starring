@@ -634,6 +634,16 @@ recovery permit authorizes its bounded operations. A cursor or successful
 revalidation alone never authorizes a registry mutation, database call,
 recovery transition, or admission resume.
 
+The first concrete tools slice composes an opaque registry with fixed limits of
+4096 slots and 8 retired routes per slot. Its per-slot active-interaction limit
+is the checked `u32` conversion of the configured process-wide gateway
+admission capacity. It does not use the registry default, expose a raw registry
+getter, or expose the guard or cursor. Its only public recovery read maps all
+ten aggregate fields into the pure worker validator and returns the resulting
+non-authorizing empty projection. The private guard-to-cursor path is added only
+with the coordinator and gateway compound transition that can enforce the
+required lock order.
+
 Public admission reads atomic observation A, requires unsealed `Serving`, and
 acquires its guard against the exact admission generation. Guard acquisition
 returns a non-cloneable capability and its exact successor observation. Final

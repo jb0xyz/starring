@@ -11,6 +11,7 @@ automation-runtime-convergence-postgres = { path = "../../crates/automation-runt
 automation-runtime-execution-postgres = { path = "../../crates/automation-runtime-execution-postgres" }
 automation-runtime-interaction-postgres = { path = "../../crates/automation-runtime-interaction-postgres" }
 automation-runtime-panel-postgres = { path = "../../crates/automation-runtime-panel-postgres" }
+automation-runtime-registry = { path = "../../crates/automation-runtime-registry" }
 automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-serving-postgres" }
 automation-runtime-worker = { path = "../../crates/automation-runtime-worker" }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }

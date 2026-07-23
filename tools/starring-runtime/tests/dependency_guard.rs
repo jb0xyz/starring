@@ -313,6 +313,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/registry.rs",
             "src/secret.rs",
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
@@ -344,6 +345,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-execution-postgres".to_string(), None),
             ("automation-runtime-interaction-postgres".to_string(), None),
             ("automation-runtime-panel-postgres".to_string(), None),
+            ("automation-runtime-registry".to_string(), None),
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
             ("chrono".to_string(), Some("dev".to_string())),
@@ -439,9 +441,17 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         {
             let allowed_readiness_worker =
                 path == Path::new("src/database.rs") && identifier == "automation_runtime_worker";
+            let allowed_registry_adapter = path == Path::new("src/registry.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_convergence"
+                        | "automation_runtime_registry"
+                        | "automation_runtime_worker"
+                );
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
+                        || allowed_registry_adapter
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -615,6 +625,112 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "start_gateway_owner_production",
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn registry_adapter_is_non_authorizing_fixed_and_confined() {
+    let sources = source_files();
+    let registry = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/registry.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = registry.split("#[cfg(test)]").next().unwrap();
+
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        if path != Path::new("src/registry.rs") {
+            assert!(
+                !contains_identifier(source, "automation_runtime_registry"),
+                "{}",
+                path.display()
+            );
+        }
+    }
+    for required in [
+        "const REGISTRY_MAX_SLOTS: NonZeroU32 = NonZeroU32::new(4_096).unwrap();",
+        "const REGISTRY_MAX_RETIRED_ROUTES_PER_SLOT: NonZeroU32 = NonZeroU32::new(8).unwrap();",
+        "max_active_interactions_per_slot",
+        "pub fn compose_runtime_registry_bootstrap_v1(",
+        "pub fn observe_recovery_empty_projection_v2(",
+        "RuntimeRegistryRecoveryObservationInputV2 {",
+        "observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(",
+        "retained_slot_count: observation.retained_slot_count()",
+        "retained_empty_tombstone_count: observation.retained_empty_tombstone_count()",
+        "staged_route_count: observation.staged_route_count()",
+        "serving_route_count: observation.serving_route_count()",
+        "draining_route_count: observation.draining_route_count()",
+        "sealed_slot_count: observation.sealed_slot_count()",
+        "active_interaction_count: observation.active_interaction_count()",
+        "failed_closed_slot_count: observation.failed_closed_slot_count()",
+        "registry_failed_closed: observation.registry_failed_closed()",
+        "RuntimeRegistryBootstrapV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for forbidden in [
+        "ServingSlotRegistryConfigV1::default",
+        "pub fn registry",
+        "pub fn into_registry",
+        "pub fn recovery_observation_guard_v2",
+        "pub fn revalidate_empty_recovery_cursor_v2",
+        "pub fn into_empty_cursor",
+        "Serialize",
+        "Deserialize",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    for name in [
+        "RuntimeRegistryBootstrapV1",
+        "RuntimeRegistryRecoveryGuardV1",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    assert!(production.contains(concat!(
+        "pub struct RuntimeRegistryBootstrapV1 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "}"
+    )));
+    assert!(production.contains("struct RuntimeRegistryRecoveryGuardV1<'a> {"));
+    assert!(!production.contains("pub struct RuntimeRegistryRecoveryGuardV1<'a> {"));
+    let mut public_surface = production;
+    while let Some((_, public)) = public_surface.split_once("pub ") {
+        let header_end = public
+            .find(['{', ';'])
+            .unwrap_or_else(|| panic!("unterminated public registry declaration"));
+        let header = &public[..header_end];
+        for forbidden in [
+            "ServingSlotRegistryV1",
+            "RegistryRecoveryObservationGuardV2",
+            "RegistryEmptyRecoveryCursorV2",
+            "RuntimeRegistryRecoveryGuardV1",
+        ] {
+            assert!(
+                !contains_identifier(header, forbidden),
+                "{header}: {forbidden}"
+            );
+        }
+        public_surface = &public[header_end + 1..];
+    }
+    let library = include_str!("../src/lib.rs");
+    for forbidden in [
+        "ServingSlotRegistryV1",
+        "RegistryRecoveryObservationGuardV2",
+        "RegistryEmptyRecoveryCursorV2",
+        "RuntimeRegistryRecoveryGuardV1",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
     }
 }
 
