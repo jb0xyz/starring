@@ -29,6 +29,10 @@ use automation_runtime_serving_postgres::{
     RuntimeServingDatabaseReadinessV1, RuntimeServingDatabaseTimeoutsV1,
     RuntimeServingPersistenceErrorV1,
 };
+use automation_runtime_worker::{
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::{timeout, timeout_at, Instant};
@@ -119,11 +123,16 @@ pub struct RuntimeDatabaseReadinessV1 {
     panel: RuntimePanelDatabaseReadinessV1,
     serving: RuntimeServingDatabaseReadinessV1,
     interaction: RuntimeInteractionDatabaseReadinessV1,
+    capability_receipts: RuntimeCapabilityReadinessSetV2,
 }
 
 impl RuntimeDatabaseReadinessV1 {
     pub const fn is_verified(&self) -> bool {
         true
+    }
+
+    pub fn exact_capability_receipts(&self) -> &RuntimeCapabilityReadinessSetV2 {
+        &self.capability_receipts
     }
 }
 
@@ -640,12 +649,62 @@ fn aggregate_readiness_v1(
         serving_authority(&serving),
         interaction_authority(&interaction),
     ])?;
+    let normalize =
+        |kind, database_identity: &str, database_name: &str, executor_role: &str, checked_at| {
+            RuntimeCapabilityReadinessReceiptV2::new(
+                kind,
+                database_identity,
+                database_name,
+                executor_role,
+                checked_at,
+            )
+            .map_err(|_| RuntimeDatabaseCompositionErrorV1::AuthorityMismatch)
+        };
+    let capability_receipts = RuntimeCapabilityReadinessSetV2::new(
+        normalize(
+            RuntimeCapabilityReadinessKindV2::Convergence,
+            &execution.database_identity,
+            &execution.database_name,
+            &execution.executor_role,
+            execution.checked_at,
+        )?,
+        normalize(
+            RuntimeCapabilityReadinessKindV2::ExactTarget,
+            &exact_target.database_identity,
+            &exact_target.database_name,
+            &exact_target.executor_role,
+            exact_target.checked_at,
+        )?,
+        normalize(
+            RuntimeCapabilityReadinessKindV2::Panel,
+            &panel.database_identity,
+            &panel.database_name,
+            &panel.executor_role,
+            panel.checked_at,
+        )?,
+        normalize(
+            RuntimeCapabilityReadinessKindV2::Serving,
+            &serving.database_identity,
+            &serving.database_name,
+            &serving.executor_role,
+            serving.checked_at,
+        )?,
+        normalize(
+            RuntimeCapabilityReadinessKindV2::Interaction,
+            &interaction.database_identity,
+            &interaction.database_name,
+            &interaction.executor_role,
+            interaction.checked_at,
+        )?,
+    )
+    .map_err(|_| RuntimeDatabaseCompositionErrorV1::AuthorityMismatch)?;
     Ok(RuntimeDatabaseReadinessV1 {
         execution,
         exact_target,
         panel,
         serving,
         interaction,
+        capability_receipts,
     })
 }
 
@@ -1056,6 +1115,13 @@ mod tests {
         assert_eq!(readiness.panel, panel);
         assert_eq!(readiness.serving, serving);
         assert_eq!(readiness.interaction, interaction);
+        assert_eq!(
+            readiness.exact_capability_receipts().checked_at_bounds(),
+            (
+                chrono::DateTime::from_timestamp(1, 0).unwrap(),
+                chrono::DateTime::from_timestamp(5, 0).unwrap(),
+            )
+        );
         assert_eq!(
             format!("{readiness:?}"),
             "RuntimeDatabaseReadinessV1(<redacted>)"

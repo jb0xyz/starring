@@ -1,9 +1,14 @@
+mod capability_readiness;
 mod gateway_lifecycle;
 mod gateway_owner;
 mod gateway_owner_watchdog;
 mod startup_recovery;
 mod writer_fence;
 
+pub use capability_readiness::{
+    RuntimeCapabilityReadinessErrorV2, RuntimeCapabilityReadinessKindV2,
+    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
+};
 pub use gateway_lifecycle::{
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
     RuntimeGatewayClosedTransitionErrorV2, RuntimeGatewayCoordinatorGenerationV2,

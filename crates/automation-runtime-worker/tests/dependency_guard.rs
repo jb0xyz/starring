@@ -35,6 +35,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
     assert_eq!(
         relative_sources,
         [
+            PathBuf::from("src/capability_readiness.rs"),
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
@@ -117,6 +118,20 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             );
         }
     }
+}
+
+#[test]
+fn readiness_evidence_is_exact_redacted_and_nonserializable() {
+    let source = include_str!("../src/capability_readiness.rs");
+
+    for forbidden in ["Serialize", "Deserialize", "Default"] {
+        assert!(!source.contains(forbidden));
+    }
+    assert!(source.contains("RuntimeCapabilityReadinessSetV2(<redacted>)"));
+    assert!(source.contains("RuntimeCapabilityReadinessReceiptV2(<redacted>)"));
+    assert!(!source.contains("pub database_identity"));
+    assert!(!source.contains("pub database_name"));
+    assert!(!source.contains("pub executor_role"));
 }
 
 #[test]

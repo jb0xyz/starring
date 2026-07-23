@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -264,10 +265,33 @@ fn database_readiness_retains_five_exact_receipts_without_serialization() {
         "panel: RuntimePanelDatabaseReadinessV1",
         "serving: RuntimeServingDatabaseReadinessV1",
         "interaction: RuntimeInteractionDatabaseReadinessV1",
+        "capability_receipts: RuntimeCapabilityReadinessSetV2",
     ] {
         assert!(declaration.contains(field));
     }
     assert!(!declaration.contains("verified: bool"));
+    assert!(database.contains("pub fn exact_capability_receipts(&self)"));
+    assert_eq!(
+        database.matches("use automation_runtime_worker::{").count(),
+        1
+    );
+    let worker_import = database
+        .split("use automation_runtime_worker::{")
+        .nth(1)
+        .and_then(|source| source.split("};").next())
+        .unwrap();
+    let imported = worker_import
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|identifier| !identifier.is_empty())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        imported,
+        BTreeSet::from([
+            "RuntimeCapabilityReadinessKindV2",
+            "RuntimeCapabilityReadinessReceiptV2",
+            "RuntimeCapabilityReadinessSetV2",
+        ])
+    );
     assert!(!database.contains("Serialize"));
     assert!(!database.contains("Deserialize"));
 }
@@ -413,15 +437,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
             .filter(|identifier| !identifier.is_empty())
         {
+            let allowed_readiness_worker =
+                path == Path::new("src/database.rs") && identifier == "automation_runtime_worker";
             assert!(
                 !identifier.ends_with("V3")
-                    && !matches!(
-                        identifier,
-                        "automation_runtime"
-                            | "automation_runtime_controller"
-                            | "automation_runtime_convergence"
-                            | "automation_runtime_worker"
-                    ),
+                    && (allowed_readiness_worker
+                        || !matches!(
+                            identifier,
+                            "automation_runtime"
+                                | "automation_runtime_controller"
+                                | "automation_runtime_convergence"
+                                | "automation_runtime_worker"
+                        )),
                 "{}: {identifier}",
                 path.display()
             );
