@@ -4,14 +4,29 @@ use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
-    RuntimeStartupRecoveryObservationCorrelationV2, RuntimeStartupRecoveryObservationReceiptV2,
-    RuntimeStartupRecoveryObservationRequestV2, RuntimeStartupRecoveryStateV2,
-    RuntimeStartupServingStateV2,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeStartupRecoveryObservationCorrelationV2,
+    RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryObservationRequestV2,
+    RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2,
 };
 use chrono::{DateTime, Utc};
 
 use crate::closed_recovery::RuntimeClosedRecoveryOperationAuthorityV2;
-use crate::{RuntimeClosedDrainRecoveryPermitV2, RuntimeGatewayCoordinatorGenerationV2};
+use crate::{
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryAuthorityRevisionV2,
+    RuntimeGatewayCoordinatorGenerationV2,
+};
+
+#[derive(PartialEq, Eq)]
+pub struct RuntimeAuthorizedStartupRecoveryIterationV2 {
+    request: RuntimeStartupRecoveryObservationRequestV2,
+    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
+}
+
+impl Debug for RuntimeAuthorizedStartupRecoveryIterationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeAuthorizedStartupRecoveryIterationV2(<redacted>)")
+    }
+}
 
 pub struct RuntimeAuthorizedStartupRecoveryObservationV2 {
     request: RuntimeStartupRecoveryObservationRequestV2,
@@ -44,6 +59,54 @@ impl Debug for RuntimeAuthorizedStartupRecoveryObservationV2 {
 pub struct RuntimeCompletedStartupRecoveryObservationV2 {
     authorization: RuntimeAuthorizedStartupRecoveryObservationV2,
     receipt: RuntimeStartupRecoveryObservationReceiptV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStartupRecoveryContinuationV2 {
+    Recover(RuntimeStartupRecoveryClassV2),
+    WaitForForeignFresh { retry_after: Duration },
+}
+
+#[derive(PartialEq, Eq)]
+pub struct RuntimeStartupRecoveryFixedPointProofV2 {
+    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
+    correlation: RuntimeStartupRecoveryObservationCorrelationV2,
+    successor_authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2,
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    acknowledged_product_handoff_count: u32,
+}
+
+impl RuntimeStartupRecoveryFixedPointProofV2 {
+    pub fn successor_authority_revision(&self) -> RuntimeClosedRecoveryAuthorityRevisionV2 {
+        self.successor_authority_revision
+    }
+
+    pub fn acknowledged_product_handoff_count(&self) -> u32 {
+        self.acknowledged_product_handoff_count
+    }
+}
+
+impl Debug for RuntimeStartupRecoveryFixedPointProofV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let _ = (
+            &self.operation_authority,
+            &self.correlation,
+            &self.owner_receipt,
+        );
+        formatter.write_str("RuntimeStartupRecoveryFixedPointProofV2(<redacted>)")
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub enum RuntimeAcceptedStartupRecoveryOutcomeV2 {
+    Continue(RuntimeStartupRecoveryContinuationV2),
+    FixedPoint(RuntimeStartupRecoveryFixedPointProofV2),
+}
+
+impl Debug for RuntimeAcceptedStartupRecoveryOutcomeV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeAcceptedStartupRecoveryOutcomeV2(<redacted>)")
+    }
 }
 
 impl Debug for RuntimeCompletedStartupRecoveryObservationV2 {
@@ -82,7 +145,8 @@ pub enum RuntimeStartupRecoveryObservationAcceptanceErrorV2 {
 
 pub(crate) struct RuntimeValidatedStartupRecoveryObservationV2 {
     operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
-    database_now: DateTime<Utc>,
+    request: RuntimeStartupRecoveryObservationRequestV2,
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     decision: RuntimeStartupRecoveryDecisionV2,
 }
 
@@ -91,22 +155,44 @@ impl RuntimeValidatedStartupRecoveryObservationV2 {
         self,
     ) -> (
         RuntimeClosedRecoveryOperationAuthorityV2,
-        DateTime<Utc>,
+        RuntimeStartupRecoveryObservationRequestV2,
+        RuntimeGatewayOwnerLeaseReceiptV1,
         RuntimeStartupRecoveryDecisionV2,
     ) {
-        (self.operation_authority, self.database_now, self.decision)
+        (
+            self.operation_authority,
+            self.request,
+            self.owner_receipt,
+            self.decision,
+        )
+    }
+}
+
+pub(crate) fn authorize_startup_recovery_iteration_v2(
+    permit: &RuntimeClosedDrainRecoveryPermitV2,
+    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,
+) -> RuntimeAuthorizedStartupRecoveryIterationV2 {
+    RuntimeAuthorizedStartupRecoveryIterationV2 {
+        request: startup_recovery_observation_request_v2(permit),
+        operation_authority,
     }
 }
 
 pub(crate) fn authorize_startup_recovery_observation_v2(
-    permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+    permit: &RuntimeClosedDrainRecoveryPermitV2,
+    iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
 ) -> Option<RuntimeAuthorizedStartupRecoveryObservationV2> {
-    let request = startup_recovery_observation_request_v2(permit);
+    let RuntimeAuthorizedStartupRecoveryIterationV2 {
+        request,
+        operation_authority,
+    } = iteration;
+    if request != startup_recovery_observation_request_v2(permit) {
+        return None;
+    }
     let minimum_database_now = permit
         .last_startup_observation_database_now()
         .unwrap_or(permit.owner_receipt().database_now)
         .max(permit.owner_receipt().database_now);
-    let operation_authority = permit.take_operation_authority()?;
     Some(RuntimeAuthorizedStartupRecoveryObservationV2 {
         request,
         minimum_database_now,
@@ -166,9 +252,81 @@ pub(crate) fn validate_startup_recovery_observation_v2(
         })?;
     Ok(RuntimeValidatedStartupRecoveryObservationV2 {
         operation_authority,
-        database_now: observed_owner.database_now,
+        request,
+        owner_receipt: receipt.owner_receipt,
         decision,
     })
+}
+
+pub(crate) fn accept_validated_startup_recovery_observation_v2(
+    permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+    validated: RuntimeValidatedStartupRecoveryObservationV2,
+) -> Option<(
+    RuntimeClosedRecoveryAuthorityRevisionV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2,
+)> {
+    let (operation_authority, request, owner_receipt, decision) = validated.into_parts();
+    let database_now = owner_receipt.database_now;
+    match decision {
+        RuntimeStartupRecoveryDecisionV2::Recover(class) => {
+            let authority_revision =
+                permit.restore_operation_authority(operation_authority, database_now)?;
+            Some((
+                authority_revision,
+                RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+                    RuntimeStartupRecoveryContinuationV2::Recover(class),
+                ),
+            ))
+        }
+        RuntimeStartupRecoveryDecisionV2::WaitForForeignFresh { retry_after } => {
+            let authority_revision =
+                permit.restore_operation_authority(operation_authority, database_now)?;
+            Some((
+                authority_revision,
+                RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+                    RuntimeStartupRecoveryContinuationV2::WaitForForeignFresh { retry_after },
+                ),
+            ))
+        }
+        RuntimeStartupRecoveryDecisionV2::FixedPoint(fixed_point) => {
+            let authority_revision = permit.advance_fixed_point(database_now)?;
+            Some((
+                authority_revision,
+                RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(
+                    RuntimeStartupRecoveryFixedPointProofV2 {
+                        operation_authority,
+                        correlation: request.correlation,
+                        successor_authority_revision: authority_revision,
+                        owner_receipt,
+                        acknowledged_product_handoff_count: fixed_point
+                            .acknowledged_product_handoff_count,
+                    },
+                ),
+            ))
+        }
+    }
+}
+
+pub(crate) fn startup_recovery_fixed_point_matches_permit_v2(
+    permit: &RuntimeClosedDrainRecoveryPermitV2,
+    proof: &RuntimeStartupRecoveryFixedPointProofV2,
+) -> bool {
+    let owner = permit.owner_receipt();
+    !permit.operation_authority_is_available()
+        && proof.correlation.recovery_id == *permit.recovery_id()
+        && proof.correlation.originating_emergency_generation
+            == generation_value(permit.originating_emergency_generation())
+        && proof.correlation.coordinator_generation
+            == generation_value(permit.coordinator_generation())
+        && proof.correlation.authority_revision.get().checked_add(1)
+            == Some(proof.successor_authority_revision.get())
+        && proof.successor_authority_revision == permit.authority_revision()
+        && proof.owner_receipt.lease_id == owner.lease_id
+        && proof.owner_receipt.owner_revision == owner.owner_revision
+        && proof.owner_receipt.expires_at == owner.expires_at
+        && proof.owner_receipt.database_now >= owner.database_now
+        && proof.owner_receipt.database_lease_duration().is_some()
+        && permit.last_startup_observation_database_now() == Some(proof.owner_receipt.database_now)
 }
 
 fn startup_recovery_observation_request_v2(

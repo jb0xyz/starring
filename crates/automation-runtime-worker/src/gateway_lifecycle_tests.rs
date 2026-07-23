@@ -16,14 +16,15 @@ use super::{
     RuntimeGatewayEmergencyCauseV2, RuntimeGatewayInvalidationCauseV2,
 };
 use crate::{
-    accept_runtime_registry_recovery_empty_observation_v2,
-    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeCapabilityReadinessKindV2,
-    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
-    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
-    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimePausedGatewayObservationV2,
-    RuntimePausedGatewaySequenceV2, RuntimeRegistryGlobalObservationSequenceV2,
-    RuntimeRegistryRecoveryObservationInputV2, RuntimeStartupRecoveryClassV2,
-    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+    accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeStartupRecoveryObservationAcceptanceErrorV2,
 };
 
 fn non_zero(value: u64) -> NonZeroU64 {
@@ -173,6 +174,27 @@ fn begin_recovery() -> (
     (lifecycle, permit)
 }
 
+fn refresh_startup_iteration(
+    lifecycle: &mut RuntimeGatewayClosedLifecycleV2,
+    permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+    checked_at: i64,
+) -> RuntimeAuthorizedStartupRecoveryIterationV2 {
+    lifecycle
+        .refresh_recovery_readiness(permit, current_readiness(checked_at))
+        .unwrap()
+}
+
+fn begin_startup_observation(
+    lifecycle: &mut RuntimeGatewayClosedLifecycleV2,
+    permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+    checked_at: i64,
+) -> RuntimeAuthorizedStartupRecoveryObservationV2 {
+    let iteration = refresh_startup_iteration(lifecycle, permit, checked_at);
+    lifecycle
+        .begin_startup_recovery_observation(permit, iteration)
+        .unwrap()
+}
+
 fn empty_startup_state() -> RuntimeStartupRecoveryStateV2 {
     RuntimeStartupRecoveryStateV2 {
         serving: RuntimeStartupServingStateV2::Empty,
@@ -216,9 +238,7 @@ fn assert_startup_observation_rejected(
 ) {
     let (mut lifecycle, mut permit) = begin_recovery();
     let generation = permit.coordinator_generation();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 200);
     let mut receipt =
         startup_observation_receipt(authorization.request(), at(101), empty_startup_state());
     mutate(&mut receipt);
@@ -235,7 +255,7 @@ fn assert_startup_observation_rejected(
             cause,
         }
     );
-    assert_eq!(permit.authority_revision().get(), 1);
+    assert_eq!(permit.authority_revision().get(), 2);
     assert_eq!(
         lifecycle.validate_recovery_permit(&permit),
         Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit)
@@ -244,11 +264,9 @@ fn assert_startup_observation_rejected(
 
 fn observe_startup_decision(
     state: RuntimeStartupRecoveryStateV2,
-) -> RuntimeStartupRecoveryDecisionV2 {
+) -> RuntimeAcceptedStartupRecoveryOutcomeV2 {
     let (mut lifecycle, mut permit) = begin_recovery();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 200);
     let completed = complete_startup_observation(authorization, at(101), state);
     lifecycle
         .complete_startup_recovery_observation(&mut permit, completed)
@@ -261,7 +279,6 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
     let generation = permit.coordinator_generation();
     let recovery_id = permit.recovery_id().clone();
     let owner = permit.owner_receipt().clone();
-    let readiness = permit.readiness().clone();
     let paused = permit.paused_gateway().clone();
     let registry_sequence = permit
         .registry_evidence()
@@ -271,8 +288,14 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
         .registry_evidence()
         .empty_observation()
         .retained_slot_count();
+    let iteration = refresh_startup_iteration(&mut lifecycle, &mut permit, 200);
+    assert_eq!(
+        format!("{iteration:?}"),
+        "RuntimeAuthorizedStartupRecoveryIterationV2(<redacted>)"
+    );
+    let readiness = permit.readiness().clone();
     let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
+        .begin_startup_recovery_observation(&mut permit, iteration)
         .unwrap();
 
     assert_eq!(authorization.request().correlation.recovery_id, recovery_id);
@@ -289,7 +312,7 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
     );
     assert_eq!(
         authorization.request().correlation.authority_revision,
-        non_zero(1)
+        non_zero(2)
     );
     assert_eq!(
         authorization.request().gateway_owner_lease_id,
@@ -311,7 +334,7 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
         "RuntimeCompletedStartupRecoveryObservationV2(<redacted>)"
     );
 
-    let RuntimeStartupRecoveryDecisionV2::FixedPoint(fixed_point) = lifecycle
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(fixed_point) = lifecycle
         .complete_startup_recovery_observation(&mut permit, completed)
         .unwrap()
     else {
@@ -319,7 +342,12 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
     };
 
     assert_eq!(fixed_point.acknowledged_product_handoff_count(), 7);
-    assert_eq!(permit.authority_revision().get(), 2);
+    assert_eq!(fixed_point.successor_authority_revision().get(), 3);
+    assert_eq!(
+        format!("{fixed_point:?}"),
+        "RuntimeStartupRecoveryFixedPointProofV2(<redacted>)"
+    );
+    assert_eq!(permit.authority_revision().get(), 3);
     assert_eq!(permit.owner_receipt(), &owner);
     assert_eq!(permit.readiness(), &readiness);
     assert_eq!(permit.paused_gateway(), &paused);
@@ -346,6 +374,39 @@ fn startup_observation_advances_exact_authority_and_preserves_closed_evidence() 
         }
     );
     assert_eq!(lifecycle.validate_recovery_permit(&permit), Ok(()));
+    assert_eq!(
+        lifecycle.validate_startup_recovery_fixed_point(&permit, &fixed_point),
+        Ok(())
+    );
+}
+
+#[test]
+fn fixed_point_proof_escrows_the_iteration_authority_until_closed_handoff() {
+    let (mut lifecycle, mut permit) = begin_recovery();
+    let generation = permit.coordinator_generation();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 200);
+    let completed = complete_startup_observation(authorization, at(101), empty_startup_state());
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(fixed_point) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("expected startup recovery fixed point")
+    };
+
+    assert_eq!(
+        lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(300)),
+        Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight)
+    );
+    let emergency = RuntimeGatewayClosedSnapshotV2::Emergency {
+        generation: RuntimeGatewayCoordinatorGenerationV2::new(non_zero(generation.get() + 1)),
+        cause: RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
+    };
+    assert_eq!(lifecycle.snapshot(), emergency);
+    assert_eq!(
+        lifecycle.validate_startup_recovery_fixed_point(&permit, &fixed_point),
+        Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit)
+    );
+    assert_eq!(lifecycle.snapshot(), emergency);
 }
 
 #[test]
@@ -354,15 +415,19 @@ fn startup_observation_forwards_every_planner_decision_without_minting_resume() 
     stale.serving = RuntimeStartupServingStateV2::RecoverableStale { count: 2 };
     assert_eq!(
         observe_startup_decision(stale),
-        RuntimeStartupRecoveryDecisionV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive)
+        RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+            RuntimeStartupRecoveryContinuationV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive)
+        )
     );
 
     let mut awaiting = empty_startup_state();
     awaiting.recoverable_awaiting_certification_count = 1;
     assert_eq!(
         observe_startup_decision(awaiting),
-        RuntimeStartupRecoveryDecisionV2::Recover(
-            RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+        RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+            RuntimeStartupRecoveryContinuationV2::Recover(
+                RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+            )
         )
     );
 
@@ -370,8 +435,10 @@ fn startup_observation_forwards_every_planner_decision_without_minting_resume() 
     suspended.suspended_local_effect_count = 1;
     assert_eq!(
         observe_startup_decision(suspended),
-        RuntimeStartupRecoveryDecisionV2::Recover(
-            RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+            RuntimeStartupRecoveryContinuationV2::Recover(
+                RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+            )
         )
     );
 
@@ -379,8 +446,10 @@ fn startup_observation_forwards_every_planner_decision_without_minting_resume() 
     drain.pending_runtime_drain_intent_count = 1;
     assert_eq!(
         observe_startup_decision(drain),
-        RuntimeStartupRecoveryDecisionV2::Recover(
-            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent
+        RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+            RuntimeStartupRecoveryContinuationV2::Recover(
+                RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent
+            )
         )
     );
 
@@ -393,14 +462,16 @@ fn startup_observation_forwards_every_planner_decision_without_minting_resume() 
     };
     assert_eq!(
         observe_startup_decision(foreign),
-        RuntimeStartupRecoveryDecisionV2::WaitForForeignFresh {
-            retry_after: std::time::Duration::from_secs(5),
-        }
+        RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+            RuntimeStartupRecoveryContinuationV2::WaitForForeignFresh {
+                retry_after: std::time::Duration::from_secs(5),
+            }
+        )
     );
 
     assert!(matches!(
         observe_startup_decision(empty_startup_state()),
-        RuntimeStartupRecoveryDecisionV2::FixedPoint(_)
+        RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(_)
     ));
 }
 
@@ -408,14 +479,12 @@ fn startup_observation_forwards_every_planner_decision_without_minting_resume() 
 fn startup_observation_token_blocks_overlap_and_is_lost_on_drop() {
     let (mut lifecycle, mut permit) = begin_recovery();
     let generation = permit.coordinator_generation();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let iteration = refresh_startup_iteration(&mut lifecycle, &mut permit, 200);
 
-    assert!(matches!(
-        lifecycle.begin_startup_recovery_observation(&mut permit),
+    assert_eq!(
+        lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(300)),
         Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight)
-    ));
+    );
     assert_eq!(
         lifecycle.snapshot(),
         RuntimeGatewayClosedSnapshotV2::Emergency {
@@ -423,13 +492,11 @@ fn startup_observation_token_blocks_overlap_and_is_lost_on_drop() {
             cause: RuntimeGatewayEmergencyCauseV2::ProtocolViolation,
         }
     );
-    drop(authorization);
+    drop(iteration);
 
     let (mut lifecycle, mut permit) = begin_recovery();
     let generation = permit.coordinator_generation();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 200);
     assert_eq!(
         lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(200)),
         Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight)
@@ -445,14 +512,12 @@ fn startup_observation_token_blocks_overlap_and_is_lost_on_drop() {
 
     let (mut lifecycle, mut permit) = begin_recovery();
     let generation = permit.coordinator_generation();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
-    drop(authorization);
-    assert!(matches!(
-        lifecycle.begin_startup_recovery_observation(&mut permit),
+    let iteration = refresh_startup_iteration(&mut lifecycle, &mut permit, 200);
+    drop(iteration);
+    assert_eq!(
+        lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(300)),
         Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight)
-    ));
+    );
     assert_eq!(
         lifecycle.snapshot().generation(),
         RuntimeGatewayCoordinatorGenerationV2::new(non_zero(generation.get() + 1))
@@ -566,19 +631,25 @@ fn startup_observation_rejects_clock_state_and_foreign_time_failures() {
 #[test]
 fn startup_observation_database_clock_is_monotonic_across_successors() {
     let (mut lifecycle, mut permit) = begin_recovery();
-    for expected_revision in [2, 3] {
-        let authorization = lifecycle
-            .begin_startup_recovery_observation(&mut permit)
-            .unwrap();
-        let completed = complete_startup_observation(authorization, at(101), empty_startup_state());
-        lifecycle
+    for (checked_at, database_now, expected_revision) in [(200, 101, 3), (300, 102, 5)] {
+        let authorization = begin_startup_observation(&mut lifecycle, &mut permit, checked_at);
+        let mut state = empty_startup_state();
+        state.serving = RuntimeStartupServingStateV2::RecoverableStale { count: 1 };
+        let completed = complete_startup_observation(authorization, at(database_now), state);
+        let outcome = lifecycle
             .complete_startup_recovery_observation(&mut permit, completed)
             .unwrap();
+        assert_eq!(
+            outcome,
+            RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
+                RuntimeStartupRecoveryContinuationV2::Recover(
+                    RuntimeStartupRecoveryClassV2::StaleLive,
+                ),
+            )
+        );
         assert_eq!(permit.authority_revision().get(), expected_revision);
     }
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 400);
     let completed = complete_startup_observation(authorization, at(100), empty_startup_state());
     assert_eq!(
         lifecycle.complete_startup_recovery_observation(&mut permit, completed),
@@ -594,9 +665,7 @@ fn startup_observation_database_clock_is_monotonic_across_successors() {
 fn stale_startup_completion_cannot_disturb_a_newer_closed_state() {
     let (mut lifecycle, mut permit) = begin_recovery();
     let generation = permit.coordinator_generation();
-    let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
-        .unwrap();
+    let authorization = begin_startup_observation(&mut lifecycle, &mut permit, 200);
     let completed = complete_startup_observation(authorization, at(101), empty_startup_state());
     lifecycle
         .invalidate(
@@ -616,7 +685,7 @@ fn stale_startup_completion_cannot_disturb_a_newer_closed_state() {
 #[test]
 fn startup_observation_authority_overflow_is_terminal() {
     let (mut lifecycle, mut permit) = begin_recovery();
-    permit.exhaust_authority_revision_for_test();
+    permit.prepare_authority_revision_overflow_for_test();
     let generation = permit.coordinator_generation();
     let recovery_id = permit.recovery_id().clone();
     let authority_revision = permit.authority_revision();
@@ -625,8 +694,13 @@ fn startup_observation_authority_overflow_is_terminal() {
         recovery_id,
         authority_revision,
     };
+    let iteration = lifecycle
+        .refresh_recovery_readiness(&mut permit, current_readiness(200))
+        .unwrap();
+    let authority_revision = permit.authority_revision();
+    assert_eq!(authority_revision.get(), i64::MAX as u64);
     let authorization = lifecycle
-        .begin_startup_recovery_observation(&mut permit)
+        .begin_startup_recovery_observation(&mut permit, iteration)
         .unwrap();
     let completed = complete_startup_observation(authorization, at(101), empty_startup_state());
 
@@ -759,9 +833,12 @@ fn readiness_refresh_advances_once_and_preserves_all_other_evidence() {
     let retained_slot_count = registry.retained_slot_count();
     let retained_tombstone_count = registry.retained_empty_tombstone_count();
 
+    let iteration = lifecycle
+        .refresh_recovery_readiness(&mut permit, current_readiness(200))
+        .unwrap();
     assert_eq!(
-        lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(200)),
-        Ok(())
+        format!("{iteration:?}"),
+        "RuntimeAuthorizedStartupRecoveryIterationV2(<redacted>)"
     );
     assert_eq!(permit.authority_revision().get(), 2);
     assert_eq!(permit.readiness().checked_at_bounds(), (at(200), at(204)));
@@ -814,13 +891,8 @@ fn readiness_refresh_advances_once_and_preserves_all_other_evidence() {
         Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit)
     );
 
-    assert_eq!(
-        lifecycle.refresh_recovery_readiness(&mut permit, current_readiness(300)),
-        Ok(())
-    );
-    assert_eq!(permit.authority_revision().get(), 3);
-    assert_eq!(permit.readiness().checked_at_bounds(), (at(300), at(304)));
     assert_eq!(lifecycle.validate_recovery_permit(&permit), Ok(()));
+    drop(iteration);
 }
 
 #[test]

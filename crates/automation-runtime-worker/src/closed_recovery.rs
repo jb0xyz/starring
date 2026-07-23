@@ -211,9 +211,26 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
     pub(crate) fn refresh_readiness(
         &mut self,
         readiness: RuntimeCapabilityReadinessSetV2,
-    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+    ) -> Option<(
+        RuntimeClosedRecoveryAuthorityRevisionV2,
+        RuntimeClosedRecoveryOperationAuthorityV2,
+    )> {
         let authority_revision = self.authority_revision.successor()?;
+        let authority = self.take_operation_authority()?;
         self.readiness = readiness;
+        self.authority_revision = authority_revision;
+        Some((authority_revision, authority))
+    }
+
+    pub(crate) fn advance_fixed_point(
+        &mut self,
+        database_now: DateTime<Utc>,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        if self.operation_authority.is_some() {
+            return None;
+        }
+        let authority_revision = self.authority_revision.successor()?;
+        self.last_startup_observation_database_now = Some(database_now);
         self.authority_revision = authority_revision;
         Some(authority_revision)
     }
@@ -222,6 +239,12 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
     pub(crate) fn exhaust_authority_revision_for_test(&mut self) {
         self.authority_revision =
             RuntimeClosedRecoveryAuthorityRevisionV2(NonZeroU64::new(i64::MAX as u64).unwrap());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_authority_revision_overflow_for_test(&mut self) {
+        self.authority_revision =
+            RuntimeClosedRecoveryAuthorityRevisionV2(NonZeroU64::new(i64::MAX as u64 - 1).unwrap());
     }
 }
 

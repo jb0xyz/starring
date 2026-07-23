@@ -1,10 +1,13 @@
 use std::num::NonZeroU64;
 
 use crate::{
-    authorize_startup_recovery_observation_v2, validate_startup_recovery_observation_v2,
-    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeClosedDrainRecoveryPermitV2,
-    RuntimeClosedRecoveryInputV2, RuntimeCompletedStartupRecoveryObservationV2,
-    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+    accept_validated_startup_recovery_observation_v2, authorize_startup_recovery_iteration_v2,
+    authorize_startup_recovery_observation_v2, startup_recovery_fixed_point_matches_permit_v2,
+    validate_startup_recovery_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
+    RuntimeCompletedStartupRecoveryObservationV2, RuntimeStartupRecoveryFixedPointProofV2,
+    RuntimeStartupRecoveryObservationAcceptanceErrorV2,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -116,6 +119,10 @@ pub enum RuntimeGatewayClosedTransitionErrorV2 {
     RecoveryOperationInFlight,
     #[error("runtime closed recovery operation is not in flight")]
     RecoveryOperationNotInFlight,
+    #[error("runtime closed recovery iteration authority is stale")]
+    StaleRecoveryIterationAuthority,
+    #[error("runtime startup recovery fixed point authority is stale")]
+    StaleRecoveryFixedPointAuthority,
     #[error("runtime startup recovery observation was rejected")]
     StartupRecoveryObservation(RuntimeStartupRecoveryObservationAcceptanceErrorV2),
 }
@@ -243,7 +250,8 @@ impl RuntimeGatewayClosedLifecycleV2 {
         &mut self,
         permit: &mut RuntimeClosedDrainRecoveryPermitV2,
         readiness: crate::RuntimeCapabilityReadinessSetV2,
-    ) -> Result<(), RuntimeGatewayClosedTransitionErrorV2> {
+    ) -> Result<RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeGatewayClosedTransitionErrorV2>
+    {
         self.validate_recovery_permit(permit)?;
         if !permit.operation_authority_is_available() {
             let generation = permit.coordinator_generation();
@@ -273,31 +281,43 @@ impl RuntimeGatewayClosedLifecycleV2 {
         }
         let generation = permit.coordinator_generation();
         let recovery_id = permit.recovery_id().clone();
-        let Some(authority_revision) = permit.refresh_readiness(readiness) else {
+        let Some((authority_revision, operation_authority)) = permit.refresh_readiness(readiness)
+        else {
             self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
             return Err(RuntimeGatewayClosedTransitionErrorV2::AuthorityRevisionOverflow);
         };
+        let iteration = authorize_startup_recovery_iteration_v2(permit, operation_authority);
         self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
             generation,
             recovery_id,
             authority_revision,
         };
-        Ok(())
+        Ok(iteration)
     }
 
     pub fn begin_startup_recovery_observation(
         &mut self,
         permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+        iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
     ) -> Result<RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeGatewayClosedTransitionErrorV2>
     {
         self.validate_recovery_permit(permit)?;
-        let Some(authorization) = authorize_startup_recovery_observation_v2(permit) else {
+        if permit.operation_authority_is_available() {
             let generation = permit.coordinator_generation();
             self.invalidate(
                 generation,
                 RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
             )?;
-            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight);
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationNotInFlight);
+        }
+        let Some(authorization) = authorize_startup_recovery_observation_v2(permit, iteration)
+        else {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryIterationAuthority);
         };
         Ok(authorization)
     }
@@ -306,7 +326,8 @@ impl RuntimeGatewayClosedLifecycleV2 {
         &mut self,
         permit: &mut RuntimeClosedDrainRecoveryPermitV2,
         completed: RuntimeCompletedStartupRecoveryObservationV2,
-    ) -> Result<RuntimeStartupRecoveryDecisionV2, RuntimeGatewayClosedTransitionErrorV2> {
+    ) -> Result<RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeGatewayClosedTransitionErrorV2>
+    {
         self.validate_recovery_permit(permit)?;
         if permit.operation_authority_is_available() {
             let generation = permit.coordinator_generation();
@@ -328,9 +349,8 @@ impl RuntimeGatewayClosedLifecycleV2 {
         };
         let generation = permit.coordinator_generation();
         let recovery_id = permit.recovery_id().clone();
-        let (operation_authority, database_now, decision) = validated.into_parts();
-        let Some(authority_revision) =
-            permit.restore_operation_authority(operation_authority, database_now)
+        let Some((authority_revision, outcome)) =
+            accept_validated_startup_recovery_observation_v2(permit, validated)
         else {
             self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
             return Err(RuntimeGatewayClosedTransitionErrorV2::AuthorityRevisionOverflow);
@@ -340,7 +360,20 @@ impl RuntimeGatewayClosedLifecycleV2 {
             recovery_id,
             authority_revision,
         };
-        Ok(decision)
+        Ok(outcome)
+    }
+
+    pub fn validate_startup_recovery_fixed_point(
+        &self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+        proof: &RuntimeStartupRecoveryFixedPointProofV2,
+    ) -> Result<(), RuntimeGatewayClosedTransitionErrorV2> {
+        self.validate_recovery_permit(permit)?;
+        if startup_recovery_fixed_point_matches_permit_v2(permit, proof) {
+            Ok(())
+        } else {
+            Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryFixedPointAuthority)
+        }
     }
 
     pub fn invalidate(

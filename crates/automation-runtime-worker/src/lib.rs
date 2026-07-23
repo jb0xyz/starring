@@ -50,12 +50,16 @@ pub use registry_recovery::{
     RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
 };
 pub(crate) use startup_recovery::{
-    authorize_startup_recovery_observation_v2, validate_startup_recovery_observation_v2,
+    accept_validated_startup_recovery_observation_v2, authorize_startup_recovery_iteration_v2,
+    authorize_startup_recovery_observation_v2, startup_recovery_fixed_point_matches_permit_v2,
+    validate_startup_recovery_observation_v2,
 };
 pub use startup_recovery::{
-    plan_runtime_startup_recovery_v2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    plan_runtime_startup_recovery_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeCompletedStartupRecoveryObservationV2, RuntimeStartupRecoveryClassV2,
-    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryDecisionV2,
+    RuntimeStartupRecoveryFixedPointProofV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
     RuntimeStartupRecoveryObservationFixedPointV2, RuntimeStartupRecoveryObservationPortV2,
     RuntimeStartupRecoveryPlanErrorV2,
 };

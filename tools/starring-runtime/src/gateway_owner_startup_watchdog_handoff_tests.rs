@@ -28,7 +28,7 @@ use automation_runtime_worker::{
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
-    RuntimeStartupRecoveryDecisionV2,
+    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Notify;
@@ -640,7 +640,7 @@ async fn initial_committed_recovery_fixture_until_v2(
 }
 
 #[tokio::test]
-async fn committed_startup_observation_advances_one_revision_and_remains_closed() {
+async fn committed_startup_observation_refreshes_then_advances_and_remains_closed() {
     let operation_cutoff = Instant::now() + Duration::from_secs(2);
     let (gateway, _registry, session, port) = initial_committed_recovery_fixture_until_v2(
         "15151515151515151515151515151515",
@@ -654,7 +654,7 @@ async fn committed_startup_observation_advances_one_revision_and_remains_closed(
     let mut state = empty_startup_recovery_state_v2();
     state.acknowledged_product_handoff_count = 7;
 
-    let (session, decision) = session
+    let outcome = session
         .observe_startup_recovery_with_test_observer_v2(move |authorization, cutoff| {
             observer_calls.fetch_add(1, Ordering::AcqRel);
             *observer_cutoff
@@ -671,10 +671,17 @@ async fn committed_startup_observation_advances_one_revision_and_remains_closed(
         .await
         .unwrap();
 
-    let RuntimeStartupRecoveryDecisionV2::FixedPoint(fixed_point) = decision else {
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
         panic!("expected startup fixed point")
     };
-    assert_eq!(fixed_point.acknowledged_product_handoff_count(), 7);
+    assert_eq!(fixed_point.acknowledged_product_handoff_count_v2(), 7);
+    assert_eq!(
+        format!("{fixed_point:?}"),
+        "RuntimeClosedRecoveryFixedPointV2(<redacted>)"
+    );
     assert_eq!(calls.load(Ordering::Acquire), 1);
     assert_eq!(
         *observed_cutoff
@@ -690,9 +697,16 @@ async fn committed_startup_observation_advances_one_revision_and_remains_closed(
             authority_revision,
         } if generation.get() == 2
             && recovery_id.as_str() == "15151515151515151515151515151515"
-            && authority_revision.get() == 2
+            && authority_revision.get() == 3
     ));
-    drop(session);
+    drop(fixed_point);
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
     wait_for(|| port.release_calls() == 1).await;
 }
 
@@ -707,7 +721,7 @@ async fn owner_safety_deadline_is_the_startup_observer_cutoff_minimum() {
     let observed_cutoff = Arc::new(Mutex::new(None));
     let observer_cutoff = observed_cutoff.clone();
 
-    let (session, _) = session
+    let outcome = session
         .observe_startup_recovery_with_test_observer_v2(move |authorization, cutoff| {
             *observer_cutoff
                 .lock()
@@ -722,6 +736,12 @@ async fn owner_safety_deadline_is_the_startup_observer_cutoff_minimum() {
         })
         .await
         .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
 
     let cutoff = observed_cutoff
         .lock()
@@ -734,9 +754,89 @@ async fn owner_safety_deadline_is_the_startup_observer_cutoff_minimum() {
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
             authority_revision,
             ..
-        } if authority_revision.get() == 2
+        } if authority_revision.get() == 3
     ));
-    drop(session);
+    drop(fixed_point);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed_point() {
+    let (gateway, _registry, session, port) =
+        initial_committed_recovery_fixture_v2("31313131313131313131313131313131").await;
+    let mut stale = empty_startup_recovery_state_v2();
+    stale.serving = RuntimeStartupServingStateV2::RecoverableStale { count: 1 };
+
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    stale,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected startup continuation")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive)
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 3
+    ));
+
+    let ready_iteration = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_at_for_test_v2(3_000_000),
+            )),
+            || {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("{ready_iteration:?}"),
+        "RuntimeClosedRecoveryReadyIterationV2(<redacted>)"
+    );
+    let outcome = ready_iteration
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_200),
+                    empty_startup_recovery_state_v2(),
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 5
+    ));
+    drop(fixed_point);
     wait_for(|| port.release_calls() == 1).await;
 }
 

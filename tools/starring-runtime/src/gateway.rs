@@ -18,7 +18,8 @@ use automation_runtime_controller::{
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
-    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
     RuntimeCompletedStartupRecoveryObservationV2, RuntimeGatewayClosedLifecycleV2,
@@ -26,7 +27,7 @@ use automation_runtime_worker::{
     RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayEmergencyCauseV2,
     RuntimeGatewayInvalidationCauseV2, RuntimeGatewayOwnerLeasePortV1,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
-    RuntimeRegistryRecoveryEmptyObservationV2, RuntimeStartupRecoveryDecisionV2,
+    RuntimeRegistryRecoveryEmptyObservationV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
 use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant as TokioInstant};
@@ -685,7 +686,10 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         readiness: RuntimeCapabilityReadinessSetV2,
-    ) -> Result<Self, RuntimeGatewayRecoverySectionErrorV2> {
+    ) -> Result<
+        (Self, RuntimeAuthorizedStartupRecoveryIterationV2),
+        RuntimeGatewayRecoverySectionErrorV2,
+    > {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
@@ -706,15 +710,16 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             }
             transition
         };
-        transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let iteration = transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
-        Ok(self)
+        Ok((self, iteration))
     }
 
     pub(crate) fn begin_startup_recovery_observation_v2(
         &mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
     ) -> Result<RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeGatewayRecoverySectionErrorV2>
     {
         let section = self.committed_pending_section_v2(committed_owner)?;
@@ -725,7 +730,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
                     RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
                 )
             })?;
-            coordinator.begin_startup_recovery_observation(&mut self.permit)
+            coordinator.begin_startup_recovery_observation(&mut self.permit, iteration)
         }
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
@@ -737,7 +742,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         completed: RuntimeCompletedStartupRecoveryObservationV2,
-    ) -> Result<(Self, RuntimeStartupRecoveryDecisionV2), RuntimeGatewayRecoverySectionErrorV2>
+    ) -> Result<(Self, RuntimeAcceptedStartupRecoveryOutcomeV2), RuntimeGatewayRecoverySectionErrorV2>
     {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
@@ -764,6 +769,38 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         Ok((self, transition))
+    }
+
+    pub(crate) fn validate_startup_recovery_fixed_point_v2(
+        &self,
+        committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        proof: &RuntimeStartupRecoveryFixedPointProofV2,
+    ) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
+        let section = self.committed_pending_section_v2(committed_owner)?;
+        drop(section);
+        let transition = {
+            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
+                RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+                )
+            })?;
+            let transition = coordinator.validate_startup_recovery_fixed_point(&self.permit, proof);
+            if matches!(
+                transition,
+                Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryFixedPointAuthority)
+            ) {
+                self.owner_invalidated.store(true, Ordering::Release);
+                let _ = coordinator.invalidate(
+                    self.permit.coordinator_generation(),
+                    RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+                );
+            }
+            transition
+        };
+        transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        let section = self.committed_pending_section_v2(committed_owner)?;
+        drop(section);
+        Ok(())
     }
 
     pub(crate) fn invalidate_capability_not_ready_v2(&self) {

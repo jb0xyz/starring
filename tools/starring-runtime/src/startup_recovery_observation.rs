@@ -3,12 +3,18 @@ use std::future::Future;
 use std::time::Instant;
 
 use automation_runtime_worker::{
-    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeCompletedStartupRecoveryObservationV2,
-    RuntimeStartupRecoveryDecisionV2, RuntimeStartupRecoveryObservationPortV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeCompletedStartupRecoveryObservationV2, RuntimeStartupRecoveryObservationPortV2,
 };
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
-use crate::closed_recovery::{RuntimeClosedRecoveryCommitErrorV2, RuntimeClosedRecoverySessionV2};
+#[cfg(test)]
+use crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2;
+use crate::closed_recovery::{
+    revalidate_committed_recovery_v2, RuntimeClosedRecoveryCommitErrorV2,
+    RuntimeClosedRecoveryFixedPointV2, RuntimeClosedRecoveryReadyIterationV2,
+    RuntimeClosedRecoverySessionV2, RuntimeClosedRecoveryStartupIterationOutcomeV2,
+};
 use crate::gateway::RuntimeGatewayRecoverySectionErrorV2;
 use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerClosedRecoveryCommitErrorV2;
 use crate::registry::RuntimeRegistryRecoveryObservationErrorV1;
@@ -33,7 +39,7 @@ impl<E> Debug for RuntimeClosedRecoveryStartupObservationErrorV2<E> {
     }
 }
 
-impl RuntimeClosedRecoverySessionV2 {
+impl RuntimeClosedRecoveryReadyIterationV2 {
     #[cfg_attr(
         not(test),
         expect(
@@ -46,7 +52,7 @@ impl RuntimeClosedRecoverySessionV2 {
         self,
         observer: &P,
     ) -> Result<
-        (Self, RuntimeStartupRecoveryDecisionV2),
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
         RuntimeClosedRecoveryStartupObservationErrorV2<P::Error>,
     >
     where
@@ -72,7 +78,7 @@ impl RuntimeClosedRecoverySessionV2 {
         post_complete: PostComplete,
         post_revalidate: PostRevalidate,
     ) -> Result<
-        (Self, RuntimeStartupRecoveryDecisionV2),
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
         RuntimeClosedRecoveryStartupObservationErrorV2<E>,
     >
     where
@@ -89,14 +95,15 @@ impl RuntimeClosedRecoverySessionV2 {
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
         }
-        let Self {
+        let RuntimeClosedRecoveryReadyIterationV2 {
             owner,
             mut gateway,
             registry,
             operation_cutoff,
+            iteration,
         } = self;
         let authorization = gateway
-            .begin_startup_recovery_observation_v2(&owner)
+            .begin_startup_recovery_observation_v2(&owner, iteration)
             .map_err(RuntimeClosedRecoveryStartupObservationErrorV2::Gateway)?;
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
@@ -126,45 +133,66 @@ impl RuntimeClosedRecoverySessionV2 {
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
         }
-        let session = Self {
-            owner,
-            gateway,
-            registry,
-            operation_cutoff,
-        };
-        session
-            .revalidate_v2()
+        revalidate_committed_recovery_v2(&owner, &gateway, &registry, operation_cutoff)
             .map_err(map_commit_observation_error_v2)?;
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
         }
-        let Self {
-            owner,
-            gateway,
-            registry,
-            operation_cutoff,
-        } = session;
-        let (gateway, decision) = gateway
+        let (gateway, outcome) = gateway
             .into_startup_recovery_observation_successor_v2(&owner, completed)
             .map_err(RuntimeClosedRecoveryStartupObservationErrorV2::Gateway)?;
         post_complete();
-        let session = Self {
-            owner,
-            gateway,
-            registry,
-            operation_cutoff,
-        };
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
         }
-        session
-            .revalidate_v2()
+        revalidate_committed_recovery_v2(&owner, &gateway, &registry, operation_cutoff)
             .map_err(map_commit_observation_error_v2)?;
         post_revalidate();
         if Instant::now() >= observation_cutoff {
             return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
         }
-        Ok((session, decision))
+        revalidate_committed_recovery_v2(&owner, &gateway, &registry, operation_cutoff)
+            .map_err(map_commit_observation_error_v2)?;
+        if Instant::now() >= observation_cutoff {
+            return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
+        }
+        match outcome {
+            RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(continuation) => {
+                Ok(RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+                    session: RuntimeClosedRecoverySessionV2 {
+                        owner,
+                        gateway,
+                        registry,
+                        operation_cutoff,
+                    },
+                    continuation,
+                })
+            }
+            RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(proof) => {
+                gateway
+                    .validate_startup_recovery_fixed_point_v2(&owner, &proof)
+                    .map_err(RuntimeClosedRecoveryStartupObservationErrorV2::Gateway)?;
+                if Instant::now() >= observation_cutoff {
+                    return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
+                }
+                let fixed_point = RuntimeClosedRecoveryFixedPointV2 {
+                    owner,
+                    gateway,
+                    registry,
+                    operation_cutoff,
+                    proof,
+                };
+                fixed_point
+                    .revalidate_v2()
+                    .map_err(map_commit_observation_error_v2)?;
+                if Instant::now() >= observation_cutoff {
+                    return Err(RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed);
+                }
+                Ok(RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+                    fixed_point,
+                ))
+            }
+        }
     }
 }
 
@@ -193,14 +221,26 @@ impl RuntimeClosedRecoverySessionV2 {
         self,
         observe: Observe,
     ) -> Result<
-        (Self, RuntimeStartupRecoveryDecisionV2),
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
         RuntimeClosedRecoveryStartupObservationErrorV2<E>,
     >
     where
         Observe: FnOnce(RuntimeAuthorizedStartupRecoveryObservationV2, Instant) -> Observation,
         Observation: Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, E>>,
     {
-        self.observe_startup_recovery_with_v2(observe, || {}, || {})
+        let ready = self
+            .refresh_iteration_readiness_with_v2(
+                |_| {
+                    std::future::ready(Ok(
+                        crate::database::runtime_database_readiness_refresh_for_test_v2(),
+                    ))
+                },
+                || {},
+            )
+            .await
+            .map_err(map_readiness_observation_error_v2)?;
+        ready
+            .observe_startup_recovery_with_v2(observe, || {}, || {})
             .await
     }
 
@@ -214,7 +254,7 @@ impl RuntimeClosedRecoverySessionV2 {
         observe: Observe,
         post_complete: PostComplete,
     ) -> Result<
-        (Self, RuntimeStartupRecoveryDecisionV2),
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
         RuntimeClosedRecoveryStartupObservationErrorV2<E>,
     >
     where
@@ -222,7 +262,19 @@ impl RuntimeClosedRecoverySessionV2 {
         Observation: Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, E>>,
         PostComplete: FnOnce(),
     {
-        self.observe_startup_recovery_with_v2(observe, post_complete, || {})
+        let ready = self
+            .refresh_iteration_readiness_with_v2(
+                |_| {
+                    std::future::ready(Ok(
+                        crate::database::runtime_database_readiness_refresh_for_test_v2(),
+                    ))
+                },
+                || {},
+            )
+            .await
+            .map_err(map_readiness_observation_error_v2)?;
+        ready
+            .observe_startup_recovery_with_v2(observe, post_complete, || {})
             .await
     }
 
@@ -236,7 +288,7 @@ impl RuntimeClosedRecoverySessionV2 {
         observe: Observe,
         post_revalidate: PostRevalidate,
     ) -> Result<
-        (Self, RuntimeStartupRecoveryDecisionV2),
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
         RuntimeClosedRecoveryStartupObservationErrorV2<E>,
     >
     where
@@ -244,7 +296,62 @@ impl RuntimeClosedRecoverySessionV2 {
         Observation: Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, E>>,
         PostRevalidate: FnOnce(),
     {
-        self.observe_startup_recovery_with_v2(observe, || {}, post_revalidate)
+        let ready = self
+            .refresh_iteration_readiness_with_v2(
+                |_| {
+                    std::future::ready(Ok(
+                        crate::database::runtime_database_readiness_refresh_for_test_v2(),
+                    ))
+                },
+                || {},
+            )
             .await
+            .map_err(map_readiness_observation_error_v2)?;
+        ready
+            .observe_startup_recovery_with_v2(observe, || {}, post_revalidate)
+            .await
+    }
+}
+
+#[cfg(test)]
+impl RuntimeClosedRecoveryReadyIterationV2 {
+    pub(crate) async fn observe_startup_recovery_with_test_observer_v2<Observe, Observation, E>(
+        self,
+        observe: Observe,
+    ) -> Result<
+        RuntimeClosedRecoveryStartupIterationOutcomeV2,
+        RuntimeClosedRecoveryStartupObservationErrorV2<E>,
+    >
+    where
+        Observe: FnOnce(RuntimeAuthorizedStartupRecoveryObservationV2, Instant) -> Observation,
+        Observation: Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, E>>,
+    {
+        self.observe_startup_recovery_with_v2(observe, || {}, || {})
+            .await
+    }
+}
+
+#[cfg(test)]
+fn map_readiness_observation_error_v2<E>(
+    error: RuntimeClosedRecoveryReadinessRefreshErrorV2,
+) -> RuntimeClosedRecoveryStartupObservationErrorV2<E> {
+    match error {
+        RuntimeClosedRecoveryReadinessRefreshErrorV2::DeadlineElapsed => {
+            RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed
+        }
+        RuntimeClosedRecoveryReadinessRefreshErrorV2::Database(_) => {
+            RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            )
+        }
+        RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(error) => {
+            RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(error)
+        }
+        RuntimeClosedRecoveryReadinessRefreshErrorV2::Registry(error) => {
+            RuntimeClosedRecoveryStartupObservationErrorV2::Registry(error)
+        }
+        RuntimeClosedRecoveryReadinessRefreshErrorV2::Owner(error) => {
+            RuntimeClosedRecoveryStartupObservationErrorV2::Owner(error)
+        }
     }
 }

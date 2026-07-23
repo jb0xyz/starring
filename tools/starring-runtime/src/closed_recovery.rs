@@ -3,6 +3,10 @@ use std::future::Future;
 use std::time::Instant;
 
 use automation_runtime_controller::RuntimeRecoveryIdV2;
+use automation_runtime_worker::{
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeStartupRecoveryFixedPointProofV2,
+};
 
 use crate::database::{
     RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
@@ -84,6 +88,44 @@ pub(crate) struct RuntimeClosedRecoverySessionV2 {
     operation_cutoff: Instant,
 }
 
+pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {
+    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    gateway: RuntimeRecoveryPendingGatewayBindingV2,
+    registry: RuntimeRegistryEmptyRecoveryBindingV2,
+    operation_cutoff: Instant,
+    iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "runtime resume composition will consume the verified fixed point"
+    )
+)]
+pub(crate) struct RuntimeClosedRecoveryFixedPointV2 {
+    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    gateway: RuntimeRecoveryPendingGatewayBindingV2,
+    registry: RuntimeRegistryEmptyRecoveryBindingV2,
+    operation_cutoff: Instant,
+    proof: RuntimeStartupRecoveryFixedPointProofV2,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "runtime recovery composition will consume the typed iteration outcome"
+    )
+)]
+pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2 {
+    Continue {
+        session: RuntimeClosedRecoverySessionV2,
+        continuation: RuntimeStartupRecoveryContinuationV2,
+    },
+    FixedPoint(RuntimeClosedRecoveryFixedPointV2),
+}
+
 impl RuntimeClosedRecoveryPendingPhaseV2 {
     fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryBeginErrorV2> {
         if Instant::now() >= self.operation_cutoff {
@@ -151,20 +193,12 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
 
 impl RuntimeClosedRecoverySessionV2 {
     fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
-        if Instant::now() >= self.operation_cutoff {
-            return Err(RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed);
-        }
-        let section = self
-            .gateway
-            .committed_pending_section_v2(&self.owner)
-            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
-        let registry = self
-            .registry
-            .revalidate_empty_projection_v2(&section)
-            .map_err(RuntimeClosedRecoveryCommitErrorV2::Registry)?;
-        section
-            .validate_empty_registry_projection_v2(&registry)
-            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)
+        revalidate_committed_recovery_v2(
+            &self.owner,
+            &self.gateway,
+            &self.registry,
+            self.operation_cutoff,
+        )
     }
 
     #[cfg_attr(
@@ -178,7 +212,8 @@ impl RuntimeClosedRecoverySessionV2 {
     pub(crate) async fn refresh_iteration_readiness_v2(
         self,
         databases: &RuntimeDatabaseDependenciesV1,
-    ) -> Result<Self, RuntimeClosedRecoveryReadinessRefreshErrorV2> {
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    {
         self.refresh_iteration_readiness_with_v2(
             |cutoff| databases.verify_readiness_refresh_until_v2(cutoff),
             || {},
@@ -190,7 +225,7 @@ impl RuntimeClosedRecoverySessionV2 {
         self,
         verify: Verify,
         post_refresh: PostRefresh,
-    ) -> Result<Self, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
     where
         Verify: FnOnce(Instant) -> Verification,
         Verification: Future<
@@ -227,21 +262,69 @@ impl RuntimeClosedRecoverySessionV2 {
             registry,
             operation_cutoff,
         } = self;
-        let gateway = gateway
+        let (gateway, iteration) = gateway
             .into_readiness_successor_v2(&owner, readiness.into_exact_capability_receipts())
             .map_err(RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway)?;
         post_refresh();
-        let session = Self {
+        let iteration = RuntimeClosedRecoveryReadyIterationV2 {
             owner,
             gateway,
             registry,
             operation_cutoff,
+            iteration,
         };
-        session
+        iteration
             .revalidate_v2()
             .map_err(map_commit_refresh_error_v2)?;
-        Ok(session)
+        Ok(iteration)
     }
+}
+
+impl RuntimeClosedRecoveryReadyIterationV2 {
+    fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+        revalidate_committed_recovery_v2(
+            &self.owner,
+            &self.gateway,
+            &self.registry,
+            self.operation_cutoff,
+        )
+    }
+}
+
+impl RuntimeClosedRecoveryFixedPointV2 {
+    fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+        revalidate_committed_recovery_v2(
+            &self.owner,
+            &self.gateway,
+            &self.registry,
+            self.operation_cutoff,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acknowledged_product_handoff_count_v2(&self) -> u32 {
+        self.proof.acknowledged_product_handoff_count()
+    }
+}
+
+fn revalidate_committed_recovery_v2(
+    owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    gateway: &RuntimeRecoveryPendingGatewayBindingV2,
+    registry: &RuntimeRegistryEmptyRecoveryBindingV2,
+    operation_cutoff: Instant,
+) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+    if Instant::now() >= operation_cutoff {
+        return Err(RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed);
+    }
+    let section = gateway
+        .committed_pending_section_v2(owner)
+        .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+    let observation = registry
+        .revalidate_empty_projection_v2(&section)
+        .map_err(RuntimeClosedRecoveryCommitErrorV2::Registry)?;
+    section
+        .validate_empty_registry_projection_v2(&observation)
+        .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)
 }
 
 impl Debug for RuntimeClosedRecoveryPendingPhaseV2 {
@@ -253,6 +336,24 @@ impl Debug for RuntimeClosedRecoveryPendingPhaseV2 {
 impl Debug for RuntimeClosedRecoverySessionV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeClosedRecoverySessionV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeClosedRecoveryReadyIterationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeClosedRecoveryReadyIterationV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeClosedRecoveryFixedPointV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeClosedRecoveryFixedPointV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeClosedRecoveryStartupIterationOutcomeV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeClosedRecoveryStartupIterationOutcomeV2(<redacted>)")
     }
 }
 
@@ -403,7 +504,7 @@ impl RuntimeClosedRecoverySessionV2 {
     pub(crate) async fn refresh_iteration_readiness_with_test_verifier_v2<Verify, Verification>(
         self,
         verify: Verify,
-    ) -> Result<Self, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
     where
         Verify: FnOnce(Instant) -> Verification,
         Verification: Future<
@@ -418,7 +519,7 @@ impl RuntimeClosedRecoverySessionV2 {
         self,
         verification: Verification,
         post_refresh: impl FnOnce(),
-    ) -> Result<Self, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
     where
         Verification: Future<
             Output = Result<RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseCompositionErrorV1>,

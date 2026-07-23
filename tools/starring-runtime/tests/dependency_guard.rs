@@ -185,8 +185,12 @@ fn contains_identifier(source: &str, expected: &str) -> bool {
 }
 
 fn declaration_attribute_block<'a>(source: &'a str, name: &str) -> &'a str {
-    let marker = format!("struct {name}");
-    let declaration = source.find(&marker).unwrap();
+    let markers = [format!("struct {name}"), format!("enum {name}")];
+    let (declaration, marker) = markers
+        .iter()
+        .filter_map(|marker| source.find(marker).map(|declaration| (declaration, marker)))
+        .min_by_key(|(declaration, _)| *declaration)
+        .unwrap();
     let mut start = source[..declaration]
         .rfind('\n')
         .map_or(0, |index| index + 1);
@@ -1037,13 +1041,19 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .find(|(path, _)| path == Path::new("src/closed_recovery.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
-    let production = closed.split("#[cfg(test)]").next().unwrap();
+    let production = closed;
     for required in [
         "pub(crate) fn begin_initial_empty_recovery_v2(",
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoverySessionV2",
         "RuntimeClosedRecoverySessionV2(<redacted>)",
+        "pub(crate) struct RuntimeClosedRecoveryReadyIterationV2",
+        "RuntimeClosedRecoveryReadyIterationV2(<redacted>)",
+        "pub(crate) struct RuntimeClosedRecoveryFixedPointV2",
+        "RuntimeClosedRecoveryFixedPointV2(<redacted>)",
+        "pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2",
+        "RuntimeClosedRecoveryStartupIterationOutcomeV2(<redacted>)",
         "pub(crate) async fn commit_owner_v2(",
         "async fn commit_owner_with_post_commit_v2(",
         "pub(crate) async fn refresh_iteration_readiness_v2(",
@@ -1057,7 +1067,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         ".into_readiness_successor_v2(",
         ".commit_prepared_owner_v2(&authority, owner, commit_cutoff)",
         "post_commit();",
-        ".committed_pending_section_v2(&self.owner)",
+        ".committed_pending_section_v2(owner)",
         "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2(<redacted>)",
         "let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };",
@@ -1091,6 +1101,33 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    operation_cutoff: Instant,\n",
         "}"
     )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {\n",
+        "    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,\n",
+        "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
+        "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    operation_cutoff: Instant,\n",
+        "    iteration: RuntimeAuthorizedStartupRecoveryIterationV2,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoveryFixedPointV2 {\n",
+        "    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,\n",
+        "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
+        "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    operation_cutoff: Instant,\n",
+        "    proof: RuntimeStartupRecoveryFixedPointProofV2,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2 {\n",
+        "    Continue {\n",
+        "        session: RuntimeClosedRecoverySessionV2,\n",
+        "        continuation: RuntimeStartupRecoveryContinuationV2,\n",
+        "    },\n",
+        "    FixedPoint(RuntimeClosedRecoveryFixedPointV2),\n",
+        "}"
+    )));
     let initial_gateway = production
         .find(".initial_emergency_gateway_section_v2(&owner)")
         .unwrap();
@@ -1115,7 +1152,9 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .find(".revalidate_empty_projection_v2(&section)")
         .unwrap();
     assert!(final_gateway < final_registry);
-    let owner_commit = braced_declaration(production, "async fn commit_owner_with_post_commit_v2(");
+    let pending_phase = braced_declaration(production, "impl RuntimeClosedRecoveryPendingPhaseV2");
+    let owner_commit =
+        braced_declaration(pending_phase, "async fn commit_owner_with_post_commit_v2(");
     let precommit = owner_commit.find("self.revalidate_v2()").unwrap();
     let cutoff = owner_commit
         .find(".min(self.owner.observation().safety_deadline())")
@@ -1140,7 +1179,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             && session < postcommit
     );
     assert_eq!(
-        production
+        pending_phase
             .matches("commit_owner_with_post_commit_v2(")
             .count(),
         2
@@ -1154,17 +1193,20 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     )));
     let committed_session = braced_declaration(production, "impl RuntimeClosedRecoverySessionV2");
     let committed_revalidation = braced_declaration(committed_session, "fn revalidate_v2(&self)");
-    let committed_deadline = committed_revalidation
-        .find("Instant::now() >= self.operation_cutoff")
+    assert!(committed_revalidation.contains("revalidate_committed_recovery_v2("));
+    let shared_revalidation =
+        braced_declaration(production, "fn revalidate_committed_recovery_v2(");
+    let committed_deadline = shared_revalidation
+        .find("Instant::now() >= operation_cutoff")
         .unwrap();
-    let committed_gateway = committed_revalidation
-        .find(".committed_pending_section_v2(&self.owner)")
+    let committed_gateway = shared_revalidation
+        .find(".committed_pending_section_v2(owner)")
         .unwrap();
-    let committed_registry = committed_revalidation
+    let committed_registry = shared_revalidation
         .find(".revalidate_empty_projection_v2(&section)")
         .unwrap();
-    let committed_final = committed_revalidation
-        .find(".validate_empty_registry_projection_v2(&registry)")
+    let committed_final = shared_revalidation
+        .find(".validate_empty_registry_projection_v2(&observation)")
         .unwrap();
     assert!(
         committed_deadline < committed_gateway
@@ -1196,8 +1238,11 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .find(".into_readiness_successor_v2(")
         .unwrap();
     let refresh_hook = readiness_refresh.find("post_refresh();").unwrap();
+    let refresh_iteration = readiness_refresh
+        .find("let iteration = RuntimeClosedRecoveryReadyIterationV2")
+        .unwrap();
     let refresh_final = readiness_refresh
-        .rfind("session\n            .revalidate_v2()")
+        .rfind("iteration\n            .revalidate_v2()")
         .unwrap();
     assert!(
         refresh_prevalidation < refresh_cutoff
@@ -1207,7 +1252,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             && refresh_post_deadline < refresh_postvalidation
             && refresh_postvalidation < refresh_successor
             && refresh_successor < refresh_hook
-            && refresh_hook < refresh_final
+            && refresh_hook < refresh_iteration
+            && refresh_iteration < refresh_final
     );
     assert_eq!(
         readiness_refresh
@@ -1228,7 +1274,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .find(".initial_emergency_gateway_section_v2(&owner)")
         .unwrap();
     assert!(begin_deadline < begin_gateway);
-    assert_eq!(production.matches(".await").count(), 4);
+    assert_eq!(owner_commit.matches(".await").count(), 1);
+    assert_eq!(readiness_refresh.matches(".await").count(), 1);
     for forbidden in [
         "pub fn permit",
         "pub fn owner",
@@ -1247,13 +1294,17 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedDrainRecoveryPermitV2",
         "activate",
         "deploy",
-        "resume",
     ] {
         assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
+    assert!(!production.contains(".resume"));
+    assert!(!production.contains("resume("));
     for name in [
         "RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoverySessionV2",
+        "RuntimeClosedRecoveryReadyIterationV2",
+        "RuntimeClosedRecoveryFixedPointV2",
+        "RuntimeClosedRecoveryStartupIterationOutcomeV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2",
     ] {
         let attributes = declaration_attribute_block(production, name);
@@ -1365,6 +1416,9 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedRecoverySessionV2",
         "RuntimeClosedRecoveryCommitErrorV2",
         "RuntimeClosedRecoveryReadinessRefreshErrorV2",
+        "RuntimeClosedRecoveryReadyIterationV2",
+        "RuntimeClosedRecoveryFixedPointV2",
+        "RuntimeClosedRecoveryStartupIterationOutcomeV2",
         "RuntimeDatabaseReadinessRefreshV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
@@ -1396,12 +1450,13 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         "async fn observe_startup_recovery_with_v2<",
         ".operation_cutoff",
         ".min(self.owner.observation().safety_deadline())",
-        ".begin_startup_recovery_observation_v2(&owner)",
+        ".begin_startup_recovery_observation_v2(&owner, iteration)",
         "biased;",
         "sleep_until(TokioInstant::from_std(observation_cutoff))",
         "result = observe(authorization, observation_cutoff)",
         ".invalidate_capability_not_ready_v2()",
         ".into_startup_recovery_observation_successor_v2(&owner, completed)",
+        ".validate_startup_recovery_fixed_point_v2(&owner, &proof)",
         "post_complete();",
         "post_revalidate();",
         "RuntimeClosedRecoveryStartupObservationErrorV2(<redacted>)",
@@ -1427,36 +1482,67 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         observation
             .matches("Instant::now() >= observation_cutoff")
             .count(),
-        7
+        10
     );
     let inner = braced_declaration(observation, "async fn observe_startup_recovery_with_v2<");
     let initial_revalidation = inner.find("self.revalidate_v2()").unwrap();
     let cutoff = inner.find("let observation_cutoff").unwrap();
     let begin = inner
-        .find(".begin_startup_recovery_observation_v2(&owner)")
+        .find(".begin_startup_recovery_observation_v2(&owner, iteration)")
         .unwrap();
     let await_observation = inner
         .find("result = observe(authorization, observation_cutoff)")
         .unwrap();
+    let revalidations = inner
+        .match_indices("revalidate_committed_recovery_v2(")
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    assert_eq!(revalidations.len(), 3);
     let successor = inner
         .find(".into_startup_recovery_observation_successor_v2(&owner, completed)")
         .unwrap();
     let post_complete = inner.find("post_complete();").unwrap();
-    let final_revalidation = inner
-        .rfind("session\n            .revalidate_v2()")
-        .unwrap();
     let post_revalidate = inner.rfind("post_revalidate();").unwrap();
-    let final_cutoff = final_revalidation
-        + inner[final_revalidation..]
-            .find("Instant::now() >= observation_cutoff")
-            .unwrap();
+    let outcome = inner.find("match outcome").unwrap();
+    let fixed_validation = inner
+        .find(".validate_startup_recovery_fixed_point_v2(&owner, &proof)")
+        .unwrap();
+    let fixed_construction = inner
+        .find("let fixed_point = RuntimeClosedRecoveryFixedPointV2")
+        .unwrap();
+    let fixed_revalidation = inner
+        .find("fixed_point\n                    .revalidate_v2()")
+        .unwrap();
     assert!(initial_revalidation < cutoff && cutoff < begin && begin < await_observation);
-    assert!(await_observation < successor && successor < post_complete);
     assert!(
-        post_complete < final_revalidation
-            && final_revalidation < post_revalidate
-            && post_revalidate < final_cutoff
+        await_observation < revalidations[0]
+            && revalidations[0] < successor
+            && successor < post_complete
+            && post_complete < revalidations[1]
+            && revalidations[1] < post_revalidate
+            && post_revalidate < revalidations[2]
+            && revalidations[2] < outcome
+            && outcome < fixed_validation
+            && fixed_validation < fixed_construction
+            && fixed_construction < fixed_revalidation
     );
+    let production_observation = observation
+        .split("#[cfg(test)]\nimpl RuntimeClosedRecoverySessionV2")
+        .next()
+        .unwrap();
+    assert!(production_observation.contains("impl RuntimeClosedRecoveryReadyIterationV2"));
+    assert!(!production_observation.contains("impl RuntimeClosedRecoverySessionV2"));
+    assert!(!observation.contains("RuntimeStartupRecoveryDecisionV2"));
+    assert!(!closed.contains("RuntimeStartupRecoveryDecisionV2"));
+    assert!(!observation.contains("(Self, RuntimeStartupRecoveryDecisionV2)"));
+    assert!(observation.contains(concat!(
+        "RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {\n",
+        "                    session: RuntimeClosedRecoverySessionV2 {"
+    )));
+    assert!(observation.contains(concat!(
+        "RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(\n",
+        "                    fixed_point,"
+    )));
     for forbidden in [
         "recover_next_stale_live",
         "activate",
@@ -1480,7 +1566,7 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         .find("self.committed_pending_section_v2(committed_owner)")
         .unwrap();
     let begin_transition = begin_gateway
-        .find("coordinator.begin_startup_recovery_observation(&mut self.permit)")
+        .find("coordinator.begin_startup_recovery_observation(&mut self.permit, iteration)")
         .unwrap();
     let begin_postflight = begin_gateway
         .rfind("self.committed_pending_section_v2(committed_owner)")
@@ -1493,6 +1579,20 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
     assert!(complete_gateway
         .contains(".complete_startup_recovery_observation(&mut self.permit, completed)"));
     assert!(complete_gateway.contains("self.owner_invalidated.store(true, Ordering::Release)"));
+    let fixed_gateway = braced_declaration(
+        gateway,
+        "pub(crate) fn validate_startup_recovery_fixed_point_v2(",
+    );
+    let fixed_preflight = fixed_gateway
+        .find("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    let fixed_transition = fixed_gateway
+        .find("coordinator.validate_startup_recovery_fixed_point(&self.permit, proof)")
+        .unwrap();
+    let fixed_postflight = fixed_gateway
+        .rfind("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    assert!(fixed_preflight < fixed_transition && fixed_transition < fixed_postflight);
 
     let library = include_str!("../src/lib.rs");
     assert!(closed.contains("mod startup_recovery_observation;"));
