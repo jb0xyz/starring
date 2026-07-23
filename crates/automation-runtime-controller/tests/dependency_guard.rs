@@ -1718,6 +1718,9 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
         "sqlx",
         "rusqlite",
         "twilight",
+        "Authority",
+        "Permit",
+        "Port",
         "RuntimeAuthorizedDrainClaimV2",
         "RuntimeClosedDrainRecoveryPermitV2",
         "RuntimeShutdownDrainCompletionPermitV2",
@@ -1784,6 +1787,121 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
             tests.contains(&format!("fn {test_name}(")),
             "missing V2 drain-intent state behavior test: {test_name}"
         );
+    }
+}
+
+#[test]
+fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
+    let source = include_str!("../src/v2_drain_intent_receipt.rs");
+    let tests = include_str!("../src/v2_drain_intent_receipt/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "RuntimeAuthorizedDrainClaimV2",
+        "RuntimeClosedDrainRecoveryPermitV2",
+        "RuntimeShutdownDrainCompletionPermitV2",
+        "pub outcome:",
+        "pub intent:",
+        "pub source:",
+        "pub fn new(",
+        "pub fn from_result(",
+        "pub fn claimed(",
+        "pub fn claim_initial(",
+        "pub fn claim_successor(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
+        ".next()",
+        "checked_add",
+        "SystemTime",
+        "Instant",
+        "Utc::now",
+        "next_intent_revision",
+        "impl Future",
+        "async fn",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 drain-intent receipt surface: {forbidden}"
+        );
+    }
+
+    for declaration in [
+        "pub enum RuntimeDrainIntentMutationOutcomeV2",
+        "pub struct RuntimeDrainRefenceSourceV2",
+        "pub struct RuntimeDrainAcknowledgementSourceV2",
+        "pub struct RuntimeRouteAbsentDrainIntentSourceV2",
+        "pub struct RuntimeDrainIntentReceiptV2",
+        "pub fn from_claimed(",
+        "pub fn from_route_absence_candidate(",
+        "pub fn from_acknowledged(",
+        "pub fn inserted(",
+        "pub fn replayed(",
+        "pub fn claim_replayed(",
+        "pub fn refenced(",
+        "pub fn acknowledged(",
+    ] {
+        assert!(source.contains(declaration), "missing {declaration}");
+    }
+
+    for exact_check in [
+        "operation.canonical() == intent.canonical()",
+        "persisted_intent.state().pending_claim().is_some()",
+        "persisted_intent != source",
+        "source.canonical() == result.canonical()",
+        "persisted_intent.intent_revision() <= source.source().intent_revision()",
+        "result_claim.claim_revision() <= source_claim.claim_revision()",
+        "result_claim.progress().seal() != source_claim.progress().seal()",
+        "acknowledgement.claim() != source_claim",
+        "source.gateway_owner_lease_id() == result.gateway_owner_lease_id()",
+        "source.observed_owner_revision() == result.observed_owner_revision()",
+        "source.process_instance_id() == result.process_instance_id()",
+        "source.controller_id() == result.controller_id()",
+        "source.controller_fencing_token() == result.controller_fencing_token()",
+        "source.claim_epoch() == result.claim_epoch()",
+        "source.expires_at() == result.expires_at()",
+    ] {
+        assert!(
+            source.contains(exact_check),
+            "missing V2 drain-intent receipt check: {exact_check}"
+        );
+    }
+
+    for test_name in [
+        "inserted_and_replayed_receipts_bind_the_exact_operation_roots",
+        "source_classifiers_accept_only_their_exact_mutable_states",
+        "claim_replay_requires_an_exact_unchanged_claimed_aggregate",
+        "refence_receipt_allows_only_progress_and_strictly_newer_database_revisions",
+        "refence_receipt_rejects_root_state_revision_identity_and_seal_drift",
+        "acknowledgement_receipt_accepts_initial_absence_and_durable_refence",
+        "acknowledgement_receipt_rejects_root_revision_state_and_claim_drift",
+        "transition_receipts_accept_canonical_timestamps_without_host_clock_ordering",
+        "receipt_surface_is_closed_data_without_claim_or_terminal_authority",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 drain-intent receipt behavior test: {test_name}"
+        );
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeDrainAcknowledgementSourceV2",
+        "RuntimeDrainIntentMutationOutcomeV2",
+        "RuntimeDrainIntentReceiptErrorV2",
+        "RuntimeDrainIntentReceiptV2",
+        "RuntimeDrainRefenceSourceV2",
+        "RuntimeRouteAbsentDrainIntentSourceV2",
+    ] {
+        assert!(library.contains(exported), "missing export {exported}");
     }
 }
 
@@ -2929,6 +3047,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_drain_intent_state/tests.rs",
             include_str!("../src/v2_drain_intent_state/tests.rs"),
+        ),
+        (
+            "src/v2_drain_intent_receipt.rs",
+            include_str!("../src/v2_drain_intent_receipt.rs"),
+        ),
+        (
+            "src/v2_drain_intent_receipt/tests.rs",
+            include_str!("../src/v2_drain_intent_receipt/tests.rs"),
         ),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
