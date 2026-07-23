@@ -548,6 +548,242 @@ fn v2_certification_outcomes_stay_exact_and_non_authorizing() {
 }
 
 #[test]
+fn v2_certification_reservation_derives_and_closes_its_natural_scope() {
+    let source = include_str!("../src/v2_certification_operation.rs");
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "certification_intent_fingerprint_v2",
+        "starring.runtime.",
+        "pub fn from_parts",
+        "pub fn into_parts",
+        "pub fn from_guard",
+        "RuntimeCertificationCanonicalRootV2",
+        "RuntimeLiveCertificationPortV2",
+        "RuntimeCertificationCommitAuthorityV2",
+        "Box<RuntimeCertificationDivergenceV2>",
+        "Authority",
+        "Permit",
+        "Future",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden V2 certification reservation surface: {forbidden}"
+        );
+    }
+
+    let scope = source
+        .split("pub struct RuntimeCertificationOperationScopeV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "scope: RuntimeDeploymentScopeV1,",
+        "deployment_revision: DeploymentRevision,",
+        "convergence_attempt: NonZeroU32,",
+    ] {
+        assert!(scope.contains(field), "{field}");
+    }
+    assert_eq!(scope.matches("    ").count(), 3);
+    assert!(!scope.contains("pub "));
+
+    let reserved = source
+        .split("pub struct RuntimeReservedCertificationIntentV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(reserved.contains("operation_scope: RuntimeCertificationOperationScopeV2,"));
+    assert!(reserved.contains("canonical_intent: RuntimeCanonicalCertificationIntentV2,"));
+    assert_eq!(reserved.matches("    ").count(), 2);
+    assert!(!reserved.contains("pub "));
+
+    assert!(source.contains("pub fn from_awaiting_execution("));
+    assert!(source.contains("validate_execution_receipt(execution)?;"));
+    assert!(source.contains("RuntimeDeploymentPhaseV1::AwaitingGatewayReady"));
+    assert!(source.contains(concat!(
+        "pub fn new(\n",
+        "        execution: &RuntimeExecutionReceiptV1,\n",
+        "        canonical_intent: RuntimeCanonicalCertificationIntentV2,\n",
+        "    ) -> Result<Self, RuntimeCertificationOperationBuildErrorV2> {"
+    )));
+    assert!(source.contains("validate_intent_against_execution(execution, &canonical_intent)?;"));
+    for persisted_input in [
+        "persisted_scope: RuntimeDeploymentScopeV1,",
+        "persisted_deployment_revision: DeploymentRevision,",
+        "persisted_convergence_attempt: NonZeroU32,",
+        "persisted_operation_id: &RuntimeCertificationOperationIdV2,",
+        "certification_intent_bytes: &[u8],",
+        "persisted_fingerprint: &RuntimeCertificationIntentFingerprintV2,",
+    ] {
+        assert!(source.contains(persisted_input), "{persisted_input}");
+    }
+    assert!(source.contains("RuntimeCanonicalCertificationIntentV2::from_persisted("));
+    assert!(source.contains("persisted_scope != intent.guard.scope"));
+    assert!(source.contains("persisted_deployment_revision != intent.guard.expected_revision"));
+    assert!(source.contains("persisted_convergence_attempt != intent.guard.convergence_attempt"));
+    assert!(source.contains("persisted_operation_id != &intent.operation_id"));
+    assert!(source.contains("pub fn require_byte_exact_replay("));
+    for replay_field in [
+        "self.operation_scope == proposed.operation_scope",
+        "self.operation_id() == proposed.operation_id()",
+        "self.certification_intent_bytes() == proposed.certification_intent_bytes()",
+        "self.intent_fingerprint() == proposed.intent_fingerprint()",
+        "Err(RuntimeCertificationDivergenceV2::ReservationMismatch)",
+    ] {
+        assert!(source.contains(replay_field), "{replay_field}");
+    }
+    assert!(source.contains(concat!(
+        "pub const fn into_divergence(self) -> RuntimeCertificationDivergenceV2 {\n",
+        "        RuntimeCertificationDivergenceV2::PersistenceCorrupt"
+    )));
+
+    let lookup = source
+        .split("pub struct RuntimeCertificationReservationScopeLookupV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(lookup.contains("operation_scope: RuntimeCertificationOperationScopeV2,"));
+    assert_eq!(lookup.matches("    ").count(), 1);
+    for forbidden in ["operation_id", "fingerprint", "digest"] {
+        assert!(!lookup.contains(forbidden), "{forbidden}");
+    }
+
+    let observation = source
+        .split("pub enum RuntimeCertificationReservationScopeObservationKindV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for member in [
+        "Absent {",
+        "lookup: RuntimeCertificationReservationScopeLookupV2,",
+        "Reserved {",
+        "reservation: RuntimeReservedCertificationIntentV2,",
+        "Diverged(RuntimeCertificationDivergenceV2),",
+    ] {
+        assert!(observation.contains(member), "{member}");
+    }
+    assert_eq!(
+        observation
+            .matches("snapshot: RuntimeDeploymentSnapshotV1")
+            .count(),
+        2
+    );
+    assert_eq!(
+        observation
+            .matches("lookup: RuntimeCertificationReservationScopeLookupV2")
+            .count(),
+        2
+    );
+    assert_eq!(observation.matches("observed_at: DateTime<Utc>").count(), 2);
+    assert_eq!(
+        observation
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ") && !line.starts_with("        ") && line.trim() != "},"
+            })
+            .count(),
+        3
+    );
+
+    let checked_observation = source
+        .split("pub struct RuntimeCertificationReservationScopeObservationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(checked_observation
+        .contains("kind: RuntimeCertificationReservationScopeObservationKindV2,"));
+    assert_eq!(checked_observation.matches("    ").count(), 1);
+    assert!(!checked_observation.contains("pub "));
+    for constructor in ["pub fn absent(", "pub fn reserved(", "pub fn diverged("] {
+        assert!(source.contains(constructor), "{constructor}");
+    }
+    assert_eq!(
+        source
+            .matches("validate_observation_scope(&snapshot,")
+            .count(),
+        2
+    );
+    assert!(source.contains("validate_reservation_against_snapshot(&snapshot, &reservation)?;"));
+    assert!(source.contains("lookup.operation_scope() != reservation.operation_scope()"));
+    assert!(source.contains("operation_scope.scope.matches(&snapshot.identity)"));
+    assert!(source.contains("operation_scope.deployment_revision != snapshot.revision"));
+
+    let outcome = source
+        .split("pub enum RuntimeCertificationIntentReservationOutcomeV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nfn").next())
+        .unwrap();
+    assert!(outcome.contains("Reserved(RuntimeReservedCertificationIntentV2),"));
+    assert!(outcome.contains("Diverged(RuntimeCertificationDivergenceV2),"));
+    assert_eq!(
+        outcome
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("        "))
+            .count(),
+        2
+    );
+
+    let fields = source
+        .split("pub enum RuntimeCertificationOperationFieldV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for variant in [
+        "Scope,",
+        "DeploymentRevision,",
+        "ConvergenceAttempt,",
+        "ControllerId,",
+        "FencingToken,",
+        "RuntimeGeneration,",
+        "Target,",
+        "PanelEvidence,",
+        "OperationId,",
+    ] {
+        assert!(fields.contains(variant), "{variant}");
+    }
+    assert_eq!(
+        fields
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.starts_with("        "))
+            .count(),
+        9
+    );
+    for panel_correlation in [
+        "intent.panel.certificate_id == panel.certificate_id",
+        "intent.panel.report_digest == panel.report_digest",
+        "intent.panel.process_identity.target == panel.target",
+        "intent.panel.process_identity.runtime_generation == panel.runtime_generation",
+        "intent.panel.process_identity.process_instance_id == panel.process_instance_id",
+    ] {
+        assert!(source.contains(panel_correlation), "{panel_correlation}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeCertificationIntentReservationOutcomeV2",
+        "RuntimeCertificationOperationBuildErrorV2",
+        "RuntimeCertificationOperationFieldV2",
+        "RuntimeCertificationOperationPersistenceErrorV2",
+        "RuntimeCertificationOperationScopeV2",
+        "RuntimeCertificationReservationObservationErrorV2",
+        "RuntimeCertificationReservationScopeLookupV2",
+        "RuntimeCertificationReservationScopeObservationKindV2",
+        "RuntimeCertificationReservationScopeObservationV2",
+        "RuntimeReservedCertificationIntentV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_certification_canonical_surface_stays_closed() {
     let canonical = include_str!("../src/v2_certification_canonical.rs");
     let wire = include_str!("../src/v2_certification_canonical/wire.rs");
@@ -944,6 +1180,10 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_certification_outcome.rs",
             include_str!("../src/v2_certification_outcome.rs"),
+        ),
+        (
+            "src/v2_certification_operation.rs",
+            include_str!("../src/v2_certification_operation.rs"),
         ),
         ("src/v2_digest.rs", include_str!("../src/v2_digest.rs")),
         ("src/v2_drain.rs", include_str!("../src/v2_drain.rs")),
