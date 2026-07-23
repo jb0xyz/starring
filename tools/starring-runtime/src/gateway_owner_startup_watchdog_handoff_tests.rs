@@ -510,6 +510,61 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
     .unwrap();
 }
 
+async fn initial_pending_recovery_fixture_v2(
+    recovery_id: &str,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
+    FakePortV1,
+) {
+    let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
+    let mut gateway = crate::compose_runtime_gateway_bootstrap_v1(
+        process_instance_id.clone(),
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    gateway.connect_ready_for_gateway_section_test_v2();
+    let lease_for = Duration::from_secs(5);
+    let owner_receipt = receipt(lease_for);
+    let port = FakePortV1::new(owner_receipt.clone(), []);
+    let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
+        lease_for,
+        Duration::from_secs(4),
+        Duration::from_millis(500),
+        Duration::from_millis(20),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let handle = gateway
+        .start_gateway_owner_startup_watchdog_v1(
+            port.clone(),
+            accepted_receipt(owner_receipt),
+            started,
+            started,
+            config,
+        )
+        .unwrap();
+    let owner = handle.prepare_closed_recovery_v2().await.unwrap();
+    let registry = crate::compose_runtime_registry_bootstrap_v1(
+        process_instance_id,
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    registry.advance_empty_sequence_for_test_v2();
+    let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
+        &gateway,
+        &registry,
+        owner,
+        RuntimeRecoveryIdV2::parse(recovery_id).unwrap(),
+        &readiness,
+    )
+    .unwrap();
+    (gateway, registry, pending, port)
+}
+
 #[tokio::test]
 async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_publication() {
     let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
@@ -593,7 +648,26 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         } if generation.get() == 4
             && recovery_id.as_str() == "fedcba9876543210fedcba9876543210"
     ));
-    drop(pending);
+    let session = pending.commit_owner_v2().await.unwrap();
+    assert_eq!(
+        format!("{session:?}"),
+        "RuntimeClosedRecoverySessionV2(<redacted>)"
+    );
+    assert!(matches!(
+        owner_gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            ..
+        } if generation.get() == 4
+            && recovery_id.as_str() == "fedcba9876543210fedcba9876543210"
+    ));
+    assert_eq!(port.observe_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.acquire_calls(), 0);
+    assert_eq!(port.release_calls(), 0);
+    assert_eq!(port.maximum_active_operations(), 1);
+    drop(session);
     assert!(matches!(
         owner_gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
@@ -602,6 +676,117 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         } if generation.get() == 5
     ));
     wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn unpolled_compound_owner_commit_cancels_closed_and_releases_once() {
+    let (gateway, _registry, pending, port) =
+        initial_pending_recovery_fixture_v2("11111111111111111111111111111111").await;
+
+    let commit = pending.commit_owner_v2();
+    drop(commit);
+
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn compound_owner_commit_ack_wait_cancels_closed_and_releases_once() {
+    let (gateway, _registry, pending, port) =
+        initial_pending_recovery_fixture_v2("44444444444444444444444444444444").await;
+    let mut commit = Box::pin(pending.commit_owner_v2());
+    let mut polled = false;
+    std::future::poll_fn(|context| {
+        if !polled {
+            polled = true;
+            assert!(commit.as_mut().poll(context).is_pending());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    drop(commit);
+
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn post_commit_registry_aba_refuses_the_compound_session() {
+    let (gateway, registry, pending, port) =
+        initial_pending_recovery_fixture_v2("22222222222222222222222222222222").await;
+    let before = registry.observe_recovery_empty_projection_v2().unwrap();
+
+    let error = pending
+        .commit_owner_after_test_hook_v2(|| registry.advance_empty_sequence_for_test_v2())
+        .await
+        .unwrap_err();
+    let after = registry.observe_recovery_empty_projection_v2().unwrap();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Registry(
+            crate::RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding,
+        )
+    );
+    assert_eq!(before.retained_slot_count(), after.retained_slot_count());
+    assert_eq!(
+        before.retained_empty_tombstone_count(),
+        after.retained_empty_tombstone_count()
+    );
+    assert_ne!(before.observation_sequence(), after.observation_sequence());
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 3
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn post_commit_disconnect_refuses_the_compound_session() {
+    let (mut gateway, _registry, pending, port) =
+        initial_pending_recovery_fixture_v2("33333333333333333333333333333333").await;
+
+    let error = pending
+        .commit_owner_after_test_hook_v2(|| gateway.disconnect_for_gateway_section_test_v2())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Gateway(
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
+                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            ),
+        )
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
+        } if generation.get() == 4
+    ));
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
 }
 
 #[test]

@@ -631,6 +631,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "pub(crate) struct RuntimeEmergencyGatewaySectionV2<'a>",
         "pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2",
         "pub(crate) struct RuntimeRecoveryPendingGatewaySectionV2<'a>",
+        "enum RuntimeGatewayOwnerRecoveryEvidenceV2<'a>",
+        "Committed(&'a RuntimeGatewayOwnerClosedRecoverySupervisorV2)",
+        "pub(crate) enum RuntimeGatewayRecoveryOwnerCommitErrorV2",
         "pub(crate) fn initial_emergency_gateway_section_v2<'a>(",
         "pub(crate) fn begin_empty_recovery_v2(",
         "_authority: &RuntimeClosedRecoveryTransitionAuthorityV2",
@@ -638,6 +641,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "registry.into_observation_v2()",
         "pub(crate) fn into_recovery_pending_binding_v2(",
         "pub(crate) fn pending_section_v2<'a>(",
+        "pub(crate) fn committed_pending_section_v2<'a>(",
+        "pub(crate) async fn commit_prepared_owner_v2(",
         "impl Drop for RuntimeEmergencyGatewaySectionV2<'_>",
         "impl Drop for RuntimeRecoveryPendingGatewayBindingV2",
         "RuntimeRecoveryPendingGatewayBindingV2(<redacted>)",
@@ -742,6 +747,12 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         assert!(owner_supervisor.contains(required), "{required}");
     }
     assert_eq!(
+        owner_supervisor
+            .matches("pub(crate) fn is_bound_to_gateway_lifetime_v2(")
+            .count(),
+        2
+    );
+    assert_eq!(
         owner_supervisor.matches("runtime.spawn(async move").count(),
         1
     );
@@ -794,6 +805,22 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             );
         }
     }
+    let owner_evidence =
+        braced_declaration(production, "enum RuntimeGatewayOwnerRecoveryEvidenceV2<'a>");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(owner_evidence, forbidden),
+            "RuntimeGatewayOwnerRecoveryEvidenceV2: {forbidden}"
+        );
+        assert!(
+            !implements_trait(
+                production,
+                "RuntimeGatewayOwnerRecoveryEvidenceV2",
+                forbidden,
+            ),
+            "RuntimeGatewayOwnerRecoveryEvidenceV2: {forbidden}"
+        );
+    }
     for name in [
         "RuntimeEmergencyGatewaySectionV2",
         "RuntimeRecoveryPendingGatewayBindingV2",
@@ -833,6 +860,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeRecoveryPendingGatewayBindingV2",
         "RuntimeRecoveryPendingGatewaySectionV2",
         "RuntimeGatewayRecoverySectionErrorV2",
+        "RuntimeGatewayRecoveryOwnerCommitErrorV2",
+        "RuntimeGatewayOwnerRecoveryEvidenceV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }
@@ -870,13 +899,33 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
 
     let pending_binding =
         braced_declaration(production, "impl RuntimeRecoveryPendingGatewayBindingV2");
-    let pending_section = braced_declaration(pending_binding, "fn pending_section_v2<'a>(");
+    let pending_section =
+        braced_declaration(pending_binding, "fn pending_section_with_owner_v2<'a>(");
     let pending_borrow = pending_section
         .find("admission_snapshot.borrow()")
         .unwrap_or_else(|| panic!("pending section watch borrow missing"));
     assert_no_watch_reborrow(
         &pending_section[pending_borrow..],
         "pending section after borrow",
+    );
+    let owner_commit = braced_declaration(
+        pending_binding,
+        "pub(crate) async fn commit_prepared_owner_v2(",
+    );
+    let preflight = owner_commit
+        .find(".pending_section_v2(&prepared_owner)")
+        .unwrap();
+    let section_drop = owner_commit.find("drop(section)").unwrap();
+    let commit = owner_commit
+        .find(".commit_closed_recovery_v2(&self.permit)")
+        .unwrap();
+    let awaited = owner_commit.find(".await").unwrap();
+    assert!(preflight < section_drop && section_drop < commit && commit < awaited);
+    assert_eq!(
+        production
+            .matches(".commit_closed_recovery_v2(&self.permit)")
+            .count(),
+        1
     );
 
     let pending = braced_declaration(
@@ -902,6 +951,13 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) fn begin_initial_empty_recovery_v2(",
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
+        "pub(crate) struct RuntimeClosedRecoverySessionV2",
+        "RuntimeClosedRecoverySessionV2(<redacted>)",
+        "pub(crate) async fn commit_owner_v2(",
+        "async fn commit_owner_with_post_commit_v2(",
+        ".commit_prepared_owner_v2(&authority, owner)",
+        "post_commit();",
+        ".committed_pending_section_v2(&self.owner)",
         "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2(<redacted>)",
         "let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };",
@@ -922,6 +978,13 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     assert!(production.contains(concat!(
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2 {\n",
         "    owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,\n",
+        "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
+        "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoverySessionV2 {\n",
+        "    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,\n",
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
         "}"
@@ -950,8 +1013,39 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .find(".revalidate_empty_projection_v2(&section)")
         .unwrap();
     assert!(final_gateway < final_registry);
+    let owner_commit = braced_declaration(production, "async fn commit_owner_with_post_commit_v2(");
+    let precommit = owner_commit.find("self.revalidate_v2()").unwrap();
+    let commit = owner_commit
+        .find(".commit_prepared_owner_v2(&authority, owner)")
+        .unwrap();
+    let hook = owner_commit.find("post_commit();").unwrap();
+    let session = owner_commit
+        .find("let session = RuntimeClosedRecoverySessionV2")
+        .unwrap();
+    let postcommit = owner_commit.find("session.revalidate_v2()?").unwrap();
+    assert!(precommit < commit && commit < hook && hook < session && session < postcommit);
+    assert_eq!(
+        production
+            .matches("commit_owner_with_post_commit_v2(")
+            .count(),
+        2
+    );
+    let committed_session = braced_declaration(production, "impl RuntimeClosedRecoverySessionV2");
+    let committed_revalidation = braced_declaration(committed_session, "fn revalidate_v2(&self)");
+    let committed_gateway = committed_revalidation
+        .find(".committed_pending_section_v2(&self.owner)")
+        .unwrap();
+    let committed_registry = committed_revalidation
+        .find(".revalidate_empty_projection_v2(&section)")
+        .unwrap();
+    let committed_final = committed_revalidation
+        .find(".validate_empty_registry_projection_v2(&registry)")
+        .unwrap();
+    assert!(committed_gateway < committed_registry && committed_registry < committed_final);
+    let begin = braced_declaration(production, "pub(crate) fn begin_initial_empty_recovery_v2(");
+    assert!(!begin.contains(".await"));
+    assert_eq!(production.matches(".await").count(), 2);
     for forbidden in [
-        ".await",
         "pub fn permit",
         "pub fn owner",
         "pub fn registry",
@@ -969,11 +1063,13 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedDrainRecoveryPermitV2",
         "activate",
         "deploy",
+        "resume",
     ] {
         assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
     for name in [
         "RuntimeClosedRecoveryPendingPhaseV2",
+        "RuntimeClosedRecoverySessionV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2",
     ] {
         let attributes = declaration_attribute_block(production, name);
@@ -1017,8 +1113,24 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
                 path.display()
             );
         }
+        for method in ["commit_prepared_owner_v2", "committed_pending_section_v2"] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/gateway.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
     }
     assert!(!production.contains("pub(crate) fn new"));
+    assert_eq!(
+        production
+            .matches("RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () }")
+            .count(),
+        2
+    );
     let library = include_str!("../src/lib.rs");
     assert!(library.contains("mod closed_recovery;"));
     assert!(!library.contains("pub mod closed_recovery;"));
@@ -1026,6 +1138,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "begin_initial_empty_recovery_v2",
         "RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryBeginErrorV2",
+        "RuntimeClosedRecoverySessionV2",
+        "RuntimeClosedRecoveryCommitErrorV2",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }

@@ -365,6 +365,18 @@ mod tests {
         SlotSealKeyV2::try_from([7_u8; 16].as_slice()).unwrap()
     }
 
+    impl super::RuntimeRegistryBootstrapV1 {
+        pub(crate) fn advance_empty_sequence_for_test_v2(&self) {
+            let key = slot_key();
+            let expected = self.registry.atomic_observation_v2(&key).unwrap();
+            let (seal, _) = self
+                .registry
+                .seal_drain_claim_v2(&key, seal_key(), expected.as_ref())
+                .unwrap();
+            self.registry.unseal_drain_claim_v2(seal).unwrap();
+        }
+    }
+
     #[test]
     fn composes_exact_empty_projection_without_exposing_registry_authority() {
         let bootstrap = compose_runtime_registry_bootstrap_v1(

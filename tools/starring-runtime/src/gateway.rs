@@ -31,7 +31,9 @@ use tokio::sync::watch;
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
 use crate::gateway_owner_startup_watchdog::{
-    start_runtime_gateway_owner_startup_watchdog_v1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
+    start_runtime_gateway_owner_startup_watchdog_v1,
+    RuntimeGatewayOwnerClosedRecoveryCommitErrorV2, RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
     RuntimeGatewayOwnerPreparedClosedRecoveryV2,
 };
 use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
@@ -167,9 +169,14 @@ pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2 {
 
 pub(crate) struct RuntimeRecoveryPendingGatewaySectionV2<'a> {
     binding: &'a RuntimeRecoveryPendingGatewayBindingV2,
-    prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    owner: RuntimeGatewayOwnerRecoveryEvidenceV2<'a>,
     coordinator: MutexGuard<'a, RuntimeGatewayClosedLifecycleV2>,
     admission_snapshot: watch::Ref<'a, GatewayAdmissionSnapshotV3>,
+}
+
+enum RuntimeGatewayOwnerRecoveryEvidenceV2<'a> {
+    Prepared(&'a RuntimeGatewayOwnerPreparedClosedRecoveryV2),
+    Committed(&'a RuntimeGatewayOwnerClosedRecoverySupervisorV2),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -180,6 +187,14 @@ pub(crate) enum RuntimeGatewayRecoverySectionErrorV2 {
     Coordinator(RuntimeGatewayClosedTransitionErrorV2),
     #[error("runtime gateway recovery section protocol was violated")]
     ProtocolViolation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayRecoveryOwnerCommitErrorV2 {
+    #[error("runtime gateway recovery owner commit precondition failed")]
+    Section(RuntimeGatewayRecoverySectionErrorV2),
+    #[error("runtime gateway recovery owner commit failed")]
+    Owner(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2),
 }
 
 struct RuntimeGatewayInvalidationBridgeV2 {
@@ -400,6 +415,14 @@ impl RuntimeGatewayBootstrapV1 {
     }
 
     #[cfg(test)]
+    pub(crate) fn disconnect_for_gateway_section_test_v2(&mut self) {
+        self._runtime
+            ._inner
+            .mark_disconnected(automation_runtime::GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+    }
+
+    #[cfg(test)]
     pub(crate) async fn held_initial_section_blocks_repeated_pause_test_v2(
         &mut self,
         prepared_owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
@@ -612,7 +635,45 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     ) -> Result<RuntimeRecoveryPendingGatewaySectionV2<'a>, RuntimeGatewayRecoverySectionErrorV2>
     {
-        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+        self.pending_section_with_owner_v2(RuntimeGatewayOwnerRecoveryEvidenceV2::Prepared(
+            prepared_owner,
+        ))
+    }
+
+    pub(crate) fn committed_pending_section_v2<'a>(
+        &'a self,
+        committed_owner: &'a RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    ) -> Result<RuntimeRecoveryPendingGatewaySectionV2<'a>, RuntimeGatewayRecoverySectionErrorV2>
+    {
+        self.pending_section_with_owner_v2(RuntimeGatewayOwnerRecoveryEvidenceV2::Committed(
+            committed_owner,
+        ))
+    }
+
+    pub(crate) async fn commit_prepared_owner_v2(
+        &self,
+        _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
+        prepared_owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    ) -> Result<
+        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        RuntimeGatewayRecoveryOwnerCommitErrorV2,
+    > {
+        let section = self
+            .pending_section_v2(&prepared_owner)
+            .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Section)?;
+        drop(section);
+        prepared_owner
+            .commit_closed_recovery_v2(&self.permit)
+            .await
+            .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
+    }
+
+    fn pending_section_with_owner_v2<'a>(
+        &'a self,
+        owner: RuntimeGatewayOwnerRecoveryEvidenceV2<'a>,
+    ) -> Result<RuntimeRecoveryPendingGatewaySectionV2<'a>, RuntimeGatewayRecoverySectionErrorV2>
+    {
+        require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         let coordinator = self.closed_lifecycle.lock().map_err(|_| {
             RuntimeGatewayRecoverySectionErrorV2::Gateway(
@@ -629,7 +690,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             snapshot,
         )
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        if prepared_owner.observation().receipt() != self.permit.owner_receipt()
+        if owner.observation().receipt() != self.permit.owner_receipt()
             || paused_gateway != *self.permit.paused_gateway()
         {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
@@ -639,7 +700,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         if self.observer.current_admission_snapshot() != snapshot {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
-        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+        require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         coordinator
             .validate_recovery_permit(&self.permit)
@@ -648,14 +709,14 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         if *admission_snapshot != snapshot {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
-        require_prepared_owner_lifetime_v2(&self.owner_invalidated, prepared_owner)
+        require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         coordinator
             .validate_recovery_permit(&self.permit)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         Ok(RuntimeRecoveryPendingGatewaySectionV2 {
             binding: self,
-            prepared_owner,
+            owner,
             coordinator,
             admission_snapshot,
         })
@@ -774,7 +835,7 @@ impl RuntimeRecoveryPendingGatewaySectionV2<'_> {
     }
 
     fn require_current_v2(&self) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
-        require_prepared_owner_lifetime_v2(&self.binding.owner_invalidated, self.prepared_owner)
+        require_recovery_owner_lifetime_v2(&self.binding.owner_invalidated, &self.owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         self.coordinator
             .validate_recovery_permit(&self.binding.permit)
@@ -786,16 +847,46 @@ impl RuntimeRecoveryPendingGatewaySectionV2<'_> {
             snapshot,
         )
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        if self.prepared_owner.observation().receipt() != self.binding.permit.owner_receipt()
+        if self.owner.observation().receipt() != self.binding.permit.owner_receipt()
             || paused_gateway != *self.binding.permit.paused_gateway()
         {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
-        require_prepared_owner_lifetime_v2(&self.binding.owner_invalidated, self.prepared_owner)
+        require_recovery_owner_lifetime_v2(&self.binding.owner_invalidated, &self.owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         self.coordinator
             .validate_recovery_permit(&self.binding.permit)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)
+    }
+}
+
+impl RuntimeGatewayOwnerRecoveryEvidenceV2<'_> {
+    fn observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        match self {
+            Self::Prepared(owner) => owner.observation(),
+            Self::Committed(owner) => owner.observation(),
+        }
+    }
+
+    fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
+        match self {
+            Self::Prepared(owner) => owner.is_bound_to_gateway_lifetime_v2(expected),
+            Self::Committed(owner) => owner.is_bound_to_gateway_lifetime_v2(expected),
+        }
+    }
+}
+
+fn require_recovery_owner_lifetime_v2(
+    owner_invalidated: &Arc<AtomicBool>,
+    owner: &RuntimeGatewayOwnerRecoveryEvidenceV2<'_>,
+) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+    if owner_invalidated.load(Ordering::Acquire)
+        || !owner.is_bound_to_gateway_lifetime_v2(owner_invalidated)
+        || owner.observation().safety_deadline() <= Instant::now()
+    {
+        Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+    } else {
+        Ok(())
     }
 }
 

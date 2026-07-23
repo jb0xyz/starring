@@ -607,8 +607,18 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         &self.observation
     }
 
+    pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
+        self.inner().is_bound_to_gateway_lifetime_v2(expected)
+    }
+
     pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         self.take_inner().shutdown().await
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("closed gateway owner recovery handle")
     }
 
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
