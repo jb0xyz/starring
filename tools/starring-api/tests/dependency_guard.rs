@@ -432,6 +432,7 @@ fn edge_contract_keeps_typed_inputs_closed_errors_and_v2_projection() {
         "MappedApplyCommand",
         "map_authoring_application_error",
         "map_product_application_error",
+        "ProductControlPortError::RuntimeDrainRequired",
         "project_promotion",
         "project_deployment_operational_v2",
         "system_time_to_utc",

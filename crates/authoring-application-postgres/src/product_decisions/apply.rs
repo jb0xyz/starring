@@ -112,7 +112,7 @@ impl PostgresProductDecisions {
             return Ok(receipt);
         }
         if locked.outcome != "ready" {
-            let error = map_lock_outcome(&locked.outcome);
+            let error = map_lock_failure(&locked);
             let _ = transaction.rollback().await;
             return Err(ApplyAttemptFailure::Control(error));
         }
@@ -379,6 +379,23 @@ fn map_lock_outcome(outcome: &str) -> ProductControlPortError {
     }
 }
 
+fn map_lock_failure(locked: &ApplyLockRow) -> ProductControlPortError {
+    if locked.outcome != "runtime_drain_required" {
+        return map_lock_outcome(&locked.outcome);
+    }
+    if locked.exact_replay
+        || locked.requires_commit
+        || locked.resulting_revision.is_some()
+        || locked.resulting_state.is_some()
+        || locked.deployment_id.is_some()
+        || locked.desired_target_digest.is_some()
+        || locked.locked_projection.is_some()
+    {
+        return invalid_apply_result();
+    }
+    ProductControlPortError::RuntimeDrainRequired
+}
+
 fn map_finalize_outcome(outcome: &str) -> ProductControlPortError {
     if outcome == "ok" {
         invalid_apply_result()
@@ -464,8 +481,9 @@ mod tests {
     use sqlx::types::Json;
 
     use super::{
-        is_terminal_supersession, map_lock_outcome, target_artifact_is_valid, ApplyFinalizeRow,
-        ApplyTargetArtifactRow, ProductControlPortError,
+        is_terminal_supersession, map_finalize_outcome, map_lock_failure, map_lock_outcome,
+        target_artifact_is_valid, ApplyFinalizeRow, ApplyLockRow, ApplyTargetArtifactRow,
+        ProductControlPortError,
     };
 
     fn artifact(schema_version: RuleSetSchemaVersion) -> ApplyTargetArtifactRow {
@@ -481,6 +499,19 @@ mod tests {
             definition: Some(Json(serde_json::to_value(definition).unwrap())),
             content_hash: content_hash.clone(),
             canonical_content_hash: Some(content_hash),
+        }
+    }
+
+    fn drain_required_row() -> ApplyLockRow {
+        ApplyLockRow {
+            outcome: "runtime_drain_required".to_string(),
+            exact_replay: false,
+            requires_commit: false,
+            resulting_revision: None,
+            resulting_state: None,
+            deployment_id: None,
+            desired_target_digest: None,
+            locked_projection: None,
         }
     }
 
@@ -523,6 +554,58 @@ mod tests {
         assert_eq!(
             map_lock_outcome("runtime_writer_fence_invalid"),
             ProductControlPortError::Backend("runtime writer fence is unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_drain_required_requires_the_exact_closed_lock_shape() {
+        let locked = drain_required_row();
+        assert_eq!(
+            map_lock_failure(&locked),
+            ProductControlPortError::RuntimeDrainRequired
+        );
+        for malformed in [
+            ApplyLockRow {
+                exact_replay: true,
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                requires_commit: true,
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                resulting_revision: Some(1),
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                resulting_state: Some("applied".to_string()),
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                deployment_id: Some("deployment".to_string()),
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                desired_target_digest: Some("digest".to_string()),
+                ..drain_required_row()
+            },
+            ApplyLockRow {
+                locked_projection: Some(sqlx::types::Json(serde_json::json!({}))),
+                ..drain_required_row()
+            },
+        ] {
+            assert_eq!(
+                map_lock_failure(&malformed),
+                ProductControlPortError::Backend(
+                    "product apply function returned an invalid result".to_string()
+                )
+            );
+        }
+        assert_eq!(
+            map_finalize_outcome("runtime_drain_required"),
+            ProductControlPortError::Backend(
+                "product apply function returned an invalid result".to_string()
+            )
         );
     }
 }

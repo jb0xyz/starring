@@ -434,6 +434,8 @@ pub enum ProductControlPortError {
     PayloadMismatch,
     #[error("product decision is not valid in the current state")]
     InvalidState,
+    #[error("runtime drain is required before product apply can continue")]
+    RuntimeDrainRequired,
     #[error("requester self-approval is forbidden")]
     SelfApprovalForbidden,
     #[error("the same product decision already exists")]

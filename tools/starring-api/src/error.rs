@@ -43,6 +43,7 @@ pub fn map_product_control_error(error: ProductControlPortError) -> FacadeError 
         ProductControlPortError::RevisionConflict => FacadeErrorCode::InvalidState,
         ProductControlPortError::PayloadMismatch => FacadeErrorCode::StalePayload,
         ProductControlPortError::InvalidState
+        | ProductControlPortError::RuntimeDrainRequired
         | ProductControlPortError::DuplicateDecision
         | ProductControlPortError::Expired => FacadeErrorCode::InvalidState,
         ProductControlPortError::SelfApprovalForbidden => FacadeErrorCode::Forbidden,
@@ -373,6 +374,10 @@ mod tests {
             )),
             FacadeErrorCode::Superseded
         );
+        let drain_required =
+            map_product_control_error(ProductControlPortError::RuntimeDrainRequired);
+        assert_eq!(drain_required.error_code(), FacadeErrorCode::InvalidState);
+        assert!(!drain_required.retryable());
     }
 
     #[test]

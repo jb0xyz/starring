@@ -202,6 +202,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(readiness.contains("pg_catalog.count(*) = 4"));
     assert!(apply.contains("\"runtime_writer_fenced\""));
     assert!(apply.contains("\"runtime_writer_fence_invalid\""));
+    assert!(apply.contains("\"runtime_drain_required\""));
+    assert!(apply.contains("ProductControlPortError::RuntimeDrainRequired"));
     assert!(apply.contains("product apply is temporarily unavailable"));
     assert!(apply.contains("runtime writer fence is unavailable"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));

@@ -1108,4 +1108,8 @@ fn product_candidate_failures_have_bounded_stable_codes() {
         ProductControlPortError::Superseded.to_string(),
         "promotion was superseded by newer server state"
     );
+    assert_eq!(
+        ProductControlPortError::RuntimeDrainRequired.to_string(),
+        "runtime drain is required before product apply can continue"
+    );
 }
