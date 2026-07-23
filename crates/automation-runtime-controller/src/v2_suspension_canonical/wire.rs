@@ -282,6 +282,15 @@ pub(super) fn encode_suspend_attempt(
     encode_root(&wire)
 }
 
+pub(super) fn validate_suspend_attempt_mutable_state(
+    local_effect: &RuntimeLocalRouteEffectV2,
+    drain_obligation: &RuntimeDrainObligationV2,
+) -> Result<(), RuntimeSuspendAttemptCanonicalErrorV2> {
+    encode_local_effect(local_effect)?;
+    encode_drain_obligation(drain_obligation)?;
+    Ok(())
+}
+
 pub(super) fn decode_suspend_attempt(
     encoded: &[u8],
 ) -> Result<RuntimeSuspendAttemptRequestV2, RuntimeSuspendAttemptCanonicalErrorV2> {

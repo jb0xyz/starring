@@ -2120,6 +2120,155 @@ fn v2_suspension_operation_binds_one_exact_execution_without_authority() {
 }
 
 #[test]
+fn v2_suspension_sidecar_allows_only_exact_local_absence_progress() {
+    let source = include_str!("../src/v2_suspension_sidecar.rs");
+    let canonical = include_str!("../src/v2_suspension_canonical.rs");
+    let wire = include_str!("../src/v2_suspension_canonical/wire.rs");
+    let tests = include_str!("../src/v2_suspension_sidecar/tests.rs");
+
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Sha256",
+        "framed_sha256",
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Authority",
+        "Permit",
+        "Port",
+        "Future",
+        "pub fn new(",
+        "pub fn from_parts",
+        "pub fn into_parts",
+        "pub fn begin_local_drain",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden suspension sidecar surface: {forbidden}"
+        );
+    }
+
+    let state = source
+        .split("pub struct RuntimeSuspendedAttemptV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    for field in [
+        "operation_scope: RuntimeSuspendAttemptOperationScopeV2,",
+        "canonical_attempt: RuntimeCanonicalSuspendAttemptV2,",
+        "sidecar_revision: NonZeroU64,",
+        "local_effect: RuntimeLocalRouteEffectV2,",
+        "drain_obligation: RuntimeDrainObligationV2,",
+        "suspended_at: DateTime<Utc>,",
+    ] {
+        assert!(state.contains(field), "{field}");
+    }
+    assert_eq!(state.matches("    ").count(), 6);
+    assert!(!state.contains("pub "));
+
+    let progress = source
+        .split("pub struct RuntimeSuspendAttemptDrainProgressV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(progress.contains("source: RuntimeSuspendedAttemptV2,"));
+    assert!(progress.contains("replacement_local_effect: RuntimeLocalRouteEffectV2,"));
+    assert!(progress.contains("replacement_drain_obligation: RuntimeDrainObligationV2,"));
+    assert_eq!(progress.matches("    ").count(), 3);
+    assert!(!progress.contains("pub "));
+
+    assert!(source.contains(concat!(
+        "pub fn from_inserted(\n",
+        "        operation: &RuntimeSuspendAttemptOperationV2,\n",
+        "        sidecar_revision: NonZeroU64,\n",
+        "        local_effect: RuntimeLocalRouteEffectV2,\n",
+        "        drain_obligation: RuntimeDrainObligationV2,\n",
+        "        suspended_at: DateTime<Utc>,"
+    )));
+    assert!(source.contains(concat!(
+        "pub fn from_persisted(\n",
+        "        root: &RuntimePersistedSuspendAttemptRootV2,\n",
+        "        sidecar_revision: NonZeroU64,\n",
+        "        local_effect: RuntimeLocalRouteEffectV2,\n",
+        "        drain_obligation: RuntimeDrainObligationV2,\n",
+        "        suspended_at: DateTime<Utc>,"
+    )));
+    assert!(source.contains("local_effect != request.local_effect"));
+    assert!(source.contains("drain_obligation != request.drain_obligation"));
+    assert!(source.contains("RuntimePersistenceU64V2::from_non_zero(sidecar_revision)"));
+    assert!(source.contains("RuntimeUnixMicrosecondsV2::from_datetime(suspended_at)"));
+    assert!(source.contains("validate_suspend_attempt_mutable_state("));
+    assert!(!source.contains("RuntimeCanonicalSuspendAttemptV2::new(candidate)"));
+    assert!(canonical.contains("pub(crate) fn validate_suspend_attempt_mutable_state("));
+    assert!(wire.contains("pub(super) fn validate_suspend_attempt_mutable_state("));
+    let mutable_validator = wire
+        .split("pub(super) fn validate_suspend_attempt_mutable_state(")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n").next())
+        .unwrap();
+    assert!(mutable_validator.contains("encode_local_effect(local_effect)?;"));
+    assert!(mutable_validator.contains("encode_drain_obligation(drain_obligation)?;"));
+    for forbidden in [
+        "suspend_attempt_digest_v2",
+        "encode_root",
+        "SUSPEND_ATTEMPT_MAX_OCTETS",
+    ] {
+        assert!(!mutable_validator.contains(forbidden), "{forbidden}");
+    }
+
+    assert!(source.contains(concat!(
+        "pub fn record_local_absent(\n",
+        "        source: RuntimeSuspendedAttemptV2,\n",
+        "        provenance: RuntimeRouteMutationProvenanceV2,\n",
+        "        observed_sequence: NonZeroU64,"
+    )));
+    assert!(!source.contains("next_sidecar_revision"));
+    assert!(source.contains("expected_route: Some(route),"));
+    assert!(source.contains("RuntimeDrainObligationV2::ExactLocalRoute(local) if local == &route"));
+    assert!(source.contains("RuntimeDrainObligationV2::None"));
+    assert!(source.contains("RuntimeDrainObligationV2::LocalAndPrevious { local, previous }"));
+    assert!(source.contains("RuntimeDrainObligationV2::PreviousServing(previous.clone())"));
+    assert!(source.contains("pub fn expected_sidecar_revision(&self) -> NonZeroU64"));
+    assert!(source.contains("pub fn expected_local_effect(&self)"));
+    assert!(source.contains("pub fn expected_drain_obligation(&self)"));
+    assert!(source.contains("pub fn replacement_local_effect(&self)"));
+    assert!(source.contains("pub fn replacement_drain_obligation(&self)"));
+    assert!(
+        source.contains("current_effect == root_effect && current_obligation == root_obligation")
+    );
+    assert!(source.contains("*lifecycle == root_lifecycle"));
+    assert!(source.contains("expected_route: Some(expected_route)"));
+    assert!(source.contains("current_obligation == expected_obligation"));
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeSuspendAttemptDrainProgressErrorV2",
+        "RuntimeSuspendAttemptDrainProgressV2",
+        "RuntimeSuspendedAttemptStateErrorV2",
+        "RuntimeSuspendedAttemptStateFieldV2",
+        "RuntimeSuspendedAttemptV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+
+    for required_test in [
+        "all_six_canonical_roots_insert_and_restore_exactly",
+        "persisted_exact_routes_allow_only_their_correlated_absence_reductions",
+        "persisted_state_rejects_lifecycle_changes_and_previous_only_removal",
+        "progress_accepts_all_three_canonical_provenance_families",
+        "progress_rejects_invalid_provenance_self_correlations",
+        "both_lifecycles_and_both_local_obligations_reduce_exactly_once",
+        "terminal_states_cannot_record_another_local_absence",
+    ] {
+        assert!(tests.contains(required_test), "{required_test}");
+    }
+}
+
+#[test]
 fn source_files_contain_no_comments() {
     let sources = [
         ("src/config.rs", include_str!("../src/config.rs")),
@@ -2214,6 +2363,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_suspension_operation/tests.rs",
             include_str!("../src/v2_suspension_operation/tests.rs"),
+        ),
+        (
+            "src/v2_suspension_sidecar.rs",
+            include_str!("../src/v2_suspension_sidecar.rs"),
+        ),
+        (
+            "src/v2_suspension_sidecar/tests.rs",
+            include_str!("../src/v2_suspension_sidecar/tests.rs"),
         ),
         (
             "src/v2_writer_fence.rs",

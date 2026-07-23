@@ -191,8 +191,25 @@ fn validate_request(
         ));
     }
     validate_failure(request)?;
+    validate_effect_and_obligation(request, &request.local_effect, &request.drain_obligation)
+}
+
+pub(crate) fn validate_suspend_attempt_mutable_state(
+    request: &RuntimeSuspendAttemptRequestV2,
+    local_effect: &RuntimeLocalRouteEffectV2,
+    drain_obligation: &RuntimeDrainObligationV2,
+) -> Result<(), RuntimeSuspendAttemptCanonicalErrorV2> {
+    validate_effect_and_obligation(request, local_effect, drain_obligation)?;
+    wire::validate_suspend_attempt_mutable_state(local_effect, drain_obligation)
+}
+
+fn validate_effect_and_obligation(
+    request: &RuntimeSuspendAttemptRequestV2,
+    local_effect: &RuntimeLocalRouteEffectV2,
+    drain_obligation: &RuntimeDrainObligationV2,
+) -> Result<(), RuntimeSuspendAttemptCanonicalErrorV2> {
     let mut slot = None;
-    match (&request.local_effect, &request.drain_obligation) {
+    match (local_effect, drain_obligation) {
         (RuntimeLocalRouteEffectV2::None, RuntimeDrainObligationV2::None) => {}
         (RuntimeLocalRouteEffectV2::None, RuntimeDrainObligationV2::PreviousServing(previous)) => {
             validate_previous(previous, request, &mut slot)?
