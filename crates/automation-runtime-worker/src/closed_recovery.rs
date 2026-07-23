@@ -17,6 +17,14 @@ impl RuntimeClosedRecoveryAuthorityRevisionV2 {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    fn successor(self) -> Option<Self> {
+        self.get()
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -159,6 +167,22 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
 
     pub fn registry_evidence(&self) -> &RuntimeClosedRecoveryRegistryEvidenceV2 {
         &self.registry_evidence
+    }
+
+    pub(crate) fn refresh_readiness(
+        &mut self,
+        readiness: RuntimeCapabilityReadinessSetV2,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        let authority_revision = self.authority_revision.successor()?;
+        self.readiness = readiness;
+        self.authority_revision = authority_revision;
+        Some(authority_revision)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_authority_revision_for_test(&mut self) {
+        self.authority_revision =
+            RuntimeClosedRecoveryAuthorityRevisionV2(NonZeroU64::new(i64::MAX as u64).unwrap());
     }
 }
 

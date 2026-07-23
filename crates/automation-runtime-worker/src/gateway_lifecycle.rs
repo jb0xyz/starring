@@ -101,6 +101,12 @@ pub enum RuntimeGatewayClosedTransitionErrorV2 {
     EvidenceSequenceOutOfRange,
     #[error("runtime closed recovery permit is stale")]
     StaleRecoveryPermit,
+    #[error("runtime capability readiness authority does not match")]
+    CapabilityReadinessAuthorityMismatch,
+    #[error("runtime capability readiness is not an exact freshness successor")]
+    CapabilityReadinessNotSuccessor,
+    #[error("runtime closed recovery authority revision overflowed")]
+    AuthorityRevisionOverflow,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,6 +226,44 @@ impl RuntimeGatewayClosedLifecycleV2 {
                 Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit)
             }
         }
+    }
+
+    pub fn refresh_recovery_readiness(
+        &mut self,
+        permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+        readiness: crate::RuntimeCapabilityReadinessSetV2,
+    ) -> Result<(), RuntimeGatewayClosedTransitionErrorV2> {
+        self.validate_recovery_permit(permit)?;
+        if !permit.readiness().has_same_authority_as(&readiness) {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
+            )?;
+            return Err(
+                RuntimeGatewayClosedTransitionErrorV2::CapabilityReadinessAuthorityMismatch,
+            );
+        }
+        if !readiness.has_strictly_newer_checks_than(permit.readiness()) {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::CapabilityReadinessNotSuccessor);
+        }
+        let generation = permit.coordinator_generation();
+        let recovery_id = permit.recovery_id().clone();
+        let Some(authority_revision) = permit.refresh_readiness(readiness) else {
+            self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
+            return Err(RuntimeGatewayClosedTransitionErrorV2::AuthorityRevisionOverflow);
+        };
+        self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            authority_revision,
+        };
+        Ok(())
     }
 
     pub fn invalidate(

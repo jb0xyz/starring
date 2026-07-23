@@ -139,6 +139,25 @@ impl RuntimeCapabilityReadinessSetV2 {
             .all(|receipt| receipt.checked_at >= cutoff)
     }
 
+    pub(crate) fn has_same_authority_as(&self, other: &Self) -> bool {
+        self.receipts()
+            .into_iter()
+            .zip(other.receipts())
+            .all(|(left, right)| {
+                left.kind == right.kind
+                    && left.database_identity == right.database_identity
+                    && left.database_name == right.database_name
+                    && left.executor_role == right.executor_role
+            })
+    }
+
+    pub(crate) fn has_strictly_newer_checks_than(&self, predecessor: &Self) -> bool {
+        self.receipts()
+            .into_iter()
+            .zip(predecessor.receipts())
+            .all(|(current, previous)| current.checked_at > previous.checked_at)
+    }
+
     fn receipts(&self) -> [&RuntimeCapabilityReadinessReceiptV2; 5] {
         [
             &self.convergence,
@@ -301,6 +320,25 @@ mod tests {
             ),
             Err(RuntimeCapabilityReadinessErrorV2::AuthorityMismatch)
         );
+    }
+
+    #[test]
+    fn authority_comparison_ignores_only_freshness() {
+        let original = set();
+        let refreshed = RuntimeCapabilityReadinessSetV2::new(
+            receipt(RuntimeCapabilityReadinessKindV2::Convergence, "role_a", 11),
+            receipt(RuntimeCapabilityReadinessKindV2::ExactTarget, "role_b", 12),
+            receipt(RuntimeCapabilityReadinessKindV2::Panel, "role_c", 13),
+            receipt(RuntimeCapabilityReadinessKindV2::Serving, "role_d", 14),
+            receipt(RuntimeCapabilityReadinessKindV2::Interaction, "role_e", 15),
+        )
+        .unwrap();
+
+        assert!(original.has_same_authority_as(&refreshed));
+        assert!(refreshed.has_same_authority_as(&original));
+        assert!(refreshed.has_strictly_newer_checks_than(&original));
+        assert!(!original.has_strictly_newer_checks_than(&refreshed));
+        assert!(!original.has_strictly_newer_checks_than(&original));
     }
 
     #[test]

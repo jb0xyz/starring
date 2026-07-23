@@ -294,6 +294,27 @@ fn worker_coordinator_authority_and_state_surface_stay_exact() {
     assert!(!lifecycle.contains("AdmissionAcknowledging"));
     assert!(!invalidation.contains("Starting"));
     assert_eq!(invalidation.matches("    ").count(), 5);
+    let refresh = lifecycle
+        .split("pub fn refresh_recovery_readiness(")
+        .nth(1)
+        .and_then(|source| source.split("\n    pub fn invalidate(").next())
+        .unwrap();
+    let current = refresh
+        .find("self.validate_recovery_permit(permit)?")
+        .unwrap();
+    let authority = refresh
+        .find("permit.readiness().has_same_authority_as(&readiness)")
+        .unwrap();
+    let freshness = refresh
+        .find("readiness.has_strictly_newer_checks_than(permit.readiness())")
+        .unwrap();
+    let successor = refresh.find("permit.refresh_readiness(readiness)").unwrap();
+    let publication = refresh
+        .find("self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending")
+        .unwrap();
+    assert!(current < authority && authority < freshness && freshness < successor);
+    assert!(successor < publication);
+    assert!(!refresh.contains("async"));
 }
 
 #[test]
@@ -345,6 +366,13 @@ fn closed_recovery_authority_is_narrow_noncloneable_and_state_only() {
     }
     assert!(!permit_fields.contains("pub "));
     assert_eq!(permit_impl.matches("pub(crate) fn new(").count(), 1);
+    assert_eq!(
+        permit_impl
+            .matches("pub(crate) fn refresh_readiness(")
+            .count(),
+        1
+    );
+    assert!(!permit_impl.contains("pub fn refresh_readiness("));
     for forbidden in ["pub fn new(", "pub fn from_", "pub(crate) fn from_"] {
         assert!(!permit_impl.contains(forbidden));
     }
