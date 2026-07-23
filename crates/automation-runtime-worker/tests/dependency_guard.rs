@@ -174,6 +174,7 @@ fn worker_gateway_owner_watchdog_state_is_nonclone_and_monotonic() {
     for authority in [
         "RuntimeGatewayOwnerRenewalScheduleV1",
         "RuntimeGatewayOwnerWatchdogV1",
+        "RuntimeGatewayOwnerObservationInFlightV1",
         "RuntimeGatewayOwnerRenewalInFlightV1",
         "RuntimeGatewayOwnerUnknownRenewalV1",
     ] {
@@ -183,6 +184,8 @@ fn worker_gateway_owner_watchdog_state_is_nonclone_and_monotonic() {
     }
     assert!(!source.contains("SystemTime"));
     assert!(!source.contains("Utc::now"));
+    assert!(!source.contains("reconcile_observation"));
+    assert!(!source.contains("RuntimeGatewayOwnerObservedWatchdogV1"));
     assert!(!source.contains("pub fn from_receipt"));
     assert!(source.contains("pub fn from_accepted_receipt"));
     assert!(source.contains(".checked_add(lease_duration)"));

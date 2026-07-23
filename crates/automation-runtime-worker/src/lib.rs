@@ -20,6 +20,7 @@ pub use gateway_owner::{
     RuntimeGatewayOwnerRenewRecoveryV1,
 };
 pub use gateway_owner_watchdog::{
+    RuntimeGatewayOwnerObservationCompletionV1, RuntimeGatewayOwnerObservationInFlightV1,
     RuntimeGatewayOwnerRenewalCompletionV1, RuntimeGatewayOwnerRenewalInFlightV1,
     RuntimeGatewayOwnerRenewalPolicyErrorV1, RuntimeGatewayOwnerRenewalPolicyV1,
     RuntimeGatewayOwnerRenewalScheduleErrorV1, RuntimeGatewayOwnerRenewalScheduleV1,
