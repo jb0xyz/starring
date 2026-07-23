@@ -59,6 +59,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
             PathBuf::from("src/product_drain.rs"),
+            PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/writer_fence.rs"),
@@ -138,6 +139,89 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             );
         }
     }
+}
+
+#[test]
+fn product_drain_unknown_recovery_contract_is_owned_and_non_authorizing() {
+    let product = include_str!("../src/product_drain.rs");
+    let recovery = include_str!("../src/recovery.rs");
+    let outcome_prefix = product
+        .split("pub struct RuntimeProductDrainRecoveryOutcomeV2<W> {")
+        .next()
+        .unwrap();
+    let outcome_attributes = outcome_prefix.rsplit_once("\n\n").unwrap().1;
+    let outcome_fields = product
+        .split("pub struct RuntimeProductDrainRecoveryOutcomeV2<W> {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\npub trait").next())
+        .unwrap();
+    let port = product
+        .split("pub trait RuntimeProductDrainUnknownRecoveryPortV2: Sized {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+    let pending_prefix = recovery
+        .split("pub struct RuntimeRecoveryPendingV2<E, R> {")
+        .next()
+        .unwrap();
+    let pending_attributes = pending_prefix.trim();
+    let pending_fields = recovery
+        .split("pub struct RuntimeRecoveryPendingV2<E, R> {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+
+    assert!(outcome_attributes.contains("#[must_use]"));
+    assert!(pending_attributes.contains("#[must_use]"));
+    assert_eq!(
+        outcome_fields,
+        "\n    pub transaction_ended: W,\n    pub observation: RuntimeProductDrainScopeObservationV2,\n"
+    );
+    assert_eq!(pending_fields, "\n    pub source: E,\n    pub recovery: R,");
+    for source in [outcome_attributes, pending_attributes] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!source.contains(forbidden));
+        }
+    }
+    for forbidden in ["Clone", "Copy", "Default"] {
+        assert!(!implements_trait(
+            product,
+            "RuntimeProductDrainRecoveryOutcomeV2<W>",
+            forbidden
+        ));
+        assert!(!implements_trait(
+            recovery,
+            "RuntimeRecoveryPendingV2<E, R>",
+            forbidden
+        ));
+    }
+    for expected in [
+        "type TransactionEnded;",
+        "fn lookup(&self) -> &RuntimeProductDrainScopeLookupV2;",
+        "fn quiesce_and_observe(\n        self,\n        timeout: Duration,",
+        "RuntimeProductDrainRecoveryOutcomeV2<Self::TransactionEnded>",
+        "RuntimeRecoveryPendingV2<Self::Error, Self>",
+    ] {
+        assert!(port.contains(expected));
+    }
+    for forbidden in [
+        "RuntimeProductOperationIdV2",
+        "RuntimeDrainIntentIdV2",
+        "RuntimeProductDrainOperationV2",
+        "RuntimeProductDrainScopeObservationV2",
+        "authorize",
+        "apply",
+        "insert",
+        "mutate",
+        "mint",
+        "generate",
+        "new_id",
+    ] {
+        assert!(!port.contains(forbidden));
+    }
+    assert_eq!(port.matches("fn ").count(), 2);
+    assert_eq!(port.matches("fn lookup(").count(), 1);
+    assert_eq!(port.matches("fn quiesce_and_observe(").count(), 1);
 }
 
 #[test]

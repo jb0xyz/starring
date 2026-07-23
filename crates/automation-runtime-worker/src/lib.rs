@@ -5,6 +5,7 @@ mod gateway_owner;
 mod gateway_owner_watchdog;
 mod paused_gateway;
 mod product_drain;
+mod recovery;
 mod registry_recovery;
 mod startup_recovery;
 mod writer_fence;
@@ -45,7 +46,11 @@ pub use paused_gateway::{
     RuntimePausedGatewayObservationErrorV2, RuntimePausedGatewayObservationV2,
     RuntimePausedGatewaySequenceV2,
 };
-pub use product_drain::RuntimeProductDrainObservationPortV2;
+pub use product_drain::{
+    RuntimeProductDrainObservationPortV2, RuntimeProductDrainRecoveryOutcomeV2,
+    RuntimeProductDrainUnknownRecoveryPortV2,
+};
+pub use recovery::RuntimeRecoveryPendingV2;
 pub use registry_recovery::{
     accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
