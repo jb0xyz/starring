@@ -183,6 +183,34 @@ fn contains_identifier(source: &str, expected: &str) -> bool {
         .any(|identifier| identifier == expected)
 }
 
+fn declaration_attribute_block<'a>(source: &'a str, name: &str) -> &'a str {
+    let marker = format!("struct {name}");
+    let declaration = source.find(&marker).unwrap();
+    let mut start = source[..declaration]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    loop {
+        let before = source[..start].trim_end();
+        if !before.ends_with(']') {
+            break;
+        }
+        let Some(attribute) = before.rfind("#[") else {
+            break;
+        };
+        start = attribute;
+    }
+    &source[start..declaration + marker.len()]
+}
+
+fn implements_trait(source: &str, name: &str, trait_name: &str) -> bool {
+    let marker = format!(" for {name}");
+    source.match_indices(&marker).any(|(end, _)| {
+        source[..end]
+            .rfind("impl ")
+            .is_some_and(|start| contains_identifier(&source[start..end], trait_name))
+    })
+}
+
 #[test]
 fn comment_scanner_cannot_be_masked_by_character_literals() {
     for source in [
@@ -195,6 +223,22 @@ fn comment_scanner_cannot_be_masked_by_character_literals() {
     }
     assert!(has_rust_comment(r#"let value = '"'; // hidden"#));
     assert!(has_rust_comment(r#"let value = b'"'; /* hidden */"#));
+}
+
+#[test]
+fn authority_type_scanner_crosses_blank_attribute_spacing_and_qualified_impls() {
+    let derived = "#[derive(Debug, Clone)]\n\npub struct Guarded { value: usize }";
+    assert!(contains_identifier(
+        declaration_attribute_block(derived, "Guarded"),
+        "Clone"
+    ));
+    let implemented = concat!(
+        "pub struct Guarded { value: usize }\n",
+        "impl std::default::Default for Guarded {\n",
+        "    fn default() -> Self { Self { value: 0 } }\n",
+        "}"
+    );
+    assert!(implements_trait(implemented, "Guarded", "Default"));
 }
 
 #[test]
@@ -211,6 +255,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/database.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup_watchdog.rs",
+            "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/secret.rs",
@@ -299,6 +344,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         if path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
+            && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
@@ -317,7 +363,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         if path == Path::new("src/gateway.rs") {
             continue;
         }
-        if path == Path::new("src/gateway_owner_startup_watchdog.rs") {
+        if path == Path::new("src/gateway_owner_startup_watchdog.rs")
+            || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+        {
             for identifier in source
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                 .filter(|identifier| !identifier.is_empty())
@@ -423,14 +471,85 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "}"
     )));
     assert!(owner_supervisor.contains("shutdown_commands: mpsc::Sender<"));
-    assert!(owner_supervisor.contains("observation_commands: mpsc::Sender<"));
+    assert!(owner_supervisor.contains("supervisor_commands: mpsc::Sender<"));
     assert!(owner_supervisor.contains("RuntimeGatewayOwnerObservationCompletionV1::Current"));
     assert!(!owner_supervisor.contains("impl Clone for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
+    assert!(owner_supervisor.contains("impl Drop for RuntimeGatewayOwnerSupervisorHandleV1"));
+    assert!(!owner_supervisor.contains("impl Drop for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
+    assert!(owner_supervisor.contains("pub(crate) async fn into_production_v1("));
+    assert!(
+        owner_supervisor.contains("pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1")
+    );
+    assert!(
+        owner_supervisor.contains("pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1")
+    );
+    assert!(owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Promote"));
+    assert_eq!(
+        owner_supervisor.matches("runtime.spawn(async move").count(),
+        1
+    );
+    assert!(!owner_supervisor.contains("tokio::spawn"));
+    assert!(!owner_supervisor.contains("spawn_local"));
+    assert!(owner_supervisor.contains(concat!(
+        "pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {\n",
+        "    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,\n",
+        "}"
+    )));
+    assert!(owner_supervisor.contains(concat!(
+        "pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {\n",
+        "    _private: (),\n",
+        "}"
+    )));
+    assert!(owner_supervisor.contains(concat!(
+        "pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1 {\n",
+        "    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,\n",
+        "    handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,\n",
+        "}"
+    )));
+    assert_eq!(
+        owner_supervisor
+            .matches("RuntimeGatewayOwnerProductionHandoffProofV1 {")
+            .count(),
+        1
+    );
+    assert!(owner_supervisor.contains(concat!(
+        "#[cfg(test)]\n",
+        "#[path = \"gateway_owner_startup_watchdog_handoff_tests.rs\"]\n",
+        "mod handoff_tests;"
+    )));
+    for name in [
+        "RuntimeGatewayOwnerSupervisorHandleV1",
+        "RuntimeGatewayOwnerStartupWatchdogHandleV1",
+        "RuntimeGatewayOwnerProductionHandoffProofV1",
+        "RuntimeGatewayOwnerProductionSupervisorV1",
+    ] {
+        let attributes = declaration_attribute_block(owner_supervisor, name);
+        for forbidden in ["Clone", "Copy", "Default"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(owner_supervisor, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    let library = include_str!("../src/lib.rs");
+    for forbidden in [
+        "RuntimeGatewayOwnerProductionHandoffProofV1",
+        "RuntimeGatewayOwnerProductionSupervisorV1",
+        "RuntimeGatewayOwnerProductionHandoffErrorV1",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
+    }
     for forbidden in [
         "pub fn watchdog",
         "pub fn schedule",
         "pub fn port",
         "RuntimeGatewayOwnerObservedWatchdogV1",
+        "start_runtime_gateway_owner_production",
+        "start_gateway_owner_production",
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
     }

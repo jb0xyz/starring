@@ -23,7 +23,7 @@ use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 use crate::GatewayOwnerTimingConfigV1;
 
 const SHUTDOWN_COMMAND_CAPACITY: usize = 1;
-const OBSERVATION_COMMAND_CAPACITY: usize = 1;
+const SUPERVISOR_COMMAND_CAPACITY: usize = 1;
 const RELEASE_ATTEMPTS: usize = 2;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -232,25 +232,25 @@ impl<P> RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P> {
     }
 }
 
-pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
+struct RuntimeGatewayOwnerSupervisorHandleV1 {
     shutdown_commands: mpsc::Sender<RuntimeGatewayOwnerStartupShutdownCommandV1>,
-    observation_commands: mpsc::Sender<RuntimeGatewayOwnerStartupObservationCommandV1>,
+    supervisor_commands: mpsc::Sender<RuntimeGatewayOwnerSupervisorCommandV1>,
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
 }
 
-impl Drop for RuntimeGatewayOwnerStartupWatchdogHandleV1 {
+impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
     fn drop(&mut self) {
         self.invalidation.invalidate();
     }
 }
 
-impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
-    pub fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+impl RuntimeGatewayOwnerSupervisorHandleV1 {
+    fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         *self.terminal.borrow()
     }
 
-    pub async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+    async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         loop {
             if let Some(exit) = *self.terminal.borrow() {
                 return exit;
@@ -261,15 +261,15 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         }
     }
 
-    pub async fn observe_current_gateway_owner_v1(
+    async fn observe_current_gateway_owner_v1(
         &self,
     ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
     {
         let (response, acknowledgement) = oneshot::channel();
         let terminal = self.terminal.clone();
         if self
-            .observation_commands
-            .send(RuntimeGatewayOwnerStartupObservationCommandV1 { response })
+            .supervisor_commands
+            .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
             .await
             .is_err()
         {
@@ -281,7 +281,35 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         }
     }
 
-    pub async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+    async fn promote_to_production_v1(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProductionHandoffErrorV1>
+    {
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        if self
+            .supervisor_commands
+            .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
+            .await
+            .is_err()
+        {
+            return Err(wait_for_handoff_terminal_v1(terminal).await);
+        }
+        match acknowledgement.await {
+            Ok(observation) => {
+                match accept_production_handoff_observation_v1(observation, Instant::now()) {
+                    Ok(observation) => Ok(observation),
+                    Err(error) => {
+                        self.invalidation.invalidate();
+                        Err(error)
+                    }
+                }
+            }
+            Err(_) => Err(wait_for_handoff_terminal_v1(terminal).await),
+        }
+    }
+
+    async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         let (response, acknowledgement) = oneshot::channel();
         if self
             .shutdown_commands
@@ -297,8 +325,185 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     }
 }
 
+fn accept_production_handoff_observation_v1(
+    observation: RuntimeGatewayOwnerCurrentObservationV1,
+    observed_at: Instant,
+) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProductionHandoffErrorV1> {
+    if observation.safety_deadline() > observed_at {
+        Ok(observation)
+    } else {
+        Err(RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed)
+    }
+}
+
+pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+}
+
+impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
+    pub fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.inner_mut().wait_terminal().await
+    }
+
+    pub async fn observe_current_gateway_owner_v1(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        self.inner().observe_current_gateway_owner_v1().await
+    }
+
+    pub async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.take_inner().shutdown().await
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production composition follows closed recovery handoff"
+        )
+    )]
+    pub(crate) async fn into_production_v1(
+        mut self,
+        _proof: RuntimeGatewayOwnerProductionHandoffProofV1,
+    ) -> Result<
+        RuntimeGatewayOwnerProductionSupervisorV1,
+        RuntimeGatewayOwnerProductionHandoffErrorV1,
+    > {
+        let handoff_observation = self.inner().promote_to_production_v1().await?;
+        let inner = self.take_inner();
+        Ok(RuntimeGatewayOwnerProductionSupervisorV1 {
+            inner: Some(inner),
+            handoff_observation,
+        })
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("gateway owner supervisor handle")
+    }
+
+    fn inner_mut(&mut self) -> &mut RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_mut()
+            .expect("gateway owner supervisor handle")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner.take().expect("gateway owner supervisor handle")
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "production composition follows closed recovery handoff"
+    )
+)]
+pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {
+    _private: (),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "production composition follows closed recovery handoff"
+    )
+)]
+pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "production composition follows closed recovery handoff"
+    )
+)]
+impl RuntimeGatewayOwnerProductionSupervisorV1 {
+    pub(crate) fn handoff_observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.handoff_observation
+    }
+
+    pub(crate) fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.inner_mut().wait_terminal().await
+    }
+
+    pub(crate) async fn observe_current_gateway_owner_v1(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        self.inner().observe_current_gateway_owner_v1().await
+    }
+
+    pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.take_inner().shutdown().await
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("gateway owner supervisor handle")
+    }
+
+    fn inner_mut(&mut self) -> &mut RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_mut()
+            .expect("gateway owner supervisor handle")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner.take().expect("gateway owner supervisor handle")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeGatewayOwnerSupervisorRoleV1 {
+    Startup,
+    Production,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerProductionHandoffErrorV1 {
+    #[error("runtime gateway owner production handoff safety deadline elapsed")]
+    SafetyElapsed,
+    #[error("runtime gateway owner production handoff found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner production handoff violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner production handoff supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
 struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
     response: oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
+}
+
+enum RuntimeGatewayOwnerSupervisorCommandV1 {
+    Observe {
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerCurrentObservationErrorV1,
+            >,
+        >,
+    },
+    Promote {
+        response: oneshot::Sender<RuntimeGatewayOwnerCurrentObservationV1>,
+    },
 }
 
 struct RuntimeGatewayOwnerStartupObservationCommandV1 {
@@ -323,6 +528,29 @@ async fn wait_for_observation_terminal_v1(
     }
 }
 
+async fn wait_for_handoff_terminal_v1(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerProductionHandoffErrorV1 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_handoff_error_v1(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerProductionHandoffErrorV1::SupervisorUnavailable;
+        }
+    }
+}
+
+async fn receive_supervisor_command_v1(
+    pending: &mut Option<RuntimeGatewayOwnerSupervisorCommandV1>,
+    commands: &mut mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
+) -> Option<RuntimeGatewayOwnerSupervisorCommandV1> {
+    match pending.take() {
+        Some(command) => Some(command),
+        None => commands.recv().await,
+    }
+}
+
 fn map_terminal_observation_error_v1(
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
 ) -> RuntimeGatewayOwnerCurrentObservationErrorV1 {
@@ -341,6 +569,28 @@ fn map_terminal_observation_error_v1(
         | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
         | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
             RuntimeGatewayOwnerCurrentObservationErrorV1::SupervisorUnavailable
+        }
+    }
+}
+
+fn map_terminal_handoff_error_v1(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerProductionHandoffErrorV1 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerProductionHandoffErrorV1::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerProductionHandoffErrorV1::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerProductionHandoffErrorV1::SupervisorUnavailable
         }
     }
 }
@@ -402,7 +652,7 @@ where
         }
     };
     let (shutdown_commands, shutdown_receiver) = mpsc::channel(SHUTDOWN_COMMAND_CAPACITY);
-    let (observation_commands, observation_receiver) = mpsc::channel(OBSERVATION_COMMAND_CAPACITY);
+    let (supervisor_commands, supervisor_receiver) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
     let (terminal_sender, terminal) = watch::channel(None);
     let guard = RuntimeGatewayOwnerStartupWatchdogGuardV1::new(invalidation.clone());
     runtime.spawn(async move {
@@ -411,17 +661,19 @@ where
             watchdog,
             config,
             shutdown_receiver,
-            observation_receiver,
+            supervisor_receiver,
             guard,
         )
         .await;
         let _result = terminal_sender.send(Some(exit));
     });
     Ok(RuntimeGatewayOwnerStartupWatchdogHandleV1 {
-        shutdown_commands,
-        observation_commands,
-        terminal,
-        invalidation,
+        inner: Some(RuntimeGatewayOwnerSupervisorHandleV1 {
+            shutdown_commands,
+            supervisor_commands,
+            terminal,
+            invalidation,
+        }),
     })
 }
 
@@ -446,7 +698,7 @@ async fn run_gateway_owner_startup_watchdog_v1<P>(
     watchdog: RuntimeGatewayOwnerWatchdogV1,
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
     mut shutdown_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
-    mut observation_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupObservationCommandV1>,
+    mut supervisor_commands: mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
@@ -455,6 +707,8 @@ where
 {
     let lease_id = watchdog.schedule().receipt().lease_id.clone();
     let mut current = Some(watchdog);
+    let mut role = RuntimeGatewayOwnerSupervisorRoleV1::Startup;
+    let mut pending_supervisor_command = None;
     let mut shutdown_acknowledgement = None;
     let stop = 'supervisor: loop {
         match shutdown_commands.try_recv() {
@@ -486,36 +740,110 @@ where
                     _ = sleep_until(TokioInstant::from_std(renew_at)) => {
                         current = Some(watchdog);
                     }
-                    command = observation_commands.recv() => {
+                    command = receive_supervisor_command_v1(
+                        &mut pending_supervisor_command,
+                        &mut supervisor_commands,
+                    ) => {
                         let Some(command) = command else {
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
                                 config.cleanup_timeout,
                             );
                         };
-                        if command.response.is_closed() {
-                            current = Some(watchdog);
-                            continue 'supervisor;
-                        }
-                        match observe_current_gateway_owner_v1(
-                            &port,
-                            watchdog,
-                            command,
-                            &mut shutdown_commands,
-                            &mut shutdown_acknowledgement,
-                            &mut guard,
-                            config.cleanup_timeout,
-                        ).await {
-                            RuntimeGatewayOwnerStartupObservationStepV1::Continue {
-                                successor,
-                                response,
-                                result,
-                            } => {
-                                current = Some(*successor);
-                                let _result = response.send(result);
+                        match command {
+                            RuntimeGatewayOwnerSupervisorCommandV1::Observe { response } => {
+                                if response.is_closed() {
+                                    current = Some(watchdog);
+                                    continue 'supervisor;
+                                }
+                                let command = RuntimeGatewayOwnerStartupObservationCommandV1 {
+                                    response,
+                                };
+                                match observe_current_gateway_owner_v1(
+                                    &port,
+                                    watchdog,
+                                    command,
+                                    &mut shutdown_commands,
+                                    &mut shutdown_acknowledgement,
+                                    &mut guard,
+                                    config.cleanup_timeout,
+                                ).await {
+                                    RuntimeGatewayOwnerStartupObservationStepV1::Continue {
+                                        successor,
+                                        response,
+                                        result,
+                                    } => {
+                                        current = Some(*successor);
+                                        let _result = response.send(result);
+                                    }
+                                    RuntimeGatewayOwnerStartupObservationStepV1::Stop(stop) => {
+                                        break 'supervisor stop;
+                                    }
+                                }
                             }
-                            RuntimeGatewayOwnerStartupObservationStepV1::Stop(stop) => {
-                                break 'supervisor stop;
+                            RuntimeGatewayOwnerSupervisorCommandV1::Promote { response } => {
+                                match shutdown_commands.try_recv() {
+                                    Ok(command) => {
+                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                            receive_shutdown(
+                                                Some(command),
+                                                &mut shutdown_acknowledgement,
+                                            ),
+                                            config.cleanup_timeout,
+                                        );
+                                    }
+                                    Err(TryRecvError::Disconnected) => {
+                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                            config.cleanup_timeout,
+                                        );
+                                    }
+                                    Err(TryRecvError::Empty) => {}
+                                }
+                                if response.is_closed() {
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                        config.cleanup_timeout,
+                                    );
+                                }
+                                if role != RuntimeGatewayOwnerSupervisorRoleV1::Startup {
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup_timeout,
+                                    );
+                                }
+                                match watchdog.action_at(Instant::now()) {
+                                    RuntimeGatewayOwnerWatchdogActionV1::WaitUntil(_) => {}
+                                    RuntimeGatewayOwnerWatchdogActionV1::RenewNow => {
+                                        current = Some(watchdog);
+                                        pending_supervisor_command = Some(
+                                            RuntimeGatewayOwnerSupervisorCommandV1::Promote {
+                                                response,
+                                            },
+                                        );
+                                        continue 'supervisor;
+                                    }
+                                    RuntimeGatewayOwnerWatchdogActionV1::InvalidateNow => {
+                                        guard.invalidate_now();
+                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                            RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                                            config.cleanup_timeout,
+                                        );
+                                    }
+                                }
+                                let projection =
+                                    RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                                role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
+                                current = Some(watchdog);
+                                if response.send(projection).is_err() {
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                        config.cleanup_timeout,
+                                    );
+                                }
                             }
                         }
                     }
@@ -989,3 +1317,7 @@ impl Drop for RuntimeGatewayOwnerStartupWatchdogGuardV1 {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gateway_owner_startup_watchdog_handoff_tests.rs"]
+mod handoff_tests;
