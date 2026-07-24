@@ -261,6 +261,11 @@ fn finalized_receipt(
             false,
         ));
     }
+    if finalized.outcome == "runtime_drain_required" {
+        return Err(ApplyAttemptFailure::Control(map_runtime_drain_finalize(
+            &finalized,
+        )));
+    }
     let revision = revision_from_database(finalized.resulting_revision)?;
     let expected_guild_id = request.scope().guild_id().to_string();
     if finalized.outcome != "ok"
@@ -298,6 +303,10 @@ fn finalized_receipt(
 }
 
 fn is_terminal_supersession(finalized: &ApplyFinalizeRow) -> bool {
+    finalize_row_is_closed(finalized)
+}
+
+fn finalize_row_is_closed(finalized: &ApplyFinalizeRow) -> bool {
     finalized.resulting_revision.is_none()
         && finalized.resulting_state.is_none()
         && !finalized.exact_replay
@@ -404,6 +413,14 @@ fn map_finalize_outcome(outcome: &str) -> ProductControlPortError {
     }
 }
 
+fn map_runtime_drain_finalize(finalized: &ApplyFinalizeRow) -> ProductControlPortError {
+    if finalize_row_is_closed(finalized) {
+        ProductControlPortError::RuntimeDrainRequired
+    } else {
+        invalid_apply_result()
+    }
+}
+
 async fn commit_apply(
     transaction: sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), ApplyAttemptFailure> {
@@ -481,7 +498,7 @@ mod tests {
     use sqlx::types::Json;
 
     use super::{
-        is_terminal_supersession, map_finalize_outcome, map_lock_failure, map_lock_outcome,
+        is_terminal_supersession, map_lock_failure, map_lock_outcome, map_runtime_drain_finalize,
         target_artifact_is_valid, ApplyFinalizeRow, ApplyLockRow, ApplyTargetArtifactRow,
         ProductControlPortError,
     };
@@ -512,6 +529,18 @@ mod tests {
             deployment_id: None,
             desired_target_digest: None,
             locked_projection: None,
+        }
+    }
+
+    fn drain_required_finalize_row() -> ApplyFinalizeRow {
+        ApplyFinalizeRow {
+            outcome: "runtime_drain_required".to_string(),
+            resulting_revision: None,
+            resulting_state: None,
+            exact_replay: false,
+            guild_id: None,
+            deployment_id: None,
+            desired_target_digest: None,
         }
     }
 
@@ -601,11 +630,43 @@ mod tests {
                 )
             );
         }
+        let finalized = drain_required_finalize_row();
         assert_eq!(
-            map_finalize_outcome("runtime_drain_required"),
-            ProductControlPortError::Backend(
-                "product apply function returned an invalid result".to_string()
-            )
+            map_runtime_drain_finalize(&finalized),
+            ProductControlPortError::RuntimeDrainRequired
         );
+        for malformed in [
+            ApplyFinalizeRow {
+                resulting_revision: Some(1),
+                ..drain_required_finalize_row()
+            },
+            ApplyFinalizeRow {
+                resulting_state: Some("applied".to_string()),
+                ..drain_required_finalize_row()
+            },
+            ApplyFinalizeRow {
+                exact_replay: true,
+                ..drain_required_finalize_row()
+            },
+            ApplyFinalizeRow {
+                guild_id: Some("guild".to_string()),
+                ..drain_required_finalize_row()
+            },
+            ApplyFinalizeRow {
+                deployment_id: Some("deployment".to_string()),
+                ..drain_required_finalize_row()
+            },
+            ApplyFinalizeRow {
+                desired_target_digest: Some("digest".to_string()),
+                ..drain_required_finalize_row()
+            },
+        ] {
+            assert_eq!(
+                map_runtime_drain_finalize(&malformed),
+                ProductControlPortError::Backend(
+                    "product apply function returned an invalid result".to_string()
+                )
+            );
+        }
     }
 }

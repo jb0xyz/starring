@@ -164,7 +164,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     }
     for required in [
         "FUNCTIONS: [ScopedFunctionContractV1<'static>; 5]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 19]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 21]",
         "ScopedFunctionContractV1::set_named(",
         "ScopedFunctionContractV1::set_plpgsql_named(",
         "verify_apply_executor_readiness",
@@ -177,6 +177,13 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "starring_product_ruleset_slot_exact_v1",
         "starring_product_apply_lock_core_unfenced_v1",
         "pg_catalog.count(*) = 12",
+        "private_routine_contract",
+        "pg_catalog.count(*) = 2",
+        "starring_runtime_private_v2",
+        "starring_runtime_slot_writer_fence_lock_v2",
+        "starring_runtime_slot_writer_fence_begin_unsafe_v2",
+        "runtime_drain_intents_v2",
+        "runtime_slot_writer_fences_v2",
         "runtime_serving_leases",
         "runtime_writer_fence",
         "runtime_attestations",

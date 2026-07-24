@@ -32,4 +32,5 @@ include!("postgres_product_apply/apply_semantics.rs");
 include!("postgres_product_apply/authority_drift.rs");
 include!("postgres_product_apply/security_concurrency.rs");
 include!("postgres_product_apply/product_apply_serving_slot.rs");
+include!("postgres_product_apply/product_apply_physical_epoch.rs");
 include!("postgres_product_apply/migration_security.rs");
