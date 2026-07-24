@@ -164,6 +164,7 @@ dependencies = [
  "automation-ruleset",
  "automation-ruleset-activation",
  "automation-ruleset-readiness",
+ "automation-runtime-controller",
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "automation-state",
