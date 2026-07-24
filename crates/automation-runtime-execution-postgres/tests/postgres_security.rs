@@ -7,4 +7,5 @@ include!("postgres_security/gateway_owner.rs");
 include!("postgres_security/writer_fence.rs");
 include!("postgres_security/product_drain.rs");
 include!("postgres_security/product_drain_first_apply.rs");
+include!("postgres_security/slot_writer_fence.rs");
 include!("postgres_security/lock_order.rs");

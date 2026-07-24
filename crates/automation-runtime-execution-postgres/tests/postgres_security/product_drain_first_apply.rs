@@ -19,8 +19,8 @@ const PRODUCT_DRAIN_FIRST_APPLY_GUCS: [&str; 3] = [
 #[derive(Debug, sqlx::FromRow)]
 struct ProductDrainFirstApplyRow {
     outcome_name: String,
-    locked_snapshot: Json<Value>,
-    observed_at: DateTime<Utc>,
+    locked_snapshot: Option<Json<Value>>,
+    observed_at: Option<DateTime<Utc>>,
     product_tenant_id: Option<String>,
     product_installation_id: Option<String>,
     product_deployment_id: Option<String>,
@@ -209,6 +209,8 @@ fn assert_complete_product_drain_row(
     let product = canonical.product_preimage();
     let drain = canonical.drain_preimage();
     let drain_guild_id = drain.key.slot.guild_id.to_string();
+    let locked_snapshot = row.locked_snapshot.as_ref().unwrap();
+    let observed_at = row.observed_at.as_ref().unwrap();
     assert_eq!(
         row.product_tenant_id.as_deref(),
         Some(product.scope.tenant_id.as_str())
@@ -276,18 +278,44 @@ fn assert_complete_product_drain_row(
     assert_eq!(row.intent_revision, Some(1));
     assert_eq!(row.intent_state.as_deref(), Some("pending"));
     assert!(row.product_expected_target.is_some());
-    assert!(row.observed_at.timestamp_micros() > 0);
+    assert!(observed_at.timestamp_micros() > 0);
     assert_eq!(
-        row.locked_snapshot.0["identity"]["deployment_id"],
+        locked_snapshot.0["identity"]["deployment_id"],
         product.scope.deployment_id.as_str()
     );
     assert_eq!(
-        row.locked_snapshot.0["identity"]["tenant_id"],
+        locked_snapshot.0["identity"]["tenant_id"],
         product.scope.tenant_id.as_str()
     );
     assert_eq!(
-        row.locked_snapshot.0["identity"]["installation_id"],
+        locked_snapshot.0["identity"]["installation_id"],
         product.scope.installation_id.as_str()
+    );
+}
+
+fn assert_empty_product_drain_row(row: &ProductDrainFirstApplyRow) {
+    assert!(
+        row.locked_snapshot.is_none()
+            && row.observed_at.is_none()
+            && row.product_tenant_id.is_none()
+            && row.product_installation_id.is_none()
+            && row.product_deployment_id.is_none()
+            && row.product_expected_revision.is_none()
+            && row.product_operation_id.is_none()
+            && row.product_expected_target.is_none()
+            && row.product_mutation_request_bytes.is_none()
+            && row.product_mutation_digest.is_none()
+            && row.drain_tenant_id.is_none()
+            && row.drain_installation_id.is_none()
+            && row.drain_deployment_id.is_none()
+            && row.drain_slot_guild_id.is_none()
+            && row.drain_slot_ruleset_key.is_none()
+            && row.drain_expected_revision.is_none()
+            && row.drain_intent_id.is_none()
+            && row.drain_intent_request_bytes.is_none()
+            && row.drain_intent_digest.is_none()
+            && row.intent_revision.is_none()
+            && row.intent_state.is_none()
     );
 }
 
@@ -406,7 +434,18 @@ async fn insert_drain_only(
     .execute(pool)
     .await
     .unwrap();
-    set_product_drain_row_triggers(pool, false).await;
+    let mut transaction = pool.begin().await.unwrap();
+    for trigger in [
+        "runtime_drain_intents_v2_reject_row_mutation",
+        "runtime_drain_intents_v2_assert_slot_writer_fence_symmetry",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE public.runtime_drain_intents_v2 DISABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
     let drain = canonical.drain_preimage();
     sqlx::query(
         "INSERT INTO public.runtime_drain_intents_v2 \
@@ -426,10 +465,21 @@ async fn insert_drain_only(
     .bind(drain.key.product_mutation_digest.as_str())
     .bind(canonical.drain_intent_request_bytes())
     .bind(canonical.drain_intent_digest().as_str())
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .unwrap();
-    set_product_drain_row_triggers(pool, true).await;
+    for trigger in [
+        "runtime_drain_intents_v2_assert_slot_writer_fence_symmetry",
+        "runtime_drain_intents_v2_reject_row_mutation",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE public.runtime_drain_intents_v2 ENABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    transaction.commit().await.unwrap();
 }
 
 async fn install_recursive_product_insert_trigger(pool: &PgPool) {
@@ -568,7 +618,7 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
         .unwrap();
     assert_eq!(inserted.outcome_name, "inserted");
     assert_eq!(
-        inserted.locked_snapshot.0["revision"],
+        inserted.locked_snapshot.as_ref().unwrap().0["revision"],
         canonical.product_preimage().expected_revision.get()
     );
     assert_complete_product_drain_row(&inserted, &canonical);
@@ -610,7 +660,7 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
         .unwrap();
     assert_eq!(replayed.outcome_name, "replayed");
     assert_eq!(
-        replayed.locked_snapshot.0["revision"],
+        replayed.locked_snapshot.as_ref().unwrap().0["revision"],
         live_snapshot.revision.get()
     );
     assert_complete_product_drain_row(&replayed, &canonical);
@@ -664,11 +714,12 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
             .product_semantic_request_digest
             .as_str(),
     );
-    let identifier_conflict =
+    let slot_conflict =
         committed_product_drain_first_apply(&database.owner_pool, &conflicting)
             .await
             .unwrap();
-    assert_eq!(identifier_conflict.outcome_name, "identifier_conflict");
+    assert_eq!(slot_conflict.outcome_name, "slot_conflict");
+    assert_empty_product_drain_row(&slot_conflict);
     assert_eq!(product_drain_row_counts(&database.owner_pool).await, (1, 1));
 
     let read_committed_error =
@@ -760,8 +811,12 @@ async fn product_drain_first_apply_rejects_partial_and_recursive_second_insert()
     let corrupt =
         committed_product_drain_first_apply(&drain_only_database.owner_pool, &drain_only_canonical)
             .await
-            .unwrap();
-    assert_eq!(corrupt.outcome_name, "persistence_corrupt");
+            .unwrap_err();
+    assert_database_error(
+        &corrupt,
+        "RX004",
+        "runtime_execution_product_drain_state_invalid",
+    );
     assert_eq!(
         product_drain_row_counts(&drain_only_database.owner_pool).await,
         (0, 1)

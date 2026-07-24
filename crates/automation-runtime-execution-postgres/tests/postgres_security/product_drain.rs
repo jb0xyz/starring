@@ -81,7 +81,7 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         "INSERT INTO public.runtime_drain_intents_v2 DEFAULT VALUES",
         "UPDATE public.runtime_drain_intents_v2 SET drain_intent_id = drain_intent_id",
         "DELETE FROM public.runtime_drain_intents_v2",
-        "TRUNCATE public.runtime_drain_intents_v2",
+        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
     ] {
         let error = sqlx::query(statement)
             .execute(&database.owner_pool)
@@ -90,7 +90,8 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         assert_sqlstate(&error, "23514");
     }
     let error = sqlx::query(
-        "TRUNCATE public.runtime_drain_intents_v2, public.runtime_product_operations_v2",
+        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2, \
+         public.runtime_product_operations_v2",
     )
     .execute(&database.owner_pool)
     .await
@@ -107,7 +108,7 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         "INSERT INTO public.runtime_drain_intents_v2 DEFAULT VALUES",
         "UPDATE public.runtime_drain_intents_v2 SET drain_intent_id = drain_intent_id",
         "DELETE FROM public.runtime_drain_intents_v2",
-        "TRUNCATE public.runtime_drain_intents_v2",
+        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
     ] {
         let error = sqlx::query(statement)
             .execute(&database.executor_pool)
@@ -356,6 +357,16 @@ async fn insert_canonical_product_drain(
 ) {
     let product = canonical.product_preimage();
     let drain = canonical.drain_preimage();
+    let writer_epoch = sqlx::query_scalar::<_, i64>(
+        "SELECT fence.writer_epoch \
+         FROM starring_runtime_private_v2.starring_runtime_slot_writer_fence_lock_v2($1,$2) \
+              AS fence",
+    )
+    .bind(drain.key.slot.guild_id.to_string())
+    .bind(drain.key.slot.ruleset_key.as_str())
+    .fetch_one(&mut **transaction)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO public.runtime_product_operations_v2 \
          (product_operation_id, tenant_id, installation_id, deployment_id, expected_revision, \
@@ -400,6 +411,24 @@ async fn insert_canonical_product_drain(
     .bind(canonical.drain_intent_request_bytes())
     .bind(canonical.drain_intent_digest().as_str())
     .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query_scalar::<_, i64>(
+        "SELECT starring_runtime_private_v2.\
+             starring_runtime_slot_writer_fence_mark_drain_v2(\
+                 $1,$2,$3,$4,$5,$6,$7,$8,$9\
+             )",
+    )
+    .bind(drain.key.slot.guild_id.to_string())
+    .bind(drain.key.slot.ruleset_key.as_str())
+    .bind(writer_epoch)
+    .bind(drain.key.intent_id.as_str())
+    .bind(drain.key.product_operation_id.as_str())
+    .bind(drain.key.scope.tenant_id.as_str())
+    .bind(drain.key.scope.installation_id.as_str())
+    .bind(drain.key.scope.deployment_id.as_str())
+    .bind(i64::try_from(drain.key.expected_revision.get()).unwrap())
+    .fetch_one(&mut **transaction)
     .await
     .unwrap();
 }
