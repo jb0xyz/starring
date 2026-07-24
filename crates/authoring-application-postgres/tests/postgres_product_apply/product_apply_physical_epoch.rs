@@ -74,10 +74,21 @@ async fn install_product_apply_pending_drain(
     snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
 ) {
     let canonical = product_apply_drain_for_epoch_test(snapshot);
+    let mut transaction = begin_serializable(pool).await;
+    let outcome = apply_product_pending_drain_in(&mut transaction, &canonical)
+        .await
+        .unwrap();
+    assert_eq!(outcome, "inserted");
+    transaction.commit().await.unwrap();
+}
+
+async fn apply_product_pending_drain_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    canonical: &automation_runtime_controller::RuntimeCanonicalProductDrainV2,
+) -> Result<String, sqlx::Error> {
     let product = canonical.product_preimage();
     let drain = canonical.drain_preimage();
-    let mut transaction = begin_serializable(pool).await;
-    let outcome = sqlx::query_scalar::<_, String>(PRODUCT_DRAIN_FIRST_APPLY_FOR_EPOCH_TEST)
+    sqlx::query_scalar::<_, String>(PRODUCT_DRAIN_FIRST_APPLY_FOR_EPOCH_TEST)
         .bind(product.operation_id.as_str())
         .bind(drain.key.intent_id.as_str())
         .bind(product.scope.tenant_id.as_str())
@@ -98,11 +109,8 @@ async fn install_product_apply_pending_drain(
         .bind(canonical.product_mutation_digest().as_str())
         .bind(canonical.drain_intent_request_bytes())
         .bind(canonical.drain_intent_digest().as_str())
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await
-        .unwrap();
-    assert_eq!(outcome, "inserted");
-    transaction.commit().await.unwrap();
 }
 
 async fn terminalize_product_apply_pending_deployment(
@@ -337,6 +345,122 @@ async fn pending_drain_preserves_replay_and_blocks_fresh_product_apply() {
             durable_before
         );
         fresh_transaction.rollback().await?;
+        assert_eq!(
+            product_pending_drain_state(&database.pool, &fixture).await,
+            pending_state
+        );
+        assert_eq!(
+            existing_runtime_product_state(&database.pool, &fixture).await,
+            durable_before
+        );
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn drain_first_apply_wins_slot_epoch_race_and_product_apply_retries_closed() {
+    let database = isolated_database("apply_epoch_race").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await?;
+        let fixture = seed_fixture(&database.pool).await;
+        let applied_operation = Operation::new("physical-epoch-race-seed");
+        let prepared = complete_apply(&database.pool, &fixture, &applied_operation).await;
+        assert_eq!(product_slot_writer_epoch(&database.pool, &fixture).await, 2);
+
+        let mut transition = database.pool.begin().await?;
+        set_existing_runtime_phase(
+            &mut transition,
+            &fixture,
+            &applied_operation.deployment_id,
+            "awaiting_gateway_ready",
+        )
+        .await?;
+        reopen_applied_activation(&mut transition, &fixture).await?;
+        transition.commit().await?;
+
+        let mut drain_snapshot = prepared.snapshot().clone();
+        drain_snapshot.revision =
+            automation_runtime_convergence::DeploymentRevision::new(2).unwrap();
+        drain_snapshot.phase =
+            automation_runtime_convergence::RuntimeDeploymentPhaseV1::AwaitingGatewayReady;
+        let canonical = product_apply_drain_for_epoch_test(&drain_snapshot);
+        let expected_intent_id = canonical.drain_preimage().key.intent_id.as_str().to_string();
+        let fresh_operation = Operation::new("physical-epoch-race-fresh");
+
+        let mut drain_transaction = begin_serializable(&database.pool).await;
+        let drain_outcome =
+            apply_product_pending_drain_in(&mut drain_transaction, &canonical).await?;
+        assert_eq!(drain_outcome, "inserted");
+        assert_eq!(
+            product_slot_writer_epoch_in(&mut drain_transaction, &fixture).await,
+            3
+        );
+
+        let (started_sender, started_receiver) = futures::channel::oneshot::channel();
+        let apply_pool = database.pool.clone();
+        let apply_fixture = fixture.clone();
+        let apply_operation = fresh_operation.clone();
+        let apply = tokio::spawn(async move {
+            let mut transaction = begin_serializable(&apply_pool).await;
+            let process_id = sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let _ = started_sender.send(process_id);
+            let mut call = Call::valid(&apply_fixture);
+            call.expected_revision = 4;
+            let result =
+                lock_apply(&mut transaction, &apply_fixture, &apply_operation, &call).await;
+            transaction.rollback().await?;
+            result
+        });
+
+        let process_id = started_receiver.await.unwrap();
+        wait_for_advisory_lock_wait(&database.pool, process_id).await;
+        assert_eq!(product_slot_writer_epoch(&database.pool, &fixture).await, 2);
+
+        drain_transaction.commit().await?;
+        let stale_error = apply
+            .await
+            .unwrap()
+            .expect_err("stale Product Apply must retry after drain first-apply commits");
+        assert!(is_serialization_failure(&stale_error));
+
+        let pending_state = product_pending_drain_state(&database.pool, &fixture).await;
+        assert_eq!(pending_state, (3, expected_intent_id, 1, 1));
+
+        terminalize_product_apply_pending_deployment(
+            &database.pool,
+            &fixture,
+            &applied_operation.deployment_id,
+        )
+        .await;
+        let durable_before = existing_runtime_product_state(&database.pool, &fixture).await;
+
+        let mut retry_transaction = begin_serializable(&database.pool).await;
+        let mut retry_call = Call::valid(&fixture);
+        retry_call.expected_revision = 4;
+        let blocked = lock_apply(
+            &mut retry_transaction,
+            &fixture,
+            &fresh_operation,
+            &retry_call,
+        )
+        .await?;
+        assert_closed_apply_result(&blocked, "runtime_drain_required");
+        assert_eq!(
+            product_slot_writer_epoch_in(&mut retry_transaction, &fixture).await,
+            3
+        );
+        assert_eq!(
+            existing_runtime_product_state_in(&mut retry_transaction, &fixture).await,
+            durable_before
+        );
+        retry_transaction.rollback().await?;
+
         assert_eq!(
             product_pending_drain_state(&database.pool, &fixture).await,
             pending_state

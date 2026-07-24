@@ -1605,12 +1605,24 @@ fn source_files_contain_no_comments() {
             include_str!("postgres_product_apply/security_concurrency.rs"),
         ),
         (
+            "tests/postgres_product_apply/product_apply_serving_slot.rs",
+            include_str!("postgres_product_apply/product_apply_serving_slot.rs"),
+        ),
+        (
+            "tests/postgres_product_apply/product_apply_physical_epoch.rs",
+            include_str!("postgres_product_apply/product_apply_physical_epoch.rs"),
+        ),
+        (
             "tests/postgres_product_apply/migration_security.rs",
             include_str!("postgres_product_apply/migration_security.rs"),
         ),
         (
             "tests/product_apply_writer_fence_migration_guard.rs",
             include_str!("product_apply_writer_fence_migration_guard.rs"),
+        ),
+        (
+            "tests/product_apply_slot_writer_epoch_migration_guard.rs",
+            include_str!("product_apply_slot_writer_epoch_migration_guard.rs"),
         ),
         (
             "tests/postgres_product_control_e2e.rs",
