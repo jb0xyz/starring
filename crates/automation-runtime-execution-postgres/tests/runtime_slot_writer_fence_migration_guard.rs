@@ -29,7 +29,7 @@ const SERVING_READINESS_DIGEST: &str =
 const MIGRATION_READINESS_DIGEST: &str =
     "48a10f783603fe02879f2a1cddbecbb39541ac0ca154c77f7b1e0eef8d9f6834";
 const CURRENT_READINESS_DIGEST: &str =
-    "17fdc258083036bc6f6faceee4dbd900f166ce15f711e99ea87e60ae03e3aa31";
+    "b5362bc1b081789a5b3ac4881fc2ea00c340a013630f7d5c809958ed1c045ec3";
 
 fn function_section(marker: &str) -> &'static str {
     MIGRATION

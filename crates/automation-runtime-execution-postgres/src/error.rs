@@ -129,6 +129,7 @@ fn map_operation_sqlstate(code: &str) -> Option<RuntimeExecutionPersistenceError
         "RX004" => Some(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt),
         "RX005" => Some(RuntimeExecutionPersistenceErrorV1::RetryNotReady),
         "RX006" => Some(RuntimeExecutionPersistenceErrorV1::Superseded),
+        "RX007" => Some(RuntimeExecutionPersistenceErrorV1::RetryNotReady),
         "55P03" | "57014" => Some(RuntimeExecutionPersistenceErrorV1::Timeout),
         "40001" | "40P01" => Some(RuntimeExecutionPersistenceErrorV1::Concurrency),
         "53300" | "57P01" | "57P02" | "57P03" => {
@@ -158,11 +159,12 @@ mod tests {
             ),
             ("RX005", RuntimeExecutionPersistenceErrorV1::RetryNotReady),
             ("RX006", RuntimeExecutionPersistenceErrorV1::Superseded),
+            ("RX007", RuntimeExecutionPersistenceErrorV1::RetryNotReady),
         ];
         for (code, error) in expected {
             assert_eq!(map_operation_sqlstate(code), Some(error));
         }
-        for code in ["RE001", "RX007", "XX000"] {
+        for code in ["RE001", "RX008", "XX000"] {
             assert_eq!(map_operation_sqlstate(code), None);
         }
     }
