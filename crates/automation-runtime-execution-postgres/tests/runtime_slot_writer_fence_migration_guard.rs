@@ -26,7 +26,10 @@ const EXACT_TARGET_READINESS_DIGEST: &str =
     "e4bae4b38acc529accd4401af853eb7e96d2a34ad8fb1224b9965166ff40c229";
 const SERVING_READINESS_DIGEST: &str =
     "1c0c79c6fbf528f28fb56e91a54b78cd1fe17c70d2bc3e8d7e3dc515d8a7f8f7";
-const READINESS_DIGEST: &str = "48a10f783603fe02879f2a1cddbecbb39541ac0ca154c77f7b1e0eef8d9f6834";
+const MIGRATION_READINESS_DIGEST: &str =
+    "48a10f783603fe02879f2a1cddbecbb39541ac0ca154c77f7b1e0eef8d9f6834";
+const CURRENT_READINESS_DIGEST: &str =
+    "17fdc258083036bc6f6faceee4dbd900f166ce15f711e99ea87e60ae03e3aa31";
 
 fn function_section(marker: &str) -> &'static str {
     MIGRATION
@@ -546,7 +549,7 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
         "RETURN observed_count = 623",
         "ce1e493041abc52b6f4073da976a99b547b32a92d7ff171b64eef791354ff491",
         "223a7d5a5aba3e418ed310c4cffa8271193af158f12729f74ad85be97123c292",
-        READINESS_DIGEST,
+        MIGRATION_READINESS_DIGEST,
         "356::BIGINT",
         "ca4d76873d9256406baaad080943a78b7a6eeeae409ad67e8dc896f0a237642a",
         "5fe0365d0cb4912a01778f3d30a2d649a40e82c5b964ba9e2e7e1901e79eb109",
@@ -584,7 +587,7 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
         assert!(!MIGRATION.contains(placeholder), "{placeholder}");
     }
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(READINESS_DIGEST));
+        assert!(source.contains(CURRENT_READINESS_DIGEST));
         assert!(
             !source.contains("3e2d46d692daf8bd9cff68f00459f00f6b8bf314378a663727b94493d7e45279")
         );
@@ -597,7 +600,7 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
 '223a7d5a5aba3e418ed310c4cffa8271193af158f12729f74ad85be97123c292'"
     ));
     assert!(postflight.contains(&format!(
-        "readiness_digest\n            <> '{READINESS_DIGEST}'"
+        "readiness_digest\n            <> '{MIGRATION_READINESS_DIGEST}'"
     )));
     assert!(postflight.contains("installation_count <> fence_count"));
     assert!(postflight.contains("unmatched_installation_count <> 0"));
