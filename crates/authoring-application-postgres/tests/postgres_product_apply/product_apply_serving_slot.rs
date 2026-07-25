@@ -641,15 +641,26 @@ async fn concurrent_first_product_insert_returns_serialization_failure() {
             .await?;
             assert_eq!(snapshot_revision, 2);
             let _ = started_sender.send(process_id);
-            let locked = lock_apply(
+            let locked = match lock_apply(
                 &mut transaction,
                 &second_task_fixture,
                 &second_task_operation,
                 &second_call,
             )
-            .await?;
-            let lock_outcome = locked.outcome.clone();
-            assert_eq!(lock_outcome, "ready");
+            .await
+            {
+                Ok(locked) => locked,
+                Err(error) => {
+                    let error_code = error
+                        .as_database_error()
+                        .and_then(|database_error| database_error.code())
+                        .expect("stale first lock must return a PostgreSQL code")
+                        .into_owned();
+                    transaction.rollback().await?;
+                    return Ok::<_, sqlx::Error>(error_code);
+                }
+            };
+            assert_eq!(locked.outcome, "ready");
             let prepared = prepare_requested_deployment(&locked);
             let error = finalize_apply(
                 &mut transaction,
@@ -671,7 +682,7 @@ async fn concurrent_first_product_insert_returns_serialization_failure() {
                 .expect("stale first insert must return a PostgreSQL code")
                 .into_owned();
             transaction.rollback().await?;
-            Ok::<_, sqlx::Error>((lock_outcome, error_code))
+            Ok::<_, sqlx::Error>(error_code)
         });
 
         let second_process_id = started_receiver.await.unwrap();
@@ -694,8 +705,7 @@ async fn concurrent_first_product_insert_returns_serialization_failure() {
         assert_eq!(first_finalized.resulting_state.as_deref(), Some("applied"));
         first.commit().await?;
 
-        let (second_lock_outcome, second_error_code) = second.await.unwrap()?;
-        assert_eq!(second_lock_outcome, "ready");
+        let second_error_code = second.await.unwrap()?;
         assert_eq!(second_error_code, "40001");
         assert_ne!(second_error_code, "23505");
 
