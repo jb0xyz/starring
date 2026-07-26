@@ -3,6 +3,7 @@ use std::future::{ready, Future};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
@@ -67,6 +68,7 @@ struct FakePortStateV1 {
     receipt: Mutex<RuntimeGatewayOwnerLeaseReceiptV1>,
     observation_steps: Mutex<VecDeque<FakeObservationStepV1>>,
     renew_steps: Mutex<VecDeque<FakeRenewStepV1>>,
+    release_gate: Mutex<Option<Arc<Notify>>>,
     acquire_calls: AtomicUsize,
     observe_calls: AtomicUsize,
     renew_calls: AtomicUsize,
@@ -85,6 +87,7 @@ impl FakePortV1 {
                 receipt: Mutex::new(receipt),
                 observation_steps: Mutex::new(VecDeque::new()),
                 renew_steps: Mutex::new(renew_steps.into_iter().collect()),
+                release_gate: Mutex::new(None),
                 acquire_calls: AtomicUsize::new(0),
                 observe_calls: AtomicUsize::new(0),
                 renew_calls: AtomicUsize::new(0),
@@ -115,6 +118,18 @@ impl FakePortV1 {
         self.state.maximum_active_operations.load(Ordering::Acquire)
     }
 
+    fn active_operations(&self) -> usize {
+        self.state.active_operations.load(Ordering::Acquire)
+    }
+
+    fn block_release(&self, gate: Arc<Notify>) {
+        *self
+            .state
+            .release_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+    }
+
     fn block_next_observation(&self, gate: Arc<Notify>) {
         *self
             .state
@@ -135,6 +150,20 @@ impl FakePortV1 {
 
 struct FakeOperationGuardV1 {
     state: Arc<FakePortStateV1>,
+}
+
+struct WakeCounterV1 {
+    wakes: AtomicUsize,
+}
+
+impl Wake for WakeCounterV1 {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl FakeOperationGuardV1 {
@@ -272,11 +301,23 @@ impl RuntimeGatewayOwnerLeasePortV1 for FakePortV1 {
             RuntimeGatewayOwnerMutationErrorV1<Self::Error>,
         >,
     > + Send {
-        self.state.release_calls.fetch_add(1, Ordering::AcqRel);
-        ready(Ok(RuntimeReleaseGatewayOwnerLeaseOutcomeV1::Released {
-            lease_id: request.lease_id,
-            database_now: at_millis(1_000_002),
-        }))
+        let state = self.state.clone();
+        async move {
+            state.release_calls.fetch_add(1, Ordering::AcqRel);
+            let _guard = FakeOperationGuardV1::begin(state.clone());
+            let gate = state
+                .release_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(RuntimeReleaseGatewayOwnerLeaseOutcomeV1::Released {
+                lease_id: request.lease_id,
+                database_now: at_millis(1_000_002),
+            })
+        }
     }
 }
 
@@ -500,6 +541,20 @@ fn fixture(
     FakePortV1,
     Arc<AtomicBool>,
 ) {
+    fixture_with_startup_cleanup_deadline(lease_for, renew_before, safety_margin, renew_steps, None)
+}
+
+fn fixture_with_startup_cleanup_deadline(
+    lease_for: Duration,
+    renew_before: Duration,
+    safety_margin: Duration,
+    renew_steps: impl IntoIterator<Item = FakeRenewStepV1>,
+    startup_cleanup_deadline: Option<Instant>,
+) -> (
+    RuntimeGatewayOwnerStartupWatchdogHandleV1,
+    FakePortV1,
+    Arc<AtomicBool>,
+) {
     let receipt = receipt(lease_for);
     let port = FakePortV1::new(receipt.clone(), renew_steps);
     let invalidated = Arc::new(AtomicBool::new(false));
@@ -520,9 +575,12 @@ fn fixture(
         invalidator,
         invalidated.clone(),
         accepted_receipt(receipt),
-        started,
-        started,
         config,
+        RuntimeGatewayOwnerStartupWatchdogStartContextV1::new(
+            started,
+            started,
+            startup_cleanup_deadline,
+        ),
     )
     .unwrap();
     (handle, port, invalidated)
@@ -2072,6 +2130,54 @@ async fn production_handoff_keeps_one_actor_and_contiguous_owner_revision() {
 }
 
 #[tokio::test]
+async fn canceled_after_promotion_ack_retains_the_startup_cleanup_cap() {
+    let cleanup_deadline = Instant::now() + Duration::from_millis(300);
+    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
+        Duration::from_secs(1),
+        Duration::from_millis(400),
+        Duration::from_millis(100),
+        [],
+        Some(cleanup_deadline),
+    );
+    port.block_release(Arc::new(Notify::new()));
+    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
+    let wake_counter = Arc::new(WakeCounterV1 {
+        wakes: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(wake_counter.clone());
+    let mut context = Context::from_waker(&waker);
+
+    assert!(matches!(handoff.as_mut().poll(&mut context), Poll::Pending));
+    wait_for(|| wake_counter.wakes.load(Ordering::Acquire) != 0).await;
+
+    drop(handoff);
+
+    wait_for(|| port.release_calls() == 1).await;
+    wait_for(|| port.active_operations() == 0).await;
+    assert!(Instant::now() <= cleanup_deadline + Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn completed_production_handoff_clears_the_startup_cleanup_cap() {
+    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
+        Duration::from_secs(1),
+        Duration::from_millis(400),
+        Duration::from_millis(100),
+        [],
+        Some(Instant::now() + Duration::from_millis(300)),
+    );
+    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
+
+    sleep(Duration::from_millis(350)).await;
+
+    assert_eq!(
+        production.shutdown().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
 async fn handoff_queued_behind_renewal_receives_the_exact_successor() {
     let gate = Arc::new(Notify::new());
     let (handle, port, invalidated) = fixture(
@@ -2265,6 +2371,7 @@ async fn shutdown_queued_with_handoff_wins_before_production_transition() {
         .shutdown_commands
         .send(RuntimeGatewayOwnerStartupShutdownCommandV1 {
             response: shutdown_response,
+            cleanup_deadline: None,
         })
         .await
         .unwrap();

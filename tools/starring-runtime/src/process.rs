@@ -18,6 +18,14 @@ use crate::{
     RuntimeRegistryBootstrapV1,
 };
 
+mod owner;
+
+pub(crate) use owner::RuntimeOwnerHeldProcessV1;
+pub use owner::{
+    RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
+    RuntimeProcessGatewayOwnerTransitionErrorV1,
+};
+
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeProcessFoundationCompositionErrorV1 {
     #[error("runtime process foundation instance identity generation failed")]

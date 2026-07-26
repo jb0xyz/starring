@@ -4,6 +4,7 @@ mod config;
 mod controller_identity;
 mod database;
 mod gateway;
+mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
 mod identity_encoding;
 mod process;
@@ -28,6 +29,7 @@ pub use gateway::{
     compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,
     RuntimeGatewayBootstrapV1, RuntimeGatewayReadyObservationErrorV1,
 };
+pub use gateway_owner_startup::RuntimeGatewayOwnerStartupAcquisitionErrorV1;
 pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerCurrentObservationErrorV1, RuntimeGatewayOwnerCurrentObservationV1,
     RuntimeGatewayOwnerReleaseStatusV1, RuntimeGatewayOwnerStartupWatchdogConfigErrorV1,
@@ -35,11 +37,14 @@ pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
 };
-pub use process::RuntimeProcessFoundationCompositionErrorV1;
+pub use process::{
+    RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
+    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerTransitionErrorV1,
+};
 pub use process_identity::RuntimeProcessInstanceIdGenerationErrorV1;
 pub use process_startup::{
-    run_runtime_process_foundation_staging_from_environment_v1,
-    RuntimeProcessFoundationStagingErrorV1, RuntimeProcessFoundationStagingOutcomeV1,
+    run_runtime_process_staging_from_environment_v1, RuntimeProcessStagingErrorV1,
+    RuntimeProcessStagingOutcomeV1,
 };
 pub use registry::{
     compose_runtime_registry_bootstrap_v1, RuntimeRegistryBootstrapErrorV1,

@@ -13,8 +13,8 @@ use automation_runtime::{
     SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
-    RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
-    RuntimeRecoveryIdV2,
+    GatewayShardIdV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2,
+    RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
@@ -37,7 +37,7 @@ use crate::gateway_owner_startup_watchdog::{
     start_runtime_gateway_owner_startup_watchdog_v1,
     RuntimeGatewayOwnerClosedRecoveryCommitErrorV2, RuntimeGatewayOwnerClosedRecoverySupervisorV2,
     RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
-    RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
 use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
 use crate::{
@@ -47,6 +47,10 @@ use crate::{
 };
 
 const SUPPORTED_GATEWAY_SHARD_ID: &str = "shard:0";
+
+pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1 {
+    GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID).expect("supported gateway shard identity")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeGatewayBootstrapErrorV1 {
@@ -357,6 +361,58 @@ impl RuntimeGatewayBootstrapV1 {
         P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
         P::Error: Send + 'static,
     {
+        self.start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1(
+            port,
+            accepted_receipt,
+            request_started_at,
+            response_observed_at,
+            config,
+            None,
+        )
+    }
+
+    pub(crate) fn start_bounded_gateway_owner_startup_watchdog_v1<P>(
+        &mut self,
+        port: P,
+        accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogHandleV1,
+        RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
+    >
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
+        P::Error: Send + 'static,
+    {
+        self.start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1(
+            port,
+            accepted_receipt,
+            request_started_at,
+            response_observed_at,
+            config,
+            Some(cleanup_deadline),
+        )
+    }
+
+    fn start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1<P>(
+        &mut self,
+        port: P,
+        accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+        cleanup_deadline: Option<Instant>,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogHandleV1,
+        RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
+    >
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
+        P::Error: Send + 'static,
+    {
         let lease_id = accepted_receipt.receipt().lease_id.clone();
         let Some(invalidator) = self.owner_invalidator.take() else {
             invalidate_gateway_owner_state(&self.adapter.closed_lifecycle, &self.owner_invalidated);
@@ -395,9 +451,12 @@ impl RuntimeGatewayBootstrapV1 {
             invalidator,
             self.owner_invalidated.clone(),
             accepted_receipt,
-            request_started_at,
-            response_observed_at,
             config,
+            RuntimeGatewayOwnerStartupWatchdogStartContextV1::new(
+                request_started_at,
+                response_observed_at,
+                cleanup_deadline,
+            ),
         )
     }
 

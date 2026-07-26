@@ -417,6 +417,19 @@ impl GatewayOwnerTimingConfigV1 {
     pub fn safety_margin(self) -> Duration {
         self.safety_margin
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test_v1(
+        lease_for: Duration,
+        renew_before: Duration,
+        safety_margin: Duration,
+    ) -> Self {
+        Self {
+            lease_for,
+            renew_before,
+            safety_margin,
+        }
+    }
 }
 
 #[derive(Clone)]

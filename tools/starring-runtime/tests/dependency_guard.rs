@@ -480,11 +480,13 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/controller_identity.rs",
             "src/database.rs",
             "src/gateway.rs",
+            "src/gateway_owner_startup.rs",
             "src/gateway_owner_startup_watchdog.rs",
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/process/owner.rs",
             "src/process.rs",
             "src/process_identity.rs",
             "src/process_startup.rs",
@@ -578,6 +580,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         }
         if path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
+            && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/process_startup.rs")
@@ -748,7 +751,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         if path == Path::new("src/gateway.rs") {
             continue;
         }
-        if path == Path::new("src/gateway_owner_startup_watchdog.rs")
+        if path == Path::new("src/gateway_owner_startup.rs")
+            || path == Path::new("src/gateway_owner_startup_watchdog.rs")
             || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
         {
             for identifier in source
@@ -2377,7 +2381,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
 }
 
 #[test]
-fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
+fn process_startup_is_the_single_ordered_bounded_owner_staging_entry() {
     let sources = source_files();
     let process_startup = sources
         .iter()
@@ -2387,11 +2391,11 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
     let production = source_before_test_module(process_startup);
     let entry = braced_declaration(
         production,
-        "pub fn run_runtime_process_foundation_staging_from_environment_v1(",
+        "pub fn run_runtime_process_staging_from_environment_v1(",
     );
     let staging = braced_declaration(
         production,
-        "async fn stage_runtime_process_foundation_from_environment_v1(",
+        "async fn stage_runtime_process_from_environment_v1(",
     );
     let config = staging
         .find("RuntimeConfigV1::from_process_environment")
@@ -2403,15 +2407,15 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
     let foundation = staging
         .find("compose_runtime_process_foundation_v1")
         .unwrap();
+    let owner = staging.find(".into_owner_held_v1()").unwrap();
     let shutdown = staging.find(".shutdown()").unwrap();
-    let outcome = staging
-        .find("Ok(RuntimeProcessFoundationStagingOutcomeV1")
-        .unwrap();
+    let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
         config < secrets
             && secrets < revision
             && revision < foundation
-            && foundation < shutdown
+            && foundation < owner
+            && owner < shutdown
             && shutdown < outcome
     );
     assert_eq!(
@@ -2425,6 +2429,7 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         "resolve_runtime_secrets_until_v1",
         "bootstrap_compiled_runtime_build_revision_v1",
         "compose_runtime_process_foundation_v1",
+        ".into_owner_held_v1()",
         ".shutdown()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -2442,7 +2447,7 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         .find("tokio::runtime::Builder::new_current_thread()")
         .unwrap();
     let block_on = entry
-        .find("runtime.block_on(stage_runtime_process_foundation_from_environment_v1(")
+        .find("runtime.block_on(stage_runtime_process_from_environment_v1(")
         .unwrap();
     assert!(
         budget < active_runtime
@@ -2452,7 +2457,7 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
     );
     assert_eq!(
         entry
-            .matches("stage_runtime_process_foundation_from_environment_v1(")
+            .matches("stage_runtime_process_from_environment_v1(")
             .count(),
         1
     );
@@ -2461,9 +2466,9 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         "tokio::runtime::Builder::new_current_thread()",
         ".enable_all()",
         ".build()",
-        "runtime.block_on(stage_runtime_process_foundation_from_environment_v1(",
-        "RuntimeProcessFoundationStagingErrorV1(<redacted>)",
-        "RuntimeProcessFoundationStagingOutcomeV1(<redacted>)",
+        "runtime.block_on(stage_runtime_process_from_environment_v1(",
+        "RuntimeProcessStagingErrorV1(<redacted>)",
+        "RuntimeProcessStagingOutcomeV1(<redacted>)",
         "pub const fn code(self) -> &'static str",
         "pub const fn context(self) -> Option<&'static str>",
         "pub const fn configuration_class(self) -> bool",
@@ -2474,7 +2479,7 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         "tokio::runtime::Handle::try_current()",
         "tokio::runtime::Builder::new_current_thread()",
         ".build()",
-        "runtime.block_on(stage_runtime_process_foundation_from_environment_v1(",
+        "runtime.block_on(stage_runtime_process_from_environment_v1(",
     ] {
         assert_eq!(entry.matches(operation).count(), 1, "{operation}");
     }
@@ -2505,11 +2510,9 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         assert!(!production.contains(forbidden), "{forbidden}");
     }
     let outcome_attributes =
-        declaration_attribute_block(production, "RuntimeProcessFoundationStagingOutcomeV1");
-    let outcome_declaration = braced_declaration(
-        production,
-        "pub struct RuntimeProcessFoundationStagingOutcomeV1",
-    );
+        declaration_attribute_block(production, "RuntimeProcessStagingOutcomeV1");
+    let outcome_declaration =
+        braced_declaration(production, "pub struct RuntimeProcessStagingOutcomeV1");
     assert!(outcome_declaration.contains("_private: ()"));
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
         assert!(
@@ -2518,15 +2521,15 @@ fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
         );
         assert!(!implements_trait(
             production,
-            "RuntimeProcessFoundationStagingOutcomeV1",
+            "RuntimeProcessStagingOutcomeV1",
             forbidden,
         ));
     }
     let library = include_str!("../src/lib.rs");
     for required in [
-        "run_runtime_process_foundation_staging_from_environment_v1",
-        "RuntimeProcessFoundationStagingErrorV1",
-        "RuntimeProcessFoundationStagingOutcomeV1",
+        "run_runtime_process_staging_from_environment_v1",
+        "RuntimeProcessStagingErrorV1",
+        "RuntimeProcessStagingOutcomeV1",
     ] {
         assert_eq!(library.matches(required).count(), 1, "{required}");
     }
@@ -2550,7 +2553,7 @@ fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     let entry = braced_declaration(main, "fn main() -> ExitCode");
     assert_eq!(
         entry
-            .matches("run_runtime_process_foundation_staging_from_environment_v1()")
+            .matches("run_runtime_process_staging_from_environment_v1()")
             .count(),
         1
     );
@@ -2585,6 +2588,222 @@ fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     ] {
         assert!(!main.contains(forbidden), "{forbidden}");
     }
+}
+
+#[test]
+fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
+    let acquisition = source_before_test_module(include_str!("../src/gateway_owner_startup.rs"));
+    let watchdog = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct RuntimeAcquiredGatewayOwnerV1",
+        "watchdog: RuntimeGatewayOwnerStartupWatchdogHandleV1,",
+        "current_observation: RuntimeGatewayOwnerCurrentObservationV1,",
+        "let request = RuntimeAcquireGatewayOwnerLeaseV1 {",
+        "gateway_shard_id: runtime_gateway_shard_id_v1(),",
+        "process_instance_id: process_instance_id.clone(),",
+        "expected_build_revision: build_revision.clone(),",
+        "lease_for: config.lease_for(),",
+        "accept_gateway_owner_acquire_v1(request, outcome)",
+        "accept_gateway_owner_observation_v1(&observation_request, observation)",
+        "classify_unknown_gateway_owner_acquire_v1(request, observation)",
+        ".start_bounded_gateway_owner_startup_watchdog_v1(",
+        "cleanup_deadline,",
+        ".observe_current_gateway_owner_v1()",
+        "release_runtime_gateway_owner_until_v1(",
+        "shutdown_until(cleanup_deadline)",
+        "RuntimeGatewayOwnerStartupAcquisitionErrorV1(<redacted>)",
+        "RuntimeAcquiredGatewayOwnerV1(<redacted>)",
+    ] {
+        assert!(acquisition.contains(required), "{required}");
+    }
+    assert_eq!(acquisition.matches(".acquire_gateway_owner(").count(), 1);
+    assert_eq!(
+        acquisition.matches("acquire_gateway_owner_once_v1").count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches("acquire_gateway_owner_second_v1")
+            .count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches("resolve_unknown_gateway_owner_acquire_v1")
+            .count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches(".start_bounded_gateway_owner_startup_watchdog_v1(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        acquisition
+            .matches(".observe_current_gateway_owner_v1()")
+            .count(),
+        1
+    );
+    assert!(!acquisition.contains("\"shard:0\""));
+    for forbidden in [
+        "loop {",
+        "while ",
+        "tokio::spawn",
+        "spawn_blocking",
+        "ready_to_serve",
+        "readiness",
+        "issue_ready_lease",
+        "resume",
+        "Discord",
+        "twilight",
+        "activate",
+        "deploy",
+        "into_production",
+        "promote_to_production_v1",
+        "start_gateway_owner_production",
+        "prepare_closed_recovery",
+        "observe_paused_connected_gateway_v2",
+        "TcpListener",
+        ".bind(",
+        ".listen(",
+        ".serve(",
+    ] {
+        assert!(!acquisition.contains(forbidden), "{forbidden}");
+        assert!(!owner.contains(forbidden), "{forbidden}");
+    }
+    let acquired_attributes =
+        declaration_attribute_block(acquisition, "RuntimeAcquiredGatewayOwnerV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(acquired_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            acquisition,
+            "RuntimeAcquiredGatewayOwnerV1",
+            forbidden,
+        ));
+    }
+    assert!(!acquisition.contains("pub struct RuntimeAcquiredGatewayOwnerV1"));
+
+    for required in [
+        "const SUPPORTED_GATEWAY_SHARD_ID: &str = \"shard:0\";",
+        "pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1",
+        "GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID)",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+
+    for required in [
+        "pub(crate) struct RuntimeOwnerHeldProcessV1",
+        "foundation: RuntimeProcessFoundationV1,",
+        "owner: RuntimeAcquiredGatewayOwnerV1,",
+        "impl RuntimeProcessFoundationV1",
+        "pub(crate) async fn into_owner_held_v1(",
+        "acquire_runtime_gateway_owner_startup_v1(",
+        "self.startup_budget.operation_cutoff()",
+        "self.startup_budget.cleanup_deadline()",
+        "RuntimeOwnerHeldProcessV1(<redacted>)",
+        "RuntimeProcessGatewayOwnerTransitionErrorV1(<redacted>)",
+        "RuntimeOwnerHeldProcessShutdownErrorV1(<redacted>)",
+    ] {
+        assert!(owner.contains(required), "{required}");
+    }
+    assert_eq!(
+        owner
+            .matches("acquire_runtime_gateway_owner_startup_v1(")
+            .count(),
+        1
+    );
+    let owner_attributes = declaration_attribute_block(owner, "RuntimeOwnerHeldProcessV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(owner_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            owner,
+            "RuntimeOwnerHeldProcessV1",
+            forbidden,
+        ));
+    }
+    let shutdown = braced_declaration(
+        owner,
+        "pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1>",
+    );
+    let owner_release = shutdown
+        .find("owner.shutdown_until(cleanup_deadline)")
+        .unwrap();
+    let database_close = shutdown.find("foundation.shutdown().await").unwrap();
+    assert!(owner_release < database_close);
+    assert!(!owner.contains("pub struct RuntimeOwnerHeldProcessV1"));
+    assert!(!library.contains("RuntimeOwnerHeldProcessV1"));
+
+    for required in [
+        "deadline_cap: Option<Instant>,",
+        ".map_or(relative, |cap| relative.min(cap))",
+        "fn capped_at(mut self, deadline_cap: Instant) -> Self",
+        "pub(crate) async fn cleanup_until(",
+        "pub(crate) async fn shutdown_until(",
+        "pub(crate) async fn release_runtime_gateway_owner_until_v1",
+        "RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed",
+        "const STARTUP_ACTOR_TERMINATION_RESERVE:",
+        "const STARTUP_TASK_ABORT_RESERVE:",
+        "task: Option<tokio::task::JoinHandle<()>>,",
+        "let task = runtime.spawn(async move",
+        "self.join_task_until(cleanup_deadline)",
+        "self.abort_and_join_task().await",
+        "cleanup_deadline: Option<Instant>,",
+        "self.request_shutdown(Some(actor_cleanup_deadline))",
+        "cleanup = cleanup.capped_at(cleanup_deadline);",
+        "struct RuntimeGatewayOwnerStartupCleanupCapV1",
+        "initial_startup_cleanup_deadline: Option<Instant>,",
+        "RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline)",
+        "startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,",
+        "startup_cleanup_cap.limit(stop.cleanup_deadline)",
+        "self.inner().clear_startup_cleanup_deadline();",
+    ] {
+        assert!(watchdog.contains(required), "{required}");
+    }
+    let stop = braced_declaration(watchdog, "impl RuntimeGatewayOwnerStartupWatchdogStopV1");
+    assert!(stop.contains("cleanup_deadline: cleanup.deadline()"));
+    assert_eq!(
+        watchdog
+            .matches("startup_cleanup_cap.limit(stop.cleanup_deadline)")
+            .count(),
+        3
+    );
+    let production_handoff =
+        braced_declaration(watchdog, "pub(crate) async fn into_production_v1(");
+    let projection = production_handoff
+        .find("self.inner().promote_to_production_v1().await?")
+        .unwrap();
+    let clear = production_handoff
+        .find("self.inner().clear_startup_cleanup_deadline()")
+        .unwrap();
+    let transfer = production_handoff
+        .find("let inner = self.take_inner()")
+        .unwrap();
+    assert!(projection < clear && clear < transfer);
+    let watchdog_start = braced_declaration(
+        watchdog,
+        "pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1",
+    );
+    let initialized_cap = watchdog_start
+        .find("RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline)")
+        .unwrap();
+    let actor_spawn = watchdog_start
+        .find("let task = runtime.spawn(async move")
+        .unwrap();
+    assert!(initialized_cap < actor_spawn);
+    assert!(!watchdog.contains("with_startup_cleanup_deadline"));
+    assert!(!watchdog.contains("fn install_startup_cleanup_deadline"));
+    assert!(!watchdog.contains("cleanup_timeout"));
 }
 
 #[test]

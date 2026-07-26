@@ -2,7 +2,8 @@ use std::fmt::{Debug, Formatter};
 
 use crate::build_revision::bootstrap_compiled_runtime_build_revision_v1;
 use crate::process::{
-    compose_runtime_process_foundation_v1, RuntimeProcessFoundationCompositionErrorV1,
+    compose_runtime_process_foundation_v1, RuntimeOwnerHeldProcessShutdownErrorV1,
+    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerTransitionErrorV1,
 };
 use crate::secret::{resolve_runtime_secrets_until_v1, RuntimeSecretsStartupResolutionErrorV1};
 use crate::startup::{
@@ -10,11 +11,11 @@ use crate::startup::{
 };
 use crate::{
     RuntimeBuildRevisionBootstrapErrorV1, RuntimeConfigErrorV1, RuntimeConfigV1,
-    RuntimeDatabasePoolShutdownErrorV1, RuntimeSecretsResolutionErrorV1,
+    RuntimeSecretsResolutionErrorV1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RuntimeProcessFoundationStagingErrorV1 {
+pub enum RuntimeProcessStagingErrorV1 {
     #[error("runtime asynchronous executor is unavailable")]
     AsyncRuntimeUnavailable,
     #[error("runtime process startup operation deadline elapsed")]
@@ -27,11 +28,13 @@ pub enum RuntimeProcessFoundationStagingErrorV1 {
     BuildRevision(RuntimeBuildRevisionBootstrapErrorV1),
     #[error("runtime process foundation composition failed")]
     Foundation(RuntimeProcessFoundationCompositionErrorV1),
-    #[error("runtime process foundation shutdown failed")]
-    FoundationShutdown(RuntimeDatabasePoolShutdownErrorV1),
+    #[error("runtime process gateway owner transition failed")]
+    GatewayOwner(RuntimeProcessGatewayOwnerTransitionErrorV1),
+    #[error("runtime owner-held process shutdown failed")]
+    OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
 }
 
-impl RuntimeProcessFoundationStagingErrorV1 {
+impl RuntimeProcessStagingErrorV1 {
     pub const fn code(self) -> &'static str {
         match self {
             Self::AsyncRuntimeUnavailable => "runtime_async_runtime_unavailable",
@@ -40,9 +43,8 @@ impl RuntimeProcessFoundationStagingErrorV1 {
             Self::Secrets(error) => error.code(),
             Self::BuildRevision(error) => error.code(),
             Self::Foundation(error) => error.code(),
-            Self::FoundationShutdown(RuntimeDatabasePoolShutdownErrorV1::TimedOut) => {
-                "runtime_process_foundation_shutdown_timed_out"
-            }
+            Self::GatewayOwner(error) => error.code(),
+            Self::OwnerHeldShutdown(error) => error.code(),
         }
     }
 
@@ -55,9 +57,9 @@ impl RuntimeProcessFoundationStagingErrorV1 {
             Self::Secrets(error) => error.context(),
             Self::BuildRevision(error) => error.context(),
             Self::Foundation(error) => error.context(),
-            Self::AsyncRuntimeUnavailable
-            | Self::OperationDeadlineElapsed
-            | Self::FoundationShutdown(_) => None,
+            Self::GatewayOwner(error) => error.context(),
+            Self::OwnerHeldShutdown(error) => error.context(),
+            Self::AsyncRuntimeUnavailable | Self::OperationDeadlineElapsed => None,
         }
     }
 
@@ -69,27 +71,27 @@ impl RuntimeProcessFoundationStagingErrorV1 {
     }
 }
 
-impl Debug for RuntimeProcessFoundationStagingErrorV1 {
+impl Debug for RuntimeProcessStagingErrorV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RuntimeProcessFoundationStagingErrorV1(<redacted>)")
+        formatter.write_str("RuntimeProcessStagingErrorV1(<redacted>)")
     }
 }
 
-pub struct RuntimeProcessFoundationStagingOutcomeV1 {
+pub struct RuntimeProcessStagingOutcomeV1 {
     _private: (),
 }
 
-impl Debug for RuntimeProcessFoundationStagingOutcomeV1 {
+impl Debug for RuntimeProcessStagingOutcomeV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RuntimeProcessFoundationStagingOutcomeV1(<redacted>)")
+        formatter.write_str("RuntimeProcessStagingOutcomeV1(<redacted>)")
     }
 }
 
-pub fn run_runtime_process_foundation_staging_from_environment_v1(
-) -> Result<RuntimeProcessFoundationStagingOutcomeV1, RuntimeProcessFoundationStagingErrorV1> {
+pub fn run_runtime_process_staging_from_environment_v1(
+) -> Result<RuntimeProcessStagingOutcomeV1, RuntimeProcessStagingErrorV1> {
     let startup_budget = RuntimeStartupBudgetV1::begin();
     if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable);
+        return Err(RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable);
     }
     let runtime = run_runtime_startup_sync_stage_v1(
         || startup_budget.operation_is_open(),
@@ -97,25 +99,21 @@ pub fn run_runtime_process_foundation_staging_from_environment_v1(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|_| RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable)
+                .map_err(|_| RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable)
         },
     )
     .map_err(|error| map_sync_stage_error_v1(error, |error| error))?;
-    runtime.block_on(stage_runtime_process_foundation_from_environment_v1(
-        startup_budget,
-    ))
+    runtime.block_on(stage_runtime_process_from_environment_v1(startup_budget))
 }
 
-async fn stage_runtime_process_foundation_from_environment_v1(
+async fn stage_runtime_process_from_environment_v1(
     startup_budget: RuntimeStartupBudgetV1,
-) -> Result<RuntimeProcessFoundationStagingOutcomeV1, RuntimeProcessFoundationStagingErrorV1> {
+) -> Result<RuntimeProcessStagingOutcomeV1, RuntimeProcessStagingErrorV1> {
     let config = run_runtime_startup_sync_stage_v1(
         || startup_budget.operation_is_open(),
         RuntimeConfigV1::from_process_environment,
     )
-    .map_err(|error| {
-        map_sync_stage_error_v1(error, RuntimeProcessFoundationStagingErrorV1::Configuration)
-    })?;
+    .map_err(|error| map_sync_stage_error_v1(error, RuntimeProcessStagingErrorV1::Configuration))?;
     let secrets = run_runtime_startup_sync_stage_v1(
         || startup_budget.operation_is_open(),
         || resolve_runtime_secrets_until_v1(&config, &startup_budget),
@@ -123,10 +121,10 @@ async fn stage_runtime_process_foundation_from_environment_v1(
     .map_err(|error| {
         map_sync_stage_error_v1(error, |error| match error {
             RuntimeSecretsStartupResolutionErrorV1::OperationDeadlineElapsed => {
-                RuntimeProcessFoundationStagingErrorV1::OperationDeadlineElapsed
+                RuntimeProcessStagingErrorV1::OperationDeadlineElapsed
             }
             RuntimeSecretsStartupResolutionErrorV1::Resolution(error) => {
-                RuntimeProcessFoundationStagingErrorV1::Secrets(error)
+                RuntimeProcessStagingErrorV1::Secrets(error)
             }
         })
     })?;
@@ -134,27 +132,29 @@ async fn stage_runtime_process_foundation_from_environment_v1(
         || startup_budget.operation_is_open(),
         bootstrap_compiled_runtime_build_revision_v1,
     )
-    .map_err(|error| {
-        map_sync_stage_error_v1(error, RuntimeProcessFoundationStagingErrorV1::BuildRevision)
-    })?;
+    .map_err(|error| map_sync_stage_error_v1(error, RuntimeProcessStagingErrorV1::BuildRevision))?;
     let foundation =
         compose_runtime_process_foundation_v1(startup_budget, config, secrets, build_revision)
             .await
-            .map_err(RuntimeProcessFoundationStagingErrorV1::Foundation)?;
-    foundation
+            .map_err(RuntimeProcessStagingErrorV1::Foundation)?;
+    let owner_held: crate::process::RuntimeOwnerHeldProcessV1 = foundation
+        .into_owner_held_v1()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::GatewayOwner)?;
+    owner_held
         .shutdown()
         .await
-        .map_err(RuntimeProcessFoundationStagingErrorV1::FoundationShutdown)?;
-    Ok(RuntimeProcessFoundationStagingOutcomeV1 { _private: () })
+        .map_err(RuntimeProcessStagingErrorV1::OwnerHeldShutdown)?;
+    Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 
 fn map_sync_stage_error_v1<E>(
     error: RuntimeStartupSyncStageErrorV1<E>,
-    map_error: impl FnOnce(E) -> RuntimeProcessFoundationStagingErrorV1,
-) -> RuntimeProcessFoundationStagingErrorV1 {
+    map_error: impl FnOnce(E) -> RuntimeProcessStagingErrorV1,
+) -> RuntimeProcessStagingErrorV1 {
     match error {
         RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed => {
-            RuntimeProcessFoundationStagingErrorV1::OperationDeadlineElapsed
+            RuntimeProcessStagingErrorV1::OperationDeadlineElapsed
         }
         RuntimeStartupSyncStageErrorV1::Stage(error) => map_error(error),
     }
@@ -165,35 +165,37 @@ mod tests {
     use super::*;
     use crate::{
         DatabaseCapabilityV1, RuntimeConfigurationFieldV1, RuntimeDatabaseCompositionErrorV1,
+        RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayOwnerShutdownFailureV1,
         RuntimeSecretResolutionErrorV1,
     };
 
     #[test]
     fn public_errors_have_finite_codes_context_and_redacted_diagnostics() {
         let errors = [
-            RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable,
-            RuntimeProcessFoundationStagingErrorV1::OperationDeadlineElapsed,
-            RuntimeProcessFoundationStagingErrorV1::Configuration(RuntimeConfigErrorV1::Missing(
+            RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable,
+            RuntimeProcessStagingErrorV1::OperationDeadlineElapsed,
+            RuntimeProcessStagingErrorV1::Configuration(RuntimeConfigErrorV1::Missing(
                 RuntimeConfigurationFieldV1::HealthBindAddress,
             )),
-            RuntimeProcessFoundationStagingErrorV1::Secrets(
-                RuntimeSecretsResolutionErrorV1::Database {
-                    capability: DatabaseCapabilityV1::Panel,
-                    source: RuntimeSecretResolutionErrorV1::Missing,
-                },
-            ),
-            RuntimeProcessFoundationStagingErrorV1::BuildRevision(
+            RuntimeProcessStagingErrorV1::Secrets(RuntimeSecretsResolutionErrorV1::Database {
+                capability: DatabaseCapabilityV1::Panel,
+                source: RuntimeSecretResolutionErrorV1::Missing,
+            }),
+            RuntimeProcessStagingErrorV1::BuildRevision(
                 RuntimeBuildRevisionBootstrapErrorV1::Missing,
             ),
-            RuntimeProcessFoundationStagingErrorV1::Foundation(
+            RuntimeProcessStagingErrorV1::Foundation(
                 RuntimeProcessFoundationCompositionErrorV1::Database(
                     RuntimeDatabaseCompositionErrorV1::Unavailable {
                         capability: DatabaseCapabilityV1::Interaction,
                     },
                 ),
             ),
-            RuntimeProcessFoundationStagingErrorV1::FoundationShutdown(
-                RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+            RuntimeProcessStagingErrorV1::OwnerHeldShutdown(
+                RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwnerAndDatabase {
+                    owner: RuntimeGatewayOwnerShutdownFailureV1::DeadlineElapsed,
+                    database: RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+                },
             ),
         ];
 
@@ -211,14 +213,14 @@ mod tests {
         assert_eq!(errors[5].context(), Some("interaction"));
         assert_eq!(
             errors[6].code(),
-            "runtime_process_foundation_shutdown_timed_out"
+            "runtime_owner_held_process_gateway_owner_and_database_shutdown"
         );
         for error in errors {
             assert!(!error.code().is_empty());
             assert!(!error.to_string().is_empty());
             assert_eq!(
                 format!("{error:?}"),
-                "RuntimeProcessFoundationStagingErrorV1(<redacted>)"
+                "RuntimeProcessStagingErrorV1(<redacted>)"
             );
             assert!(std::error::Error::source(&error).is_none());
         }
@@ -226,23 +228,21 @@ mod tests {
 
     #[test]
     fn only_configuration_stages_use_the_configuration_exit_class() {
-        assert!(RuntimeProcessFoundationStagingErrorV1::Configuration(
+        assert!(RuntimeProcessStagingErrorV1::Configuration(
             RuntimeConfigErrorV1::AmbientDatabaseConfiguration,
         )
         .configuration_class());
-        assert!(RuntimeProcessFoundationStagingErrorV1::Secrets(
+        assert!(RuntimeProcessStagingErrorV1::Secrets(
             RuntimeSecretsResolutionErrorV1::DiscordBotToken {
                 source: RuntimeSecretResolutionErrorV1::Missing,
             },
         )
         .configuration_class());
-        assert!(RuntimeProcessFoundationStagingErrorV1::BuildRevision(
+        assert!(RuntimeProcessStagingErrorV1::BuildRevision(
             RuntimeBuildRevisionBootstrapErrorV1::Invalid,
         )
         .configuration_class());
-        assert!(
-            !RuntimeProcessFoundationStagingErrorV1::OperationDeadlineElapsed.configuration_class()
-        );
+        assert!(!RuntimeProcessStagingErrorV1::OperationDeadlineElapsed.configuration_class());
     }
 
     #[test]
@@ -252,22 +252,21 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = runtime
-            .block_on(async { run_runtime_process_foundation_staging_from_environment_v1() });
+        let result = runtime.block_on(async { run_runtime_process_staging_from_environment_v1() });
 
         assert!(matches!(
             result,
-            Err(RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable)
+            Err(RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable)
         ));
     }
 
     #[test]
     fn staging_outcome_has_no_serializable_or_diagnostic_payload() {
-        let outcome = RuntimeProcessFoundationStagingOutcomeV1 { _private: () };
+        let outcome = RuntimeProcessStagingOutcomeV1 { _private: () };
 
         assert_eq!(
             format!("{outcome:?}"),
-            "RuntimeProcessFoundationStagingOutcomeV1(<redacted>)"
+            "RuntimeProcessStagingOutcomeV1(<redacted>)"
         );
     }
 }
