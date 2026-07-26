@@ -6,6 +6,7 @@ mod gateway_owner_startup_watchdog;
 mod process;
 mod registry;
 mod secret;
+mod startup;
 
 pub use config::{
     DatabaseCapabilityV1, DatabaseOperationConfigV1, DatabasePoolConfigV1,
@@ -13,9 +14,8 @@ pub use config::{
     RuntimeConfigurationFieldV1, RuntimeSecretReferenceV1, RuntimeSecretReferencesV1,
 };
 pub use database::{
-    compose_runtime_database_dependencies_v1, RuntimeDatabaseCompositionErrorV1,
-    RuntimeDatabaseDependenciesV1, RuntimeDatabasePoolShutdownErrorV1,
-    RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,
+    RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
+    RuntimeDatabasePoolShutdownErrorV1, RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,
 };
 pub use gateway::{
     compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,
@@ -42,3 +42,4 @@ pub use secret::{
     RuntimeDatabaseSslModeV1, RuntimeDatabaseUrlSecretV1, RuntimeDiscordBotTokenV1,
     RuntimeSecretResolutionErrorV1, RuntimeSecretsResolutionErrorV1,
 };
+pub use startup::RuntimeStartupBudgetV1;

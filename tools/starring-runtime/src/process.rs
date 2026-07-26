@@ -2,12 +2,13 @@ use std::fmt::{Debug, Formatter};
 
 use automation_runtime_convergence::ProcessInstanceId;
 
+use crate::database::compose_runtime_database_dependencies_v1;
 use crate::{
-    compose_runtime_database_dependencies_v1, compose_runtime_gateway_bootstrap_v1,
-    compose_runtime_registry_bootstrap_v1, GatewayResourceConfigV1, ResolvedRuntimeSecretsV1,
-    RuntimeConfigV1, RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
+    compose_runtime_gateway_bootstrap_v1, compose_runtime_registry_bootstrap_v1,
+    GatewayResourceConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
+    RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
     RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayBootstrapErrorV1, RuntimeGatewayBootstrapV1,
-    RuntimeRegistryBootstrapErrorV1, RuntimeRegistryBootstrapV1,
+    RuntimeRegistryBootstrapErrorV1, RuntimeRegistryBootstrapV1, RuntimeStartupBudgetV1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -28,6 +29,12 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
         composition: RuntimeGatewayBootstrapErrorV1,
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
+    #[error("runtime process foundation startup operation deadline elapsed")]
+    OperationDeadlineElapsed,
+    #[error("runtime process foundation startup deadline cleanup failed")]
+    CleanupAfterOperationDeadline {
+        cleanup: RuntimeDatabasePoolShutdownErrorV1,
+    },
 }
 
 impl RuntimeProcessFoundationCompositionErrorV1 {
@@ -40,6 +47,12 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
                 "runtime_process_foundation_cleanup_after_registry"
             }
             Self::CleanupAfterGateway { .. } => "runtime_process_foundation_cleanup_after_gateway",
+            Self::OperationDeadlineElapsed => {
+                "runtime_process_foundation_operation_deadline_elapsed"
+            }
+            Self::CleanupAfterOperationDeadline { .. } => {
+                "runtime_process_foundation_cleanup_after_operation_deadline"
+            }
         }
     }
 
@@ -49,7 +62,9 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Registry(_)
             | Self::Gateway(_)
             | Self::CleanupAfterRegistry { .. }
-            | Self::CleanupAfterGateway { .. } => None,
+            | Self::CleanupAfterGateway { .. }
+            | Self::OperationDeadlineElapsed
+            | Self::CleanupAfterOperationDeadline { .. } => None,
         }
     }
 }
@@ -61,6 +76,7 @@ impl Debug for RuntimeProcessFoundationCompositionErrorV1 {
 }
 
 pub struct RuntimeProcessFoundationV1 {
+    startup_budget: RuntimeStartupBudgetV1,
     process_instance_id: ProcessInstanceId,
     databases: RuntimeDatabaseDependenciesV1,
     registry: RuntimeRegistryBootstrapV1,
@@ -72,22 +88,24 @@ impl RuntimeProcessFoundationV1 {
         &self.process_instance_id
     }
 
-    pub fn databases(&self) -> &RuntimeDatabaseDependenciesV1 {
-        &self.databases
-    }
-
-    pub fn registry(&self) -> &RuntimeRegistryBootstrapV1 {
-        &self.registry
-    }
-
-    pub fn gateway(&self) -> &RuntimeGatewayBootstrapV1 {
-        &self.gateway
-    }
-
     pub async fn shutdown(self) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
-        let shutdown = self.databases.shutdown();
-        drop(self);
-        shutdown.close().await
+        let Self {
+            startup_budget,
+            process_instance_id,
+            databases,
+            registry,
+            gateway,
+        } = self;
+        let cleanup_deadline = startup_budget.cleanup_deadline();
+        let shutdown = databases.shutdown();
+        drop((
+            startup_budget,
+            process_instance_id,
+            databases,
+            registry,
+            gateway,
+        ));
+        shutdown.close_until(cleanup_deadline).await
     }
 }
 
@@ -98,28 +116,58 @@ impl Debug for RuntimeProcessFoundationV1 {
 }
 
 pub async fn compose_runtime_process_foundation_v1(
+    startup_budget: RuntimeStartupBudgetV1,
     config: &RuntimeConfigV1,
     secrets: &ResolvedRuntimeSecretsV1,
     process_instance_id: ProcessInstanceId,
 ) -> Result<RuntimeProcessFoundationV1, RuntimeProcessFoundationCompositionErrorV1> {
-    let databases = compose_runtime_database_dependencies_v1(config, secrets)
+    let databases = compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)
         .await
         .map_err(RuntimeProcessFoundationCompositionErrorV1::Database)?;
+    if !startup_budget.operation_is_open() {
+        return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
+    }
     let closed_components =
         match compose_closed_process_components_v1(&process_instance_id, config.gateway()) {
             Ok(components) => components,
             Err(error) => {
                 let shutdown = databases.shutdown();
-                let cleanup = shutdown.close().await.err();
+                drop(databases);
+                let cleanup = shutdown
+                    .close_until(startup_budget.cleanup_deadline())
+                    .await
+                    .err();
                 return Err(error.into_public(cleanup));
             }
         };
+    if !startup_budget.operation_is_open() {
+        drop(closed_components);
+        return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
+    }
     Ok(RuntimeProcessFoundationV1 {
+        startup_budget,
         process_instance_id,
         databases,
         registry: closed_components.registry,
         gateway: closed_components.gateway,
     })
+}
+
+async fn cleanup_after_operation_deadline_v1(
+    databases: RuntimeDatabaseDependenciesV1,
+    startup_budget: &RuntimeStartupBudgetV1,
+) -> RuntimeProcessFoundationCompositionErrorV1 {
+    let shutdown = databases.shutdown();
+    drop(databases);
+    match shutdown
+        .close_until(startup_budget.cleanup_deadline())
+        .await
+    {
+        Ok(()) => RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed,
+        Err(cleanup) => {
+            RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline { cleanup }
+        }
+    }
 }
 
 struct RuntimeClosedProcessComponentsV1 {
@@ -235,6 +283,9 @@ mod tests {
             RuntimeGatewayBootstrapErrorV1::CommandCapacity,
         )
         .into_public(Some(RuntimeDatabasePoolShutdownErrorV1::TimedOut));
+        let database_cleanup = RuntimeProcessFoundationCompositionErrorV1::Database(
+            RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut,
+        );
 
         assert_eq!(database.code(), "runtime_database_unavailable");
         assert_eq!(database.context(), Some("panel"));
@@ -248,6 +299,26 @@ mod tests {
             "runtime_process_foundation_cleanup_after_gateway"
         );
         assert_eq!(gateway.context(), None);
+        assert_eq!(
+            database_cleanup.code(),
+            "runtime_database_startup_cleanup_timed_out"
+        );
+        assert_eq!(database_cleanup.context(), None);
+        let deadline = RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed;
+        let deadline_cleanup =
+            RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline {
+                cleanup: RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+            };
+        assert_eq!(
+            deadline.code(),
+            "runtime_process_foundation_operation_deadline_elapsed"
+        );
+        assert_eq!(
+            deadline_cleanup.code(),
+            "runtime_process_foundation_cleanup_after_operation_deadline"
+        );
+        assert_eq!(deadline.context(), None);
+        assert_eq!(deadline_cleanup.context(), None);
         assert_eq!(
             format!("{gateway:?}"),
             "RuntimeProcessFoundationCompositionErrorV1(<redacted>)"

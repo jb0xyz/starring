@@ -484,6 +484,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process.rs",
             "src/registry.rs",
             "src/secret.rs",
+            "src/startup.rs",
             "src/startup_recovery_observation.rs",
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
@@ -1786,11 +1787,25 @@ fn database_composition_is_five_pool_function_only_and_fail_closed() {
         .find(|(path, _)| path == Path::new("src/database.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
+    let library = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/lib.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
     for required in [
+        "pub(crate) async fn compose_runtime_database_dependencies_v1(",
         "PgConnectOptions::new_without_pgpass()",
         ".disable_statement_logging()",
         "tokio::join!",
-        "timeout_at(startup_deadline",
+        "biased;",
+        "sleep_until(",
+        "TokioInstant::from_std(startup_budget.operation_cutoff())",
+        "TokioInstant::from_std(startup_budget.cleanup_deadline())",
+        "begin_before_operation_cutoff_v1",
+        "RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed",
+        "RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut",
+        "RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut",
+        "map_database_startup_cleanup_result_v1",
         "PERIODIC_READINESS_TIMEOUT",
         "verify_expected_database_authority_v1",
         "observe_runtime_execution_database_identity_with_timeouts_v1",
@@ -1819,8 +1834,140 @@ fn database_composition_is_five_pool_function_only_and_fail_closed() {
         "INSERT ",
         "UPDATE ",
         "DELETE ",
+        "STARTUP_READINESS_TIMEOUT",
+        "RuntimeStartupBudgetV1::begin()",
     ] {
         assert!(!database.contains(forbidden), "{forbidden}");
+    }
+    assert!(!library.contains("compose_runtime_database_dependencies_v1"));
+    let attributes = declaration_attribute_block(database, "RuntimeDatabaseDependenciesV1");
+    assert!(!contains_identifier(attributes, "Clone"));
+    assert!(!implements_trait(
+        database,
+        "RuntimeDatabaseDependenciesV1",
+        "Clone",
+    ));
+
+    let connect = braced_declaration(database, "async fn connect_pool_v1(");
+    let guard = connect
+        .find("begin_before_operation_cutoff_v1(operation_cutoff")
+        .unwrap();
+    let future = connect.find("pool.connect_with(options)").unwrap();
+    let precheck = connect
+        .find("classify_database_connection_deadline_v1(")
+        .unwrap();
+    let timer = connect.find("tokio::select!").unwrap();
+    let biased = connect[timer..].find("biased;").unwrap() + timer;
+    let timer_branch = connect[timer..]
+        .find("_ = sleep_until(TokioInstant::from_std(acquire_deadline))")
+        .unwrap()
+        + timer;
+    let work_branch = connect[timer..].find("result = connect").unwrap() + timer;
+    let postcheck = connect
+        .rfind("classify_database_connection_deadline_v1(")
+        .unwrap();
+    let success = connect.rfind("Ok(pool) => Ok(pool)").unwrap();
+    assert!(
+        guard < future
+            && future < precheck
+            && precheck < timer
+            && timer < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+            && postcheck < success
+    );
+
+    let composer = braced_declaration(
+        database,
+        "pub(crate) async fn compose_runtime_database_dependencies_v1(",
+    );
+    let build = composer
+        .find("let build = build_verified_dependencies_v1")
+        .unwrap();
+    let wait = composer.find("let result = tokio::select!").unwrap();
+    let biased = composer[wait..].find("biased;").unwrap() + wait;
+    let timer_branch = composer[wait..]
+        .find("_ = sleep_until(TokioInstant::from_std(startup_budget.operation_cutoff()))")
+        .unwrap()
+        + wait;
+    let work_branch = composer[wait..].find("result = build").unwrap() + wait;
+    let postcheck = composer
+        .find("let operation_is_open = startup_budget.operation_is_open()")
+        .unwrap();
+    let success = composer.find("return Ok(dependencies)").unwrap();
+    let cleanup = composer
+        .find("map_database_startup_cleanup_result_v1(primary, cleanup)")
+        .unwrap();
+    assert!(
+        build < wait
+            && wait < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+            && postcheck < success
+            && success < cleanup
+    );
+
+    let hard_cleanup = braced_declaration(database, "async fn close_pool_refs_until(");
+    let close = hard_cleanup
+        .find("let close = begin_pool_closures(pools)")
+        .unwrap();
+    let precheck = hard_cleanup
+        .find("if TokioInstant::now() >= deadline")
+        .unwrap();
+    let timer = hard_cleanup.find("tokio::select!").unwrap();
+    let biased = hard_cleanup[timer..].find("biased;").unwrap() + timer;
+    let timer_branch = hard_cleanup[timer..]
+        .find("_ = sleep_until(deadline)")
+        .unwrap()
+        + timer;
+    let work_branch = hard_cleanup[timer..].find("() = &mut close").unwrap() + timer;
+    let postcheck = hard_cleanup
+        .find("if TokioInstant::now() < deadline")
+        .unwrap();
+    assert!(
+        close < precheck
+            && precheck < timer
+            && timer < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+    );
+}
+
+#[test]
+fn startup_budget_is_single_origin_linear_monotonic_and_partitioned() {
+    let sources = source_files();
+    let startup = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/startup.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = source_before_test_module(startup);
+    let begin = braced_declaration(production, "pub fn begin()");
+
+    for required in [
+        "const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);",
+        "const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);",
+        "operation_cutoff: started_at + STARTUP_OPERATION_WINDOW",
+        "cleanup_deadline: started_at + STARTUP_TOTAL_WINDOW",
+        "now < self.operation_cutoff",
+        "RuntimeStartupBudgetV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    assert_eq!(begin.matches("Instant::now()").count(), 1);
+    assert!(!contains_identifier(production, "SystemTime"));
+    assert!(!contains_identifier(production, "tokio"));
+    let attributes = declaration_attribute_block(production, "RuntimeStartupBudgetV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
+        assert!(!implements_trait(
+            production,
+            "RuntimeStartupBudgetV1",
+            forbidden,
+        ));
     }
 }
 
@@ -1905,12 +2052,14 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "pub async fn compose_runtime_process_foundation_v1(",
     );
     let databases = composer
-        .find("compose_runtime_database_dependencies_v1(config, secrets)")
+        .find("compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)")
         .unwrap();
     let closed = composer
         .find("compose_closed_process_components_v1(&process_instance_id, config.gateway())")
         .unwrap();
-    let cleanup = composer.find("shutdown.close().await").unwrap();
+    let cleanup = composer
+        .find(".close_until(startup_budget.cleanup_deadline())")
+        .unwrap();
 
     assert!(databases < closed && closed < cleanup);
     for required in [
@@ -1918,20 +2067,42 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
         "RuntimeProcessFoundationCompositionErrorV1(<redacted>)",
+        "startup_budget: RuntimeStartupBudgetV1",
+        "if !startup_budget.operation_is_open()",
+        "cleanup_after_operation_deadline_v1",
+        "RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed",
+        "RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline",
         "pub async fn shutdown(self)",
-        "drop(self);",
+        "shutdown.close_until(cleanup_deadline).await",
+        "let Self {",
+        "drop((",
     ] {
         assert!(production.contains(required), "{required}");
     }
+    assert_eq!(
+        composer
+            .matches("if !startup_budget.operation_is_open()")
+            .count(),
+        2
+    );
     for forbidden in [
         "ready_to_serve",
         "health_ready",
         "start_gateway_owner_startup_watchdog_v1",
         "observe_current_ready_attestation()?",
         "Discord",
+        "RuntimeStartupBudgetV1::begin()",
+        "pub fn databases(&self)",
+        "pub fn registry(&self)",
+        "pub fn gateway(&self)",
     ] {
         assert!(!production.contains(forbidden), "{forbidden}");
     }
+    let shutdown = braced_declaration(production, "pub async fn shutdown(self)");
+    assert!(shutdown.contains("let cleanup_deadline = startup_budget.cleanup_deadline()"));
+    assert!(shutdown.contains("shutdown.close_until(cleanup_deadline).await"));
+    assert!(!shutdown.contains("shutdown.close().await"));
+    assert!(!composer.contains("shutdown.close().await"));
     for name in [
         "RuntimeProcessFoundationV1",
         "RuntimeClosedProcessComponentsV1",
