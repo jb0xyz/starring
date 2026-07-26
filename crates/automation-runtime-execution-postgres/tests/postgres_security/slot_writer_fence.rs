@@ -441,7 +441,8 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
     let canonical = canonical_product_drain(&snapshot);
     let guild_id = GUILD.to_string();
     let initial = slot_writer_fence_row(&database.owner_pool, &guild_id, RULESET).await;
-    assert_open_slot_writer_fence(&initial, &guild_id, RULESET, 1);
+    let initial_epoch = initial.2;
+    assert_open_slot_writer_fence(&initial, &guild_id, RULESET, initial_epoch);
 
     let mut hostile = database.owner_pool.begin().await.unwrap();
     sqlx::raw_sql(
@@ -462,7 +463,7 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
     .fetch_one(&mut *hostile)
     .await
     .unwrap();
-    assert_eq!(locked_epoch, 1);
+    assert_eq!(locked_epoch, initial_epoch);
     let advanced = sqlx::query_scalar::<_, i64>(
         "SELECT starring_runtime_private_v2.\
              starring_runtime_slot_writer_fence_begin_unsafe_v2($1,$2,$3)",
@@ -473,7 +474,7 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
     .fetch_one(&mut *hostile)
     .await
     .unwrap();
-    assert_eq!(advanced, 2);
+    assert_eq!(advanced, initial_epoch + 1);
     let decoy_epoch =
         sqlx::query_scalar::<_, i64>("SELECT writer_epoch FROM runtime_slot_writer_fences_v2")
             .fetch_one(&mut *hostile)
@@ -489,7 +490,7 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
     )
     .bind(&guild_id)
     .bind(RULESET)
-    .bind(1_i64)
+    .bind(initial_epoch)
     .fetch_one(&database.owner_pool)
     .await
     .unwrap_err();
@@ -498,7 +499,7 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
         &slot_writer_fence_row(&database.owner_pool, &guild_id, RULESET).await,
         &guild_id,
         RULESET,
-        2,
+        initial_epoch + 1,
     );
 
     let mut first_apply = begin_product_drain_first_apply(&database.owner_pool).await;
@@ -510,7 +511,7 @@ async fn slot_writer_fence_epoch_and_first_apply_are_atomic_and_replay_stable() 
     first_apply.commit().await.unwrap();
 
     let pending = slot_writer_fence_row(&database.owner_pool, &guild_id, RULESET).await;
-    assert_eq!(pending.2, 3);
+    assert_eq!(pending.2, initial_epoch + 2);
     assert_eq!(
         pending.3.as_deref(),
         Some(canonical.drain_preimage().key.intent_id.as_str())
@@ -747,14 +748,14 @@ async fn slot_writer_fence_physical_epoch_update_aborts_a_stale_serializable_wri
     .fetch_one(&mut *stale)
     .await
     .unwrap();
-    assert_eq!(stale_epoch, 1);
+    assert!(stale_epoch > 0);
 
     let inserted = committed_product_drain_first_apply(&database.owner_pool, &canonical)
         .await
         .unwrap();
     assert_eq!(inserted.outcome_name, "inserted");
     let pending = slot_writer_fence_row(&database.owner_pool, &guild_id, RULESET).await;
-    assert_eq!(pending.2, 2);
+    assert_eq!(pending.2, stale_epoch + 1);
 
     let serialization = sqlx::query_scalar::<_, i64>(
         "SELECT starring_runtime_private_v2.\

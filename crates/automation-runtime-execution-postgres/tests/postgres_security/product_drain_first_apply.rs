@@ -361,10 +361,10 @@ async fn product_drain_ready_snapshot(
     session.snapshot().clone()
 }
 
-async fn advance_product_drain_deployment_to_live(
+async fn product_drain_live_transition_error(
     database: &IsolatedDatabase,
     session: &RuntimeConvergenceSessionV1,
-) -> RuntimeDeploymentSnapshotV1 {
+) -> sqlx::Error {
     let gateway_ready = gateway_ready_attestation(database, session).await;
     let guard = session.execution_guard().unwrap();
     let mut transaction = database.executor_pool.begin().await.unwrap();
@@ -377,16 +377,15 @@ async fn advance_product_drain_deployment_to_live(
     .await
     .unwrap();
     let input = certification_input(&guard, gateway_ready, &prepared);
-    let outcome = raw_certify_commit(
+    let error = raw_certify_commit(
         &mut transaction,
         &input,
         CERTIFICATION_LEASE_MILLISECONDS,
     )
     .await
-    .unwrap();
-    assert_eq!(outcome, "applied");
-    transaction.commit().await.unwrap();
-    product_drain_snapshot(&database.owner_pool).await
+    .unwrap_err();
+    transaction.rollback().await.unwrap();
+    error
 }
 
 async fn insert_product_only(
@@ -651,9 +650,21 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
     }
     transaction.commit().await.unwrap();
 
-    let live_snapshot = advance_product_drain_deployment_to_live(&database, &session).await;
-    assert_eq!(live_snapshot.phase, RuntimeDeploymentPhaseV1::Live);
-    assert_ne!(live_snapshot.revision, canonical.product_preimage().expected_revision);
+    let blocked_live = product_drain_live_transition_error(&database, &session).await;
+    assert_database_error(
+        &blocked_live,
+        "RX007",
+        "runtime_execution_product_drain_pending",
+    );
+    let pending_snapshot = product_drain_snapshot(&database.owner_pool).await;
+    assert_eq!(
+        pending_snapshot.phase,
+        RuntimeDeploymentPhaseV1::AwaitingGatewayReady
+    );
+    assert_eq!(
+        pending_snapshot.revision,
+        canonical.product_preimage().expected_revision
+    );
 
     let replayed = committed_product_drain_first_apply(&database.owner_pool, &canonical)
         .await
@@ -661,7 +672,7 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
     assert_eq!(replayed.outcome_name, "replayed");
     assert_eq!(
         replayed.locked_snapshot.as_ref().unwrap().0["revision"],
-        live_snapshot.revision.get()
+        pending_snapshot.revision.get()
     );
     assert_complete_product_drain_row(&replayed, &canonical);
 
@@ -705,8 +716,10 @@ async fn product_drain_first_apply_is_atomic_replayable_divergent_and_closed() {
     assert_complete_product_drain_row(&diverged, &canonical);
     assert_eq!(product_drain_row_counts(&database.owner_pool).await, (1, 1));
 
+    let mut conflicting_snapshot = snapshot.clone();
+    conflicting_snapshot.revision = conflicting_snapshot.revision.next().unwrap();
     let conflicting = product_drain_canonical_with(
-        &live_snapshot,
+        &conflicting_snapshot,
         canonical.product_preimage().operation_id.as_str(),
         canonical.drain_preimage().key.intent_id.as_str(),
         canonical
