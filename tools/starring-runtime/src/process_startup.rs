@@ -10,8 +10,9 @@ use crate::startup::{
     run_runtime_startup_sync_stage_v1, RuntimeStartupBudgetV1, RuntimeStartupSyncStageErrorV1,
 };
 use crate::{
-    RuntimeBuildRevisionBootstrapErrorV1, RuntimeConfigErrorV1, RuntimeConfigV1,
-    RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessPausedConnectedTransitionErrorV1,
+    RuntimeBuildRevisionBootstrapErrorV1, RuntimeClosedRecoveryProcessShutdownErrorV2,
+    RuntimeConfigErrorV1, RuntimeConfigV1, RuntimePausedConnectedProcessShutdownErrorV1,
+    RuntimeProcessClosedRecoveryTransitionErrorV2, RuntimeProcessPausedConnectedTransitionErrorV1,
     RuntimeProcessRecoveryPendingTransitionErrorV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
     RuntimeSecretsResolutionErrorV1,
 };
@@ -36,12 +37,16 @@ pub enum RuntimeProcessStagingErrorV1 {
     PausedConnected(RuntimeProcessPausedConnectedTransitionErrorV1),
     #[error("runtime process recovery-pending transition failed")]
     RecoveryPending(RuntimeProcessRecoveryPendingTransitionErrorV2),
+    #[error("runtime process closed-recovery transition failed")]
+    ClosedRecovery(RuntimeProcessClosedRecoveryTransitionErrorV2),
     #[error("runtime owner-held process shutdown failed")]
     OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
     #[error("runtime paused-connected process shutdown failed")]
     PausedConnectedShutdown(RuntimePausedConnectedProcessShutdownErrorV1),
     #[error("runtime recovery-pending process shutdown failed")]
     RecoveryPendingShutdown(RuntimeRecoveryPendingProcessShutdownErrorV2),
+    #[error("runtime closed-recovery process shutdown failed")]
+    ClosedRecoveryShutdown(RuntimeClosedRecoveryProcessShutdownErrorV2),
 }
 
 impl RuntimeProcessStagingErrorV1 {
@@ -56,9 +61,11 @@ impl RuntimeProcessStagingErrorV1 {
             Self::GatewayOwner(error) => error.code(),
             Self::PausedConnected(error) => error.code(),
             Self::RecoveryPending(error) => error.code(),
+            Self::ClosedRecovery(error) => error.code(),
             Self::OwnerHeldShutdown(error) => error.code(),
             Self::PausedConnectedShutdown(error) => error.code(),
             Self::RecoveryPendingShutdown(error) => error.code(),
+            Self::ClosedRecoveryShutdown(error) => error.code(),
         }
     }
 
@@ -74,9 +81,11 @@ impl RuntimeProcessStagingErrorV1 {
             Self::GatewayOwner(error) => error.context(),
             Self::PausedConnected(error) => error.context(),
             Self::RecoveryPending(error) => error.context(),
+            Self::ClosedRecovery(error) => error.context(),
             Self::OwnerHeldShutdown(error) => error.context(),
             Self::PausedConnectedShutdown(error) => error.context(),
             Self::RecoveryPendingShutdown(error) => error.context(),
+            Self::ClosedRecoveryShutdown(error) => error.context(),
             Self::AsyncRuntimeUnavailable | Self::OperationDeadlineElapsed => None,
         }
     }
@@ -189,10 +198,14 @@ async fn stage_runtime_process_from_environment_v1(
         .into_recovery_pending_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::RecoveryPending)?;
-    recovery_pending
+    let closed_recovery = recovery_pending
+        .into_closed_recovery_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ClosedRecovery)?;
+    closed_recovery
         .shutdown()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 
@@ -212,9 +225,11 @@ fn map_sync_stage_error_v1<E>(
 mod tests {
     use super::*;
     use crate::{
-        DatabaseCapabilityV1, RuntimeConfigurationFieldV1, RuntimeDatabaseCompositionErrorV1,
+        DatabaseCapabilityV1, RuntimeClosedRecoveryProcessCleanupFailureV2,
+        RuntimeConfigurationFieldV1, RuntimeDatabaseCompositionErrorV1,
         RuntimeDatabasePoolShutdownErrorV1, RuntimeDiscordGatewayShutdownFailureV1,
-        RuntimeGatewayOwnerShutdownFailureV1, RuntimeProcessPausedConnectedTransitionFailureV1,
+        RuntimeGatewayOwnerShutdownFailureV1, RuntimeProcessClosedRecoveryTransitionFailureV2,
+        RuntimeProcessPausedConnectedTransitionFailureV1,
         RuntimeProcessRecoveryPendingTransitionFailureV2,
         RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeSecretResolutionErrorV1,
     };
@@ -269,6 +284,18 @@ mod tests {
                     ),
                 ),
             ),
+            RuntimeProcessStagingErrorV1::ClosedRecovery(
+                RuntimeProcessClosedRecoveryTransitionErrorV2::Transition(
+                    RuntimeProcessClosedRecoveryTransitionFailureV2::OperationDeadlineElapsed,
+                ),
+            ),
+            RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(
+                RuntimeClosedRecoveryProcessShutdownErrorV2::Cleanup(
+                    RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+                    ),
+                ),
+            ),
         ];
 
         assert_eq!(errors[0].code(), "runtime_async_runtime_unavailable");
@@ -302,6 +329,14 @@ mod tests {
         assert_eq!(
             errors[10].code(),
             "runtime_discord_gateway_shutdown_close_deadline_elapsed"
+        );
+        assert_eq!(
+            errors[11].code(),
+            "runtime_process_closed_recovery_operation_deadline_elapsed"
+        );
+        assert_eq!(
+            errors[12].code(),
+            "runtime_discord_gateway_shutdown_unexpected_exit"
         );
         for error in errors {
             assert!(!error.code().is_empty());

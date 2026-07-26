@@ -1594,6 +1594,137 @@ async fn retained_recovery_begin_deadline_returns_owner_for_bounded_cleanup() {
 }
 
 #[tokio::test]
+async fn in_place_owner_commit_converts_once_and_supports_bounded_shutdown() {
+    let (gateway, _registry, mut pending, port) =
+        initial_pending_recovery_fixture_v2("71717171717171717171717171717171").await;
+
+    pending.commit_owner_in_place_v2().await.unwrap();
+    let session = pending.try_into_committed_session_v2().unwrap();
+    session.revalidate_v2().unwrap();
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 1
+    ));
+    assert_eq!(
+        session
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn elapsed_in_place_owner_commit_retains_bounded_cleanup_authority() {
+    let (_gateway, _registry, pending, port) =
+        initial_pending_recovery_fixture_v2("72727272727272727272727272727272").await;
+    let mut pending = pending.with_operation_cutoff_for_test_v2(Instant::now());
+
+    assert_eq!(
+        pending.commit_owner_in_place_v2().await,
+        Err(crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed)
+    );
+    assert_eq!(
+        pending
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn canceled_in_place_owner_commit_retains_bounded_cleanup_authority() {
+    let (_gateway, _registry, mut pending, port) =
+        initial_pending_recovery_fixture_v2("75757575757575757575757575757575").await;
+    let mut commit = Box::pin(pending.commit_owner_in_place_v2());
+    let mut polled = false;
+    std::future::poll_fn(|context| {
+        if !polled {
+            polled = true;
+            assert!(commit.as_mut().poll(context).is_pending());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    drop(commit);
+
+    assert_eq!(
+        pending
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn duplicate_in_place_owner_commit_invalidates_and_releases_once() {
+    let (_gateway, _registry, mut pending, port) =
+        initial_pending_recovery_fixture_v2("73737373737373737373737373737373").await;
+
+    pending.commit_owner_in_place_v2().await.unwrap();
+    assert_eq!(
+        pending.commit_owner_in_place_v2().await,
+        Err(
+            crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Owner(
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation,
+            )
+        )
+    );
+    let pending = match pending.try_into_committed_session_v2() {
+        Ok(_) => panic!("duplicate commit converted"),
+        Err(pending) => *pending,
+    };
+    assert_eq!(
+        pending
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn post_commit_registry_failure_retains_committed_bounded_cleanup() {
+    let (_gateway, registry, mut pending, port) =
+        initial_pending_recovery_fixture_v2("74747474747474747474747474747474").await;
+
+    pending.commit_owner_in_place_v2().await.unwrap();
+    let session = pending.try_into_committed_session_v2().unwrap();
+    registry.advance_empty_sequence_for_test_v2();
+    assert_eq!(
+        session.revalidate_v2(),
+        Err(
+            crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Registry(
+                crate::RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding,
+            )
+        )
+    );
+    assert_eq!(
+        session
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
 async fn unpolled_compound_owner_commit_cancels_closed_and_releases_once() {
     let (gateway, _registry, pending, port) =
         initial_pending_recovery_fixture_v2("11111111111111111111111111111111").await;

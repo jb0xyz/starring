@@ -18,10 +18,16 @@ use crate::{
     RuntimeRegistryBootstrapV1,
 };
 
+mod closed;
 pub(crate) mod connected;
 mod owner;
 mod recovery;
 
+pub use closed::{
+    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
+    RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
+    RuntimeProcessClosedRecoveryTransitionFailureV2, RuntimeProcessGatewayOwnerCommitFailureV2,
+};
 pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,

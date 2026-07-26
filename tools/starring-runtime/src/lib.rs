@@ -45,8 +45,11 @@ pub use process::connected::{
     RuntimeProcessPausedConnectedTransitionFailureV1,
 };
 pub use process::{
+    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
-    RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessFoundationCompositionErrorV1,
+    RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessClosedRecoveryCommitFailureV2,
+    RuntimeProcessClosedRecoveryTransitionErrorV2, RuntimeProcessClosedRecoveryTransitionFailureV2,
+    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
     RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2,

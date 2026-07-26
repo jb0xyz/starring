@@ -252,9 +252,9 @@ impl Debug for RuntimeRecoveryPendingProcessShutdownErrorV2 {
 }
 
 pub(crate) struct RuntimeRecoveryPendingProcessV2 {
-    discord: RuntimeDiscordGatewaySupervisorV1,
-    foundation: RuntimeProcessFoundationV1,
-    pending: RuntimeClosedRecoveryPendingPhaseV2,
+    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,
+    pub(super) foundation: RuntimeProcessFoundationV1,
+    pub(super) pending: RuntimeClosedRecoveryPendingPhaseV2,
 }
 
 impl RuntimePausedConnectedProcessV1 {
@@ -391,20 +391,6 @@ impl RuntimePausedConnectedProcessV1 {
             foundation,
             pending,
         })
-    }
-}
-
-impl RuntimeRecoveryPendingProcessV2 {
-    pub(crate) async fn shutdown(self) -> Result<(), RuntimeRecoveryPendingProcessShutdownErrorV2> {
-        let Self {
-            discord,
-            foundation,
-            pending,
-        } = self;
-        shutdown_pending_recovery_v2(foundation, discord, pending)
-            .await
-            .map_err(RuntimeRecoveryPendingProcessCleanupFailureV2::from)
-            .map_err(RuntimeRecoveryPendingProcessShutdownErrorV2::Cleanup)
     }
 }
 

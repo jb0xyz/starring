@@ -716,6 +716,7 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         Ok(RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
             inner: Some(inner),
             observation,
+            committed_closed_recovery_observation: None,
         })
     }
 
@@ -745,6 +746,7 @@ pub(crate) enum RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1 {
 pub(crate) struct RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     observation: RuntimeGatewayOwnerCurrentObservationV1,
+    committed_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl std::fmt::Debug for RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
@@ -792,13 +794,15 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         inner.shutdown_until(cleanup_deadline).await
     }
 
-    pub(crate) async fn commit_closed_recovery_v2(
-        mut self,
+    pub(crate) async fn commit_closed_recovery_in_place_v2(
+        &mut self,
         permit: &RuntimeClosedDrainRecoveryPermitV2,
-    ) -> Result<
-        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
-    > {
+    ) -> Result<(), RuntimeGatewayOwnerClosedRecoveryCommitErrorV2> {
+        if self.committed_closed_recovery_observation.is_some() {
+            self.committed_closed_recovery_observation = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation);
+        }
         if Instant::now() >= self.observation.safety_deadline() {
             self.inner().invalidation.invalidate();
             return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed);
@@ -807,10 +811,17 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
             self.inner().invalidation.invalidate();
             return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::OwnerReceiptMismatch);
         }
-        let acknowledged = self
+        let acknowledged = match self
             .inner()
             .commit_closed_recovery_v2(permit.owner_receipt().clone())
-            .await?;
+            .await
+        {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                self.inner().invalidation.invalidate();
+                return Err(error);
+            }
+        };
         let acknowledged = match accept_closed_recovery_commit_observation_v2(
             acknowledged,
             &self.observation,
@@ -823,11 +834,48 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
                 return Err(error);
             }
         };
+        self.committed_closed_recovery_observation = Some(acknowledged);
+        Ok(())
+    }
+
+    pub(crate) fn try_into_committed_closed_recovery_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerClosedRecoverySupervisorV2, Box<Self>> {
+        let Some(acknowledged) = self.committed_closed_recovery_observation.take() else {
+            return Err(Box::new(self));
+        };
+        if accept_closed_recovery_commit_observation_v2(
+            acknowledged.clone(),
+            &self.observation,
+            self.observation.receipt(),
+            Instant::now(),
+        )
+        .is_err()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(Box::new(self));
+        }
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
             inner: Some(inner),
             observation: acknowledged,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn commit_closed_recovery_v2(
+        mut self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<
+        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    > {
+        self.commit_closed_recovery_in_place_v2(permit).await?;
+        self.try_into_committed_closed_recovery_v2()
+            .map_err(|owner| {
+                owner.inner().invalidation.invalidate();
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation
+            })
     }
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -873,6 +921,18 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
 
     pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         self.take_inner().shutdown().await
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
     }
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {

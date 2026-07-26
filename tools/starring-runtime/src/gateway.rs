@@ -1151,17 +1151,14 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         ))
     }
 
-    pub(crate) async fn commit_prepared_owner_v2(
+    pub(crate) async fn commit_prepared_owner_in_place_v2(
         &self,
         _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
-        prepared_owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        prepared_owner: &mut RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         commit_cutoff: Instant,
-    ) -> Result<
-        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-        RuntimeGatewayRecoveryOwnerCommitErrorV2,
-    > {
+    ) -> Result<(), RuntimeGatewayRecoveryOwnerCommitErrorV2> {
         let section = self
-            .pending_section_v2(&prepared_owner)
+            .pending_section_v2(prepared_owner)
             .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Section)?;
         drop(section);
         if Instant::now() >= commit_cutoff {
@@ -1172,7 +1169,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             _ = sleep_until(TokioInstant::from_std(commit_cutoff)) => {
                 Err(RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed)
             }
-            result = prepared_owner.commit_closed_recovery_v2(&self.permit) => {
+            result = prepared_owner.commit_closed_recovery_in_place_v2(&self.permit) => {
                 result.map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
             }
         }

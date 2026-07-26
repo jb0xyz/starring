@@ -167,50 +167,75 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
         owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime fixed-point composition consumes the committed closed session"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) async fn commit_owner_v2(
         self,
     ) -> Result<RuntimeClosedRecoverySessionV2, RuntimeClosedRecoveryCommitErrorV2> {
         self.commit_owner_with_post_commit_v2(|| {}).await
     }
 
+    #[cfg(test)]
     async fn commit_owner_with_post_commit_v2(
-        self,
+        mut self,
         post_commit: impl FnOnce(),
     ) -> Result<RuntimeClosedRecoverySessionV2, RuntimeClosedRecoveryCommitErrorV2> {
+        self.commit_owner_in_place_v2().await?;
+        post_commit();
+        let session = self.try_into_committed_session_v2().map_err(|_| {
+            RuntimeClosedRecoveryCommitErrorV2::Owner(
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation,
+            )
+        })?;
+        session.revalidate_v2()?;
+        Ok(session)
+    }
+
+    pub(crate) fn commit_cutoff_v2(&self) -> Instant {
+        self.operation_cutoff
+            .min(self.owner.observation().safety_deadline())
+    }
+
+    pub(crate) async fn commit_owner_in_place_v2(
+        &mut self,
+    ) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
         self.revalidate_v2().map_err(map_begin_commit_error_v2)?;
-        let commit_cutoff = self
-            .operation_cutoff
-            .min(self.owner.observation().safety_deadline());
+        let commit_cutoff = self.commit_cutoff_v2();
         if Instant::now() >= commit_cutoff {
             return Err(RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed);
         }
         let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };
+        self.gateway
+            .commit_prepared_owner_in_place_v2(&authority, &mut self.owner, commit_cutoff)
+            .await
+            .map_err(map_gateway_owner_commit_error_v2)
+    }
+
+    pub(crate) fn try_into_committed_session_v2(
+        self,
+    ) -> Result<RuntimeClosedRecoverySessionV2, Box<Self>> {
         let Self {
             owner,
             gateway,
             registry,
             operation_cutoff,
         } = self;
-        let owner = gateway
-            .commit_prepared_owner_v2(&authority, owner, commit_cutoff)
-            .await
-            .map_err(map_gateway_owner_commit_error_v2)?;
-        post_commit();
-        let session = RuntimeClosedRecoverySessionV2 {
+        let owner = match owner.try_into_committed_closed_recovery_v2() {
+            Ok(owner) => owner,
+            Err(owner) => {
+                return Err(Box::new(Self {
+                    owner: *owner,
+                    gateway,
+                    registry,
+                    operation_cutoff,
+                }));
+            }
+        };
+        Ok(RuntimeClosedRecoverySessionV2 {
             owner,
             gateway,
             registry,
             operation_cutoff,
-        };
-        session.revalidate_v2()?;
-        Ok(session)
+        })
     }
 }
 
@@ -226,13 +251,30 @@ impl RuntimeClosedRecoveryBeginFailureV2 {
 }
 
 impl RuntimeClosedRecoverySessionV2 {
-    fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+    pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
         revalidate_committed_recovery_v2(
             &self.owner,
             &self.gateway,
             &self.registry,
             self.operation_cutoff,
         )
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+        } = self;
+        drop((gateway, registry, operation_cutoff));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 
     #[cfg_attr(
