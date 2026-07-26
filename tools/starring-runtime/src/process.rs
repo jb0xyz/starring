@@ -3,17 +3,19 @@ use std::fmt::{Debug, Formatter};
 use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
 
+use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::compose_runtime_database_dependencies_v1;
 use crate::process_identity::generate_runtime_process_instance_id_v1;
+use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     compose_runtime_gateway_bootstrap_v1, compose_runtime_registry_bootstrap_v1,
-    CompiledRuntimeBuildRevisionV1, GatewayResourceConfigV1, ResolvedRuntimeSecretsV1,
-    RuntimeConfigV1, RuntimeControllerIdGenerationErrorV1, RuntimeDatabaseCompositionErrorV1,
+    GatewayResourceConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
+    RuntimeControllerIdGenerationErrorV1, RuntimeDatabaseCompositionErrorV1,
     RuntimeDatabaseDependenciesV1, RuntimeDatabasePoolShutdownErrorV1,
     RuntimeGatewayBootstrapErrorV1, RuntimeGatewayBootstrapV1,
     RuntimeProcessInstanceIdGenerationErrorV1, RuntimeRegistryBootstrapErrorV1,
-    RuntimeRegistryBootstrapV1, RuntimeStartupBudgetV1,
+    RuntimeRegistryBootstrapV1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -88,52 +90,58 @@ impl Debug for RuntimeProcessFoundationCompositionErrorV1 {
     }
 }
 
-pub struct RuntimeProcessFoundationV1 {
+pub(crate) struct RuntimeProcessFoundationV1 {
+    gateway: RuntimeGatewayBootstrapV1,
+    registry: RuntimeRegistryBootstrapV1,
+    databases: RuntimeDatabaseDependenciesV1,
+    secrets: ResolvedRuntimeSecretsV1,
+    config: RuntimeConfigV1,
     startup_budget: RuntimeStartupBudgetV1,
-    build_revision: CompiledRuntimeBuildRevisionV1,
+    build_revision: RuntimeBuildRevisionV1,
     process_instance_id: ProcessInstanceId,
     controller_id: ControllerId,
-    databases: RuntimeDatabaseDependenciesV1,
-    registry: RuntimeRegistryBootstrapV1,
-    gateway: RuntimeGatewayBootstrapV1,
 }
 
 impl RuntimeProcessFoundationV1 {
-    pub fn runtime_build_revision(&self) -> &RuntimeBuildRevisionV1 {
-        self.build_revision.revision()
-    }
-
-    pub fn process_instance_id(&self) -> &ProcessInstanceId {
-        &self.process_instance_id
-    }
-
-    pub fn controller_id(&self) -> &ControllerId {
-        &self.controller_id
-    }
-
-    pub async fn shutdown(self) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
+    pub(crate) async fn shutdown(self) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
         let Self {
+            gateway,
+            registry,
+            databases,
+            secrets,
+            config,
             startup_budget,
             build_revision,
             process_instance_id,
             controller_id,
-            databases,
-            registry,
-            gateway,
         } = self;
         let cleanup_deadline = startup_budget.cleanup_deadline();
         let shutdown = databases.shutdown();
-        drop((
-            startup_budget,
-            build_revision,
-            process_instance_id,
-            controller_id,
-            databases,
-            registry,
-            gateway,
-        ));
-        shutdown.close_until(cleanup_deadline).await
+        drop((gateway, registry, databases));
+        let result = shutdown.close_until(cleanup_deadline).await;
+        drop(shutdown);
+        finish_runtime_process_foundation_shutdown_v1(
+            secrets,
+            (
+                config,
+                startup_budget,
+                build_revision,
+                process_instance_id,
+                controller_id,
+            ),
+            result,
+        )
     }
+}
+
+fn finish_runtime_process_foundation_shutdown_v1<S, R>(
+    secrets: S,
+    retained: R,
+    result: Result<(), RuntimeDatabasePoolShutdownErrorV1>,
+) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
+    drop(secrets);
+    drop(retained);
+    result
 }
 
 impl Debug for RuntimeProcessFoundationV1 {
@@ -142,10 +150,10 @@ impl Debug for RuntimeProcessFoundationV1 {
     }
 }
 
-pub async fn compose_runtime_process_foundation_v1(
+pub(crate) async fn compose_runtime_process_foundation_v1(
     startup_budget: RuntimeStartupBudgetV1,
-    config: &RuntimeConfigV1,
-    secrets: &ResolvedRuntimeSecretsV1,
+    config: RuntimeConfigV1,
+    secrets: ResolvedRuntimeSecretsV1,
     build_revision: CompiledRuntimeBuildRevisionV1,
 ) -> Result<RuntimeProcessFoundationV1, RuntimeProcessFoundationCompositionErrorV1> {
     if !startup_budget.operation_is_open() {
@@ -163,37 +171,45 @@ pub async fn compose_runtime_process_foundation_v1(
     }
     let controller_id =
         controller_id.map_err(RuntimeProcessFoundationCompositionErrorV1::ControllerId)?;
-    let databases = compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)
+    let build_revision = build_revision.into_revision();
+    let databases = compose_runtime_database_dependencies_v1(&config, &secrets, &startup_budget)
         .await
         .map_err(RuntimeProcessFoundationCompositionErrorV1::Database)?;
     if !startup_budget.operation_is_open() {
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
     let closed_components =
-        match compose_closed_process_components_v1(&process_instance_id, config.gateway()) {
-            Ok(components) => components,
-            Err(error) => {
-                let shutdown = databases.shutdown();
-                drop(databases);
-                let cleanup = shutdown
-                    .close_until(startup_budget.cleanup_deadline())
-                    .await
-                    .err();
-                return Err(error.into_public(cleanup));
-            }
-        };
+        compose_closed_process_components_v1(&process_instance_id, config.gateway());
+    if !startup_budget.operation_is_open() {
+        drop(closed_components);
+        return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
+    }
+    let closed_components = match closed_components {
+        Ok(components) => components,
+        Err(error) => {
+            let shutdown = databases.shutdown();
+            drop(databases);
+            let cleanup = shutdown
+                .close_until(startup_budget.cleanup_deadline())
+                .await
+                .err();
+            return Err(error.into_public(cleanup));
+        }
+    };
     if !startup_budget.operation_is_open() {
         drop(closed_components);
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
     Ok(RuntimeProcessFoundationV1 {
+        gateway: closed_components.gateway,
+        registry: closed_components.registry,
+        databases,
+        secrets,
+        config,
         startup_budget,
         build_revision,
         process_instance_id,
         controller_id,
-        databases,
-        registry: closed_components.registry,
-        gateway: closed_components.gateway,
     })
 }
 
@@ -267,6 +283,9 @@ fn compose_closed_process_components_v1(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use automation_runtime_worker::{
         RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
     };
@@ -276,6 +295,38 @@ mod tests {
 
     fn process_instance_id() -> ProcessInstanceId {
         ProcessInstanceId::parse("runtime-process:foundation").unwrap()
+    }
+
+    struct DropProbeV1 {
+        name: &'static str,
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbeV1 {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push(self.name);
+        }
+    }
+
+    fn assert_shutdown_finish_drop_order(result: Result<(), RuntimeDatabasePoolShutdownErrorV1>) {
+        let events = Rc::new(RefCell::new(vec!["pool_close_returned"]));
+        let returned = finish_runtime_process_foundation_shutdown_v1(
+            DropProbeV1 {
+                name: "secrets",
+                events: events.clone(),
+            },
+            DropProbeV1 {
+                name: "retained",
+                events: events.clone(),
+            },
+            result,
+        );
+
+        assert_eq!(returned, result);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["pool_close_returned", "secrets", "retained"]
+        );
     }
 
     #[test]
@@ -310,6 +361,12 @@ mod tests {
             components.gateway.observe_paused_connected_gateway_v2(),
             Err(RuntimeGatewayReadyObservationErrorV1::NotConnected)
         );
+    }
+
+    #[test]
+    fn shutdown_finish_drops_secrets_only_after_close_returns_on_every_result() {
+        assert_shutdown_finish_drop_order(Ok(()));
+        assert_shutdown_finish_drop_order(Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut));
     }
 
     #[test]

@@ -2,37 +2,52 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use starring_runtime::{
-    resolve_runtime_secrets_v1, RuntimeConfigErrorV1, RuntimeConfigV1,
-    RuntimeSecretsResolutionErrorV1,
+    run_runtime_process_foundation_staging_from_environment_v1,
+    RuntimeProcessFoundationStagingErrorV1,
 };
 
-fn main() -> ExitCode {
-    install_panic_hook();
-    match RuntimeConfigV1::from_process_environment() {
-        Ok(config) => match resolve_runtime_secrets_v1(&config) {
-            Ok(_) => {
-                emit_status("runtime_not_composed", None);
+#[derive(Clone, Copy)]
+enum RuntimeProcessExitStatusV1 {
+    FoundationVerifiedAndClosed,
+    Failed(RuntimeProcessFoundationStagingErrorV1),
+}
+
+impl RuntimeProcessExitStatusV1 {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::FoundationVerifiedAndClosed => "runtime_staging_foundation_verified_and_closed",
+            Self::Failed(error) => error.code(),
+        }
+    }
+
+    const fn context(self) -> Option<&'static str> {
+        match self {
+            Self::FoundationVerifiedAndClosed => None,
+            Self::Failed(error) => error.context(),
+        }
+    }
+
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::FoundationVerifiedAndClosed => ExitCode::from(70),
+            Self::Failed(error) if error.configuration_class() => ExitCode::from(78),
+            Self::Failed(RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable)
+            | Self::Failed(RuntimeProcessFoundationStagingErrorV1::FoundationShutdown(_)) => {
                 ExitCode::from(70)
             }
-            Err(error) => {
-                emit_secret_error(error);
-                ExitCode::from(78)
-            }
-        },
-        Err(error) => {
-            emit_configuration_error(error);
-            ExitCode::from(78)
+            Self::Failed(_) => ExitCode::from(69),
         }
     }
 }
 
-fn emit_secret_error(error: RuntimeSecretsResolutionErrorV1) {
-    emit_status(error.code(), error.context());
-}
-
-fn emit_configuration_error(error: RuntimeConfigErrorV1) {
-    let context = error.field().map(|field| field.code());
-    emit_status(error.code(), context);
+fn main() -> ExitCode {
+    install_panic_hook();
+    let status = match run_runtime_process_foundation_staging_from_environment_v1() {
+        Ok(_) => RuntimeProcessExitStatusV1::FoundationVerifiedAndClosed,
+        Err(error) => RuntimeProcessExitStatusV1::Failed(error),
+    };
+    emit_status(status.code(), status.context());
+    status.exit_code()
 }
 
 fn emit_status(status: &str, context: Option<&str>) {
@@ -53,16 +68,44 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starring_runtime::{
+        RuntimeBuildRevisionBootstrapErrorV1, RuntimeConfigErrorV1, RuntimeConfigurationFieldV1,
+        RuntimeDatabasePoolShutdownErrorV1,
+    };
 
     #[test]
-    fn configuration_errors_emit_only_finite_status_context() {
-        let error = RuntimeConfigErrorV1::InvalidValue(
-            starring_runtime::RuntimeConfigurationFieldV1::HealthBindAddress,
+    fn status_codes_context_and_exit_classes_are_finite() {
+        let staged = RuntimeProcessExitStatusV1::FoundationVerifiedAndClosed;
+        let configuration = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessFoundationStagingErrorV1::Configuration(RuntimeConfigErrorV1::Missing(
+                RuntimeConfigurationFieldV1::HealthBindAddress,
+            )),
         );
-        assert_eq!(error.code(), "runtime_config_invalid_value");
+        let build = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessFoundationStagingErrorV1::BuildRevision(
+                RuntimeBuildRevisionBootstrapErrorV1::Invalid,
+            ),
+        );
+        let runtime = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessFoundationStagingErrorV1::AsyncRuntimeUnavailable,
+        );
+        let shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessFoundationStagingErrorV1::FoundationShutdown(
+                RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+            ),
+        );
+
         assert_eq!(
-            error.field().map(|field| field.code()),
-            Some("health_bind_address")
+            staged.code(),
+            "runtime_staging_foundation_verified_and_closed"
         );
+        assert_eq!(staged.context(), None);
+        assert_eq!(staged.exit_code(), ExitCode::from(70));
+        assert_eq!(configuration.code(), "runtime_config_missing");
+        assert_eq!(configuration.context(), Some("health_bind_address"));
+        assert_eq!(configuration.exit_code(), ExitCode::from(78));
+        assert_eq!(build.exit_code(), ExitCode::from(78));
+        assert_eq!(runtime.exit_code(), ExitCode::from(70));
+        assert_eq!(shutdown.exit_code(), ExitCode::from(70));
     }
 }

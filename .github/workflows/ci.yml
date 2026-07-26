@@ -11,6 +11,7 @@ permissions:
 
 env:
   STARRING_RUNTIME_BUILD_REVISION: "${{ github.sha }}"
+  STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION: "1"
 
 jobs:
   checks:

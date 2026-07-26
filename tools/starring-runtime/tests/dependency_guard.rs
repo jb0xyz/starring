@@ -487,6 +487,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/main.rs",
             "src/process.rs",
             "src/process_identity.rs",
+            "src/process_startup.rs",
             "src/registry.rs",
             "src/secret.rs",
             "src/startup.rs",
@@ -579,6 +580,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+            && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
@@ -607,10 +609,11 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
     for required in [
         "option_env!(\"STARRING_RUNTIME_BUILD_REVISION\")",
         "const GIT_REVISION_BYTES: usize = 40;",
-        "pub struct CompiledRuntimeBuildRevisionV1 {",
+        "pub(crate) struct CompiledRuntimeBuildRevisionV1 {",
         "revision: RuntimeBuildRevisionV1,",
-        "pub fn bootstrap_compiled_runtime_build_revision_v1(",
-        "pub(crate) fn revision(&self) -> &RuntimeBuildRevisionV1",
+        "pub(crate) fn bootstrap_compiled_runtime_build_revision_v1(",
+        "pub(crate) fn into_revision(self) -> RuntimeBuildRevisionV1",
+        "self.revision",
         "RuntimeBuildRevisionV1::parse(value)",
         "RuntimeBuildRevisionBootstrapErrorV1(<redacted>)",
         "CompiledRuntimeBuildRevisionV1(<redacted>)",
@@ -626,6 +629,9 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
         "trim(",
         "to_ascii_lowercase",
         "STARRING_APPROVED_RELEASE_REVISION",
+        "pub struct CompiledRuntimeBuildRevisionV1",
+        "pub fn bootstrap_compiled_runtime_build_revision_v1",
+        "fn revision(&self)",
     ] {
         assert!(!production.contains(forbidden), "{forbidden}");
     }
@@ -645,6 +651,7 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
         "\"${{ github.sha }}\""
     )));
     assert!(!CI_WORKFLOW.contains("STARRING_APPROVED_RELEASE_REVISION"));
+    assert!(CI_WORKFLOW.contains("STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION: \"1\""));
 }
 
 #[test]
@@ -2105,21 +2112,58 @@ fn startup_budget_is_single_origin_linear_monotonic_and_partitioned() {
         .map(|(_, source)| source.as_str())
         .unwrap();
     let production = source_before_test_module(startup);
-    let begin = braced_declaration(production, "pub fn begin()");
+    let begin = braced_declaration(production, "pub(crate) fn begin()");
+    let sync_stage = braced_declaration(
+        production,
+        "pub(crate) fn run_runtime_startup_sync_stage_v1<T, E, C, S>(",
+    );
 
     for required in [
         "const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);",
         "const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);",
+        "pub(crate) struct RuntimeStartupBudgetV1 {",
         "operation_cutoff: started_at + STARTUP_OPERATION_WINDOW",
         "cleanup_deadline: started_at + STARTUP_TOTAL_WINDOW",
         "now < self.operation_cutoff",
+        "pub(crate) enum RuntimeStartupSyncStageErrorV1<E>",
+        "RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed",
+        "RuntimeStartupSyncStageErrorV1::Stage",
         "RuntimeStartupBudgetV1(<redacted>)",
     ] {
         assert!(production.contains(required), "{required}");
     }
     assert_eq!(begin.matches("Instant::now()").count(), 1);
+    let checks = sync_stage
+        .match_indices("if !operation_is_open()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let stage = sync_stage.find("let result = stage();").unwrap();
+    let result = sync_stage
+        .find("result.map_err(RuntimeStartupSyncStageErrorV1::Stage)")
+        .unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks[0] < stage && stage < checks[1] && checks[1] < result);
+    assert_eq!(sync_stage.matches("stage()").count(), 1);
+    let begin_origins = sources
+        .iter()
+        .filter(|(path, _)| path.starts_with("src"))
+        .flat_map(|(path, source)| {
+            let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            production
+                .match_indices("RuntimeStartupBudgetV1::begin()")
+                .map(move |_| path.as_path())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(begin_origins, [Path::new("src/process_startup.rs")]);
     assert!(!contains_identifier(production, "SystemTime"));
     assert!(!contains_identifier(production, "tokio"));
+    for forbidden in [
+        "pub struct RuntimeStartupBudgetV1",
+        "pub enum RuntimeStartupSyncStageErrorV1",
+        "pub fn run_runtime_startup_sync_stage_v1",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
     let attributes = declaration_attribute_block(production, "RuntimeStartupBudgetV1");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
         assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
@@ -2139,12 +2183,13 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         .find(|(path, _)| path == Path::new("src/secret.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
+    let production = source_before_test_module(secret);
     for required in [
         "Command::new(\"/usr/bin/security\")",
         ".env_clear()",
         "KEYCHAIN_TIMEOUT",
+        "KEYCHAIN_CLEANUP_WINDOW",
         "KEYCHAIN_CAPTURE_BYTES",
-        "terminate_and_reap",
         "child.kill()",
         "child.wait()",
         "Zeroizing<String>",
@@ -2154,8 +2199,28 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         "RuntimeDatabasePasswordV1(<redacted>)",
         "RuntimeDiscordBotTokenV1(<redacted>)",
         "RuntimeDatabaseUrlSecretV1(<redacted>)",
+        "RuntimeSecretsStartupResolutionErrorV1(<redacted>)",
+        "pub(crate) fn resolve_runtime_secrets_until_v1(",
+        "startup_budget: &RuntimeStartupBudgetV1",
+        "startup_budget.operation_cutoff()",
+        "startup_budget.cleanup_deadline()",
+        "operation_cutoff: Instant",
+        "cleanup_deadline: Instant",
+        "run_runtime_startup_sync_stage_v1(",
+        "Instant::now() < operation_cutoff",
+        "local_deadline.min(operation_cutoff)",
+        "fn run_keychain_command_until(",
+        "fn capture_keychain_child_until(",
+        "fn cancel_keychain_child_until(",
+        "struct KeychainReaperDispatchV1",
+        "KeychainReaperDispatchV1::start()",
+        "starring-runtime-keychain-reaper",
+        "capture_bounded_until_cancelled",
+        "cancellation.store(true, Ordering::Release)",
+        "join_keychain_captures",
+        "runtime_secret_keychain_cleanup_timed_out",
     ] {
-        assert!(secret.contains(required), "{required}");
+        assert!(production.contains(required), "{required}");
     }
     for forbidden in [
         "sqlx",
@@ -2164,37 +2229,361 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         "twilight_gateway",
         "Url",
         "into_zeroizing",
+        "spawn_blocking",
+        "timeout_at",
     ] {
-        assert!(!contains_identifier(secret, forbidden), "{forbidden}");
+        assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
     for forbidden in [
         "pub type RuntimeDatabaseConnectionPartsV1",
         "pub fn into_zeroizing",
+        "pub fn resolve_runtime_secrets_until_v1",
+        "resolve_runtime_secrets_v1",
+        "terminate_and_reap",
     ] {
-        assert!(!secret.contains(forbidden), "{forbidden}");
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let keychain_runner = braced_declaration(production, "fn run_keychain_command_until(");
+    let deadline_checks = keychain_runner
+        .match_indices("if now >= operation_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let cleanup_checks = keychain_runner
+        .match_indices("if now >= cleanup_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let configure = keychain_runner
+        .find("configure_keychain_command(&mut command)")
+        .unwrap();
+    let reaper = keychain_runner
+        .find("KeychainReaperDispatchV1::start()")
+        .unwrap();
+    let spawn = keychain_runner.find(".spawn()").unwrap();
+    let capture = keychain_runner
+        .find("capture_keychain_child_until(")
+        .unwrap();
+    assert_eq!(deadline_checks.len(), 2);
+    assert_eq!(cleanup_checks.len(), 2);
+    assert!(
+        deadline_checks[0] < cleanup_checks[0]
+            && cleanup_checks[0] < configure
+            && configure < reaper
+            && reaper < deadline_checks[1]
+            && deadline_checks[1] < cleanup_checks[1]
+            && cleanup_checks[1] < spawn
+            && reaper < spawn
+            && spawn < capture
+    );
+    let keychain_capture = braced_declaration(production, "fn capture_keychain_child_until(");
+    let capture_deadline_checks = keychain_capture
+        .match_indices("if Instant::now() >= operation_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let stdout_pipe = keychain_capture.find("child.stdout.take()").unwrap();
+    let stdout_thread = keychain_capture
+        .find("starring-runtime-keychain-stdout")
+        .unwrap();
+    let stderr_thread = keychain_capture
+        .find("starring-runtime-keychain-stderr")
+        .unwrap();
+    let status_wait = keychain_capture.find("let status = loop").unwrap();
+    assert_eq!(capture_deadline_checks.len(), 6);
+    assert!(
+        capture_deadline_checks[0] < stdout_pipe
+            && stdout_pipe < capture_deadline_checks[1]
+            && capture_deadline_checks[1] < stdout_thread
+            && stdout_thread < capture_deadline_checks[2]
+            && capture_deadline_checks[2] < stderr_thread
+            && stderr_thread < capture_deadline_checks[3]
+            && capture_deadline_checks[3] < status_wait
+    );
+    let captures_complete = keychain_capture
+        .find("stdout_capture.is_finished() || !stderr_capture.is_finished()")
+        .unwrap();
+    let operation_postcheck = keychain_capture[captures_complete..]
+        .find("if Instant::now() >= operation_deadline")
+        .map(|offset| captures_complete + offset)
+        .unwrap();
+    let join = keychain_capture.find("join_keychain_captures(").unwrap();
+    let final_postcheck = keychain_capture[join..]
+        .find("if Instant::now() >= operation_deadline")
+        .map(|offset| join + offset)
+        .unwrap();
+    let capture_result = keychain_capture
+        .find("let (stdout, stderr) = captures?")
+        .unwrap();
+    assert!(
+        captures_complete < operation_postcheck
+            && operation_postcheck < join
+            && join < final_postcheck
+            && final_postcheck < capture_result
+    );
+    assert!(!keychain_capture.contains("child.wait()"));
+    let cancellation = braced_declaration(production, "fn cancel_keychain_child_until(");
+    let cancel = cancellation
+        .find("cancellation.store(true, Ordering::Release)")
+        .unwrap();
+    let kill = cancellation.find("child.kill()").unwrap();
+    let observe_child = cancellation.find("child.try_wait()").unwrap();
+    let observe_captures = cancellation.find("capture_finished(").unwrap();
+    let cleanup_cutoff = cancellation
+        .find("if Instant::now() >= cleanup_deadline")
+        .unwrap();
+    let completed = cancellation
+        .find("if child_finished && captures_finished")
+        .unwrap();
+    let dispatch = cancellation.find("reaper.dispatch(").unwrap();
+    assert!(
+        cancel < kill
+            && kill < observe_child
+            && observe_child < observe_captures
+            && observe_captures < cleanup_cutoff
+            && cleanup_cutoff < completed
+            && completed < dispatch
+    );
+    assert!(!cancellation.contains("child.wait()"));
+    assert!(!cancellation.contains(".join()"));
+    let reaper_start = braced_declaration(
+        production,
+        "fn start() -> Result<Self, KeychainSecretReadErrorV1>",
+    );
+    assert!(reaper_start.contains("starring-runtime-keychain-reaper"));
+    assert!(reaper_start.contains("payload.child.wait()"));
+    assert!(reaper_start.contains("join_optional_keychain_captures("));
+    let reaper_dispatch = braced_declaration(production, "fn dispatch(");
+    assert!(reaper_dispatch.contains("self.sender.send(payload)"));
+    assert!(reaper_dispatch.contains("std::process::abort()"));
+    assert!(
+        secret.contains("keychain_cleanup_cutoff_returns_before_late_capture_and_reaper_finishes")
+    );
+    assert!(production.contains("#[cfg(all(test, unix))]\nfn run_keychain_command("));
+    assert!(production.contains("#[cfg(all(test, unix))]\nfn capture_keychain_child("));
+    let resolver = braced_declaration(production, "fn resolve_until<");
+    assert_eq!(
+        resolver
+            .matches("run_runtime_startup_sync_stage_v1(")
+            .count(),
+        2
+    );
+    for capability in [
+        "DatabaseCapabilityV1::Convergence",
+        "DatabaseCapabilityV1::ExactTarget",
+        "DatabaseCapabilityV1::Panel",
+        "DatabaseCapabilityV1::Serving",
+        "DatabaseCapabilityV1::Interaction",
+    ] {
+        assert_eq!(resolver.matches(capability).count(), 1, "{capability}");
     }
 }
 
 #[test]
-fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
+fn process_startup_is_the_single_ordered_bounded_foundation_entry() {
     let sources = source_files();
-    let main = sources
+    let process_startup = sources
         .iter()
-        .find(|(path, _)| path == Path::new("src/main.rs"))
+        .find(|(path, _)| path == Path::new("src/process_startup.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
-    assert!(main.contains("RuntimeConfigV1::from_process_environment"));
-    assert!(main.contains("resolve_runtime_secrets_v1"));
-    assert!(main.contains("runtime_not_composed"));
-    assert!(!main.contains("compose_runtime_database_dependencies_v1"));
-    for forbidden in [
-        "health_ready",
-        "ready_to_serve",
-        "gateway_connected",
-        "compose_runtime_gateway_bootstrap_v1",
-        "RuntimeGatewayBootstrapV1",
+    let production = source_before_test_module(process_startup);
+    let entry = braced_declaration(
+        production,
+        "pub fn run_runtime_process_foundation_staging_from_environment_v1(",
+    );
+    let staging = braced_declaration(
+        production,
+        "async fn stage_runtime_process_foundation_from_environment_v1(",
+    );
+    let config = staging
+        .find("RuntimeConfigV1::from_process_environment")
+        .unwrap();
+    let secrets = staging.find("resolve_runtime_secrets_until_v1").unwrap();
+    let revision = staging
+        .find("bootstrap_compiled_runtime_build_revision_v1")
+        .unwrap();
+    let foundation = staging
+        .find("compose_runtime_process_foundation_v1")
+        .unwrap();
+    let shutdown = staging.find(".shutdown()").unwrap();
+    let outcome = staging
+        .find("Ok(RuntimeProcessFoundationStagingOutcomeV1")
+        .unwrap();
+    assert!(
+        config < secrets
+            && secrets < revision
+            && revision < foundation
+            && foundation < shutdown
+            && shutdown < outcome
+    );
+    assert_eq!(
+        staging
+            .matches("run_runtime_startup_sync_stage_v1(")
+            .count(),
+        3
+    );
+    for operation in [
+        "RuntimeConfigV1::from_process_environment",
+        "resolve_runtime_secrets_until_v1",
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "compose_runtime_process_foundation_v1",
+        ".shutdown()",
     ] {
-        assert!(!main.contains(forbidden));
+        assert_eq!(staging.matches(operation).count(), 1, "{operation}");
+    }
+    assert_eq!(
+        entry.matches("run_runtime_startup_sync_stage_v1(").count(),
+        1
+    );
+    let entry_body = entry.split_once('{').unwrap().1.trim_start();
+    assert!(entry_body.starts_with("let startup_budget = RuntimeStartupBudgetV1::begin();"));
+    let budget = entry.find("RuntimeStartupBudgetV1::begin()").unwrap();
+    let active_runtime = entry.find("tokio::runtime::Handle::try_current()").unwrap();
+    let runtime_stage = entry.find("run_runtime_startup_sync_stage_v1(").unwrap();
+    let runtime_builder = entry
+        .find("tokio::runtime::Builder::new_current_thread()")
+        .unwrap();
+    let block_on = entry
+        .find("runtime.block_on(stage_runtime_process_foundation_from_environment_v1(")
+        .unwrap();
+    assert!(
+        budget < active_runtime
+            && active_runtime < runtime_stage
+            && runtime_stage < runtime_builder
+            && runtime_builder < block_on
+    );
+    assert_eq!(
+        entry
+            .matches("stage_runtime_process_foundation_from_environment_v1(")
+            .count(),
+        1
+    );
+    for required in [
+        "tokio::runtime::Handle::try_current()",
+        "tokio::runtime::Builder::new_current_thread()",
+        ".enable_all()",
+        ".build()",
+        "runtime.block_on(stage_runtime_process_foundation_from_environment_v1(",
+        "RuntimeProcessFoundationStagingErrorV1(<redacted>)",
+        "RuntimeProcessFoundationStagingOutcomeV1(<redacted>)",
+        "pub const fn code(self) -> &'static str",
+        "pub const fn context(self) -> Option<&'static str>",
+        "pub const fn configuration_class(self) -> bool",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for operation in [
+        "tokio::runtime::Handle::try_current()",
+        "tokio::runtime::Builder::new_current_thread()",
+        ".build()",
+        "runtime.block_on(stage_runtime_process_foundation_from_environment_v1(",
+    ] {
+        assert_eq!(entry.matches(operation).count(), 1, "{operation}");
+    }
+    for forbidden in [
+        "#[tokio::main]",
+        "new_multi_thread",
+        "tokio::spawn",
+        "spawn_blocking",
+        "tokio::select!",
+        "timeout(",
+        "timeout_at",
+        "signal",
+        "sleep",
+        "retry",
+        "loop {",
+        "compose_runtime_database_dependencies_v1",
+        "compose_runtime_registry_bootstrap_v1",
+        "compose_runtime_gateway_bootstrap_v1",
+        "start_gateway_owner_startup_watchdog_v1",
+        "observe_current_ready_attestation",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "activate",
+        "deploy",
+        "twilight",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let outcome_attributes =
+        declaration_attribute_block(production, "RuntimeProcessFoundationStagingOutcomeV1");
+    let outcome_declaration = braced_declaration(
+        production,
+        "pub struct RuntimeProcessFoundationStagingOutcomeV1",
+    );
+    assert!(outcome_declaration.contains("_private: ()"));
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(outcome_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            production,
+            "RuntimeProcessFoundationStagingOutcomeV1",
+            forbidden,
+        ));
+    }
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "run_runtime_process_foundation_staging_from_environment_v1",
+        "RuntimeProcessFoundationStagingErrorV1",
+        "RuntimeProcessFoundationStagingOutcomeV1",
+    ] {
+        assert_eq!(library.matches(required).count(), 1, "{required}");
+    }
+    for forbidden in [
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "CompiledRuntimeBuildRevisionV1",
+        "compose_runtime_process_foundation_v1",
+        "RuntimeProcessFoundationV1",
+        "resolve_runtime_secrets_until_v1",
+        "resolve_runtime_secrets_v1",
+        "RuntimeStartupBudgetV1",
+        "run_runtime_startup_sync_stage_v1",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
+    let main = source_before_test_module(include_str!("../src/main.rs"));
+    let entry = braced_declaration(main, "fn main() -> ExitCode");
+    assert_eq!(
+        entry
+            .matches("run_runtime_process_foundation_staging_from_environment_v1()")
+            .count(),
+        1
+    );
+    assert!(entry.contains("emit_status(status.code(), status.context())"));
+    assert!(entry.contains("status.exit_code()"));
+    for forbidden in [
+        "#[tokio::main]",
+        "tokio",
+        ".await",
+        "RuntimeConfigV1",
+        "from_process_environment",
+        "resolve_runtime_secrets",
+        "RuntimeStartupBudgetV1",
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "CompiledRuntimeBuildRevisionV1",
+        "compose_runtime_process_foundation_v1",
+        "RuntimeProcessFoundationV1",
+        "compose_runtime_database_dependencies_v1",
+        "compose_runtime_registry_bootstrap_v1",
+        "compose_runtime_gateway_bootstrap_v1",
+        "start_gateway_owner_startup_watchdog_v1",
+        "tokio::spawn",
+        "spawn_blocking",
+        "tokio::select!",
+        "signal",
+        "sleep",
+        "retry",
+        "loop {",
+        "ready_to_serve",
+        "health_ready",
+        "twilight",
+    ] {
+        assert!(!main.contains(forbidden), "{forbidden}");
     }
 }
 
@@ -2209,7 +2598,7 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     let production = source_before_test_module(process);
     let composer = braced_declaration(
         production,
-        "pub async fn compose_runtime_process_foundation_v1(",
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
     );
     let deadline_before_process_identity = composer
         .find("if !startup_budget.operation_is_open()")
@@ -2234,11 +2623,19 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     let controller_identity_error = composer
         .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ControllerId)")
         .unwrap();
+    let build_revision = composer.find("build_revision.into_revision()").unwrap();
     let databases = composer
-        .find("compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)")
+        .find("compose_runtime_database_dependencies_v1(&config, &secrets, &startup_budget)")
         .unwrap();
     let closed = composer
         .find("compose_closed_process_components_v1(&process_instance_id, config.gateway())")
+        .unwrap();
+    let deadline_after_closed_result = composer[closed..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| closed + offset)
+        .unwrap();
+    let closed_result = composer
+        .find("let closed_components = match closed_components")
         .unwrap();
     let cleanup = composer
         .find(".close_until(startup_budget.cleanup_deadline())")
@@ -2251,19 +2648,23 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
             && process_identity_error < controller_identity
             && controller_identity < deadline_after_controller_identity
             && deadline_after_controller_identity < controller_identity_error
-            && controller_identity_error < databases
+            && controller_identity_error < build_revision
+            && build_revision < databases
             && databases < closed
-            && closed < cleanup
+            && closed < deadline_after_closed_result
+            && deadline_after_closed_result < closed_result
+            && closed_result < cleanup
     );
     for required in [
+        "pub(crate) struct RuntimeProcessFoundationV1",
+        "config: RuntimeConfigV1,",
+        "secrets: ResolvedRuntimeSecretsV1,",
+        "build_revision: RuntimeBuildRevisionV1,",
         "build_revision: CompiledRuntimeBuildRevisionV1",
-        "build_revision: CompiledRuntimeBuildRevisionV1,",
+        "build_revision.into_revision()",
         "build_revision,",
-        "pub fn runtime_build_revision(&self) -> &RuntimeBuildRevisionV1",
         "process_instance_id: ProcessInstanceId,",
-        "pub fn process_instance_id(&self) -> &ProcessInstanceId",
         "controller_id: ControllerId,",
-        "pub fn controller_id(&self) -> &ControllerId",
         "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
@@ -2273,8 +2674,9 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "cleanup_after_operation_deadline_v1",
         "RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed",
         "RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline",
-        "pub async fn shutdown(self)",
+        "pub(crate) async fn shutdown(self)",
         "shutdown.close_until(cleanup_deadline).await",
+        "finish_runtime_process_foundation_shutdown_v1(",
         "let Self {",
         "drop((",
     ] {
@@ -2284,7 +2686,7 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         composer
             .matches("if !startup_budget.operation_is_open()")
             .count(),
-        5
+        6
     );
     assert_eq!(
         composer
@@ -2298,11 +2700,24 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
             .count(),
         1
     );
+    assert_eq!(
+        composer.matches("build_revision.into_revision()").count(),
+        1
+    );
     let signature = production
-        .split("pub async fn compose_runtime_process_foundation_v1(")
+        .split("pub(crate) async fn compose_runtime_process_foundation_v1(")
         .nth(1)
         .and_then(|source| source.split(") -> Result<").next())
         .unwrap();
+    for owned in [
+        "config: RuntimeConfigV1",
+        "secrets: ResolvedRuntimeSecretsV1",
+        "build_revision: CompiledRuntimeBuildRevisionV1",
+    ] {
+        assert!(signature.contains(owned), "{owned}");
+    }
+    assert!(!signature.contains("config: &RuntimeConfigV1"));
+    assert!(!signature.contains("secrets: &ResolvedRuntimeSecretsV1"));
     assert!(!signature.contains("process_instance_id: ProcessInstanceId"));
     assert!(!signature.contains("controller_id: ControllerId"));
     assert!(!signature.contains("build_revision: RuntimeBuildRevisionV1"));
@@ -2316,17 +2731,64 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "observe_current_ready_attestation()?",
         "Discord",
         "RuntimeStartupBudgetV1::begin()",
+        "pub struct RuntimeProcessFoundationV1",
+        "pub async fn compose_runtime_process_foundation_v1",
+        "pub async fn shutdown(self)",
+        "pub fn runtime_build_revision(&self)",
+        "pub fn process_instance_id(&self)",
+        "pub fn controller_id(&self)",
         "pub fn databases(&self)",
         "pub fn registry(&self)",
         "pub fn gateway(&self)",
     ] {
         assert!(!production.contains(forbidden), "{forbidden}");
     }
-    let shutdown = braced_declaration(production, "pub async fn shutdown(self)");
+    assert!(!composer.contains("drop(secrets)"));
+    assert!(!composer.contains("drop(config)"));
+    let shutdown = braced_declaration(production, "pub(crate) async fn shutdown(self)");
+    let cleanup_deadline = shutdown
+        .find("let cleanup_deadline = startup_budget.cleanup_deadline()")
+        .unwrap();
+    let shutdown_handle = shutdown
+        .find("let shutdown = databases.shutdown()")
+        .unwrap();
+    let closed_components = shutdown
+        .find("drop((gateway, registry, databases))")
+        .unwrap();
+    let close = shutdown
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    let release_handle = shutdown.find("drop(shutdown)").unwrap();
+    let finish = shutdown
+        .find("finish_runtime_process_foundation_shutdown_v1(")
+        .unwrap();
+    assert!(
+        cleanup_deadline < shutdown_handle
+            && shutdown_handle < closed_components
+            && closed_components < close
+            && close < release_handle
+            && release_handle < finish
+    );
     assert!(shutdown.contains("let cleanup_deadline = startup_budget.cleanup_deadline()"));
     assert!(shutdown.contains("shutdown.close_until(cleanup_deadline).await"));
     assert!(!shutdown.contains("shutdown.close().await"));
     assert!(!composer.contains("shutdown.close().await"));
+    let finish_shutdown = braced_declaration(
+        production,
+        "fn finish_runtime_process_foundation_shutdown_v1<S, R>(",
+    );
+    let drop_secrets = finish_shutdown.find("drop(secrets)").unwrap();
+    let drop_retained = finish_shutdown.find("drop(retained)").unwrap();
+    let return_result = finish_shutdown.rfind("result").unwrap();
+    assert!(drop_secrets < drop_retained && drop_retained < return_result);
+    for required in [
+        "shutdown_finish_drops_secrets_only_after_close_returns_on_every_result",
+        "[\"pool_close_returned\", \"secrets\", \"retained\"]",
+        "assert_shutdown_finish_drop_order(Ok(()))",
+        "assert_shutdown_finish_drop_order(Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut))",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
     for name in [
         "RuntimeProcessFoundationV1",
         "RuntimeClosedProcessComponentsV1",

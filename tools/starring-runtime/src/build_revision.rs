@@ -33,14 +33,8 @@ impl Debug for RuntimeBuildRevisionBootstrapErrorV1 {
     }
 }
 
-pub struct CompiledRuntimeBuildRevisionV1 {
+pub(crate) struct CompiledRuntimeBuildRevisionV1 {
     revision: RuntimeBuildRevisionV1,
-}
-
-impl CompiledRuntimeBuildRevisionV1 {
-    pub(crate) fn revision(&self) -> &RuntimeBuildRevisionV1 {
-        &self.revision
-    }
 }
 
 impl Debug for CompiledRuntimeBuildRevisionV1 {
@@ -49,7 +43,13 @@ impl Debug for CompiledRuntimeBuildRevisionV1 {
     }
 }
 
-pub fn bootstrap_compiled_runtime_build_revision_v1(
+impl CompiledRuntimeBuildRevisionV1 {
+    pub(crate) fn into_revision(self) -> RuntimeBuildRevisionV1 {
+        self.revision
+    }
+}
+
+pub(crate) fn bootstrap_compiled_runtime_build_revision_v1(
 ) -> Result<CompiledRuntimeBuildRevisionV1, RuntimeBuildRevisionBootstrapErrorV1> {
     parse_compiled_runtime_build_revision_v1(COMPILED_RUNTIME_BUILD_REVISION)
 }
@@ -80,7 +80,7 @@ mod tests {
     fn exact_full_git_revision_is_accepted_without_normalization() {
         let revision = parse_compiled_runtime_build_revision_v1(Some(SHA_40)).unwrap();
 
-        assert_eq!(revision.revision().as_str(), SHA_40);
+        assert_eq!(revision.into_revision().as_str(), SHA_40);
     }
 
     #[test]

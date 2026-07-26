@@ -59,14 +59,43 @@ fn configured_command() -> Command {
 }
 
 #[test]
-fn valid_configuration_exits_as_not_composed_without_claiming_readiness() {
+fn valid_runtime_configuration_stays_at_an_exact_closed_boundary() {
     let output = configured_command().output().unwrap();
-    assert_eq!(output.status.code(), Some(70));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "starring_runtime_status=runtime_not_composed\n"
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    if std::env::var_os("STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION").is_some() {
+        assert_eq!(output.status.code(), Some(69));
+        assert_eq!(
+            stderr,
+            "starring_runtime_status=runtime_database_unavailable context=convergence\n"
+        );
+    } else {
+        assert!(
+            matches!(
+                (output.status.code(), stderr.as_str()),
+                (
+                    Some(69),
+                    "starring_runtime_status=runtime_database_unavailable context=convergence\n"
+                ) | (
+                    Some(78),
+                    "starring_runtime_status=runtime_build_revision_missing\n"
+                )
+            ),
+            "runtime did not stop at an exact closed boundary"
+        );
+    }
+    for forbidden in [
+        database_password(),
+        "opaque.discord_bot-token_1234567890abcdef".to_string(),
+        database_socket_path(),
+        "ready".to_string(),
+        "owner".to_string(),
+        "discord".to_string(),
+    ] {
+        assert!(!stderr
+            .to_ascii_lowercase()
+            .contains(&forbidden.to_ascii_lowercase()));
+    }
 }
 
 #[test]
@@ -130,7 +159,18 @@ fn duplicate_database_identity_exits_with_stable_capability_context() {
 
 fn database_url(capability: &str) -> String {
     format!(
-        "postgresql:{}{}runtime_{capability}:{}@db.example:5432/starring?sslmode=verify-full",
-        "/", "/", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-"
+        "postgresql:{}{}runtime_{capability}:{}@localhost:5432/starring?host={}&sslmode=disable",
+        "/",
+        "/",
+        database_password(),
+        database_socket_path()
     )
+}
+
+fn database_password() -> String {
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-".to_string()
+}
+
+fn database_socket_path() -> String {
+    format!("/tmp/starring_runtime_no_postgres_{}", std::process::id())
 }

@@ -37,10 +37,10 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
 
+use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     DatabaseCapabilityV1, DatabasePoolConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
     RuntimeDatabaseConnectionSecretV1, RuntimeDatabaseEndpointV1, RuntimeDatabaseSslModeV1,
-    RuntimeStartupBudgetV1,
 };
 
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);

@@ -4,13 +4,23 @@ use std::io::Read;
 use std::net::IpAddr;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::process::{Child, Command, Stdio};
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicUsize;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{channel, Sender},
+    Arc,
+};
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::thread;
-#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::startup::{
+    run_runtime_startup_sync_stage_v1, RuntimeStartupBudgetV1, RuntimeStartupSyncStageErrorV1,
+};
 use crate::{
     DatabaseCapabilityV1, RuntimeConfigV1, RuntimeSecretReferenceV1, RuntimeSecretReferencesV1,
 };
@@ -21,10 +31,14 @@ const MIN_DISCORD_TOKEN_BYTES: usize = 32;
 const MAX_DISCORD_TOKEN_BYTES: usize = 512;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const KEYCHAIN_CLEANUP_WINDOW: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const KEYCHAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const KEYCHAIN_CAPTURE_BYTES: usize = MAX_SECRET_BYTES + 2;
+#[cfg(all(test, unix))]
+static KEYCHAIN_REAPER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnvironmentSecretReadErrorV1 {
@@ -62,6 +76,8 @@ enum KeychainSecretReadErrorV1 {
     #[cfg(any(target_os = "macos", test))]
     Timeout,
     #[cfg(any(target_os = "macos", test))]
+    CleanupTimedOut,
+    #[cfg(any(target_os = "macos", test))]
     OutputTooLarge,
 }
 
@@ -70,6 +86,8 @@ trait KeychainSecretReaderV1 {
         &self,
         service: &str,
         account: &str,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1>;
 }
 
@@ -81,14 +99,16 @@ impl KeychainSecretReaderV1 for MacOsKeychainSecretReaderV1 {
         &self,
         service: &str,
         account: &str,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
         #[cfg(target_os = "macos")]
         {
-            read_macos_keychain_secret(service, account)
+            read_macos_keychain_secret(service, account, operation_cutoff, cleanup_deadline)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (service, account);
+            let _ = (service, account, operation_cutoff, cleanup_deadline);
             Err(KeychainSecretReadErrorV1::Unavailable)
         }
     }
@@ -98,24 +118,64 @@ impl KeychainSecretReaderV1 for MacOsKeychainSecretReaderV1 {
 fn read_macos_keychain_secret(
     service: &str,
     account: &str,
+    operation_cutoff: Instant,
+    cleanup_deadline: Instant,
 ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
     let mut command = Command::new("/usr/bin/security");
     command
         .args(["find-generic-password", "-w", "-s", service, "-a", account])
         .env_clear();
-    run_keychain_command(command, KEYCHAIN_TIMEOUT)
+    let local_deadline = Instant::now()
+        .checked_add(KEYCHAIN_TIMEOUT)
+        .ok_or(KeychainSecretReadErrorV1::Timeout)?;
+    let command_deadline = local_deadline.min(operation_cutoff);
+    let command_cleanup_deadline = command_deadline
+        .checked_add(KEYCHAIN_CLEANUP_WINDOW)
+        .unwrap_or(cleanup_deadline)
+        .min(cleanup_deadline);
+    run_keychain_command_until(command, command_deadline, command_cleanup_deadline)
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn run_keychain_command(
+fn run_keychain_command_until(
     mut command: Command,
-    timeout: Duration,
+    operation_deadline: Instant,
+    cleanup_deadline: Instant,
 ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+    let now = Instant::now();
+    if now >= operation_deadline {
+        return Err(KeychainSecretReadErrorV1::Timeout);
+    }
+    if now >= cleanup_deadline {
+        return Err(KeychainSecretReadErrorV1::CleanupTimedOut);
+    }
     configure_keychain_command(&mut command);
+    let reaper = KeychainReaperDispatchV1::start()?;
+    let now = Instant::now();
+    if now >= operation_deadline {
+        return Err(KeychainSecretReadErrorV1::Timeout);
+    }
+    if now >= cleanup_deadline {
+        return Err(KeychainSecretReadErrorV1::CleanupTimedOut);
+    }
     let child = command
         .spawn()
         .map_err(|_| KeychainSecretReadErrorV1::Unavailable)?;
-    capture_keychain_child(child, timeout)
+    capture_keychain_child_until(child, operation_deadline, cleanup_deadline, reaper)
+}
+
+#[cfg(all(test, unix))]
+fn run_keychain_command(
+    command: Command,
+    timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+    let operation_deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(KeychainSecretReadErrorV1::Timeout)?;
+    let cleanup_deadline = operation_deadline
+        .checked_add(Duration::from_secs(1))
+        .ok_or(KeychainSecretReadErrorV1::CleanupTimedOut)?;
+    run_keychain_command_until(command, operation_deadline, cleanup_deadline)
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -127,61 +187,167 @@ fn configure_keychain_command(command: &mut Command) {
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn capture_keychain_child(
+fn capture_keychain_child_until(
     mut child: Child,
-    timeout: Duration,
+    operation_deadline: Instant,
+    cleanup_deadline: Instant,
+    reaper: KeychainReaperDispatchV1,
 ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    if Instant::now() >= operation_deadline {
+        return cancel_keychain_child_until(
+            child,
+            None,
+            None,
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Timeout,
+        );
+    }
     let Some(stdout) = child.stdout.take() else {
-        terminate_and_reap(&mut child);
-        return Err(KeychainSecretReadErrorV1::Unavailable);
+        return cancel_keychain_child_until(
+            child,
+            None,
+            None,
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Unavailable,
+        );
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_and_reap(&mut child);
-        return Err(KeychainSecretReadErrorV1::Unavailable);
+        drop(stdout);
+        return cancel_keychain_child_until(
+            child,
+            None,
+            None,
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Unavailable,
+        );
     };
+    if Instant::now() >= operation_deadline {
+        drop((stdout, stderr));
+        return cancel_keychain_child_until(
+            child,
+            None,
+            None,
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Timeout,
+        );
+    }
+    let stdout_cancellation = cancellation.clone();
     let stdout_capture = match thread::Builder::new()
         .name("starring-runtime-keychain-stdout".to_string())
-        .spawn(move || capture_bounded(stdout))
+        .spawn(move || capture_bounded_until_cancelled(stdout, stdout_cancellation))
     {
         Ok(capture) => capture,
         Err(_) => {
-            terminate_and_reap(&mut child);
-            return Err(KeychainSecretReadErrorV1::Unavailable);
+            return cancel_keychain_child_until(
+                child,
+                None,
+                None,
+                cancellation,
+                cleanup_deadline,
+                reaper,
+                KeychainSecretReadErrorV1::Unavailable,
+            );
         }
     };
+    if Instant::now() >= operation_deadline {
+        drop(stderr);
+        return cancel_keychain_child_until(
+            child,
+            Some(stdout_capture),
+            None,
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Timeout,
+        );
+    }
+    let stderr_cancellation = cancellation.clone();
     let stderr_capture = match thread::Builder::new()
         .name("starring-runtime-keychain-stderr".to_string())
-        .spawn(move || capture_bounded(stderr))
+        .spawn(move || capture_bounded_until_cancelled(stderr, stderr_cancellation))
     {
         Ok(capture) => capture,
         Err(_) => {
-            terminate_and_reap(&mut child);
-            let _ = stdout_capture.join();
-            return Err(KeychainSecretReadErrorV1::Unavailable);
+            return cancel_keychain_child_until(
+                child,
+                Some(stdout_capture),
+                None,
+                cancellation,
+                cleanup_deadline,
+                reaper,
+                KeychainSecretReadErrorV1::Unavailable,
+            );
         }
     };
-    let started_at = Instant::now();
+    if Instant::now() >= operation_deadline {
+        return cancel_keychain_child_until(
+            child,
+            Some(stdout_capture),
+            Some(stderr_capture),
+            cancellation,
+            cleanup_deadline,
+            reaper,
+            KeychainSecretReadErrorV1::Timeout,
+        );
+    }
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started_at.elapsed() < timeout => {
-                thread::sleep(KEYCHAIN_POLL_INTERVAL.min(timeout));
+            Ok(None) if Instant::now() < operation_deadline => {
+                sleep_until_keychain_deadline(operation_deadline);
             }
             Ok(None) => {
-                terminate_and_reap(&mut child);
-                let _ = stdout_capture.join();
-                let _ = stderr_capture.join();
-                return Err(KeychainSecretReadErrorV1::Timeout);
+                return cancel_keychain_child_until(
+                    child,
+                    Some(stdout_capture),
+                    Some(stderr_capture),
+                    cancellation,
+                    cleanup_deadline,
+                    reaper,
+                    KeychainSecretReadErrorV1::Timeout,
+                );
             }
             Err(_) => {
-                terminate_and_reap(&mut child);
-                let _ = stdout_capture.join();
-                let _ = stderr_capture.join();
-                return Err(KeychainSecretReadErrorV1::Unavailable);
+                return cancel_keychain_child_until(
+                    child,
+                    Some(stdout_capture),
+                    Some(stderr_capture),
+                    cancellation,
+                    cleanup_deadline,
+                    reaper,
+                    KeychainSecretReadErrorV1::Unavailable,
+                );
             }
         }
     };
-    let (stdout, stderr) = join_keychain_captures(stdout_capture, stderr_capture)?;
+    while !stdout_capture.is_finished() || !stderr_capture.is_finished() {
+        if Instant::now() >= operation_deadline {
+            return cancel_keychain_child_until(
+                child,
+                Some(stdout_capture),
+                Some(stderr_capture),
+                cancellation,
+                cleanup_deadline,
+                reaper,
+                KeychainSecretReadErrorV1::Timeout,
+            );
+        }
+        sleep_until_keychain_deadline(operation_deadline);
+    }
+    let captures = join_keychain_captures(stdout_capture, stderr_capture);
+    if Instant::now() >= operation_deadline {
+        return Err(KeychainSecretReadErrorV1::Timeout);
+    }
+    let (stdout, stderr) = captures?;
     if stdout.overflowed || stderr.overflowed {
         return Err(KeychainSecretReadErrorV1::OutputTooLarge);
     }
@@ -198,10 +364,138 @@ fn capture_keychain_child(
     Ok(value)
 }
 
+#[cfg(all(test, unix))]
+fn capture_keychain_child(
+    child: Child,
+    timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+    let operation_deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(KeychainSecretReadErrorV1::Timeout)?;
+    let cleanup_deadline = operation_deadline
+        .checked_add(Duration::from_secs(1))
+        .ok_or(KeychainSecretReadErrorV1::CleanupTimedOut)?;
+    let reaper = KeychainReaperDispatchV1::start()?;
+    capture_keychain_child_until(child, operation_deadline, cleanup_deadline, reaper)
+}
+
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn terminate_and_reap(child: &mut Child) {
+fn cancel_keychain_child_until(
+    mut child: Child,
+    stdout_capture: Option<KeychainCaptureHandleV1>,
+    stderr_capture: Option<KeychainCaptureHandleV1>,
+    cancellation: Arc<AtomicBool>,
+    cleanup_deadline: Instant,
+    reaper: KeychainReaperDispatchV1,
+    primary: KeychainSecretReadErrorV1,
+) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+    cancellation.store(true, Ordering::Release);
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        let child_finished = matches!(child.try_wait(), Ok(Some(_)));
+        let captures_finished =
+            capture_finished(&stdout_capture) && capture_finished(&stderr_capture);
+        if Instant::now() >= cleanup_deadline {
+            if child_finished && captures_finished {
+                join_optional_keychain_captures(stdout_capture, stderr_capture);
+            } else {
+                reaper.dispatch(child, stdout_capture, stderr_capture);
+            }
+            return Err(KeychainSecretReadErrorV1::CleanupTimedOut);
+        }
+        if child_finished && captures_finished {
+            join_optional_keychain_captures(stdout_capture, stderr_capture);
+            return if Instant::now() < cleanup_deadline {
+                Err(primary)
+            } else {
+                Err(KeychainSecretReadErrorV1::CleanupTimedOut)
+            };
+        }
+        sleep_until_keychain_deadline(cleanup_deadline);
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+type KeychainCaptureHandleV1 =
+    thread::JoinHandle<Result<BoundedCaptureV1, KeychainSecretReadErrorV1>>;
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn capture_finished(capture: &Option<KeychainCaptureHandleV1>) -> bool {
+    capture.as_ref().is_none_or(thread::JoinHandle::is_finished)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn join_optional_keychain_captures(
+    stdout_capture: Option<KeychainCaptureHandleV1>,
+    stderr_capture: Option<KeychainCaptureHandleV1>,
+) {
+    if let Some(capture) = stdout_capture {
+        let _ = capture.join();
+    }
+    if let Some(capture) = stderr_capture {
+        let _ = capture.join();
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct KeychainReaperPayloadV1 {
+    child: Child,
+    stdout_capture: Option<KeychainCaptureHandleV1>,
+    stderr_capture: Option<KeychainCaptureHandleV1>,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct KeychainReaperDispatchV1 {
+    sender: Sender<KeychainReaperPayloadV1>,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl KeychainReaperDispatchV1 {
+    fn start() -> Result<Self, KeychainSecretReadErrorV1> {
+        let (sender, receiver) = channel::<KeychainReaperPayloadV1>();
+        thread::Builder::new()
+            .name("starring-runtime-keychain-reaper".to_string())
+            .spawn(move || {
+                let Ok(mut payload) = receiver.recv() else {
+                    return;
+                };
+                let _ = payload.child.kill();
+                let _ = payload.child.wait();
+                join_optional_keychain_captures(payload.stdout_capture, payload.stderr_capture);
+                #[cfg(all(test, unix))]
+                KEYCHAIN_REAPER_COUNT.fetch_sub(1, Ordering::AcqRel);
+            })
+            .map_err(|_| KeychainSecretReadErrorV1::Unavailable)?;
+        Ok(Self { sender })
+    }
+
+    fn dispatch(
+        self,
+        child: Child,
+        stdout_capture: Option<KeychainCaptureHandleV1>,
+        stderr_capture: Option<KeychainCaptureHandleV1>,
+    ) {
+        let payload = KeychainReaperPayloadV1 {
+            child,
+            stdout_capture,
+            stderr_capture,
+        };
+        #[cfg(all(test, unix))]
+        KEYCHAIN_REAPER_COUNT.fetch_add(1, Ordering::AcqRel);
+        if self.sender.send(payload).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+fn keychain_reaper_is_idle() -> bool {
+    KEYCHAIN_REAPER_COUNT.load(Ordering::Acquire) == 0
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn sleep_until_keychain_deadline(deadline: Instant) {
+    thread::sleep(KEYCHAIN_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -223,14 +517,26 @@ struct BoundedCaptureV1 {
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn capture_bounded(mut reader: impl Read) -> Result<BoundedCaptureV1, KeychainSecretReadErrorV1> {
+fn capture_bounded_until_cancelled(
+    mut reader: impl Read,
+    cancellation: Arc<AtomicBool>,
+) -> Result<BoundedCaptureV1, KeychainSecretReadErrorV1> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(KEYCHAIN_CAPTURE_BYTES));
     let mut overflowed = false;
     let mut buffer = Zeroizing::new([0_u8; 1024]);
     loop {
+        if cancellation.load(Ordering::Acquire) {
+            bytes.zeroize();
+            return Err(KeychainSecretReadErrorV1::Timeout);
+        }
         let read = reader
             .read(&mut *buffer)
             .map_err(|_| KeychainSecretReadErrorV1::Unavailable)?;
+        if cancellation.load(Ordering::Acquire) {
+            buffer[..read].zeroize();
+            bytes.zeroize();
+            return Err(KeychainSecretReadErrorV1::Timeout);
+        }
         if read == 0 {
             break;
         }
@@ -243,6 +549,11 @@ fn capture_bounded(mut reader: impl Read) -> Result<BoundedCaptureV1, KeychainSe
     Ok(BoundedCaptureV1 { bytes, overflowed })
 }
 
+#[cfg(all(test, unix))]
+fn capture_bounded(reader: impl Read) -> Result<BoundedCaptureV1, KeychainSecretReadErrorV1> {
+    capture_bounded_until_cancelled(reader, Arc::new(AtomicBool::new(false)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeSecretResolutionErrorV1 {
     Missing,
@@ -252,6 +563,7 @@ pub enum RuntimeSecretResolutionErrorV1 {
     TooLarge,
     KeychainUnavailable,
     KeychainTimeout,
+    KeychainCleanupTimedOut,
 }
 
 impl RuntimeSecretResolutionErrorV1 {
@@ -264,6 +576,7 @@ impl RuntimeSecretResolutionErrorV1 {
             Self::TooLarge => "runtime_secret_too_large",
             Self::KeychainUnavailable => "runtime_secret_keychain_unavailable",
             Self::KeychainTimeout => "runtime_secret_keychain_timeout",
+            Self::KeychainCleanupTimedOut => "runtime_secret_keychain_cleanup_timed_out",
         }
     }
 }
@@ -278,6 +591,7 @@ impl Display for RuntimeSecretResolutionErrorV1 {
             Self::TooLarge => "referenced runtime secret exceeds the supported size",
             Self::KeychainUnavailable => "runtime Keychain secret lookup is unavailable",
             Self::KeychainTimeout => "runtime Keychain secret lookup timed out",
+            Self::KeychainCleanupTimedOut => "runtime Keychain secret cleanup timed out",
         })
     }
 }
@@ -465,6 +779,8 @@ impl<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1> SecretResolverV1<E
     fn resolve(
         &self,
         reference: &RuntimeSecretReferenceV1,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<ResolvedSecretV1, RuntimeSecretResolutionErrorV1> {
         let value = if let Some(name) = reference.environment_name() {
             self.environment
@@ -474,7 +790,7 @@ impl<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1> SecretResolverV1<E
         } else if let Some((service, account)) = reference.keychain_identity() {
             let bytes = self
                 .keychain
-                .read_secret(service, account)
+                .read_secret(service, account, operation_cutoff, cleanup_deadline)
                 .map_err(map_keychain_error)?;
             zeroizing_utf8(bytes)?
         } else {
@@ -486,15 +802,27 @@ impl<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1> SecretResolverV1<E
     fn resolve_database_url(
         &self,
         reference: &RuntimeSecretReferenceV1,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<RuntimeDatabaseUrlSecretV1, RuntimeSecretResolutionErrorV1> {
-        RuntimeDatabaseUrlSecretV1::parse(self.resolve(reference)?)
+        RuntimeDatabaseUrlSecretV1::parse(self.resolve(
+            reference,
+            operation_cutoff,
+            cleanup_deadline,
+        )?)
     }
 
     fn resolve_discord_bot_token(
         &self,
         reference: &RuntimeSecretReferenceV1,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
     ) -> Result<RuntimeDiscordBotTokenV1, RuntimeSecretResolutionErrorV1> {
-        RuntimeDiscordBotTokenV1::parse(self.resolve(reference)?)
+        RuntimeDiscordBotTokenV1::parse(self.resolve(
+            reference,
+            operation_cutoff,
+            cleanup_deadline,
+        )?)
     }
 }
 
@@ -556,6 +884,18 @@ impl std::error::Error for RuntimeSecretsResolutionErrorV1 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeSecretsStartupResolutionErrorV1 {
+    OperationDeadlineElapsed,
+    Resolution(RuntimeSecretsResolutionErrorV1),
+}
+
+impl Debug for RuntimeSecretsStartupResolutionErrorV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeSecretsStartupResolutionErrorV1(<redacted>)")
+    }
+}
+
 pub struct RuntimeDatabaseSecretsByCapabilityV1 {
     convergence: RuntimeDatabaseUrlSecretV1,
     exact_target: RuntimeDatabaseUrlSecretV1,
@@ -602,21 +942,57 @@ pub struct ResolvedRuntimeSecretsV1 {
     discord_bot_token: RuntimeDiscordBotTokenV1,
 }
 
-pub fn resolve_runtime_secrets_v1(
+pub(crate) fn resolve_runtime_secrets_until_v1(
     config: &RuntimeConfigV1,
-) -> Result<ResolvedRuntimeSecretsV1, RuntimeSecretsResolutionErrorV1> {
-    ResolvedRuntimeSecretsV1::resolve(config.secret_references(), &SecretResolverV1::default())
+    startup_budget: &RuntimeStartupBudgetV1,
+) -> Result<ResolvedRuntimeSecretsV1, RuntimeSecretsStartupResolutionErrorV1> {
+    ResolvedRuntimeSecretsV1::resolve_until(
+        config.secret_references(),
+        &SecretResolverV1::default(),
+        startup_budget.operation_cutoff(),
+        startup_budget.cleanup_deadline(),
+    )
 }
 
 impl ResolvedRuntimeSecretsV1 {
+    #[cfg(test)]
     fn resolve<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1>(
         references: &RuntimeSecretReferencesV1,
         resolver: &SecretResolverV1<E, K>,
     ) -> Result<Self, RuntimeSecretsResolutionErrorV1> {
+        let operation_cutoff = Instant::now().checked_add(Duration::from_secs(60)).unwrap();
+        let cleanup_deadline = operation_cutoff
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
+        match Self::resolve_until(references, resolver, operation_cutoff, cleanup_deadline) {
+            Ok(resolved) => Ok(resolved),
+            Err(RuntimeSecretsStartupResolutionErrorV1::Resolution(error)) => Err(error),
+            Err(RuntimeSecretsStartupResolutionErrorV1::OperationDeadlineElapsed) => {
+                panic!("test secret resolution deadline elapsed")
+            }
+        }
+    }
+
+    fn resolve_until<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1>(
+        references: &RuntimeSecretReferencesV1,
+        resolver: &SecretResolverV1<E, K>,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<Self, RuntimeSecretsStartupResolutionErrorV1> {
         let resolve_database_url = |capability| {
-            resolver
-                .resolve_database_url(references.database_url(capability))
-                .map_err(|source| RuntimeSecretsResolutionErrorV1::Database { capability, source })
+            map_startup_secret_stage_v1(
+                run_runtime_startup_sync_stage_v1(
+                    || Instant::now() < operation_cutoff,
+                    || {
+                        resolver.resolve_database_url(
+                            references.database_url(capability),
+                            operation_cutoff,
+                            cleanup_deadline,
+                        )
+                    },
+                ),
+                |source| RuntimeSecretsResolutionErrorV1::Database { capability, source },
+            )
         };
         let database_urls = RuntimeDatabaseSecretsByCapabilityV1 {
             convergence: resolve_database_url(DatabaseCapabilityV1::Convergence)?,
@@ -626,11 +1002,23 @@ impl ResolvedRuntimeSecretsV1 {
             interaction: resolve_database_url(DatabaseCapabilityV1::Interaction)?,
         };
         if let Some(capability) = database_urls.duplicate_capability() {
-            return Err(RuntimeSecretsResolutionErrorV1::DuplicateDatabaseIdentity { capability });
+            return Err(RuntimeSecretsStartupResolutionErrorV1::Resolution(
+                RuntimeSecretsResolutionErrorV1::DuplicateDatabaseIdentity { capability },
+            ));
         }
-        let discord_bot_token = resolver
-            .resolve_discord_bot_token(references.discord_bot_token())
-            .map_err(|source| RuntimeSecretsResolutionErrorV1::DiscordBotToken { source })?;
+        let discord_bot_token = map_startup_secret_stage_v1(
+            run_runtime_startup_sync_stage_v1(
+                || Instant::now() < operation_cutoff,
+                || {
+                    resolver.resolve_discord_bot_token(
+                        references.discord_bot_token(),
+                        operation_cutoff,
+                        cleanup_deadline,
+                    )
+                },
+            ),
+            |source| RuntimeSecretsResolutionErrorV1::DiscordBotToken { source },
+        )?;
         Ok(Self {
             database_urls,
             discord_bot_token,
@@ -643,6 +1031,21 @@ impl ResolvedRuntimeSecretsV1 {
 
     pub fn discord_bot_token(&self) -> &RuntimeDiscordBotTokenV1 {
         &self.discord_bot_token
+    }
+}
+
+fn map_startup_secret_stage_v1<T>(
+    result: Result<T, RuntimeStartupSyncStageErrorV1<RuntimeSecretResolutionErrorV1>>,
+    map_error: impl FnOnce(RuntimeSecretResolutionErrorV1) -> RuntimeSecretsResolutionErrorV1,
+) -> Result<T, RuntimeSecretsStartupResolutionErrorV1> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed) => {
+            Err(RuntimeSecretsStartupResolutionErrorV1::OperationDeadlineElapsed)
+        }
+        Err(RuntimeStartupSyncStageErrorV1::Stage(error)) => Err(
+            RuntimeSecretsStartupResolutionErrorV1::Resolution(map_error(error)),
+        ),
     }
 }
 
@@ -932,13 +1335,19 @@ fn map_keychain_error(error: KeychainSecretReadErrorV1) -> RuntimeSecretResoluti
         #[cfg(any(target_os = "macos", test))]
         KeychainSecretReadErrorV1::Timeout => RuntimeSecretResolutionErrorV1::KeychainTimeout,
         #[cfg(any(target_os = "macos", test))]
+        KeychainSecretReadErrorV1::CleanupTimedOut => {
+            RuntimeSecretResolutionErrorV1::KeychainCleanupTimedOut
+        }
+        #[cfg(any(target_os = "macos", test))]
         KeychainSecretReadErrorV1::OutputTooLarge => RuntimeSecretResolutionErrorV1::TooLarge,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     use super::*;
 
@@ -966,12 +1375,30 @@ mod tests {
         error: Option<KeychainSecretReadErrorV1>,
     }
 
+    struct CountingEnvironmentV1 {
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl EnvironmentSecretReaderV1 for CountingEnvironmentV1 {
+        fn read_secret(
+            &self,
+            _name: &str,
+        ) -> Result<Option<Zeroizing<String>>, EnvironmentSecretReadErrorV1> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(None)
+        }
+    }
+
     impl KeychainSecretReaderV1 for FakeKeychainV1 {
         fn read_secret(
             &self,
             service: &str,
             account: &str,
+            operation_cutoff: Instant,
+            cleanup_deadline: Instant,
         ) -> Result<Zeroizing<Vec<u8>>, KeychainSecretReadErrorV1> {
+            assert!(Instant::now() < operation_cutoff);
+            assert!(operation_cutoff < cleanup_deadline);
             if let Some(error) = self.error {
                 return Err(error);
             }
@@ -1029,6 +1456,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn expired_absolute_keychain_deadline_skips_process_spawn() {
+        let command = process_command("/__starring_runtime_missing_keychain_program");
+        let operation_deadline = Instant::now();
+        let cleanup_deadline = operation_deadline
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(
+            run_keychain_command_until(command, operation_deadline, cleanup_deadline).unwrap_err(),
+            KeychainSecretReadErrorV1::Timeout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn keychain_process_runner_kills_and_reaps_on_timeout() {
         let mut command = process_command("/bin/sleep");
         command.arg("10");
@@ -1042,6 +1484,32 @@ mod tests {
         );
         assert!(started_at.elapsed() < Duration::from_secs(2));
         assert!(!process_is_alive(process_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keychain_cleanup_cutoff_returns_before_late_capture_and_reaper_finishes() {
+        let mut command = process_command("/bin/sh");
+        command.args(["-c", "(/bin/sleep 1) & /usr/bin/printf late-secret-value"]);
+        let operation_deadline = Instant::now()
+            .checked_add(Duration::from_millis(40))
+            .unwrap();
+        let cleanup_deadline = operation_deadline
+            .checked_add(Duration::from_millis(40))
+            .unwrap();
+        let started_at = Instant::now();
+
+        assert_eq!(
+            run_keychain_command_until(command, operation_deadline, cleanup_deadline).unwrap_err(),
+            KeychainSecretReadErrorV1::CleanupTimedOut
+        );
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+        assert!(!keychain_reaper_is_idle());
+        let reaper_deadline = Instant::now().checked_add(Duration::from_secs(2)).unwrap();
+        while !keychain_reaper_is_idle() && Instant::now() < reaper_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(keychain_reaper_is_idle());
     }
 
     #[cfg(unix)]
@@ -1168,6 +1636,45 @@ mod tests {
     }
 
     #[test]
+    fn expired_startup_cutoff_skips_every_secret_reader() {
+        let calls = Rc::new(Cell::new(0));
+        let database_references = DatabaseCapabilityV1::ALL.map(|capability| {
+            RuntimeSecretReferenceV1::parse(&format!(
+                "env:STARRING_RUNTIME_TEST_DATABASE_{}",
+                capability.index()
+            ))
+            .unwrap()
+        });
+        let references = RuntimeSecretReferencesV1::from_parts(
+            database_references,
+            RuntimeSecretReferenceV1::parse("env:STARRING_RUNTIME_TEST_DISCORD_TOKEN").unwrap(),
+        );
+        let resolver = SecretResolverV1::new(
+            CountingEnvironmentV1 {
+                calls: calls.clone(),
+            },
+            FakeKeychainV1::default(),
+        );
+
+        let operation_cutoff = Instant::now();
+        let cleanup_deadline = operation_cutoff
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
+        let result = ResolvedRuntimeSecretsV1::resolve_until(
+            &references,
+            &resolver,
+            operation_cutoff,
+            cleanup_deadline,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RuntimeSecretsStartupResolutionErrorV1::OperationDeadlineElapsed)
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
     fn duplicate_resolved_database_identity_is_rejected_with_capability_context() {
         let mut environment = FakeEnvironmentV1::default();
         let database_references = DatabaseCapabilityV1::ALL.map(|capability| {
@@ -1215,8 +1722,14 @@ mod tests {
     fn resolution_errors_are_finite_and_secret_values_are_never_formatted() {
         let missing = resolver(FakeEnvironmentV1::default(), FakeKeychainV1::default());
         let reference = RuntimeSecretReferenceV1::parse("env:MISSING_RUNTIME_SECRET").unwrap();
+        let operation_cutoff = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        let cleanup_deadline = operation_cutoff
+            .checked_add(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(
-            missing.resolve(&reference).unwrap_err(),
+            missing
+                .resolve(&reference, operation_cutoff, cleanup_deadline)
+                .unwrap_err(),
             RuntimeSecretResolutionErrorV1::Missing
         );
         let invalid = resolver(
@@ -1227,7 +1740,9 @@ mod tests {
             FakeKeychainV1::default(),
         );
         assert_eq!(
-            invalid.resolve(&reference).unwrap_err(),
+            invalid
+                .resolve(&reference, operation_cutoff, cleanup_deadline)
+                .unwrap_err(),
             RuntimeSecretResolutionErrorV1::InvalidEncoding
         );
         let marker = "runtime-secret-marker";

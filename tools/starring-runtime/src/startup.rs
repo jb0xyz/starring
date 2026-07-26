@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);
 const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);
 
-pub struct RuntimeStartupBudgetV1 {
+pub(crate) struct RuntimeStartupBudgetV1 {
     operation_cutoff: Instant,
     cleanup_deadline: Instant,
 }
 
 impl RuntimeStartupBudgetV1 {
-    pub fn begin() -> Self {
+    pub(crate) fn begin() -> Self {
         Self::from_started_at(Instant::now())
     }
 
@@ -36,6 +36,30 @@ impl RuntimeStartupBudgetV1 {
     fn operation_is_open_at(&self, now: Instant) -> bool {
         now < self.operation_cutoff
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeStartupSyncStageErrorV1<E> {
+    OperationDeadlineElapsed,
+    Stage(E),
+}
+
+pub(crate) fn run_runtime_startup_sync_stage_v1<T, E, C, S>(
+    mut operation_is_open: C,
+    stage: S,
+) -> Result<T, RuntimeStartupSyncStageErrorV1<E>>
+where
+    C: FnMut() -> bool,
+    S: FnOnce() -> Result<T, E>,
+{
+    if !operation_is_open() {
+        return Err(RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed);
+    }
+    let result = stage();
+    if !operation_is_open() {
+        return Err(RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed);
+    }
+    result.map_err(RuntimeStartupSyncStageErrorV1::Stage)
 }
 
 impl Debug for RuntimeStartupBudgetV1 {
@@ -86,5 +110,53 @@ mod tests {
         let budget = RuntimeStartupBudgetV1::begin();
 
         assert_eq!(format!("{budget:?}"), "RuntimeStartupBudgetV1(<redacted>)");
+    }
+
+    #[test]
+    fn closed_precheck_skips_the_sync_stage() {
+        let mut calls = 0;
+        let result = run_runtime_startup_sync_stage_v1(
+            || false,
+            || {
+                calls += 1;
+                Ok::<_, u8>(())
+            },
+        );
+
+        assert_eq!(calls, 0);
+        assert_eq!(
+            result,
+            Err(RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed)
+        );
+    }
+
+    #[test]
+    fn closed_postcheck_precedes_both_success_and_stage_error() {
+        for stage_result in [Ok::<_, u8>(()), Err(7)] {
+            let mut states = [true, false].into_iter();
+            let result =
+                run_runtime_startup_sync_stage_v1(|| states.next().unwrap(), || stage_result);
+
+            assert_eq!(
+                result,
+                Err(RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed)
+            );
+            assert!(states.next().is_none());
+        }
+    }
+
+    #[test]
+    fn open_checks_preserve_success_and_stage_error() {
+        let mut success_states = [true, true].into_iter();
+        let success =
+            run_runtime_startup_sync_stage_v1(|| success_states.next().unwrap(), || Ok::<_, u8>(9));
+        let mut error_states = [true, true].into_iter();
+        let error =
+            run_runtime_startup_sync_stage_v1(|| error_states.next().unwrap(), || Err::<u8, _>(11));
+
+        assert_eq!(success, Ok(9));
+        assert_eq!(error, Err(RuntimeStartupSyncStageErrorV1::Stage(11)));
+        assert!(success_states.next().is_none());
+        assert!(error_states.next().is_none());
     }
 }
