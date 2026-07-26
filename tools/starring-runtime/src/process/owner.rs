@@ -97,15 +97,15 @@ impl Debug for RuntimeOwnerHeldProcessShutdownErrorV1 {
 }
 
 pub(crate) struct RuntimeOwnerHeldProcessV1 {
-    foundation: RuntimeProcessFoundationV1,
-    owner: RuntimeAcquiredGatewayOwnerV1,
+    pub(super) foundation: RuntimeProcessFoundationV1,
+    pub(super) owner: RuntimeAcquiredGatewayOwnerV1,
 }
 
 impl RuntimeOwnerHeldProcessV1 {
     pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1> {
         let Self { foundation, owner } = self;
-        let cleanup_deadline = foundation.startup_budget.cleanup_deadline();
-        let owner = owner.shutdown_until(cleanup_deadline).await;
+        let owner_cleanup_deadline = foundation.startup_budget.owner_cleanup_deadline();
+        let owner = owner.shutdown_until(owner_cleanup_deadline).await;
         let database = foundation.shutdown().await;
         finish_runtime_owner_held_process_shutdown_v1(owner, database)
     }
@@ -136,7 +136,7 @@ impl RuntimeProcessFoundationV1 {
             &self.build_revision,
             self.config.gateway_owner(),
             self.startup_budget.operation_cutoff(),
-            self.startup_budget.cleanup_deadline(),
+            self.startup_budget.owner_cleanup_deadline(),
         )
         .await;
         let owner = match transition {
@@ -147,7 +147,7 @@ impl RuntimeProcessFoundationV1 {
         };
         if !self.startup_budget.operation_is_open() {
             let owner_cleanup = owner
-                .shutdown_until(self.startup_budget.cleanup_deadline())
+                .shutdown_until(self.startup_budget.owner_cleanup_deadline())
                 .await;
             let error = match owner_cleanup {
                 Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed)

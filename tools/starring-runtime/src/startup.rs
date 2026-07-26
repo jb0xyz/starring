@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);
 const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);
+const STARTUP_DISCORD_CLEANUP_RESERVE: Duration = Duration::from_secs(7);
+const STARTUP_DATABASE_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 
 pub(crate) struct RuntimeStartupBudgetV1 {
     operation_cutoff: Instant,
@@ -27,6 +29,18 @@ impl RuntimeStartupBudgetV1 {
 
     pub(crate) fn cleanup_deadline(&self) -> Instant {
         self.cleanup_deadline
+    }
+
+    pub(crate) fn discord_cleanup_deadline(&self) -> Instant {
+        self.cleanup_deadline
+            .checked_sub(STARTUP_DISCORD_CLEANUP_RESERVE)
+            .expect("startup Discord cleanup deadline")
+    }
+
+    pub(crate) fn owner_cleanup_deadline(&self) -> Instant {
+        self.cleanup_deadline
+            .checked_sub(STARTUP_DATABASE_CLEANUP_RESERVE)
+            .expect("startup owner cleanup deadline")
     }
 
     pub(crate) fn operation_is_open(&self) -> bool {
@@ -90,6 +104,24 @@ mod tests {
                 .cleanup_deadline
                 .duration_since(budget.operation_cutoff),
             Duration::from_secs(10)
+        );
+        assert_eq!(
+            budget
+                .discord_cleanup_deadline()
+                .duration_since(budget.operation_cutoff),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            budget
+                .owner_cleanup_deadline()
+                .duration_since(budget.discord_cleanup_deadline()),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            budget
+                .cleanup_deadline()
+                .duration_since(budget.owner_cleanup_deadline()),
+            Duration::from_secs(2)
         );
     }
 

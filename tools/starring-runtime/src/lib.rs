@@ -3,6 +3,7 @@ mod closed_recovery;
 mod config;
 mod controller_identity;
 mod database;
+mod discord;
 mod gateway;
 mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
@@ -36,6 +37,11 @@ pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerStartupWatchdogConfigV1, RuntimeGatewayOwnerStartupWatchdogExitV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
+};
+pub use process::connected::{
+    RuntimeDiscordGatewayShutdownFailureV1, RuntimePausedConnectedProcessShutdownErrorV1,
+    RuntimeProcessPausedConnectedTransitionErrorV1,
+    RuntimeProcessPausedConnectedTransitionFailureV1,
 };
 pub use process::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,

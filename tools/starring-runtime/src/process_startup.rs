@@ -11,6 +11,7 @@ use crate::startup::{
 };
 use crate::{
     RuntimeBuildRevisionBootstrapErrorV1, RuntimeConfigErrorV1, RuntimeConfigV1,
+    RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessPausedConnectedTransitionErrorV1,
     RuntimeSecretsResolutionErrorV1,
 };
 
@@ -30,8 +31,12 @@ pub enum RuntimeProcessStagingErrorV1 {
     Foundation(RuntimeProcessFoundationCompositionErrorV1),
     #[error("runtime process gateway owner transition failed")]
     GatewayOwner(RuntimeProcessGatewayOwnerTransitionErrorV1),
+    #[error("runtime process paused-connected transition failed")]
+    PausedConnected(RuntimeProcessPausedConnectedTransitionErrorV1),
     #[error("runtime owner-held process shutdown failed")]
     OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
+    #[error("runtime paused-connected process shutdown failed")]
+    PausedConnectedShutdown(RuntimePausedConnectedProcessShutdownErrorV1),
 }
 
 impl RuntimeProcessStagingErrorV1 {
@@ -44,7 +49,9 @@ impl RuntimeProcessStagingErrorV1 {
             Self::BuildRevision(error) => error.code(),
             Self::Foundation(error) => error.code(),
             Self::GatewayOwner(error) => error.code(),
+            Self::PausedConnected(error) => error.code(),
             Self::OwnerHeldShutdown(error) => error.code(),
+            Self::PausedConnectedShutdown(error) => error.code(),
         }
     }
 
@@ -58,7 +65,9 @@ impl RuntimeProcessStagingErrorV1 {
             Self::BuildRevision(error) => error.context(),
             Self::Foundation(error) => error.context(),
             Self::GatewayOwner(error) => error.context(),
+            Self::PausedConnected(error) => error.context(),
             Self::OwnerHeldShutdown(error) => error.context(),
+            Self::PausedConnectedShutdown(error) => error.context(),
             Self::AsyncRuntimeUnavailable | Self::OperationDeadlineElapsed => None,
         }
     }
@@ -141,10 +150,36 @@ async fn stage_runtime_process_from_environment_v1(
         .into_owner_held_v1()
         .await
         .map_err(RuntimeProcessStagingErrorV1::GatewayOwner)?;
-    owner_held
+    let mut discord_starting = match owner_held.begin_paused_discord_connection_v1().await {
+        Ok(starting) => starting,
+        Err(failure) => {
+            return Err(RuntimeProcessStagingErrorV1::PausedConnected(
+                failure.cleanup().await,
+            ));
+        }
+    };
+    let paused_gateway = match discord_starting.wait_for_paused_connected_v1().await {
+        Ok(paused_gateway) => paused_gateway,
+        Err(transition) => {
+            return Err(RuntimeProcessStagingErrorV1::PausedConnected(
+                discord_starting
+                    .cleanup_after_transition_failure_v1(transition)
+                    .await,
+            ));
+        }
+    };
+    let paused_connected = match discord_starting.into_paused_connected_v1(paused_gateway) {
+        Ok(paused_connected) => paused_connected,
+        Err(failure) => {
+            return Err(RuntimeProcessStagingErrorV1::PausedConnected(
+                failure.cleanup().await,
+            ));
+        }
+    };
+    paused_connected
         .shutdown()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::OwnerHeldShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::PausedConnectedShutdown)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 
@@ -165,7 +200,8 @@ mod tests {
     use super::*;
     use crate::{
         DatabaseCapabilityV1, RuntimeConfigurationFieldV1, RuntimeDatabaseCompositionErrorV1,
-        RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayOwnerShutdownFailureV1,
+        RuntimeDatabasePoolShutdownErrorV1, RuntimeDiscordGatewayShutdownFailureV1,
+        RuntimeGatewayOwnerShutdownFailureV1, RuntimeProcessPausedConnectedTransitionFailureV1,
         RuntimeSecretResolutionErrorV1,
     };
 
@@ -197,6 +233,16 @@ mod tests {
                     database: RuntimeDatabasePoolShutdownErrorV1::TimedOut,
                 },
             ),
+            RuntimeProcessStagingErrorV1::PausedConnected(
+                RuntimeProcessPausedConnectedTransitionErrorV1::Transition(
+                    RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated,
+                ),
+            ),
+            RuntimeProcessStagingErrorV1::PausedConnectedShutdown(
+                RuntimePausedConnectedProcessShutdownErrorV1::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
+                ),
+            ),
         ];
 
         assert_eq!(errors[0].code(), "runtime_async_runtime_unavailable");
@@ -214,6 +260,14 @@ mod tests {
         assert_eq!(
             errors[6].code(),
             "runtime_owner_held_process_gateway_owner_and_database_shutdown"
+        );
+        assert_eq!(
+            errors[7].code(),
+            "runtime_process_paused_connected_discord_terminated"
+        );
+        assert_eq!(
+            errors[8].code(),
+            "runtime_discord_gateway_shutdown_task_stopped"
         );
         for error in errors {
             assert!(!error.code().is_empty());

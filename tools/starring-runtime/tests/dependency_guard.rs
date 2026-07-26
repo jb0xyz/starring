@@ -63,6 +63,21 @@ fn package_dependencies() -> Vec<serde_json::Value> {
         .clone()
 }
 
+fn resolved_package_metadata() -> serde_json::Value {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn has_rust_comment(source: &str) -> bool {
     let bytes = source.as_bytes();
     let mut index = 0;
@@ -479,6 +494,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/config.rs",
             "src/controller_identity.rs",
             "src/database.rs",
+            "src/discord.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup.rs",
             "src/gateway_owner_startup_watchdog.rs",
@@ -486,6 +502,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/process/connected.rs",
             "src/process/owner.rs",
             "src/process.rs",
             "src/process_identity.rs",
@@ -503,10 +520,27 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
 
 #[test]
 fn direct_dependencies_are_the_exact_runtime_composition_surface() {
-    let mut dependencies = package_dependencies()
+    let package_dependencies = package_dependencies();
+    let twilight_gateway = package_dependencies
+        .iter()
+        .find(|dependency| dependency["name"] == "twilight-gateway")
+        .unwrap();
+    assert_eq!(twilight_gateway["rename"], "paused-discord-gateway");
+    assert_eq!(
+        twilight_gateway["source"],
+        "git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b"
+    );
+    assert_eq!(twilight_gateway["uses_default_features"], false);
+    assert_eq!(
+        twilight_gateway["features"],
+        serde_json::json!(["rustls-platform-verifier"])
+    );
+    let mut dependencies = package_dependencies
         .into_iter()
         .map(|dependency| {
-            assert!(dependency["rename"].is_null());
+            if dependency["name"] != "twilight-gateway" {
+                assert!(dependency["rename"].is_null());
+            }
             (
                 dependency["name"].as_str().unwrap().to_string(),
                 dependency["kind"].as_str().map(str::to_string),
@@ -533,8 +567,37 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
             ("tokio".to_string(), None),
+            ("twilight-gateway".to_string(), None),
             ("zeroize".to_string(), None),
         ]
+    );
+}
+
+#[test]
+fn paused_discord_gateway_dependency_is_feature_isolated() {
+    let metadata = resolved_package_metadata();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| {
+            package["name"] == "twilight-gateway"
+                && package["version"] == "0.17.1"
+                && package["source"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with("git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b#"))
+        })
+        .unwrap();
+    let package_id = package["id"].as_str().unwrap();
+    let resolved = metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == package_id)
+        .unwrap();
+    assert_eq!(
+        resolved["features"],
+        serde_json::json!(["rustls-platform-verifier"])
     );
 }
 
@@ -553,8 +616,12 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             "reqwest",
             "twilight_gateway",
             "twilight_http",
+            "twilight_model",
             "TcpListener",
         ] {
+            if path == Path::new("src/discord.rs") && forbidden == "twilight_gateway" {
+                continue;
+            }
             assert!(
                 !contains_identifier(&source, forbidden),
                 "{}: {forbidden}",
@@ -583,6 +650,8 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+            && path != Path::new("src/discord.rs")
+            && path != Path::new("src/process/connected.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -748,7 +817,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         .map(|(_, source)| source.as_str())
         .unwrap();
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
-        if path == Path::new("src/gateway.rs") {
+        if path == Path::new("src/gateway.rs") || path == Path::new("src/discord.rs") {
             continue;
         }
         if path == Path::new("src/gateway_owner_startup.rs")
@@ -797,6 +866,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "automation_runtime_convergence"
                         | "automation_runtime_worker"
                 );
+            let allowed_paused_connected = path == Path::new("src/process/connected.rs")
+                && identifier == "automation_runtime_worker";
             let allowed_process_identity = path == Path::new("src/process_identity.rs")
                 && identifier == "automation_runtime_convergence";
             let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
@@ -809,6 +880,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_startup_observation
                         || allowed_build_revision
                         || allowed_process_foundation
+                        || allowed_paused_connected
                         || allowed_process_identity
                         || allowed_controller_identity
                         || !matches!(
@@ -835,7 +907,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ShardMismatch",
         "pub fn observe_paused_connected_gateway_v2(",
         "require_healthy_paused_control",
-        "self.control.issue_ready_lease(epoch)",
+        "self.connection_observer.issue_ready_lease(epoch)",
         "RuntimePausedGatewayObservationV2::new(",
         "RuntimePausedGatewaySequenceV2::new(",
         "control.admission_snapshot_watch()",
@@ -1086,6 +1158,199 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
     }
+}
+
+#[test]
+fn paused_discord_connection_is_single_owned_closed_and_bounded() {
+    let discord = source_before_test_module(include_str!("../src/discord.rs"));
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let connected = include_str!("../src/process/connected.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let watchdog = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "Shard::new(ShardId::ONE, token, Intents::empty())",
+        "EventTypeFlags::READY",
+        "EventTypeFlags::RESUMED",
+        "EventTypeFlags::GATEWAY_RECONNECT",
+        "EventTypeFlags::GATEWAY_INVALIDATE_SESSION",
+        "GatewayCommandAckV3::Paused { .. }",
+        "GatewayCommandAckV3::AdmissionResumed { .. }",
+        "RuntimeDiscordGatewayExitV1::AdmissionOpened",
+        "RuntimeDiscordGatewayTransportStateV1::Connecting",
+        "RuntimeDiscordGatewayTransportStateV1::Active",
+        "RuntimeDiscordGatewayTransportStateV1::Disconnected",
+        "GatewayCommandAckV3::Draining { .. }",
+        "control.mark_connected(GatewayReadyKindV3::Ready)",
+        "control.mark_connected(GatewayReadyKindV3::Resumed)",
+        "control.mark_disconnected(GatewayDisconnectKindV3::Reconnect)",
+        "driver.close_until(close_deadline).await",
+        "control.mark_stopped()",
+        "self.shard.close(CloseFrame::NORMAL)",
+        "actor_abort: AbortHandle",
+        "control_abort: AbortHandle",
+        "join_task: Option<JoinHandle<bool>>",
+        "impl Drop for RuntimeDiscordControlTaskV1",
+        "let actor_joined = actor_task.await.is_ok();",
+        "let _control_result = control_task.await;",
+        "let _stopped = stopped_sender.send(true);",
+        "self.abort_tasks();",
+        "finish_runtime_discord_gateway_without_transport_v1(",
+        "finish_runtime_discord_gateway_if_connected_v1(",
+        "start_receiver.await.is_ok()",
+        "wait_for_lifecycle_drain_v1(",
+        "RuntimeDiscordGatewaySupervisorV1(<redacted>)",
+    ] {
+        assert!(discord.contains(required), "{required}");
+    }
+    assert_eq!(discord.matches("runtime.spawn(async move").count(), 2);
+    for forbidden in [
+        "INTERACTION_CREATE",
+        "twilight_http",
+        "Client",
+        "run_shared_gateway_v3",
+        "resume_admission",
+        "issue_ready_lease",
+        "bot_runtime",
+        "InteractionCreate",
+        "InteractionResponder",
+        "transport_started",
+        "catch_unwind",
+    ] {
+        assert!(!discord.contains(forbidden), "discord: {forbidden}");
+    }
+
+    for required in [
+        "_runtime: Option<SharedGatewayRuntimeHalfV3>",
+        "self._runtime.take()",
+        "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
+        "pub(crate) fn admission_change_watch_v1(",
+        "pub(crate) fn begin_discord_drain_v1(",
+        "run_runtime_discord_control_v1(",
+        "control.next_lifecycle()",
+        "prepare_twilight_runtime_discord_gateway_driver_v1(",
+        "prepare_discord_gateway_start_v1(operation_cutoff)",
+        "supervisor.release_start_v1()",
+        "owner_discord_attachment:",
+        "abort_handle.abort()",
+        "fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>>",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+    assert_eq!(gateway.matches("start_discord_gateway_v1(").count(), 1);
+    assert_eq!(
+        gateway
+            .matches("prepare_twilight_runtime_discord_gateway_driver_v1(")
+            .count(),
+        1
+    );
+
+    for required in [
+        "pub(crate) struct RuntimeDiscordStartingProcessV1",
+        "pub(crate) struct RuntimePausedConnectedProcessV1",
+        "owner_held: RuntimeOwnerHeldProcessV1",
+        "discord: RuntimeDiscordGatewaySupervisorV1",
+        "paused_gateway: RuntimePausedGatewayObservationV2",
+        "pub(crate) async fn wait_for_paused_connected_v1(",
+        ".observe_paused_connected_gateway_v2()",
+        "Ok(current) if current == first => {",
+        "self.require_live_paused_connection_v1()?",
+        "pub(crate) fn into_paused_connected_v1(",
+        "RuntimeDiscordStartingProcessV1(<redacted>)",
+        "RuntimePausedConnectedProcessV1(<redacted>)",
+        "shutdown_paused_discord_owner_v1",
+        ".begin_discord_drain_v1()",
+        "let owner_shutdown = owner_held.shutdown().await;",
+    ] {
+        assert!(connected.contains(required), "{required}");
+    }
+    let connected_attributes =
+        declaration_attribute_block(connected, "RuntimePausedConnectedProcessV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(connected_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            connected,
+            "RuntimePausedConnectedProcessV1",
+            forbidden,
+        ));
+    }
+    for marker in [
+        "pub(crate) struct RuntimeDiscordStartingProcessV1",
+        "pub(crate) struct RuntimePausedConnectedProcessV1",
+    ] {
+        let declaration = braced_declaration(connected, marker);
+        assert!(declaration.find("discord:").unwrap() < declaration.find("owner_held:").unwrap());
+    }
+    let connected_shutdown =
+        braced_declaration(connected, "async fn shutdown_paused_discord_owner_v1(");
+    let discord_shutdown = connected_shutdown.find(".shutdown_until(").unwrap();
+    let owner_shutdown = connected_shutdown
+        .find("let owner_shutdown = owner_held.shutdown().await;")
+        .unwrap();
+    assert!(discord_shutdown < owner_shutdown);
+    let start = braced_declaration(gateway, "pub(crate) async fn start_discord_gateway_v1(");
+    let driver = start
+        .find("prepare_twilight_runtime_discord_gateway_driver_v1(")
+        .unwrap();
+    let prepare = start
+        .find("prepare_discord_gateway_start_v1(operation_cutoff)")
+        .unwrap();
+    let spawn = start.find("start_runtime_discord_gateway_v1(").unwrap();
+    let attach = start.find("attach_discord_supervisor_v1").unwrap();
+    let release = start.find("supervisor.release_start_v1()").unwrap();
+    assert!(driver < prepare && prepare < spawn && spawn < attach && attach < release);
+    let prepare = braced_declaration(gateway, "async fn prepare_discord_gateway_start_v1(");
+    let reserve = prepare.find("reserve_discord_supervisor_v1").unwrap();
+    let recheck = prepare[reserve..]
+        .find("self.owner_invalidated.load(Ordering::Acquire)")
+        .map(|offset| reserve + offset)
+        .unwrap();
+    let runtime_take = prepare.find("self._runtime.take()").unwrap();
+    assert!(reserve < recheck && recheck < runtime_take);
+    for forbidden in [
+        "resume_admission",
+        "issue_ready_lease",
+        "readiness",
+        "recovery",
+        "dispatch",
+        "execute",
+        "serve",
+        "activate",
+        "deploy",
+        "twilight",
+    ] {
+        assert!(
+            !contains_identifier(connected, forbidden),
+            "connected: {forbidden}"
+        );
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+    assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
+    assert!(!library.contains("RuntimePausedConnectedProcessV1"));
+
+    let watchdog_supervisor = braced_declaration(
+        watchdog,
+        "async fn run_gateway_owner_startup_watchdog_v1<P>(",
+    );
+    let invalidation = watchdog_supervisor
+        .rfind("guard.invalidate_now();")
+        .unwrap();
+    let wait = watchdog_supervisor[invalidation..]
+        .find("wait_for_emergency_gateway_shutdown_v1(")
+        .map(|offset| invalidation + offset)
+        .unwrap();
+    let release = watchdog_supervisor[wait..]
+        .find("release_gateway_owner_v1(&port, lease_id, cleanup_deadline)")
+        .map(|offset| wait + offset)
+        .unwrap();
+    assert!(invalidation < wait && wait < release);
 }
 
 #[test]
@@ -2125,9 +2390,13 @@ fn startup_budget_is_single_origin_linear_monotonic_and_partitioned() {
     for required in [
         "const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);",
         "const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);",
+        "const STARTUP_DISCORD_CLEANUP_RESERVE: Duration = Duration::from_secs(7);",
+        "const STARTUP_DATABASE_CLEANUP_RESERVE: Duration = Duration::from_secs(2);",
         "pub(crate) struct RuntimeStartupBudgetV1 {",
         "operation_cutoff: started_at + STARTUP_OPERATION_WINDOW",
         "cleanup_deadline: started_at + STARTUP_TOTAL_WINDOW",
+        "pub(crate) fn discord_cleanup_deadline(&self) -> Instant",
+        "pub(crate) fn owner_cleanup_deadline(&self) -> Instant",
         "now < self.operation_cutoff",
         "pub(crate) enum RuntimeStartupSyncStageErrorV1<E>",
         "RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed",
@@ -2381,7 +2650,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
 }
 
 #[test]
-fn process_startup_is_the_single_ordered_bounded_owner_staging_entry() {
+fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry() {
     let sources = source_files();
     let process_startup = sources
         .iter()
@@ -2408,6 +2677,11 @@ fn process_startup_is_the_single_ordered_bounded_owner_staging_entry() {
         .find("compose_runtime_process_foundation_v1")
         .unwrap();
     let owner = staging.find(".into_owner_held_v1()").unwrap();
+    let discord_start = staging
+        .find(".begin_paused_discord_connection_v1()")
+        .unwrap();
+    let paused_observation = staging.find(".wait_for_paused_connected_v1()").unwrap();
+    let paused_connected = staging.find(".into_paused_connected_v1(").unwrap();
     let shutdown = staging.find(".shutdown()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
@@ -2415,6 +2689,10 @@ fn process_startup_is_the_single_ordered_bounded_owner_staging_entry() {
             && secrets < revision
             && revision < foundation
             && foundation < owner
+            && owner < discord_start
+            && discord_start < paused_observation
+            && paused_observation < paused_connected
+            && paused_connected < shutdown
             && owner < shutdown
             && shutdown < outcome
     );
@@ -2430,6 +2708,9 @@ fn process_startup_is_the_single_ordered_bounded_owner_staging_entry() {
         "bootstrap_compiled_runtime_build_revision_v1",
         "compose_runtime_process_foundation_v1",
         ".into_owner_held_v1()",
+        ".begin_paused_discord_connection_v1()",
+        ".wait_for_paused_connected_v1()",
+        ".into_paused_connected_v1(",
         ".shutdown()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -2707,7 +2988,7 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         "pub(crate) async fn into_owner_held_v1(",
         "acquire_runtime_gateway_owner_startup_v1(",
         "self.startup_budget.operation_cutoff()",
-        "self.startup_budget.cleanup_deadline()",
+        "self.startup_budget.owner_cleanup_deadline()",
         "RuntimeOwnerHeldProcessV1(<redacted>)",
         "RuntimeProcessGatewayOwnerTransitionErrorV1(<redacted>)",
         "RuntimeOwnerHeldProcessShutdownErrorV1(<redacted>)",
@@ -2720,6 +3001,8 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
             .count(),
         1
     );
+    assert_eq!(owner.matches("owner_cleanup_deadline()").count(), 3);
+    assert!(!owner.contains("startup_budget.cleanup_deadline()"));
     let owner_attributes = declaration_attribute_block(owner, "RuntimeOwnerHeldProcessV1");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
         assert!(
@@ -2737,7 +3020,7 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         "pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1>",
     );
     let owner_release = shutdown
-        .find("owner.shutdown_until(cleanup_deadline)")
+        .find("owner.shutdown_until(owner_cleanup_deadline)")
         .unwrap();
     let database_close = shutdown.find("foundation.shutdown().await").unwrap();
     assert!(owner_release < database_close);

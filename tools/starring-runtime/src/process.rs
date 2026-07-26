@@ -18,6 +18,7 @@ use crate::{
     RuntimeRegistryBootstrapV1,
 };
 
+pub(crate) mod connected;
 mod owner;
 
 pub(crate) use owner::RuntimeOwnerHeldProcessV1;

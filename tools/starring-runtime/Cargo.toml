@@ -18,6 +18,7 @@ getrandom = "0.4"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+paused-discord-gateway = { package = "twilight-gateway", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false, features = ["rustls-platform-verifier"] }
 zeroize = "1"
 
 [dev-dependencies]

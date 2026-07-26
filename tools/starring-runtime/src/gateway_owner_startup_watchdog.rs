@@ -34,6 +34,10 @@ const STARTUP_TASK_ABORT_RESERVE: Duration = Duration::from_millis(25);
 
 pub(crate) trait RuntimeGatewayOwnerEmergencyInvalidatorV1: Send + Sync + 'static {
     fn invalidate_gateway_ownership(&self);
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1795,7 +1799,14 @@ where
     };
     guard.invalidate_now();
     let cleanup_deadline = startup_cleanup_cap.limit(stop.cleanup_deadline);
-    let release = release_gateway_owner_v1(&port, lease_id, cleanup_deadline).await;
+    let gateway_stopped =
+        wait_for_emergency_gateway_shutdown_v1(guard.gateway_shutdown_watch(), cleanup_deadline)
+            .await;
+    let release = if gateway_stopped {
+        release_gateway_owner_v1(&port, lease_id, cleanup_deadline).await
+    } else {
+        RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed
+    };
     let exit = finalize_gateway_owner_exit_v1(stop.exit, release);
     guard.disarm();
     if let Some(response) = shutdown_acknowledgement {
@@ -2380,6 +2391,10 @@ impl RuntimeGatewayOwnerInvalidationLatchV1 {
             self.invalidator.invalidate_gateway_ownership();
         }
     }
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        self.invalidator.gateway_shutdown_watch()
+    }
 }
 
 struct RuntimeGatewayOwnerStartupWatchdogGuardV1 {
@@ -2402,6 +2417,10 @@ impl RuntimeGatewayOwnerStartupWatchdogGuardV1 {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        self.invalidation.gateway_shutdown_watch()
+    }
 }
 
 impl Drop for RuntimeGatewayOwnerStartupWatchdogGuardV1 {
@@ -2409,6 +2428,87 @@ impl Drop for RuntimeGatewayOwnerStartupWatchdogGuardV1 {
         if self.armed {
             self.invalidation.invalidate();
         }
+    }
+}
+
+async fn wait_for_emergency_gateway_shutdown_v1(
+    mut stopped: Option<watch::Receiver<bool>>,
+    cleanup_deadline: TokioInstant,
+) -> bool {
+    let Some(stopped) = stopped.as_mut() else {
+        return true;
+    };
+    loop {
+        if *stopped.borrow() {
+            return true;
+        }
+        if TokioInstant::now() >= cleanup_deadline {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = sleep_until(cleanup_deadline) => return false,
+            changed = stopped.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod emergency_gateway_shutdown_tests {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio::time::Instant;
+
+    use super::wait_for_emergency_gateway_shutdown_v1;
+
+    #[tokio::test]
+    async fn unattached_or_already_stopped_gateway_never_blocks_owner_cleanup() {
+        assert!(
+            wait_for_emergency_gateway_shutdown_v1(None, Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        let (_sender, receiver) = watch::channel(true);
+        assert!(
+            wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_gateway_must_publish_stopped_before_owner_cleanup_continues() {
+        let (sender, receiver) = watch::channel(false);
+        let waiter =
+            tokio::runtime::Handle::current().spawn(wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1),
+            ));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        sender.send(true).unwrap();
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn closed_or_expired_gateway_stop_evidence_never_authorizes_release() {
+        let (sender, receiver) = watch::channel(false);
+        drop(sender);
+        assert!(
+            !wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+        let (_sender, receiver) = watch::channel(false);
+        assert!(!wait_for_emergency_gateway_shutdown_v1(Some(receiver), Instant::now()).await);
     }
 }
 

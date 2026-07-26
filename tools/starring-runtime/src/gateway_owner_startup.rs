@@ -86,6 +86,14 @@ pub(crate) struct RuntimeAcquiredGatewayOwnerV1 {
 }
 
 impl RuntimeAcquiredGatewayOwnerV1 {
+    pub(crate) fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.watchdog.terminal_status()
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.watchdog.wait_terminal().await
+    }
+
     pub(crate) async fn shutdown_until(
         self,
         cleanup_deadline: Instant,
