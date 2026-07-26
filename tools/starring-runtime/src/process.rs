@@ -1,18 +1,23 @@
 use std::fmt::{Debug, Formatter};
 
+use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::ProcessInstanceId;
 
 use crate::database::compose_runtime_database_dependencies_v1;
+use crate::process_identity::generate_runtime_process_instance_id_v1;
 use crate::{
     compose_runtime_gateway_bootstrap_v1, compose_runtime_registry_bootstrap_v1,
-    GatewayResourceConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
-    RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
+    CompiledRuntimeBuildRevisionV1, GatewayResourceConfigV1, ResolvedRuntimeSecretsV1,
+    RuntimeConfigV1, RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
     RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayBootstrapErrorV1, RuntimeGatewayBootstrapV1,
-    RuntimeRegistryBootstrapErrorV1, RuntimeRegistryBootstrapV1, RuntimeStartupBudgetV1,
+    RuntimeProcessInstanceIdGenerationErrorV1, RuntimeRegistryBootstrapErrorV1,
+    RuntimeRegistryBootstrapV1, RuntimeStartupBudgetV1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeProcessFoundationCompositionErrorV1 {
+    #[error("runtime process foundation instance identity generation failed")]
+    ProcessInstanceId(RuntimeProcessInstanceIdGenerationErrorV1),
     #[error("runtime process foundation database composition failed")]
     Database(RuntimeDatabaseCompositionErrorV1),
     #[error("runtime process foundation registry composition failed")]
@@ -40,6 +45,7 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
 impl RuntimeProcessFoundationCompositionErrorV1 {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::ProcessInstanceId(error) => error.code(),
             Self::Database(error) => error.code(),
             Self::Registry(error) => error.code(),
             Self::Gateway(error) => error.code(),
@@ -58,6 +64,7 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
 
     pub const fn context(self) -> Option<&'static str> {
         match self {
+            Self::ProcessInstanceId(error) => error.context(),
             Self::Database(error) => error.context(),
             Self::Registry(_)
             | Self::Gateway(_)
@@ -77,6 +84,7 @@ impl Debug for RuntimeProcessFoundationCompositionErrorV1 {
 
 pub struct RuntimeProcessFoundationV1 {
     startup_budget: RuntimeStartupBudgetV1,
+    build_revision: CompiledRuntimeBuildRevisionV1,
     process_instance_id: ProcessInstanceId,
     databases: RuntimeDatabaseDependenciesV1,
     registry: RuntimeRegistryBootstrapV1,
@@ -84,6 +92,10 @@ pub struct RuntimeProcessFoundationV1 {
 }
 
 impl RuntimeProcessFoundationV1 {
+    pub fn runtime_build_revision(&self) -> &RuntimeBuildRevisionV1 {
+        self.build_revision.revision()
+    }
+
     pub fn process_instance_id(&self) -> &ProcessInstanceId {
         &self.process_instance_id
     }
@@ -91,6 +103,7 @@ impl RuntimeProcessFoundationV1 {
     pub async fn shutdown(self) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
         let Self {
             startup_budget,
+            build_revision,
             process_instance_id,
             databases,
             registry,
@@ -100,6 +113,7 @@ impl RuntimeProcessFoundationV1 {
         let shutdown = databases.shutdown();
         drop((
             startup_budget,
+            build_revision,
             process_instance_id,
             databases,
             registry,
@@ -119,8 +133,17 @@ pub async fn compose_runtime_process_foundation_v1(
     startup_budget: RuntimeStartupBudgetV1,
     config: &RuntimeConfigV1,
     secrets: &ResolvedRuntimeSecretsV1,
-    process_instance_id: ProcessInstanceId,
+    build_revision: CompiledRuntimeBuildRevisionV1,
 ) -> Result<RuntimeProcessFoundationV1, RuntimeProcessFoundationCompositionErrorV1> {
+    if !startup_budget.operation_is_open() {
+        return Err(RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed);
+    }
+    let process_instance_id = generate_runtime_process_instance_id_v1();
+    if !startup_budget.operation_is_open() {
+        return Err(RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed);
+    }
+    let process_instance_id = process_instance_id
+        .map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)?;
     let databases = compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)
         .await
         .map_err(RuntimeProcessFoundationCompositionErrorV1::Database)?;
@@ -146,6 +169,7 @@ pub async fn compose_runtime_process_foundation_v1(
     }
     Ok(RuntimeProcessFoundationV1 {
         startup_budget,
+        build_revision,
         process_instance_id,
         databases,
         registry: closed_components.registry,
@@ -286,7 +310,15 @@ mod tests {
         let database_cleanup = RuntimeProcessFoundationCompositionErrorV1::Database(
             RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut,
         );
+        let process_instance_id = RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId(
+            RuntimeProcessInstanceIdGenerationErrorV1::EntropyUnavailable,
+        );
 
+        assert_eq!(
+            process_instance_id.code(),
+            "runtime_process_instance_id_entropy_unavailable"
+        );
+        assert_eq!(process_instance_id.context(), None);
         assert_eq!(database.code(), "runtime_database_unavailable");
         assert_eq!(database.context(), Some("panel"));
         assert_eq!(

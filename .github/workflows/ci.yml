@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  STARRING_RUNTIME_BUILD_REVISION: "${{ github.sha }}"
+
 jobs:
   checks:
     runs-on: ubuntu-latest

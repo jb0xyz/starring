@@ -1,13 +1,19 @@
+mod build_revision;
 mod closed_recovery;
 mod config;
 mod database;
 mod gateway;
 mod gateway_owner_startup_watchdog;
 mod process;
+mod process_identity;
 mod registry;
 mod secret;
 mod startup;
 
+pub use build_revision::{
+    bootstrap_compiled_runtime_build_revision_v1, CompiledRuntimeBuildRevisionV1,
+    RuntimeBuildRevisionBootstrapErrorV1,
+};
 pub use config::{
     DatabaseCapabilityV1, DatabaseOperationConfigV1, DatabasePoolConfigV1,
     GatewayOwnerTimingConfigV1, GatewayResourceConfigV1, RuntimeConfigErrorV1, RuntimeConfigV1,
@@ -32,6 +38,7 @@ pub use process::{
     compose_runtime_process_foundation_v1, RuntimeProcessFoundationCompositionErrorV1,
     RuntimeProcessFoundationV1,
 };
+pub use process_identity::RuntimeProcessInstanceIdGenerationErrorV1;
 pub use registry::{
     compose_runtime_registry_bootstrap_v1, RuntimeRegistryBootstrapErrorV1,
     RuntimeRegistryBootstrapV1, RuntimeRegistryRecoveryObservationErrorV1,

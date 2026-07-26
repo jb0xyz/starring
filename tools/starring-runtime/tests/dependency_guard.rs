@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 
 fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) {
     let mut entries = fs::read_dir(directory)
@@ -473,6 +474,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             .map(|(path, _)| path.to_str().unwrap())
             .collect::<Vec<_>>(),
         [
+            "src/build_revision.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
             "src/database.rs",
@@ -482,6 +484,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/lib.rs",
             "src/main.rs",
             "src/process.rs",
+            "src/process_identity.rs",
             "src/registry.rs",
             "src/secret.rs",
             "src/startup.rs",
@@ -520,6 +523,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
             ("chrono".to_string(), Some("dev".to_string())),
+            ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
@@ -577,7 +581,98 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
+        if path != Path::new("src/process_identity.rs") {
+            assert!(
+                !contains_identifier(&source, "getrandom"),
+                "{}",
+                path.display()
+            );
+        }
+        if path != Path::new("src/build_revision.rs") {
+            assert!(!source.contains("option_env!"), "{}", path.display());
+        }
     }
+}
+
+#[test]
+fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
+    let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!package_root.join("build.rs").exists());
+    let build_revision = include_str!("../src/build_revision.rs");
+    let production = source_before_test_module(build_revision);
+    for required in [
+        "option_env!(\"STARRING_RUNTIME_BUILD_REVISION\")",
+        "const GIT_REVISION_BYTES: usize = 40;",
+        "pub struct CompiledRuntimeBuildRevisionV1 {",
+        "revision: RuntimeBuildRevisionV1,",
+        "pub fn bootstrap_compiled_runtime_build_revision_v1(",
+        "pub(crate) fn revision(&self) -> &RuntimeBuildRevisionV1",
+        "RuntimeBuildRevisionV1::parse(value)",
+        "RuntimeBuildRevisionBootstrapErrorV1(<redacted>)",
+        "CompiledRuntimeBuildRevisionV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for forbidden in [
+        "std::env",
+        "env::var",
+        "Command::new",
+        "std::process",
+        "git rev-parse",
+        "trim(",
+        "to_ascii_lowercase",
+        "STARRING_APPROVED_RELEASE_REVISION",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let attributes = declaration_attribute_block(production, "CompiledRuntimeBuildRevisionV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(attributes, forbidden),
+            "CompiledRuntimeBuildRevisionV1: {forbidden}"
+        );
+        assert!(
+            !implements_trait(production, "CompiledRuntimeBuildRevisionV1", forbidden,),
+            "CompiledRuntimeBuildRevisionV1: {forbidden}"
+        );
+    }
+    assert!(CI_WORKFLOW.contains(concat!(
+        "STARRING_RUNTIME_BUILD_REVISION: ",
+        "\"${{ github.sha }}\""
+    )));
+    assert!(!CI_WORKFLOW.contains("STARRING_APPROVED_RELEASE_REVISION"));
+}
+
+#[test]
+fn process_identity_entropy_is_exact_and_confined() {
+    let identity = include_str!("../src/process_identity.rs");
+    let production = source_before_test_module(identity);
+    for required in [
+        "const PROCESS_INSTANCE_ENTROPY_BYTES: usize = 16;",
+        "const LOWER_HEX: &[u8; 16] = b\"0123456789abcdef\";",
+        "getrandom::fill(bytes)",
+        "let mut bytes = [0_u8; PROCESS_INSTANCE_ENTROPY_BYTES];",
+        "ProcessInstanceId::parse(encode_lower_hex_v1(bytes))",
+        "RuntimeProcessInstanceIdGenerationErrorV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for forbidden in [
+        "SystemTime",
+        "Instant",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "/dev/urandom",
+        "thread_rng",
+        "StdRng",
+        "getrandom::fill_uninit",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(production.matches("getrandom::fill").count(), 1);
+    assert!(!production.contains("pub fn generate_runtime_process_instance_id_v1"));
 }
 
 #[test]
@@ -628,18 +723,26 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_startup_observation = path
                 == Path::new("src/startup_recovery_observation.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_build_revision = path == Path::new("src/build_revision.rs")
+                && identifier == "automation_runtime_controller";
             let allowed_process_foundation = path == Path::new("src/process.rs")
                 && matches!(
                     identifier,
-                    "automation_runtime_convergence" | "automation_runtime_worker"
+                    "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
                 );
+            let allowed_process_identity = path == Path::new("src/process_identity.rs")
+                && identifier == "automation_runtime_convergence";
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
                         || allowed_startup_observation
+                        || allowed_build_revision
                         || allowed_process_foundation
+                        || allowed_process_identity
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -2051,6 +2154,19 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         production,
         "pub async fn compose_runtime_process_foundation_v1(",
     );
+    let deadline_before_identity = composer
+        .find("if !startup_budget.operation_is_open()")
+        .unwrap();
+    let identity = composer
+        .find("generate_runtime_process_instance_id_v1()")
+        .unwrap();
+    let deadline_after_identity = composer[identity..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| identity + offset)
+        .unwrap();
+    let identity_error = composer
+        .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)")
+        .unwrap();
     let databases = composer
         .find("compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)")
         .unwrap();
@@ -2061,8 +2177,19 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         .find(".close_until(startup_budget.cleanup_deadline())")
         .unwrap();
 
-    assert!(databases < closed && closed < cleanup);
+    assert!(
+        deadline_before_identity < identity
+            && identity < deadline_after_identity
+            && deadline_after_identity < identity_error
+            && identity_error < databases
+            && databases < closed
+            && closed < cleanup
+    );
     for required in [
+        "build_revision: CompiledRuntimeBuildRevisionV1",
+        "build_revision: CompiledRuntimeBuildRevisionV1,",
+        "build_revision,",
+        "pub fn runtime_build_revision(&self) -> &RuntimeBuildRevisionV1",
         "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
@@ -2083,8 +2210,15 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         composer
             .matches("if !startup_budget.operation_is_open()")
             .count(),
-        2
+        4
     );
+    let signature = production
+        .split("pub async fn compose_runtime_process_foundation_v1(")
+        .nth(1)
+        .and_then(|source| source.split(") -> Result<").next())
+        .unwrap();
+    assert!(!signature.contains("process_instance_id: ProcessInstanceId"));
+    assert!(!signature.contains("build_revision: RuntimeBuildRevisionV1"));
     for forbidden in [
         "ready_to_serve",
         "health_ready",
