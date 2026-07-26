@@ -477,10 +477,12 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/build_revision.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
+            "src/controller_identity.rs",
             "src/database.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup_watchdog.rs",
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
+            "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/process.rs",
@@ -581,7 +583,9 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
-        if path != Path::new("src/process_identity.rs") {
+        if path != Path::new("src/process_identity.rs")
+            && path != Path::new("src/controller_identity.rs")
+        {
             assert!(
                 !contains_identifier(&source, "getrandom"),
                 "{}",
@@ -644,18 +648,30 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
 }
 
 #[test]
-fn process_identity_entropy_is_exact_and_confined() {
-    let identity = include_str!("../src/process_identity.rs");
-    let production = source_before_test_module(identity);
+fn startup_identity_entropy_is_exact_independent_and_confined() {
+    let encoding = source_before_test_module(include_str!("../src/identity_encoding.rs"));
+    let process = source_before_test_module(include_str!("../src/process_identity.rs"));
+    let controller = source_before_test_module(include_str!("../src/controller_identity.rs"));
     for required in [
-        "const PROCESS_INSTANCE_ENTROPY_BYTES: usize = 16;",
+        "pub(crate) const RUNTIME_IDENTITY_ENTROPY_BYTES: usize = 16;",
         "const LOWER_HEX: &[u8; 16] = b\"0123456789abcdef\";",
-        "getrandom::fill(bytes)",
-        "let mut bytes = [0_u8; PROCESS_INSTANCE_ENTROPY_BYTES];",
-        "ProcessInstanceId::parse(encode_lower_hex_v1(bytes))",
+        "pub(crate) fn encode_runtime_identity_lower_hex_v1(",
+        "String::with_capacity(RUNTIME_IDENTITY_ENTROPY_BYTES * 2)",
+    ] {
+        assert!(encoding.contains(required), "{required}");
+    }
+    assert!(!encoding.contains("getrandom"));
+    for required in [
+        "ProcessInstanceId::parse(encode_runtime_identity_lower_hex_v1(bytes))",
         "RuntimeProcessInstanceIdGenerationErrorV1(<redacted>)",
     ] {
-        assert!(production.contains(required), "{required}");
+        assert!(process.contains(required), "{required}");
+    }
+    for required in [
+        "ControllerId::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeControllerIdGenerationErrorV1(<redacted>)",
+    ] {
+        assert!(controller.contains(required), "{required}");
     }
     for forbidden in [
         "SystemTime",
@@ -668,11 +684,49 @@ fn process_identity_entropy_is_exact_and_confined() {
         "thread_rng",
         "StdRng",
         "getrandom::fill_uninit",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
     ] {
-        assert!(!production.contains(forbidden), "{forbidden}");
+        assert!(!process.contains(forbidden), "process: {forbidden}");
+        assert!(!controller.contains(forbidden), "controller: {forbidden}");
     }
-    assert_eq!(production.matches("getrandom::fill").count(), 1);
-    assert!(!production.contains("pub fn generate_runtime_process_instance_id_v1"));
+    let process_wrapper = braced_declaration(
+        process,
+        "pub(crate) fn generate_runtime_process_instance_id_v1(",
+    );
+    let process_seam = braced_declaration(
+        process,
+        "fn generate_runtime_process_instance_id_with_v1<F>(",
+    );
+    let controller_wrapper = braced_declaration(
+        controller,
+        "pub(crate) fn generate_runtime_controller_id_v1(",
+    );
+    let controller_seam =
+        braced_declaration(controller, "fn generate_runtime_controller_id_with_v1<F>(");
+    for (wrapper, seam) in [
+        (process_wrapper, process_seam),
+        (controller_wrapper, controller_seam),
+    ] {
+        assert_eq!(wrapper.matches("getrandom::fill").count(), 1);
+        assert_eq!(seam.matches("getrandom::fill").count(), 0);
+        assert!(seam.contains("F: FnOnce("));
+        assert!(seam.contains("&mut [u8; RUNTIME_IDENTITY_ENTROPY_BYTES]"));
+        assert!(seam.contains("let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];"));
+        assert_eq!(seam.matches("fill(&mut bytes)?;").count(), 1);
+    }
+    assert!(!process.contains("ControllerId"));
+    assert!(!process.contains("controller_id"));
+    assert!(!controller.contains("ProcessInstanceId"));
+    assert!(!controller.contains("process_instance_id"));
+    assert!(!process.contains("pub fn generate_runtime_process_instance_id_v1"));
+    assert!(!controller.contains("pub fn generate_runtime_controller_id_v1"));
 }
 
 #[test]
@@ -734,6 +788,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 );
             let allowed_process_identity = path == Path::new("src/process_identity.rs")
                 && identifier == "automation_runtime_convergence";
+            let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
+                && identifier == "automation_runtime_convergence";
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
@@ -743,6 +799,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_build_revision
                         || allowed_process_foundation
                         || allowed_process_identity
+                        || allowed_controller_identity
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -2154,18 +2211,28 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         production,
         "pub async fn compose_runtime_process_foundation_v1(",
     );
-    let deadline_before_identity = composer
+    let deadline_before_process_identity = composer
         .find("if !startup_budget.operation_is_open()")
         .unwrap();
-    let identity = composer
+    let process_identity = composer
         .find("generate_runtime_process_instance_id_v1()")
         .unwrap();
-    let deadline_after_identity = composer[identity..]
+    let deadline_after_process_identity = composer[process_identity..]
         .find("if !startup_budget.operation_is_open()")
-        .map(|offset| identity + offset)
+        .map(|offset| process_identity + offset)
         .unwrap();
-    let identity_error = composer
+    let process_identity_error = composer
         .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)")
+        .unwrap();
+    let controller_identity = composer
+        .find("generate_runtime_controller_id_v1()")
+        .unwrap();
+    let deadline_after_controller_identity = composer[controller_identity..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| controller_identity + offset)
+        .unwrap();
+    let controller_identity_error = composer
+        .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ControllerId)")
         .unwrap();
     let databases = composer
         .find("compose_runtime_database_dependencies_v1(config, secrets, &startup_budget)")
@@ -2178,10 +2245,13 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         .unwrap();
 
     assert!(
-        deadline_before_identity < identity
-            && identity < deadline_after_identity
-            && deadline_after_identity < identity_error
-            && identity_error < databases
+        deadline_before_process_identity < process_identity
+            && process_identity < deadline_after_process_identity
+            && deadline_after_process_identity < process_identity_error
+            && process_identity_error < controller_identity
+            && controller_identity < deadline_after_controller_identity
+            && deadline_after_controller_identity < controller_identity_error
+            && controller_identity_error < databases
             && databases < closed
             && closed < cleanup
     );
@@ -2190,6 +2260,10 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "build_revision: CompiledRuntimeBuildRevisionV1,",
         "build_revision,",
         "pub fn runtime_build_revision(&self) -> &RuntimeBuildRevisionV1",
+        "process_instance_id: ProcessInstanceId,",
+        "pub fn process_instance_id(&self) -> &ProcessInstanceId",
+        "controller_id: ControllerId,",
+        "pub fn controller_id(&self) -> &ControllerId",
         "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
@@ -2210,7 +2284,19 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         composer
             .matches("if !startup_budget.operation_is_open()")
             .count(),
-        4
+        5
+    );
+    assert_eq!(
+        composer
+            .matches("generate_runtime_process_instance_id_v1()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        composer
+            .matches("generate_runtime_controller_id_v1()")
+            .count(),
+        1
     );
     let signature = production
         .split("pub async fn compose_runtime_process_foundation_v1(")
@@ -2218,7 +2304,11 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         .and_then(|source| source.split(") -> Result<").next())
         .unwrap();
     assert!(!signature.contains("process_instance_id: ProcessInstanceId"));
+    assert!(!signature.contains("controller_id: ControllerId"));
     assert!(!signature.contains("build_revision: RuntimeBuildRevisionV1"));
+    assert!(!composer.contains("ControllerId::parse(process_instance_id"));
+    assert!(!composer.contains("ControllerId::parse(build_revision"));
+    assert!(!composer.contains("ProcessInstanceId::parse(controller_id"));
     for forbidden in [
         "ready_to_serve",
         "health_ready",

@@ -1,9 +1,11 @@
 mod build_revision;
 mod closed_recovery;
 mod config;
+mod controller_identity;
 mod database;
 mod gateway;
 mod gateway_owner_startup_watchdog;
+mod identity_encoding;
 mod process;
 mod process_identity;
 mod registry;
@@ -19,6 +21,7 @@ pub use config::{
     GatewayOwnerTimingConfigV1, GatewayResourceConfigV1, RuntimeConfigErrorV1, RuntimeConfigV1,
     RuntimeConfigurationFieldV1, RuntimeSecretReferenceV1, RuntimeSecretReferencesV1,
 };
+pub use controller_identity::RuntimeControllerIdGenerationErrorV1;
 pub use database::{
     RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
     RuntimeDatabasePoolShutdownErrorV1, RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,

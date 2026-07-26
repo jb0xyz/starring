@@ -2,8 +2,9 @@ use std::fmt::{Debug, Formatter};
 
 use automation_runtime_convergence::ProcessInstanceId;
 
-const PROCESS_INSTANCE_ENTROPY_BYTES: usize = 16;
-const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+use crate::identity_encoding::{
+    encode_runtime_identity_lower_hex_v1, RUNTIME_IDENTITY_ENTROPY_BYTES,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeProcessInstanceIdGenerationErrorV1 {
@@ -41,24 +42,17 @@ pub(crate) fn generate_runtime_process_instance_id_v1(
 }
 
 fn generate_runtime_process_instance_id_with_v1<F>(
-    mut fill: F,
+    fill: F,
 ) -> Result<ProcessInstanceId, RuntimeProcessInstanceIdGenerationErrorV1>
 where
-    F: FnMut(&mut [u8]) -> Result<(), RuntimeProcessInstanceIdGenerationErrorV1>,
+    F: FnOnce(
+        &mut [u8; RUNTIME_IDENTITY_ENTROPY_BYTES],
+    ) -> Result<(), RuntimeProcessInstanceIdGenerationErrorV1>,
 {
-    let mut bytes = [0_u8; PROCESS_INSTANCE_ENTROPY_BYTES];
+    let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];
     fill(&mut bytes)?;
-    ProcessInstanceId::parse(encode_lower_hex_v1(bytes))
+    ProcessInstanceId::parse(encode_runtime_identity_lower_hex_v1(bytes))
         .map_err(|_| RuntimeProcessInstanceIdGenerationErrorV1::InvalidGeneratedValue)
-}
-
-fn encode_lower_hex_v1(bytes: [u8; PROCESS_INSTANCE_ENTROPY_BYTES]) -> String {
-    let mut encoded = String::with_capacity(PROCESS_INSTANCE_ENTROPY_BYTES * 2);
-    for byte in bytes {
-        encoded.push(LOWER_HEX[usize::from(byte >> 4)] as char);
-        encoded.push(LOWER_HEX[usize::from(byte & 0x0f)] as char);
-    }
-    encoded
 }
 
 #[cfg(test)]
@@ -66,31 +60,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_entropy_vectors_encode_exact_lower_hex() {
-        for (bytes, expected) in [
-            ([0_u8; 16], "00000000000000000000000000000000"),
-            ([u8::MAX; 16], "ffffffffffffffffffffffffffffffff"),
-            (
-                [
-                    0x00, 0x01, 0x0a, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba,
-                    0x98, 0x76, 0x54,
-                ],
-                "00010a0f107f80abcdeffedcba987654",
-            ),
-        ] {
-            let identity = generate_runtime_process_instance_id_with_v1(|destination| {
-                destination.copy_from_slice(&bytes);
-                Ok(())
-            })
-            .unwrap();
+    fn fixed_entropy_roundtrips_as_an_exact_process_instance_id() {
+        let identity = generate_runtime_process_instance_id_with_v1(|destination| {
+            destination.copy_from_slice(&[
+                0x00, 0x01, 0x0a, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98,
+                0x76, 0x54,
+            ]);
+            Ok(())
+        })
+        .unwrap();
 
-            assert_eq!(identity.as_str(), expected);
-            assert_eq!(identity.as_str().len(), 32);
-            assert!(identity
-                .as_str()
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
-        }
+        assert_eq!(identity.as_str(), "00010a0f107f80abcdeffedcba987654");
     }
 
     #[test]
@@ -98,7 +78,7 @@ mod tests {
         let mut calls = 0;
         let identity = generate_runtime_process_instance_id_with_v1(|destination| {
             calls += 1;
-            assert_eq!(destination.len(), PROCESS_INSTANCE_ENTROPY_BYTES);
+            assert_eq!(destination.len(), RUNTIME_IDENTITY_ENTROPY_BYTES);
             destination.fill(0x5a);
             Ok(())
         })
@@ -113,7 +93,7 @@ mod tests {
         let mut calls = 0;
         let result = generate_runtime_process_instance_id_with_v1(|destination| {
             calls += 1;
-            assert_eq!(destination, &[0_u8; PROCESS_INSTANCE_ENTROPY_BYTES]);
+            assert_eq!(destination, &[0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES]);
             Err(RuntimeProcessInstanceIdGenerationErrorV1::EntropyUnavailable)
         });
 
