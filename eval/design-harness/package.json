@@ -13,9 +13,11 @@
     "test": "node --test acceptance.test.js assertions.test.js intent-assertions.test.js matrix.test.js provider.test.js summarize.test.js"
   },
   "devDependencies": {
-    "promptfoo": "0.121.19"
+    "promptfoo": "0.121.17"
   },
   "overrides": {
-    "adm-zip": "0.6.0"
+    "adm-zip": "0.6.0",
+    "gaxios": "7.3.0",
+    "sharp": "0.35.3"
   }
 }
