@@ -1,6 +1,8 @@
 const EXECUTION_SLOT_WRITER_EPOCH_MIGRATION: &str = include_str!(
     "../../../../migrations/202607240013_fence_runtime_execution_slot_writer_epoch.sql"
 );
+const EXECUTION_SLOT_WRITER_EPOCH_READINESS_DIGEST: &str =
+    "b5362bc1b081789a5b3ac4881fc2ea00c340a013630f7d5c809958ed1c045ec3";
 const EXECUTION_SLOT_WRITER_CAPABILITIES: [&str; 6] = [
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
@@ -756,7 +758,7 @@ async fn execution_slot_writer_epoch_upgrade_preserves_capabilities_and_rerun_is
         slot_writer_fence_manifests(&pool).await,
         (true, true, true, true)
     );
-    assert_readiness_definition_sha(&pool).await;
+    assert_readiness_definition_sha(&pool, EXECUTION_SLOT_WRITER_EPOCH_READINESS_DIGEST).await;
     assert_eq!(
         execution_slot_writer_private_exposure(&pool, &role).await,
         (false, false, false)
