@@ -3,6 +3,7 @@ mod config;
 mod database;
 mod gateway;
 mod gateway_owner_startup_watchdog;
+mod process;
 mod registry;
 mod secret;
 
@@ -26,6 +27,10 @@ pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerStartupWatchdogConfigV1, RuntimeGatewayOwnerStartupWatchdogExitV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
+};
+pub use process::{
+    compose_runtime_process_foundation_v1, RuntimeProcessFoundationCompositionErrorV1,
+    RuntimeProcessFoundationV1,
 };
 pub use registry::{
     compose_runtime_registry_bootstrap_v1, RuntimeRegistryBootstrapErrorV1,

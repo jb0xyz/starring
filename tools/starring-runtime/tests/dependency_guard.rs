@@ -481,6 +481,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/process.rs",
             "src/registry.rs",
             "src/secret.rs",
             "src/startup_recovery_observation.rs",
@@ -626,12 +627,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_startup_observation = path
                 == Path::new("src/startup_recovery_observation.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_process_foundation = path == Path::new("src/process.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_convergence" | "automation_runtime_worker"
+                );
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
                         || allowed_startup_observation
+                        || allowed_process_foundation
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1881,5 +1888,64 @@ fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
         "RuntimeGatewayBootstrapV1",
     ] {
         assert!(!main.contains(forbidden));
+    }
+}
+
+#[test]
+fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure() {
+    let sources = source_files();
+    let process = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = source_before_test_module(process);
+    let composer = braced_declaration(
+        production,
+        "pub async fn compose_runtime_process_foundation_v1(",
+    );
+    let databases = composer
+        .find("compose_runtime_database_dependencies_v1(config, secrets)")
+        .unwrap();
+    let closed = composer
+        .find("compose_closed_process_components_v1(&process_instance_id, config.gateway())")
+        .unwrap();
+    let cleanup = composer.find("shutdown.close().await").unwrap();
+
+    assert!(databases < closed && closed < cleanup);
+    for required in [
+        "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
+        "compose_runtime_gateway_bootstrap_v1(",
+        "RuntimeProcessFoundationV1(<redacted>)",
+        "RuntimeProcessFoundationCompositionErrorV1(<redacted>)",
+        "pub async fn shutdown(self)",
+        "drop(self);",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for forbidden in [
+        "ready_to_serve",
+        "health_ready",
+        "start_gateway_owner_startup_watchdog_v1",
+        "observe_current_ready_attestation()?",
+        "Discord",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    for name in [
+        "RuntimeProcessFoundationV1",
+        "RuntimeClosedProcessComponentsV1",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
     }
 }
