@@ -49,7 +49,7 @@ async fn execution_security_scenario(
     assert_raw_sql_rejected(&executor_pool, &administrator_role).await;
     assert_invalid_operations_are_non_mutating(&owner_pool, &executor_pool).await;
     assert_claim_and_renew_success(&owner_pool, &executor_pool, &database_name, &role).await;
-    assert_readiness_definition_sha(&owner_pool).await;
+    assert_readiness_definition_sha(&owner_pool, EXPECTED_READINESS_DEFINITION_SHA256_V1).await;
 }
 
 async fn assert_verified_adapter(
@@ -776,7 +776,7 @@ fn assert_cancelled_execution(state: &CancelledExecutionState, controller_id: &C
     assert_eq!(state.7["last_fencing_token"], json!(2));
 }
 
-async fn assert_readiness_definition_sha(owner_pool: &PgPool) {
+async fn assert_readiness_definition_sha(owner_pool: &PgPool, expected_digest: &str) {
     let digest = sqlx::query_scalar::<_, String>(
         "SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to( \
             pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure( \
@@ -789,6 +789,6 @@ async fn assert_readiness_definition_sha(owner_pool: &PgPool) {
     .unwrap();
     assert!(canonical_sha256(&digest));
     eprintln!("runtime execution readiness definition sha256: {digest}");
-    assert_ne!(EXPECTED_READINESS_DEFINITION_SHA256_V1, "PENDING");
-    assert_eq!(digest, EXPECTED_READINESS_DEFINITION_SHA256_V1);
+    assert_ne!(expected_digest, "PENDING");
+    assert_eq!(digest, expected_digest);
 }
