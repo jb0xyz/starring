@@ -643,8 +643,8 @@ async fn product_runtime_canonical_builders_match_rust_and_reject_unsafe_access(
     .execute(&database.pool)
     .await
     .unwrap();
-    let (schema_usage, schema_create, helper_execute, denied_helper_count) =
-        sqlx::query_as::<_, (bool, bool, bool, i64)>(
+    let (schema_usage, schema_create, helper_execute, helper_count, denied_helper_count) =
+        sqlx::query_as::<_, (bool, bool, bool, i64, i64)>(
             r#"SELECT
                 pg_catalog.has_schema_privilege(
                     pg_catalog.to_regrole($1),
@@ -667,6 +667,11 @@ async fn product_runtime_canonical_builders_match_rust_and_reject_unsafe_access(
                  FROM pg_catalog.pg_proc AS function_row
                  INNER JOIN pg_catalog.pg_namespace AS namespace
                     ON namespace.oid = function_row.pronamespace
+                 WHERE namespace.nspname = 'starring_runtime_private_v2'),
+                (SELECT pg_catalog.count(*)
+                 FROM pg_catalog.pg_proc AS function_row
+                 INNER JOIN pg_catalog.pg_namespace AS namespace
+                    ON namespace.oid = function_row.pronamespace
                  WHERE namespace.nspname = 'starring_runtime_private_v2'
                     AND NOT pg_catalog.has_function_privilege(
                         pg_catalog.to_regrole($1),
@@ -681,7 +686,8 @@ async fn product_runtime_canonical_builders_match_rust_and_reject_unsafe_access(
     assert!(!schema_usage);
     assert!(!schema_create);
     assert!(!helper_execute);
-    assert_eq!(denied_helper_count, 6);
+    assert!(helper_count > 0);
+    assert_eq!(denied_helper_count, helper_count);
     let login_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(
