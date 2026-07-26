@@ -1,4 +1,4 @@
-use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
@@ -19,7 +19,7 @@ pub async fn run<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {
@@ -43,7 +43,7 @@ pub async fn handle_event<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {

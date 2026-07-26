@@ -2,7 +2,7 @@ mod effect;
 mod prepare;
 mod state;
 
-use automation_instance::{InstanceIdGenerator, InstanceStore};
+use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1};
 use automation_instance_teardown::InstanceTeardownService;
 
 use crate::adapter::{
@@ -24,7 +24,7 @@ pub(crate) async fn execute_plan<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {
@@ -45,7 +45,7 @@ pub(crate) async fn execute_prepared_event<M, R, S, G, T>(
 where
     M: DiscordMutationAdapter,
     R: InteractionResponder,
-    S: InstanceStore,
+    S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {

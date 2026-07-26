@@ -1,20 +1,23 @@
 use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
+use automation_runtime_controller::runtime_failure_message_v1;
 use automation_runtime_convergence::{
     CommandGuardV1, FencingToken, LeaseRequestV1, RuntimeDeployment, RuntimeDeploymentError,
     RuntimeDeploymentPhaseV1, RuntimeFailureV1, RuntimePendingConditionV1, TransitionOutcomeV1,
 };
 use sqlx::types::Json;
 
-use crate::digest::desired_target_digest;
 use crate::error::database;
 use crate::model::{
     ClaimDeploymentV1, ClaimExecutionReceiptV1, ClaimNextDeploymentV1, ClaimReceiptV1,
     DeploymentMutationV1, EnqueueDeploymentOutcomeV1, EnqueueDeploymentV1, MutationReceiptV1,
-    RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1, SubmitDeploymentMutationV1,
+    RenewDeploymentV1, RuntimeConvergenceAttemptV1, RuntimeDeploymentScopeV1,
+    SubmitDeploymentMutationV1,
 };
+use crate::persistence::desired_target_digest_v1;
 use crate::prepare::prepare_requested_deployment_v1;
 use crate::row::{
-    runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, DEPLOYMENT_COLUMNS,
+    runtime_i64, DeploymentProjection, DeploymentRow, PersistedDeployment, ServingLeaseRow,
+    DEPLOYMENT_COLUMNS, SERVING_LEASE_COLUMNS,
 };
 use crate::{PostgresRuntimeConvergence, RuntimeConvergenceStoreError};
 
@@ -30,13 +33,13 @@ impl PostgresRuntimeConvergence {
                 "installation authority revision",
             ));
         }
-        let desired_digest = desired_target_digest(
+        let desired_digest = desired_target_digest_v1(
             &request.identity,
             &request.target,
             request.runtime_generation.get(),
             request.installation_authority_revision,
             request.previous_runtime.as_ref(),
-        );
+        )?;
         let mut transaction = self.begin().await?;
         let existing = sqlx::query_as::<_, DeploymentRow>(&format!(
             "SELECT {DEPLOYMENT_COLUMNS} FROM public.runtime_deployments \
@@ -205,39 +208,14 @@ impl PostgresRuntimeConvergence {
         Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
         let now = Self::mutation_now(&mut transaction).await?;
         if persisted.deployment.revision() != request.expected_revision {
-            let replayed_claim = request
-                .expected_revision
-                .next()
-                .is_ok_and(|revision| revision == persisted.deployment.revision())
-                && persisted
-                    .deployment
-                    .controller_lease()
-                    .is_some_and(|lease| {
-                        lease.controller_id == request.controller_id && lease.expires_at > now
-                    });
-            if replayed_claim {
-                let lease = persisted.deployment.controller_lease().ok_or(
-                    RuntimeConvergenceStoreError::InvalidPersistedState(
-                        "replayed controller lease",
-                    ),
-                )?;
-                let convergence_attempt = persisted.exact_convergence_attempt()?.started().ok_or(
-                    RuntimeConvergenceStoreError::InvalidPersistedState(
-                        "replayed runtime convergence attempt",
-                    ),
-                )?;
-                let receipt = ClaimExecutionReceiptV1 {
-                    snapshot: persisted.deployment.snapshot(),
-                    controller_id: lease.controller_id.clone(),
-                    fencing_token: lease.fencing_token,
-                    convergence_attempt,
-                    acquired_at: lease.acquired_at,
-                    expires_at: lease.expires_at,
-                };
-                transaction.commit().await.map_err(database)?;
-                return Ok(receipt);
-            }
             return Err(RuntimeConvergenceStoreError::RevisionConflict);
+        }
+        if persisted
+            .deployment
+            .controller_lease()
+            .is_some_and(|lease| lease.expires_at > now)
+        {
+            return Err(RuntimeConvergenceStoreError::ExecutionClaimStale);
         }
         let receipt = Self::claim_locked(
             &mut transaction,
@@ -248,6 +226,97 @@ impl PostgresRuntimeConvergence {
             now,
         )
         .await?;
+        transaction.commit().await.map_err(database)?;
+        Ok(receipt)
+    }
+
+    pub async fn renew_execution(
+        &self,
+        request: RenewDeploymentV1,
+    ) -> Result<ClaimExecutionReceiptV1, RuntimeConvergenceStoreError> {
+        let lease_duration = self.bounded_lease_duration(
+            request.lease_for,
+            self.config.maximum_controller_lease,
+            "controller lease duration",
+        )?;
+        let mut transaction = self.begin().await?;
+        let persisted = Self::load_scoped_for_update(&mut transaction, &request.scope).await?;
+        Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
+        let convergence_attempt =
+            Self::require_convergence_attempt(&persisted, request.convergence_attempt)?;
+        let now = Self::mutation_now(&mut transaction).await?;
+        if persisted.deployment.revision() != request.expected_revision {
+            let replay_revision = request
+                .expected_revision
+                .next()
+                .is_ok_and(|revision| revision == persisted.deployment.revision());
+            if !replay_revision {
+                return Err(RuntimeConvergenceStoreError::RevisionConflict);
+            }
+            let expected_fencing_token = request
+                .fencing_token
+                .next()
+                .map_err(|_| RuntimeDeploymentError::FencingTokenNotMonotonic)?;
+            let lease = persisted
+                .deployment
+                .controller_lease()
+                .ok_or(RuntimeConvergenceStoreError::ExecutionClaimStale)?;
+            let exact = persisted.deployment.runtime_generation() == request.runtime_generation
+                && persisted.deployment.snapshot().last_fencing_token
+                    == Some(expected_fencing_token)
+                && lease.controller_id == request.controller_id
+                && lease.fencing_token == expected_fencing_token
+                && lease.expires_at > now
+                && lease.expires_at - lease.acquired_at == lease_duration;
+            if !exact {
+                return Err(RuntimeConvergenceStoreError::ExecutionClaimStale);
+            }
+            let receipt = ClaimExecutionReceiptV1 {
+                snapshot: persisted.deployment.snapshot(),
+                controller_id: lease.controller_id.clone(),
+                fencing_token: lease.fencing_token,
+                convergence_attempt,
+                acquired_at: lease.acquired_at,
+                expires_at: lease.expires_at,
+            };
+            transaction.commit().await.map_err(database)?;
+            return Ok(receipt);
+        }
+        Self::require_controller(
+            &persisted.deployment,
+            request.expected_revision,
+            &request.controller_id,
+            request.fencing_token,
+            request.runtime_generation,
+            now,
+        )?;
+        let current_expiry = persisted
+            .deployment
+            .controller_lease()
+            .ok_or(RuntimeConvergenceStoreError::ExecutionClaimStale)?
+            .expires_at;
+        let renewed_expiry = now.checked_add_signed(lease_duration).ok_or(
+            RuntimeConvergenceStoreError::InvalidInput("controller lease expiry overflow"),
+        )?;
+        if renewed_expiry <= current_expiry {
+            return Err(RuntimeConvergenceStoreError::InvalidInput(
+                "controller renewal must extend lease",
+            ));
+        }
+        let receipt = Self::claim_locked(
+            &mut transaction,
+            &request.scope,
+            persisted,
+            request.controller_id,
+            lease_duration,
+            now,
+        )
+        .await?;
+        if receipt.convergence_attempt != convergence_attempt {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "renewed runtime convergence attempt",
+            ));
+        }
         transaction.commit().await.map_err(database)?;
         Ok(receipt)
     }
@@ -426,6 +495,7 @@ impl PostgresRuntimeConvergence {
             &persisted.deployment,
             DeploymentExecutionProjection {
                 live_attestation_id: persisted.live_attestation_id.as_ref().map(|id| id.as_str()),
+                last_controller_id: Some(controller_id.as_str()),
                 convergence_attempt: RuntimeConvergenceAttemptV1::from(convergence_attempt),
                 last_failure_attempt: persisted.last_failure_attempt,
             },
@@ -448,19 +518,26 @@ impl PostgresRuntimeConvergence {
     ) -> Result<MutationReceiptV1, RuntimeConvergenceStoreError> {
         let mut transaction = self.begin().await?;
         let mut persisted = Self::load_scoped_for_update(&mut transaction, &request.scope).await?;
-        let mutation = sanitize_failure_evidence(request.mutation);
-        if terminal_replay(&persisted.deployment, &mutation) {
+        let convergence_attempt =
+            Self::require_convergence_attempt(&persisted, request.convergence_attempt)?;
+        let mutation = sanitize_failure_evidence(request.mutation.clone());
+        if terminal_replay(&persisted, &request, &mutation, convergence_attempt) {
             let snapshot = persisted.deployment.snapshot();
             let outcome = TransitionOutcomeV1::Replayed {
                 revision: snapshot.revision,
             };
             transaction.commit().await.map_err(database)?;
-            return Ok(MutationReceiptV1 { outcome, snapshot });
+            return Ok(MutationReceiptV1 {
+                outcome,
+                snapshot,
+                convergence_attempt,
+            });
         }
         if attempt::failure_replay(
             self,
             &persisted,
             request.expected_revision,
+            &request.controller_id,
             request.fencing_token,
             request.runtime_generation,
             &mutation,
@@ -471,14 +548,27 @@ impl PostgresRuntimeConvergence {
                 revision: snapshot.revision,
             };
             transaction.commit().await.map_err(database)?;
-            return Ok(MutationReceiptV1 { outcome, snapshot });
+            return Ok(MutationReceiptV1 {
+                outcome,
+                snapshot,
+                convergence_attempt,
+            });
         }
         Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
-        let now = Self::mutation_now(&mut transaction).await?;
-        let convergence_attempt = persisted
-            .exact_convergence_attempt()?
-            .started()
-            .ok_or(RuntimeConvergenceStoreError::ConvergenceAttemptConflict)?;
+        let now = match (&mutation, persisted.deployment.phase()) {
+            (
+                DeploymentMutationV1::AcceptDrain(attestation),
+                RuntimeDeploymentPhaseV1::DrainRequested,
+            ) => {
+                Self::assert_accept_drain_previous_serving(
+                    &mut transaction,
+                    &persisted,
+                    attestation.drained_at,
+                )
+                .await?
+            }
+            _ => Self::mutation_now(&mut transaction).await?,
+        };
         if matches!(
             &mutation,
             DeploymentMutationV1::RecordRetryableFailure { attempt, .. }
@@ -503,6 +593,7 @@ impl PostgresRuntimeConvergence {
             now,
         )?;
         self.validate_mutation_times(&mutation, now)?;
+        let executing_controller_id = request.controller_id.clone();
         let guard = CommandGuardV1 {
             expected_revision: request.expected_revision,
             controller_id: request.controller_id,
@@ -625,6 +716,7 @@ impl PostgresRuntimeConvergence {
                         .live_attestation_id
                         .as_ref()
                         .map(|id| id.as_str()),
+                    last_controller_id: Some(executing_controller_id.as_str()),
                     convergence_attempt: RuntimeConvergenceAttemptV1::from(convergence_attempt),
                     last_failure_attempt,
                 },
@@ -634,7 +726,11 @@ impl PostgresRuntimeConvergence {
         }
         let snapshot = persisted.deployment.snapshot();
         transaction.commit().await.map_err(database)?;
-        Ok(MutationReceiptV1 { outcome, snapshot })
+        Ok(MutationReceiptV1 {
+            outcome,
+            snapshot,
+            convergence_attempt,
+        })
     }
 
     fn validate_mutation_times(
@@ -658,30 +754,147 @@ impl PostgresRuntimeConvergence {
             _ => Ok(()),
         }
     }
+
+    async fn assert_accept_drain_previous_serving(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        persisted: &PersistedDeployment,
+        drained_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, RuntimeConvergenceStoreError> {
+        let snapshot = persisted.deployment.snapshot();
+        Self::lock_serving_slot(
+            transaction,
+            &snapshot.target.guild_id.to_string(),
+            snapshot.target.ruleset_key.as_str(),
+        )
+        .await?;
+        let serving = sqlx::query_as::<_, ServingLeaseRow>(&format!(
+            "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
+             WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"
+        ))
+        .bind(snapshot.target.guild_id.to_string())
+        .bind(snapshot.target.ruleset_key.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        let now = Self::mutation_now(transaction).await?;
+        let closure = match (snapshot.previous_runtime.as_ref(), serving.as_ref()) {
+            (None, None) => DrainClosureV1::Absent,
+            (None, Some(serving)) => {
+                validate_drain_serving_state(serving, now)?;
+                DrainClosureV1::Closed(
+                    serving_closure_boundary(serving, now)
+                        .ok_or(RuntimeConvergenceStoreError::ServingLeaseConflict)?,
+                )
+            }
+            (Some(_), None) => return Err(RuntimeConvergenceStoreError::ServingLeaseConflict),
+            (Some(previous), Some(serving)) => {
+                validate_drain_serving_state(serving, now)?;
+                let exact = serving.tenant_id == snapshot.identity.tenant_id.as_str()
+                    && serving.installation_id == snapshot.identity.installation_id.as_str()
+                    && serving.deployment_id != snapshot.identity.deployment_id.as_str()
+                    && serving.guild_id == previous.target.guild_id.to_string()
+                    && serving.ruleset_key == previous.target.ruleset_key.as_str()
+                    && serving.target_version == i64::from(previous.target.version.get())
+                    && serving.target_content_hash == previous.target.content_hash.to_hex()
+                    && serving.binding_revision
+                        == runtime_i64(previous.target.binding_revision.get())?
+                    && serving.binding_fingerprint == previous.target.binding_fingerprint.as_str()
+                    && serving.runtime_generation
+                        == runtime_i64(previous.runtime_generation.get())?
+                    && serving.process_instance_id == previous.process_instance_id.as_str()
+                    && serving.acquired_at <= snapshot.requested_at;
+                let boundary = serving_closure_boundary(serving, now)
+                    .filter(|boundary| exact && *boundary >= snapshot.requested_at)
+                    .ok_or(RuntimeConvergenceStoreError::ServingLeaseConflict)?;
+                DrainClosureV1::Closed(boundary)
+            }
+        };
+        match closure {
+            DrainClosureV1::Closed(boundary) if drained_at < boundary => Err(
+                automation_runtime_convergence::RuntimeDeploymentError::AttestationTimeRegression
+                    .into(),
+            ),
+            DrainClosureV1::Absent | DrainClosureV1::Closed(_) => Ok(now),
+        }
+    }
 }
 
-fn terminal_replay(deployment: &RuntimeDeployment, mutation: &DeploymentMutationV1) -> bool {
-    match (deployment.phase(), mutation) {
-        (
-            RuntimeDeploymentPhaseV1::Superseded {
-                by,
-                reason: current_reason,
-                ..
-            },
-            DeploymentMutationV1::Supersede {
-                by: requested,
-                reason,
-            },
-        ) => by == requested && current_reason == reason,
-        (
-            RuntimeDeploymentPhaseV1::Cancelled {
-                reason: current_reason,
-                ..
-            },
-            DeploymentMutationV1::Cancel { reason },
-        ) => current_reason == reason,
-        _ => false,
+enum DrainClosureV1 {
+    Absent,
+    Closed(chrono::DateTime<chrono::Utc>),
+}
+
+fn serving_closure_boundary(
+    serving: &ServingLeaseRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !serving.connected {
+        Some(serving.last_heartbeat_at)
+    } else if serving.expires_at <= now {
+        Some(serving.expires_at)
+    } else {
+        None
     }
+}
+
+fn validate_drain_serving_state(
+    serving: &ServingLeaseRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    serving.validate()?;
+    let temporal_state_valid = if serving.connected {
+        serving.last_heartbeat_at < serving.expires_at && serving.last_heartbeat_at <= now
+    } else {
+        serving.last_heartbeat_at == serving.expires_at && serving.expires_at <= now
+    };
+    if serving.acquired_at <= now && temporal_state_valid {
+        Ok(())
+    } else {
+        Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "accept drain serving lease projections",
+        ))
+    }
+}
+
+fn terminal_replay(
+    persisted: &PersistedDeployment,
+    request: &SubmitDeploymentMutationV1,
+    mutation: &DeploymentMutationV1,
+    convergence_attempt: std::num::NonZeroU32,
+) -> bool {
+    let snapshot = persisted.deployment.snapshot();
+    let guard_is_exact = request
+        .expected_revision
+        .next()
+        .is_ok_and(|revision| revision == snapshot.revision)
+        && snapshot.last_fencing_token == Some(request.fencing_token)
+        && persisted.last_controller_id.as_ref() == Some(&request.controller_id)
+        && snapshot.runtime_generation == request.runtime_generation
+        && persisted
+            .exact_convergence_attempt()
+            .is_ok_and(|attempt| attempt.started() == Some(convergence_attempt));
+    guard_is_exact
+        && match (persisted.deployment.phase(), mutation) {
+            (
+                RuntimeDeploymentPhaseV1::Superseded {
+                    by,
+                    reason: current_reason,
+                    ..
+                },
+                DeploymentMutationV1::Supersede {
+                    by: requested,
+                    reason,
+                },
+            ) => by == requested && current_reason == reason,
+            (
+                RuntimeDeploymentPhaseV1::Cancelled {
+                    reason: current_reason,
+                    ..
+                },
+                DeploymentMutationV1::Cancel { reason },
+            ) => current_reason == reason,
+            _ => false,
+        }
 }
 
 fn matching_retryable_failure(
@@ -746,7 +959,7 @@ fn sanitize_failure_evidence(mutation: DeploymentMutationV1) -> DeploymentMutati
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
             attempt,
             retry_after,
         },
@@ -759,34 +972,9 @@ fn sanitize_failure_evidence(mutation: DeploymentMutationV1) -> DeploymentMutati
             failure_id,
             kind,
             code,
-            message: stable_failure_message(kind).to_string(),
+            message: runtime_failure_message_v1(kind).to_string(),
         },
         mutation => mutation,
-    }
-}
-
-fn stable_failure_message(
-    kind: automation_runtime_convergence::RuntimeFailureKindV1,
-) -> &'static str {
-    match kind {
-        automation_runtime_convergence::RuntimeFailureKindV1::EnvironmentUnavailable => {
-            "runtime environment unavailable"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::ActivationNotObservable => {
-            "activation not observable"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::PanelReconciliation => {
-            "panel reconciliation failed"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::GatewayStart => {
-            "gateway start failed"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::GatewayReadyTimeout => {
-            "gateway Ready timed out"
-        }
-        automation_runtime_convergence::RuntimeFailureKindV1::InvariantViolation => {
-            "runtime invariant rejected"
-        }
     }
 }
 

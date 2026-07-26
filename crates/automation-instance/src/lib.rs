@@ -9,5 +9,8 @@ pub use id::{InstanceId, InstanceIdError};
 pub use model::{
     AutomationInstance, InstanceKind, InstanceMessageRef, InstanceResources, InstanceStatus,
 };
-pub use store::{InMemoryInstanceStore, InstanceStore, InstanceStoreError};
+pub use store::{
+    InMemoryInstanceStore, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStore,
+    InstanceStoreError, LegacyInstanceStoreCapabilitiesV1,
+};
 pub use version::{InstanceRuleSetVersion, InstanceRuleSetVersionError};

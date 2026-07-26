@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivationRequestId, PanelCertificateId, ProcessInstanceId, RuntimeDeploymentTargetV1,
-    RuntimeGeneration, RuntimeProcessIdentityV1,
+    ActivationRequestId, PanelCertificateId, PanelReportDigestV1, ProcessInstanceId,
+    RuntimeDeploymentTargetV1, RuntimeGeneration, RuntimeProcessIdentityV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +45,7 @@ pub struct ActivationAttestationV1 {
 #[serde(deny_unknown_fields)]
 pub struct PanelCertificateV1 {
     pub certificate_id: PanelCertificateId,
+    pub report_digest: PanelReportDigestV1,
     pub target: RuntimeDeploymentTargetV1,
     pub runtime_generation: RuntimeGeneration,
     pub process_instance_id: ProcessInstanceId,

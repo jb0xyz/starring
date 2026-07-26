@@ -1,6 +1,6 @@
 use automation_runtime_convergence::{
-    DeploymentRevision, FencingToken, RuntimeDeploymentPhaseV1, RuntimeFailureDispositionV1,
-    RuntimeFailureId, RuntimeGeneration, RuntimePendingConditionV1,
+    ControllerId, DeploymentRevision, FencingToken, RuntimeDeploymentPhaseV1,
+    RuntimeFailureDispositionV1, RuntimeFailureId, RuntimeGeneration, RuntimePendingConditionV1,
 };
 use chrono::{DateTime, Utc};
 
@@ -133,6 +133,7 @@ pub(super) fn failure_replay(
     adapter: &PostgresRuntimeConvergence,
     persisted: &PersistedDeployment,
     expected_revision: DeploymentRevision,
+    controller_id: &ControllerId,
     fencing_token: FencingToken,
     runtime_generation: RuntimeGeneration,
     mutation: &DeploymentMutationV1,
@@ -143,6 +144,7 @@ pub(super) fn failure_replay(
         .is_ok_and(|revision| revision == snapshot.revision);
     let replay_fence = snapshot.last_fencing_token == Some(fencing_token)
         && snapshot.runtime_generation == runtime_generation;
+    let replay_controller = persisted.last_controller_id.as_ref() == Some(controller_id);
     match (&snapshot.phase, mutation) {
         (
             RuntimeDeploymentPhaseV1::RuntimePending {
@@ -179,6 +181,7 @@ pub(super) fn failure_replay(
             .map_err(|_| RuntimeConvergenceStoreError::InvalidInput("retry delay"))?;
             let exact = replay_revision
                 && replay_fence
+                && replay_controller
                 && persisted.deployment.controller_lease().is_none()
                 && persisted.exact_convergence_attempt()?.started() == Some(*attempt)
                 && failure.kind == *kind
@@ -206,6 +209,7 @@ pub(super) fn failure_replay(
         ) if failure.failure_id == *failure_id => {
             let exact = replay_revision
                 && replay_fence
+                && replay_controller
                 && persisted.deployment.controller_lease().is_none()
                 && failure.kind == *kind
                 && failure.code == *code

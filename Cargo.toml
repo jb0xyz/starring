@@ -26,7 +26,15 @@ members = [
     "crates/product-control-http",
     "crates/automation-runtime",
     "crates/automation-runtime-convergence",
+    "crates/automation-runtime-controller",
+    "crates/automation-runtime-worker",
+    "crates/automation-runtime-registry",
     "crates/automation-runtime-convergence-postgres",
+    "crates/automation-runtime-execution-postgres",
+    "crates/automation-runtime-serving-postgres",
+    "crates/automation-runtime-interaction-postgres",
+    "crates/automation-runtime-panel-postgres",
+    "crates/automation-runtime-panel-evidence",
     "crates/automation-instance",
     "crates/automation-instance-postgres",
     "crates/automation-instance-teardown",
@@ -44,6 +52,7 @@ members = [
     "tools/interaction-smoke",
     "tools/design-harness",
     "tools/starring-api",
+    "tools/starring-runtime",
 ]
 resolver = "2"
 

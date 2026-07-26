@@ -225,7 +225,8 @@ async fn normalize_public_ownership(pool: &PgPool, owner: &str) {
          FROM pg_catalog.pg_proc AS function_row \
          INNER JOIN pg_catalog.pg_namespace AS namespace \
           ON namespace.oid = function_row.pronamespace \
-         WHERE namespace.nspname = 'public' AND function_row.prokind = 'f' \
+         WHERE namespace.nspname IN ('public', 'starring_runtime_private_v2') \
+          AND function_row.prokind = 'f' \
          ORDER BY function_row.oid",
     )
     .fetch_all(pool)
@@ -241,6 +242,12 @@ async fn normalize_public_ownership(pool: &PgPool, owner: &str) {
         .execute(pool)
         .await
         .unwrap();
+    sqlx::query(&format!(
+        "ALTER SCHEMA starring_runtime_private_v2 OWNER TO {owner}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn grant_functions(pool: &PgPool, role: &str, functions: &[&str]) {

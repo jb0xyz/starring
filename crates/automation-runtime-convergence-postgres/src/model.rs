@@ -144,6 +144,17 @@ pub struct ClaimNextDeploymentV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewDeploymentV1 {
+    pub scope: RuntimeDeploymentScopeV1,
+    pub expected_revision: DeploymentRevision,
+    pub controller_id: ControllerId,
+    pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
+    pub runtime_generation: RuntimeGeneration,
+    pub lease_for: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverBlockedDeploymentV1 {
     pub scope: RuntimeDeploymentScopeV1,
     pub expected_revision: DeploymentRevision,
@@ -225,6 +236,7 @@ pub struct SubmitDeploymentMutationV1 {
     pub expected_revision: DeploymentRevision,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub runtime_generation: RuntimeGeneration,
     pub mutation: DeploymentMutationV1,
 }
@@ -233,6 +245,7 @@ pub struct SubmitDeploymentMutationV1 {
 pub struct MutationReceiptV1 {
     pub outcome: TransitionOutcomeV1,
     pub snapshot: RuntimeDeploymentSnapshotV1,
+    pub convergence_attempt: NonZeroU32,
 }
 
 macro_rules! define_safe_text {
@@ -296,18 +309,6 @@ define_lower_hex_digest!(AttestationIdV1, "runtime attestation identity");
 define_lower_hex_digest!(PanelReportDigestV1, "panel report digest");
 define_lower_hex_digest!(RuntimeDigestV1, "runtime digest");
 
-impl RuntimeDigestV1 {
-    pub(crate) fn from_sha256(bytes: [u8; 32]) -> Self {
-        const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut value = String::with_capacity(64);
-        for byte in bytes {
-            value.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
-            value.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
-        }
-        Self(value)
-    }
-}
-
 impl From<RuntimeDigestV1> for AttestationIdV1 {
     fn from(value: RuntimeDigestV1) -> Self {
         Self(value.0)
@@ -328,21 +329,11 @@ pub struct SubmitLiveAttestationV1 {
     pub expected_revision: DeploymentRevision,
     pub controller_id: ControllerId,
     pub fencing_token: FencingToken,
+    pub convergence_attempt: NonZeroU32,
     pub runtime_generation: RuntimeGeneration,
     pub gateway_ready: GatewayReadyAttestationV1,
     pub metadata: LiveMetadataV1,
     pub serving_lease_for: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AttestationRecordV1 {
-    pub live: automation_runtime_convergence::LiveAttestationV1,
-    pub runtime_build_revision: RuntimeBuildRevisionV1,
-    pub panel_report_digest: PanelReportDigestV1,
-    pub gateway_shard_id: GatewayShardIdV1,
-    pub controller_fencing_token: FencingToken,
-    pub deployment_revision: DeploymentRevision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

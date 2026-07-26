@@ -100,3 +100,18 @@ impl FacadeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::{FacadeError, FacadeErrorCode};
+
+    #[test]
+    fn invalid_state_is_a_non_retryable_conflict_wire_error() {
+        let error = FacadeError::new(FacadeErrorCode::InvalidState);
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "invalid_state");
+        assert!(!error.retryable());
+    }
+}

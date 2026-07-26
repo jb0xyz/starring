@@ -5,9 +5,9 @@ use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
     CommandGuardV1, ControllerId, DeploymentId, DrainAttestationV1, FencingToken,
     GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1, LiveLossKindV1,
-    PanelCertificateId, PanelCertificateV1, PanelIneligibilityV1, PreflightAttestationV1,
-    ProcessInstanceId, PromotionId, RecoverBlockedRequestV1, RecoverLiveRequestV1,
-    RuntimeDeployment, RuntimeDeploymentError, RuntimeDeploymentIdentityV1,
+    PanelCertificateId, PanelCertificateV1, PanelIneligibilityV1, PanelReportDigestV1,
+    PreflightAttestationV1, ProcessInstanceId, PromotionId, RecoverBlockedRequestV1,
+    RecoverLiveRequestV1, RuntimeDeployment, RuntimeDeploymentError, RuntimeDeploymentIdentityV1,
     RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1,
     RuntimeFailureId, RuntimeFailureKindV1, RuntimeFailureV1, RuntimeGeneration,
     RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId, TransitionOutcomeV1,
@@ -126,6 +126,7 @@ impl Fixture {
     fn panel(&self) -> PanelCertificateV1 {
         PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse("panels-2").unwrap(),
+            report_digest: PanelReportDigestV1::parse("4".repeat(64)).unwrap(),
             target: self.target.clone(),
             runtime_generation: RuntimeGeneration::new(2).unwrap(),
             process_instance_id: ProcessInstanceId::parse("process-new").unwrap(),

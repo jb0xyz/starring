@@ -166,7 +166,7 @@ pub(crate) fn project_status(
                 serving_revision: serving.checked_revision()?,
                 last_heartbeat_at: serving.last_heartbeat_at,
                 expires_at: serving.expires_at,
-                metadata: metadata(&attestation.record),
+                metadata: metadata(&attestation.record)?,
             })
         })
         .transpose()?;

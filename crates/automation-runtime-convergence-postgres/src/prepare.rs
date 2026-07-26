@@ -2,8 +2,8 @@ use automation_runtime_convergence::{RuntimeDeployment, RuntimeDeploymentSnapsho
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::digest::desired_target_digest;
 use crate::model::{EnqueueDeploymentV1, RuntimeDigestV1};
+use crate::persistence::desired_target_digest_v1;
 use crate::RuntimeConvergenceStoreError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,13 +41,13 @@ pub fn prepare_requested_deployment_v1(
             "installation authority revision",
         ));
     }
-    let desired_target_digest = desired_target_digest(
+    let desired_target_digest = desired_target_digest_v1(
         &request.identity,
         &request.target,
         request.runtime_generation.get(),
         request.installation_authority_revision,
         request.previous_runtime.as_ref(),
-    );
+    )?;
     let deployment = RuntimeDeployment::request(
         request.identity,
         request.target,

@@ -107,6 +107,7 @@ impl PostgresRuntimeConvergence {
             &persisted.deployment,
             DeploymentExecutionProjection {
                 live_attestation_id: persisted.live_attestation_id.as_ref().map(|id| id.as_str()),
+                last_controller_id: Some(controller_id.as_str()),
                 convergence_attempt: RuntimeConvergenceAttemptV1::from(convergence_attempt),
                 last_failure_attempt: persisted.last_failure_attempt,
             },

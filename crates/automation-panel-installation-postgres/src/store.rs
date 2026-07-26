@@ -1,9 +1,10 @@
 use automation_panel_installation::{
+    strict::{validate_strict_panel_key_v1, MAX_STRICT_PANEL_RECORDS_PER_SLOT},
     PanelInstallation, PanelInstallationKey, PanelInstallationStore, PanelInstallationStoreError,
 };
 use automation_ruleset::{RuleSetKey, RuleSetVersionId};
 use discord_model::{ChannelId, GuildId, MessageId};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -15,10 +16,14 @@ impl PostgresPanelInstallationStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 #[derive(sqlx::FromRow)]
-struct PanelInstallationRow {
+pub(crate) struct PanelInstallationRow {
     guild_id: String,
     ruleset_key: String,
     panel_key: String,
@@ -28,8 +33,39 @@ struct PanelInstallationRow {
     spec_hash: String,
 }
 
-fn backend(error: impl std::fmt::Display) -> PanelInstallationStoreError {
-    PanelInstallationStoreError::Backend(error.to_string())
+pub(crate) fn bounded_message(error: impl std::fmt::Display) -> String {
+    const MAX_ERROR_BYTES: usize = 512;
+    const TRUNCATION_SUFFIX: &str = "...";
+    let message = error.to_string();
+    if message.len() <= MAX_ERROR_BYTES {
+        return message;
+    }
+    let content_limit = MAX_ERROR_BYTES - TRUNCATION_SUFFIX.len();
+    let boundary = message
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= content_limit)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &message[..boundary], TRUNCATION_SUFFIX)
+}
+
+pub(crate) fn backend(error: impl std::fmt::Display) -> PanelInstallationStoreError {
+    PanelInstallationStoreError::Backend(bounded_message(error))
+}
+
+pub(crate) async fn begin_slot_write<'a>(
+    pool: &'a PgPool,
+    guild_id: &str,
+    ruleset_key: &str,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let lane = format!("{guild_id}:{ruleset_key}");
+    sqlx::query("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 739391))")
+        .bind(lane)
+        .execute(&mut *transaction)
+        .await?;
+    Ok(transaction)
 }
 
 fn valid_hash(value: &str) -> bool {
@@ -94,7 +130,7 @@ impl PanelInstallationStore for PostgresPanelInstallationStore {
     ) -> Result<Option<PanelInstallation>, PanelInstallationStoreError> {
         let row = sqlx::query_as::<_, PanelInstallationRow>(
             "SELECT guild_id, ruleset_key, panel_key, installed_version, channel_id, message_id, spec_hash \
-             FROM ruleset_panel_installations \
+             FROM public.ruleset_panel_installations \
              WHERE guild_id = $1 AND ruleset_key = $2 AND panel_key = $3",
         )
         .bind(key.guild_id.to_string())
@@ -110,8 +146,39 @@ impl PanelInstallationStore for PostgresPanelInstallationStore {
         &self,
         installation: PanelInstallation,
     ) -> Result<(), PanelInstallationStoreError> {
+        validate_strict_panel_key_v1(&installation.panel_key)
+            .map_err(|error| backend(format!("invalid panel key: {error:?}")))?;
+        if installation.guild_id.0 == 0
+            || installation.channel_id.0 == 0
+            || installation.message_id.0 == 0
+            || !valid_hash(&installation.spec_hash)
+        {
+            return Err(backend("invalid panel installation write"));
+        }
+        let guild_id = installation.guild_id.to_string();
+        let ruleset_key = installation.ruleset_key.as_str();
+        let mut transaction = begin_slot_write(&self.pool, &guild_id, ruleset_key)
+            .await
+            .map_err(backend)?;
+        let (exists, count) = sqlx::query_as::<_, (bool, i64)>(
+            "SELECT \
+             EXISTS(SELECT 1 FROM public.ruleset_panel_installations \
+                    WHERE guild_id = $1 AND ruleset_key = $2 AND panel_key = $3), \
+             COUNT(*) \
+             FROM public.ruleset_panel_installations \
+             WHERE guild_id = $1 AND ruleset_key = $2",
+        )
+        .bind(&guild_id)
+        .bind(ruleset_key)
+        .bind(&installation.panel_key)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(backend)?;
+        if !exists && count >= MAX_STRICT_PANEL_RECORDS_PER_SLOT as i64 {
+            return Err(backend("panel installation slot capacity exceeded"));
+        }
         sqlx::query(
-            "INSERT INTO ruleset_panel_installations \
+            "INSERT INTO public.ruleset_panel_installations \
              (guild_id, ruleset_key, panel_key, installed_version, channel_id, message_id, spec_hash) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (guild_id, ruleset_key, panel_key) DO UPDATE SET \
@@ -120,16 +187,17 @@ impl PanelInstallationStore for PostgresPanelInstallationStore {
              message_id = EXCLUDED.message_id, \
              spec_hash = EXCLUDED.spec_hash",
         )
-        .bind(installation.guild_id.to_string())
-        .bind(installation.ruleset_key.as_str())
+        .bind(guild_id)
+        .bind(ruleset_key)
         .bind(&installation.panel_key)
         .bind(i64::from(installation.installed_version.get()))
         .bind(installation.channel_id.to_string())
         .bind(installation.message_id.to_string())
         .bind(&installation.spec_hash)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(backend)?;
+        transaction.commit().await.map_err(backend)?;
         Ok(())
     }
 }

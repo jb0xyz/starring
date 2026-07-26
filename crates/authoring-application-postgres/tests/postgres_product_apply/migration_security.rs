@@ -720,6 +720,346 @@ async fn product_activation_cannot_commit_applying_residue() {
     assert_eq!(persisted, ("approved".to_string(), 0, None));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_waits_at_writer_fence_before_product_row_locks() {
+    let database = isolated_database("apply_writer_fence_order").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await.unwrap();
+        let fixture = seed_fixture(&database.pool).await;
+        let operation = Operation::new("writer-fence-order");
+        let mut fence = database.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+             pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0))",
+        )
+        .execute(&mut *fence)
+        .await?;
+        let (started_sender, started_receiver) = futures::channel::oneshot::channel();
+        let apply_pool = database.pool.clone();
+        let apply_fixture = fixture.clone();
+        let apply_operation = operation.clone();
+        let apply = tokio::spawn(async move {
+            let mut transaction = begin_serializable(&apply_pool).await;
+            let process_id = sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let _ = started_sender.send(process_id);
+            let call = Call::valid(&apply_fixture);
+            let locked = lock_apply(
+                &mut transaction,
+                &apply_fixture,
+                &apply_operation,
+                &call,
+            )
+            .await?;
+            transaction.rollback().await?;
+            Ok::<_, sqlx::Error>(locked.outcome)
+        });
+        let process_id = started_receiver.await.unwrap();
+        wait_for_advisory_lock_wait(&database.pool, process_id).await;
+        let mut row_probe = database.pool.begin().await?;
+        let locked_activation = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM public.activation_requests WHERE id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(&fixture.activation_id)
+        .fetch_one(&mut *row_probe)
+        .await?;
+        assert_eq!(locked_activation, fixture.activation_id);
+        row_probe.rollback().await?;
+        fence.rollback().await?;
+        assert_eq!(apply.await.unwrap()?, "ready");
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn stale_product_apply_snapshot_retries_into_closed_writer_fence() {
+    let database = isolated_database("apply_writer_fence_snapshot").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await.unwrap();
+        let fixture = seed_fixture(&database.pool).await;
+        let operation = Operation::new("writer-fence-snapshot");
+        let mut stale = begin_serializable(&database.pool).await;
+        sqlx::query(
+            "SELECT pg_catalog.set_config('statement_timeout', '10s', TRUE), \
+              pg_catalog.set_config('lock_timeout', '5s', TRUE), \
+              pg_catalog.set_config('idle_in_transaction_session_timeout', '10s', TRUE), \
+              pg_catalog.set_config('search_path', 'pg_catalog', TRUE), \
+              pg_catalog.set_config('quote_all_identifiers', 'off', TRUE)",
+        )
+        .execute(&mut *stale)
+        .await?;
+
+        let mut writer = database.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+             pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0))",
+        )
+        .execute(&mut *writer)
+        .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&mut *writer)
+            .await?;
+        sqlx::query(
+            "UPDATE public.runtime_writer_fence \
+             SET fence_state = 'closed', fence_generation = 2, \
+              cutover_lease_epoch_high_water = 1, \
+              cutover_coordinator_id = '0123456789abcdef0123456789abcdef', \
+              cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+             WHERE singleton",
+        )
+        .execute(&mut *writer)
+        .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&mut *writer)
+            .await?;
+        writer.commit().await?;
+
+        let stale_error = lock_apply(&mut stale, &fixture, &operation, &Call::valid(&fixture))
+            .await
+            .expect_err("stale Product Apply snapshot must be retried");
+        assert!(matches!(
+            stale_error,
+            sqlx::Error::Database(database)
+                if database.code().as_deref() == Some("40001")
+        ));
+        stale.rollback().await?;
+
+        let mut retry = begin_serializable(&database.pool).await;
+        let retry_result =
+            lock_apply(&mut retry, &fixture, &operation, &Call::valid(&fixture)).await?;
+        assert_eq!(retry_result.outcome, "runtime_writer_fenced");
+        retry.rollback().await?;
+
+        let mut durable = database.pool.begin().await?;
+        assert_apply_unmutated(&mut durable, &fixture, &operation).await;
+        durable.rollback().await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_writer_fence_closed_and_missing_are_stable_failures() {
+    let database = isolated_database("apply_writer_fence_state").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await.unwrap();
+        let fixture = seed_fixture(&database.pool).await;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&database.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE public.runtime_writer_fence \
+             SET fence_state = 'closed', fence_generation = 2, \
+              cutover_lease_epoch_high_water = 1, \
+              cutover_coordinator_id = '0123456789abcdef0123456789abcdef', \
+              cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+             WHERE singleton",
+        )
+        .execute(&database.pool)
+        .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&database.pool)
+            .await?;
+
+        let mut closed = begin_serializable(&database.pool).await;
+        let closed_result = lock_apply(
+            &mut closed,
+            &fixture,
+            &Operation::new("writer-fence-closed"),
+            &Call::valid(&fixture),
+        )
+        .await?;
+        assert_eq!(closed_result.outcome, "runtime_writer_fenced");
+        closed.rollback().await?;
+
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&database.pool)
+            .await?;
+        sqlx::query("DELETE FROM public.runtime_writer_fence")
+            .execute(&database.pool)
+            .await?;
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&database.pool)
+            .await?;
+
+        let mut missing = begin_serializable(&database.pool).await;
+        let missing_result = lock_apply(
+            &mut missing,
+            &fixture,
+            &Operation::new("writer-fence-missing"),
+            &Call::valid(&fixture),
+        )
+        .await?;
+        assert_eq!(missing_result.outcome, "runtime_writer_fence_invalid");
+        missing.rollback().await?;
+
+        let unchanged = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT activation.state, activation.product_revision, \
+              (SELECT pg_catalog.count(*) FROM public.runtime_deployments \
+               WHERE activation_request_id = activation.id) \
+             FROM public.activation_requests AS activation WHERE activation.id = $1",
+        )
+        .bind(&fixture.activation_id)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(unchanged, ("approved".to_string(), 2, 0));
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+async fn product_apply_writer_fence_catalog_state(
+    pool: &PgPool,
+) -> (String, bool, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT \
+          pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
+           pg_catalog.pg_get_functiondef(core.oid), 'UTF8')), 'hex'), \
+          pg_catalog.to_regprocedure(\
+           'public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)') IS NULL, \
+          (SELECT pg_catalog.count(*) \
+           FROM pg_catalog.aclexplode(active.proacl) AS privilege \
+           WHERE privilege.grantee = 0 \
+            AND privilege.privilege_type = 'EXECUTE'), \
+          active.proowner::BIGINT, core.proowner::BIGINT \
+         FROM pg_catalog.pg_proc AS core \
+         CROSS JOIN pg_catalog.pg_proc AS active \
+         WHERE core.oid = pg_catalog.to_regprocedure(\
+          'public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)') \
+          AND active.oid = pg_catalog.to_regprocedure(\
+          'public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_writer_fence_migration_rejects_public_capability_atomically() {
+    let database = isolated_database("apply_writer_acl").await;
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 202_607_240_001)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        for function in [
+            "public.starring_product_apply_executor_database_identity_v1()",
+            "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
+            "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
+            "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
+            "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+        ] {
+            sqlx::query(&format!(
+                "GRANT EXECUTE ON FUNCTION {function} TO PUBLIC"
+            ))
+            .execute(&database.pool)
+            .await?;
+        }
+        let before = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert!(before.1);
+        assert_eq!(before.2, 1);
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_240_002)
+            .unwrap();
+        let error = sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .expect_err("PUBLIC Apply capability must reject writer fence migration");
+        assert!(matches!(
+            error,
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("PA001")
+                    && database_error.message()
+                        == "product_apply_writer_fence_postflight_drift"
+        ));
+        let after = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert_eq!(after, before);
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_writer_fence_migration_rejects_split_active_owner_atomically() {
+    let database = isolated_database("apply_writer_owner").await;
+    let split_owner = format!("starring_apply_split_{}", suffix());
+    sqlx::query(&format!("CREATE ROLE {split_owner} NOLOGIN"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let outcome = async {
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 202_607_240_001)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&database.pool)
+                .await?;
+        }
+        sqlx::query(&format!(
+            "ALTER FUNCTION public.starring_product_apply_lock_v1(\
+             text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,\
+             timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],\
+             text[],text[],text,text,text,text,text,text) OWNER TO {split_owner}"
+        ))
+        .execute(&database.pool)
+        .await?;
+        let before = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert!(before.1);
+        assert_ne!(before.3, before.4);
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_607_240_002)
+            .unwrap();
+        let error = sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&database.pool)
+            .await
+            .expect_err("split active Apply owner must reject writer fence migration");
+        assert!(matches!(
+            error,
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("PA001")
+                    && database_error.message()
+                        == "product_apply_writer_fence_preflight_drift"
+        ));
+        let after = product_apply_writer_fence_catalog_state(&database.pool).await;
+        assert_eq!(after, before);
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {split_owner}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    outcome.unwrap();
+}
+
 async fn function_execute(pool: &PgPool, role: &str, identity: &str) -> bool {
     sqlx::query_scalar("SELECT pg_catalog.has_function_privilege($1, $2, 'EXECUTE')")
         .bind(role)

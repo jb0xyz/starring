@@ -1,5 +1,8 @@
+use automation_runtime_controller::{
+    decode_runtime_live_attestation_record_v1, RuntimeLiveAttestationRecordV1,
+};
 use automation_runtime_convergence::{
-    RuntimeDeployment, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
+    ControllerId, RuntimeDeployment, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
     RuntimeFailureDispositionV1, RuntimePendingConditionV1,
 };
 use chrono::{DateTime, Utc};
@@ -7,11 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sqlx::types::Json;
 
-use crate::digest::{desired_target_digest, live_attestation_digest};
-use crate::model::{
-    AttestationIdV1, AttestationRecordV1, LiveMetadataV1, RuntimeConvergenceAttemptV1,
-    RuntimeDigestV1,
-};
+use crate::model::{AttestationIdV1, LiveMetadataV1, RuntimeConvergenceAttemptV1, RuntimeDigestV1};
+use crate::persistence::{desired_target_digest_v1, live_attestation_id_v1, live_metadata_v1};
 use crate::RuntimeConvergenceStoreError;
 
 pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installation_id, \
@@ -20,7 +20,7 @@ pub(crate) const DEPLOYMENT_COLUMNS: &str = "deployment_id, tenant_id, installat
     desired_target_digest, runtime_generation, previous_runtime, requested_at, \
     snapshot_format_version, snapshot, revision, phase, controller_id, \
     controller_fencing_token, controller_acquired_at, controller_lease_expires_at, \
-    last_fencing_token, convergence_attempt_no, last_failure_attempt_no, next_retry_at, \
+    last_fencing_token, last_controller_id, convergence_attempt_no, last_failure_attempt_no, next_retry_at, \
     last_stable_error_code, live_attestation_id, live_at, blocked_at, superseded_at, \
     cancelled_at, created_at, updated_at";
 
@@ -53,6 +53,8 @@ pub(crate) struct DeploymentRow {
     pub controller_lease_expires_at: Option<DateTime<Utc>>,
     pub last_fencing_token: Option<i64>,
     #[serde(default)]
+    pub last_controller_id: Option<String>,
+    #[serde(default)]
     pub convergence_attempt_no: Option<i64>,
     #[serde(default)]
     pub last_failure_attempt_no: Option<i64>,
@@ -72,6 +74,7 @@ pub(crate) struct PersistedDeployment {
     pub installation_authority_revision: u64,
     pub desired_target_digest: RuntimeDigestV1,
     pub live_attestation_id: Option<AttestationIdV1>,
+    pub last_controller_id: Option<ControllerId>,
     pub convergence_attempt: Option<RuntimeConvergenceAttemptV1>,
     pub last_failure_attempt: Option<std::num::NonZeroU32>,
 }
@@ -129,6 +132,15 @@ impl DeploymentRow {
             .last_failure_attempt_no
             .map(|value| positive_u32(value, "runtime failure attempt"))
             .transpose()?;
+        let last_controller_id = self
+            .last_controller_id
+            .map(ControllerId::parse)
+            .transpose()
+            .map_err(|_| {
+                RuntimeConvergenceStoreError::InvalidPersistedState(
+                    "runtime last controller identity",
+                )
+            })?;
         if require_attempt_evidence && convergence_attempt.is_none() {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "runtime convergence attempt",
@@ -140,6 +152,8 @@ impl DeploymentRow {
                 attempt,
                 last_failure_attempt,
                 live_attestation_id.as_ref(),
+                last_controller_id.as_ref(),
+                require_attempt_evidence,
             )?;
         } else if last_failure_attempt.is_some() {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
@@ -158,13 +172,30 @@ impl DeploymentRow {
         let row_previous = self.previous_runtime.map(|value| value.0);
         let target = &snapshot.target;
         let identity = &snapshot.identity;
-        let recomputed_desired_target_digest = desired_target_digest(
+        let last_controller_projection_valid =
+            if !require_attempt_evidence && last_controller_id.is_none() {
+                true
+            } else {
+                match (
+                    snapshot.last_fencing_token,
+                    last_controller_id.as_ref(),
+                    snapshot.controller_lease.as_ref(),
+                ) {
+                    (None, None, None) => true,
+                    (Some(_), Some(last_controller_id), Some(lease)) => {
+                        last_controller_id == &lease.controller_id
+                    }
+                    (Some(_), Some(_), None) => true,
+                    _ => false,
+                }
+            };
+        let recomputed_desired_target_digest = desired_target_digest_v1(
             identity,
             target,
             snapshot.runtime_generation.get(),
             authority_revision,
             snapshot.previous_runtime.as_ref(),
-        );
+        )?;
         let valid = self.deployment_id == identity.deployment_id.as_str()
             && self.tenant_id == identity.tenant_id.as_str()
             && self.installation_id == identity.installation_id.as_str()
@@ -194,7 +225,7 @@ impl DeploymentRow {
             && self.cancelled_at == projection.cancelled_at
             && self.created_at <= self.updated_at
             && persisted_desired_target_digest == recomputed_desired_target_digest;
-        if !valid {
+        if !valid || !last_controller_projection_valid {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "deployment projections",
             ));
@@ -204,6 +235,7 @@ impl DeploymentRow {
             installation_authority_revision: authority_revision,
             desired_target_digest: persisted_desired_target_digest,
             live_attestation_id,
+            last_controller_id,
             convergence_attempt,
             last_failure_attempt,
         })
@@ -286,7 +318,7 @@ impl DeploymentProjection {
 }
 
 pub(crate) const ATTESTATION_COLUMNS: &str = "attestation_id, attestation_digest, deployment_id, \
-    deployment_revision, convergence_attempt_no, tenant_id, installation_id, promotion_id, activation_request_id, \
+    deployment_revision, convergence_attempt_no, serving_lease_duration_nanos, tenant_id, installation_id, promotion_id, activation_request_id, \
     guild_id, ruleset_key, target_version, target_content_hash, binding_revision, \
     binding_fingerprint, runtime_generation, controller_fencing_token, process_instance_id, \
     runtime_build_revision, panel_certificate_id, panel_report_digest, gateway_shard_id, \
@@ -301,6 +333,8 @@ pub(crate) struct AttestationRow {
     pub deployment_revision: i64,
     #[serde(default)]
     pub convergence_attempt_no: Option<i64>,
+    #[serde(default)]
+    pub serving_lease_duration_nanos: i64,
     pub tenant_id: String,
     pub installation_id: String,
     pub promotion_id: String,
@@ -328,13 +362,14 @@ pub(crate) struct AttestationRow {
 
 pub(crate) struct PersistedAttestation {
     pub id: AttestationIdV1,
-    pub record: AttestationRecordV1,
+    pub record: RuntimeLiveAttestationRecordV1,
     pub deployment_id: String,
     pub tenant_id: String,
     pub installation_id: String,
     pub promotion_id: String,
     pub activation_request_id: String,
     pub convergence_attempt: Option<std::num::NonZeroU32>,
+    pub serving_lease_for: Option<std::time::Duration>,
 }
 
 impl AttestationRow {
@@ -358,25 +393,33 @@ impl AttestationRow {
             ));
         }
         let id = AttestationIdV1::parse(self.attestation_id)?;
-        let record =
-            serde_json::from_value::<AttestationRecordV1>(self.record.0).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
-            })?;
+        let encoded_record = serde_json::to_vec(&self.record.0).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
+        })?;
+        let record = decode_runtime_live_attestation_record_v1(&encoded_record).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidPersistedState("attestation record JSON")
+        })?;
         let live = &record.live;
         let convergence_attempt = self
             .convergence_attempt_no
             .map(|value| positive_u32(value, "runtime attestation attempt"))
             .transpose()?;
+        let serving_lease_for = u64::try_from(self.serving_lease_duration_nanos)
+            .ok()
+            .filter(|value| *value > 0)
+            .map(std::time::Duration::from_nanos);
+        if require_attempt_evidence && serving_lease_for.is_none() {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime attestation serving lease duration",
+            ));
+        }
         if require_attempt_evidence && convergence_attempt.is_none() {
             return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
                 "runtime attestation attempt",
             ));
         }
         let target = &live.target;
-        let recomputed_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidPersistedState("attestation record digest")
-            })?);
+        let recomputed_id = live_attestation_id_v1(&record)?;
         let valid = self.deployment_revision == runtime_i64(record.deployment_revision.get())?
             && self.guild_id == target.guild_id.to_string()
             && self.ruleset_key == target.ruleset_key.as_str()
@@ -415,6 +458,7 @@ impl AttestationRow {
             promotion_id: self.promotion_id,
             activation_request_id: self.activation_request_id,
             convergence_attempt,
+            serving_lease_for,
         })
     }
 }
@@ -502,6 +546,8 @@ fn validate_attempt_projection(
     convergence_attempt: RuntimeConvergenceAttemptV1,
     last_failure_attempt: Option<std::num::NonZeroU32>,
     live_attestation_id: Option<&AttestationIdV1>,
+    last_controller_id: Option<&ControllerId>,
+    require_controller_evidence: bool,
 ) -> Result<(), RuntimeConvergenceStoreError> {
     let snapshot_failure_attempt = match snapshot.last_runtime_failure.as_ref() {
         Some(RuntimeFailureDispositionV1::Retryable { attempt, .. }) => Some(*attempt),
@@ -527,6 +573,7 @@ fn validate_attempt_projection(
             && matches!(snapshot.phase, RuntimeDeploymentPhaseV1::Requested)
             && snapshot.controller_lease.is_none()
             && snapshot.last_fencing_token.is_none()
+            && last_controller_id.is_none()
             && snapshot.preflight.is_none()
             && snapshot.drain.is_none()
             && snapshot.activation.is_none()
@@ -541,7 +588,9 @@ fn validate_attempt_projection(
                 "pending runtime convergence attempt",
             ));
         }
-    } else if snapshot.last_fencing_token.is_none() {
+    } else if snapshot.last_fencing_token.is_none()
+        || require_controller_evidence && last_controller_id.is_none()
+    {
         return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
             "started runtime convergence attempt",
         ));
@@ -585,10 +634,8 @@ pub(crate) fn positive_u64(
         .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(field))
 }
 
-pub(crate) fn metadata(record: &AttestationRecordV1) -> LiveMetadataV1 {
-    LiveMetadataV1 {
-        runtime_build_revision: record.runtime_build_revision.clone(),
-        panel_report_digest: record.panel_report_digest.clone(),
-        gateway_shard_id: record.gateway_shard_id.clone(),
-    }
+pub(crate) fn metadata(
+    record: &RuntimeLiveAttestationRecordV1,
+) -> Result<LiveMetadataV1, RuntimeConvergenceStoreError> {
+    live_metadata_v1(record)
 }

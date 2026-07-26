@@ -164,6 +164,7 @@ dependencies = [
  "automation-ruleset",
  "automation-ruleset-activation",
  "automation-ruleset-readiness",
+ "automation-runtime-controller",
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "automation-state",
@@ -302,6 +303,7 @@ dependencies = [
  "automation-panel-installation",
  "automation-ruleset",
  "discord-model",
+ "serde_json",
  "sqlx",
  "tokio",
 ]
@@ -414,15 +416,35 @@ dependencies = [
  "automation-panel-installation",
  "automation-ruleset",
  "automation-ruleset-dispatch",
+ "automation-ruleset-readiness",
+ "automation-runtime-convergence",
+ "automation-runtime-registry",
  "automation-state",
  "desired-state",
  "discord-model",
  "futures",
  "resource-resolution",
+ "rustls",
+ "thiserror 1.0.69",
  "tokio",
  "twilight-gateway",
  "twilight-http",
  "twilight-model",
+]
+
+[[package]]
+name = "automation-runtime-controller"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -444,17 +466,124 @@ version = "0.1.0"
 dependencies = [
  "automation-core",
  "automation-ruleset",
+ "automation-runtime-controller",
  "automation-runtime-convergence",
  "automation-state",
  "chrono",
+ "desired-state",
  "discord-model",
  "resource-resolution",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "automation-runtime-execution-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "automation-runtime-worker",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "automation-runtime-interaction-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-instance",
+ "automation-ruleset",
+ "automation-ruleset-dispatch",
+ "automation-state",
+ "chrono",
+ "discord-model",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "automation-runtime-panel-evidence"
+version = "0.1.0"
+dependencies = [
+ "automation-panel-installation",
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "automation-runtime-panel-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-panel-installation",
+ "automation-ruleset",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "automation-runtime-convergence-postgres",
+ "automation-state",
+ "chrono",
+ "desired-state",
+ "discord-model",
+ "getrandom 0.4.3",
+ "resource-resolution",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "automation-runtime-registry"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "resource-resolution",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "automation-runtime-serving-postgres"
+version = "0.1.0"
+dependencies = [
+ "automation-ruleset",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "chrono",
+ "discord-model",
+ "resource-resolution",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "automation-runtime-worker"
+version = "0.1.0"
+dependencies = [
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "chrono",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3147,6 +3276,28 @@ dependencies = [
  "serde_json",
  "simulator",
  "virtual-apply",
+]
+
+[[package]]
+name = "starring-runtime"
+version = "0.1.0"
+dependencies = [
+ "automation-runtime",
+ "automation-runtime-controller",
+ "automation-runtime-convergence",
+ "automation-runtime-convergence-postgres",
+ "automation-runtime-execution-postgres",
+ "automation-runtime-interaction-postgres",
+ "automation-runtime-panel-postgres",
+ "automation-runtime-registry",
+ "automation-runtime-serving-postgres",
+ "automation-runtime-worker",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

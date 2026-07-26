@@ -1,6 +1,7 @@
 mod attempt;
 mod deployment;
 mod operator;
+mod previous_serving;
 mod serving;
 mod status;
 
@@ -33,6 +34,7 @@ pub struct PostgresRuntimeConvergence {
 
 struct DeploymentExecutionProjection<'a> {
     live_attestation_id: Option<&'a str>,
+    last_controller_id: Option<&'a str>,
     convergence_attempt: RuntimeConvergenceAttemptV1,
     last_failure_attempt: Option<std::num::NonZeroU32>,
 }
@@ -110,6 +112,23 @@ impl PostgresRuntimeConvergence {
             .map_err(database)
     }
 
+    async fn lock_serving_slot(
+        transaction: &mut Transaction<'_, Postgres>,
+        guild_id: &str,
+        ruleset_key: &str,
+    ) -> Result<(), RuntimeConvergenceStoreError> {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(\
+             pg_catalog.concat('starring-runtime-serving-slot-v1:', $1::TEXT, ':', $2::TEXT), 0))",
+        )
+        .bind(guild_id)
+        .bind(ruleset_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database)?;
+        Ok(())
+    }
+
     fn bounded_duration(
         duration: Duration,
         maximum: Duration,
@@ -119,6 +138,14 @@ impl PostgresRuntimeConvergence {
             return Err(RuntimeConvergenceStoreError::InvalidInput(field));
         }
         TimeDelta::from_std(duration).map_err(|_| RuntimeConvergenceStoreError::InvalidInput(field))
+    }
+
+    fn duration_nanos(
+        duration: Duration,
+        field: &'static str,
+    ) -> Result<i64, RuntimeConvergenceStoreError> {
+        i64::try_from(duration.as_nanos())
+            .map_err(|_| RuntimeConvergenceStoreError::InvalidInput(field))
     }
 
     fn bounded_lease_duration(
@@ -226,13 +253,13 @@ impl PostgresRuntimeConvergence {
         let updated = sqlx::query(
             "UPDATE public.runtime_deployments SET snapshot = $4, revision = $5, phase = $6, \
              controller_id = $7, controller_fencing_token = $8, controller_acquired_at = $9, \
-             controller_lease_expires_at = $10, last_fencing_token = $11, next_retry_at = $12, \
-             last_stable_error_code = $13, live_attestation_id = $14, live_at = $15, \
-             blocked_at = $16, superseded_at = $17, cancelled_at = $18, \
-             convergence_attempt_no = $19, last_failure_attempt_no = $20, \
-             updated_at = GREATEST($22, updated_at + INTERVAL '1 microsecond') \
+             controller_lease_expires_at = $10, last_fencing_token = $11, \
+             last_controller_id = $12, next_retry_at = $13, last_stable_error_code = $14, \
+             live_attestation_id = $15, live_at = $16, blocked_at = $17, superseded_at = $18, \
+             cancelled_at = $19, convergence_attempt_no = $20, last_failure_attempt_no = $21, \
+             updated_at = GREATEST($23, updated_at + INTERVAL '1 microsecond') \
              WHERE tenant_id = $1 AND installation_id = $2 AND deployment_id = $3 \
-             AND revision = $21",
+             AND revision = $22",
         )
         .bind(scope.tenant_id.as_str())
         .bind(scope.installation_id.as_str())
@@ -245,6 +272,7 @@ impl PostgresRuntimeConvergence {
         .bind(projection.controller_acquired_at)
         .bind(projection.controller_lease_expires_at)
         .bind(projection.last_fencing_token)
+        .bind(execution.last_controller_id)
         .bind(projection.next_retry_at)
         .bind(projection.last_stable_error_code)
         .bind(execution.live_attestation_id)
@@ -304,6 +332,20 @@ impl PostgresRuntimeConvergence {
             .into());
         }
         Ok(())
+    }
+
+    fn require_convergence_attempt(
+        persisted: &PersistedDeployment,
+        expected: std::num::NonZeroU32,
+    ) -> Result<std::num::NonZeroU32, RuntimeConvergenceStoreError> {
+        let current = persisted
+            .exact_convergence_attempt()?
+            .started()
+            .ok_or(RuntimeConvergenceStoreError::ConvergenceAttemptConflict)?;
+        if expected != current {
+            return Err(RuntimeConvergenceStoreError::ConvergenceAttemptConflict);
+        }
+        Ok(current)
     }
 
     async fn assert_current_snapshot_authority(
@@ -433,6 +475,12 @@ impl PostgresRuntimeConvergence {
         transaction: &mut Transaction<'_, Postgres>,
         snapshot: &RuntimeDeploymentSnapshotV1,
     ) -> Result<DateTime<Utc>, RuntimeConvergenceStoreError> {
+        Self::lock_serving_slot(
+            transaction,
+            &snapshot.target.guild_id.to_string(),
+            snapshot.target.ruleset_key.as_str(),
+        )
+        .await?;
         let serving = sqlx::query_as::<_, ServingLeaseRow>(&format!(
             "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
              WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"

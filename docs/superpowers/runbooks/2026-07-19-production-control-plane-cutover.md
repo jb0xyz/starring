@@ -662,6 +662,22 @@ lease path remain unavailable.
 3. Stop new promotion, approval, rejection, and apply requests.
 4. Drain legacy writers, including every old `interaction-smoke` process, and
    confirm no activation is `applying`.
+   Before `202607240013_fence_runtime_execution_slot_writer_epoch.sql`, set the
+   exact runtime execution executor role to `NOLOGIN`, remove every membership
+   into that role, drain every other client session from the target database,
+   and resolve every prepared transaction in that database. Keep runtime
+   ingress isolated until migration, the matching runtime binary, and its
+   readiness probe are green. Migration 013 rejects a login-capable or
+   inherited executor, any other client session, and any prepared transaction
+   because legacy `renew` and non-drain mutation bodies do not share the new
+   physical slot fence and cannot participate in a rolling mixed-version
+   cutover.
+   After the migration and matching runtime binary are installed, keep ingress
+   isolated, restore `LOGIN` only on the exact runtime execution role, and run
+   one readiness probe through that role. If the probe fails, stop the new
+   process, return the role to `NOLOGIN`, drain its session, and keep ingress
+   closed. Start the runtime and reopen ingress only after that exact-role probe
+   is green; never restore the legacy binary against migration 013.
 5. Confirm every product-authored promotion is provisioned into exactly one
    active tenant installation with the same tenant, guild, and RuleSet key.
 6. Estimate table and index size and schedule a maintenance window for the

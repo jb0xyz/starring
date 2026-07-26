@@ -1,17 +1,19 @@
 use automation_ruleset::CURRENT_RULESET_SCHEMA_VERSION;
+use automation_runtime_controller::{
+    encode_runtime_live_attestation_record_v1, RuntimeLiveAttestationRecordV1,
+};
 use automation_runtime_convergence::{
     CommandGuardV1, LiveLossKindV1, RecoverLiveRequestV1, RuntimeDeploymentPhaseV1,
     TransitionOutcomeV1,
 };
 use sqlx::types::Json;
 
-use crate::digest::live_attestation_digest;
 use crate::error::database;
 use crate::model::{
-    AttestationIdV1, AttestationRecordV1, HeartbeatServingLeaseV1, MarkServingDisconnectedV1,
-    MutationReceiptV1, RecoverStaleLiveV1, ServingLeaseIdentityV1, ServingLeaseReceiptV1,
-    SubmitLiveAttestationV1,
+    AttestationIdV1, HeartbeatServingLeaseV1, MarkServingDisconnectedV1, MutationReceiptV1,
+    RecoverStaleLiveV1, ServingLeaseIdentityV1, ServingLeaseReceiptV1, SubmitLiveAttestationV1,
 };
+use crate::persistence::{live_attestation_id_v1, live_attestation_record_v1};
 use crate::row::{
     gateway_ready_kind_name, runtime_i64, AttestationRow, ServingLeaseRow, ATTESTATION_COLUMNS,
     SERVING_LEASE_COLUMNS,
@@ -30,9 +32,23 @@ impl PostgresRuntimeConvergence {
             self.config.maximum_serving_lease,
             "serving lease duration",
         )?;
+        let serving_duration_nanos =
+            Self::duration_nanos(request.serving_lease_for, "serving lease duration")?;
         let mut transaction = self.begin().await?;
         let mut persisted = Self::load_scoped_for_update(&mut transaction, &request.scope).await?;
+        let convergence_attempt =
+            Self::require_convergence_attempt(&persisted, request.convergence_attempt)?;
         Self::assert_current_deployment_authority(&mut transaction, &persisted).await?;
+        let certification_snapshot = persisted.deployment.snapshot();
+        let panel_report_digest = certification_snapshot
+            .panel_certificate
+            .as_ref()
+            .map(|certificate| certificate.report_digest.as_str());
+        if panel_report_digest != Some(request.metadata.panel_report_digest.as_str()) {
+            return Err(RuntimeConvergenceStoreError::InvalidInput(
+                "panel report digest mismatch",
+            ));
+        }
         let current_serving = Self::load_serving_lease_for_update(
             &mut transaction,
             persisted.deployment.target().guild_id.to_string(),
@@ -58,6 +74,7 @@ impl PostgresRuntimeConvergence {
             request.runtime_generation,
             now,
         )?;
+        let executing_controller_id = request.controller_id.clone();
         let guard = CommandGuardV1 {
             expected_revision: request.expected_revision,
             controller_id: request.controller_id,
@@ -68,10 +85,7 @@ impl PostgresRuntimeConvergence {
         let outcome = persisted
             .deployment
             .certify_live(&guard, request.gateway_ready, now)?;
-        let convergence_attempt = persisted.exact_convergence_attempt()?;
-        let attestation_attempt = convergence_attempt.started().ok_or(
-            RuntimeConvergenceStoreError::InvalidPersistedState("Live runtime convergence attempt"),
-        )?;
+        let attestation_attempt = convergence_attempt;
         let snapshot = persisted.deployment.snapshot();
         let live =
             snapshot
@@ -80,18 +94,13 @@ impl PostgresRuntimeConvergence {
                 .ok_or(RuntimeConvergenceStoreError::InvalidPersistedState(
                     "Live transition did not produce an attestation",
                 ))?;
-        let record = AttestationRecordV1 {
-            live: live.clone(),
-            runtime_build_revision: request.metadata.runtime_build_revision,
-            panel_report_digest: request.metadata.panel_report_digest,
-            gateway_shard_id: request.metadata.gateway_shard_id,
-            controller_fencing_token: request.fencing_token,
-            deployment_revision: snapshot.revision,
-        };
-        let attestation_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-            })?);
+        let record = live_attestation_record_v1(
+            live.clone(),
+            &request.metadata,
+            request.fencing_token,
+            snapshot.revision,
+        )?;
+        let attestation_id = live_attestation_id_v1(&record)?;
         let existing_attestation =
             Self::load_attestation(&mut transaction, &request.scope, &attestation_id, true).await?;
         match (outcome, existing_attestation) {
@@ -103,6 +112,7 @@ impl PostgresRuntimeConvergence {
                     &record,
                     &snapshot,
                     attestation_attempt,
+                    serving_duration_nanos,
                 )
                 .await?;
             }
@@ -128,7 +138,14 @@ impl PostgresRuntimeConvergence {
                 }
                 let receipt = serving_receipt(&request.scope, current)?;
                 transaction.commit().await.map_err(database)?;
-                return Ok((MutationReceiptV1 { outcome, snapshot }, receipt));
+                return Ok((
+                    MutationReceiptV1 {
+                        outcome,
+                        snapshot,
+                        convergence_attempt,
+                    },
+                    receipt,
+                ));
             }
             if current.expires_at > now && (current.connected || current.serving) {
                 return Err(RuntimeConvergenceStoreError::ServingLeaseConflict);
@@ -226,7 +243,8 @@ impl PostgresRuntimeConvergence {
                 &persisted.deployment,
                 DeploymentExecutionProjection {
                     live_attestation_id: Some(attestation_id.as_str()),
-                    convergence_attempt,
+                    last_controller_id: Some(executing_controller_id.as_str()),
+                    convergence_attempt: convergence_attempt.into(),
                     last_failure_attempt: persisted.last_failure_attempt,
                 },
                 now,
@@ -235,7 +253,14 @@ impl PostgresRuntimeConvergence {
         }
         let receipt = serving_receipt(&request.scope, &serving)?;
         transaction.commit().await.map_err(database)?;
-        Ok((MutationReceiptV1 { outcome, snapshot }, receipt))
+        Ok((
+            MutationReceiptV1 {
+                outcome,
+                snapshot,
+                convergence_attempt,
+            },
+            receipt,
+        ))
     }
 
     pub async fn heartbeat_serving(
@@ -371,6 +396,10 @@ impl PostgresRuntimeConvergence {
         current: ServingLeaseRow,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<MutationReceiptV1, RuntimeConvergenceStoreError> {
+        let convergence_attempt = persisted
+            .exact_convergence_attempt()?
+            .started()
+            .ok_or(RuntimeConvergenceStoreError::ConvergenceAttemptConflict)?;
         validate_serving_identity(&current, &request.identity)?;
         let (kind, evidence_at) = if !current.connected || !current.serving {
             (
@@ -401,7 +430,11 @@ impl PostgresRuntimeConvergence {
                 let outcome = TransitionOutcomeV1::Replayed {
                     revision: snapshot.revision,
                 };
-                return Ok(MutationReceiptV1 { outcome, snapshot });
+                return Ok(MutationReceiptV1 {
+                    outcome,
+                    snapshot,
+                    convergence_attempt,
+                });
             }
             return Err(RuntimeConvergenceStoreError::ServingLeaseConflict);
         }
@@ -444,14 +477,22 @@ impl PostgresRuntimeConvergence {
             &persisted.deployment,
             DeploymentExecutionProjection {
                 live_attestation_id: None,
-                convergence_attempt: persisted.exact_convergence_attempt()?,
+                last_controller_id: persisted
+                    .last_controller_id
+                    .as_ref()
+                    .map(|controller| controller.as_str()),
+                convergence_attempt: convergence_attempt.into(),
                 last_failure_attempt: persisted.last_failure_attempt,
             },
             now,
         )
         .await?;
         let snapshot = persisted.deployment.snapshot();
-        Ok(MutationReceiptV1 { outcome, snapshot })
+        Ok(MutationReceiptV1 {
+            outcome,
+            snapshot,
+            convergence_attempt,
+        })
     }
 
     pub async fn recover_next_stale_live(
@@ -597,21 +638,17 @@ impl PostgresRuntimeConvergence {
         if request.expected_revision.next().ok() != Some(snapshot.revision)
             || request.runtime_generation != snapshot.runtime_generation
             || request.gateway_ready != live.gateway_ready
+            || persisted.last_controller_id.as_ref() != Some(&request.controller_id)
         {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
-        let record = AttestationRecordV1 {
-            live: live.clone(),
-            runtime_build_revision: request.metadata.runtime_build_revision.clone(),
-            panel_report_digest: request.metadata.panel_report_digest.clone(),
-            gateway_shard_id: request.metadata.gateway_shard_id.clone(),
-            controller_fencing_token: request.fencing_token,
-            deployment_revision: snapshot.revision,
-        };
-        let attestation_id =
-            AttestationIdV1::from(live_attestation_digest(&record).map_err(|_| {
-                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-            })?);
+        let record = live_attestation_record_v1(
+            live.clone(),
+            &request.metadata,
+            request.fencing_token,
+            snapshot.revision,
+        )?;
+        let attestation_id = live_attestation_id_v1(&record)?;
         if persisted.live_attestation_id.as_ref() != Some(&attestation_id) {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
@@ -625,6 +662,7 @@ impl PostgresRuntimeConvergence {
             .ok_or(RuntimeConvergenceStoreError::AttestationConflict)?;
         if attestation.record != record
             || attestation.convergence_attempt != Some(convergence_attempt)
+            || attestation.serving_lease_for != Some(request.serving_lease_for)
         {
             return Err(RuntimeConvergenceStoreError::AttestationConflict);
         }
@@ -646,6 +684,7 @@ impl PostgresRuntimeConvergence {
                     revision: snapshot.revision,
                 },
                 snapshot,
+                convergence_attempt,
             },
             serving_receipt(&request.scope, serving)?,
         ))
@@ -679,26 +718,35 @@ impl PostgresRuntimeConvergence {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         scope: &crate::RuntimeDeploymentScopeV1,
         attestation_id: &AttestationIdV1,
-        record: &AttestationRecordV1,
+        record: &RuntimeLiveAttestationRecordV1,
         snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
         convergence_attempt: std::num::NonZeroU32,
+        serving_lease_duration_nanos: i64,
     ) -> Result<(), RuntimeConvergenceStoreError> {
         let live = &record.live;
+        let encoded_record = encode_runtime_live_attestation_record_v1(record).map_err(|_| {
+            RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
+        })?;
+        let record_json: serde_json::Value =
+            serde_json::from_slice(&encoded_record).map_err(|_| {
+                RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
+            })?;
         sqlx::query(
             "INSERT INTO public.runtime_attestations (attestation_id, attestation_digest, deployment_id, \
-             deployment_revision, convergence_attempt_no, tenant_id, installation_id, promotion_id, activation_request_id, \
+             deployment_revision, convergence_attempt_no, serving_lease_duration_nanos, tenant_id, installation_id, promotion_id, activation_request_id, \
              guild_id, ruleset_key, target_version, target_content_hash, binding_revision, \
              binding_fingerprint, runtime_generation, controller_fencing_token, \
              process_instance_id, runtime_build_revision, panel_certificate_id, \
              panel_report_digest, gateway_shard_id, gateway_ready_kind, gateway_ready_at, \
              certified_at, record_format_version, record, created_at) \
-             VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 1, $25, $24)",
+             VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, 1, $26, $25)",
         )
         .bind(attestation_id.as_str())
         .bind(scope.deployment_id.as_str())
         .bind(runtime_i64(record.deployment_revision.get())?)
         .bind(i64::from(convergence_attempt.get()))
+        .bind(serving_lease_duration_nanos)
         .bind(scope.tenant_id.as_str())
         .bind(scope.installation_id.as_str())
         .bind(snapshot.identity.promotion_id.as_str())
@@ -719,9 +767,7 @@ impl PostgresRuntimeConvergence {
         .bind(gateway_ready_kind_name(live.gateway_ready.kind))
         .bind(live.gateway_ready.ready_at)
         .bind(live.certified_at)
-        .bind(Json(serde_json::to_value(record).map_err(|_| {
-            RuntimeConvergenceStoreError::InvalidInput("Live attestation serialization")
-        })?))
+        .bind(Json(record_json))
         .execute(&mut **transaction)
         .await
         .map_err(|error| {
@@ -739,6 +785,7 @@ impl PostgresRuntimeConvergence {
         guild_id: String,
         ruleset_key: &str,
     ) -> Result<Option<ServingLeaseRow>, RuntimeConvergenceStoreError> {
+        Self::lock_serving_slot(transaction, &guild_id, ruleset_key).await?;
         sqlx::query_as::<_, ServingLeaseRow>(&format!(
             "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \
              WHERE guild_id = $1 AND ruleset_key = $2 FOR UPDATE"

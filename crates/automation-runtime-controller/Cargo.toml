@@ -1,0 +1,15 @@
+[package]
+name = "automation-runtime-controller"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-ruleset = { path = "../automation-ruleset" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+chrono = "0.4"
+discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }

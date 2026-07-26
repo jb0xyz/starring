@@ -5,7 +5,7 @@ const PRODUCT_APPLY_FUNCTIONS: [&str; 5] = [
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
     "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
 ];
-const PRODUCT_DECISION_BOUNDARY_RELATIONS: [&str; 20] = [
+const PRODUCT_DECISION_BOUNDARY_RELATIONS: [&str; 23] = [
     "product_control_plane_identity",
     "activation_requests",
     "activation_request_approvals",
@@ -24,6 +24,9 @@ const PRODUCT_DECISION_BOUNDARY_RELATIONS: [&str; 20] = [
     "automation_ruleset_activations",
     "automation_ruleset_versions",
     "runtime_deployments",
+    "runtime_drain_intents_v2",
+    "runtime_slot_writer_fences_v2",
+    "runtime_writer_fence",
     "runtime_serving_leases",
     "runtime_attestations",
 ];
@@ -39,13 +42,23 @@ const PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS: [&str; 10] = [
     "public.reject_runtime_deployment_delete()",
     "public.validate_runtime_deployment_projection()",
 ];
+const PRODUCT_APPLY_WRITER_FENCE_SUPPORT_FUNCTION: &str =
+    "public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)";
 const PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION: &str =
     "public.validate_runtime_convergence_attempt_projection()";
+const PRODUCT_APPLY_SLOT_WRITER_FENCE_SUPPORT_FUNCTIONS: [&str; 2] = [
+    "starring_runtime_private_v2.starring_runtime_slot_writer_fence_lock_v2(text,text)",
+    "starring_runtime_private_v2.starring_runtime_slot_writer_fence_begin_unsafe_v2(text,text,bigint)",
+];
 
 fn product_apply_support_functions() -> impl Iterator<Item = &'static str> {
     PRODUCT_APPLY_MIGRATION_202607190022_SUPPORT_FUNCTIONS
         .into_iter()
-        .chain([PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION])
+        .chain([
+            PRODUCT_APPLY_WRITER_FENCE_SUPPORT_FUNCTION,
+            PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION,
+        ])
+        .chain(PRODUCT_APPLY_SLOT_WRITER_FENCE_SUPPORT_FUNCTIONS)
 }
 
 fn incomplete_apply_security_keyring() -> ProductDecisionDigestKeyringV1 {
@@ -61,6 +74,12 @@ fn incomplete_apply_security_keyring() -> ProductDecisionDigestKeyringV1 {
 }
 
 async fn alter_product_decision_boundary_owner(pool: &PgPool, owner_role: &str) {
+    sqlx::query(&format!(
+        "ALTER SCHEMA starring_runtime_private_v2 OWNER TO {owner_role}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
     for relation in PRODUCT_DECISION_BOUNDARY_RELATIONS {
         sqlx::query(&format!(
             "ALTER TABLE public.{relation} OWNER TO {owner_role}"
@@ -218,6 +237,57 @@ async fn product_apply_executor_is_exactly_scoped_replay_safe_and_fail_closed() 
             .verify_product_decision_boundary_readiness()
             .await
             .unwrap();
+
+        let mut close_fence = database.pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {owner_role}"))
+            .execute(&mut *close_fence)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&mut *close_fence)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE public.runtime_writer_fence \
+             SET fence_state = 'closed', fence_generation = 2, \
+              cutover_lease_epoch_high_water = 1, \
+              cutover_coordinator_id = '0123456789abcdef0123456789abcdef', \
+              cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+             WHERE singleton",
+        )
+        .execute(&mut *close_fence)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&mut *close_fence)
+            .await
+            .unwrap();
+        close_fence.commit().await.unwrap();
+        decisions.verify_apply_executor_readiness().await.unwrap();
+
+        let mut open_fence = database.pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {owner_role}"))
+            .execute(&mut *open_fence)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE public.runtime_writer_fence DISABLE TRIGGER USER")
+            .execute(&mut *open_fence)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE public.runtime_writer_fence \
+             SET fence_state = 'open', cutover_coordinator_id = NULL, \
+              cutover_expires_at = NULL WHERE singleton",
+        )
+        .execute(&mut *open_fence)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE public.runtime_writer_fence ENABLE TRIGGER USER")
+            .execute(&mut *open_fence)
+            .await
+            .unwrap();
+        open_fence.commit().await.unwrap();
+        decisions.verify_apply_executor_readiness().await.unwrap();
 
         let authentication = PostgresAuthentication::new(database.pool.clone());
         let authority = authority_adapter(fixture.clone());

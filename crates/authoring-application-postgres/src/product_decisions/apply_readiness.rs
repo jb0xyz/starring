@@ -39,7 +39,7 @@ const FUNCTIONS: [ScopedFunctionContractV1<'static>; 5] = [
         KEYRING_COVERAGE_ARGUMENTS,
     ),
 ];
-const RELATIONS: [ScopedRelationContractV1<'static>; 18] = [
+const RELATIONS: [ScopedRelationContractV1<'static>; 21] = [
     ScopedRelationContractV1::ordinary_without_rls("public.product_control_plane_identity"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_requests"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_request_approvals"),
@@ -60,6 +60,9 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 18] = [
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_activations"),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_versions"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_deployments"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_drain_intents_v2"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_slot_writer_fences_v2"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_writer_fence"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_serving_leases"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_attestations"),
 ];
@@ -201,6 +204,9 @@ WITH common_owner AS (
         ('public.starring_product_apply_lock_core_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)',
             'plpgsql', 'v', TRUE, TRUE, TRUE, 1::REAL,
             'TABLE(outcome text, exact_replay boolean, requires_commit boolean, resulting_revision bigint, resulting_state text, deployment_id text, desired_target_digest text, locked_projection jsonb)'),
+        ('public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)',
+            'plpgsql', 'v', TRUE, TRUE, TRUE, 1::REAL,
+            'TABLE(outcome text, exact_replay boolean, requires_commit boolean, resulting_revision bigint, resulting_state text, deployment_id text, desired_target_digest text, locked_projection jsonb)'),
         ('public.starring_product_apply_authority_projection_v1(text,text,text,text,bytea,text,text,text,text,bigint,text,timestamp with time zone,timestamp with time zone,text,boolean,text)',
             'plpgsql', 'v', TRUE, TRUE, FALSE, 0::REAL, 'jsonb'),
         ('public.starring_product_ruleset_slot_exact_v1(text,text,text,text,bigint)',
@@ -223,7 +229,7 @@ WITH common_owner AS (
         ('public.validate_runtime_convergence_attempt_projection()',
             'plpgsql', 'v', FALSE, TRUE, FALSE, 0::REAL, 'trigger')
 ), routine_contract AS (
-    SELECT pg_catalog.count(*) = 11
+    SELECT pg_catalog.count(*) = 12
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -255,10 +261,68 @@ WITH common_owner AS (
         ON function_row.oid = pg_catalog.to_regprocedure(expected.function_identity)
     LEFT JOIN pg_catalog.pg_language AS language_row
         ON language_row.oid = function_row.prolang
+), expected_private_routines(
+    function_name,
+    identity_arguments,
+    returns_set,
+    rows_estimate,
+    result_name
+) AS (
+    VALUES
+        ('starring_runtime_slot_writer_fence_lock_v2',
+            'requested_slot_guild_id text, requested_slot_ruleset_key text',
+            TRUE, 1::REAL,
+            'TABLE(writer_epoch bigint, pending_drain_intent_id text, pending_product_operation_id text, pending_tenant_id text, pending_installation_id text, pending_deployment_id text, pending_expected_revision bigint, pending_marked_at timestamp with time zone, observed_at timestamp with time zone)'),
+        ('starring_runtime_slot_writer_fence_begin_unsafe_v2',
+            'requested_slot_guild_id text, requested_slot_ruleset_key text, requested_expected_epoch bigint',
+            FALSE, 0::REAL, 'bigint')
+), private_routine_contract AS (
+    SELECT pg_catalog.count(*) = 2
+        AND pg_catalog.bool_and(COALESCE(
+            namespace.oid IS NOT NULL
+            AND namespace.nspowner = common_owner.owner_oid
+            AND function_row.oid IS NOT NULL
+            AND function_row.proowner = common_owner.owner_oid
+            AND function_row.prokind = 'f'
+            AND function_row.provolatile = 'v'
+            AND function_row.proisstrict
+            AND function_row.proparallel = 'u'
+            AND NOT function_row.prosecdef
+            AND NOT function_row.proleakproof
+            AND function_row.pronargdefaults = 0
+            AND function_row.provariadic = 0
+            AND function_row.proretset = expected.returns_set
+            AND function_row.prorows = expected.rows_estimate
+            AND function_row.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]
+            AND language_row.lanname = 'plpgsql'
+            AND pg_catalog.pg_get_function_identity_arguments(function_row.oid)
+                = expected.identity_arguments
+            AND pg_catalog.pg_get_function_result(function_row.oid)
+                = expected.result_name
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.aclexplode(COALESCE(
+                    function_row.proacl,
+                    pg_catalog.acldefault('f', function_row.proowner)
+                )) AS privilege
+                WHERE privilege.grantee <> function_row.proowner
+            ), FALSE)) AS valid
+    FROM expected_private_routines AS expected
+    CROSS JOIN common_owner
+    LEFT JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.nspname = 'starring_runtime_private_v2'
+    LEFT JOIN pg_catalog.pg_proc AS function_row
+        ON function_row.pronamespace = namespace.oid
+        AND function_row.proname = expected.function_name
+    LEFT JOIN pg_catalog.pg_language AS language_row
+        ON language_row.oid = function_row.prolang
 )
-SELECT trigger_manifest.valid AND routine_contract.valid
+SELECT trigger_manifest.valid
+    AND routine_contract.valid
+    AND private_routine_contract.valid
 FROM trigger_manifest
 CROSS JOIN routine_contract
+CROSS JOIN private_routine_contract
 "#;
 
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -312,6 +376,13 @@ impl PostgresProductDecisions {
         verify_scoped_schema_trust(&mut metadata, "public", DATABASE_IDENTITY_FUNCTION)
             .await
             .map_err(map_readiness)?;
+        verify_scoped_schema_trust(
+            &mut metadata,
+            "starring_runtime_private_v2",
+            DATABASE_IDENTITY_FUNCTION,
+        )
+        .await
+        .map_err(map_readiness)?;
         verify_approval_support_contract(&mut metadata).await?;
         verify_apply_support_contract(&mut metadata).await?;
         let topology = load_scoped_database_topology(&mut metadata, TOPOLOGY_QUERY)
@@ -389,18 +460,12 @@ async fn run_apply_probes(
         .fetch_all(&mut **transaction)
         .await
         .map_err(readiness_database)?;
-    if lock_rows
-        != [ApplyLockProbeRow {
-            outcome: "invalid_input".to_string(),
-            exact_replay: false,
-            requires_commit: false,
-            resulting_revision: None,
-            resulting_state: None,
-            deployment_id: None,
-            desired_target_digest: None,
-            locked_projection: None,
-        }]
-    {
+    if !matches!(
+        lock_rows.as_slice(),
+        [row]
+            if lock_probe_row_is_exact(row, "invalid_input")
+                || lock_probe_row_is_exact(row, "runtime_writer_fenced")
+    ) {
         return Err(ProductDecisionReadinessErrorV1::ContractMismatch);
     }
     let artifact_count = sqlx::query_scalar::<_, i64>(ARTIFACT_PROBE_QUERY)
@@ -433,6 +498,19 @@ async fn run_apply_probes(
     Ok(())
 }
 
+fn lock_probe_row_is_exact(row: &ApplyLockProbeRow, outcome: &str) -> bool {
+    row == &ApplyLockProbeRow {
+        outcome: outcome.to_string(),
+        exact_replay: false,
+        requires_commit: false,
+        resulting_revision: None,
+        resulting_state: None,
+        deployment_id: None,
+        desired_target_digest: None,
+        locked_projection: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +518,7 @@ mod tests {
     #[test]
     fn apply_manifest_is_exact_and_nonempty() {
         assert_eq!(FUNCTIONS.len(), 5);
-        assert_eq!(RELATIONS.len(), 18);
+        assert_eq!(RELATIONS.len(), 21);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 32);
         assert_eq!(PROBE_SUBJECT_DIGEST.len(), 32);
     }

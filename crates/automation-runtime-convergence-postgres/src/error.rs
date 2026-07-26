@@ -27,6 +27,8 @@ pub enum RuntimeConvergenceStoreError {
     ConvergenceAttemptOverflow,
     #[error("runtime convergence retry is not ready")]
     RetryNotReady,
+    #[error("runtime execution claim is stale or no longer authorized")]
+    ExecutionClaimStale,
     #[error("runtime deployment requires an operator action")]
     OperatorActionRequired,
     #[error("runtime convergence input is invalid: {0}")]
@@ -43,6 +45,8 @@ pub enum RuntimeConvergenceStoreError {
     DatabaseUnavailable,
     #[error("runtime convergence database operation failed")]
     DatabaseFailure,
+    #[error("runtime database authority does not match")]
+    DatabaseAuthorityMismatch,
 }
 
 impl RuntimeConvergenceStoreError {
@@ -60,6 +64,7 @@ impl RuntimeConvergenceStoreError {
             Self::ConvergenceAttemptConflict => "runtime_convergence_attempt_conflict",
             Self::ConvergenceAttemptOverflow => "runtime_convergence_attempt_overflow",
             Self::RetryNotReady => "runtime_retry_not_ready",
+            Self::ExecutionClaimStale => "runtime_execution_claim_stale",
             Self::OperatorActionRequired => "runtime_operator_action_required",
             Self::InvalidInput(_) => "runtime_invalid_input",
             Self::InvalidPersistedState(_) => "runtime_invalid_persisted_state",
@@ -68,6 +73,7 @@ impl RuntimeConvergenceStoreError {
             Self::DatabaseConcurrency => "runtime_database_concurrency",
             Self::DatabaseUnavailable => "runtime_database_unavailable",
             Self::DatabaseFailure => "runtime_database_failure",
+            Self::DatabaseAuthorityMismatch => "runtime_database_authority_mismatch",
         }
     }
 
@@ -106,5 +112,42 @@ pub(crate) fn database(error: sqlx::Error) -> RuntimeConvergenceStoreError {
             RuntimeConvergenceStoreError::DatabaseUnavailable
         }
         _ => RuntimeConvergenceStoreError::DatabaseFailure,
+    }
+}
+
+pub(crate) fn database_readiness(error: sqlx::Error) -> RuntimeConvergenceStoreError {
+    let state = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .map(|state| state.into_owned());
+    match state.as_deref() {
+        Some("RE001") => RuntimeConvergenceStoreError::DatabaseAuthorityMismatch,
+        _ => match error {
+            sqlx::Error::RowNotFound
+            | sqlx::Error::TypeNotFound { .. }
+            | sqlx::Error::ColumnIndexOutOfBounds { .. }
+            | sqlx::Error::ColumnNotFound(_)
+            | sqlx::Error::ColumnDecode { .. }
+            | sqlx::Error::Decode(_) => RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime exact target database readiness",
+            ),
+            other => database(other),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_authority_mismatch_is_stable_and_nonretryable() {
+        let error = RuntimeConvergenceStoreError::DatabaseAuthorityMismatch;
+        assert_eq!(error.code(), "runtime_database_authority_mismatch");
+        assert!(!error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "runtime database authority does not match"
+        );
     }
 }

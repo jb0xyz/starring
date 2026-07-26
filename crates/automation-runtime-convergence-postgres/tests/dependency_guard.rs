@@ -26,11 +26,18 @@ fn adapter_does_not_depend_on_runtime_or_product_authority_edges() {
 fn adapter_sources_contain_no_comments() {
     let sources = [
         include_str!("../src/artifact.rs"),
-        include_str!("../src/digest.rs"),
+        include_str!("../src/controller.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/evidence.rs"),
+        include_str!("../src/hydration/bindings.rs"),
+        include_str!("../src/hydration/connection.rs"),
+        include_str!("../src/hydration/contract.rs"),
+        include_str!("../src/hydration/database.rs"),
+        include_str!("../src/hydration/mod.rs"),
+        include_str!("../src/hydration/row.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/model.rs"),
+        include_str!("../src/persistence.rs"),
         include_str!("../src/prepare.rs"),
         include_str!("../src/projection.rs"),
         include_str!("../src/row.rs"),
@@ -38,6 +45,9 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/store/deployment.rs"),
         include_str!("../src/store/mod.rs"),
         include_str!("../src/store/operator.rs"),
+        include_str!("../src/store/previous_serving/contract.rs"),
+        include_str!("../src/store/previous_serving/mod.rs"),
+        include_str!("../src/store/previous_serving/row.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
     ];
@@ -49,6 +59,291 @@ fn adapter_sources_contain_no_comments() {
             assert!(!trimmed.starts_with('*'));
         }
     }
+}
+
+#[test]
+fn production_controller_uses_only_exact_convergence_guards() {
+    let controller = include_str!("../src/controller.rs");
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::renew_execution(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::mutate(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        controller
+            .matches("PostgresRuntimeConvergence::certify_live(")
+            .count(),
+        1
+    );
+    for bypass in [
+        "renew_execution_guarded",
+        "mutate_guarded",
+        "certify_live_guarded",
+        "SubmitGuardedDeploymentMutationV1",
+        "SubmitGuardedLiveAttestationV1",
+    ] {
+        assert!(!controller.contains(bypass));
+    }
+    assert!(controller.contains("convergence_attempt: receipt.convergence_attempt"));
+    assert!(controller.contains("convergence_attempt: mutation.convergence_attempt"));
+    let model = include_str!("../src/model.rs");
+    for request in ["SubmitDeploymentMutationV1", "SubmitLiveAttestationV1"] {
+        let definition = model
+            .split(&format!("pub struct {request}"))
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .unwrap();
+        assert!(definition.contains("pub convergence_attempt: NonZeroU32"));
+    }
+}
+
+#[test]
+fn broad_owner_store_does_not_implement_the_serving_lease_port() {
+    let controller = include_str!("../src/controller.rs");
+    assert!(!controller.contains("impl RuntimeServingLeasePort for PostgresRuntimeConvergence"));
+    assert!(!controller.contains("RuntimeHeartbeatServingV1"));
+    assert!(!controller.contains("RuntimeDisconnectServingV1"));
+}
+
+#[test]
+fn persistence_encoding_and_failure_messages_are_shared_with_the_controller() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(!manifest.contains("sha2"));
+    let library = include_str!("../src/lib.rs");
+    assert!(!library.contains("mod digest;"));
+    let model = include_str!("../src/model.rs");
+    assert!(!model.contains("struct AttestationRecordV1"));
+    let persistence = include_str!("../src/persistence.rs");
+    for shared in [
+        "runtime_desired_target_digest_v1",
+        "runtime_live_attestation_digest_v1",
+        "RuntimeLiveAttestationRecordV1",
+    ] {
+        assert!(persistence.contains(shared));
+    }
+    for source in [
+        include_str!("../src/controller.rs"),
+        include_str!("../src/store/deployment.rs"),
+    ] {
+        assert!(source.contains("runtime_failure_message_v1"));
+        assert!(!source.contains("fn stable_failure_message"));
+    }
+}
+
+#[test]
+fn last_controller_migration_preserves_readiness_shape_and_fails_closed() {
+    let migration =
+        include_str!("../../../migrations/202607220026_persist_runtime_last_controller.sql");
+    assert!(migration.contains("legacy runtime controller history cannot be inferred safely"));
+    assert!(migration.contains("ADD COLUMN last_controller_id TEXT"));
+    assert!(migration.contains("AND last_controller_id IS NOT NULL"));
+    assert!(migration.contains("last_controller_id IS NOT DISTINCT FROM controller_id"));
+    assert!(migration.contains("ADD COLUMN serving_lease_duration_nanos BIGINT NOT NULL"));
+    assert!(migration.contains("runtime_attestations_serving_lease_duration_valid CHECK"));
+    assert!(migration.contains("duration_column_count <> 1"));
+    assert!(migration.contains("invalid_duration_column_count <> 0"));
+    assert!(migration.contains("duration_constraint_definition <> 'CHECK"));
+    assert!(migration.contains(
+        "CREATE OR REPLACE FUNCTION public.validate_runtime_convergence_attempt_projection()"
+    ));
+    assert!(migration.contains("runtime controller identity cannot change without a new fence"));
+    assert!(migration.contains("runtime fencing transition lacks its controller identity"));
+    assert!(!migration
+        .lines()
+        .any(|line| line.trim_start().starts_with("CREATE TRIGGER")));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT "));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+}
+
+#[test]
+fn previous_serving_observation_is_a_private_fenced_capability() {
+    let migration =
+        include_str!("../../../migrations/202607220023_observe_previous_runtime_serving.sql");
+    assert!(
+        migration.contains("CREATE FUNCTION public.starring_runtime_observe_previous_serving_v1(")
+    );
+    assert!(migration.contains("SECURITY DEFINER\nSET search_path = pg_catalog"));
+    assert!(migration.contains(
+        "REVOKE ALL PRIVILEGES ON FUNCTION public.starring_runtime_observe_previous_serving_v1("
+    ));
+    assert!(migration.contains("FROM public.runtime_deployments"));
+    assert!(migration.contains("FOR UPDATE;"));
+    assert!(migration.contains("pg_catalog.pg_advisory_xact_lock"));
+    assert!(migration.contains("starring-runtime-serving-slot-v1:"));
+    assert!(migration.contains("database_now := pg_catalog.clock_timestamp();"));
+    assert!(migration.contains("deployment_row.phase <> 'drain_requested'"));
+    assert!(migration.contains(
+        "deployment_row.controller_fencing_token\n            IS DISTINCT FROM expected_controller_fencing_token"
+    ));
+    assert!(migration
+        .contains("deployment_row.previous_runtime IS DISTINCT FROM expected_previous_runtime"));
+    assert!(migration.contains("serving_row.acquired_at > deployment_row.requested_at"));
+    assert!(migration.contains("serving_row.last_heartbeat_at < deployment_row.requested_at"));
+    assert!(migration.contains("serving_row.expires_at <= deployment_row.requested_at"));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT SELECT"));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let contract = include_str!("../src/store/previous_serving/contract.rs");
+    assert!(contract.contains("starring_runtime_observe_previous_serving_v1"));
+    for relation in ["runtime_deployments", "runtime_serving_leases"] {
+        assert!(!contract.contains(relation));
+    }
+}
+
+#[test]
+fn exact_target_hydration_is_scoped_to_private_capabilities() {
+    let migration =
+        include_str!("../../../migrations/202607220001_scope_runtime_exact_target_hydration.sql");
+    assert_eq!(
+        migration
+            .matches("CREATE FUNCTION public.starring_runtime_exact_target_")
+            .count(),
+        2
+    );
+    assert_eq!(
+        migration.matches("SECURITY DEFINER").count(),
+        migration.matches("SET search_path = pg_catalog").count()
+    );
+    for function in [
+        "starring_runtime_exact_target_reader_database_identity_v1",
+        "starring_runtime_exact_target_read_v1",
+    ] {
+        assert!(migration.contains(&format!("CREATE FUNCTION public.{function}(")));
+    }
+    assert!(migration.contains("REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE"));
+    assert!(migration.contains("privilege.grantee <> common_owner"));
+    assert!(migration.contains("privilege.grantee <> 0"));
+    assert!(migration.contains("function_row.proconfig"));
+    assert!(migration.contains("ARRAY['search_path=pg_catalog']::TEXT[]"));
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT EXECUTE"));
+    assert!(!migration.contains("GRANT SELECT"));
+    assert!(!migration.contains("WITH GRANT OPTION"));
+    assert!(migration
+        .contains("deployment.controller_fencing_token = expected_controller_fencing_token"));
+    assert!(
+        migration.contains("deployment.controller_lease_expires_at > request_clock.database_now")
+    );
+    assert!(migration.contains("current_authority.resource_bindings"));
+    assert!(migration.contains("IS NOT DISTINCT FROM historical_authority.resource_bindings"));
+    assert!(migration.contains("version.canonical_content_hash = version.content_hash"));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let contract = include_str!("../src/hydration/contract.rs");
+    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    for relation in [
+        "runtime_deployments",
+        "activation_requests",
+        "authoring_promotions",
+        "automation_installation_authority_versions",
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+    ] {
+        assert!(!contract.contains(relation));
+    }
+}
+
+#[test]
+fn exact_target_database_capability_is_verified_and_fail_closed() {
+    let migration =
+        include_str!("../../../migrations/202607220028_scope_runtime_exact_target_database.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_runtime_exact_target_schema_manifest_v1()",
+        "CREATE FUNCTION public.starring_runtime_exact_target_database_readiness_v1()",
+        "TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)",
+        "ERRCODE = 'RE001'",
+        "pg_catalog.current_setting('role') <> 'none'",
+        "role_row.rolconnlimit NOT BETWEEN 1 AND 4",
+        "pg_catalog.pg_auth_members",
+        "pg_catalog.pg_db_role_setting",
+        "pg_catalog.pg_default_acl",
+        "pg_catalog.pg_parameter_acl",
+        "pg_catalog.pg_largeobject_metadata",
+        "public.starring_runtime_exact_target_schema_manifest_v1()",
+        "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for relation in [
+        "product_control_plane_identity",
+        "runtime_deployments",
+        "activation_requests",
+        "authoring_promotions",
+        "product_tenants",
+        "automation_installations",
+        "automation_installation_authority_versions",
+        "automation_ruleset_activations",
+        "automation_ruleset_versions",
+    ] {
+        assert!(migration.contains(relation));
+    }
+    for forbidden in ["CREATE ROLE", "GRANT EXECUTE", "GRANT SELECT", "COMMENT ON"] {
+        assert!(!migration.contains(forbidden));
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+
+    let adapter = include_str!("../src/hydration/mod.rs");
+    assert!(adapter.contains("pub async fn connect_verified("));
+    assert!(adapter.contains("pub async fn connect_verified_default("));
+    assert!(adapter.contains("pub async fn verify_database_v1("));
+    assert!(!adapter.contains("pub fn new("));
+    assert!(!adapter.contains("pub fn with_timeouts("));
+    assert!(!adapter.contains("pub async fn database_identity("));
+    let contract = include_str!("../src/hydration/contract.rs");
+    assert!(contract.contains("starring_runtime_exact_target_database_readiness_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_reader_database_identity_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    assert!(contract.contains("pg_catalog.pg_get_functiondef"));
+    assert!(!contract.contains("runtime_deployments"));
+    assert!(!contract.contains("automation_ruleset_versions"));
+    let connection = include_str!("../src/hydration/connection.rs");
+    assert!(connection.contains("drop(connection.detach())"));
+    assert!(adapter.contains("tokio::time::timeout_at"));
+    assert!(adapter.contains("verify_runtime_exact_target_binding_v1"));
+    let database = include_str!("../src/hydration/database.rs");
+    assert!(database.contains("RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V1"));
+}
+
+#[test]
+fn exact_target_database_migration_is_registered_after_interaction_scope() {
+    let versions = automation_runtime_convergence_postgres::MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let interaction = versions
+        .iter()
+        .position(|version| *version == 202_607_220_027)
+        .unwrap();
+    let exact_target = versions
+        .iter()
+        .position(|version| *version == 202_607_220_028)
+        .unwrap();
+    assert!(interaction < exact_target);
 }
 
 #[test]

@@ -46,6 +46,7 @@ async fn deployment_status_redacts_controller_failure_evidence() {
             expected_revision: ready_revision,
             controller_id: controller,
             fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
             runtime_generation: RuntimeGeneration::FIRST,
             mutation: DeploymentMutationV1::RecordRetryableFailure {
                 failure_id: RuntimeFailureId::parse(format!("failure-{}", suffix())).unwrap(),
@@ -158,22 +159,43 @@ fn product_runtime_scope(
     }
 }
 
+struct ProductRuntimeMutationGuard<'a> {
+    scope: &'a RuntimeDeploymentScopeV1,
+    controller_id: &'a ControllerId,
+    fencing_token: FencingToken,
+    convergence_attempt: NonZeroU32,
+    runtime_generation: RuntimeGeneration,
+}
+
+impl<'a> ProductRuntimeMutationGuard<'a> {
+    fn from_claim(
+        scope: &'a RuntimeDeploymentScopeV1,
+        claim: &'a automation_runtime_convergence_postgres::ClaimReceiptV1,
+    ) -> Self {
+        Self {
+            scope,
+            controller_id: &claim.controller_id,
+            fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
+            runtime_generation: claim.snapshot.runtime_generation,
+        }
+    }
+}
+
 async fn mutate_product_runtime(
     runtime: &PostgresRuntimeConvergence,
-    scope: &RuntimeDeploymentScopeV1,
+    guard: &ProductRuntimeMutationGuard<'_>,
     expected_revision: DeploymentRevision,
-    controller_id: &ControllerId,
-    fencing_token: FencingToken,
-    runtime_generation: RuntimeGeneration,
     mutation: DeploymentMutationV1,
 ) -> DeploymentRevision {
     runtime
         .mutate(SubmitDeploymentMutationV1 {
-            scope: scope.clone(),
+            scope: guard.scope.clone(),
             expected_revision,
-            controller_id: controller_id.clone(),
-            fencing_token,
-            runtime_generation,
+            controller_id: guard.controller_id.clone(),
+            fencing_token: guard.fencing_token,
+            convergence_attempt: guard.convergence_attempt,
+            runtime_generation: guard.runtime_generation,
             mutation,
         })
         .await
@@ -189,13 +211,11 @@ async fn advance_product_runtime_to_ready(
 ) -> DeploymentRevision {
     let target = claim.snapshot.target.clone();
     let generation = claim.snapshot.runtime_generation;
+    let mutation_guard = ProductRuntimeMutationGuard::from_claim(scope, claim);
     let mut revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         claim.snapshot.revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::AcceptPreflight(PreflightAttestationV1 {
             target: target.clone(),
             runtime_generation: generation,
@@ -206,21 +226,15 @@ async fn advance_product_runtime_to_ready(
     .await;
     revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::RequestDrain,
     )
     .await;
     revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::AcceptDrain(DrainAttestationV1 {
             previous_runtime: None,
             target_runtime_generation: generation,
@@ -230,21 +244,15 @@ async fn advance_product_runtime_to_ready(
     .await;
     revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::BeginActivation,
     )
     .await;
     mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::AcceptActivation(ActivationAttestationV1 {
             activation_request_id: ActivationRequestId::parse(
                 claim.snapshot.identity.activation_request_id.as_str(),
@@ -273,28 +281,28 @@ async fn certify_product_runtime_live(
     let generation = claim.snapshot.runtime_generation;
     let process_instance_id =
         ProcessInstanceId::parse(format!("product-live-process-{}", suffix())).unwrap();
+    let panel_report_digest = sha256_hex(&format!("product-panel-report:{}", suffix()));
+    let mutation_guard = ProductRuntimeMutationGuard::from_claim(scope, claim);
     let revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         ready_revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::BeginPanelReconciliation,
     )
     .await;
     let revision = mutate_product_runtime(
         runtime,
-        scope,
+        &mutation_guard,
         revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        generation,
         DeploymentMutationV1::AcceptPanelCertificate(PanelCertificateV1 {
             certificate_id: PanelCertificateId::parse(format!(
                 "product-live-certificate-{}",
                 suffix()
             ))
+            .unwrap(),
+            report_digest: automation_runtime_convergence::PanelReportDigestV1::parse(
+                panel_report_digest.clone(),
+            )
             .unwrap(),
             target: target.clone(),
             runtime_generation: generation,
@@ -319,6 +327,7 @@ async fn certify_product_runtime_live(
             expected_revision: revision,
             controller_id: claim.controller_id.clone(),
             fencing_token: claim.fencing_token,
+            convergence_attempt: claim.convergence_attempt,
             runtime_generation: generation,
             gateway_ready: GatewayReadyAttestationV1 {
                 target,
@@ -330,11 +339,7 @@ async fn certify_product_runtime_live(
             metadata: LiveMetadataV1 {
                 runtime_build_revision: RuntimeBuildRevisionV1::parse("product-status-e2e")
                     .unwrap(),
-                panel_report_digest: PanelReportDigestV1::parse(sha256_hex(&format!(
-                    "product-panel-report:{}",
-                    suffix()
-                )))
-                .unwrap(),
+                panel_report_digest: PanelReportDigestV1::parse(panel_report_digest).unwrap(),
                 gateway_shard_id: GatewayShardIdV1::parse("shard:product-status").unwrap(),
             },
             serving_lease_for,
@@ -717,13 +722,11 @@ async fn product_status_maps_blocked_failure_to_stable_public_code() {
         .unwrap();
     let ready_revision = advance_product_runtime_to_ready(&runtime, &scope, &claim).await;
     let private_code = sha256_hex(&format!("private-blocked-code:{}", suffix()));
+    let mutation_guard = ProductRuntimeMutationGuard::from_claim(&scope, &claim);
     mutate_product_runtime(
         &runtime,
-        &scope,
+        &mutation_guard,
         ready_revision,
-        &claim.controller_id,
-        claim.fencing_token,
-        claim.snapshot.runtime_generation,
         DeploymentMutationV1::RecordBlockedFailure {
             failure_id: RuntimeFailureId::parse(format!("blocked-{}", suffix())).unwrap(),
             kind: RuntimeFailureKindV1::InvariantViolation,

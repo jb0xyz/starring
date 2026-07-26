@@ -1,0 +1,10 @@
+[package]
+name = "automation-runtime-worker"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-runtime-controller = { path = "../automation-runtime-controller" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+chrono = "0.4"
+thiserror.workspace = true
