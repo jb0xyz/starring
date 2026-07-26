@@ -180,7 +180,7 @@ async fn cleanup_runtime_gateway_owner_transition_failure_v1(
     }
 }
 
-fn finish_runtime_owner_held_process_shutdown_v1(
+pub(super) fn finish_runtime_owner_held_process_shutdown_v1(
     owner: Result<
         RuntimeGatewayOwnerStartupWatchdogExitV1,
         RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,

@@ -17,7 +17,8 @@ use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use crate::gateway::runtime_gateway_shard_id_v1;
 use crate::gateway_owner_startup_watchdog::{
-    release_runtime_gateway_owner_until_v1, RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    release_runtime_gateway_owner_until_v1, RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
+    RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
 };
 use crate::{
     GatewayOwnerTimingConfigV1, RuntimeGatewayBootstrapV1,
@@ -92,6 +93,31 @@ impl RuntimeAcquiredGatewayOwnerV1 {
 
     pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         self.watchdog.wait_terminal().await
+    }
+
+    pub(crate) async fn prepare_closed_recovery_in_place_v2(
+        &mut self,
+    ) -> Result<(), RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2> {
+        self.watchdog.prepare_closed_recovery_in_place_v2().await
+    }
+
+    pub(crate) fn try_into_prepared_closed_recovery_v2(
+        self,
+    ) -> Result<RuntimeGatewayOwnerPreparedClosedRecoveryV2, Box<Self>> {
+        let Self {
+            watchdog,
+            current_observation,
+        } = self;
+        match watchdog.try_into_prepared_closed_recovery_v2() {
+            Ok(prepared) => {
+                drop(current_observation);
+                Ok(prepared)
+            }
+            Err(watchdog) => Err(Box::new(Self {
+                watchdog: *watchdog,
+                current_observation,
+            })),
+        }
     }
 
     pub(crate) async fn shutdown_until(

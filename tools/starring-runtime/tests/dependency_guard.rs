@@ -504,9 +504,11 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/main.rs",
             "src/process/connected.rs",
             "src/process/owner.rs",
+            "src/process/recovery.rs",
             "src/process.rs",
             "src/process_identity.rs",
             "src/process_startup.rs",
+            "src/recovery_identity.rs",
             "src/registry.rs",
             "src/secret.rs",
             "src/startup.rs",
@@ -652,6 +654,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/discord.rs")
             && path != Path::new("src/process/connected.rs")
+            && path != Path::new("src/process/recovery.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -659,6 +662,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         }
         if path != Path::new("src/process_identity.rs")
             && path != Path::new("src/controller_identity.rs")
+            && path != Path::new("src/recovery_identity.rs")
         {
             assert!(
                 !contains_identifier(&source, "getrandom"),
@@ -868,10 +872,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 );
             let allowed_paused_connected = path == Path::new("src/process/connected.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_recovery_process = path == Path::new("src/process/recovery.rs")
+                && identifier == "automation_runtime_worker";
             let allowed_process_identity = path == Path::new("src/process_identity.rs")
                 && identifier == "automation_runtime_convergence";
             let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
                 && identifier == "automation_runtime_convergence";
+            let allowed_recovery_identity = path == Path::new("src/recovery_identity.rs")
+                && identifier == "automation_runtime_controller";
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
@@ -881,8 +889,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_build_revision
                         || allowed_process_foundation
                         || allowed_paused_connected
+                        || allowed_recovery_process
                         || allowed_process_identity
                         || allowed_controller_identity
+                        || allowed_recovery_identity
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1012,7 +1022,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Commit"));
     for required in [
         "pub(crate) async fn prepare_closed_recovery_v2(\n        mut self,",
+        "pub(crate) async fn prepare_closed_recovery_in_place_v2(",
+        "pub(crate) fn try_into_prepared_closed_recovery_v2(",
         "pub(crate) async fn abort_and_shutdown_v2(\n        mut self,",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
         "pub(crate) async fn commit_closed_recovery_v2(\n        mut self,",
         "const CLOSED_RECOVERY_COMMAND_CAPACITY: usize = 1;",
         "RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare",
@@ -1044,8 +1057,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     assert!(owner_supervisor.contains(concat!(
         "pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {\n",
         "    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,\n",
+        "    prepared_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,\n",
         "}"
     )));
+    assert!(!owner_supervisor.contains("prepare_closed_recovery_observation_v2"));
     assert!(owner_supervisor.contains(concat!(
         "pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {\n",
         "    _private: (),\n",
@@ -1315,7 +1330,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "resume_admission",
         "issue_ready_lease",
         "readiness",
-        "recovery",
         "dispatch",
         "execute",
         "serve",
@@ -1332,6 +1346,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
             "startup: {forbidden}"
         );
     }
+    assert!(!contains_identifier(connected, "recovery"));
     assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
     assert!(!library.contains("RuntimePausedConnectedProcessV1"));
 
@@ -1354,11 +1369,194 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
 }
 
 #[test]
+fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
+    let recovery = source_before_test_module(include_str!("../src/process/recovery.rs"));
+    let identity = source_before_test_module(include_str!("../src/recovery_identity.rs"));
+    let closed = include_str!("../src/closed_recovery.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct RuntimeRecoveryPendingProcessV2",
+        "discord: RuntimeDiscordGatewaySupervisorV1,",
+        "foundation: RuntimeProcessFoundationV1,",
+        "pending: RuntimeClosedRecoveryPendingPhaseV2,",
+        "RuntimeRecoveryPendingProcessV2(<redacted>)",
+        "pub(crate) async fn into_recovery_pending_v2(",
+        "self.require_current_paused_connection_v1()",
+        "generate_runtime_recovery_id_v2()",
+        "owner.prepare_closed_recovery_in_place_v2()",
+        "owner.try_into_prepared_closed_recovery_v2()",
+        "foundation.databases.verify_readiness_v1()",
+        "require_prepared_paused_connection_v2(",
+        "begin_initial_empty_recovery_retained_v2(",
+        "&paused_gateway,",
+        ".revalidate_v2()",
+        "shutdown_prepared_recovery_v2(",
+        "shutdown_pending_recovery_v2(",
+        "finish_runtime_owner_held_process_shutdown_v1(",
+        "finish_paused_connected_shutdown_v1(",
+        "RuntimeProcessRecoveryPendingTransitionErrorV2(<redacted>)",
+        "RuntimeRecoveryPendingProcessShutdownErrorV2(<redacted>)",
+    ] {
+        assert!(recovery.contains(required), "{required}");
+    }
+    let transition = braced_declaration(recovery, "pub(crate) async fn into_recovery_pending_v2(");
+    let initial_check = transition
+        .find("self.require_current_paused_connection_v1()")
+        .unwrap();
+    let recovery_id = transition
+        .find("generate_runtime_recovery_id_v2()")
+        .unwrap();
+    let prepare = transition
+        .find("owner.prepare_closed_recovery_in_place_v2()")
+        .unwrap();
+    let prepared = transition
+        .find("owner.try_into_prepared_closed_recovery_v2()")
+        .unwrap();
+    let readiness = transition
+        .find("foundation.databases.verify_readiness_v1()")
+        .unwrap();
+    let exact_recheck = transition
+        .find("require_prepared_paused_connection_v2(")
+        .unwrap();
+    let begin = transition
+        .find("begin_initial_empty_recovery_retained_v2(")
+        .unwrap();
+    let final_recheck = transition[begin..]
+        .find(".revalidate_v2()")
+        .map(|offset| begin + offset)
+        .unwrap();
+    assert!(
+        initial_check < recovery_id
+            && recovery_id < prepare
+            && prepare < prepared
+            && prepared < readiness
+            && readiness < exact_recheck
+            && exact_recheck < begin
+            && begin < final_recheck
+    );
+    assert_eq!(
+        transition
+            .matches("generate_runtime_recovery_id_v2()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        transition
+            .matches("foundation.databases.verify_readiness_v1()")
+            .count(),
+        1
+    );
+    assert!(!transition.contains("initial_readiness()"));
+    for shutdown_name in [
+        "async fn shutdown_prepared_recovery_v2(",
+        "async fn shutdown_pending_recovery_v2(",
+    ] {
+        let shutdown = braced_declaration(recovery, shutdown_name);
+        let discord = shutdown.find(".shutdown_until(").unwrap();
+        let owner = shutdown[discord..]
+            .find("shutdown_until_v2(")
+            .map(|offset| discord + offset)
+            .unwrap();
+        let database = shutdown.find("foundation.shutdown().await").unwrap();
+        assert!(discord < owner && owner < database, "{shutdown_name}");
+    }
+    let state_attributes = declaration_attribute_block(recovery, "RuntimeRecoveryPendingProcessV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(state_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            recovery,
+            "RuntimeRecoveryPendingProcessV2",
+            forbidden,
+        ));
+    }
+    for required in [
+        "getrandom::fill(bytes)",
+        "RuntimeRecoveryIdV2::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeRecoveryIdGenerationErrorV2(<redacted>)",
+        "let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];",
+        "fill(&mut bytes)?;",
+    ] {
+        assert!(identity.contains(required), "{required}");
+    }
+    assert_eq!(identity.matches("getrandom::fill").count(), 1);
+    assert_eq!(
+        recovery
+            .matches("generate_runtime_recovery_id_v2()")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "SystemTime",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "thread_rng",
+        "StdRng",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
+    ] {
+        assert!(!identity.contains(forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "commit_owner_v2",
+        "observe_startup_recovery_v2",
+    ] {
+        assert!(!contains_identifier(recovery, forbidden), "{forbidden}");
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+    for required in [
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+        ".abort_and_shutdown_until_v2(cleanup_deadline)",
+        "expected_paused_gateway: &RuntimePausedGatewayObservationV2,",
+        ".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)",
+    ] {
+        assert!(closed.contains(required), "{required}");
+    }
+    assert!(closed.contains(concat!(
+        "#[cfg(test)]\n",
+        "pub(crate) fn begin_initial_empty_recovery_v2("
+    )));
+    assert!(!library.contains("RuntimeRecoveryPendingProcessV2"));
+    assert!(!library.contains("RuntimeClosedRecoveryPendingPhaseV2"));
+    assert!(!library.contains("RuntimeGatewayOwnerPreparedClosedRecoveryV2"));
+}
+
+#[test]
 fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     let gateway = include_str!("../src/gateway.rs");
     let production = source_before_test_module(gateway);
     let emergency = braced_declaration(production, "impl<'a> RuntimeEmergencyGatewaySectionV2<'a>");
     let acquire = braced_declaration(emergency, "fn acquire(");
+    assert!(acquire.contains("expected_paused_gateway: &RuntimePausedGatewayObservationV2,"));
+    assert!(acquire.contains("if paused_gateway != *expected_paused_gateway"));
     let acquire_borrow = acquire
         .find("admission_snapshot.borrow()")
         .unwrap_or_else(|| panic!("initial section watch borrow missing"));
@@ -1488,6 +1686,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     let production = closed;
     for required in [
         "pub(crate) fn begin_initial_empty_recovery_v2(",
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoverySessionV2",
@@ -1515,7 +1715,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2(<redacted>)",
         "let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };",
-        ".initial_emergency_gateway_section_v2(&owner)",
+        ".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)",
         ".recovery_observation_guard_v2(&authority, &gateway_section)",
         ".locked_empty_evidence_v2()",
         "readiness: &RuntimeDatabaseReadinessV1",
@@ -1573,7 +1773,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "}"
     )));
     let initial_gateway = production
-        .find(".initial_emergency_gateway_section_v2(&owner)")
+        .find(".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)")
         .unwrap();
     let initial_registry = production
         .find(".recovery_observation_guard_v2(&authority, &gateway_section)")
@@ -1711,13 +1911,22 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) async fn refresh_iteration_readiness_v2(",
     );
     assert!(!public_refresh.contains("operation_cutoff:"));
-    let begin = braced_declaration(production, "pub(crate) fn begin_initial_empty_recovery_v2(");
+    let begin = braced_declaration(
+        production,
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+    );
     assert!(!begin.contains(".await"));
     let begin_deadline = begin.find("Instant::now() >= operation_cutoff").unwrap();
-    let begin_gateway = begin
-        .find(".initial_emergency_gateway_section_v2(&owner)")
+    let begin_bindings = begin.find("bind_initial_empty_recovery_v2(").unwrap();
+    assert!(begin_deadline < begin_bindings);
+    let binding = braced_declaration(production, "fn bind_initial_empty_recovery_v2(");
+    let begin_gateway = binding
+        .find(".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)")
         .unwrap();
-    assert!(begin_deadline < begin_gateway);
+    let begin_registry = binding
+        .find(".recovery_observation_guard_v2(&authority, &gateway_section)")
+        .unwrap();
+    assert!(begin_gateway < begin_registry);
     assert_eq!(owner_commit.matches(".await").count(), 1);
     assert_eq!(readiness_refresh.matches(".await").count(), 1);
     for forbidden in [
@@ -2650,7 +2859,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
 }
 
 #[test]
-fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry() {
+fn process_startup_is_the_single_ordered_bounded_recovery_pending_staging_entry() {
     let sources = source_files();
     let process_startup = sources
         .iter()
@@ -2682,6 +2891,7 @@ fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry(
         .unwrap();
     let paused_observation = staging.find(".wait_for_paused_connected_v1()").unwrap();
     let paused_connected = staging.find(".into_paused_connected_v1(").unwrap();
+    let recovery_pending = staging.find(".into_recovery_pending_v2()").unwrap();
     let shutdown = staging.find(".shutdown()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
@@ -2692,7 +2902,8 @@ fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry(
             && owner < discord_start
             && discord_start < paused_observation
             && paused_observation < paused_connected
-            && paused_connected < shutdown
+            && paused_connected < recovery_pending
+            && recovery_pending < shutdown
             && owner < shutdown
             && shutdown < outcome
     );
@@ -2711,6 +2922,7 @@ fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry(
         ".begin_paused_discord_connection_v1()",
         ".wait_for_paused_connected_v1()",
         ".into_paused_connected_v1(",
+        ".into_recovery_pending_v2()",
         ".shutdown()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -2832,6 +3044,9 @@ fn process_startup_is_the_single_ordered_bounded_paused_connected_staging_entry(
 fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     let main = source_before_test_module(include_str!("../src/main.rs"));
     let entry = braced_declaration(main, "fn main() -> ExitCode");
+    assert!(main.contains("RecoveryPendingAndClosed"));
+    assert!(main.contains("runtime_staging_recovery_pending_and_closed"));
+    assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_))"));
     assert_eq!(
         entry
             .matches("run_runtime_process_staging_from_environment_v1()")
@@ -2896,11 +3111,14 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         ".observe_current_gateway_owner_v1()",
         "release_runtime_gateway_owner_until_v1(",
         "shutdown_until(cleanup_deadline)",
+        "pub(crate) async fn prepare_closed_recovery_in_place_v2(",
+        "pub(crate) fn try_into_prepared_closed_recovery_v2(",
         "RuntimeGatewayOwnerStartupAcquisitionErrorV1(<redacted>)",
         "RuntimeAcquiredGatewayOwnerV1(<redacted>)",
     ] {
         assert!(acquisition.contains(required), "{required}");
     }
+    assert!(!acquisition.contains("prepare_closed_recovery_observation_v2"));
     assert_eq!(acquisition.matches(".acquire_gateway_owner(").count(), 1);
     assert_eq!(
         acquisition.matches("acquire_gateway_owner_once_v1").count(),
@@ -2947,7 +3165,6 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         "into_production",
         "promote_to_production_v1",
         "start_gateway_owner_production",
-        "prepare_closed_recovery",
         "observe_paused_connected_gateway_v2",
         "TcpListener",
         ".bind(",
@@ -2957,6 +3174,7 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         assert!(!acquisition.contains(forbidden), "{forbidden}");
         assert!(!owner.contains(forbidden), "{forbidden}");
     }
+    assert!(!owner.contains("prepare_closed_recovery"));
     let acquired_attributes =
         declaration_attribute_block(acquisition, "RuntimeAcquiredGatewayOwnerV1");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {

@@ -20,11 +20,18 @@ use crate::{
 
 pub(crate) mod connected;
 mod owner;
+mod recovery;
 
 pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
     RuntimeProcessGatewayOwnerTransitionErrorV1,
+};
+pub use recovery::{
+    RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessGatewayOwnerPrepareFailureV2,
+    RuntimeProcessRecoveryPendingTransitionErrorV2,
+    RuntimeProcessRecoveryPendingTransitionFailureV2,
+    RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]

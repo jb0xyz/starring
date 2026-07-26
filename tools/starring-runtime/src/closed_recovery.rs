@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use automation_runtime_controller::RuntimeRecoveryIdV2;
 use automation_runtime_worker::{
-    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeStartupRecoveryContinuationV2,
-    RuntimeStartupRecoveryFixedPointProofV2,
+    RuntimeAuthorizedStartupRecoveryIterationV2, RuntimePausedGatewayObservationV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
 
 use crate::database::{
@@ -18,7 +18,8 @@ use crate::gateway::{
 };
 use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerClosedRecoveryCommitErrorV2, RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-    RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogExitV1,
+    RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
 };
 use crate::registry::{
     RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
@@ -81,6 +82,11 @@ pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2 {
     operation_cutoff: Instant,
 }
 
+pub(crate) struct RuntimeClosedRecoveryBeginFailureV2 {
+    owner: Box<RuntimeGatewayOwnerPreparedClosedRecoveryV2>,
+    error: RuntimeClosedRecoveryBeginErrorV2,
+}
+
 pub(crate) struct RuntimeClosedRecoverySessionV2 {
     owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
@@ -127,7 +133,7 @@ pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2 {
 }
 
 impl RuntimeClosedRecoveryPendingPhaseV2 {
-    fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryBeginErrorV2> {
+    pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryBeginErrorV2> {
         if Instant::now() >= self.operation_cutoff {
             return Err(RuntimeClosedRecoveryBeginErrorV2::DeadlineElapsed);
         }
@@ -142,6 +148,23 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
         section
             .validate_empty_registry_projection_v2(&registry)
             .map_err(RuntimeClosedRecoveryBeginErrorV2::Gateway)
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+        } = self;
+        drop((gateway, registry, operation_cutoff));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 
     #[cfg_attr(
@@ -188,6 +211,17 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
         };
         session.revalidate_v2()?;
         Ok(session)
+    }
+}
+
+impl RuntimeClosedRecoveryBeginFailureV2 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        RuntimeClosedRecoveryBeginErrorV2,
+    ) {
+        (*self.owner, self.error)
     }
 }
 
@@ -408,27 +442,99 @@ fn map_commit_refresh_error_v2(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "owner commit composition consumes the exact pending phase"
-    )
-)]
+#[cfg(test)]
 pub(crate) fn begin_initial_empty_recovery_v2(
     gateway: &RuntimeGatewayBootstrapV1,
     registry: &RuntimeRegistryBootstrapV1,
     owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     recovery_id: RuntimeRecoveryIdV2,
     readiness: &RuntimeDatabaseReadinessV1,
+    expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     operation_cutoff: Instant,
 ) -> Result<RuntimeClosedRecoveryPendingPhaseV2, RuntimeClosedRecoveryBeginErrorV2> {
+    begin_initial_empty_recovery_retained_v2(
+        gateway,
+        registry,
+        owner,
+        recovery_id,
+        readiness,
+        expected_paused_gateway,
+        operation_cutoff,
+    )
+    .map_err(|failure| failure.error)
+}
+
+pub(crate) fn begin_initial_empty_recovery_retained_v2(
+    gateway: &RuntimeGatewayBootstrapV1,
+    registry: &RuntimeRegistryBootstrapV1,
+    owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    recovery_id: RuntimeRecoveryIdV2,
+    readiness: &RuntimeDatabaseReadinessV1,
+    expected_paused_gateway: &RuntimePausedGatewayObservationV2,
+    operation_cutoff: Instant,
+) -> Result<RuntimeClosedRecoveryPendingPhaseV2, RuntimeClosedRecoveryBeginFailureV2> {
     if Instant::now() >= operation_cutoff {
-        return Err(RuntimeClosedRecoveryBeginErrorV2::DeadlineElapsed);
+        return Err(RuntimeClosedRecoveryBeginFailureV2 {
+            owner: Box::new(owner),
+            error: RuntimeClosedRecoveryBeginErrorV2::DeadlineElapsed,
+        });
     }
+    let bindings = bind_initial_empty_recovery_v2(
+        gateway,
+        registry,
+        &owner,
+        recovery_id,
+        readiness,
+        expected_paused_gateway,
+    );
+    let (gateway, registry) = match bindings {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            return Err(RuntimeClosedRecoveryBeginFailureV2 {
+                owner: Box::new(owner),
+                error,
+            });
+        }
+    };
+    let pending = RuntimeClosedRecoveryPendingPhaseV2 {
+        owner,
+        gateway,
+        registry,
+        operation_cutoff,
+    };
+    if let Err(error) = pending.revalidate_v2() {
+        let RuntimeClosedRecoveryPendingPhaseV2 {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+        } = pending;
+        drop((gateway, registry, operation_cutoff));
+        return Err(RuntimeClosedRecoveryBeginFailureV2 {
+            owner: Box::new(owner),
+            error,
+        });
+    }
+    Ok(pending)
+}
+
+fn bind_initial_empty_recovery_v2(
+    gateway: &RuntimeGatewayBootstrapV1,
+    registry: &RuntimeRegistryBootstrapV1,
+    owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    recovery_id: RuntimeRecoveryIdV2,
+    readiness: &RuntimeDatabaseReadinessV1,
+    expected_paused_gateway: &RuntimePausedGatewayObservationV2,
+) -> Result<
+    (
+        RuntimeRecoveryPendingGatewayBindingV2,
+        RuntimeRegistryEmptyRecoveryBindingV2,
+    ),
+    RuntimeClosedRecoveryBeginErrorV2,
+> {
     let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };
     let mut gateway_section = gateway
-        .initial_emergency_gateway_section_v2(&owner)
+        .initial_emergency_gateway_section_v2(owner, expected_paused_gateway)
         .map_err(|error| {
             RuntimeClosedRecoveryBeginErrorV2::Gateway(
                 RuntimeGatewayRecoverySectionErrorV2::Gateway(error),
@@ -454,14 +560,7 @@ pub(crate) fn begin_initial_empty_recovery_v2(
     let gateway = gateway_section
         .into_recovery_pending_binding_v2()
         .map_err(RuntimeClosedRecoveryBeginErrorV2::Gateway)?;
-    let pending = RuntimeClosedRecoveryPendingPhaseV2 {
-        owner,
-        gateway,
-        registry,
-        operation_cutoff,
-    };
-    pending.revalidate_v2()?;
-    Ok(pending)
+    Ok((gateway, registry))
 }
 
 #[cfg(test)]

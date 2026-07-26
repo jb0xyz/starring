@@ -657,12 +657,14 @@ async fn initial_pending_recovery_fixture_until_v2(
     .unwrap();
     registry.advance_empty_sequence_for_test_v2();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
     let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
         &gateway,
         &registry,
         owner,
         RuntimeRecoveryIdV2::parse(recovery_id).unwrap(),
         &readiness,
+        &paused_gateway,
         operation_cutoff,
     )
     .unwrap();
@@ -1363,15 +1365,17 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         )
         .unwrap();
     let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let owner_paused_gateway = owner_gateway.observe_paused_connected_gateway_v2().unwrap();
 
     assert!(matches!(
-        foreign_gateway.initial_emergency_gateway_section_v2(&prepared),
+        foreign_gateway.initial_emergency_gateway_section_v2(&prepared, &owner_paused_gateway),
         Err(crate::RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
     ));
     owner_gateway
         .held_initial_section_blocks_repeated_pause_test_v2(&prepared)
         .await
         .unwrap();
+    let owner_paused_gateway = owner_gateway.observe_paused_connected_gateway_v2().unwrap();
 
     let registry = crate::compose_runtime_registry_bootstrap_v1(
         ProcessInstanceId::parse("process:handoff").unwrap(),
@@ -1385,6 +1389,7 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         prepared,
         RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
         &readiness,
+        &owner_paused_gateway,
         Instant::now() + Duration::from_secs(4),
     )
     .unwrap();
@@ -1402,6 +1407,7 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         format!("{pending:?}"),
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)"
     );
+    pending.revalidate_v2().unwrap();
     pending
         .stale_predecessor_drop_preserves_successor_v2()
         .unwrap();
@@ -1442,6 +1448,149 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
         } if generation.get() == 5
     ));
     wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn initial_recovery_rejects_a_replaced_paused_connection_epoch() {
+    let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
+    let mut gateway = crate::gateway::compose_runtime_gateway_section_test_bootstrap_v2(
+        process_instance_id.clone(),
+    );
+    gateway.connect_ready_for_gateway_section_test_v2();
+    let stale_paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
+    gateway.disconnect_for_gateway_section_test_v2();
+    gateway.connect_ready_for_gateway_section_test_v2();
+    let current_paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
+    assert_ne!(stale_paused_gateway, current_paused_gateway);
+
+    let lease_for = Duration::from_secs(2);
+    let owner_receipt = receipt(lease_for);
+    let port = FakePortV1::new(owner_receipt.clone(), []);
+    let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
+        lease_for,
+        Duration::from_millis(1_500),
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let handle = gateway
+        .start_gateway_owner_startup_watchdog_v1(
+            port.clone(),
+            accepted_receipt(owner_receipt),
+            started,
+            started,
+            config,
+        )
+        .unwrap();
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let registry = crate::compose_runtime_registry_bootstrap_v1(
+        process_instance_id,
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
+        &gateway,
+        &registry,
+        prepared,
+        RuntimeRecoveryIdV2::parse("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap(),
+        &readiness,
+        &stale_paused_gateway,
+        Instant::now() + Duration::from_secs(1),
+    ) {
+        Ok(_) => panic!("replaced epoch advanced recovery"),
+        Err(failure) => failure,
+    };
+    let (prepared, error) = failure.into_parts();
+
+    assert!(matches!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryBeginErrorV2::Gateway(
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot
+            )
+        )
+    ));
+    assert_eq!(
+        gateway.observe_paused_connected_gateway_v2().unwrap(),
+        current_paused_gateway
+    );
+    assert_eq!(
+        prepared
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn retained_recovery_begin_deadline_returns_owner_for_bounded_cleanup() {
+    let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
+    let mut gateway = crate::compose_runtime_gateway_bootstrap_v1(
+        process_instance_id.clone(),
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    gateway.connect_ready_for_gateway_section_test_v2();
+    let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
+    let lease_for = Duration::from_secs(2);
+    let owner_receipt = receipt(lease_for);
+    let port = FakePortV1::new(owner_receipt.clone(), []);
+    let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
+        lease_for,
+        Duration::from_millis(1_500),
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let handle = gateway
+        .start_gateway_owner_startup_watchdog_v1(
+            port.clone(),
+            accepted_receipt(owner_receipt),
+            started,
+            started,
+            config,
+        )
+        .unwrap();
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let registry = crate::compose_runtime_registry_bootstrap_v1(
+        process_instance_id,
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
+        &gateway,
+        &registry,
+        prepared,
+        RuntimeRecoveryIdV2::parse("abababababababababababababababab").unwrap(),
+        &readiness,
+        &paused_gateway,
+        Instant::now().checked_sub(Duration::from_nanos(1)).unwrap(),
+    ) {
+        Ok(_) => panic!("elapsed recovery begin advanced"),
+        Err(failure) => failure,
+    };
+    let (prepared, error) = failure.into_parts();
+
+    assert_eq!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryBeginErrorV2::DeadlineElapsed
+    );
+    assert_eq!(
+        prepared
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_millis(500))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
 }
 
 #[tokio::test]
@@ -2698,6 +2847,64 @@ async fn dropping_prepared_closed_recovery_invalidates_and_releases_once() {
 
     assert!(invalidated.load(Ordering::Acquire));
     wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn in_place_closed_recovery_prepare_is_linear_and_self_bound() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    let mut handle = match handle.try_into_prepared_closed_recovery_v2() {
+        Ok(_) => panic!("unprepared handle advanced"),
+        Err(handle) => *handle,
+    };
+    assert_eq!(port.observe_calls(), 0);
+
+    handle.prepare_closed_recovery_in_place_v2().await.unwrap();
+    let prepared = match handle.try_into_prepared_closed_recovery_v2() {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("prepared handle did not advance"),
+    };
+
+    assert_eq!(
+        prepared.observation().receipt(),
+        &receipt(Duration::from_secs(5))
+    );
+    assert_eq!(port.observe_calls(), 1);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        prepared.abort_and_shutdown_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_in_place_closed_recovery_prepare_invalidates_and_releases_once() {
+    let (mut handle, port, invalidated) = fixture(
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+        [],
+    );
+    handle.prepare_closed_recovery_in_place_v2().await.unwrap();
+
+    assert_eq!(
+        handle.prepare_closed_recovery_in_place_v2().await,
+        Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation)
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    let handle = match handle.try_into_prepared_closed_recovery_v2() {
+        Ok(_) => panic!("invalidated duplicate prepare advanced"),
+        Err(handle) => *handle,
+    };
+    drop(handle);
+    wait_for(|| port.release_calls() == 1).await;
+    assert_eq!(port.observe_calls(), 1);
     assert_eq!(port.renew_calls(), 0);
 }
 

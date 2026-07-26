@@ -7,34 +7,33 @@ use starring_runtime::{
 
 #[derive(Clone, Copy)]
 enum RuntimeProcessExitStatusV1 {
-    DiscordPausedConnectedAndClosed,
+    RecoveryPendingAndClosed,
     Failed(RuntimeProcessStagingErrorV1),
 }
 
 impl RuntimeProcessExitStatusV1 {
     const fn code(self) -> &'static str {
         match self {
-            Self::DiscordPausedConnectedAndClosed => {
-                "runtime_staging_discord_paused_connected_and_closed"
-            }
+            Self::RecoveryPendingAndClosed => "runtime_staging_recovery_pending_and_closed",
             Self::Failed(error) => error.code(),
         }
     }
 
     const fn context(self) -> Option<&'static str> {
         match self {
-            Self::DiscordPausedConnectedAndClosed => None,
+            Self::RecoveryPendingAndClosed => None,
             Self::Failed(error) => error.context(),
         }
     }
 
     fn exit_code(self) -> ExitCode {
         match self {
-            Self::DiscordPausedConnectedAndClosed => ExitCode::from(70),
+            Self::RecoveryPendingAndClosed => ExitCode::from(70),
             Self::Failed(error) if error.configuration_class() => ExitCode::from(78),
             Self::Failed(RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable)
             | Self::Failed(RuntimeProcessStagingErrorV1::OwnerHeldShutdown(_))
-            | Self::Failed(RuntimeProcessStagingErrorV1::PausedConnectedShutdown(_)) => {
+            | Self::Failed(RuntimeProcessStagingErrorV1::PausedConnectedShutdown(_))
+            | Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_)) => {
                 ExitCode::from(70)
             }
             Self::Failed(_) => ExitCode::from(69),
@@ -45,7 +44,7 @@ impl RuntimeProcessExitStatusV1 {
 fn main() -> ExitCode {
     install_panic_hook();
     let status = match run_runtime_process_staging_from_environment_v1() {
-        Ok(_) => RuntimeProcessExitStatusV1::DiscordPausedConnectedAndClosed,
+        Ok(_) => RuntimeProcessExitStatusV1::RecoveryPendingAndClosed,
         Err(error) => RuntimeProcessExitStatusV1::Failed(error),
     };
     emit_status(status.code(), status.context());
@@ -75,11 +74,13 @@ mod tests {
         RuntimeDatabasePoolShutdownErrorV1, RuntimeDiscordGatewayShutdownFailureV1,
         RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
         RuntimePausedConnectedProcessShutdownErrorV1,
+        RuntimeRecoveryPendingProcessCleanupFailureV2,
+        RuntimeRecoveryPendingProcessShutdownErrorV2,
     };
 
     #[test]
     fn status_codes_context_and_exit_classes_are_finite() {
-        let staged = RuntimeProcessExitStatusV1::DiscordPausedConnectedAndClosed;
+        let staged = RuntimeProcessExitStatusV1::RecoveryPendingAndClosed;
         let configuration =
             RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::Configuration(
                 RuntimeConfigErrorV1::Missing(RuntimeConfigurationFieldV1::HealthBindAddress),
@@ -105,11 +106,17 @@ mod tests {
                 ),
             ),
         );
-
-        assert_eq!(
-            staged.code(),
-            "runtime_staging_discord_paused_connected_and_closed"
+        let recovery_pending_shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(
+                RuntimeRecoveryPendingProcessShutdownErrorV2::Cleanup(
+                    RuntimeRecoveryPendingProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::CloseDeadlineElapsed,
+                    ),
+                ),
+            ),
         );
+
+        assert_eq!(staged.code(), "runtime_staging_recovery_pending_and_closed");
         assert_eq!(staged.context(), None);
         assert_eq!(staged.exit_code(), ExitCode::from(70));
         assert_eq!(configuration.code(), "runtime_config_missing");
@@ -119,5 +126,6 @@ mod tests {
         assert_eq!(runtime.exit_code(), ExitCode::from(70));
         assert_eq!(shutdown.exit_code(), ExitCode::from(70));
         assert_eq!(paused_shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(recovery_pending_shutdown.exit_code(), ExitCode::from(70));
     }
 }

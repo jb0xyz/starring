@@ -668,21 +668,16 @@ impl RuntimeGatewayBootstrapV1 {
         Ok(observation)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "closed recovery composition consumes the synchronous gateway section"
-        )
-    )]
     pub(crate) fn initial_emergency_gateway_section_v2<'a>(
         &'a self,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<RuntimeEmergencyGatewaySectionV2<'a>, RuntimeGatewayReadyObservationErrorV1> {
         RuntimeEmergencyGatewaySectionV2::acquire(
             &self.adapter,
             &self.owner_invalidated,
             prepared_owner,
+            expected_paused_gateway,
         )
     }
 
@@ -835,14 +830,19 @@ impl RuntimeGatewayBootstrapV1 {
         &mut self,
         prepared_owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        let expected_paused_gateway = self.observe_paused_connected_gateway_v2()?;
         let Self {
             adapter,
             _runtime,
             owner_invalidated,
             ..
         } = self;
-        let section =
-            RuntimeEmergencyGatewaySectionV2::acquire(adapter, owner_invalidated, prepared_owner)?;
+        let section = RuntimeEmergencyGatewaySectionV2::acquire(
+            adapter,
+            owner_invalidated,
+            prepared_owner,
+            &expected_paused_gateway,
+        )?;
         let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(0);
         let (completed_sender, completed_receiver) = std::sync::mpsc::sync_channel(1);
         let (dummy_control, dummy_runtime) =
@@ -981,6 +981,7 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
         gateway: &'a SharedGatewayControlAdapterV2,
         owner_invalidated: &'a Arc<AtomicBool>,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<Self, RuntimeGatewayReadyObservationErrorV1> {
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
         let coordinator = gateway
@@ -1001,6 +1002,9 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             RuntimeGatewayCoordinatorGenerationV2::FIRST,
             snapshot,
         )?;
+        if paused_gateway != *expected_paused_gateway {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
         gateway.require_healthy_paused_control(connection_epoch)?;
         if gateway.connection_observer.current_admission_snapshot() != snapshot {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);

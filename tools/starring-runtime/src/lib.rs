@@ -11,6 +11,7 @@ mod identity_encoding;
 mod process;
 mod process_identity;
 mod process_startup;
+mod recovery_identity;
 mod registry;
 mod secret;
 mod startup;
@@ -45,13 +46,18 @@ pub use process::connected::{
 };
 pub use process::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
-    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerTransitionErrorV1,
+    RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessFoundationCompositionErrorV1,
+    RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
+    RuntimeProcessRecoveryPendingTransitionErrorV2,
+    RuntimeProcessRecoveryPendingTransitionFailureV2,
+    RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
 };
 pub use process_identity::RuntimeProcessInstanceIdGenerationErrorV1;
 pub use process_startup::{
     run_runtime_process_staging_from_environment_v1, RuntimeProcessStagingErrorV1,
     RuntimeProcessStagingOutcomeV1,
 };
+pub use recovery_identity::RuntimeRecoveryIdGenerationErrorV2;
 pub use registry::{
     compose_runtime_registry_bootstrap_v1, RuntimeRegistryBootstrapErrorV1,
     RuntimeRegistryBootstrapV1, RuntimeRegistryRecoveryObservationErrorV1,

@@ -152,9 +152,9 @@ pub(crate) struct RuntimeDiscordStartingProcessTransitionFailureV1 {
 }
 
 pub(crate) struct RuntimePausedConnectedProcessV1 {
-    discord: RuntimeDiscordGatewaySupervisorV1,
-    owner_held: RuntimeOwnerHeldProcessV1,
-    paused_gateway: RuntimePausedGatewayObservationV2,
+    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,
+    pub(super) owner_held: RuntimeOwnerHeldProcessV1,
+    pub(super) paused_gateway: RuntimePausedGatewayObservationV2,
 }
 
 impl RuntimeOwnerHeldProcessV1 {
@@ -387,6 +387,52 @@ impl RuntimeDiscordStartingProcessTransitionFailureV1 {
 }
 
 impl RuntimePausedConnectedProcessV1 {
+    pub(super) fn require_current_paused_connection_v1(
+        &self,
+    ) -> Result<(), RuntimeProcessPausedConnectedTransitionFailureV1> {
+        if !self
+            .owner_held
+            .foundation
+            .startup_budget
+            .operation_is_open()
+        {
+            return Err(RuntimeProcessPausedConnectedTransitionFailureV1::OperationDeadlineElapsed);
+        }
+        if self.owner_held.owner.terminal_status().is_some() {
+            return Err(RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated);
+        }
+        if let Some(transition) = discord_transition_failure_v1(&self.discord) {
+            return Err(transition);
+        }
+        match self
+            .owner_held
+            .foundation
+            .gateway
+            .observe_paused_connected_gateway_v2()
+        {
+            Ok(current) if current == self.paused_gateway => {}
+            Ok(_) => {
+                return Err(
+                    RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(
+                        RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot,
+                    ),
+                );
+            }
+            Err(error) => {
+                return Err(
+                    RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(error),
+                );
+            }
+        }
+        if self.owner_held.owner.terminal_status().is_some() {
+            return Err(RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated);
+        }
+        if let Some(transition) = discord_transition_failure_v1(&self.discord) {
+            return Err(transition);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn shutdown(self) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
         let Self {
             owner_held,
@@ -420,7 +466,7 @@ fn retryable_gateway_observation_v1(error: RuntimeGatewayReadyObservationErrorV1
     )
 }
 
-fn discord_transition_failure_v1(
+pub(super) fn discord_transition_failure_v1(
     discord: &RuntimeDiscordGatewaySupervisorV1,
 ) -> Option<RuntimeProcessPausedConnectedTransitionFailureV1> {
     discord
@@ -433,7 +479,7 @@ fn discord_transition_failure_v1(
         })
 }
 
-fn map_discord_transition_exit_v1(
+pub(super) fn map_discord_transition_exit_v1(
     exit: RuntimeDiscordGatewayExitV1,
 ) -> RuntimeProcessPausedConnectedTransitionFailureV1 {
     match exit {
@@ -452,7 +498,7 @@ fn map_discord_transition_exit_v1(
     }
 }
 
-async fn shutdown_paused_discord_owner_v1(
+pub(super) async fn shutdown_paused_discord_owner_v1(
     owner_held: RuntimeOwnerHeldProcessV1,
     discord: RuntimeDiscordGatewaySupervisorV1,
 ) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
@@ -471,7 +517,7 @@ async fn shutdown_paused_discord_owner_v1(
     finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown)
 }
 
-fn finish_paused_connected_shutdown_v1<T>(
+pub(super) fn finish_paused_connected_shutdown_v1<T>(
     discord_shutdown: Result<T, RuntimeDiscordGatewayShutdownFailureV1>,
     owner_shutdown: Result<(), super::RuntimeOwnerHeldProcessShutdownErrorV1>,
 ) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
@@ -492,7 +538,7 @@ fn finish_paused_connected_shutdown_v1<T>(
     }
 }
 
-fn map_discord_shutdown_failure_v1(
+pub(super) fn map_discord_shutdown_failure_v1(
     error: RuntimeDiscordGatewayShutdownErrorV1,
 ) -> RuntimeDiscordGatewayShutdownFailureV1 {
     match error {

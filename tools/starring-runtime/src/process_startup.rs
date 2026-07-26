@@ -12,6 +12,7 @@ use crate::startup::{
 use crate::{
     RuntimeBuildRevisionBootstrapErrorV1, RuntimeConfigErrorV1, RuntimeConfigV1,
     RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessPausedConnectedTransitionErrorV1,
+    RuntimeProcessRecoveryPendingTransitionErrorV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
     RuntimeSecretsResolutionErrorV1,
 };
 
@@ -33,10 +34,14 @@ pub enum RuntimeProcessStagingErrorV1 {
     GatewayOwner(RuntimeProcessGatewayOwnerTransitionErrorV1),
     #[error("runtime process paused-connected transition failed")]
     PausedConnected(RuntimeProcessPausedConnectedTransitionErrorV1),
+    #[error("runtime process recovery-pending transition failed")]
+    RecoveryPending(RuntimeProcessRecoveryPendingTransitionErrorV2),
     #[error("runtime owner-held process shutdown failed")]
     OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
     #[error("runtime paused-connected process shutdown failed")]
     PausedConnectedShutdown(RuntimePausedConnectedProcessShutdownErrorV1),
+    #[error("runtime recovery-pending process shutdown failed")]
+    RecoveryPendingShutdown(RuntimeRecoveryPendingProcessShutdownErrorV2),
 }
 
 impl RuntimeProcessStagingErrorV1 {
@@ -50,8 +55,10 @@ impl RuntimeProcessStagingErrorV1 {
             Self::Foundation(error) => error.code(),
             Self::GatewayOwner(error) => error.code(),
             Self::PausedConnected(error) => error.code(),
+            Self::RecoveryPending(error) => error.code(),
             Self::OwnerHeldShutdown(error) => error.code(),
             Self::PausedConnectedShutdown(error) => error.code(),
+            Self::RecoveryPendingShutdown(error) => error.code(),
         }
     }
 
@@ -66,8 +73,10 @@ impl RuntimeProcessStagingErrorV1 {
             Self::Foundation(error) => error.context(),
             Self::GatewayOwner(error) => error.context(),
             Self::PausedConnected(error) => error.context(),
+            Self::RecoveryPending(error) => error.context(),
             Self::OwnerHeldShutdown(error) => error.context(),
             Self::PausedConnectedShutdown(error) => error.context(),
+            Self::RecoveryPendingShutdown(error) => error.context(),
             Self::AsyncRuntimeUnavailable | Self::OperationDeadlineElapsed => None,
         }
     }
@@ -176,10 +185,14 @@ async fn stage_runtime_process_from_environment_v1(
             ));
         }
     };
-    paused_connected
+    let recovery_pending = paused_connected
+        .into_recovery_pending_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::RecoveryPending)?;
+    recovery_pending
         .shutdown()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::PausedConnectedShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 
@@ -202,7 +215,8 @@ mod tests {
         DatabaseCapabilityV1, RuntimeConfigurationFieldV1, RuntimeDatabaseCompositionErrorV1,
         RuntimeDatabasePoolShutdownErrorV1, RuntimeDiscordGatewayShutdownFailureV1,
         RuntimeGatewayOwnerShutdownFailureV1, RuntimeProcessPausedConnectedTransitionFailureV1,
-        RuntimeSecretResolutionErrorV1,
+        RuntimeProcessRecoveryPendingTransitionFailureV2,
+        RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeSecretResolutionErrorV1,
     };
 
     #[test]
@@ -243,6 +257,18 @@ mod tests {
                     RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
                 ),
             ),
+            RuntimeProcessStagingErrorV1::RecoveryPending(
+                RuntimeProcessRecoveryPendingTransitionErrorV2::Transition(
+                    RuntimeProcessRecoveryPendingTransitionFailureV2::OperationDeadlineElapsed,
+                ),
+            ),
+            RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(
+                RuntimeRecoveryPendingProcessShutdownErrorV2::Cleanup(
+                    RuntimeRecoveryPendingProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::CloseDeadlineElapsed,
+                    ),
+                ),
+            ),
         ];
 
         assert_eq!(errors[0].code(), "runtime_async_runtime_unavailable");
@@ -268,6 +294,14 @@ mod tests {
         assert_eq!(
             errors[8].code(),
             "runtime_discord_gateway_shutdown_task_stopped"
+        );
+        assert_eq!(
+            errors[9].code(),
+            "runtime_process_recovery_pending_operation_deadline_elapsed"
+        );
+        assert_eq!(
+            errors[10].code(),
+            "runtime_discord_gateway_shutdown_close_deadline_elapsed"
         );
         for error in errors {
             assert!(!error.code().is_empty());

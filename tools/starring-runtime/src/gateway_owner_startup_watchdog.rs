@@ -622,6 +622,7 @@ fn accept_closed_recovery_commit_observation_v2(
 
 pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    prepared_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
@@ -677,14 +678,40 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn prepare_closed_recovery_v2(
         mut self,
     ) -> Result<
         RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
     > {
+        self.prepare_closed_recovery_in_place_v2().await?;
+        self.try_into_prepared_closed_recovery_v2()
+            .map_err(|handle| {
+                handle.inner().invalidation.invalidate();
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation
+            })
+    }
+
+    pub(crate) async fn prepare_closed_recovery_in_place_v2(
+        &mut self,
+    ) -> Result<(), RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2> {
+        if self.prepared_closed_recovery_observation.is_some() {
+            self.prepared_closed_recovery_observation = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation);
+        }
         let observation = self.inner().prepare_closed_recovery_v2().await?;
+        self.prepared_closed_recovery_observation = Some(observation);
+        Ok(())
+    }
+
+    pub(crate) fn try_into_prepared_closed_recovery_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerPreparedClosedRecoveryV2, Box<Self>> {
+        let Some(observation) = self.prepared_closed_recovery_observation.take() else {
+            return Err(Box::new(self));
+        };
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
             inner: Some(inner),
@@ -732,16 +759,37 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         &self.observation
     }
 
+    pub(crate) fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.inner_mut().wait_terminal().await
+    }
+
     pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }
 
+    #[cfg(test)]
     pub(crate) async fn abort_and_shutdown_v2(
         mut self,
     ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         let inner = self.take_inner();
         inner.invalidation.invalidate();
         inner.shutdown().await
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
     }
 
     pub(crate) async fn commit_closed_recovery_v2(
@@ -785,6 +833,12 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
             .as_ref()
+            .expect("prepared gateway owner recovery handle")
+    }
+
+    fn inner_mut(&mut self) -> &mut RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_mut()
             .expect("prepared gateway owner recovery handle")
     }
 
@@ -1260,6 +1314,7 @@ where
             task: Some(task),
             startup_cleanup_cap,
         }),
+        prepared_closed_recovery_observation: None,
     })
 }
 
