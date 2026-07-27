@@ -1239,6 +1239,146 @@ fn empty_slot_seal_materializes_a_fenced_tombstone() {
 }
 
 #[test]
+fn empty_recovery_cursor_seals_and_restores_one_exact_empty_slot() {
+    let registry = registry(8);
+    let key = route(10, "study", 1, 1, "p1", None).slot_key();
+    let source_guard = registry.recovery_observation_guard_v2().unwrap();
+    let source_global = source_guard.observation();
+    let source_cursor = source_guard.into_empty_cursor().unwrap();
+    let sealed = registry
+        .seal_empty_recovery_drain_claim_v2(source_cursor, &key, seal_key(10))
+        .unwrap();
+
+    assert!(sealed.source_slot_observation().is_none());
+    assert_eq!(sealed.seal().key(), &key);
+    assert_eq!(sealed.seal().seal_generation().get(), 1);
+    assert_eq!(sealed.seal().route(), None);
+    assert_eq!(sealed.slot_observation().route, None);
+    assert_eq!(sealed.slot_observation().active_interactions, 0);
+    assert_eq!(
+        sealed.slot_observation().admission_state,
+        SlotAdmissionStateV2::DrainClaimSealed {
+            seal_key: seal_key(10),
+            seal_generation: sealed.seal().seal_generation(),
+        }
+    );
+    assert_eq!(
+        sealed.registry_observation().observation_sequence().get(),
+        source_global.observation_sequence().get() + 1
+    );
+    assert_eq!(sealed.registry_observation().retained_slot_count(), 1);
+    assert_eq!(
+        sealed
+            .registry_observation()
+            .retained_empty_tombstone_count(),
+        0
+    );
+    assert_eq!(sealed.registry_observation().sealed_slot_count(), 1);
+
+    let unsealed = registry
+        .unseal_empty_recovery_drain_claim_v2(sealed.into_seal())
+        .unwrap();
+    assert_eq!(unsealed.slot_observation().route, None);
+    assert_eq!(
+        unsealed.slot_observation().admission_state,
+        SlotAdmissionStateV2::Empty
+    );
+    assert_eq!(unsealed.registry_observation().retained_slot_count(), 1);
+    assert_eq!(
+        unsealed
+            .registry_observation()
+            .retained_empty_tombstone_count(),
+        1
+    );
+    assert_eq!(unsealed.registry_observation().sealed_slot_count(), 0);
+    let restored = registry
+        .revalidate_empty_recovery_cursor_v2(&unsealed.into_cursor())
+        .unwrap();
+    assert!(restored.is_recovery_empty());
+}
+
+#[test]
+fn empty_recovery_seal_preserves_tombstone_local_generation() {
+    let registry = registry(8);
+    let key = route(10, "study", 1, 1, "p1", None).slot_key();
+    let (first, _) = registry
+        .seal_drain_claim_v2(&key, seal_key(11), None)
+        .unwrap();
+    registry.unseal_drain_claim_v2(first).unwrap();
+    let source_slot = registry.atomic_observation_v2(&key).unwrap().unwrap();
+    let cursor = registry
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    let sealed = registry
+        .seal_empty_recovery_drain_claim_v2(cursor, &key, seal_key(12))
+        .unwrap();
+
+    assert_eq!(sealed.source_slot_observation(), Some(&source_slot));
+    assert_eq!(sealed.seal().seal_generation().get(), 2);
+    assert_eq!(
+        sealed.slot_observation().admission_generation.get(),
+        source_slot.admission_generation.get() + 1
+    );
+    assert_eq!(
+        sealed.slot_observation().observation_sequence.get(),
+        source_slot.observation_sequence.get() + 1
+    );
+}
+
+#[test]
+fn empty_recovery_seal_rejects_stale_foreign_and_nonempty_cursors() {
+    let source = registry(8);
+    let foreign = registry(8);
+    let key = route(10, "study", 1, 1, "p1", None).slot_key();
+    let stale = source
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    let (advance, _) = source
+        .seal_drain_claim_v2(&key, seal_key(13), None)
+        .unwrap();
+    source.unseal_drain_claim_v2(advance).unwrap();
+    assert_eq!(
+        source
+            .seal_empty_recovery_drain_claim_v2(stale, &key, seal_key(14))
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor
+    );
+
+    let foreign_cursor = source
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    assert_eq!(
+        foreign
+            .seal_empty_recovery_drain_claim_v2(foreign_cursor, &key, seal_key(15))
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor
+    );
+
+    let occupied = registry(8);
+    let candidate = route(10, "study", 1, 1, "p1", None);
+    occupied
+        .install(candidate.slot_key(), candidate, fence(1))
+        .unwrap();
+    assert_eq!(
+        occupied
+            .recovery_observation_guard_v2()
+            .unwrap()
+            .into_empty_cursor()
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::RegistryRecoveryNotEmpty
+    );
+}
+
+#[test]
 fn seal_requires_the_exact_atomic_observation() {
     let registry = registry(8);
     let candidate = route(10, "study", 1, 1, "p1", None);
