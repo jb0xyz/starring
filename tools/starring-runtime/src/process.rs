@@ -33,6 +33,11 @@ pub use closed::{
     RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
     RuntimeProcessClosedRecoveryTransitionFailureV2, RuntimeProcessGatewayOwnerCommitFailureV2,
 };
+#[cfg(test)]
+pub(crate) use execution::{
+    execute_pending_drain_recovery_with_environment_v2, RuntimePendingDrainRecoveryEnvironmentV2,
+    RuntimeStartupRecoveryExecutionAwaitFailureV2,
+};
 pub use observation::{
     RuntimeProcessStartupRecoveryObservationErrorV2,
     RuntimeProcessStartupRecoveryObservationFailureV2,

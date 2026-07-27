@@ -446,7 +446,7 @@ impl RuntimeClosedRecoveryReadyIterationV2 {
                     session: RuntimeClosedRecoverySessionV2 {
                         owner,
                         gateway,
-                        registry,
+                        registry: super::RuntimeClosedRecoverySessionRegistryV2::Empty(registry),
                         operation_cutoff,
                         readiness: super::RuntimeClosedRecoveryReadinessStateV2::Available,
                     },

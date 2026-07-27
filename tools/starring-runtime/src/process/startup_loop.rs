@@ -42,6 +42,9 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     SuspendedLocalEffectExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
     SuspendedLocalEffectRetryAfterUnsupported,
     PendingRuntimeDrainRecoveryUnavailable,
+    PendingRuntimeDrainExecution(RuntimeExecutionPersistenceErrorV1),
+    PendingRuntimeDrainExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    PendingRuntimeDrainCompound,
     ProtocolViolation,
 }
 
@@ -84,6 +87,11 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             Self::PendingRuntimeDrainRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_pending_runtime_drain_recovery_unavailable"
             }
+            Self::PendingRuntimeDrainExecution(error) => runtime_execution_error_code_v2(error),
+            Self::PendingRuntimeDrainExecutionRejected(error) => error.code(),
+            Self::PendingRuntimeDrainCompound => {
+                "runtime_process_startup_recovery_loop_pending_runtime_drain_compound"
+            }
             Self::ProtocolViolation => {
                 "runtime_process_startup_recovery_loop_protocol_violation"
             }
@@ -108,6 +116,9 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             | Self::SuspendedLocalEffectExecutionRejected(_)
             | Self::SuspendedLocalEffectRetryAfterUnsupported
             | Self::PendingRuntimeDrainRecoveryUnavailable
+            | Self::PendingRuntimeDrainExecution(_)
+            | Self::PendingRuntimeDrainExecutionRejected(_)
+            | Self::PendingRuntimeDrainCompound
             | Self::ProtocolViolation => None,
         }
     }

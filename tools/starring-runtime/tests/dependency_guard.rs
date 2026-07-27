@@ -863,7 +863,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_registry_adapter = path == Path::new("src/registry.rs")
                 && matches!(
                     identifier,
-                    "automation_runtime_convergence"
+                    "automation_runtime_controller"
+                        | "automation_runtime_convergence"
                         | "automation_runtime_registry"
                         | "automation_runtime_worker"
                 );
@@ -2362,6 +2363,10 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoverySessionV2",
+        "enum RuntimeClosedRecoverySessionRegistryV2",
+        "RuntimeClosedRecoverySessionRegistryV2::Empty",
+        "RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed",
+        "RuntimeClosedRecoverySessionRegistryV2::Failed",
         "RuntimeClosedRecoverySessionV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoveryReadyIterationV2",
         "RuntimeClosedRecoveryReadyIterationV2(<redacted>)",
@@ -2421,7 +2426,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) struct RuntimeClosedRecoverySessionV2 {\n",
         "    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,\n",
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
-        "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    registry: RuntimeClosedRecoverySessionRegistryV2,\n",
         "    operation_cutoff: Instant,\n",
         "    readiness: RuntimeClosedRecoveryReadinessStateV2,\n",
         "}"
@@ -3171,6 +3176,98 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         .find(".complete_startup_recovery_execution_v2(completed)")
         .unwrap();
     assert!(begin < database && database < complete);
+    let pending_execution = braced_declaration(
+        execution,
+        "async fn try_execute_pending_drain_recovery_with_environment_v2<",
+    );
+    let pending_wrapper = braced_declaration(
+        execution,
+        "async fn execute_pending_drain_recovery_in_place_v2(",
+    );
+    let pending_environment = pending_wrapper
+        .find("RuntimeProductionPendingDrainRecoveryEnvironmentV2")
+        .unwrap();
+    let pending_driver = pending_wrapper
+        .find("execute_pending_drain_recovery_with_environment_v2(session, &mut environment)")
+        .unwrap();
+    assert!(pending_environment < pending_driver);
+    let generic_wrapper = braced_declaration(
+        execution,
+        "pub(crate) async fn execute_pending_drain_recovery_with_environment_v2<",
+    );
+    let pending_attempt = generic_wrapper
+        .find("try_execute_pending_drain_recovery_with_environment_v2(session, environment)")
+        .unwrap();
+    let pending_failure = generic_wrapper.find("if result.is_err()").unwrap();
+    let pending_invalidation = generic_wrapper
+        .find("session.invalidate_startup_recovery_execution_v2()")
+        .unwrap();
+    assert!(pending_attempt < pending_failure && pending_failure < pending_invalidation);
+    let production_environment =
+        braced_declaration(execution, "impl RuntimePendingDrainRecoveryEnvironmentV2");
+    assert_eq!(
+        production_environment
+            .matches("await_pending_drain_database_v2(")
+            .count(),
+        4
+    );
+    assert_eq!(
+        pending_execution
+            .matches("revalidate_pending_drain_stage_v2(environment, session)?")
+            .count(),
+        4
+    );
+    let pending_begin = pending_execution
+        .find(".begin_startup_recovery_execution_v2(")
+        .unwrap();
+    let pending_select = pending_execution.find(".select_pending_drain_v2(").unwrap();
+    let pending_accept = pending_execution.find(".accept_selection(").unwrap();
+    let pending_seal = pending_execution
+        .find(".seal_pending_drain_candidate_v2(")
+        .unwrap();
+    let pending_bind = pending_execution.find(".bind_registry_seal(").unwrap();
+    let pending_claim = pending_execution
+        .find(".execute_pending_drain_claim_v2(")
+        .unwrap();
+    let pending_acknowledgement = pending_execution
+        .find(".execute_pending_drain_acknowledgement_v2(")
+        .unwrap();
+    let durable_acknowledgement = pending_execution
+        .find(".complete(acknowledgement_receipt)")
+        .unwrap();
+    let pending_unseal = pending_execution
+        .find(".unseal_pending_drain_after_durable_ack_v2(&durable)")
+        .unwrap();
+    let pending_rollover = pending_execution
+        .find(".complete_registry_rollover(unseal)")
+        .unwrap();
+    let pending_gateway_completion = pending_execution
+        .rfind(".complete_startup_recovery_execution_v2(completed)")
+        .unwrap();
+    assert!(
+        pending_begin < pending_select
+            && pending_select < pending_accept
+            && pending_accept < pending_seal
+            && pending_seal < pending_bind
+            && pending_bind < pending_claim
+            && pending_claim < pending_acknowledgement
+            && pending_acknowledgement < durable_acknowledgement
+            && durable_acknowledgement < pending_unseal
+            && pending_unseal < pending_rollover
+            && pending_rollover < pending_gateway_completion
+    );
+    assert_eq!(
+        pending_execution
+            .matches(".unseal_pending_drain_after_durable_ack_v2(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        pending_execution
+            .matches(".record_pending_drain_no_candidate_v2(")
+            .count(),
+        1
+    );
     let production_continue = braced_declaration(
         startup_loop,
         "impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinueProcessV2",
@@ -3483,6 +3580,15 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "registry_failed_closed: observation.registry_failed_closed()",
         "RuntimeRegistryBootstrapV1(<redacted>)",
         "RuntimeRegistryEmptyRecoveryBindingV2(<redacted>)",
+        "pub(crate) struct RuntimeRegistryPendingDrainSealBindingV2",
+        "pub(crate) fn into_pending_drain_seal_binding_v2(",
+        "candidate: &RuntimePendingDrainCandidateV2",
+        "candidate.intent_id().canonical_bytes()",
+        "pub(crate) fn into_empty_binding_after_durable_ack_v2(",
+        "durable: &RuntimeDurablyAcknowledgedPendingDrainV2",
+        "RuntimePendingDrainRegistryUnsealWitnessV2",
+        "require_pending_drain_durable_seal_match_v2(&self.witness, durable.seal_witness())",
+        ".unseal_empty_recovery_drain_claim_v2(sealed)",
     ] {
         assert!(production.contains(required), "{required}");
     }
@@ -3544,6 +3650,25 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
             .count(),
         1
     );
+    let unseal = braced_declaration(
+        production,
+        "pub(crate) fn into_empty_binding_after_durable_ack_v2(",
+    );
+    let durable_match = unseal
+        .find("require_pending_drain_durable_seal_match_v2")
+        .unwrap();
+    let exact_revalidation = unseal.find("self.revalidate_sealed_v2()?").unwrap();
+    let mutation = unseal
+        .find(".unseal_empty_recovery_drain_claim_v2(sealed)")
+        .unwrap();
+    assert!(durable_match < exact_revalidation && exact_revalidation < mutation);
+    assert_eq!(
+        production
+            .matches(".unseal_empty_recovery_drain_claim_v2(sealed)")
+            .count(),
+        1
+    );
+    assert!(!production.contains(".unseal_drain_claim_v2("));
     for forbidden in [
         "pub fn cursor",
         "pub fn registry",

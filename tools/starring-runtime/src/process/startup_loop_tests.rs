@@ -28,6 +28,7 @@ enum FakeLoopStepV2 {
     WaitFailure,
     ReadinessFailure,
     Recover(RuntimeStartupRecoveryClassV2),
+    RecoveryFailure(RuntimeStartupRecoveryClassV2),
 }
 
 struct FakeLoopStateV2 {
@@ -47,6 +48,7 @@ struct FakeContinueProcessV2 {
     state: Arc<FakeLoopStateV2>,
     continuation: RuntimeStartupRecoveryContinuationV2,
     wait_failure: bool,
+    recovery_failure: bool,
     readiness_failure: bool,
 }
 
@@ -144,6 +146,7 @@ impl RuntimeStartupRecoveryLoopReadyStepV2 for FakeReadyProcessV2 {
                         retry_after: Duration::from_millis(1),
                     },
                     wait_failure: false,
+                    recovery_failure: false,
                     readiness_failure: false,
                 }),
             ),
@@ -154,6 +157,7 @@ impl RuntimeStartupRecoveryLoopReadyStepV2 for FakeReadyProcessV2 {
                         retry_after: Duration::from_millis(1),
                     },
                     wait_failure: true,
+                    recovery_failure: false,
                     readiness_failure: false,
                 }),
             ),
@@ -164,6 +168,7 @@ impl RuntimeStartupRecoveryLoopReadyStepV2 for FakeReadyProcessV2 {
                         retry_after: Duration::from_millis(1),
                     },
                     wait_failure: false,
+                    recovery_failure: false,
                     readiness_failure: true,
                 }),
             ),
@@ -172,6 +177,16 @@ impl RuntimeStartupRecoveryLoopReadyStepV2 for FakeReadyProcessV2 {
                     state: self.state,
                     continuation: RuntimeStartupRecoveryContinuationV2::Recover(class),
                     wait_failure: false,
+                    recovery_failure: false,
+                    readiness_failure: false,
+                }),
+            ),
+            FakeLoopStepV2::RecoveryFailure(class) => Ok(
+                RuntimeStartupRecoveryLoopIterationOutcomeV2::Continue(FakeContinueProcessV2 {
+                    state: self.state,
+                    continuation: RuntimeStartupRecoveryContinuationV2::Recover(class),
+                    wait_failure: false,
+                    recovery_failure: true,
                     readiness_failure: false,
                 }),
             ),
@@ -215,18 +230,17 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
 
     fn execute_recovery_in_place_v2(
         &mut self,
-        class: RuntimeStartupRecoveryClassV2,
+        _class: RuntimeStartupRecoveryClassV2,
     ) -> RuntimeStartupRecoveryBorrowedStepFutureV2<
         '_,
         Self::RecoveryCompletion,
         Self::RecoveryFailure,
     > {
         push_fake_loop_event_v2(&self.state, "recovery");
-        Box::pin(ready(match class {
-            RuntimeStartupRecoveryClassV2::StaleLive
-            | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
-            | RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => Ok(()),
-            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => Err(()),
+        Box::pin(ready(if self.recovery_failure {
+            Err(())
+        } else {
+            Ok(())
         }))
     }
 
@@ -381,6 +395,7 @@ async fn production_used_driver_refreshes_and_reobserves_after_supported_recover
         RuntimeStartupRecoveryClassV2::StaleLive,
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
         RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
     ] {
         let ready = fake_loop_v2([FakeLoopStepV2::Recover(class), FakeLoopStepV2::FixedPoint]);
         let state = ready.state.clone();
@@ -426,7 +441,9 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
             vec!["observe", "finalize", "wait", "cleanup_readiness"],
         ),
         (
-            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent),
+            FakeLoopStepV2::RecoveryFailure(
+                RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+            ),
             FakeLoopErrorV2::Recovery,
             vec!["observe", "finalize", "recovery", "cleanup_recovery"],
         ),
