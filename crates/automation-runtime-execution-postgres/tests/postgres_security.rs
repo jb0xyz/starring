@@ -22,3 +22,5 @@ include!("postgres_security/startup_recovery_observation.rs");
 include!("postgres_security/startup_recovery_action_journal.rs");
 include!("postgres_security/startup_recovery_execution.rs");
 include!("postgres_security/startup_recovery_execution_adapter.rs");
+include!("postgres_security/startup_pending_drain_execution.rs");
+include!("postgres_security/startup_pending_drain_execution_adapter.rs");

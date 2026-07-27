@@ -9,7 +9,10 @@ const DATABASE_SOURCE: &str = include_str!("../src/database.rs");
 const SECURITY_SUPPORT_SOURCE: &str = include_str!("postgres_security/support.rs");
 
 const EXECUTOR: &str = "public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2";
-const READINESS_DIGEST: &str = "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
+const MIGRATION_READINESS_DIGEST: &str =
+    "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
+const CURRENT_READINESS_DIGEST: &str =
+    "de739460f2c86c2016cbc91aa47a625fbced903cc93722de80a33c93c7b54932";
 const MANIFEST_DIGEST: &str = "c2de6cf64ce6efbcf22e31f06da774195996060a692c45b48f073ff93fa4d630";
 
 fn dollar_block(tag: &str) -> &'static str {
@@ -188,17 +191,17 @@ fn manifest_readiness_acl_and_rust_pins_advance_together() {
         "RETURN observed_count = 799",
         "52022b152b1189e01928d8cc14dc229d1ed094a5da7837711a06cf3077b0ea41",
         MANIFEST_DIGEST,
-        READINESS_DIGEST,
+        MIGRATION_READINESS_DIGEST,
         "runtime_startup_reserved_awaiting_execution_postflight_drift",
         "starring_runtime_execution_database_readiness_v1",
     ] {
         assert!(MIGRATION.contains(required), "{required}");
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 19]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 22]"));
     assert!(CONTRACT_SOURCE.contains(EXECUTOR));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 21"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 21]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 24"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 24]"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(READINESS_DIGEST));
+        assert!(source.contains(CURRENT_READINESS_DIGEST));
     }
 }

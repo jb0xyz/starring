@@ -13,6 +13,7 @@ use automation_runtime_controller::{
 use automation_runtime_convergence::{
     ControllerId, FencingToken, RuntimeDeployment, RuntimeDeploymentSnapshotV1,
 };
+use automation_runtime_worker::{RuntimePendingDrainCandidateV2, RuntimePendingDrainStateDigestV2};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
@@ -22,7 +23,6 @@ use super::closed_evidence::{
 };
 use super::pending_projection::{
     RuntimePendingDrainProductRootV2, RuntimePendingDrainProgressedProjectionV2,
-    RuntimePendingDrainSealBundleV2,
 };
 use crate::RuntimeExecutionPersistenceErrorV1;
 
@@ -36,7 +36,9 @@ pub(super) struct RuntimePendingDrainExpectationV2<'a> {
     pub gateway_owner_lease_id: &'a RuntimeGatewayOwnerLeaseIdV1,
     pub owner_revision: i64,
     pub owner_expires_at: DateTime<Utc>,
-    pub database_now: DateTime<Utc>,
+    pub candidate: RuntimePendingDrainCandidateV2,
+    pub source_intent_revision: NonZeroU64,
+    pub source_state_digest: RuntimePendingDrainStateDigestV2,
     pub prior_claim_terminal_digest: Option<&'a str>,
     pub seal: RuntimePendingDrainSealExpectationV2,
     pub evidence: &'a RuntimeClosedRecoveryExpectedEvidenceV2,
@@ -62,8 +64,17 @@ pub(super) struct RuntimePendingDrainSealExpectationV2 {
 pub(super) fn validate_pending_drain_claimed_projection_v2(
     projection: &RuntimePendingDrainProgressedProjectionV2,
     expected: &RuntimePendingDrainExpectationV2<'_>,
+    minimum_database_now: DateTime<Utc>,
+    database_now: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
-    validate_common(projection, expected)?;
+    validate_common(
+        projection,
+        expected,
+        minimum_database_now,
+        database_now,
+        recorded_at,
+    )?;
     if expected.claim_action_authority_revision != expected.action_authority_revision {
         return Err(invalid());
     }
@@ -131,8 +142,17 @@ pub(super) fn validate_pending_drain_claimed_projection_v2(
 pub(super) fn validate_pending_drain_acknowledged_projection_v2(
     projection: &RuntimePendingDrainProgressedProjectionV2,
     expected: &RuntimePendingDrainExpectationV2<'_>,
+    minimum_database_now: DateTime<Utc>,
+    database_now: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
-    validate_common(projection, expected)?;
+    validate_common(
+        projection,
+        expected,
+        minimum_database_now,
+        database_now,
+        recorded_at,
+    )?;
     if expected
         .claim_action_authority_revision
         .checked_add(1)
@@ -182,7 +202,7 @@ pub(super) fn validate_pending_drain_acknowledged_projection_v2(
     )?;
     if acknowledgement.acknowledged_at() != projection.product_root.transitioned_at
         || acknowledgement.registry_observation_sequence().get()
-            != positive_u64(expected.evidence.registry_observation_sequence)?
+            != positive_u64(expected.seal.post_global_sequence)?
     {
         return Err(invalid());
     }
@@ -190,7 +210,7 @@ pub(super) fn validate_pending_drain_acknowledged_projection_v2(
         persisted_source,
         RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2 {
             acknowledgement_observation_sequence: positive_non_zero(
-                expected.evidence.registry_observation_sequence,
+                expected.seal.post_global_sequence,
             )?,
             certification: acknowledgement.certification().clone(),
             acknowledged_at: projection.product_root.transitioned_at,
@@ -214,12 +234,26 @@ pub(super) fn validate_pending_drain_acknowledged_projection_v2(
 fn validate_common(
     projection: &RuntimePendingDrainProgressedProjectionV2,
     expected: &RuntimePendingDrainExpectationV2<'_>,
+    minimum_database_now: DateTime<Utc>,
+    database_now: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
+    let transitioned_at = projection.product_root.transitioned_at;
     if expected
         .selection_authority_revision
         .checked_add(1)
         .is_none_or(|revision| revision != expected.action_authority_revision)
-        || projection.product_root.transitioned_at != expected.database_now
+        || transitioned_at < minimum_database_now
+        || transitioned_at > database_now
+        || transitioned_at > recorded_at
+        || transitioned_at >= expected.owner_expires_at
+        || projection.source_state_digest
+            != expected
+                .source_state_digest
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
     {
         return Err(invalid());
     }
@@ -415,7 +449,19 @@ fn validate_stage_root(
     source_revision: NonZeroU64,
     root: &RuntimePersistedProductDrainRootV2,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
+    let candidate = &expected.candidate;
+    let target = candidate.expected_target();
     if positive_u64(projection.source_intent_revision)? != source_revision.get()
+        || source_revision != expected.source_intent_revision
+        || projection.drain_intent_id != candidate.intent_id().as_str()
+        || projection.drain_slot_guild_id != candidate.slot().guild_id.to_string()
+        || projection.drain_slot_ruleset_key != candidate.slot().ruleset_key.as_str()
+        || projection.target_guild_id != target.guild_id.to_string()
+        || projection.target_ruleset_key != target.ruleset_key.as_str()
+        || positive_u64(projection.target_version)? != u64::from(target.version.get())
+        || projection.target_content_hash != target.content_hash.to_hex()
+        || positive_u64(projection.target_binding_revision)? != target.binding_revision.get()
+        || projection.target_binding_fingerprint != target.binding_fingerprint.as_str()
         || projection.claim_action_authority_revision != expected.claim_action_authority_revision
         || projection.prior_claim_terminal_digest.as_deref() != expected.prior_claim_terminal_digest
     {
@@ -601,12 +647,14 @@ mod tests {
     use automation_runtime_controller::{
         GatewayShardIdV1, RuntimeBuildRevisionV1, RuntimeCertificationIntentFingerprintV2,
         RuntimeCertificationOperationIdV2, RuntimeDrainCertificationResolutionV2,
+        RuntimeDrainIntentIdV2,
     };
     use automation_runtime_convergence::ProcessInstanceId;
     use serde_json::json;
 
     use super::*;
     use crate::startup_recovery_execution::closed_evidence::RuntimeClosedRecoveryEvidenceV2;
+    use crate::startup_recovery_execution::pending_projection::RuntimePendingDrainSealBundleV2;
 
     const RECOVERY_ID: &str = "0123456789abcdef0123456789abcdef";
     const PRODUCT_OPERATION_ID: &str = "00112233445566778899aabbccddeeff";
@@ -819,6 +867,9 @@ mod tests {
         owner: &'a RuntimeGatewayOwnerLeaseIdV1,
         evidence: &'a RuntimeClosedRecoveryExpectedEvidenceV2,
     ) -> RuntimePendingDrainExpectationV2<'a> {
+        let root = persisted_root(&product_root(true)).unwrap();
+        let drain = &root.canonical().drain_preimage().key;
+        let source = source(&root, 1, None);
         RuntimePendingDrainExpectationV2 {
             recovery_id: RECOVERY_ID,
             originating_emergency_generation: 2,
@@ -829,7 +880,20 @@ mod tests {
             gateway_owner_lease_id: owner,
             owner_revision: 7,
             owner_expires_at: at(200),
-            database_now: at(101),
+            candidate: RuntimePendingDrainCandidateV2::new(
+                drain.intent_id.clone(),
+                drain.slot.clone(),
+                drain.expected_target.clone(),
+                NonZeroU64::MIN,
+                RuntimePendingDrainStateDigestV2::new(Sha256::digest(source.state_bytes()).into())
+                    .unwrap(),
+            )
+            .unwrap(),
+            source_intent_revision: NonZeroU64::MIN,
+            source_state_digest: RuntimePendingDrainStateDigestV2::new(
+                Sha256::digest(source.state_bytes()).into(),
+            )
+            .unwrap(),
             prior_claim_terminal_digest: None,
             seal: RuntimePendingDrainSealExpectationV2 {
                 pre_slot_admission_generation: None,
@@ -849,6 +913,24 @@ mod tests {
             },
             evidence,
         }
+    }
+
+    fn acknowledgement_expectation<'a>(
+        owner: &'a RuntimeGatewayOwnerLeaseIdV1,
+        evidence: &'a RuntimeClosedRecoveryExpectedEvidenceV2,
+    ) -> RuntimePendingDrainExpectationV2<'a> {
+        let mut expected = expectation(owner, evidence);
+        let claimed = claimed_projection();
+        expected.selection_authority_revision = 5;
+        expected.action_authority_revision = 6;
+        expected.source_intent_revision = NonZeroU64::new(2).unwrap();
+        expected.source_state_digest = RuntimePendingDrainStateDigestV2::new(
+            Sha256::digest(&claimed.successor_state_bytes).into(),
+        )
+        .unwrap();
+        expected.prior_claim_terminal_digest =
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        expected
     }
 
     fn source(
@@ -935,7 +1017,7 @@ mod tests {
         let transition = RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2::build(
             persisted,
             RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2 {
-                acknowledgement_observation_sequence: NonZeroU64::new(20).unwrap(),
+                acknowledgement_observation_sequence: NonZeroU64::new(21).unwrap(),
                 certification,
                 acknowledged_at: at(101),
                 recovery_witness: closed_recovery_route_witness_v2(&provenance_expectation(
@@ -965,7 +1047,10 @@ mod tests {
         let evidence = expected_evidence();
         assert!(validate_pending_drain_claimed_projection_v2(
             projection,
-            &expectation(&owner, &evidence)
+            &expectation(&owner, &evidence),
+            at(100),
+            at(102),
+            at(103),
         )
         .is_err());
     }
@@ -973,32 +1058,60 @@ mod tests {
     fn assert_acknowledged_fails(projection: &RuntimePendingDrainProgressedProjectionV2) {
         let owner = owner();
         let evidence = expected_evidence();
-        let mut expected = expectation(&owner, &evidence);
-        expected.selection_authority_revision = 5;
-        expected.action_authority_revision = 6;
-        expected.prior_claim_terminal_digest =
-            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
-        assert!(validate_pending_drain_acknowledged_projection_v2(projection, &expected).is_err());
+        let expected = acknowledgement_expectation(&owner, &evidence);
+        assert!(validate_pending_drain_acknowledged_projection_v2(
+            projection,
+            &expected,
+            at(100),
+            at(102),
+            at(103),
+        )
+        .is_err());
     }
 
     #[test]
-    fn claimed_projection_reconstructs_exact_roots_claim_and_fence_transition() {
+    fn claimed_projection_accepts_distinct_transition_action_and_record_clocks() {
         let projection = claimed_projection();
         let owner = owner();
         let evidence = expected_evidence();
-        validate_pending_drain_claimed_projection_v2(&projection, &expectation(&owner, &evidence))
-            .unwrap();
+        validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &expectation(&owner, &evidence),
+            at(100),
+            at(102),
+            at(103),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn transitioned_at_must_stay_inside_the_authorized_action_window() {
+        let projection = claimed_projection();
+        let owner = owner();
+        let evidence = expected_evidence();
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &expectation(&owner, &evidence),
+            at(102),
+            at(103),
+            at(104),
+        )
+        .is_err());
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &expectation(&owner, &evidence),
+            at(100),
+            at(100),
+            at(103),
+        )
+        .is_err());
     }
 
     #[test]
     fn acknowledged_projection_uses_each_actual_certification_variant() {
         let owner = owner();
         let evidence = expected_evidence();
-        let mut expected = expectation(&owner, &evidence);
-        expected.selection_authority_revision = 5;
-        expected.action_authority_revision = 6;
-        expected.prior_claim_terminal_digest =
-            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let expected = acknowledgement_expectation(&owner, &evidence);
         for certification in [
             RuntimeDrainCertificationResolutionV2::no_operation_reserved(),
             RuntimeDrainCertificationResolutionV2::no_attestation_for_reserved_operation(
@@ -1010,6 +1123,9 @@ mod tests {
             validate_pending_drain_acknowledged_projection_v2(
                 &acknowledged_projection(certification),
                 &expected,
+                at(100),
+                at(102),
+                at(103),
             )
             .unwrap();
         }
@@ -1032,6 +1148,39 @@ mod tests {
         let mut successor = claimed_projection();
         successor.successor_state_bytes[0] ^= 1;
         assert_claimed_fails(&successor);
+
+        let projection = claimed_projection();
+        let owner = owner();
+        let evidence = expected_evidence();
+        let mut candidate = expectation(&owner, &evidence);
+        candidate.candidate = RuntimePendingDrainCandidateV2::new(
+            RuntimeDrainIntentIdV2::parse("11112222333344445555666677778888").unwrap(),
+            candidate.candidate.slot().clone(),
+            candidate.candidate.expected_target().clone(),
+            candidate.candidate.source_intent_revision(),
+            candidate.candidate.source_state_digest().clone(),
+        )
+        .unwrap();
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &candidate,
+            at(100),
+            at(102),
+            at(103),
+        )
+        .is_err());
+
+        let mut expected_source = expectation(&owner, &evidence);
+        expected_source.source_state_digest =
+            RuntimePendingDrainStateDigestV2::new([9; 32]).unwrap();
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &expected_source,
+            at(100),
+            at(102),
+            at(103),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1055,7 +1204,7 @@ mod tests {
         assert_claimed_fails(&snapshot_tamper);
 
         let mut transitioned_at = claimed_projection();
-        transitioned_at.product_root.transitioned_at = at(102);
+        transitioned_at.product_root.transitioned_at = at(104);
         assert_claimed_fails(&transitioned_at);
     }
 
@@ -1066,19 +1215,34 @@ mod tests {
         let evidence = expected_evidence();
         let mut wrong_seal = expectation(&owner, &evidence);
         wrong_seal.seal.seal_generation = 13;
-        assert!(validate_pending_drain_claimed_projection_v2(&projection, &wrong_seal).is_err());
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &wrong_seal,
+            at(100),
+            at(102),
+            at(103),
+        )
+        .is_err());
 
         let mut wrong_observation = expectation(&owner, &evidence);
         wrong_observation.seal.post_slot_observation_sequence = 2;
-        assert!(
-            validate_pending_drain_claimed_projection_v2(&projection, &wrong_observation).is_err()
-        );
+        assert!(validate_pending_drain_claimed_projection_v2(
+            &projection,
+            &wrong_observation,
+            at(100),
+            at(102),
+            at(103),
+        )
+        .is_err());
 
         let mut wrong_evidence = expected_evidence();
         wrong_evidence.registry_observation_sequence = 21;
         assert!(validate_pending_drain_claimed_projection_v2(
             &projection,
-            &expectation(&owner, &wrong_evidence)
+            &expectation(&owner, &wrong_evidence),
+            at(100),
+            at(102),
+            at(103),
         )
         .is_err());
     }

@@ -18,7 +18,7 @@ const PREVIOUS_READINESS_DIGEST: &str =
 const CURRENT_READINESS_DIGEST: &str =
     "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
 const LATEST_READINESS_DIGEST: &str =
-    "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
+    "de739460f2c86c2016cbc91aa47a625fbced903cc93722de80a33c93c7b54932";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION

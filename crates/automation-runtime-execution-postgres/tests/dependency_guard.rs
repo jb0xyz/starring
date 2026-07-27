@@ -212,6 +212,10 @@ fn adapter_exposes_only_approved_runtime_ports() {
         "impl RuntimeCertificationReservationPortV2",
         "impl RuntimeStartupRecoveryObservationPortV2",
         "impl RuntimeStartupRecoveryExecutionPortV2",
+        "impl RuntimePendingDrainSelectionPortV2",
+        "impl RuntimePendingDrainNoCandidateRecorderPortV2",
+        "impl RuntimePendingDrainClaimExecutionPortV2",
+        "impl RuntimePendingDrainAcknowledgementExecutionPortV2",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -231,6 +235,11 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
     assert!(
         source.contains("public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2")
     );
+    assert!(source.contains("public.starring_runtime_startup_recovery_select_pending_drain_v2"));
+    assert!(
+        source.contains("public.starring_runtime_startup_recovery_record_pending_drain_none_v2")
+    );
+    assert!(source.contains("public.starring_runtime_startup_recovery_execute_pending_drain_v2"));
     for forbidden in [
         "starring_runtime_private_v2",
         "starring_runtime_startup_recovery_action_record_v2",
@@ -252,7 +261,7 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        18
+        22
     );
 }
 
