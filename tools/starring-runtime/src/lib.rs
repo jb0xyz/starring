@@ -55,6 +55,8 @@ pub use process::{
     RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2,
     RuntimeProcessRecoveryReadinessTransitionFailureV2,
+    RuntimeProcessStartupRecoveryObservationErrorV2,
+    RuntimeProcessStartupRecoveryObservationFailureV2,
     RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
     RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
 };

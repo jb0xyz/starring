@@ -20,6 +20,8 @@ use crate::{
 
 mod closed;
 pub(crate) mod connected;
+#[cfg_attr(test, allow(dead_code))]
+mod observation;
 mod owner;
 mod readiness;
 mod recovery;
@@ -28,6 +30,10 @@ pub use closed::{
     RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
     RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
     RuntimeProcessClosedRecoveryTransitionFailureV2, RuntimeProcessGatewayOwnerCommitFailureV2,
+};
+pub use observation::{
+    RuntimeProcessStartupRecoveryObservationErrorV2,
+    RuntimeProcessStartupRecoveryObservationFailureV2,
 };
 pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{

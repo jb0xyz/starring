@@ -27,6 +27,7 @@ use crate::registry::{
 };
 
 #[path = "startup_recovery_observation.rs"]
+#[cfg_attr(test, allow(dead_code))]
 mod startup_recovery_observation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -100,7 +101,7 @@ pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
     registry: RuntimeRegistryEmptyRecoveryBindingV2,
     operation_cutoff: Instant,
-    iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
+    iteration: Option<RuntimeAuthorizedStartupRecoveryIterationV2>,
 }
 
 enum RuntimeClosedRecoveryReadinessStateV2 {
@@ -390,7 +391,7 @@ impl RuntimeClosedRecoverySessionV2 {
                     gateway,
                     registry,
                     operation_cutoff,
-                    iteration,
+                    iteration: Some(iteration),
                 })
             }
             readiness => Err(Box::new(Self {
@@ -406,6 +407,11 @@ impl RuntimeClosedRecoverySessionV2 {
 
 impl RuntimeClosedRecoveryReadyIterationV2 {
     pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+        if self.iteration.is_none() {
+            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
         revalidate_committed_recovery_v2(
             &self.owner,
             &self.gateway,
@@ -414,16 +420,26 @@ impl RuntimeClosedRecoveryReadyIterationV2 {
         )
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn owner_terminal_status_v2(
         &self,
     ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         self.owner.terminal_status_v2()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn owner_safety_deadline_v2(&self) -> Instant {
         self.owner.observation().safety_deadline()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn owner_terminal_observation_v2(
+        &self,
+    ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
+        self.owner.terminal_observation_v2()
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) async fn abort_and_shutdown_until_v2(
         self,
         cleanup_deadline: Instant,
@@ -451,6 +467,37 @@ impl RuntimeClosedRecoveryFixedPointV2 {
             &self.registry,
             self.operation_cutoff,
         )
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn owner_terminal_status_v2(
+        &self,
+    ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.owner.terminal_status_v2()
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn owner_safety_deadline_v2(&self) -> Instant {
+        self.owner.observation().safety_deadline()
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            proof,
+        } = self;
+        drop((gateway, registry, operation_cutoff, proof));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 
     #[cfg(test)]
@@ -681,8 +728,12 @@ fn bind_initial_empty_recovery_v2(
     Ok((gateway, registry))
 }
 
-#[cfg(test)]
-pub(crate) use startup_recovery_observation::RuntimeClosedRecoveryStartupObservationErrorV2;
+pub(crate) use startup_recovery_observation::{
+    RuntimeClosedRecoveryStartupObservationAttemptErrorV2,
+    RuntimeClosedRecoveryStartupObservationCleanupV2,
+    RuntimeClosedRecoveryStartupObservationCompletionV2,
+    RuntimeClosedRecoveryStartupObservationErrorV2,
+};
 
 #[cfg(test)]
 impl RuntimeClosedRecoveryPendingPhaseV2 {
@@ -779,5 +830,13 @@ impl RuntimeClosedRecoverySessionV2 {
     {
         self.refresh_iteration_readiness_in_place_with_v2(|_| verification, post_refresh)
             .await
+    }
+}
+
+#[cfg(test)]
+impl RuntimeClosedRecoveryReadyIterationV2 {
+    pub(crate) fn with_operation_cutoff_for_test_v2(mut self, operation_cutoff: Instant) -> Self {
+        self.operation_cutoff = operation_cutoff;
+        self
     }
 }

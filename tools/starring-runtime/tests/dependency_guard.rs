@@ -504,6 +504,8 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/main.rs",
             "src/process/closed.rs",
             "src/process/connected.rs",
+            "src/process/observation.rs",
+            "src/process/observation_tests.rs",
             "src/process/owner.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
@@ -657,6 +659,8 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/discord.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
+            && path != Path::new("src/process/observation.rs")
+            && path != Path::new("src/process/observation_tests.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
             && path != Path::new("src/process_startup.rs")
@@ -878,6 +882,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_worker";
             let allowed_recovery_process = path == Path::new("src/process/recovery.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_observation_process = path == Path::new("src/process/observation.rs")
+                && identifier == "automation_runtime_worker";
+            let allowed_observation_process_tests = path
+                == Path::new("src/process/observation_tests.rs")
+                && identifier == "automation_runtime_worker";
             let allowed_process_identity = path == Path::new("src/process_identity.rs")
                 && identifier == "automation_runtime_convergence";
             let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
@@ -894,6 +903,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_process_foundation
                         || allowed_paused_connected
                         || allowed_recovery_process
+                        || allowed_observation_process
+                        || allowed_observation_process_tests
                         || allowed_process_identity
                         || allowed_controller_identity
                         || allowed_recovery_identity
@@ -1886,9 +1897,9 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
     }
     assert!(process.contains(concat!(
         "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2 {\n",
-        "    discord: RuntimeDiscordGatewaySupervisorV1,\n",
-        "    foundation: RuntimeProcessFoundationV1,\n",
-        "    iteration: RuntimeClosedRecoveryReadyIterationV2,\n",
+        "    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,\n",
+        "    pub(super) foundation: RuntimeProcessFoundationV1,\n",
+        "    pub(super) iteration: RuntimeClosedRecoveryReadyIterationV2,\n",
         "}"
     )));
     assert!(closed_process.contains(concat!(
@@ -2410,7 +2421,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
         "    operation_cutoff: Instant,\n",
-        "    iteration: RuntimeAuthorizedStartupRecoveryIterationV2,\n",
+        "    iteration: Option<RuntimeAuthorizedStartupRecoveryIterationV2>,\n",
         "}"
     )));
     assert!(production.contains(concat!(
@@ -2781,6 +2792,145 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
 }
 
 #[test]
+fn startup_recovery_observation_process_is_single_use_interruptible_and_fail_closed() {
+    let process = include_str!("../src/process/observation.rs");
+    let process_tests = include_str!("../src/process/observation_tests.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub enum RuntimeProcessStartupRecoveryObservationFailureV2",
+        "pub enum RuntimeProcessStartupRecoveryObservationErrorV2",
+        "RuntimeProcessStartupRecoveryObservationErrorV2(<redacted>)",
+        "pub(crate) enum RuntimeStartupRecoveryObservationProcessOutcomeV2",
+        "Continue(RuntimeStartupRecoveryContinueProcessV2)",
+        "FixedPoint(RuntimeStartupRecoveryFixedPointProcessV2)",
+        "pub(crate) struct RuntimeStartupRecoveryObservedProcessV2",
+        "trait RuntimeStartupRecoveryObservationProcessStepV2<P>",
+        "async fn observe_startup_recovery_process_step_v2<R, P>(",
+        "fn finalize_startup_recovery_process_step_v2<",
+        "pub(crate) async fn observe_startup_recovery_once_v2<P>(",
+        "P: RuntimeStartupRecoveryObservationPortV2 + Sync",
+        "iteration.owner_terminal_observation_v2()",
+        "discord.wait_terminal().await.exit()",
+        "await_startup_recovery_observation_interrupt_v2(",
+        ".observe_startup_recovery_interruptible_in_place_v2(observer, interrupt)",
+        "pub(crate) fn into_startup_recovery_observation_outcome_v2(",
+        "cleanup_after_startup_recovery_observation_failure_v2(",
+        "current_typed_observation_outcome_transition_v2(",
+        "shutdown_startup_observation_process_v2(",
+        "sequence_startup_observation_cleanup_v2(",
+        "finish_observation_transition_v2(",
+        "finish_runtime_owner_held_process_shutdown_v1,",
+        "finish_paused_connected_shutdown_v1,",
+        "#[path = \"observation_tests.rs\"]",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    for required_test in [
+        "generic_process_flow_finalizes_and_shuts_down_both_typed_outcomes",
+        "generic_process_failures_retain_cleanup_for_deadline_observer_and_state_change",
+        "generic_process_interrupts_drop_the_observer_and_preserve_cleanup",
+        "generic_process_future_drop_preserves_resource_and_cleanup_authority",
+        "generic_finalize_retains_each_authority_shape_for_ordered_cleanup",
+    ] {
+        assert!(process_tests.contains(required_test), "{required_test}");
+        assert!(!process.contains(required_test), "{required_test}");
+    }
+    assert_eq!(
+        process
+            .matches(".observe_startup_recovery_interruptible_in_place_v2(observer, interrupt)")
+            .count(),
+        1
+    );
+    let production_transition = braced_declaration(
+        process,
+        "pub(crate) async fn observe_startup_recovery_once_v2<P>(",
+    );
+    let signature = production_transition.split("where").next().unwrap();
+    assert!(signature.contains("&mut self"));
+    assert!(production_transition
+        .contains("observe_startup_recovery_process_step_v2(self, observer).await"));
+    let transition = braced_declaration(
+        process,
+        "async fn observe_startup_recovery_process_step_v2<R, P>(",
+    );
+    let currentness = transition
+        .match_indices("resource.current_failure_v2()")
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    assert_eq!(currentness.len(), 2);
+    let observe = transition
+        .find("resource.observe_once_v2(observer).await?")
+        .unwrap();
+    assert!(currentness[0] < observe && observe < currentness[1]);
+    let concrete = braced_declaration(
+        process,
+        "impl<P> RuntimeStartupRecoveryObservationProcessStepV2<P>",
+    );
+    let owner_terminal = concrete
+        .find("iteration.owner_terminal_observation_v2()")
+        .unwrap();
+    let concrete_observe = concrete
+        .find(".observe_startup_recovery_interruptible_in_place_v2(observer, interrupt)")
+        .unwrap();
+    assert!(owner_terminal < concrete_observe);
+    let finalize = braced_declaration(
+        process,
+        "pub(crate) fn into_startup_recovery_observation_outcome_v2(",
+    );
+    assert!(!finalize.contains(".await"));
+    assert!(finalize.contains("finalize_startup_recovery_process_step_v2("));
+    let finalization = braced_declaration(process, "fn finalize_startup_recovery_process_step_v2<");
+    let current_resource = finalization.find("current_resource(&resource)").unwrap();
+    let finalize_resource = finalization.find("finalize(resource, observed)?").unwrap();
+    let current_outcome = finalization.find("current_outcome(&outcome)").unwrap();
+    assert!(current_resource < finalize_resource && finalize_resource < current_outcome);
+    let cleanup = braced_declaration(process, "async fn sequence_startup_observation_cleanup_v2<");
+    let discord_cleanup = cleanup.find("start_discord().await").unwrap();
+    let owner_cleanup = cleanup.find("start_owner().await").unwrap();
+    let database_cleanup = cleanup.find("start_database().await").unwrap();
+    let finish_cleanup = cleanup
+        .find("finish(discord, finish_owner_held(owner, database))")
+        .unwrap();
+    assert!(
+        discord_cleanup < owner_cleanup
+            && owner_cleanup < database_cleanup
+            && database_cleanup < finish_cleanup
+    );
+    for declaration in [
+        "impl RuntimeStartupRecoveryContinueProcessV2",
+        "impl RuntimeStartupRecoveryFixedPointProcessV2",
+    ] {
+        let typed_process = braced_declaration(process, declaration);
+        assert!(typed_process.contains("pub(crate) async fn shutdown(self)"));
+        assert!(typed_process.contains("shutdown_startup_observation_process_v2("));
+    }
+    assert!(!startup.contains("observe_startup_recovery_once_v2"));
+    assert!(library.contains("RuntimeProcessStartupRecoveryObservationErrorV2"));
+    assert!(library.contains("RuntimeProcessStartupRecoveryObservationFailureV2"));
+    for private in [
+        "RuntimeStartupRecoveryObservationProcessOutcomeV2",
+        "RuntimeStartupRecoveryContinueProcessV2",
+        "RuntimeStartupRecoveryFixedPointProcessV2",
+        "RuntimeStartupRecoveryObservedProcessV2",
+        "RuntimeStartupRecoveryObservationFinalizeFailureV2",
+    ] {
+        assert!(!library.contains(private), "{private}");
+    }
+    for forbidden in [
+        "activate",
+        "deploy",
+        "open_admission",
+        "sqlx",
+        "PgPool",
+        "PostgresRuntime",
+    ] {
+        assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+}
+
+#[test]
 fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authorizing() {
     let sources = source_files();
     let observation = sources
@@ -2801,14 +2951,20 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
 
     for required in [
         "pub(crate) enum RuntimeClosedRecoveryStartupObservationErrorV2<E>",
+        "pub(crate) enum RuntimeClosedRecoveryStartupObservationAttemptErrorV2<E, I>",
+        "pub(crate) struct RuntimeClosedRecoveryStartupObservationFailureV2<E, I>",
+        "pub(crate) struct RuntimeClosedRecoveryStartupObservationCompletionV2",
         "pub(crate) async fn observe_startup_recovery_v2<P>(",
         "async fn observe_startup_recovery_with_v2<",
+        "async fn observe_startup_recovery_interruptible_in_place_with_v2<",
+        "pub(crate) fn into_startup_recovery_observation_outcome_v2(",
+        "fn finalize_startup_recovery_observation_with_v2<",
         ".operation_cutoff",
         ".min(self.owner.observation().safety_deadline())",
-        ".begin_startup_recovery_observation_v2(&owner, iteration)",
+        ".begin_startup_recovery_observation_v2(&self.owner, iteration)",
         "biased;",
         "sleep_until(TokioInstant::from_std(observation_cutoff))",
-        "result = observe(authorization, observation_cutoff)",
+        "let observed = observe(authorization, observation_cutoff)",
         ".invalidate_capability_not_ready_v2()",
         ".into_startup_recovery_observation_successor_v2(&owner, completed)",
         ".validate_startup_recovery_fixed_point_v2(&owner, &proof)",
@@ -2839,39 +2995,59 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
             .count(),
         10
     );
-    let inner = braced_declaration(observation, "async fn observe_startup_recovery_with_v2<");
-    let initial_revalidation = inner.find("self.revalidate_v2()").unwrap();
-    let cutoff = inner.find("let observation_cutoff").unwrap();
-    let begin = inner
-        .find(".begin_startup_recovery_observation_v2(&owner, iteration)")
+    let wrapper = braced_declaration(observation, "async fn observe_startup_recovery_with_v2<");
+    assert!(wrapper.contains("observe_startup_recovery_interruptible_in_place_with_v2("));
+    assert!(wrapper.contains("finalize_startup_recovery_observation_with_v2("));
+    assert!(wrapper.contains("std::future::pending::<std::convert::Infallible>()"));
+    let observation_stage = braced_declaration(
+        observation,
+        "async fn observe_startup_recovery_interruptible_in_place_with_v2<",
+    );
+    let initial_revalidation = observation_stage.find("self.revalidate_v2()").unwrap();
+    let cutoff = observation_stage.find("let observation_cutoff").unwrap();
+    let take_iteration = observation_stage.find("self.iteration.take()").unwrap();
+    let begin = observation_stage
+        .find(".begin_startup_recovery_observation_v2(&self.owner, iteration)")
         .unwrap();
-    let await_observation = inner
-        .find("result = observe(authorization, observation_cutoff)")
+    let await_observation = observation_stage
+        .find("let observed = observe(authorization, observation_cutoff)")
         .unwrap();
-    let revalidations = inner
+    let stage_revalidation = observation_stage
+        .rfind("revalidate_committed_recovery_v2(")
+        .unwrap();
+    assert!(
+        initial_revalidation < cutoff
+            && cutoff < take_iteration
+            && take_iteration < begin
+            && begin < await_observation
+            && await_observation < stage_revalidation
+    );
+    let finalize = braced_declaration(
+        observation,
+        "fn finalize_startup_recovery_observation_with_v2<",
+    );
+    let revalidations = finalize
         .match_indices("revalidate_committed_recovery_v2(")
         .map(|(position, _)| position)
         .collect::<Vec<_>>();
     assert_eq!(revalidations.len(), 3);
-    let successor = inner
+    let successor = finalize
         .find(".into_startup_recovery_observation_successor_v2(&owner, completed)")
         .unwrap();
-    let post_complete = inner.find("post_complete();").unwrap();
-    let post_revalidate = inner.rfind("post_revalidate();").unwrap();
-    let outcome = inner.find("match outcome").unwrap();
-    let fixed_validation = inner
+    let post_complete = finalize.find("post_complete();").unwrap();
+    let post_revalidate = finalize.rfind("post_revalidate();").unwrap();
+    let outcome = finalize.find("match outcome").unwrap();
+    let fixed_validation = finalize
         .find(".validate_startup_recovery_fixed_point_v2(&owner, &proof)")
         .unwrap();
-    let fixed_construction = inner
+    let fixed_construction = finalize
         .find("let fixed_point = RuntimeClosedRecoveryFixedPointV2")
         .unwrap();
-    let fixed_revalidation = inner
-        .find("fixed_point\n                    .revalidate_v2()")
+    let fixed_revalidation = finalize
+        .find("if let Err(error) = fixed_point.revalidate_v2()")
         .unwrap();
-    assert!(initial_revalidation < cutoff && cutoff < begin && begin < await_observation);
     assert!(
-        await_observation < revalidations[0]
-            && revalidations[0] < successor
+        revalidations[0] < successor
             && successor < post_complete
             && post_complete < revalidations[1]
             && revalidations[1] < post_revalidate

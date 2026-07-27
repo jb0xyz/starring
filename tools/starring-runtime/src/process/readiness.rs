@@ -211,9 +211,9 @@ impl Debug for RuntimeRecoveryIterationReadyProcessShutdownErrorV2 {
 }
 
 pub(crate) struct RuntimeRecoveryIterationReadyProcessV2 {
-    discord: RuntimeDiscordGatewaySupervisorV1,
-    foundation: RuntimeProcessFoundationV1,
-    iteration: RuntimeClosedRecoveryReadyIterationV2,
+    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,
+    pub(super) foundation: RuntimeProcessFoundationV1,
+    pub(super) iteration: RuntimeClosedRecoveryReadyIterationV2,
 }
 
 impl RuntimeClosedRecoveryProcessV2 {
