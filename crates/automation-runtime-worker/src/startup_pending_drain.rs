@@ -265,6 +265,36 @@ pub trait RuntimePendingDrainSelectionPortV2 {
     ) -> impl Future<Output = Result<RuntimePendingDrainSelectionReceiptV2, Self::Error>> + Send;
 }
 
+pub trait RuntimePendingDrainNoCandidateRecorderPortV2 {
+    type Error;
+
+    fn record_pending_drain_no_candidate(
+        &self,
+        selection: &RuntimeSelectedPendingDrainNoCandidateV2,
+        operation_cutoff: Instant,
+    ) -> impl Future<Output = Result<RuntimePendingDrainNoCandidateReceiptV2, Self::Error>> + Send;
+}
+
+pub trait RuntimePendingDrainClaimExecutionPortV2 {
+    type Error;
+
+    fn execute_pending_drain_claim(
+        &self,
+        authorization: &RuntimeAuthorizedPendingDrainClaimV2,
+        operation_cutoff: Instant,
+    ) -> impl Future<Output = Result<RuntimePendingDrainClaimReceiptV2, Self::Error>> + Send;
+}
+
+pub trait RuntimePendingDrainAcknowledgementExecutionPortV2 {
+    type Error;
+
+    fn execute_pending_drain_acknowledgement(
+        &self,
+        authorization: &RuntimeAuthorizedPendingDrainAcknowledgementV2,
+        operation_cutoff: Instant,
+    ) -> impl Future<Output = Result<RuntimePendingDrainAcknowledgementReceiptV2, Self::Error>> + Send;
+}
+
 pub struct RuntimeAuthorizedPendingDrainSelectionV2 {
     authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,
     acknowledgement_action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,

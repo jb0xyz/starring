@@ -1259,6 +1259,53 @@ fn pending_drain_compound_authority_is_linear_and_registry_rollover_gated() {
         .find("self.authorization.complete_pending_drain(")
         .unwrap();
     assert!(seal_access < consume && consume < validation && validation < completion);
+
+    for (port_name, method, authority, receipt) in [
+        (
+            "RuntimePendingDrainNoCandidateRecorderPortV2",
+            "record_pending_drain_no_candidate",
+            "RuntimeSelectedPendingDrainNoCandidateV2",
+            "RuntimePendingDrainNoCandidateReceiptV2",
+        ),
+        (
+            "RuntimePendingDrainClaimExecutionPortV2",
+            "execute_pending_drain_claim",
+            "RuntimeAuthorizedPendingDrainClaimV2",
+            "RuntimePendingDrainClaimReceiptV2",
+        ),
+        (
+            "RuntimePendingDrainAcknowledgementExecutionPortV2",
+            "execute_pending_drain_acknowledgement",
+            "RuntimeAuthorizedPendingDrainAcknowledgementV2",
+            "RuntimePendingDrainAcknowledgementReceiptV2",
+        ),
+    ] {
+        let port = source
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert_eq!(port.matches(&format!("fn {method}(")).count(), 1);
+        assert!(port.contains(&format!("&{authority}")));
+        assert!(port.contains("operation_cutoff: Instant"));
+        assert!(port.contains(&format!("Result<{receipt}, Self::Error>")));
+        assert!(port.contains("impl Future"));
+        assert!(port.contains("+ Send"));
+        for forbidden in [
+            "RuntimeClosedRecoveryOperationAuthorityV2",
+            "RuntimeAuthorizedStartupRecoveryExecutionV2",
+            "RuntimeCompletedStartupRecoveryExecutionV2",
+            "RuntimeDurablyAcknowledgedPendingDrainV2",
+            "deploy",
+            "activate",
+            "admission",
+            "Discord",
+            "sqlx",
+            "twilight",
+        ] {
+            assert!(!port.contains(forbidden), "{port_name}: {forbidden}");
+        }
+    }
 }
 
 #[test]
