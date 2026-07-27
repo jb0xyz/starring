@@ -51,6 +51,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/capability_readiness.rs"),
+            PathBuf::from("src/certification_reservation.rs"),
             PathBuf::from("src/closed_recovery.rs"),
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_lifecycle_tests.rs"),
@@ -139,6 +140,48 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             );
         }
     }
+}
+
+#[test]
+fn certification_reservation_port_is_pure_checked_and_non_authorizing() {
+    let source = include_str!("../src/certification_reservation.rs");
+    let port = source
+        .split("pub trait RuntimeCertificationReservationPortV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+
+    for expected in [
+        "type Error;",
+        "reservation: RuntimeReservedCertificationIntentV2,",
+        "Result<RuntimeCertificationIntentReservationOutcomeV2, Self::Error>",
+        "lookup: RuntimeCertificationReservationScopeLookupV2,",
+        "Result<RuntimeCertificationReservationScopeObservationV2, Self::Error>",
+    ] {
+        assert!(port.contains(expected), "{expected}");
+    }
+    for forbidden in [
+        "RuntimeCertificationOperationIdV2",
+        "RuntimeCanonicalCertificationIntentV2",
+        "RuntimeCertificationIntentV2",
+        "RuntimeExecutionReceiptV1",
+        "authorize",
+        "commit",
+        "prepare",
+        "reset",
+        "consume",
+        "generate",
+        "new_id",
+    ] {
+        assert!(!port.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(port.matches("fn ").count(), 2);
+    assert_eq!(port.matches("fn reserve_certification_intent(").count(), 1);
+    assert_eq!(
+        port.matches("fn observe_certification_reservation_scope(")
+            .count(),
+        1
+    );
 }
 
 #[test]

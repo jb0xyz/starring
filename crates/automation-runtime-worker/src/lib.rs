@@ -1,4 +1,5 @@
 mod capability_readiness;
+mod certification_reservation;
 mod closed_recovery;
 mod gateway_lifecycle;
 mod gateway_owner;
@@ -14,6 +15,7 @@ pub use capability_readiness::{
     RuntimeCapabilityReadinessErrorV2, RuntimeCapabilityReadinessKindV2,
     RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
 };
+pub use certification_reservation::RuntimeCertificationReservationPortV2;
 pub use closed_recovery::{
     RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryAuthorityRevisionV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
