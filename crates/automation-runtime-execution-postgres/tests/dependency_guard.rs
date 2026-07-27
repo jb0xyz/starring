@@ -222,6 +222,35 @@ fn adapter_exposes_only_approved_runtime_ports() {
 }
 
 #[test]
+fn startup_recovery_action_journal_has_no_executor_adapter_surface() {
+    let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let source = sources.join("\n");
+    for forbidden in [
+        "RuntimeStartupRecoveryExecutionPortV2",
+        "starring_runtime_startup_recovery_action_record_v2",
+        "runtime_startup_recovery_actions_v2",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden surface: {forbidden}"
+        );
+    }
+    let contract = include_str!("../src/contract.rs");
+    assert_eq!(
+        contract
+            .split("pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1")
+            .nth(1)
+            .unwrap()
+            .split("];")
+            .next()
+            .unwrap()
+            .matches("public.starring_runtime_")
+            .count(),
+        16
+    );
+}
+
+#[test]
 fn startup_recovery_observation_is_atomic_bounded_and_fail_closed() {
     let adapter = include_str!("../src/startup_recovery/mod.rs");
     let query = include_str!("../src/startup_recovery/query.rs");
