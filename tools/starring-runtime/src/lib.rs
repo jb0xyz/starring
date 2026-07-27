@@ -52,7 +52,10 @@ pub use process::{
     RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
     RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
-    RuntimeProcessRecoveryPendingTransitionFailureV2,
+    RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,
+    RuntimeProcessRecoveryReadinessTransitionErrorV2,
+    RuntimeProcessRecoveryReadinessTransitionFailureV2,
+    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
     RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
 };
 pub use process_identity::RuntimeProcessInstanceIdGenerationErrorV1;

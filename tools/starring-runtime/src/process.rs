@@ -21,6 +21,7 @@ use crate::{
 mod closed;
 pub(crate) mod connected;
 mod owner;
+mod readiness;
 mod recovery;
 
 pub use closed::{
@@ -32,6 +33,11 @@ pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
     RuntimeProcessGatewayOwnerTransitionErrorV1,
+};
+pub use readiness::{
+    RuntimeProcessRecoveryReadinessFailureV2, RuntimeProcessRecoveryReadinessTransitionErrorV2,
+    RuntimeProcessRecoveryReadinessTransitionFailureV2,
+    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
 };
 pub use recovery::{
     RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessGatewayOwnerPrepareFailureV2,

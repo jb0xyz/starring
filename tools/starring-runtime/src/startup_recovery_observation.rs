@@ -164,6 +164,7 @@ impl RuntimeClosedRecoveryReadyIterationV2 {
                         gateway,
                         registry,
                         operation_cutoff,
+                        readiness: super::RuntimeClosedRecoveryReadinessStateV2::Available,
                     },
                     continuation,
                 })

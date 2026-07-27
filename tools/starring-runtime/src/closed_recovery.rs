@@ -92,6 +92,7 @@ pub(crate) struct RuntimeClosedRecoverySessionV2 {
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
     registry: RuntimeRegistryEmptyRecoveryBindingV2,
     operation_cutoff: Instant,
+    readiness: RuntimeClosedRecoveryReadinessStateV2,
 }
 
 pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {
@@ -100,6 +101,12 @@ pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {
     registry: RuntimeRegistryEmptyRecoveryBindingV2,
     operation_cutoff: Instant,
     iteration: RuntimeAuthorizedStartupRecoveryIterationV2,
+}
+
+enum RuntimeClosedRecoveryReadinessStateV2 {
+    Available,
+    Failed,
+    Ready(RuntimeAuthorizedStartupRecoveryIterationV2),
 }
 
 #[cfg_attr(
@@ -235,6 +242,7 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
             gateway,
             registry,
             operation_cutoff,
+            readiness: RuntimeClosedRecoveryReadinessStateV2::Available,
         })
     }
 }
@@ -272,36 +280,49 @@ impl RuntimeClosedRecoverySessionV2 {
             gateway,
             registry,
             operation_cutoff,
+            readiness,
         } = self;
-        drop((gateway, registry, operation_cutoff));
+        drop((gateway, registry, operation_cutoff, readiness));
         owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime fixed-point loop refreshes the committed iteration authority"
-        )
-    )]
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) async fn refresh_iteration_readiness_v2(
-        self,
+    pub(crate) fn readiness_cutoff_v2(&self) -> Instant {
+        self.operation_cutoff
+            .min(self.owner.observation().safety_deadline())
+    }
+
+    pub(crate) fn owner_safety_deadline_v2(&self) -> Instant {
+        self.owner.observation().safety_deadline()
+    }
+
+    pub(crate) fn owner_terminal_status_v2(
+        &self,
+    ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.owner.terminal_status_v2()
+    }
+
+    pub(crate) fn owner_terminal_observation_v2(
+        &self,
+    ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
+        self.owner.terminal_observation_v2()
+    }
+
+    pub(crate) async fn refresh_iteration_readiness_in_place_v2(
+        &mut self,
         databases: &RuntimeDatabaseDependenciesV1,
-    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
-    {
-        self.refresh_iteration_readiness_with_v2(
+    ) -> Result<(), RuntimeClosedRecoveryReadinessRefreshErrorV2> {
+        self.refresh_iteration_readiness_in_place_with_v2(
             |cutoff| databases.verify_readiness_refresh_until_v2(cutoff),
             || {},
         )
         .await
     }
 
-    async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(
-        self,
+    async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(
+        &mut self,
         verify: Verify,
         post_refresh: PostRefresh,
-    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    ) -> Result<(), RuntimeClosedRecoveryReadinessRefreshErrorV2>
     where
         Verify: FnOnce(Instant) -> Verification,
         Verification: Future<
@@ -309,10 +330,20 @@ impl RuntimeClosedRecoverySessionV2 {
         >,
         PostRefresh: FnOnce(),
     {
+        if !matches!(
+            std::mem::replace(
+                &mut self.readiness,
+                RuntimeClosedRecoveryReadinessStateV2::Failed,
+            ),
+            RuntimeClosedRecoveryReadinessStateV2::Available
+        ) {
+            self.gateway.invalidate_protocol_violation_v2();
+            return Err(RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
         self.revalidate_v2().map_err(map_commit_refresh_error_v2)?;
-        let verification_cutoff = self
-            .operation_cutoff
-            .min(self.owner.observation().safety_deadline());
+        let verification_cutoff = self.readiness_cutoff_v2();
         if Instant::now() >= verification_cutoff {
             return Err(RuntimeClosedRecoveryReadinessRefreshErrorV2::DeadlineElapsed);
         }
@@ -332,38 +363,83 @@ impl RuntimeClosedRecoverySessionV2 {
             return Err(RuntimeClosedRecoveryReadinessRefreshErrorV2::DeadlineElapsed);
         }
         self.revalidate_v2().map_err(map_commit_refresh_error_v2)?;
+        let iteration = self
+            .gateway
+            .refresh_readiness_in_place_v2(&self.owner, readiness.into_exact_capability_receipts())
+            .map_err(RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway)?;
+        post_refresh();
+        self.revalidate_v2().map_err(map_commit_refresh_error_v2)?;
+        self.readiness = RuntimeClosedRecoveryReadinessStateV2::Ready(iteration);
+        Ok(())
+    }
+
+    pub(crate) fn try_into_ready_iteration_v2(
+        self,
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, Box<Self>> {
         let Self {
             owner,
             gateway,
             registry,
             operation_cutoff,
+            readiness,
         } = self;
-        let (gateway, iteration) = gateway
-            .into_readiness_successor_v2(&owner, readiness.into_exact_capability_receipts())
-            .map_err(RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway)?;
-        post_refresh();
-        let iteration = RuntimeClosedRecoveryReadyIterationV2 {
-            owner,
-            gateway,
-            registry,
-            operation_cutoff,
-            iteration,
-        };
-        iteration
-            .revalidate_v2()
-            .map_err(map_commit_refresh_error_v2)?;
-        Ok(iteration)
+        match readiness {
+            RuntimeClosedRecoveryReadinessStateV2::Ready(iteration) => {
+                Ok(RuntimeClosedRecoveryReadyIterationV2 {
+                    owner,
+                    gateway,
+                    registry,
+                    operation_cutoff,
+                    iteration,
+                })
+            }
+            readiness => Err(Box::new(Self {
+                owner,
+                gateway,
+                registry,
+                operation_cutoff,
+                readiness,
+            })),
+        }
     }
 }
 
 impl RuntimeClosedRecoveryReadyIterationV2 {
-    fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+    pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
         revalidate_committed_recovery_v2(
             &self.owner,
             &self.gateway,
             &self.registry,
             self.operation_cutoff,
         )
+    }
+
+    pub(crate) fn owner_terminal_status_v2(
+        &self,
+    ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.owner.terminal_status_v2()
+    }
+
+    pub(crate) fn owner_safety_deadline_v2(&self) -> Instant {
+        self.owner.observation().safety_deadline()
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            iteration,
+        } = self;
+        drop((gateway, registry, operation_cutoff, iteration));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
     }
 }
 
@@ -642,6 +718,27 @@ impl RuntimeClosedRecoverySessionV2 {
         self
     }
 
+    async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(
+        mut self,
+        verify: Verify,
+        post_refresh: PostRefresh,
+    ) -> Result<RuntimeClosedRecoveryReadyIterationV2, RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    where
+        Verify: FnOnce(Instant) -> Verification,
+        Verification: Future<
+            Output = Result<RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseCompositionErrorV1>,
+        >,
+        PostRefresh: FnOnce(),
+    {
+        self.refresh_iteration_readiness_in_place_with_v2(verify, post_refresh)
+            .await?;
+        self.try_into_ready_iteration_v2().map_err(|_| {
+            RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            )
+        })
+    }
+
     pub(crate) async fn refresh_iteration_readiness_with_test_verifier_v2<Verify, Verification>(
         self,
         verify: Verify,
@@ -667,6 +764,20 @@ impl RuntimeClosedRecoverySessionV2 {
         >,
     {
         self.refresh_iteration_readiness_with_v2(|_| verification, post_refresh)
+            .await
+    }
+
+    pub(crate) async fn refresh_iteration_readiness_in_place_after_test_hook_v2<Verification>(
+        &mut self,
+        verification: Verification,
+        post_refresh: impl FnOnce(),
+    ) -> Result<(), RuntimeClosedRecoveryReadinessRefreshErrorV2>
+    where
+        Verification: Future<
+            Output = Result<RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseCompositionErrorV1>,
+        >,
+    {
+        self.refresh_iteration_readiness_in_place_with_v2(|_| verification, post_refresh)
             .await
     }
 }

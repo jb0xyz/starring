@@ -505,6 +505,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/closed.rs",
             "src/process/connected.rs",
             "src/process/owner.rs",
+            "src/process/readiness.rs",
             "src/process/recovery.rs",
             "src/process.rs",
             "src/process_identity.rs",
@@ -656,6 +657,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/discord.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
+            && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
@@ -1331,7 +1333,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
     for forbidden in [
         "resume_admission",
         "issue_ready_lease",
-        "readiness",
         "dispatch",
         "execute",
         "serve",
@@ -1348,6 +1349,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
             "startup: {forbidden}"
         );
     }
+    assert!(!contains_identifier(connected, "readiness"));
     assert!(!contains_identifier(connected, "recovery"));
     assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
     assert!(!library.contains("RuntimePausedConnectedProcessV1"));
@@ -1783,9 +1785,9 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
         }
     }
     for forbidden in [
-        "refresh_iteration_readiness_v2",
+        "refresh_iteration_readiness_in_place_v2",
         "observe_startup_recovery_v2",
-        "into_readiness_successor_v2",
+        "try_into_ready_iteration_v2",
         "begin_startup_recovery_observation_v2",
         "resume_admission",
         "issue_ready_lease",
@@ -1802,6 +1804,24 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
         "into_production",
     ] {
         assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "into_production",
+    ] {
         assert!(
             !contains_identifier(startup, forbidden),
             "startup: {forbidden}"
@@ -1813,14 +1833,368 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     );
     let pending = startup_stage.find(".into_recovery_pending_v2()").unwrap();
     let committed = startup_stage.find(".into_closed_recovery_v2()").unwrap();
-    let shutdown = startup_stage[committed..]
-        .find(".shutdown()")
-        .map(|offset| committed + offset)
+    let ready = startup_stage
+        .find(".into_recovery_iteration_ready_v2()")
         .unwrap();
-    assert!(pending < committed && committed < shutdown);
+    let shutdown = startup_stage[ready..]
+        .find(".shutdown()")
+        .map(|offset| ready + offset)
+        .unwrap();
+    assert!(pending < committed && committed < ready && ready < shutdown);
     assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
     assert!(!library.contains("RuntimeClosedRecoverySessionV2"));
     assert!(!library.contains("RuntimeGatewayOwnerClosedRecoverySupervisorV2"));
+}
+
+#[test]
+fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizing() {
+    let sources = source_files();
+    let process = source_before_test_module(include_str!("../src/process/readiness.rs"));
+    let closed_process = source_before_test_module(include_str!("../src/process/closed.rs"));
+    let closed = include_str!("../src/closed_recovery.rs");
+    let owner_supervisor = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub enum RuntimeProcessRecoveryReadinessFailureV2",
+        "pub enum RuntimeProcessRecoveryReadinessTransitionFailureV2",
+        "pub enum RuntimeProcessRecoveryReadinessTransitionErrorV2",
+        "pub enum RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
+        "RuntimeProcessRecoveryReadinessTransitionErrorV2(<redacted>)",
+        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2(<redacted>)",
+        "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2",
+        "discord: RuntimeDiscordGatewaySupervisorV1,",
+        "foundation: RuntimeProcessFoundationV1,",
+        "iteration: RuntimeClosedRecoveryReadyIterationV2,",
+        "pub(crate) async fn into_recovery_iteration_ready_v2(",
+        "require_current_closed_recovery_v2(",
+        "session.readiness_cutoff_v2()",
+        "session.owner_safety_deadline_v2()",
+        "session.owner_terminal_observation_v2()",
+        "session.refresh_iteration_readiness_in_place_v2(&foundation.databases)",
+        "await_recovery_readiness_refresh_v2(",
+        "session.try_into_ready_iteration_v2()",
+        "let iteration_validation = iteration",
+        "iteration.owner_terminal_status_v2()",
+        "iteration.owner_safety_deadline_v2()",
+        "shutdown_committed_recovery_v2(",
+        "shutdown_ready_recovery_v2(",
+        "RuntimeRecoveryIterationReadyProcessV2(<redacted>)",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    assert!(process.contains(concat!(
+        "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2 {\n",
+        "    discord: RuntimeDiscordGatewaySupervisorV1,\n",
+        "    foundation: RuntimeProcessFoundationV1,\n",
+        "    iteration: RuntimeClosedRecoveryReadyIterationV2,\n",
+        "}"
+    )));
+    assert!(closed_process.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoveryProcessV2 {\n",
+        "    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,\n",
+        "    pub(super) foundation: RuntimeProcessFoundationV1,\n",
+        "    pub(super) session: RuntimeClosedRecoverySessionV2,\n",
+        "}"
+    )));
+    let attributes = declaration_attribute_block(process, "RuntimeRecoveryIterationReadyProcessV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
+        assert!(!implements_trait(
+            process,
+            "RuntimeRecoveryIterationReadyProcessV2",
+            forbidden,
+        ));
+    }
+
+    let transition = braced_declaration(
+        process,
+        "pub(crate) async fn into_recovery_iteration_ready_v2(",
+    );
+    let preflight = transition
+        .find("require_current_closed_recovery_v2(")
+        .unwrap();
+    let cutoff = transition.find("session.readiness_cutoff_v2()").unwrap();
+    let owner_deadline = transition
+        .find("session.owner_safety_deadline_v2()")
+        .unwrap();
+    let owner_terminal = transition
+        .find("session.owner_terminal_observation_v2()")
+        .unwrap();
+    let refresh = transition
+        .find("session.refresh_iteration_readiness_in_place_v2(&foundation.databases)")
+        .unwrap();
+    let race = transition
+        .find("await_recovery_readiness_refresh_v2(")
+        .unwrap();
+    let failed_cleanup = transition[race..]
+        .find("shutdown_committed_recovery_v2(")
+        .map(|offset| race + offset)
+        .unwrap();
+    let conversion = transition
+        .find("session.try_into_ready_iteration_v2()")
+        .unwrap();
+    let retained_conversion_cleanup = transition[conversion..]
+        .find("shutdown_committed_recovery_v2(")
+        .map(|offset| conversion + offset)
+        .unwrap();
+    let final_revalidation = transition
+        .find("iteration\n            .revalidate_v2()")
+        .unwrap();
+    let final_discord = transition[final_revalidation..]
+        .find("discord_transition_failure_v1(&discord)")
+        .map(|offset| final_revalidation + offset)
+        .unwrap();
+    let final_owner = transition[final_discord..]
+        .find("iteration.owner_terminal_status_v2()")
+        .map(|offset| final_discord + offset)
+        .unwrap();
+    let final_budget = transition[final_owner..]
+        .find("foundation.startup_budget.operation_is_open()")
+        .map(|offset| final_owner + offset)
+        .unwrap();
+    let ready_cleanup = transition[final_budget..]
+        .find("shutdown_ready_recovery_v2(")
+        .map(|offset| final_budget + offset)
+        .unwrap();
+    let construct = transition
+        .find("Ok(RuntimeRecoveryIterationReadyProcessV2")
+        .unwrap();
+    assert!(
+        preflight < cutoff
+            && cutoff < owner_deadline
+            && owner_deadline < owner_terminal
+            && owner_terminal < refresh
+            && refresh < race
+            && race < failed_cleanup
+            && failed_cleanup < conversion
+            && conversion < retained_conversion_cleanup
+            && retained_conversion_cleanup < final_revalidation
+            && final_revalidation < final_discord
+            && final_discord < final_owner
+            && final_owner < final_budget
+            && final_budget < ready_cleanup
+            && ready_cleanup < construct
+    );
+    for operation in [
+        "session.readiness_cutoff_v2()",
+        "session.owner_terminal_observation_v2()",
+        "session.refresh_iteration_readiness_in_place_v2(&foundation.databases)",
+        "session.try_into_ready_iteration_v2()",
+    ] {
+        assert_eq!(transition.matches(operation).count(), 1, "{operation}");
+    }
+
+    let preflight = braced_declaration(process, "fn require_current_closed_recovery_v2(");
+    let initial_budget = preflight
+        .find("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    let initial_discord = preflight
+        .find("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let initial_owner = preflight
+        .find("session.owner_terminal_status_v2()")
+        .unwrap();
+    let compound = preflight.find("session\n        .revalidate_v2()").unwrap();
+    let final_owner = preflight
+        .rfind("session.owner_terminal_status_v2()")
+        .unwrap();
+    let final_discord = preflight
+        .rfind("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let final_budget = preflight
+        .rfind("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    assert!(
+        initial_budget < initial_discord
+            && initial_discord < initial_owner
+            && initial_owner < compound
+            && compound < final_owner
+            && final_owner < final_discord
+            && final_discord < final_budget
+    );
+    assert_eq!(
+        preflight
+            .matches("foundation.startup_budget.operation_is_open()")
+            .count(),
+        2
+    );
+    assert_eq!(
+        preflight
+            .matches("discord_transition_failure_v1(discord)")
+            .count(),
+        2
+    );
+    assert_eq!(
+        preflight
+            .matches("session.owner_terminal_status_v2()")
+            .count(),
+        2
+    );
+    assert_eq!(preflight.matches(".revalidate_v2()").count(), 1);
+
+    let race = braced_declaration(process, "async fn await_recovery_readiness_refresh_v2<");
+    let elapsed = race.find("Instant::now() >= readiness_cutoff").unwrap();
+    let biased = race.find("biased;").unwrap();
+    let deadline = race.find("sleep_until(").unwrap();
+    let discord = race.find("transition = &mut discord_terminal").unwrap();
+    let owner = race.find("() = &mut owner_terminal").unwrap();
+    let refresh = race.find("result = &mut refresh").unwrap();
+    assert!(
+        elapsed < biased
+            && biased < deadline
+            && deadline < discord
+            && discord < owner
+            && owner < refresh
+    );
+    assert_eq!(race.matches("tokio::select!").count(), 1);
+
+    let cleanup = braced_declaration(process, "async fn shutdown_ready_recovery_v2(");
+    let discord_drain = cleanup
+        .find("foundation.gateway.begin_discord_drain_v1()")
+        .unwrap();
+    let discord_deadline = cleanup
+        .find("foundation.startup_budget.discord_cleanup_deadline()")
+        .unwrap();
+    let owner_deadline = cleanup
+        .find("foundation.startup_budget.owner_cleanup_deadline()")
+        .unwrap();
+    let database = cleanup.find("foundation.shutdown().await").unwrap();
+    assert!(
+        discord_drain < discord_deadline
+            && discord_deadline < owner_deadline
+            && owner_deadline < database
+    );
+    let ready_impl = braced_declaration(closed, "impl RuntimeClosedRecoveryReadyIterationV2");
+    let ready_abort = braced_declaration(
+        ready_impl,
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+    );
+    let authority_drop = ready_abort
+        .find("drop((gateway, registry, operation_cutoff, iteration))")
+        .unwrap();
+    let owner_abort = ready_abort
+        .find("owner.abort_and_shutdown_until_v2(cleanup_deadline).await")
+        .unwrap();
+    assert!(authority_drop < owner_abort);
+
+    let owner_impl = braced_declaration(
+        owner_supervisor,
+        "impl RuntimeGatewayOwnerClosedRecoverySupervisorV2",
+    );
+    let terminal_observation =
+        braced_declaration(owner_impl, "pub(crate) fn terminal_observation_v2(");
+    let clone = terminal_observation
+        .find("let mut terminal = self.inner().terminal.clone()")
+        .unwrap();
+    let immediate = terminal_observation
+        .find("if let Some(exit) = *terminal.borrow()")
+        .unwrap();
+    let changed = terminal_observation
+        .find("terminal.changed().await")
+        .unwrap();
+    assert!(clone < immediate && immediate < changed);
+    assert_eq!(terminal_observation.matches(".await").count(), 1);
+    for forbidden in ["spawn", "send", "renew", "acquire", "release", "invalidate"] {
+        assert!(
+            !contains_identifier(terminal_observation, forbidden),
+            "terminal observation: {forbidden}"
+        );
+    }
+
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "observe_startup_recovery_with_v2",
+        "observe_startup_recovery",
+        "begin_startup_recovery_observation_v2",
+        "into_startup_recovery_observation_successor_v2",
+        "complete_startup_recovery_observation",
+        "validate_startup_recovery_fixed_point_v2",
+        "RuntimeStartupRecoveryContinuationV2",
+        "RuntimeStartupRecoveryFixedPointProofV2",
+        "RuntimeStartupRecoveryObservationPortV2",
+        "verify_readiness_v1",
+        "initial_readiness",
+        "refresh_recovery_readiness",
+        "recover_next_stale_live",
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "into_production",
+        "retry",
+    ] {
+        assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+    assert!(!process.contains("loop {"));
+    assert!(!process.contains(".resume"));
+    assert!(!process.contains("resume("));
+    assert!(!process.contains("tokio::spawn"));
+    assert!(!process.contains("spawn_blocking"));
+    assert_eq!(
+        startup
+            .matches(".into_recovery_iteration_ready_v2()")
+            .count(),
+        1
+    );
+    assert!(
+        startup.find(".into_closed_recovery_v2()").unwrap()
+            < startup.find(".into_recovery_iteration_ready_v2()").unwrap()
+    );
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
+        "RuntimeStartupRecoveryObservationPortV2",
+    ] {
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        for method in [
+            "refresh_iteration_readiness_in_place_v2",
+            "try_into_ready_iteration_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/process/readiness.rs")
+                        || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        if contains_identifier(source, "shutdown_committed_recovery_v2") {
+            assert!(
+                path == Path::new("src/process/closed.rs")
+                    || path == Path::new("src/process/readiness.rs"),
+                "{}: shutdown_committed_recovery_v2",
+                path.display()
+            );
+        }
+    }
+    for required in [
+        "RuntimeProcessRecoveryReadinessFailureV2",
+        "RuntimeProcessRecoveryReadinessTransitionFailureV2",
+        "RuntimeProcessRecoveryReadinessTransitionErrorV2",
+        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
+    ] {
+        assert_eq!(library.matches(required).count(), 1, "{required}");
+    }
+    assert!(!library.contains("RuntimeRecoveryIterationReadyProcessV2"));
+    assert!(closed.contains("readiness: RuntimeClosedRecoveryReadinessStateV2,"));
 }
 
 #[test]
@@ -1894,8 +2268,9 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     );
     let readiness = braced_declaration(
         pending_binding,
-        "pub(crate) fn into_readiness_successor_v2(",
+        "pub(crate) fn refresh_readiness_in_place_v2(",
     );
+    assert!(readiness.contains("&mut self,"));
     let readiness_preflight = readiness
         .find(".committed_pending_section_v2(committed_owner)")
         .unwrap();
@@ -1977,15 +2352,21 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "pub(crate) fn commit_cutoff_v2(",
         "pub(crate) async fn commit_owner_in_place_v2(",
         "pub(crate) fn try_into_committed_session_v2(",
-        "pub(crate) async fn refresh_iteration_readiness_v2(",
-        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+        "enum RuntimeClosedRecoveryReadinessStateV2",
+        "RuntimeClosedRecoveryReadinessStateV2::Available",
+        "RuntimeClosedRecoveryReadinessStateV2::Failed",
+        "RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)",
+        "pub(crate) async fn refresh_iteration_readiness_in_place_v2(",
+        "async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(",
+        "pub(crate) fn try_into_ready_iteration_v2(",
         ".verify_readiness_refresh_until_v2(cutoff)",
         "operation_cutoff: Instant",
         ".operation_cutoff",
         ".min(self.owner.observation().safety_deadline())",
         "Instant::now() >= verification_cutoff",
         ".invalidate_capability_not_ready_v2()",
-        ".into_readiness_successor_v2(",
+        ".invalidate_protocol_violation_v2()",
+        ".refresh_readiness_in_place_v2(",
         ".commit_prepared_owner_in_place_v2(&authority, &mut self.owner, commit_cutoff)",
         "post_commit();",
         ".committed_pending_section_v2(owner)",
@@ -2020,6 +2401,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
         "    operation_cutoff: Instant,\n",
+        "    readiness: RuntimeClosedRecoveryReadinessStateV2,\n",
         "}"
     )));
     assert!(production.contains(concat!(
@@ -2132,11 +2514,21 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     );
     let readiness_refresh = braced_declaration(
         committed_session,
-        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+        "async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(",
     );
+    let refresh_consume = readiness_refresh.find("std::mem::replace(").unwrap();
+    let refresh_failed = readiness_refresh
+        .find("RuntimeClosedRecoveryReadinessStateV2::Failed")
+        .unwrap();
+    let refresh_available = readiness_refresh
+        .find("RuntimeClosedRecoveryReadinessStateV2::Available")
+        .unwrap();
+    let refresh_protocol = readiness_refresh
+        .find("self.gateway.invalidate_protocol_violation_v2()")
+        .unwrap();
     let refresh_prevalidation = readiness_refresh.find("self.revalidate_v2()").unwrap();
     let refresh_cutoff = readiness_refresh
-        .find(".min(self.owner.observation().safety_deadline())")
+        .find("self.readiness_cutoff_v2()")
         .unwrap();
     let refresh_await = readiness_refresh
         .find("verify(verification_cutoff).await")
@@ -2152,25 +2544,30 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .map(|offset| offset + refresh_await + 1)
         .unwrap();
     let refresh_successor = readiness_refresh
-        .find(".into_readiness_successor_v2(")
+        .find(".refresh_readiness_in_place_v2(")
         .unwrap();
     let refresh_hook = readiness_refresh.find("post_refresh();").unwrap();
-    let refresh_iteration = readiness_refresh
-        .find("let iteration = RuntimeClosedRecoveryReadyIterationV2")
+    let refresh_final_validation = readiness_refresh[refresh_hook..]
+        .find("self.revalidate_v2()")
+        .map(|offset| refresh_hook + offset)
         .unwrap();
-    let refresh_final = readiness_refresh
-        .rfind("iteration\n            .revalidate_v2()")
+    let refresh_ready = readiness_refresh
+        .find("self.readiness = RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)")
         .unwrap();
     assert!(
-        refresh_prevalidation < refresh_cutoff
+        refresh_consume < refresh_failed
+            && refresh_failed < refresh_available
+            && refresh_available < refresh_protocol
+            && refresh_protocol < refresh_prevalidation
+            && refresh_prevalidation < refresh_cutoff
             && refresh_cutoff < refresh_pre_deadline
             && refresh_pre_deadline < refresh_await
             && refresh_await < refresh_post_deadline
             && refresh_post_deadline < refresh_postvalidation
             && refresh_postvalidation < refresh_successor
             && refresh_successor < refresh_hook
-            && refresh_hook < refresh_iteration
-            && refresh_iteration < refresh_final
+            && refresh_hook < refresh_final_validation
+            && refresh_final_validation < refresh_ready
     );
     assert_eq!(
         readiness_refresh
@@ -2181,9 +2578,22 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     assert!(!readiness_refresh.contains("initial_readiness"));
     let public_refresh = braced_declaration(
         committed_session,
-        "pub(crate) async fn refresh_iteration_readiness_v2(",
+        "pub(crate) async fn refresh_iteration_readiness_in_place_v2(",
     );
     assert!(!public_refresh.contains("operation_cutoff:"));
+    assert!(public_refresh.contains("&mut self,"));
+    let conversion = braced_declaration(
+        committed_session,
+        "pub(crate) fn try_into_ready_iteration_v2(",
+    );
+    let ready_match = conversion
+        .find("RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)")
+        .unwrap();
+    let ready_construct = conversion
+        .find("Ok(RuntimeClosedRecoveryReadyIterationV2")
+        .unwrap();
+    let retained_failure = conversion.find("readiness => Err(Box::new(Self").unwrap();
+    assert!(ready_match < ready_construct && ready_construct < retained_failure);
     let begin = braced_declaration(
         production,
         "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
@@ -2228,6 +2638,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     for name in [
         "RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoverySessionV2",
+        "RuntimeClosedRecoveryReadinessStateV2",
         "RuntimeClosedRecoveryReadyIterationV2",
         "RuntimeClosedRecoveryFixedPointV2",
         "RuntimeClosedRecoveryStartupIterationOutcomeV2",
@@ -2301,14 +2712,29 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             }
         }
         for method in [
-            "into_readiness_successor_v2",
+            "refresh_readiness_in_place_v2",
             "invalidate_capability_not_ready_v2",
+            "invalidate_protocol_violation_v2",
         ] {
             if contains_identifier(source, method) {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
                         || path == Path::new("src/gateway.rs")
                         || path == Path::new("src/startup_recovery_observation.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        for method in [
+            "refresh_iteration_readiness_in_place_v2",
+            "try_into_ready_iteration_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/process/readiness.rs")
+                        || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs"),
                     "{}: {method}",
                     path.display()
                 );
@@ -3135,7 +3561,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
 }
 
 #[test]
-fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry() {
+fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_staging_entry() {
     let sources = source_files();
     let process_startup = sources
         .iter()
@@ -3169,6 +3595,7 @@ fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry()
     let paused_connected = staging.find(".into_paused_connected_v1(").unwrap();
     let recovery_pending = staging.find(".into_recovery_pending_v2()").unwrap();
     let closed_recovery = staging.find(".into_closed_recovery_v2()").unwrap();
+    let recovery_iteration_ready = staging.find(".into_recovery_iteration_ready_v2()").unwrap();
     let shutdown = staging.find(".shutdown()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
@@ -3181,7 +3608,8 @@ fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry()
             && paused_observation < paused_connected
             && paused_connected < recovery_pending
             && recovery_pending < closed_recovery
-            && closed_recovery < shutdown
+            && closed_recovery < recovery_iteration_ready
+            && recovery_iteration_ready < shutdown
             && owner < shutdown
             && shutdown < outcome
     );
@@ -3202,6 +3630,7 @@ fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry()
         ".into_paused_connected_v1(",
         ".into_recovery_pending_v2()",
         ".into_closed_recovery_v2()",
+        ".into_recovery_iteration_ready_v2()",
         ".shutdown()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -3271,6 +3700,8 @@ fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry()
         "compose_runtime_registry_bootstrap_v1",
         "compose_runtime_gateway_bootstrap_v1",
         "start_gateway_owner_startup_watchdog_v1",
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
         "observe_current_ready_attestation",
         "issue_ready_lease",
         "ready_to_serve",
@@ -3323,10 +3754,12 @@ fn process_startup_is_the_single_ordered_bounded_closed_recovery_staging_entry()
 fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     let main = source_before_test_module(include_str!("../src/main.rs"));
     let entry = braced_declaration(main, "fn main() -> ExitCode");
-    assert!(main.contains("ClosedRecoveryAndClosed"));
-    assert!(main.contains("runtime_staging_closed_recovery_and_closed"));
+    assert!(main.contains("RecoveryIterationReadyAndClosed"));
+    assert!(main.contains("runtime_staging_recovery_iteration_ready_and_closed"));
     assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_))"));
     assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(_))"));
+    assert!(main
+        .contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(_))"));
     assert_eq!(
         entry
             .matches("run_runtime_process_staging_from_environment_v1()")

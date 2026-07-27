@@ -915,6 +915,27 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         &self.observation
     }
 
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) fn terminal_observation_v2(
+        &self,
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
+    {
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }

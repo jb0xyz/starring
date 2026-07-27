@@ -1175,14 +1175,12 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         }
     }
 
-    pub(crate) fn into_readiness_successor_v2(
-        mut self,
+    pub(crate) fn refresh_readiness_in_place_v2(
+        &mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         readiness: RuntimeCapabilityReadinessSetV2,
-    ) -> Result<
-        (Self, RuntimeAuthorizedStartupRecoveryIterationV2),
-        RuntimeGatewayRecoverySectionErrorV2,
-    > {
+    ) -> Result<RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeGatewayRecoverySectionErrorV2>
+    {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
@@ -1206,7 +1204,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let iteration = transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
-        Ok((self, iteration))
+        Ok(iteration)
     }
 
     pub(crate) fn begin_startup_recovery_observation_v2(
@@ -1298,6 +1296,10 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
 
     pub(crate) fn invalidate_capability_not_ready_v2(&self) {
         self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady);
+    }
+
+    pub(crate) fn invalidate_protocol_violation_v2(&self) {
+        self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
     }
 
     fn pending_section_with_owner_v2<'a>(
