@@ -1,6 +1,8 @@
 mod digest;
 mod projection;
 mod query;
+mod reserved_projection;
+mod reserved_semantic;
 mod row;
 mod semantic;
 
@@ -16,7 +18,9 @@ use automation_runtime_worker::{
 };
 use sqlx::{PgConnection, Postgres, Transaction};
 
-use self::query::EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY;
+use self::query::{
+    EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY, EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY,
+};
 use self::row::{
     RuntimeStartupRecoveryExecutionDatabaseOutcomeV2, RuntimeStartupRecoveryExecutionExpectedV2,
     RuntimeStartupRecoveryExecutionRowV2,
@@ -33,7 +37,7 @@ impl PostgresRuntimeExecutionV1 {
         operation_cutoff: Instant,
     ) -> Result<RuntimeCompletedStartupRecoveryExecutionV2, RuntimeExecutionPersistenceErrorV1>
     {
-        if authorization.request().class() != RuntimeStartupRecoveryClassV2::StaleLive {
+        if recovery_execution_query(authorization.request().class()).is_err() {
             return Err(RuntimeExecutionPersistenceErrorV1::RetryNotReady);
         }
         if Instant::now() >= operation_cutoff {
@@ -148,25 +152,24 @@ impl PostgresRuntimeExecutionV1 {
     > {
         let correlation = request.correlation();
         let owner = request.gateway_owner_lease_id();
+        let query = recovery_execution_query(request.class())?;
         mutation_dispatched.store(true, Ordering::Release);
-        let mut rows = sqlx::query_as::<_, RuntimeStartupRecoveryExecutionRowV2>(
-            EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY,
-        )
-        .bind(correlation.recovery_id().as_str())
-        .bind(bindings.originating_emergency_generation)
-        .bind(bindings.coordinator_generation)
-        .bind(bindings.action_authority_revision)
-        .bind(bindings.selection_authority_revision)
-        .bind(owner.gateway_shard_id.as_str())
-        .bind(owner.process_instance_id.as_str())
-        .bind(bindings.owner_lease_epoch)
-        .bind(owner.expected_build_revision.as_str())
-        .bind(bindings.owner_revision)
-        .bind(request.expected_owner_expires_at())
-        .bind(request.minimum_database_now())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(map_mutation_dispatch_error)?;
+        let mut rows = sqlx::query_as::<_, RuntimeStartupRecoveryExecutionRowV2>(query)
+            .bind(correlation.recovery_id().as_str())
+            .bind(bindings.originating_emergency_generation)
+            .bind(bindings.coordinator_generation)
+            .bind(bindings.action_authority_revision)
+            .bind(bindings.selection_authority_revision)
+            .bind(owner.gateway_shard_id.as_str())
+            .bind(owner.process_instance_id.as_str())
+            .bind(bindings.owner_lease_epoch)
+            .bind(owner.expected_build_revision.as_str())
+            .bind(bindings.owner_revision)
+            .bind(request.expected_owner_expires_at())
+            .bind(request.minimum_database_now())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(map_mutation_dispatch_error)?;
         if rows.len() != 1 {
             return Err(RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt);
         }
@@ -240,12 +243,39 @@ impl RuntimeStartupRecoveryExecutionBindingsV2 {
             coordinator_generation: self.coordinator_generation,
             action_authority_revision: self.action_authority_revision,
             selection_authority_revision: self.selection_authority_revision,
-            recovery_class: "stale_live",
+            recovery_class: recovery_class_name(request.class())
+                .expect("supported startup recovery class has a name"),
             gateway_owner_lease_id: request.gateway_owner_lease_id().clone(),
             owner_revision: self.owner_revision,
             owner_expires_at: request.expected_owner_expires_at(),
             minimum_database_now: request.minimum_database_now(),
         }
+    }
+}
+
+fn recovery_execution_query(
+    class: RuntimeStartupRecoveryClassV2,
+) -> Result<&'static str, RuntimeExecutionPersistenceErrorV1> {
+    match class {
+        RuntimeStartupRecoveryClassV2::StaleLive => Ok(EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY),
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
+            Ok(EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY)
+        }
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+            Err(RuntimeExecutionPersistenceErrorV1::RetryNotReady)
+        }
+    }
+}
+
+fn recovery_class_name(class: RuntimeStartupRecoveryClassV2) -> Option<&'static str> {
+    match class {
+        RuntimeStartupRecoveryClassV2::StaleLive => Some("stale_live"),
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
+            Some("reserved_awaiting_certification")
+        }
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => None,
     }
 }
 
@@ -343,6 +373,26 @@ mod tests {
         assert_eq!(
             client_cutoff_error(true),
             RuntimeExecutionPersistenceErrorV1::Indeterminate
+        );
+    }
+
+    #[test]
+    fn execution_dispatch_supports_only_implemented_recovery_classes() {
+        assert_eq!(
+            recovery_execution_query(RuntimeStartupRecoveryClassV2::StaleLive).unwrap(),
+            EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY
+        );
+        assert_eq!(
+            recovery_execution_query(RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification)
+                .unwrap(),
+            EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY
+        );
+        assert!(
+            recovery_execution_query(RuntimeStartupRecoveryClassV2::SuspendedLocalEffect).is_err()
+        );
+        assert!(
+            recovery_execution_query(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent)
+                .is_err()
         );
     }
 

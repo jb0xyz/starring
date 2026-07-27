@@ -10,6 +10,12 @@ use super::digest::{
 use super::projection::{
     decode_terminal_projection_v2, RuntimeStartupRecoveryTerminalProjectionV2,
 };
+use super::reserved_projection::{
+    decode_reserved_terminal_projection_v2, RuntimeReservedStartupRecoveryTerminalProjectionV2,
+};
+use super::reserved_semantic::{
+    validate_reserved_progressed_projection_v2, RuntimeReservedStartupRecoveryExpectationV2,
+};
 use super::semantic::validate_progressed_projection_v2;
 use crate::gateway_owner::MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION;
 use crate::RuntimeExecutionPersistenceErrorV1;
@@ -69,10 +75,7 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
         self.require_exact_identity(expected)?;
         self.require_exact_owner(expected)?;
         self.require_valid_times(expected)?;
-        let projection = decode_terminal_projection_v2(
-            &self.terminal_outcome_name,
-            &self.terminal_projection_bytes,
-        )?;
+        let projection_outcome = self.decode_projection(expected)?;
         let persisted_digest = lowercase_sha256_bytes(&self.terminal_digest)?;
         let derived_digest =
             startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
@@ -97,12 +100,11 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
         }
         let terminal_digest = RuntimeStartupRecoveryExecutionTerminalDigestV2::new(derived_digest)
             .map_err(|_| invalid())?;
-        let outcome = match projection {
-            RuntimeStartupRecoveryTerminalProjectionV2::NoCandidate => {
+        let outcome = match projection_outcome {
+            RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate => {
                 RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::NoCandidate
             }
-            RuntimeStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
-                validate_progressed_projection_v2(&projection, self.recorded_at)?;
+            RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed => {
                 RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::Progressed(terminal_digest)
             }
         };
@@ -118,6 +120,53 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
             },
             outcome,
         })
+    }
+
+    fn decode_projection(
+        &self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+    ) -> Result<RuntimeStartupRecoveryDecodedProjectionOutcomeV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        match self.recovery_class.as_str() {
+            "stale_live" => match decode_terminal_projection_v2(
+                &self.terminal_outcome_name,
+                &self.terminal_projection_bytes,
+            )? {
+                RuntimeStartupRecoveryTerminalProjectionV2::NoCandidate => {
+                    Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                }
+                RuntimeStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                    validate_progressed_projection_v2(&projection, self.recorded_at)?;
+                    Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                }
+            },
+            "reserved_awaiting_certification" => {
+                match decode_reserved_terminal_projection_v2(
+                    &self.terminal_outcome_name,
+                    &self.terminal_projection_bytes,
+                )? {
+                    RuntimeReservedStartupRecoveryTerminalProjectionV2::NoCandidate => {
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                    }
+                    RuntimeReservedStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                        validate_reserved_progressed_projection_v2(
+                            &projection,
+                            &RuntimeReservedStartupRecoveryExpectationV2 {
+                                recovery_id: &expected.recovery_id,
+                                originating_emergency_generation: expected
+                                    .originating_emergency_generation,
+                                coordinator_generation: expected.coordinator_generation,
+                                action_authority_revision: expected.action_authority_revision,
+                                selection_authority_revision: expected.selection_authority_revision,
+                            },
+                            self.recorded_at,
+                        )?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                    }
+                }
+            }
+            _ => Err(invalid()),
+        }
     }
 
     fn require_exact_identity(
@@ -184,6 +233,11 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
     }
 }
 
+enum RuntimeStartupRecoveryDecodedProjectionOutcomeV2 {
+    NoCandidate,
+    Progressed,
+}
+
 fn invalid() -> RuntimeExecutionPersistenceErrorV1 {
     RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt
 }
@@ -206,14 +260,14 @@ mod tests {
         DateTime::from_timestamp(second, 0).unwrap()
     }
 
-    fn expected() -> RuntimeStartupRecoveryExecutionExpectedV2 {
+    fn expected_for(recovery_class: &'static str) -> RuntimeStartupRecoveryExecutionExpectedV2 {
         RuntimeStartupRecoveryExecutionExpectedV2 {
             recovery_id: "0123456789abcdef0123456789abcdef".to_owned(),
             originating_emergency_generation: 2,
             coordinator_generation: 3,
             action_authority_revision: 5,
             selection_authority_revision: 4,
-            recovery_class: "stale_live",
+            recovery_class,
             gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1 {
                 gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
                 process_instance_id: ProcessInstanceId::parse("process:1").unwrap(),
@@ -226,8 +280,19 @@ mod tests {
         }
     }
 
-    fn no_candidate_projection() -> Vec<u8> {
-        let domain = b"starring.runtime.startup_recovery.stale_live.terminal.v2";
+    fn expected() -> RuntimeStartupRecoveryExecutionExpectedV2 {
+        expected_for("stale_live")
+    }
+
+    fn no_candidate_projection(recovery_class: &str) -> Vec<u8> {
+        let domain = match recovery_class {
+            "stale_live" => b"starring.runtime.startup_recovery.stale_live.terminal.v2".as_slice(),
+            "reserved_awaiting_certification" => {
+                b"starring.runtime.startup_recovery.reserved_awaiting_certification.terminal.v2"
+                    .as_slice()
+            }
+            _ => panic!(),
+        };
         [
             (domain.len() as i64).to_be_bytes().as_slice(),
             domain,
@@ -239,7 +304,7 @@ mod tests {
 
     fn row() -> RuntimeStartupRecoveryExecutionRowV2 {
         let expected = expected();
-        let projection = no_candidate_projection();
+        let projection = no_candidate_projection(expected.recovery_class);
         let recorded_at = at(101);
         let digest = startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
             recovery_id: &expected.recovery_id,
@@ -297,6 +362,46 @@ mod tests {
         let mut tampered = row();
         tampered.terminal_digest.replace_range(0..2, "ff");
         assert!(tampered.decode(&expected()).is_err());
+    }
+
+    #[test]
+    fn reserved_no_candidate_uses_its_own_projection_domain() {
+        let expected = expected_for("reserved_awaiting_certification");
+        let mut reserved = row();
+        reserved.recovery_class = expected.recovery_class.to_owned();
+        reserved.terminal_projection_bytes = no_candidate_projection(expected.recovery_class);
+        reserved.terminal_digest =
+            startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
+                recovery_id: &expected.recovery_id,
+                originating_emergency_generation: expected.originating_emergency_generation,
+                coordinator_generation: expected.coordinator_generation,
+                action_authority_revision: expected.action_authority_revision,
+                selection_authority_revision: expected.selection_authority_revision,
+                recovery_class: expected.recovery_class,
+                gateway_shard_id: expected.gateway_owner_lease_id.gateway_shard_id.as_str(),
+                owner_process_instance_id: expected
+                    .gateway_owner_lease_id
+                    .process_instance_id
+                    .as_str(),
+                owner_lease_epoch: 6,
+                owner_runtime_build_revision: expected
+                    .gateway_owner_lease_id
+                    .expected_build_revision
+                    .as_str(),
+                owner_revision: expected.owner_revision,
+                owner_expires_at: expected.owner_expires_at,
+                minimum_database_now: expected.minimum_database_now,
+                recorded_at: reserved.recorded_at,
+                terminal_projection_bytes: &reserved.terminal_projection_bytes,
+            })
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(matches!(
+            reserved.decode(&expected).unwrap().outcome,
+            RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::NoCandidate
+        ));
     }
 
     #[test]

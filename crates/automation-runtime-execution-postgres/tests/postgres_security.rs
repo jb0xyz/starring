@@ -3,6 +3,7 @@ include!("postgres_security/security.rs");
 include!("postgres_security/mutations.rs");
 include!("postgres_security/certification.rs");
 include!("postgres_security/certification_reservation.rs");
+include!("postgres_security/startup_reserved_awaiting_execution.rs");
 include!("postgres_security/certification_terminal_ledger.rs");
 include!("postgres_security/adapter.rs");
 include!("postgres_security/gateway_owner.rs");

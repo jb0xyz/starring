@@ -228,6 +228,9 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
     let source = sources.join("\n");
     assert!(source.contains("impl RuntimeStartupRecoveryExecutionPortV2"));
     assert!(source.contains("public.starring_runtime_startup_recovery_execute_stale_live_v2"));
+    assert!(
+        source.contains("public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2")
+    );
     for forbidden in [
         "starring_runtime_private_v2",
         "starring_runtime_startup_recovery_action_record_v2",
@@ -249,7 +252,7 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        17
+        18
     );
 }
 

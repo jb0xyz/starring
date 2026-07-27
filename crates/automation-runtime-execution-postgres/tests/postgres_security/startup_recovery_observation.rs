@@ -556,6 +556,25 @@ async fn seed_pending_product_drain_for_startup_observation(pool: &PgPool) {
             .await
             .unwrap();
     }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT starring_runtime_private_v2.\
+         starring_runtime_slot_writer_fence_mark_drain_v2(\
+            $1,$2,(\
+                SELECT writer_epoch \
+                FROM public.runtime_slot_writer_fences_v2 \
+                WHERE slot_guild_id = $1 AND slot_ruleset_key = $2\
+            ),'33333333333333333333333333333333',\
+            '11111111111111111111111111111111',$3,$4,$5,1\
+         )",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(DEPLOYMENT)
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
     transaction.commit().await.unwrap();
 }
 

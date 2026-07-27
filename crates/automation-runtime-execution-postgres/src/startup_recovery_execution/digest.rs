@@ -6,6 +6,9 @@ use crate::RuntimeExecutionPersistenceErrorV1;
 const RECORD_FORMAT_VERSION: i16 = 2;
 const POSTGRES_EPOCH_UNIX_MICROSECONDS: i64 = 946_684_800_000_000;
 const ACTION_PROOF_DOMAIN: &[u8] = b"starring.runtime.startup_recovery.action_proof.v2\0";
+const CERTIFICATION_TERMINAL_DOMAIN: &[u8] = b"starring.runtime.certification.terminal.v2\0";
+const RESERVED_RESET_RECEIPT_DOMAIN: &[u8] =
+    b"starring.runtime.certification.awaiting_reset.receipt.v2";
 
 pub(super) struct RuntimeStartupRecoveryActionProofV2<'a> {
     pub recovery_id: &'a str,
@@ -23,6 +26,36 @@ pub(super) struct RuntimeStartupRecoveryActionProofV2<'a> {
     pub minimum_database_now: DateTime<Utc>,
     pub recorded_at: DateTime<Utc>,
     pub terminal_projection_bytes: &'a [u8],
+}
+
+pub(super) struct RuntimeCertificationTerminalProofV2<'a> {
+    pub operation_id: &'a str,
+    pub intent_fingerprint: &'a str,
+    pub tenant_id: &'a str,
+    pub installation_id: &'a str,
+    pub deployment_id: &'a str,
+    pub deployment_revision: i64,
+    pub convergence_attempt: i64,
+    pub terminal_outcome_name: &'a str,
+    pub resulting_phase: &'a str,
+    pub resulting_deployment_revision: i64,
+    pub resulting_convergence_attempt: i64,
+    pub terminal_at: DateTime<Utc>,
+    pub terminal_receipt_bytes: &'a [u8],
+}
+
+pub(super) struct RuntimeReservedResetReceiptProofV2<'a> {
+    pub recovery_id: &'a str,
+    pub originating_emergency_generation: i64,
+    pub coordinator_generation: i64,
+    pub action_authority_revision: i64,
+    pub selection_authority_revision: i64,
+    pub source_deployment_frame: &'a [u8],
+    pub successor_deployment_frame: &'a [u8],
+    pub source_slot_frame: &'a [u8],
+    pub successor_slot_frame: &'a [u8],
+    pub reservation_frame: &'a [u8],
+    pub terminal_at: DateTime<Utc>,
 }
 
 pub(super) fn startup_recovery_action_digest_v2(
@@ -62,6 +95,67 @@ pub(super) fn startup_recovery_action_digest_v2(
     push_bytes(&mut framed, ACTION_PROOF_DOMAIN)?;
     push_bytes(&mut framed, &payload)?;
     Ok(Sha256::digest(framed).into())
+}
+
+pub(super) fn certification_terminal_digest_v2(
+    proof: &RuntimeCertificationTerminalProofV2<'_>,
+) -> Result<[u8; 32], RuntimeExecutionPersistenceErrorV1> {
+    let mut payload = Vec::with_capacity(
+        proof
+            .terminal_receipt_bytes
+            .len()
+            .checked_add(512)
+            .ok_or_else(invalid)?,
+    );
+    payload.extend_from_slice(&RECORD_FORMAT_VERSION.to_be_bytes());
+    push_bytes(&mut payload, proof.operation_id.as_bytes())?;
+    push_bytes(&mut payload, proof.intent_fingerprint.as_bytes())?;
+    push_bytes(&mut payload, proof.tenant_id.as_bytes())?;
+    push_bytes(&mut payload, proof.installation_id.as_bytes())?;
+    push_bytes(&mut payload, proof.deployment_id.as_bytes())?;
+    push_i64(&mut payload, proof.deployment_revision);
+    push_i64(&mut payload, proof.convergence_attempt);
+    push_bytes(&mut payload, proof.terminal_outcome_name.as_bytes())?;
+    push_bytes(&mut payload, proof.resulting_phase.as_bytes())?;
+    push_i64(&mut payload, proof.resulting_deployment_revision);
+    push_i64(&mut payload, proof.resulting_convergence_attempt);
+    push_timestamp(&mut payload, proof.terminal_at)?;
+    push_bytes(&mut payload, proof.terminal_receipt_bytes)?;
+    let mut framed = Vec::with_capacity(
+        CERTIFICATION_TERMINAL_DOMAIN
+            .len()
+            .checked_add(payload.len())
+            .and_then(|length| length.checked_add(16))
+            .ok_or_else(invalid)?,
+    );
+    push_bytes(&mut framed, CERTIFICATION_TERMINAL_DOMAIN)?;
+    push_bytes(&mut framed, &payload)?;
+    Ok(Sha256::digest(framed).into())
+}
+
+pub(super) fn reserved_reset_receipt_bytes_v2(
+    proof: &RuntimeReservedResetReceiptProofV2<'_>,
+) -> Result<Vec<u8>, RuntimeExecutionPersistenceErrorV1> {
+    let mut receipt = Vec::with_capacity(384);
+    push_bytes(&mut receipt, RESERVED_RESET_RECEIPT_DOMAIN)?;
+    receipt.extend_from_slice(&RECORD_FORMAT_VERSION.to_be_bytes());
+    receipt.extend_from_slice(&1_i16.to_be_bytes());
+    push_bytes(&mut receipt, proof.recovery_id.as_bytes())?;
+    push_i64(&mut receipt, proof.originating_emergency_generation);
+    push_i64(&mut receipt, proof.coordinator_generation);
+    push_i64(&mut receipt, proof.action_authority_revision);
+    push_i64(&mut receipt, proof.selection_authority_revision);
+    for frame in [
+        proof.source_deployment_frame,
+        proof.successor_deployment_frame,
+        proof.source_slot_frame,
+        proof.successor_slot_frame,
+        proof.reservation_frame,
+    ] {
+        receipt.extend_from_slice(&Sha256::digest(frame));
+    }
+    push_timestamp(&mut receipt, proof.terminal_at)?;
+    Ok(receipt)
 }
 
 pub(super) fn lowercase_sha256_bytes(
@@ -182,5 +276,55 @@ mod tests {
         ] {
             assert!(lowercase_sha256_bytes(&invalid_digest).is_err());
         }
+    }
+
+    #[test]
+    fn reserved_receipt_binds_every_raw_projection_frame() {
+        let proof = RuntimeReservedResetReceiptProofV2 {
+            recovery_id: "0123456789abcdef0123456789abcdef",
+            originating_emergency_generation: 2,
+            coordinator_generation: 3,
+            action_authority_revision: 5,
+            selection_authority_revision: 4,
+            source_deployment_frame: b"source",
+            successor_deployment_frame: b"successor",
+            source_slot_frame: b"slot-source",
+            successor_slot_frame: b"slot-successor",
+            reservation_frame: b"reservation",
+            terminal_at: at("2026-01-02T03:01:02.000003Z"),
+        };
+        let original = reserved_reset_receipt_bytes_v2(&proof).unwrap();
+        let changed = reserved_reset_receipt_bytes_v2(&RuntimeReservedResetReceiptProofV2 {
+            source_deployment_frame: b"forged",
+            ..proof
+        })
+        .unwrap();
+        assert_ne!(original, changed);
+    }
+
+    #[test]
+    fn certification_terminal_digest_binds_receipt_and_terminal_scalar() {
+        let proof = RuntimeCertificationTerminalProofV2 {
+            operation_id: "00112233445566778899aabbccddeeff",
+            intent_fingerprint: &"a".repeat(64),
+            tenant_id: "tenant:1",
+            installation_id: "installation:1",
+            deployment_id: "deployment:1",
+            deployment_revision: 8,
+            convergence_attempt: 5,
+            terminal_outcome_name: "awaiting_reset",
+            resulting_phase: "reconciling_panels",
+            resulting_deployment_revision: 9,
+            resulting_convergence_attempt: 5,
+            terminal_at: at("2026-01-02T03:01:02.000003Z"),
+            terminal_receipt_bytes: b"receipt",
+        };
+        let original = certification_terminal_digest_v2(&proof).unwrap();
+        let changed = certification_terminal_digest_v2(&RuntimeCertificationTerminalProofV2 {
+            terminal_receipt_bytes: b"changed",
+            ..proof
+        })
+        .unwrap();
+        assert_ne!(original, changed);
     }
 }
