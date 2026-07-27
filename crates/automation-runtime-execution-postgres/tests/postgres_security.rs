@@ -18,3 +18,4 @@ include!("postgres_security/suspension_ledger.rs");
 include!("postgres_security/startup_recovery_observation.rs");
 include!("postgres_security/startup_recovery_action_journal.rs");
 include!("postgres_security/startup_recovery_execution.rs");
+include!("postgres_security/startup_recovery_execution_adapter.rs");

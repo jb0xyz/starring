@@ -15,6 +15,7 @@ mod query;
 mod recovery;
 mod row;
 mod startup_recovery;
+mod startup_recovery_execution;
 mod store;
 mod writer_fence;
 

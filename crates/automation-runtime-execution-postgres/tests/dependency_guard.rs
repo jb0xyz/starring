@@ -211,6 +211,7 @@ fn adapter_exposes_only_approved_runtime_ports() {
         "impl RuntimeProductDrainObservationPortV2",
         "impl RuntimeCertificationReservationPortV2",
         "impl RuntimeStartupRecoveryObservationPortV2",
+        "impl RuntimeStartupRecoveryExecutionPortV2",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -222,11 +223,13 @@ fn adapter_exposes_only_approved_runtime_ports() {
 }
 
 #[test]
-fn startup_recovery_action_journal_has_no_executor_adapter_surface() {
+fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
+    assert!(source.contains("impl RuntimeStartupRecoveryExecutionPortV2"));
+    assert!(source.contains("public.starring_runtime_startup_recovery_execute_stale_live_v2"));
     for forbidden in [
-        "RuntimeStartupRecoveryExecutionPortV2",
+        "starring_runtime_private_v2",
         "starring_runtime_startup_recovery_action_record_v2",
         "runtime_startup_recovery_actions_v2",
     ] {
@@ -246,7 +249,7 @@ fn startup_recovery_action_journal_has_no_executor_adapter_surface() {
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        16
+        17
     );
 }
 
