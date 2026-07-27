@@ -14,7 +14,9 @@ use std::sync::{
 };
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(any(target_os = "macos", all(test, unix)))]
+use std::time::Duration;
+use std::time::Instant;
 
 use zeroize::{Zeroize, Zeroizing};
 
