@@ -3,7 +3,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use automation_runtime_convergence_postgres::{
     PostgresRuntimeExactTargetReader, RuntimeConvergenceStoreError,
@@ -35,14 +35,14 @@ use automation_runtime_worker::{
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
 
+use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     DatabaseCapabilityV1, DatabasePoolConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
     RuntimeDatabaseConnectionSecretV1, RuntimeDatabaseEndpointV1, RuntimeDatabaseSslModeV1,
 };
 
-const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(45);
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -66,6 +66,8 @@ pub enum RuntimeDatabaseCompositionErrorV1 {
     ReadinessRejected { capability: DatabaseCapabilityV1 },
     #[error("runtime database readiness timed out")]
     ReadinessTimedOut,
+    #[error("runtime database startup cleanup timed out")]
+    StartupCleanupTimedOut,
     #[error("runtime database aggregate authority does not match")]
     AuthorityMismatch,
 }
@@ -84,6 +86,7 @@ impl RuntimeDatabaseCompositionErrorV1 {
             Self::ReadinessUnavailable { .. } => "runtime_database_readiness_unavailable",
             Self::ReadinessRejected { .. } => "runtime_database_readiness_rejected",
             Self::ReadinessTimedOut => "runtime_database_readiness_timed_out",
+            Self::StartupCleanupTimedOut => "runtime_database_startup_cleanup_timed_out",
             Self::AuthorityMismatch => "runtime_database_authority_mismatch",
         }
     }
@@ -99,6 +102,7 @@ impl RuntimeDatabaseCompositionErrorV1 {
             Self::InvalidConfiguration
             | Self::IdentityVerification
             | Self::ReadinessTimedOut
+            | Self::StartupCleanupTimedOut
             | Self::AuthorityMismatch => None,
         }
     }
@@ -226,6 +230,17 @@ impl RuntimeDatabasePoolShutdownV1 {
         close_pool_refs_with_deadline(self.pools.each_ref().map(Some)).await
     }
 
+    pub(crate) async fn close_until(
+        &self,
+        deadline: StdInstant,
+    ) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
+        close_pool_refs_until(
+            self.pools.each_ref().map(Some),
+            TokioInstant::from_std(deadline),
+        )
+        .await
+    }
+
     pub fn is_closed(&self) -> bool {
         self.pools.iter().all(PgPool::is_closed)
     }
@@ -237,7 +252,6 @@ impl Debug for RuntimeDatabasePoolShutdownV1 {
     }
 }
 
-#[derive(Clone)]
 pub struct RuntimeDatabaseDependenciesV1 {
     execution: PostgresRuntimeExecutionV1,
     exact_target: PostgresRuntimeExactTargetReader,
@@ -301,7 +315,7 @@ impl RuntimeDatabaseDependenciesV1 {
         operation_cutoff: std::time::Instant,
     ) -> Result<RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseCompositionErrorV1> {
         let readiness = timeout_at(
-            Instant::from_std(operation_cutoff),
+            TokioInstant::from_std(operation_cutoff),
             self.verify_readiness_v1(),
         )
         .await
@@ -316,27 +330,68 @@ impl Debug for RuntimeDatabaseDependenciesV1 {
     }
 }
 
-pub async fn compose_runtime_database_dependencies_v1(
+pub(crate) async fn compose_runtime_database_dependencies_v1(
     config: &RuntimeConfigV1,
     secrets: &ResolvedRuntimeSecretsV1,
+    startup_budget: &RuntimeStartupBudgetV1,
 ) -> Result<RuntimeDatabaseDependenciesV1, RuntimeDatabaseCompositionErrorV1> {
-    let startup_deadline = Instant::now() + STARTUP_READINESS_TIMEOUT;
+    require_open_startup_operation_v1(startup_budget.operation_cutoff())?;
     let timeouts = RuntimeDatabaseTimeoutBundleV1::new(config)?;
     verify_expected_database_authority_v1(secrets)?;
-    let pools =
-        connect_database_pools_v1(secrets, config.database_pool(), startup_deadline).await?;
+    let pools = connect_database_pools_v1(
+        secrets,
+        config.database_pool(),
+        startup_budget.operation_cutoff(),
+        startup_budget.cleanup_deadline(),
+    )
+    .await?;
+    if let Err(error) = require_open_startup_operation_v1(startup_budget.operation_cutoff()) {
+        let cleanup = pools
+            .close_until(TokioInstant::from_std(startup_budget.cleanup_deadline()))
+            .await;
+        return Err(map_database_startup_cleanup_result_v1(error, cleanup));
+    }
     let build = build_verified_dependencies_v1(secrets, &pools, timeouts);
-    let result = timeout_at(startup_deadline, build).await;
-    match result {
-        Ok(Ok(dependencies)) => Ok(dependencies),
-        Ok(Err(error)) => {
-            let _shutdown_result = pools.close_until(startup_deadline).await;
-            Err(error)
+    let result = tokio::select! {
+        biased;
+        _ = sleep_until(TokioInstant::from_std(startup_budget.operation_cutoff())) => None,
+        result = build => Some(result),
+    };
+    let operation_is_open = startup_budget.operation_is_open();
+    let primary = match result {
+        Some(Ok(dependencies)) if operation_is_open => return Ok(dependencies),
+        Some(Ok(dependencies)) => {
+            drop(dependencies);
+            RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut
         }
-        Err(_) => {
-            let _shutdown_result = pools.close_until(startup_deadline).await;
-            Err(RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)
+        Some(Err(error)) if operation_is_open => error,
+        Some(Err(_)) | None => RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut,
+    };
+    let cleanup = pools
+        .close_until(TokioInstant::from_std(startup_budget.cleanup_deadline()))
+        .await;
+    Err(map_database_startup_cleanup_result_v1(primary, cleanup))
+}
+
+fn map_database_startup_cleanup_result_v1(
+    primary: RuntimeDatabaseCompositionErrorV1,
+    cleanup: Result<(), RuntimeDatabasePoolShutdownErrorV1>,
+) -> RuntimeDatabaseCompositionErrorV1 {
+    match cleanup {
+        Ok(()) => primary,
+        Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut) => {
+            RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut
         }
+    }
+}
+
+fn require_open_startup_operation_v1(
+    operation_cutoff: StdInstant,
+) -> Result<(), RuntimeDatabaseCompositionErrorV1> {
+    if StdInstant::now() < operation_cutoff {
+        Ok(())
+    } else {
+        Err(RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)
     }
 }
 
@@ -829,7 +884,7 @@ impl ConnectedRuntimeDatabasePoolsV1 {
 
     async fn close_until(
         &self,
-        deadline: Instant,
+        deadline: TokioInstant,
     ) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
         close_pool_refs_until(self.pools().map(Some), deadline).await
     }
@@ -840,53 +895,75 @@ enum RuntimeDatabasePoolConnectErrorV1 {
     Configuration,
     UnsafeTransport,
     Unavailable,
+    DeadlineElapsed,
+    CleanupTimedOut,
 }
 
 async fn connect_database_pools_v1(
     secrets: &ResolvedRuntimeSecretsV1,
     config: DatabasePoolConfigV1,
-    startup_deadline: Instant,
+    operation_cutoff: StdInstant,
+    cleanup_deadline: StdInstant,
 ) -> Result<ConnectedRuntimeDatabasePoolsV1, RuntimeDatabaseCompositionErrorV1> {
+    require_open_startup_operation_v1(operation_cutoff)?;
     let database_secrets = secrets.database_secrets();
     let (convergence, exact_target, panel, serving, interaction) = tokio::join!(
         connect_pool_v1(
             database_secrets.database_url(DatabaseCapabilityV1::Convergence),
             DatabaseCapabilityV1::Convergence,
             config,
-            startup_deadline,
+            operation_cutoff,
+            cleanup_deadline,
         ),
         connect_pool_v1(
             database_secrets.database_url(DatabaseCapabilityV1::ExactTarget),
             DatabaseCapabilityV1::ExactTarget,
             config,
-            startup_deadline,
+            operation_cutoff,
+            cleanup_deadline,
         ),
         connect_pool_v1(
             database_secrets.database_url(DatabaseCapabilityV1::Panel),
             DatabaseCapabilityV1::Panel,
             config,
-            startup_deadline,
+            operation_cutoff,
+            cleanup_deadline,
         ),
         connect_pool_v1(
             database_secrets.database_url(DatabaseCapabilityV1::Serving),
             DatabaseCapabilityV1::Serving,
             config,
-            startup_deadline,
+            operation_cutoff,
+            cleanup_deadline,
         ),
         connect_pool_v1(
             database_secrets.database_url(DatabaseCapabilityV1::Interaction),
             DatabaseCapabilityV1::Interaction,
             config,
-            startup_deadline,
+            operation_cutoff,
+            cleanup_deadline,
         ),
     );
     let results = [&convergence, &exact_target, &panel, &serving, &interaction];
-    if results.iter().any(|result| result.is_err()) {
-        let error = first_database_error(results);
-        let _shutdown_result =
-            close_pool_refs_until(results.map(|result| result.as_ref().ok()), startup_deadline)
-                .await;
-        return Err(error);
+    let operation_is_open = StdInstant::now() < operation_cutoff;
+    if results.iter().any(|result| result.is_err()) || !operation_is_open {
+        let observed_error = results
+            .iter()
+            .any(|result| result.is_err())
+            .then(|| first_database_error(results));
+        let primary = match observed_error {
+            Some(RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut) => {
+                RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut
+            }
+            Some(error) if operation_is_open => error,
+            Some(_) | None => RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut,
+        };
+        let cleanup = close_pool_refs_until(
+            results.map(|result| result.as_ref().ok()),
+            TokioInstant::from_std(cleanup_deadline),
+        )
+        .await;
+        return Err(map_database_startup_cleanup_result_v1(primary, cleanup));
     }
     Ok(ConnectedRuntimeDatabasePoolsV1 {
         convergence: convergence.expect("runtime database results were checked"),
@@ -900,6 +977,22 @@ async fn connect_database_pools_v1(
 fn first_database_error<T>(
     results: [&Result<T, RuntimeDatabasePoolConnectErrorV1>; 5],
 ) -> RuntimeDatabaseCompositionErrorV1 {
+    if results.iter().any(|result| {
+        matches!(
+            result,
+            Err(RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut)
+        )
+    }) {
+        return RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut;
+    }
+    if results.iter().any(|result| {
+        matches!(
+            result,
+            Err(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed)
+        )
+    }) {
+        return RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut;
+    }
     DatabaseCapabilityV1::ALL
         .into_iter()
         .zip(results)
@@ -927,6 +1020,12 @@ fn map_database_connect_error(
         RuntimeDatabasePoolConnectErrorV1::Unavailable => {
             RuntimeDatabaseCompositionErrorV1::Unavailable { capability }
         }
+        RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed => {
+            RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut
+        }
+        RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut => {
+            RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut
+        }
     }
 }
 
@@ -934,7 +1033,8 @@ async fn connect_pool_v1(
     database_url: &crate::RuntimeDatabaseUrlSecretV1,
     capability: DatabaseCapabilityV1,
     config: DatabasePoolConfigV1,
-    startup_deadline: Instant,
+    operation_cutoff: StdInstant,
+    cleanup_deadline: StdInstant,
 ) -> Result<PgPool, RuntimeDatabasePoolConnectErrorV1> {
     let options = database_connect_options_v1(database_url.connection_secret(), capability);
     validate_database_transport_v1(&options)?;
@@ -945,10 +1045,109 @@ async fn connect_pool_v1(
         .idle_timeout(Some(config.idle_timeout()))
         .max_lifetime(Some(config.max_lifetime()))
         .test_before_acquire(true);
-    let acquire_deadline = (Instant::now() + config.acquire_timeout()).min(startup_deadline);
-    match timeout_at(acquire_deadline, pool.connect_with(options)).await {
-        Ok(Ok(pool)) => Ok(pool),
-        Ok(Err(_)) | Err(_) => Err(RuntimeDatabasePoolConnectErrorV1::Unavailable),
+    let started_at = StdInstant::now();
+    let local_acquire_deadline = started_at + config.acquire_timeout();
+    let (acquire_deadline, timeout_error) =
+        select_database_acquire_deadline_v1(started_at, config.acquire_timeout(), operation_cutoff);
+    let connect =
+        begin_before_operation_cutoff_v1(operation_cutoff, || pool.connect_with(options))?;
+    if let Some(error) = classify_database_connection_deadline_v1(
+        StdInstant::now(),
+        local_acquire_deadline,
+        operation_cutoff,
+    ) {
+        return Err(error);
+    }
+    let result = tokio::select! {
+        biased;
+        _ = sleep_until(TokioInstant::from_std(acquire_deadline)) => {
+            return Err(
+                classify_database_connection_deadline_v1(
+                    StdInstant::now(),
+                    local_acquire_deadline,
+                    operation_cutoff,
+                )
+                .unwrap_or(timeout_error)
+            );
+        }
+        result = connect => result,
+    };
+    if let Some(error) = classify_database_connection_deadline_v1(
+        StdInstant::now(),
+        local_acquire_deadline,
+        operation_cutoff,
+    ) {
+        return match result {
+            Ok(pool) => Err(close_late_connected_pool_v1(pool, cleanup_deadline, error).await),
+            Err(_) => Err(error),
+        };
+    }
+    match result {
+        Ok(pool) => Ok(pool),
+        Err(_) => Err(RuntimeDatabasePoolConnectErrorV1::Unavailable),
+    }
+}
+
+async fn close_late_connected_pool_v1(
+    pool: PgPool,
+    cleanup_deadline: StdInstant,
+    primary: RuntimeDatabasePoolConnectErrorV1,
+) -> RuntimeDatabasePoolConnectErrorV1 {
+    let cleanup = close_pool_refs_until(
+        [Some(&pool), None, None, None, None],
+        TokioInstant::from_std(cleanup_deadline),
+    )
+    .await;
+    drop(pool);
+    match cleanup {
+        Ok(()) => primary,
+        Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut) => {
+            RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut
+        }
+    }
+}
+
+fn select_database_acquire_deadline_v1(
+    started_at: StdInstant,
+    acquire_timeout: Duration,
+    operation_cutoff: StdInstant,
+) -> (StdInstant, RuntimeDatabasePoolConnectErrorV1) {
+    let acquire_deadline = started_at + acquire_timeout;
+    if operation_cutoff <= acquire_deadline {
+        (
+            operation_cutoff,
+            RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed,
+        )
+    } else {
+        (
+            acquire_deadline,
+            RuntimeDatabasePoolConnectErrorV1::Unavailable,
+        )
+    }
+}
+
+fn classify_database_connection_deadline_v1(
+    completed_at: StdInstant,
+    local_acquire_deadline: StdInstant,
+    operation_cutoff: StdInstant,
+) -> Option<RuntimeDatabasePoolConnectErrorV1> {
+    if completed_at >= operation_cutoff {
+        Some(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed)
+    } else if completed_at >= local_acquire_deadline {
+        Some(RuntimeDatabasePoolConnectErrorV1::Unavailable)
+    } else {
+        None
+    }
+}
+
+fn begin_before_operation_cutoff_v1<T>(
+    operation_cutoff: StdInstant,
+    begin: impl FnOnce() -> T,
+) -> Result<T, RuntimeDatabasePoolConnectErrorV1> {
+    if StdInstant::now() < operation_cutoff {
+        Ok(begin())
+    } else {
+        Err(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed)
     }
 }
 
@@ -1020,11 +1219,24 @@ async fn close_pool_refs_with_deadline(
 
 async fn close_pool_refs_until(
     pools: [Option<&PgPool>; 5],
-    deadline: Instant,
+    deadline: TokioInstant,
 ) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
-    timeout_at(deadline, begin_pool_closures(pools))
-        .await
-        .map_err(|_| RuntimeDatabasePoolShutdownErrorV1::TimedOut)
+    let close = begin_pool_closures(pools);
+    if TokioInstant::now() >= deadline {
+        return Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut);
+    }
+    tokio::pin!(close);
+    tokio::select! {
+        biased;
+        _ = sleep_until(deadline) => Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut),
+        () = &mut close => {
+            if TokioInstant::now() < deadline {
+                Ok(())
+            } else {
+                Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut)
+            }
+        }
+    }
 }
 
 fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 5]) -> impl Future<Output = ()> + 'a {
@@ -1068,6 +1280,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -1287,13 +1501,129 @@ mod tests {
                 .connect_lazy("postgresql://localhost/starring")
                 .unwrap()
         });
-        let _result = close_pool_refs_until(pools.each_ref().map(Some), Instant::now()).await;
+        assert!(pools.iter().all(|pool| !pool.is_closed()));
+        let result = close_pool_refs_until(pools.each_ref().map(Some), TokioInstant::now()).await;
+        assert_eq!(result, Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut));
         assert!(pools.iter().all(PgPool::is_closed));
     }
 
+    #[tokio::test]
+    async fn late_connected_pool_cleanup_timeout_is_typed_and_fail_closed() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/starring")
+            .unwrap();
+        let observation = pool.clone();
+
+        assert_eq!(
+            close_late_connected_pool_v1(
+                pool,
+                StdInstant::now(),
+                RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed,
+            )
+            .await,
+            RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut
+        );
+        assert!(observation.is_closed());
+    }
+
     #[test]
-    fn periodic_probe_budget_is_separate_and_shorter_than_startup() {
-        assert!(PERIODIC_READINESS_TIMEOUT < STARTUP_READINESS_TIMEOUT);
+    fn periodic_probe_budget_remains_independent_and_bounded() {
+        assert_eq!(PERIODIC_READINESS_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn acquire_deadline_uses_the_first_scoped_or_global_limit() {
+        let started_at = StdInstant::now();
+        let operation_cutoff = started_at + Duration::from_secs(20);
+        let (scoped_deadline, scoped_error) = select_database_acquire_deadline_v1(
+            started_at,
+            Duration::from_secs(5),
+            operation_cutoff,
+        );
+        let (global_deadline, global_error) = select_database_acquire_deadline_v1(
+            started_at,
+            Duration::from_secs(30),
+            operation_cutoff,
+        );
+        let (equal_deadline, equal_error) = select_database_acquire_deadline_v1(
+            started_at,
+            Duration::from_secs(20),
+            operation_cutoff,
+        );
+
+        assert_eq!(scoped_deadline, started_at + Duration::from_secs(5));
+        assert_eq!(scoped_error, RuntimeDatabasePoolConnectErrorV1::Unavailable);
+        assert_eq!(global_deadline, operation_cutoff);
+        assert_eq!(
+            global_error,
+            RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed
+        );
+        assert_eq!(equal_deadline, operation_cutoff);
+        assert_eq!(
+            equal_error,
+            RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed
+        );
+    }
+
+    #[test]
+    fn expired_operation_cutoff_does_not_create_connection_future() {
+        let begin_called = Cell::new(false);
+        let cutoff = StdInstant::now();
+        let result = begin_before_operation_cutoff_v1(cutoff, || {
+            begin_called.set(true);
+        });
+
+        assert_eq!(
+            result,
+            Err(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed)
+        );
+        assert!(!begin_called.get());
+    }
+
+    #[test]
+    fn actual_global_cutoff_preempts_a_nominally_earlier_acquire_timeout() {
+        let started_at = StdInstant::now();
+        let local_acquire_deadline = started_at + Duration::from_secs(5);
+        let operation_cutoff = local_acquire_deadline + Duration::from_nanos(1);
+
+        assert_eq!(
+            classify_database_connection_deadline_v1(
+                local_acquire_deadline,
+                local_acquire_deadline,
+                operation_cutoff,
+            ),
+            Some(RuntimeDatabasePoolConnectErrorV1::Unavailable)
+        );
+        assert_eq!(
+            classify_database_connection_deadline_v1(
+                operation_cutoff,
+                local_acquire_deadline,
+                operation_cutoff,
+            ),
+            Some(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed)
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_timeout_has_a_stable_public_failure_class() {
+        let primary = RuntimeDatabaseCompositionErrorV1::Unavailable {
+            capability: DatabaseCapabilityV1::Panel,
+        };
+
+        assert_eq!(
+            map_database_startup_cleanup_result_v1(primary, Ok(())),
+            primary
+        );
+        let cleanup = map_database_startup_cleanup_result_v1(
+            primary,
+            Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut),
+        );
+        assert_eq!(
+            cleanup,
+            RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut
+        );
+        assert_eq!(cleanup.code(), "runtime_database_startup_cleanup_timed_out");
+        assert_eq!(cleanup.context(), None);
     }
 
     #[test]
@@ -1315,6 +1645,36 @@ mod tests {
         );
         assert_eq!(error.code(), "runtime_database_unavailable");
         assert_eq!(error.context(), Some("exact_target"));
+    }
+
+    #[test]
+    fn global_operation_deadline_preempts_capability_scoped_connection_errors() {
+        let results = [
+            Err(RuntimeDatabasePoolConnectErrorV1::Unavailable),
+            Err(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed),
+            Err(RuntimeDatabasePoolConnectErrorV1::Configuration),
+            Ok(()),
+            Ok(()),
+        ];
+        let references = std::array::from_fn(|index| &results[index]);
+
+        assert_eq!(
+            first_database_error(references),
+            RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut
+        );
+
+        let cleanup_results = [
+            Err(RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed),
+            Err(RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut),
+            Err(RuntimeDatabasePoolConnectErrorV1::Configuration),
+            Ok(()),
+            Ok(()),
+        ];
+        let cleanup_references = std::array::from_fn(|index| &cleanup_results[index]);
+        assert_eq!(
+            first_database_error(cleanup_references),
+            RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut
+        );
     }
 
     #[test]

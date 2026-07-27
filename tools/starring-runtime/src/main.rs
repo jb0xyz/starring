@@ -2,37 +2,57 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use starring_runtime::{
-    resolve_runtime_secrets_v1, RuntimeConfigErrorV1, RuntimeConfigV1,
-    RuntimeSecretsResolutionErrorV1,
+    run_runtime_process_staging_from_environment_v1, RuntimeProcessStagingErrorV1,
 };
 
-fn main() -> ExitCode {
-    install_panic_hook();
-    match RuntimeConfigV1::from_process_environment() {
-        Ok(config) => match resolve_runtime_secrets_v1(&config) {
-            Ok(_) => {
-                emit_status("runtime_not_composed", None);
+#[derive(Clone, Copy)]
+enum RuntimeProcessExitStatusV1 {
+    RecoveryIterationReadyAndClosed,
+    Failed(RuntimeProcessStagingErrorV1),
+}
+
+impl RuntimeProcessExitStatusV1 {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::RecoveryIterationReadyAndClosed => {
+                "runtime_staging_recovery_iteration_ready_and_closed"
+            }
+            Self::Failed(error) => error.code(),
+        }
+    }
+
+    const fn context(self) -> Option<&'static str> {
+        match self {
+            Self::RecoveryIterationReadyAndClosed => None,
+            Self::Failed(error) => error.context(),
+        }
+    }
+
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::RecoveryIterationReadyAndClosed => ExitCode::from(70),
+            Self::Failed(error) if error.configuration_class() => ExitCode::from(78),
+            Self::Failed(RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable)
+            | Self::Failed(RuntimeProcessStagingErrorV1::OwnerHeldShutdown(_))
+            | Self::Failed(RuntimeProcessStagingErrorV1::PausedConnectedShutdown(_))
+            | Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_))
+            | Self::Failed(RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(_))
+            | Self::Failed(RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(_)) => {
                 ExitCode::from(70)
             }
-            Err(error) => {
-                emit_secret_error(error);
-                ExitCode::from(78)
-            }
-        },
-        Err(error) => {
-            emit_configuration_error(error);
-            ExitCode::from(78)
+            Self::Failed(_) => ExitCode::from(69),
         }
     }
 }
 
-fn emit_secret_error(error: RuntimeSecretsResolutionErrorV1) {
-    emit_status(error.code(), error.context());
-}
-
-fn emit_configuration_error(error: RuntimeConfigErrorV1) {
-    let context = error.field().map(|field| field.code());
-    emit_status(error.code(), context);
+fn main() -> ExitCode {
+    install_panic_hook();
+    let status = match run_runtime_process_staging_from_environment_v1() {
+        Ok(_) => RuntimeProcessExitStatusV1::RecoveryIterationReadyAndClosed,
+        Err(error) => RuntimeProcessExitStatusV1::Failed(error),
+    };
+    emit_status(status.code(), status.context());
+    status.exit_code()
 }
 
 fn emit_status(status: &str, context: Option<&str>) {
@@ -53,16 +73,91 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starring_runtime::{
+        RuntimeBuildRevisionBootstrapErrorV1, RuntimeClosedRecoveryProcessCleanupFailureV2,
+        RuntimeClosedRecoveryProcessShutdownErrorV2, RuntimeConfigErrorV1,
+        RuntimeConfigurationFieldV1, RuntimeDatabasePoolShutdownErrorV1,
+        RuntimeDiscordGatewayShutdownFailureV1, RuntimeGatewayOwnerShutdownFailureV1,
+        RuntimeOwnerHeldProcessShutdownErrorV1, RuntimePausedConnectedProcessShutdownErrorV1,
+        RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
+        RuntimeRecoveryPendingProcessCleanupFailureV2,
+        RuntimeRecoveryPendingProcessShutdownErrorV2,
+    };
 
     #[test]
-    fn configuration_errors_emit_only_finite_status_context() {
-        let error = RuntimeConfigErrorV1::InvalidValue(
-            starring_runtime::RuntimeConfigurationFieldV1::HealthBindAddress,
+    fn status_codes_context_and_exit_classes_are_finite() {
+        let staged = RuntimeProcessExitStatusV1::RecoveryIterationReadyAndClosed;
+        let configuration =
+            RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::Configuration(
+                RuntimeConfigErrorV1::Missing(RuntimeConfigurationFieldV1::HealthBindAddress),
+            ));
+        let build =
+            RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::BuildRevision(
+                RuntimeBuildRevisionBootstrapErrorV1::Invalid,
+            ));
+        let runtime = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable,
         );
-        assert_eq!(error.code(), "runtime_config_invalid_value");
+        let shutdown =
+            RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::OwnerHeldShutdown(
+                RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwnerAndDatabase {
+                    owner: RuntimeGatewayOwnerShutdownFailureV1::DeadlineElapsed,
+                    database: RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+                },
+            ));
+        let paused_shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::PausedConnectedShutdown(
+                RuntimePausedConnectedProcessShutdownErrorV1::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::DeadlineElapsed,
+                ),
+            ),
+        );
+        let recovery_pending_shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(
+                RuntimeRecoveryPendingProcessShutdownErrorV2::Cleanup(
+                    RuntimeRecoveryPendingProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::CloseDeadlineElapsed,
+                    ),
+                ),
+            ),
+        );
+        let closed_recovery_shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(
+                RuntimeClosedRecoveryProcessShutdownErrorV2::Cleanup(
+                    RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+                    ),
+                ),
+            ),
+        );
+        let recovery_iteration_ready_shutdown = RuntimeProcessExitStatusV1::Failed(
+            RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(
+                RuntimeRecoveryIterationReadyProcessShutdownErrorV2::Cleanup(
+                    RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
+                    ),
+                ),
+            ),
+        );
+
         assert_eq!(
-            error.field().map(|field| field.code()),
-            Some("health_bind_address")
+            staged.code(),
+            "runtime_staging_recovery_iteration_ready_and_closed"
+        );
+        assert_eq!(staged.context(), None);
+        assert_eq!(staged.exit_code(), ExitCode::from(70));
+        assert_eq!(configuration.code(), "runtime_config_missing");
+        assert_eq!(configuration.context(), Some("health_bind_address"));
+        assert_eq!(configuration.exit_code(), ExitCode::from(78));
+        assert_eq!(build.exit_code(), ExitCode::from(78));
+        assert_eq!(runtime.exit_code(), ExitCode::from(70));
+        assert_eq!(shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(paused_shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(recovery_pending_shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(closed_recovery_shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(
+            recovery_iteration_ready_shutdown.exit_code(),
+            ExitCode::from(70)
         );
     }
 }

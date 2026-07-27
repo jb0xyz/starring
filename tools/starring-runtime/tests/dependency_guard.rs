@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 
 fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) {
     let mut entries = fs::read_dir(directory)
@@ -60,6 +61,21 @@ fn package_dependencies() -> Vec<serde_json::Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+fn resolved_package_metadata() -> serde_json::Value {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn has_rust_comment(source: &str) -> bool {
@@ -473,16 +489,31 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             .map(|(path, _)| path.to_str().unwrap())
             .collect::<Vec<_>>(),
         [
+            "src/build_revision.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
+            "src/controller_identity.rs",
             "src/database.rs",
+            "src/discord.rs",
             "src/gateway.rs",
+            "src/gateway_owner_startup.rs",
             "src/gateway_owner_startup_watchdog.rs",
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
+            "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/process/closed.rs",
+            "src/process/connected.rs",
+            "src/process/owner.rs",
+            "src/process/readiness.rs",
+            "src/process/recovery.rs",
+            "src/process.rs",
+            "src/process_identity.rs",
+            "src/process_startup.rs",
+            "src/recovery_identity.rs",
             "src/registry.rs",
             "src/secret.rs",
+            "src/startup.rs",
             "src/startup_recovery_observation.rs",
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
@@ -493,10 +524,27 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
 
 #[test]
 fn direct_dependencies_are_the_exact_runtime_composition_surface() {
-    let mut dependencies = package_dependencies()
+    let package_dependencies = package_dependencies();
+    let twilight_gateway = package_dependencies
+        .iter()
+        .find(|dependency| dependency["name"] == "twilight-gateway")
+        .unwrap();
+    assert_eq!(twilight_gateway["rename"], "paused-discord-gateway");
+    assert_eq!(
+        twilight_gateway["source"],
+        "git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b"
+    );
+    assert_eq!(twilight_gateway["uses_default_features"], false);
+    assert_eq!(
+        twilight_gateway["features"],
+        serde_json::json!(["rustls-platform-verifier"])
+    );
+    let mut dependencies = package_dependencies
         .into_iter()
         .map(|dependency| {
-            assert!(dependency["rename"].is_null());
+            if dependency["name"] != "twilight-gateway" {
+                assert!(dependency["rename"].is_null());
+            }
             (
                 dependency["name"].as_str().unwrap().to_string(),
                 dependency["kind"].as_str().map(str::to_string),
@@ -518,12 +566,42 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
             ("chrono".to_string(), Some("dev".to_string())),
+            ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
             ("tokio".to_string(), None),
+            ("twilight-gateway".to_string(), None),
             ("zeroize".to_string(), None),
         ]
+    );
+}
+
+#[test]
+fn paused_discord_gateway_dependency_is_feature_isolated() {
+    let metadata = resolved_package_metadata();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| {
+            package["name"] == "twilight-gateway"
+                && package["version"] == "0.17.1"
+                && package["source"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with("git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b#"))
+        })
+        .unwrap();
+    let package_id = package["id"].as_str().unwrap();
+    let resolved = metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == package_id)
+        .unwrap();
+    assert_eq!(
+        resolved["features"],
+        serde_json::json!(["rustls-platform-verifier"])
     );
 }
 
@@ -542,8 +620,12 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             "reqwest",
             "twilight_gateway",
             "twilight_http",
+            "twilight_model",
             "TcpListener",
         ] {
+            if path == Path::new("src/discord.rs") && forbidden == "twilight_gateway" {
+                continue;
+            }
             assert!(
                 !contains_identifier(&source, forbidden),
                 "{}: {forbidden}",
@@ -569,13 +651,169 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         }
         if path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
+            && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+            && path != Path::new("src/discord.rs")
+            && path != Path::new("src/process/closed.rs")
+            && path != Path::new("src/process/connected.rs")
+            && path != Path::new("src/process/readiness.rs")
+            && path != Path::new("src/process/recovery.rs")
+            && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
         }
+        if path != Path::new("src/process_identity.rs")
+            && path != Path::new("src/controller_identity.rs")
+            && path != Path::new("src/recovery_identity.rs")
+        {
+            assert!(
+                !contains_identifier(&source, "getrandom"),
+                "{}",
+                path.display()
+            );
+        }
+        if path != Path::new("src/build_revision.rs") {
+            assert!(!source.contains("option_env!"), "{}", path.display());
+        }
     }
+}
+
+#[test]
+fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
+    let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!package_root.join("build.rs").exists());
+    let build_revision = include_str!("../src/build_revision.rs");
+    let production = source_before_test_module(build_revision);
+    for required in [
+        "option_env!(\"STARRING_RUNTIME_BUILD_REVISION\")",
+        "const GIT_REVISION_BYTES: usize = 40;",
+        "pub(crate) struct CompiledRuntimeBuildRevisionV1 {",
+        "revision: RuntimeBuildRevisionV1,",
+        "pub(crate) fn bootstrap_compiled_runtime_build_revision_v1(",
+        "pub(crate) fn into_revision(self) -> RuntimeBuildRevisionV1",
+        "self.revision",
+        "RuntimeBuildRevisionV1::parse(value)",
+        "RuntimeBuildRevisionBootstrapErrorV1(<redacted>)",
+        "CompiledRuntimeBuildRevisionV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for forbidden in [
+        "std::env",
+        "env::var",
+        "Command::new",
+        "std::process",
+        "git rev-parse",
+        "trim(",
+        "to_ascii_lowercase",
+        "STARRING_APPROVED_RELEASE_REVISION",
+        "pub struct CompiledRuntimeBuildRevisionV1",
+        "pub fn bootstrap_compiled_runtime_build_revision_v1",
+        "fn revision(&self)",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let attributes = declaration_attribute_block(production, "CompiledRuntimeBuildRevisionV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(attributes, forbidden),
+            "CompiledRuntimeBuildRevisionV1: {forbidden}"
+        );
+        assert!(
+            !implements_trait(production, "CompiledRuntimeBuildRevisionV1", forbidden,),
+            "CompiledRuntimeBuildRevisionV1: {forbidden}"
+        );
+    }
+    assert!(CI_WORKFLOW.contains(concat!(
+        "STARRING_RUNTIME_BUILD_REVISION: ",
+        "\"${{ github.sha }}\""
+    )));
+    assert!(!CI_WORKFLOW.contains("STARRING_APPROVED_RELEASE_REVISION"));
+    assert!(CI_WORKFLOW.contains("STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION: \"1\""));
+}
+
+#[test]
+fn startup_identity_entropy_is_exact_independent_and_confined() {
+    let encoding = source_before_test_module(include_str!("../src/identity_encoding.rs"));
+    let process = source_before_test_module(include_str!("../src/process_identity.rs"));
+    let controller = source_before_test_module(include_str!("../src/controller_identity.rs"));
+    for required in [
+        "pub(crate) const RUNTIME_IDENTITY_ENTROPY_BYTES: usize = 16;",
+        "const LOWER_HEX: &[u8; 16] = b\"0123456789abcdef\";",
+        "pub(crate) fn encode_runtime_identity_lower_hex_v1(",
+        "String::with_capacity(RUNTIME_IDENTITY_ENTROPY_BYTES * 2)",
+    ] {
+        assert!(encoding.contains(required), "{required}");
+    }
+    assert!(!encoding.contains("getrandom"));
+    for required in [
+        "ProcessInstanceId::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeProcessInstanceIdGenerationErrorV1(<redacted>)",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    for required in [
+        "ControllerId::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeControllerIdGenerationErrorV1(<redacted>)",
+    ] {
+        assert!(controller.contains(required), "{required}");
+    }
+    for forbidden in [
+        "SystemTime",
+        "Instant",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "/dev/urandom",
+        "thread_rng",
+        "StdRng",
+        "getrandom::fill_uninit",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
+    ] {
+        assert!(!process.contains(forbidden), "process: {forbidden}");
+        assert!(!controller.contains(forbidden), "controller: {forbidden}");
+    }
+    let process_wrapper = braced_declaration(
+        process,
+        "pub(crate) fn generate_runtime_process_instance_id_v1(",
+    );
+    let process_seam = braced_declaration(
+        process,
+        "fn generate_runtime_process_instance_id_with_v1<F>(",
+    );
+    let controller_wrapper = braced_declaration(
+        controller,
+        "pub(crate) fn generate_runtime_controller_id_v1(",
+    );
+    let controller_seam =
+        braced_declaration(controller, "fn generate_runtime_controller_id_with_v1<F>(");
+    for (wrapper, seam) in [
+        (process_wrapper, process_seam),
+        (controller_wrapper, controller_seam),
+    ] {
+        assert_eq!(wrapper.matches("getrandom::fill").count(), 1);
+        assert_eq!(seam.matches("getrandom::fill").count(), 0);
+        assert!(seam.contains("F: FnOnce("));
+        assert!(seam.contains("&mut [u8; RUNTIME_IDENTITY_ENTROPY_BYTES]"));
+        assert!(seam.contains("let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];"));
+        assert_eq!(seam.matches("fill(&mut bytes)?;").count(), 1);
+    }
+    assert!(!process.contains("ControllerId"));
+    assert!(!process.contains("controller_id"));
+    assert!(!controller.contains("ProcessInstanceId"));
+    assert!(!controller.contains("process_instance_id"));
+    assert!(!process.contains("pub fn generate_runtime_process_instance_id_v1"));
+    assert!(!controller.contains("pub fn generate_runtime_controller_id_v1"));
 }
 
 #[test]
@@ -587,10 +825,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         .map(|(_, source)| source.as_str())
         .unwrap();
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
-        if path == Path::new("src/gateway.rs") {
+        if path == Path::new("src/gateway.rs") || path == Path::new("src/discord.rs") {
             continue;
         }
-        if path == Path::new("src/gateway_owner_startup_watchdog.rs")
+        if path == Path::new("src/gateway_owner_startup.rs")
+            || path == Path::new("src/gateway_owner_startup_watchdog.rs")
             || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
         {
             for identifier in source
@@ -626,12 +865,38 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_startup_observation = path
                 == Path::new("src/startup_recovery_observation.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_build_revision = path == Path::new("src/build_revision.rs")
+                && identifier == "automation_runtime_controller";
+            let allowed_process_foundation = path == Path::new("src/process.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
+                );
+            let allowed_paused_connected = path == Path::new("src/process/connected.rs")
+                && identifier == "automation_runtime_worker";
+            let allowed_recovery_process = path == Path::new("src/process/recovery.rs")
+                && identifier == "automation_runtime_worker";
+            let allowed_process_identity = path == Path::new("src/process_identity.rs")
+                && identifier == "automation_runtime_convergence";
+            let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
+                && identifier == "automation_runtime_convergence";
+            let allowed_recovery_identity = path == Path::new("src/recovery_identity.rs")
+                && identifier == "automation_runtime_controller";
             assert!(
                 !identifier.ends_with("V3")
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
                         || allowed_startup_observation
+                        || allowed_build_revision
+                        || allowed_process_foundation
+                        || allowed_paused_connected
+                        || allowed_recovery_process
+                        || allowed_process_identity
+                        || allowed_controller_identity
+                        || allowed_recovery_identity
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -656,7 +921,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerStartupWatchdogStartErrorV1::ShardMismatch",
         "pub fn observe_paused_connected_gateway_v2(",
         "require_healthy_paused_control",
-        "self.control.issue_ready_lease(epoch)",
+        "self.connection_observer.issue_ready_lease(epoch)",
         "RuntimePausedGatewayObservationV2::new(",
         "RuntimePausedGatewaySequenceV2::new(",
         "control.admission_snapshot_watch()",
@@ -674,7 +939,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "pub(crate) fn into_recovery_pending_binding_v2(",
         "pub(crate) fn pending_section_v2<'a>(",
         "pub(crate) fn committed_pending_section_v2<'a>(",
-        "pub(crate) async fn commit_prepared_owner_v2(",
+        "pub(crate) async fn commit_prepared_owner_in_place_v2(",
         "impl Drop for RuntimeEmergencyGatewaySectionV2<'_>",
         "impl Drop for RuntimeRecoveryPendingGatewayBindingV2",
         "RuntimeRecoveryPendingGatewayBindingV2(<redacted>)",
@@ -761,7 +1026,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Commit"));
     for required in [
         "pub(crate) async fn prepare_closed_recovery_v2(\n        mut self,",
+        "pub(crate) async fn prepare_closed_recovery_in_place_v2(",
+        "pub(crate) fn try_into_prepared_closed_recovery_v2(",
         "pub(crate) async fn abort_and_shutdown_v2(\n        mut self,",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
         "pub(crate) async fn commit_closed_recovery_v2(\n        mut self,",
         "const CLOSED_RECOVERY_COMMAND_CAPACITY: usize = 1;",
         "RuntimeGatewayOwnerClosedRecoveryCommandV2::Prepare",
@@ -793,8 +1061,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     assert!(owner_supervisor.contains(concat!(
         "pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {\n",
         "    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,\n",
+        "    prepared_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,\n",
         "}"
     )));
+    assert!(!owner_supervisor.contains("prepare_closed_recovery_observation_v2"));
     assert!(owner_supervisor.contains(concat!(
         "pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {\n",
         "    _private: (),\n",
@@ -910,11 +1180,1031 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
 }
 
 #[test]
+fn paused_discord_connection_is_single_owned_closed_and_bounded() {
+    let discord = source_before_test_module(include_str!("../src/discord.rs"));
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let connected = include_str!("../src/process/connected.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let watchdog = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "Shard::new(ShardId::ONE, token, Intents::empty())",
+        "EventTypeFlags::READY",
+        "EventTypeFlags::RESUMED",
+        "EventTypeFlags::GATEWAY_RECONNECT",
+        "EventTypeFlags::GATEWAY_INVALIDATE_SESSION",
+        "GatewayCommandAckV3::Paused { .. }",
+        "GatewayCommandAckV3::AdmissionResumed { .. }",
+        "RuntimeDiscordGatewayExitV1::AdmissionOpened",
+        "RuntimeDiscordGatewayTransportStateV1::Connecting",
+        "RuntimeDiscordGatewayTransportStateV1::Active",
+        "RuntimeDiscordGatewayTransportStateV1::Disconnected",
+        "GatewayCommandAckV3::Draining { .. }",
+        "control.mark_connected(GatewayReadyKindV3::Ready)",
+        "control.mark_connected(GatewayReadyKindV3::Resumed)",
+        "control.mark_disconnected(GatewayDisconnectKindV3::Reconnect)",
+        "driver.close_until(close_deadline).await",
+        "control.mark_stopped()",
+        "self.shard.close(CloseFrame::NORMAL)",
+        "actor_abort: AbortHandle",
+        "control_abort: AbortHandle",
+        "join_task: Option<JoinHandle<bool>>",
+        "impl Drop for RuntimeDiscordControlTaskV1",
+        "let actor_joined = actor_task.await.is_ok();",
+        "let _control_result = control_task.await;",
+        "let _stopped = stopped_sender.send(true);",
+        "self.abort_tasks();",
+        "finish_runtime_discord_gateway_without_transport_v1(",
+        "finish_runtime_discord_gateway_if_connected_v1(",
+        "start_receiver.await.is_ok()",
+        "wait_for_lifecycle_drain_v1(",
+        "RuntimeDiscordGatewaySupervisorV1(<redacted>)",
+    ] {
+        assert!(discord.contains(required), "{required}");
+    }
+    assert_eq!(discord.matches("runtime.spawn(async move").count(), 2);
+    for forbidden in [
+        "INTERACTION_CREATE",
+        "twilight_http",
+        "Client",
+        "run_shared_gateway_v3",
+        "resume_admission",
+        "issue_ready_lease",
+        "bot_runtime",
+        "InteractionCreate",
+        "InteractionResponder",
+        "transport_started",
+        "catch_unwind",
+    ] {
+        assert!(!discord.contains(forbidden), "discord: {forbidden}");
+    }
+
+    for required in [
+        "_runtime: Option<SharedGatewayRuntimeHalfV3>",
+        "self._runtime.take()",
+        "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
+        "pub(crate) fn admission_change_watch_v1(",
+        "pub(crate) fn begin_discord_drain_v1(",
+        "run_runtime_discord_control_v1(",
+        "control.next_lifecycle()",
+        "prepare_twilight_runtime_discord_gateway_driver_v1(",
+        "prepare_discord_gateway_start_v1(operation_cutoff)",
+        "supervisor.release_start_v1()",
+        "owner_discord_attachment:",
+        "abort_handle.abort()",
+        "fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>>",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+    assert_eq!(gateway.matches("start_discord_gateway_v1(").count(), 1);
+    assert_eq!(
+        gateway
+            .matches("prepare_twilight_runtime_discord_gateway_driver_v1(")
+            .count(),
+        1
+    );
+
+    for required in [
+        "pub(crate) struct RuntimeDiscordStartingProcessV1",
+        "pub(crate) struct RuntimePausedConnectedProcessV1",
+        "owner_held: RuntimeOwnerHeldProcessV1",
+        "discord: RuntimeDiscordGatewaySupervisorV1",
+        "paused_gateway: RuntimePausedGatewayObservationV2",
+        "pub(crate) async fn wait_for_paused_connected_v1(",
+        ".observe_paused_connected_gateway_v2()",
+        "Ok(current) if current == first => {",
+        "self.require_live_paused_connection_v1()?",
+        "pub(crate) fn into_paused_connected_v1(",
+        "RuntimeDiscordStartingProcessV1(<redacted>)",
+        "RuntimePausedConnectedProcessV1(<redacted>)",
+        "shutdown_paused_discord_owner_v1",
+        ".begin_discord_drain_v1()",
+        "let owner_shutdown = owner_held.shutdown().await;",
+    ] {
+        assert!(connected.contains(required), "{required}");
+    }
+    let connected_attributes =
+        declaration_attribute_block(connected, "RuntimePausedConnectedProcessV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(connected_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            connected,
+            "RuntimePausedConnectedProcessV1",
+            forbidden,
+        ));
+    }
+    for marker in [
+        "pub(crate) struct RuntimeDiscordStartingProcessV1",
+        "pub(crate) struct RuntimePausedConnectedProcessV1",
+    ] {
+        let declaration = braced_declaration(connected, marker);
+        assert!(declaration.find("discord:").unwrap() < declaration.find("owner_held:").unwrap());
+    }
+    let connected_shutdown =
+        braced_declaration(connected, "async fn shutdown_paused_discord_owner_v1(");
+    let discord_shutdown = connected_shutdown.find(".shutdown_until(").unwrap();
+    let owner_shutdown = connected_shutdown
+        .find("let owner_shutdown = owner_held.shutdown().await;")
+        .unwrap();
+    assert!(discord_shutdown < owner_shutdown);
+    let start = braced_declaration(gateway, "pub(crate) async fn start_discord_gateway_v1(");
+    let driver = start
+        .find("prepare_twilight_runtime_discord_gateway_driver_v1(")
+        .unwrap();
+    let prepare = start
+        .find("prepare_discord_gateway_start_v1(operation_cutoff)")
+        .unwrap();
+    let spawn = start.find("start_runtime_discord_gateway_v1(").unwrap();
+    let attach = start.find("attach_discord_supervisor_v1").unwrap();
+    let release = start.find("supervisor.release_start_v1()").unwrap();
+    assert!(driver < prepare && prepare < spawn && spawn < attach && attach < release);
+    let prepare = braced_declaration(gateway, "async fn prepare_discord_gateway_start_v1(");
+    let reserve = prepare.find("reserve_discord_supervisor_v1").unwrap();
+    let recheck = prepare[reserve..]
+        .find("self.owner_invalidated.load(Ordering::Acquire)")
+        .map(|offset| reserve + offset)
+        .unwrap();
+    let runtime_take = prepare.find("self._runtime.take()").unwrap();
+    assert!(reserve < recheck && recheck < runtime_take);
+    for forbidden in [
+        "resume_admission",
+        "issue_ready_lease",
+        "dispatch",
+        "execute",
+        "serve",
+        "activate",
+        "deploy",
+        "twilight",
+    ] {
+        assert!(
+            !contains_identifier(connected, forbidden),
+            "connected: {forbidden}"
+        );
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+    assert!(!contains_identifier(connected, "readiness"));
+    assert!(!contains_identifier(connected, "recovery"));
+    assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
+    assert!(!library.contains("RuntimePausedConnectedProcessV1"));
+
+    let watchdog_supervisor = braced_declaration(
+        watchdog,
+        "async fn run_gateway_owner_startup_watchdog_v1<P>(",
+    );
+    let invalidation = watchdog_supervisor
+        .rfind("guard.invalidate_now();")
+        .unwrap();
+    let wait = watchdog_supervisor[invalidation..]
+        .find("wait_for_emergency_gateway_shutdown_v1(")
+        .map(|offset| invalidation + offset)
+        .unwrap();
+    let release = watchdog_supervisor[wait..]
+        .find("release_gateway_owner_v1(&port, lease_id, cleanup_deadline)")
+        .map(|offset| wait + offset)
+        .unwrap();
+    assert!(invalidation < wait && wait < release);
+}
+
+#[test]
+fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
+    let recovery = source_before_test_module(include_str!("../src/process/recovery.rs"));
+    let identity = source_before_test_module(include_str!("../src/recovery_identity.rs"));
+    let closed = include_str!("../src/closed_recovery.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct RuntimeRecoveryPendingProcessV2",
+        "discord: RuntimeDiscordGatewaySupervisorV1,",
+        "foundation: RuntimeProcessFoundationV1,",
+        "pending: RuntimeClosedRecoveryPendingPhaseV2,",
+        "RuntimeRecoveryPendingProcessV2(<redacted>)",
+        "pub(crate) async fn into_recovery_pending_v2(",
+        "self.require_current_paused_connection_v1()",
+        "generate_runtime_recovery_id_v2()",
+        "owner.prepare_closed_recovery_in_place_v2()",
+        "owner.try_into_prepared_closed_recovery_v2()",
+        "foundation.databases.verify_readiness_v1()",
+        "require_prepared_paused_connection_v2(",
+        "begin_initial_empty_recovery_retained_v2(",
+        "&paused_gateway,",
+        ".revalidate_v2()",
+        "shutdown_prepared_recovery_v2(",
+        "shutdown_pending_recovery_v2(",
+        "finish_runtime_owner_held_process_shutdown_v1(",
+        "finish_paused_connected_shutdown_v1(",
+        "RuntimeProcessRecoveryPendingTransitionErrorV2(<redacted>)",
+        "RuntimeRecoveryPendingProcessShutdownErrorV2(<redacted>)",
+    ] {
+        assert!(recovery.contains(required), "{required}");
+    }
+    let transition = braced_declaration(recovery, "pub(crate) async fn into_recovery_pending_v2(");
+    let initial_check = transition
+        .find("self.require_current_paused_connection_v1()")
+        .unwrap();
+    let recovery_id = transition
+        .find("generate_runtime_recovery_id_v2()")
+        .unwrap();
+    let prepare = transition
+        .find("owner.prepare_closed_recovery_in_place_v2()")
+        .unwrap();
+    let prepared = transition
+        .find("owner.try_into_prepared_closed_recovery_v2()")
+        .unwrap();
+    let readiness = transition
+        .find("foundation.databases.verify_readiness_v1()")
+        .unwrap();
+    let exact_recheck = transition
+        .find("require_prepared_paused_connection_v2(")
+        .unwrap();
+    let begin = transition
+        .find("begin_initial_empty_recovery_retained_v2(")
+        .unwrap();
+    let final_recheck = transition[begin..]
+        .find(".revalidate_v2()")
+        .map(|offset| begin + offset)
+        .unwrap();
+    assert!(
+        initial_check < recovery_id
+            && recovery_id < prepare
+            && prepare < prepared
+            && prepared < readiness
+            && readiness < exact_recheck
+            && exact_recheck < begin
+            && begin < final_recheck
+    );
+    assert_eq!(
+        transition
+            .matches("generate_runtime_recovery_id_v2()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        transition
+            .matches("foundation.databases.verify_readiness_v1()")
+            .count(),
+        1
+    );
+    assert!(!transition.contains("initial_readiness()"));
+    for shutdown_name in [
+        "async fn shutdown_prepared_recovery_v2(",
+        "async fn shutdown_pending_recovery_v2(",
+    ] {
+        let shutdown = braced_declaration(recovery, shutdown_name);
+        let discord = shutdown.find(".shutdown_until(").unwrap();
+        let owner = shutdown[discord..]
+            .find("shutdown_until_v2(")
+            .map(|offset| discord + offset)
+            .unwrap();
+        let database = shutdown.find("foundation.shutdown().await").unwrap();
+        assert!(discord < owner && owner < database, "{shutdown_name}");
+    }
+    let state_attributes = declaration_attribute_block(recovery, "RuntimeRecoveryPendingProcessV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(state_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            recovery,
+            "RuntimeRecoveryPendingProcessV2",
+            forbidden,
+        ));
+    }
+    for required in [
+        "getrandom::fill(bytes)",
+        "RuntimeRecoveryIdV2::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeRecoveryIdGenerationErrorV2(<redacted>)",
+        "let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];",
+        "fill(&mut bytes)?;",
+    ] {
+        assert!(identity.contains(required), "{required}");
+    }
+    assert_eq!(identity.matches("getrandom::fill").count(), 1);
+    assert_eq!(
+        recovery
+            .matches("generate_runtime_recovery_id_v2()")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "SystemTime",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "thread_rng",
+        "StdRng",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
+    ] {
+        assert!(!identity.contains(forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "commit_owner_v2",
+        "observe_startup_recovery_v2",
+    ] {
+        assert!(!contains_identifier(recovery, forbidden), "{forbidden}");
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+    for required in [
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+        ".abort_and_shutdown_until_v2(cleanup_deadline)",
+        "expected_paused_gateway: &RuntimePausedGatewayObservationV2,",
+        ".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)",
+    ] {
+        assert!(closed.contains(required), "{required}");
+    }
+    assert!(closed.contains(concat!(
+        "#[cfg(test)]\n",
+        "pub(crate) fn begin_initial_empty_recovery_v2("
+    )));
+    assert!(!library.contains("RuntimeRecoveryPendingProcessV2"));
+    assert!(!library.contains("RuntimeClosedRecoveryPendingPhaseV2"));
+    assert!(!library.contains("RuntimeGatewayOwnerPreparedClosedRecoveryV2"));
+}
+
+#[test]
+fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
+    let sources = source_files();
+    let process = source_before_test_module(include_str!("../src/process/closed.rs"));
+    let closed = include_str!("../src/closed_recovery.rs");
+    let owner = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct RuntimeClosedRecoveryProcessV2",
+        "discord: RuntimeDiscordGatewaySupervisorV1,",
+        "foundation: RuntimeProcessFoundationV1,",
+        "session: RuntimeClosedRecoverySessionV2,",
+        "RuntimeClosedRecoveryProcessV2(<redacted>)",
+        "pub(crate) async fn into_closed_recovery_v2(",
+        "require_current_recovery_pending_v2(",
+        "pending.commit_cutoff_v2()",
+        "pending.commit_owner_in_place_v2()",
+        "await_closed_recovery_commit_v2(",
+        "pending.try_into_committed_session_v2()",
+        "let session_validation = session",
+        "shutdown_pending_commit_v2(",
+        "shutdown_committed_recovery_v2(",
+        "RuntimeProcessClosedRecoveryTransitionErrorV2(<redacted>)",
+        "RuntimeClosedRecoveryProcessShutdownErrorV2(<redacted>)",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    let transition = braced_declaration(process, "pub(crate) async fn into_closed_recovery_v2(");
+    let preflight = transition
+        .find("require_current_recovery_pending_v2(")
+        .unwrap();
+    let cutoff = transition.find("pending.commit_cutoff_v2()").unwrap();
+    let commit = transition
+        .find("pending.commit_owner_in_place_v2()")
+        .unwrap();
+    let race = transition.find("await_closed_recovery_commit_v2(").unwrap();
+    let conversion = transition
+        .find("pending.try_into_committed_session_v2()")
+        .unwrap();
+    let revalidate = transition[conversion..]
+        .find(".revalidate_v2()")
+        .map(|offset| conversion + offset)
+        .unwrap();
+    let final_discord = transition[revalidate..]
+        .find("discord_transition_failure_v1(&discord)")
+        .map(|offset| revalidate + offset)
+        .unwrap();
+    let final_budget = transition[final_discord..]
+        .find("foundation.startup_budget.operation_is_open()")
+        .map(|offset| final_discord + offset)
+        .unwrap();
+    let validation_consumed = transition[final_budget..]
+        .find("session_validation.err()")
+        .map(|offset| final_budget + offset)
+        .unwrap();
+    let failed_session_cleanup = transition[validation_consumed..]
+        .find("shutdown_committed_recovery_v2(")
+        .map(|offset| validation_consumed + offset)
+        .unwrap();
+    let construct = transition
+        .find("Ok(RuntimeClosedRecoveryProcessV2")
+        .unwrap();
+    assert!(
+        preflight < cutoff
+            && cutoff < commit
+            && commit < race
+            && race < conversion
+            && conversion < revalidate
+            && revalidate < final_discord
+            && final_discord < final_budget
+            && final_budget < validation_consumed
+            && validation_consumed < failed_session_cleanup
+            && failed_session_cleanup < construct
+    );
+    assert_eq!(
+        transition
+            .matches("pending.commit_owner_in_place_v2()")
+            .count(),
+        1
+    );
+    for operation in [
+        "discord_transition_failure_v1(&discord)",
+        "foundation.startup_budget.operation_is_open()",
+        "session_validation.err()",
+        "shutdown_committed_recovery_v2(",
+    ] {
+        assert_eq!(transition.matches(operation).count(), 1, "{operation}");
+    }
+    assert_eq!(transition.matches(".revalidate_v2()").count(), 1);
+    let pending_preflight = braced_declaration(process, "fn require_current_recovery_pending_v2(");
+    let initial_budget = pending_preflight
+        .find("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    let initial_discord = pending_preflight
+        .find("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let pending_validation = pending_preflight
+        .find("pending\n        .revalidate_v2()")
+        .unwrap();
+    let final_discord = pending_preflight
+        .rfind("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let final_budget = pending_preflight
+        .rfind("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    assert!(
+        initial_budget < initial_discord
+            && initial_discord < pending_validation
+            && pending_validation < final_discord
+            && final_discord < final_budget
+    );
+    assert_eq!(
+        pending_preflight
+            .matches("foundation.startup_budget.operation_is_open()")
+            .count(),
+        2
+    );
+    assert_eq!(
+        pending_preflight
+            .matches("discord_transition_failure_v1(discord)")
+            .count(),
+        2
+    );
+    assert_eq!(pending_preflight.matches(".revalidate_v2()").count(), 1);
+    assert_eq!(
+        transition
+            .matches("pending.try_into_committed_session_v2()")
+            .count(),
+        1
+    );
+    let race_helper = braced_declaration(process, "async fn await_closed_recovery_commit_v2<");
+    let cutoff_branch = race_helper.find("Instant::now() >= commit_cutoff").unwrap();
+    let biased = race_helper.find("biased;").unwrap();
+    let deadline = race_helper.find("sleep_until(").unwrap();
+    let discord = race_helper
+        .find("transition = &mut discord_terminal")
+        .unwrap();
+    let commit_result = race_helper.find("result = &mut commit").unwrap();
+    assert!(cutoff_branch < biased && biased < deadline && deadline < discord);
+    assert!(discord < commit_result);
+    for shutdown_name in [
+        "async fn shutdown_pending_commit_v2(",
+        "async fn shutdown_committed_recovery_v2(",
+    ] {
+        let shutdown = braced_declaration(process, shutdown_name);
+        let discord = shutdown.find(".shutdown_until(").unwrap();
+        let owner = shutdown[discord..]
+            .find(".abort_and_shutdown_until_v2(")
+            .map(|offset| discord + offset)
+            .unwrap();
+        let database = shutdown.find("foundation.shutdown().await").unwrap();
+        assert!(discord < owner && owner < database, "{shutdown_name}");
+    }
+    let state_attributes = declaration_attribute_block(process, "RuntimeClosedRecoveryProcessV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(state_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            process,
+            "RuntimeClosedRecoveryProcessV2",
+            forbidden,
+        ));
+    }
+    for required in [
+        "committed_closed_recovery_observation:",
+        "commit_closed_recovery_in_place_v2(",
+        "try_into_committed_closed_recovery_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+    ] {
+        assert!(owner.contains(required), "{required}");
+    }
+    for required in [
+        "pub(crate) fn commit_cutoff_v2(",
+        "pub(crate) async fn commit_owner_in_place_v2(",
+        "pub(crate) fn try_into_committed_session_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+    ] {
+        assert!(closed.contains(required), "{required}");
+    }
+    assert!(closed.contains(concat!(
+        "#[cfg(test)]\n",
+        "    pub(crate) async fn commit_owner_v2("
+    )));
+    assert!(owner.contains(concat!(
+        "#[cfg(test)]\n",
+        "    pub(crate) async fn commit_closed_recovery_v2("
+    )));
+    assert!(gateway.contains("commit_prepared_owner_in_place_v2("));
+    assert!(gateway.contains("&mut RuntimeGatewayOwnerPreparedClosedRecoveryV2"));
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        for method in ["commit_owner_in_place_v2", "try_into_committed_session_v2"] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/process/closed.rs")
+                        || path
+                            == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs",),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        for method in [
+            "commit_closed_recovery_in_place_v2",
+            "try_into_committed_closed_recovery_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/gateway.rs")
+                        || path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/gateway_owner_startup_watchdog.rs")
+                        || path
+                            == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs",),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        if contains_identifier(source, "commit_prepared_owner_in_place_v2") {
+            assert!(
+                path == Path::new("src/gateway.rs") || path == Path::new("src/closed_recovery.rs"),
+                "{}: commit_prepared_owner_in_place_v2",
+                path.display()
+            );
+        }
+    }
+    for forbidden in [
+        "refresh_iteration_readiness_in_place_v2",
+        "observe_startup_recovery_v2",
+        "try_into_ready_iteration_v2",
+        "begin_startup_recovery_observation_v2",
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "into_production",
+    ] {
+        assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "into_production",
+    ] {
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+    let startup_stage = braced_declaration(
+        startup,
+        "async fn stage_runtime_process_from_environment_v1(",
+    );
+    let pending = startup_stage.find(".into_recovery_pending_v2()").unwrap();
+    let committed = startup_stage.find(".into_closed_recovery_v2()").unwrap();
+    let ready = startup_stage
+        .find(".into_recovery_iteration_ready_v2()")
+        .unwrap();
+    let shutdown = startup_stage[ready..]
+        .find(".shutdown()")
+        .map(|offset| ready + offset)
+        .unwrap();
+    assert!(pending < committed && committed < ready && ready < shutdown);
+    assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
+    assert!(!library.contains("RuntimeClosedRecoverySessionV2"));
+    assert!(!library.contains("RuntimeGatewayOwnerClosedRecoverySupervisorV2"));
+}
+
+#[test]
+fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizing() {
+    let sources = source_files();
+    let process = source_before_test_module(include_str!("../src/process/readiness.rs"));
+    let closed_process = source_before_test_module(include_str!("../src/process/closed.rs"));
+    let closed = include_str!("../src/closed_recovery.rs");
+    let owner_supervisor = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub enum RuntimeProcessRecoveryReadinessFailureV2",
+        "pub enum RuntimeProcessRecoveryReadinessTransitionFailureV2",
+        "pub enum RuntimeProcessRecoveryReadinessTransitionErrorV2",
+        "pub enum RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
+        "RuntimeProcessRecoveryReadinessTransitionErrorV2(<redacted>)",
+        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2(<redacted>)",
+        "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2",
+        "discord: RuntimeDiscordGatewaySupervisorV1,",
+        "foundation: RuntimeProcessFoundationV1,",
+        "iteration: RuntimeClosedRecoveryReadyIterationV2,",
+        "pub(crate) async fn into_recovery_iteration_ready_v2(",
+        "require_current_closed_recovery_v2(",
+        "session.readiness_cutoff_v2()",
+        "session.owner_safety_deadline_v2()",
+        "session.owner_terminal_observation_v2()",
+        "session.refresh_iteration_readiness_in_place_v2(&foundation.databases)",
+        "await_recovery_readiness_refresh_v2(",
+        "session.try_into_ready_iteration_v2()",
+        "let iteration_validation = iteration",
+        "iteration.owner_terminal_status_v2()",
+        "iteration.owner_safety_deadline_v2()",
+        "shutdown_committed_recovery_v2(",
+        "shutdown_ready_recovery_v2(",
+        "RuntimeRecoveryIterationReadyProcessV2(<redacted>)",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    assert!(process.contains(concat!(
+        "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2 {\n",
+        "    discord: RuntimeDiscordGatewaySupervisorV1,\n",
+        "    foundation: RuntimeProcessFoundationV1,\n",
+        "    iteration: RuntimeClosedRecoveryReadyIterationV2,\n",
+        "}"
+    )));
+    assert!(closed_process.contains(concat!(
+        "pub(crate) struct RuntimeClosedRecoveryProcessV2 {\n",
+        "    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,\n",
+        "    pub(super) foundation: RuntimeProcessFoundationV1,\n",
+        "    pub(super) session: RuntimeClosedRecoverySessionV2,\n",
+        "}"
+    )));
+    let attributes = declaration_attribute_block(process, "RuntimeRecoveryIterationReadyProcessV2");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
+        assert!(!implements_trait(
+            process,
+            "RuntimeRecoveryIterationReadyProcessV2",
+            forbidden,
+        ));
+    }
+
+    let transition = braced_declaration(
+        process,
+        "pub(crate) async fn into_recovery_iteration_ready_v2(",
+    );
+    let preflight = transition
+        .find("require_current_closed_recovery_v2(")
+        .unwrap();
+    let cutoff = transition.find("session.readiness_cutoff_v2()").unwrap();
+    let owner_deadline = transition
+        .find("session.owner_safety_deadline_v2()")
+        .unwrap();
+    let owner_terminal = transition
+        .find("session.owner_terminal_observation_v2()")
+        .unwrap();
+    let refresh = transition
+        .find("session.refresh_iteration_readiness_in_place_v2(&foundation.databases)")
+        .unwrap();
+    let race = transition
+        .find("await_recovery_readiness_refresh_v2(")
+        .unwrap();
+    let failed_cleanup = transition[race..]
+        .find("shutdown_committed_recovery_v2(")
+        .map(|offset| race + offset)
+        .unwrap();
+    let conversion = transition
+        .find("session.try_into_ready_iteration_v2()")
+        .unwrap();
+    let retained_conversion_cleanup = transition[conversion..]
+        .find("shutdown_committed_recovery_v2(")
+        .map(|offset| conversion + offset)
+        .unwrap();
+    let final_revalidation = transition
+        .find("iteration\n            .revalidate_v2()")
+        .unwrap();
+    let final_discord = transition[final_revalidation..]
+        .find("discord_transition_failure_v1(&discord)")
+        .map(|offset| final_revalidation + offset)
+        .unwrap();
+    let final_owner = transition[final_discord..]
+        .find("iteration.owner_terminal_status_v2()")
+        .map(|offset| final_discord + offset)
+        .unwrap();
+    let final_budget = transition[final_owner..]
+        .find("foundation.startup_budget.operation_is_open()")
+        .map(|offset| final_owner + offset)
+        .unwrap();
+    let ready_cleanup = transition[final_budget..]
+        .find("shutdown_ready_recovery_v2(")
+        .map(|offset| final_budget + offset)
+        .unwrap();
+    let construct = transition
+        .find("Ok(RuntimeRecoveryIterationReadyProcessV2")
+        .unwrap();
+    assert!(
+        preflight < cutoff
+            && cutoff < owner_deadline
+            && owner_deadline < owner_terminal
+            && owner_terminal < refresh
+            && refresh < race
+            && race < failed_cleanup
+            && failed_cleanup < conversion
+            && conversion < retained_conversion_cleanup
+            && retained_conversion_cleanup < final_revalidation
+            && final_revalidation < final_discord
+            && final_discord < final_owner
+            && final_owner < final_budget
+            && final_budget < ready_cleanup
+            && ready_cleanup < construct
+    );
+    for operation in [
+        "session.readiness_cutoff_v2()",
+        "session.owner_terminal_observation_v2()",
+        "session.refresh_iteration_readiness_in_place_v2(&foundation.databases)",
+        "session.try_into_ready_iteration_v2()",
+    ] {
+        assert_eq!(transition.matches(operation).count(), 1, "{operation}");
+    }
+
+    let preflight = braced_declaration(process, "fn require_current_closed_recovery_v2(");
+    let initial_budget = preflight
+        .find("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    let initial_discord = preflight
+        .find("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let initial_owner = preflight
+        .find("session.owner_terminal_status_v2()")
+        .unwrap();
+    let compound = preflight.find("session\n        .revalidate_v2()").unwrap();
+    let final_owner = preflight
+        .rfind("session.owner_terminal_status_v2()")
+        .unwrap();
+    let final_discord = preflight
+        .rfind("discord_transition_failure_v1(discord)")
+        .unwrap();
+    let final_budget = preflight
+        .rfind("foundation.startup_budget.operation_is_open()")
+        .unwrap();
+    assert!(
+        initial_budget < initial_discord
+            && initial_discord < initial_owner
+            && initial_owner < compound
+            && compound < final_owner
+            && final_owner < final_discord
+            && final_discord < final_budget
+    );
+    assert_eq!(
+        preflight
+            .matches("foundation.startup_budget.operation_is_open()")
+            .count(),
+        2
+    );
+    assert_eq!(
+        preflight
+            .matches("discord_transition_failure_v1(discord)")
+            .count(),
+        2
+    );
+    assert_eq!(
+        preflight
+            .matches("session.owner_terminal_status_v2()")
+            .count(),
+        2
+    );
+    assert_eq!(preflight.matches(".revalidate_v2()").count(), 1);
+
+    let race = braced_declaration(process, "async fn await_recovery_readiness_refresh_v2<");
+    let elapsed = race.find("Instant::now() >= readiness_cutoff").unwrap();
+    let biased = race.find("biased;").unwrap();
+    let deadline = race.find("sleep_until(").unwrap();
+    let discord = race.find("transition = &mut discord_terminal").unwrap();
+    let owner = race.find("() = &mut owner_terminal").unwrap();
+    let refresh = race.find("result = &mut refresh").unwrap();
+    assert!(
+        elapsed < biased
+            && biased < deadline
+            && deadline < discord
+            && discord < owner
+            && owner < refresh
+    );
+    assert_eq!(race.matches("tokio::select!").count(), 1);
+
+    let cleanup = braced_declaration(process, "async fn shutdown_ready_recovery_v2(");
+    let discord_drain = cleanup
+        .find("foundation.gateway.begin_discord_drain_v1()")
+        .unwrap();
+    let discord_deadline = cleanup
+        .find("foundation.startup_budget.discord_cleanup_deadline()")
+        .unwrap();
+    let owner_deadline = cleanup
+        .find("foundation.startup_budget.owner_cleanup_deadline()")
+        .unwrap();
+    let database = cleanup.find("foundation.shutdown().await").unwrap();
+    assert!(
+        discord_drain < discord_deadline
+            && discord_deadline < owner_deadline
+            && owner_deadline < database
+    );
+    let ready_impl = braced_declaration(closed, "impl RuntimeClosedRecoveryReadyIterationV2");
+    let ready_abort = braced_declaration(
+        ready_impl,
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
+    );
+    let authority_drop = ready_abort
+        .find("drop((gateway, registry, operation_cutoff, iteration))")
+        .unwrap();
+    let owner_abort = ready_abort
+        .find("owner.abort_and_shutdown_until_v2(cleanup_deadline).await")
+        .unwrap();
+    assert!(authority_drop < owner_abort);
+
+    let owner_impl = braced_declaration(
+        owner_supervisor,
+        "impl RuntimeGatewayOwnerClosedRecoverySupervisorV2",
+    );
+    let terminal_observation =
+        braced_declaration(owner_impl, "pub(crate) fn terminal_observation_v2(");
+    let clone = terminal_observation
+        .find("let mut terminal = self.inner().terminal.clone()")
+        .unwrap();
+    let immediate = terminal_observation
+        .find("if let Some(exit) = *terminal.borrow()")
+        .unwrap();
+    let changed = terminal_observation
+        .find("terminal.changed().await")
+        .unwrap();
+    assert!(clone < immediate && immediate < changed);
+    assert_eq!(terminal_observation.matches(".await").count(), 1);
+    for forbidden in ["spawn", "send", "renew", "acquire", "release", "invalidate"] {
+        assert!(
+            !contains_identifier(terminal_observation, forbidden),
+            "terminal observation: {forbidden}"
+        );
+    }
+
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "observe_startup_recovery_with_v2",
+        "observe_startup_recovery",
+        "begin_startup_recovery_observation_v2",
+        "into_startup_recovery_observation_successor_v2",
+        "complete_startup_recovery_observation",
+        "validate_startup_recovery_fixed_point_v2",
+        "RuntimeStartupRecoveryContinuationV2",
+        "RuntimeStartupRecoveryFixedPointProofV2",
+        "RuntimeStartupRecoveryObservationPortV2",
+        "verify_readiness_v1",
+        "initial_readiness",
+        "refresh_recovery_readiness",
+        "recover_next_stale_live",
+        "resume_admission",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "serving_lease",
+        "heartbeat",
+        "dispatch",
+        "execute",
+        "hydrate",
+        "reconcile",
+        "activate",
+        "deploy",
+        "into_production",
+        "retry",
+    ] {
+        assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+    assert!(!process.contains("loop {"));
+    assert!(!process.contains(".resume"));
+    assert!(!process.contains("resume("));
+    assert!(!process.contains("tokio::spawn"));
+    assert!(!process.contains("spawn_blocking"));
+    assert_eq!(
+        startup
+            .matches(".into_recovery_iteration_ready_v2()")
+            .count(),
+        1
+    );
+    assert!(
+        startup.find(".into_closed_recovery_v2()").unwrap()
+            < startup.find(".into_recovery_iteration_ready_v2()").unwrap()
+    );
+    for forbidden in [
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
+        "RuntimeStartupRecoveryObservationPortV2",
+    ] {
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "startup: {forbidden}"
+        );
+    }
+
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        for method in [
+            "refresh_iteration_readiness_in_place_v2",
+            "try_into_ready_iteration_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/process/readiness.rs")
+                        || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        if contains_identifier(source, "shutdown_committed_recovery_v2") {
+            assert!(
+                path == Path::new("src/process/closed.rs")
+                    || path == Path::new("src/process/readiness.rs"),
+                "{}: shutdown_committed_recovery_v2",
+                path.display()
+            );
+        }
+    }
+    for required in [
+        "RuntimeProcessRecoveryReadinessFailureV2",
+        "RuntimeProcessRecoveryReadinessTransitionFailureV2",
+        "RuntimeProcessRecoveryReadinessTransitionErrorV2",
+        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
+    ] {
+        assert_eq!(library.matches(required).count(), 1, "{required}");
+    }
+    assert!(!library.contains("RuntimeRecoveryIterationReadyProcessV2"));
+    assert!(closed.contains("readiness: RuntimeClosedRecoveryReadinessStateV2,"));
+}
+
+#[test]
 fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     let gateway = include_str!("../src/gateway.rs");
     let production = source_before_test_module(gateway);
     let emergency = braced_declaration(production, "impl<'a> RuntimeEmergencyGatewaySectionV2<'a>");
     let acquire = braced_declaration(emergency, "fn acquire(");
+    assert!(acquire.contains("expected_paused_gateway: &RuntimePausedGatewayObservationV2,"));
+    assert!(acquire.contains("if paused_gateway != *expected_paused_gateway"));
     let acquire_borrow = acquire
         .find("admission_snapshot.borrow()")
         .unwrap_or_else(|| panic!("initial section watch borrow missing"));
@@ -942,11 +2232,11 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     );
     let owner_commit = braced_declaration(
         pending_binding,
-        "pub(crate) async fn commit_prepared_owner_v2(",
+        "pub(crate) async fn commit_prepared_owner_in_place_v2(",
     );
     assert!(owner_commit.contains("commit_cutoff: Instant"));
     let preflight = owner_commit
-        .find(".pending_section_v2(&prepared_owner)")
+        .find(".pending_section_v2(prepared_owner)")
         .unwrap();
     let section_drop = owner_commit.find("drop(section)").unwrap();
     let cutoff_guard = owner_commit
@@ -958,7 +2248,7 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         .find("sleep_until(TokioInstant::from_std(commit_cutoff))")
         .unwrap();
     let commit = owner_commit
-        .find("prepared_owner.commit_closed_recovery_v2(&self.permit)")
+        .find("prepared_owner.commit_closed_recovery_in_place_v2(&self.permit)")
         .unwrap();
     assert!(
         preflight < section_drop
@@ -972,14 +2262,15 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     assert!(!owner_commit.contains(".await"));
     assert_eq!(
         production
-            .matches("prepared_owner.commit_closed_recovery_v2(&self.permit)")
+            .matches("prepared_owner.commit_closed_recovery_in_place_v2(&self.permit)")
             .count(),
         1
     );
     let readiness = braced_declaration(
         pending_binding,
-        "pub(crate) fn into_readiness_successor_v2(",
+        "pub(crate) fn refresh_readiness_in_place_v2(",
     );
+    assert!(readiness.contains("&mut self,"));
     let readiness_preflight = readiness
         .find(".committed_pending_section_v2(committed_owner)")
         .unwrap();
@@ -1044,6 +2335,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     let production = closed;
     for required in [
         "pub(crate) fn begin_initial_empty_recovery_v2(",
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+        "pub(crate) async fn abort_and_shutdown_until_v2(",
         "pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoveryPendingPhaseV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoverySessionV2",
@@ -1056,22 +2349,31 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "RuntimeClosedRecoveryStartupIterationOutcomeV2(<redacted>)",
         "pub(crate) async fn commit_owner_v2(",
         "async fn commit_owner_with_post_commit_v2(",
-        "pub(crate) async fn refresh_iteration_readiness_v2(",
-        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+        "pub(crate) fn commit_cutoff_v2(",
+        "pub(crate) async fn commit_owner_in_place_v2(",
+        "pub(crate) fn try_into_committed_session_v2(",
+        "enum RuntimeClosedRecoveryReadinessStateV2",
+        "RuntimeClosedRecoveryReadinessStateV2::Available",
+        "RuntimeClosedRecoveryReadinessStateV2::Failed",
+        "RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)",
+        "pub(crate) async fn refresh_iteration_readiness_in_place_v2(",
+        "async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(",
+        "pub(crate) fn try_into_ready_iteration_v2(",
         ".verify_readiness_refresh_until_v2(cutoff)",
         "operation_cutoff: Instant",
         ".operation_cutoff",
         ".min(self.owner.observation().safety_deadline())",
         "Instant::now() >= verification_cutoff",
         ".invalidate_capability_not_ready_v2()",
-        ".into_readiness_successor_v2(",
-        ".commit_prepared_owner_v2(&authority, owner, commit_cutoff)",
+        ".invalidate_protocol_violation_v2()",
+        ".refresh_readiness_in_place_v2(",
+        ".commit_prepared_owner_in_place_v2(&authority, &mut self.owner, commit_cutoff)",
         "post_commit();",
         ".committed_pending_section_v2(owner)",
         "pub(crate) struct RuntimeClosedRecoveryTransitionAuthorityV2",
         "RuntimeClosedRecoveryTransitionAuthorityV2(<redacted>)",
         "let authority = RuntimeClosedRecoveryTransitionAuthorityV2 { _private: () };",
-        ".initial_emergency_gateway_section_v2(&owner)",
+        ".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)",
         ".recovery_observation_guard_v2(&authority, &gateway_section)",
         ".locked_empty_evidence_v2()",
         "readiness: &RuntimeDatabaseReadinessV1",
@@ -1099,6 +2401,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "    gateway: RuntimeRecoveryPendingGatewayBindingV2,\n",
         "    registry: RuntimeRegistryEmptyRecoveryBindingV2,\n",
         "    operation_cutoff: Instant,\n",
+        "    readiness: RuntimeClosedRecoveryReadinessStateV2,\n",
         "}"
     )));
     assert!(production.contains(concat!(
@@ -1129,7 +2432,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "}"
     )));
     let initial_gateway = production
-        .find(".initial_emergency_gateway_section_v2(&owner)")
+        .find(".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)")
         .unwrap();
     let initial_registry = production
         .find(".recovery_observation_guard_v2(&authority, &gateway_section)")
@@ -1153,31 +2456,27 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .unwrap();
     assert!(final_gateway < final_registry);
     let pending_phase = braced_declaration(production, "impl RuntimeClosedRecoveryPendingPhaseV2");
-    let owner_commit =
-        braced_declaration(pending_phase, "async fn commit_owner_with_post_commit_v2(");
+    let owner_commit = braced_declaration(
+        pending_phase,
+        "pub(crate) async fn commit_owner_in_place_v2(",
+    );
     let precommit = owner_commit.find("self.revalidate_v2()").unwrap();
-    let cutoff = owner_commit
-        .find(".min(self.owner.observation().safety_deadline())")
-        .unwrap();
+    let cutoff = owner_commit.find("self.commit_cutoff_v2()").unwrap();
     let cutoff_guard = owner_commit
         .find("if Instant::now() >= commit_cutoff")
         .unwrap();
     let commit = owner_commit
-        .find(".commit_prepared_owner_v2(&authority, owner, commit_cutoff)")
+        .find(".commit_prepared_owner_in_place_v2(&authority, &mut self.owner, commit_cutoff)")
         .unwrap();
-    let hook = owner_commit.find("post_commit();").unwrap();
-    let session = owner_commit
-        .find("let session = RuntimeClosedRecoverySessionV2")
+    assert!(precommit < cutoff && cutoff < cutoff_guard && cutoff_guard < commit);
+    let wrapper = braced_declaration(pending_phase, "async fn commit_owner_with_post_commit_v2(");
+    let wrapper_commit = wrapper
+        .find("self.commit_owner_in_place_v2().await?")
         .unwrap();
-    let postcommit = owner_commit.find("session.revalidate_v2()?").unwrap();
-    assert!(
-        precommit < cutoff
-            && cutoff < cutoff_guard
-            && cutoff_guard < commit
-            && commit < hook
-            && hook < session
-            && session < postcommit
-    );
+    let hook = wrapper.find("post_commit();").unwrap();
+    let conversion = wrapper.find(".try_into_committed_session_v2()").unwrap();
+    let postcommit = wrapper.find("session.revalidate_v2()?").unwrap();
+    assert!(wrapper_commit < hook && hook < conversion && conversion < postcommit);
     assert_eq!(
         pending_phase
             .matches("commit_owner_with_post_commit_v2(")
@@ -1215,11 +2514,21 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     );
     let readiness_refresh = braced_declaration(
         committed_session,
-        "async fn refresh_iteration_readiness_with_v2<Verify, Verification, PostRefresh>(",
+        "async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(",
     );
+    let refresh_consume = readiness_refresh.find("std::mem::replace(").unwrap();
+    let refresh_failed = readiness_refresh
+        .find("RuntimeClosedRecoveryReadinessStateV2::Failed")
+        .unwrap();
+    let refresh_available = readiness_refresh
+        .find("RuntimeClosedRecoveryReadinessStateV2::Available")
+        .unwrap();
+    let refresh_protocol = readiness_refresh
+        .find("self.gateway.invalidate_protocol_violation_v2()")
+        .unwrap();
     let refresh_prevalidation = readiness_refresh.find("self.revalidate_v2()").unwrap();
     let refresh_cutoff = readiness_refresh
-        .find(".min(self.owner.observation().safety_deadline())")
+        .find("self.readiness_cutoff_v2()")
         .unwrap();
     let refresh_await = readiness_refresh
         .find("verify(verification_cutoff).await")
@@ -1235,25 +2544,30 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         .map(|offset| offset + refresh_await + 1)
         .unwrap();
     let refresh_successor = readiness_refresh
-        .find(".into_readiness_successor_v2(")
+        .find(".refresh_readiness_in_place_v2(")
         .unwrap();
     let refresh_hook = readiness_refresh.find("post_refresh();").unwrap();
-    let refresh_iteration = readiness_refresh
-        .find("let iteration = RuntimeClosedRecoveryReadyIterationV2")
+    let refresh_final_validation = readiness_refresh[refresh_hook..]
+        .find("self.revalidate_v2()")
+        .map(|offset| refresh_hook + offset)
         .unwrap();
-    let refresh_final = readiness_refresh
-        .rfind("iteration\n            .revalidate_v2()")
+    let refresh_ready = readiness_refresh
+        .find("self.readiness = RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)")
         .unwrap();
     assert!(
-        refresh_prevalidation < refresh_cutoff
+        refresh_consume < refresh_failed
+            && refresh_failed < refresh_available
+            && refresh_available < refresh_protocol
+            && refresh_protocol < refresh_prevalidation
+            && refresh_prevalidation < refresh_cutoff
             && refresh_cutoff < refresh_pre_deadline
             && refresh_pre_deadline < refresh_await
             && refresh_await < refresh_post_deadline
             && refresh_post_deadline < refresh_postvalidation
             && refresh_postvalidation < refresh_successor
             && refresh_successor < refresh_hook
-            && refresh_hook < refresh_iteration
-            && refresh_iteration < refresh_final
+            && refresh_hook < refresh_final_validation
+            && refresh_final_validation < refresh_ready
     );
     assert_eq!(
         readiness_refresh
@@ -1264,16 +2578,38 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     assert!(!readiness_refresh.contains("initial_readiness"));
     let public_refresh = braced_declaration(
         committed_session,
-        "pub(crate) async fn refresh_iteration_readiness_v2(",
+        "pub(crate) async fn refresh_iteration_readiness_in_place_v2(",
     );
     assert!(!public_refresh.contains("operation_cutoff:"));
-    let begin = braced_declaration(production, "pub(crate) fn begin_initial_empty_recovery_v2(");
+    assert!(public_refresh.contains("&mut self,"));
+    let conversion = braced_declaration(
+        committed_session,
+        "pub(crate) fn try_into_ready_iteration_v2(",
+    );
+    let ready_match = conversion
+        .find("RuntimeClosedRecoveryReadinessStateV2::Ready(iteration)")
+        .unwrap();
+    let ready_construct = conversion
+        .find("Ok(RuntimeClosedRecoveryReadyIterationV2")
+        .unwrap();
+    let retained_failure = conversion.find("readiness => Err(Box::new(Self").unwrap();
+    assert!(ready_match < ready_construct && ready_construct < retained_failure);
+    let begin = braced_declaration(
+        production,
+        "pub(crate) fn begin_initial_empty_recovery_retained_v2(",
+    );
     assert!(!begin.contains(".await"));
     let begin_deadline = begin.find("Instant::now() >= operation_cutoff").unwrap();
-    let begin_gateway = begin
-        .find(".initial_emergency_gateway_section_v2(&owner)")
+    let begin_bindings = begin.find("bind_initial_empty_recovery_v2(").unwrap();
+    assert!(begin_deadline < begin_bindings);
+    let binding = braced_declaration(production, "fn bind_initial_empty_recovery_v2(");
+    let begin_gateway = binding
+        .find(".initial_emergency_gateway_section_v2(owner, expected_paused_gateway)")
         .unwrap();
-    assert!(begin_deadline < begin_gateway);
+    let begin_registry = binding
+        .find(".recovery_observation_guard_v2(&authority, &gateway_section)")
+        .unwrap();
+    assert!(begin_gateway < begin_registry);
     assert_eq!(owner_commit.matches(".await").count(), 1);
     assert_eq!(readiness_refresh.matches(".await").count(), 1);
     for forbidden in [
@@ -1302,6 +2638,7 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     for name in [
         "RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoverySessionV2",
+        "RuntimeClosedRecoveryReadinessStateV2",
         "RuntimeClosedRecoveryReadyIterationV2",
         "RuntimeClosedRecoveryFixedPointV2",
         "RuntimeClosedRecoveryStartupIterationOutcomeV2",
@@ -1348,7 +2685,10 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
                 path.display()
             );
         }
-        for method in ["commit_prepared_owner_v2", "committed_pending_section_v2"] {
+        for method in [
+            "commit_prepared_owner_in_place_v2",
+            "committed_pending_section_v2",
+        ] {
             if contains_identifier(source, method) {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
@@ -1372,14 +2712,29 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             }
         }
         for method in [
-            "into_readiness_successor_v2",
+            "refresh_readiness_in_place_v2",
             "invalidate_capability_not_ready_v2",
+            "invalidate_protocol_violation_v2",
         ] {
             if contains_identifier(source, method) {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
                         || path == Path::new("src/gateway.rs")
                         || path == Path::new("src/startup_recovery_observation.rs"),
+                    "{}: {method}",
+                    path.display()
+                );
+            }
+        }
+        for method in [
+            "refresh_iteration_readiness_in_place_v2",
+            "try_into_ready_iteration_v2",
+        ] {
+            if contains_identifier(source, method) {
+                assert!(
+                    path == Path::new("src/closed_recovery.rs")
+                        || path == Path::new("src/process/readiness.rs")
+                        || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs"),
                     "{}: {method}",
                     path.display()
                 );
@@ -1779,11 +3134,25 @@ fn database_composition_is_five_pool_function_only_and_fail_closed() {
         .find(|(path, _)| path == Path::new("src/database.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
+    let library = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/lib.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
     for required in [
+        "pub(crate) async fn compose_runtime_database_dependencies_v1(",
         "PgConnectOptions::new_without_pgpass()",
         ".disable_statement_logging()",
         "tokio::join!",
-        "timeout_at(startup_deadline",
+        "biased;",
+        "sleep_until(",
+        "TokioInstant::from_std(startup_budget.operation_cutoff())",
+        "TokioInstant::from_std(startup_budget.cleanup_deadline())",
+        "begin_before_operation_cutoff_v1",
+        "RuntimeDatabasePoolConnectErrorV1::DeadlineElapsed",
+        "RuntimeDatabasePoolConnectErrorV1::CleanupTimedOut",
+        "RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut",
+        "map_database_startup_cleanup_result_v1",
         "PERIODIC_READINESS_TIMEOUT",
         "verify_expected_database_authority_v1",
         "observe_runtime_execution_database_identity_with_timeouts_v1",
@@ -1812,8 +3181,181 @@ fn database_composition_is_five_pool_function_only_and_fail_closed() {
         "INSERT ",
         "UPDATE ",
         "DELETE ",
+        "STARTUP_READINESS_TIMEOUT",
+        "RuntimeStartupBudgetV1::begin()",
     ] {
         assert!(!database.contains(forbidden), "{forbidden}");
+    }
+    assert!(!library.contains("compose_runtime_database_dependencies_v1"));
+    let attributes = declaration_attribute_block(database, "RuntimeDatabaseDependenciesV1");
+    assert!(!contains_identifier(attributes, "Clone"));
+    assert!(!implements_trait(
+        database,
+        "RuntimeDatabaseDependenciesV1",
+        "Clone",
+    ));
+
+    let connect = braced_declaration(database, "async fn connect_pool_v1(");
+    let guard = connect
+        .find("begin_before_operation_cutoff_v1(operation_cutoff")
+        .unwrap();
+    let future = connect.find("pool.connect_with(options)").unwrap();
+    let precheck = connect
+        .find("classify_database_connection_deadline_v1(")
+        .unwrap();
+    let timer = connect.find("tokio::select!").unwrap();
+    let biased = connect[timer..].find("biased;").unwrap() + timer;
+    let timer_branch = connect[timer..]
+        .find("_ = sleep_until(TokioInstant::from_std(acquire_deadline))")
+        .unwrap()
+        + timer;
+    let work_branch = connect[timer..].find("result = connect").unwrap() + timer;
+    let postcheck = connect
+        .rfind("classify_database_connection_deadline_v1(")
+        .unwrap();
+    let success = connect.rfind("Ok(pool) => Ok(pool)").unwrap();
+    assert!(
+        guard < future
+            && future < precheck
+            && precheck < timer
+            && timer < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+            && postcheck < success
+    );
+
+    let composer = braced_declaration(
+        database,
+        "pub(crate) async fn compose_runtime_database_dependencies_v1(",
+    );
+    let build = composer
+        .find("let build = build_verified_dependencies_v1")
+        .unwrap();
+    let wait = composer.find("let result = tokio::select!").unwrap();
+    let biased = composer[wait..].find("biased;").unwrap() + wait;
+    let timer_branch = composer[wait..]
+        .find("_ = sleep_until(TokioInstant::from_std(startup_budget.operation_cutoff()))")
+        .unwrap()
+        + wait;
+    let work_branch = composer[wait..].find("result = build").unwrap() + wait;
+    let postcheck = composer
+        .find("let operation_is_open = startup_budget.operation_is_open()")
+        .unwrap();
+    let success = composer.find("return Ok(dependencies)").unwrap();
+    let cleanup = composer
+        .find("map_database_startup_cleanup_result_v1(primary, cleanup)")
+        .unwrap();
+    assert!(
+        build < wait
+            && wait < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+            && postcheck < success
+            && success < cleanup
+    );
+
+    let hard_cleanup = braced_declaration(database, "async fn close_pool_refs_until(");
+    let close = hard_cleanup
+        .find("let close = begin_pool_closures(pools)")
+        .unwrap();
+    let precheck = hard_cleanup
+        .find("if TokioInstant::now() >= deadline")
+        .unwrap();
+    let timer = hard_cleanup.find("tokio::select!").unwrap();
+    let biased = hard_cleanup[timer..].find("biased;").unwrap() + timer;
+    let timer_branch = hard_cleanup[timer..]
+        .find("_ = sleep_until(deadline)")
+        .unwrap()
+        + timer;
+    let work_branch = hard_cleanup[timer..].find("() = &mut close").unwrap() + timer;
+    let postcheck = hard_cleanup
+        .find("if TokioInstant::now() < deadline")
+        .unwrap();
+    assert!(
+        close < precheck
+            && precheck < timer
+            && timer < biased
+            && biased < timer_branch
+            && timer_branch < work_branch
+            && work_branch < postcheck
+    );
+}
+
+#[test]
+fn startup_budget_is_single_origin_linear_monotonic_and_partitioned() {
+    let sources = source_files();
+    let startup = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/startup.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = source_before_test_module(startup);
+    let begin = braced_declaration(production, "pub(crate) fn begin()");
+    let sync_stage = braced_declaration(
+        production,
+        "pub(crate) fn run_runtime_startup_sync_stage_v1<T, E, C, S>(",
+    );
+
+    for required in [
+        "const STARTUP_OPERATION_WINDOW: Duration = Duration::from_secs(35);",
+        "const STARTUP_TOTAL_WINDOW: Duration = Duration::from_secs(45);",
+        "const STARTUP_DISCORD_CLEANUP_RESERVE: Duration = Duration::from_secs(7);",
+        "const STARTUP_DATABASE_CLEANUP_RESERVE: Duration = Duration::from_secs(2);",
+        "pub(crate) struct RuntimeStartupBudgetV1 {",
+        "operation_cutoff: started_at + STARTUP_OPERATION_WINDOW",
+        "cleanup_deadline: started_at + STARTUP_TOTAL_WINDOW",
+        "pub(crate) fn discord_cleanup_deadline(&self) -> Instant",
+        "pub(crate) fn owner_cleanup_deadline(&self) -> Instant",
+        "now < self.operation_cutoff",
+        "pub(crate) enum RuntimeStartupSyncStageErrorV1<E>",
+        "RuntimeStartupSyncStageErrorV1::OperationDeadlineElapsed",
+        "RuntimeStartupSyncStageErrorV1::Stage",
+        "RuntimeStartupBudgetV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    assert_eq!(begin.matches("Instant::now()").count(), 1);
+    let checks = sync_stage
+        .match_indices("if !operation_is_open()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let stage = sync_stage.find("let result = stage();").unwrap();
+    let result = sync_stage
+        .find("result.map_err(RuntimeStartupSyncStageErrorV1::Stage)")
+        .unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks[0] < stage && stage < checks[1] && checks[1] < result);
+    assert_eq!(sync_stage.matches("stage()").count(), 1);
+    let begin_origins = sources
+        .iter()
+        .filter(|(path, _)| path.starts_with("src"))
+        .flat_map(|(path, source)| {
+            let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            production
+                .match_indices("RuntimeStartupBudgetV1::begin()")
+                .map(move |_| path.as_path())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(begin_origins, [Path::new("src/process_startup.rs")]);
+    assert!(!contains_identifier(production, "SystemTime"));
+    assert!(!contains_identifier(production, "tokio"));
+    for forbidden in [
+        "pub struct RuntimeStartupBudgetV1",
+        "pub enum RuntimeStartupSyncStageErrorV1",
+        "pub fn run_runtime_startup_sync_stage_v1",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let attributes = declaration_attribute_block(production, "RuntimeStartupBudgetV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!contains_identifier(attributes, forbidden), "{forbidden}");
+        assert!(!implements_trait(
+            production,
+            "RuntimeStartupBudgetV1",
+            forbidden,
+        ));
     }
 }
 
@@ -1825,12 +3367,13 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         .find(|(path, _)| path == Path::new("src/secret.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
+    let production = source_before_test_module(secret);
     for required in [
         "Command::new(\"/usr/bin/security\")",
         ".env_clear()",
         "KEYCHAIN_TIMEOUT",
+        "KEYCHAIN_CLEANUP_WINDOW",
         "KEYCHAIN_CAPTURE_BYTES",
-        "terminate_and_reap",
         "child.kill()",
         "child.wait()",
         "Zeroizing<String>",
@@ -1840,8 +3383,28 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         "RuntimeDatabasePasswordV1(<redacted>)",
         "RuntimeDiscordBotTokenV1(<redacted>)",
         "RuntimeDatabaseUrlSecretV1(<redacted>)",
+        "RuntimeSecretsStartupResolutionErrorV1(<redacted>)",
+        "pub(crate) fn resolve_runtime_secrets_until_v1(",
+        "startup_budget: &RuntimeStartupBudgetV1",
+        "startup_budget.operation_cutoff()",
+        "startup_budget.cleanup_deadline()",
+        "operation_cutoff: Instant",
+        "cleanup_deadline: Instant",
+        "run_runtime_startup_sync_stage_v1(",
+        "Instant::now() < operation_cutoff",
+        "local_deadline.min(operation_cutoff)",
+        "fn run_keychain_command_until(",
+        "fn capture_keychain_child_until(",
+        "fn cancel_keychain_child_until(",
+        "struct KeychainReaperDispatchV1",
+        "KeychainReaperDispatchV1::start()",
+        "starring-runtime-keychain-reaper",
+        "capture_bounded_until_cancelled",
+        "cancellation.store(true, Ordering::Release)",
+        "join_keychain_captures",
+        "runtime_secret_keychain_cleanup_timed_out",
     ] {
-        assert!(secret.contains(required), "{required}");
+        assert!(production.contains(required), "{required}");
     }
     for forbidden in [
         "sqlx",
@@ -1850,36 +3413,829 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         "twilight_gateway",
         "Url",
         "into_zeroizing",
+        "spawn_blocking",
+        "timeout_at",
     ] {
-        assert!(!contains_identifier(secret, forbidden), "{forbidden}");
+        assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
     for forbidden in [
         "pub type RuntimeDatabaseConnectionPartsV1",
         "pub fn into_zeroizing",
+        "pub fn resolve_runtime_secrets_until_v1",
+        "resolve_runtime_secrets_v1",
+        "terminate_and_reap",
     ] {
-        assert!(!secret.contains(forbidden), "{forbidden}");
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let keychain_runner = braced_declaration(production, "fn run_keychain_command_until(");
+    let deadline_checks = keychain_runner
+        .match_indices("if now >= operation_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let cleanup_checks = keychain_runner
+        .match_indices("if now >= cleanup_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let configure = keychain_runner
+        .find("configure_keychain_command(&mut command)")
+        .unwrap();
+    let reaper = keychain_runner
+        .find("KeychainReaperDispatchV1::start()")
+        .unwrap();
+    let spawn = keychain_runner.find(".spawn()").unwrap();
+    let capture = keychain_runner
+        .find("capture_keychain_child_until(")
+        .unwrap();
+    assert_eq!(deadline_checks.len(), 2);
+    assert_eq!(cleanup_checks.len(), 2);
+    assert!(
+        deadline_checks[0] < cleanup_checks[0]
+            && cleanup_checks[0] < configure
+            && configure < reaper
+            && reaper < deadline_checks[1]
+            && deadline_checks[1] < cleanup_checks[1]
+            && cleanup_checks[1] < spawn
+            && reaper < spawn
+            && spawn < capture
+    );
+    let keychain_capture = braced_declaration(production, "fn capture_keychain_child_until(");
+    let capture_deadline_checks = keychain_capture
+        .match_indices("if Instant::now() >= operation_deadline")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let stdout_pipe = keychain_capture.find("child.stdout.take()").unwrap();
+    let stdout_thread = keychain_capture
+        .find("starring-runtime-keychain-stdout")
+        .unwrap();
+    let stderr_thread = keychain_capture
+        .find("starring-runtime-keychain-stderr")
+        .unwrap();
+    let status_wait = keychain_capture.find("let status = loop").unwrap();
+    assert_eq!(capture_deadline_checks.len(), 6);
+    assert!(
+        capture_deadline_checks[0] < stdout_pipe
+            && stdout_pipe < capture_deadline_checks[1]
+            && capture_deadline_checks[1] < stdout_thread
+            && stdout_thread < capture_deadline_checks[2]
+            && capture_deadline_checks[2] < stderr_thread
+            && stderr_thread < capture_deadline_checks[3]
+            && capture_deadline_checks[3] < status_wait
+    );
+    let captures_complete = keychain_capture
+        .find("stdout_capture.is_finished() || !stderr_capture.is_finished()")
+        .unwrap();
+    let operation_postcheck = keychain_capture[captures_complete..]
+        .find("if Instant::now() >= operation_deadline")
+        .map(|offset| captures_complete + offset)
+        .unwrap();
+    let join = keychain_capture.find("join_keychain_captures(").unwrap();
+    let final_postcheck = keychain_capture[join..]
+        .find("if Instant::now() >= operation_deadline")
+        .map(|offset| join + offset)
+        .unwrap();
+    let capture_result = keychain_capture
+        .find("let (stdout, stderr) = captures?")
+        .unwrap();
+    assert!(
+        captures_complete < operation_postcheck
+            && operation_postcheck < join
+            && join < final_postcheck
+            && final_postcheck < capture_result
+    );
+    assert!(!keychain_capture.contains("child.wait()"));
+    let cancellation = braced_declaration(production, "fn cancel_keychain_child_until(");
+    let cancel = cancellation
+        .find("cancellation.store(true, Ordering::Release)")
+        .unwrap();
+    let kill = cancellation.find("child.kill()").unwrap();
+    let observe_child = cancellation.find("child.try_wait()").unwrap();
+    let observe_captures = cancellation.find("capture_finished(").unwrap();
+    let cleanup_cutoff = cancellation
+        .find("if Instant::now() >= cleanup_deadline")
+        .unwrap();
+    let completed = cancellation
+        .find("if child_finished && captures_finished")
+        .unwrap();
+    let dispatch = cancellation.find("reaper.dispatch(").unwrap();
+    assert!(
+        cancel < kill
+            && kill < observe_child
+            && observe_child < observe_captures
+            && observe_captures < cleanup_cutoff
+            && cleanup_cutoff < completed
+            && completed < dispatch
+    );
+    assert!(!cancellation.contains("child.wait()"));
+    assert!(!cancellation.contains(".join()"));
+    let reaper_start = braced_declaration(
+        production,
+        "fn start() -> Result<Self, KeychainSecretReadErrorV1>",
+    );
+    assert!(reaper_start.contains("starring-runtime-keychain-reaper"));
+    assert!(reaper_start.contains("payload.child.wait()"));
+    assert!(reaper_start.contains("join_optional_keychain_captures("));
+    let reaper_dispatch = braced_declaration(production, "fn dispatch(");
+    assert!(reaper_dispatch.contains("self.sender.send(payload)"));
+    assert!(reaper_dispatch.contains("std::process::abort()"));
+    assert!(
+        secret.contains("keychain_cleanup_cutoff_returns_before_late_capture_and_reaper_finishes")
+    );
+    assert!(production.contains("#[cfg(all(test, unix))]\nfn run_keychain_command("));
+    assert!(production.contains("#[cfg(all(test, unix))]\nfn capture_keychain_child("));
+    let resolver = braced_declaration(production, "fn resolve_until<");
+    assert_eq!(
+        resolver
+            .matches("run_runtime_startup_sync_stage_v1(")
+            .count(),
+        2
+    );
+    for capability in [
+        "DatabaseCapabilityV1::Convergence",
+        "DatabaseCapabilityV1::ExactTarget",
+        "DatabaseCapabilityV1::Panel",
+        "DatabaseCapabilityV1::Serving",
+        "DatabaseCapabilityV1::Interaction",
+    ] {
+        assert_eq!(resolver.matches(capability).count(), 1, "{capability}");
     }
 }
 
 #[test]
-fn executable_stops_after_secret_resolution_and_cannot_claim_readiness() {
+fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_staging_entry() {
     let sources = source_files();
-    let main = sources
+    let process_startup = sources
         .iter()
-        .find(|(path, _)| path == Path::new("src/main.rs"))
+        .find(|(path, _)| path == Path::new("src/process_startup.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
-    assert!(main.contains("RuntimeConfigV1::from_process_environment"));
-    assert!(main.contains("resolve_runtime_secrets_v1"));
-    assert!(main.contains("runtime_not_composed"));
-    assert!(!main.contains("compose_runtime_database_dependencies_v1"));
-    for forbidden in [
-        "health_ready",
-        "ready_to_serve",
-        "gateway_connected",
-        "compose_runtime_gateway_bootstrap_v1",
-        "RuntimeGatewayBootstrapV1",
+    let production = source_before_test_module(process_startup);
+    let entry = braced_declaration(
+        production,
+        "pub fn run_runtime_process_staging_from_environment_v1(",
+    );
+    let staging = braced_declaration(
+        production,
+        "async fn stage_runtime_process_from_environment_v1(",
+    );
+    let config = staging
+        .find("RuntimeConfigV1::from_process_environment")
+        .unwrap();
+    let secrets = staging.find("resolve_runtime_secrets_until_v1").unwrap();
+    let revision = staging
+        .find("bootstrap_compiled_runtime_build_revision_v1")
+        .unwrap();
+    let foundation = staging
+        .find("compose_runtime_process_foundation_v1")
+        .unwrap();
+    let owner = staging.find(".into_owner_held_v1()").unwrap();
+    let discord_start = staging
+        .find(".begin_paused_discord_connection_v1()")
+        .unwrap();
+    let paused_observation = staging.find(".wait_for_paused_connected_v1()").unwrap();
+    let paused_connected = staging.find(".into_paused_connected_v1(").unwrap();
+    let recovery_pending = staging.find(".into_recovery_pending_v2()").unwrap();
+    let closed_recovery = staging.find(".into_closed_recovery_v2()").unwrap();
+    let recovery_iteration_ready = staging.find(".into_recovery_iteration_ready_v2()").unwrap();
+    let shutdown = staging.find(".shutdown()").unwrap();
+    let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
+    assert!(
+        config < secrets
+            && secrets < revision
+            && revision < foundation
+            && foundation < owner
+            && owner < discord_start
+            && discord_start < paused_observation
+            && paused_observation < paused_connected
+            && paused_connected < recovery_pending
+            && recovery_pending < closed_recovery
+            && closed_recovery < recovery_iteration_ready
+            && recovery_iteration_ready < shutdown
+            && owner < shutdown
+            && shutdown < outcome
+    );
+    assert_eq!(
+        staging
+            .matches("run_runtime_startup_sync_stage_v1(")
+            .count(),
+        3
+    );
+    for operation in [
+        "RuntimeConfigV1::from_process_environment",
+        "resolve_runtime_secrets_until_v1",
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "compose_runtime_process_foundation_v1",
+        ".into_owner_held_v1()",
+        ".begin_paused_discord_connection_v1()",
+        ".wait_for_paused_connected_v1()",
+        ".into_paused_connected_v1(",
+        ".into_recovery_pending_v2()",
+        ".into_closed_recovery_v2()",
+        ".into_recovery_iteration_ready_v2()",
+        ".shutdown()",
     ] {
-        assert!(!main.contains(forbidden));
+        assert_eq!(staging.matches(operation).count(), 1, "{operation}");
+    }
+    assert_eq!(
+        entry.matches("run_runtime_startup_sync_stage_v1(").count(),
+        1
+    );
+    let entry_body = entry.split_once('{').unwrap().1.trim_start();
+    assert!(entry_body.starts_with("let startup_budget = RuntimeStartupBudgetV1::begin();"));
+    let budget = entry.find("RuntimeStartupBudgetV1::begin()").unwrap();
+    let active_runtime = entry.find("tokio::runtime::Handle::try_current()").unwrap();
+    let runtime_stage = entry.find("run_runtime_startup_sync_stage_v1(").unwrap();
+    let runtime_builder = entry
+        .find("tokio::runtime::Builder::new_current_thread()")
+        .unwrap();
+    let block_on = entry
+        .find("runtime.block_on(stage_runtime_process_from_environment_v1(")
+        .unwrap();
+    assert!(
+        budget < active_runtime
+            && active_runtime < runtime_stage
+            && runtime_stage < runtime_builder
+            && runtime_builder < block_on
+    );
+    assert_eq!(
+        entry
+            .matches("stage_runtime_process_from_environment_v1(")
+            .count(),
+        1
+    );
+    for required in [
+        "tokio::runtime::Handle::try_current()",
+        "tokio::runtime::Builder::new_current_thread()",
+        ".enable_all()",
+        ".build()",
+        "runtime.block_on(stage_runtime_process_from_environment_v1(",
+        "RuntimeProcessStagingErrorV1(<redacted>)",
+        "RuntimeProcessStagingOutcomeV1(<redacted>)",
+        "pub const fn code(self) -> &'static str",
+        "pub const fn context(self) -> Option<&'static str>",
+        "pub const fn configuration_class(self) -> bool",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for operation in [
+        "tokio::runtime::Handle::try_current()",
+        "tokio::runtime::Builder::new_current_thread()",
+        ".build()",
+        "runtime.block_on(stage_runtime_process_from_environment_v1(",
+    ] {
+        assert_eq!(entry.matches(operation).count(), 1, "{operation}");
+    }
+    for forbidden in [
+        "#[tokio::main]",
+        "new_multi_thread",
+        "tokio::spawn",
+        "spawn_blocking",
+        "tokio::select!",
+        "timeout(",
+        "timeout_at",
+        "signal",
+        "sleep",
+        "retry",
+        "loop {",
+        "compose_runtime_database_dependencies_v1",
+        "compose_runtime_registry_bootstrap_v1",
+        "compose_runtime_gateway_bootstrap_v1",
+        "start_gateway_owner_startup_watchdog_v1",
+        "observe_startup_recovery_v2",
+        "begin_startup_recovery_observation_v2",
+        "observe_current_ready_attestation",
+        "issue_ready_lease",
+        "ready_to_serve",
+        "health_ready",
+        "activate",
+        "deploy",
+        "twilight",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    let outcome_attributes =
+        declaration_attribute_block(production, "RuntimeProcessStagingOutcomeV1");
+    let outcome_declaration =
+        braced_declaration(production, "pub struct RuntimeProcessStagingOutcomeV1");
+    assert!(outcome_declaration.contains("_private: ()"));
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(outcome_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            production,
+            "RuntimeProcessStagingOutcomeV1",
+            forbidden,
+        ));
+    }
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "run_runtime_process_staging_from_environment_v1",
+        "RuntimeProcessStagingErrorV1",
+        "RuntimeProcessStagingOutcomeV1",
+    ] {
+        assert_eq!(library.matches(required).count(), 1, "{required}");
+    }
+    for forbidden in [
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "CompiledRuntimeBuildRevisionV1",
+        "compose_runtime_process_foundation_v1",
+        "RuntimeProcessFoundationV1",
+        "resolve_runtime_secrets_until_v1",
+        "resolve_runtime_secrets_v1",
+        "RuntimeStartupBudgetV1",
+        "run_runtime_startup_sync_stage_v1",
+    ] {
+        assert!(!library.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
+    let main = source_before_test_module(include_str!("../src/main.rs"));
+    let entry = braced_declaration(main, "fn main() -> ExitCode");
+    assert!(main.contains("RecoveryIterationReadyAndClosed"));
+    assert!(main.contains("runtime_staging_recovery_iteration_ready_and_closed"));
+    assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_))"));
+    assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(_))"));
+    assert!(main
+        .contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(_))"));
+    assert_eq!(
+        entry
+            .matches("run_runtime_process_staging_from_environment_v1()")
+            .count(),
+        1
+    );
+    assert!(entry.contains("emit_status(status.code(), status.context())"));
+    assert!(entry.contains("status.exit_code()"));
+    for forbidden in [
+        "#[tokio::main]",
+        "tokio",
+        ".await",
+        "RuntimeConfigV1",
+        "from_process_environment",
+        "resolve_runtime_secrets",
+        "RuntimeStartupBudgetV1",
+        "bootstrap_compiled_runtime_build_revision_v1",
+        "CompiledRuntimeBuildRevisionV1",
+        "compose_runtime_process_foundation_v1",
+        "RuntimeProcessFoundationV1",
+        "compose_runtime_database_dependencies_v1",
+        "compose_runtime_registry_bootstrap_v1",
+        "compose_runtime_gateway_bootstrap_v1",
+        "start_gateway_owner_startup_watchdog_v1",
+        "tokio::spawn",
+        "spawn_blocking",
+        "tokio::select!",
+        "signal",
+        "sleep",
+        "retry",
+        "loop {",
+        "ready_to_serve",
+        "health_ready",
+        "twilight",
+    ] {
+        assert!(!main.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
+    let acquisition = source_before_test_module(include_str!("../src/gateway_owner_startup.rs"));
+    let watchdog = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub(crate) struct RuntimeAcquiredGatewayOwnerV1",
+        "watchdog: RuntimeGatewayOwnerStartupWatchdogHandleV1,",
+        "current_observation: RuntimeGatewayOwnerCurrentObservationV1,",
+        "let request = RuntimeAcquireGatewayOwnerLeaseV1 {",
+        "gateway_shard_id: runtime_gateway_shard_id_v1(),",
+        "process_instance_id: process_instance_id.clone(),",
+        "expected_build_revision: build_revision.clone(),",
+        "lease_for: config.lease_for(),",
+        "accept_gateway_owner_acquire_v1(request, outcome)",
+        "accept_gateway_owner_observation_v1(&observation_request, observation)",
+        "classify_unknown_gateway_owner_acquire_v1(request, observation)",
+        ".start_bounded_gateway_owner_startup_watchdog_v1(",
+        "cleanup_deadline,",
+        ".observe_current_gateway_owner_v1()",
+        "release_runtime_gateway_owner_until_v1(",
+        "shutdown_until(cleanup_deadline)",
+        "pub(crate) async fn prepare_closed_recovery_in_place_v2(",
+        "pub(crate) fn try_into_prepared_closed_recovery_v2(",
+        "RuntimeGatewayOwnerStartupAcquisitionErrorV1(<redacted>)",
+        "RuntimeAcquiredGatewayOwnerV1(<redacted>)",
+    ] {
+        assert!(acquisition.contains(required), "{required}");
+    }
+    assert!(!acquisition.contains("prepare_closed_recovery_observation_v2"));
+    assert_eq!(acquisition.matches(".acquire_gateway_owner(").count(), 1);
+    assert_eq!(
+        acquisition.matches("acquire_gateway_owner_once_v1").count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches("acquire_gateway_owner_second_v1")
+            .count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches("resolve_unknown_gateway_owner_acquire_v1")
+            .count(),
+        3
+    );
+    assert_eq!(
+        acquisition
+            .matches(".start_bounded_gateway_owner_startup_watchdog_v1(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        acquisition
+            .matches(".observe_current_gateway_owner_v1()")
+            .count(),
+        1
+    );
+    assert!(!acquisition.contains("\"shard:0\""));
+    for forbidden in [
+        "loop {",
+        "while ",
+        "tokio::spawn",
+        "spawn_blocking",
+        "ready_to_serve",
+        "readiness",
+        "issue_ready_lease",
+        "resume",
+        "Discord",
+        "twilight",
+        "activate",
+        "deploy",
+        "into_production",
+        "promote_to_production_v1",
+        "start_gateway_owner_production",
+        "observe_paused_connected_gateway_v2",
+        "TcpListener",
+        ".bind(",
+        ".listen(",
+        ".serve(",
+    ] {
+        assert!(!acquisition.contains(forbidden), "{forbidden}");
+        assert!(!owner.contains(forbidden), "{forbidden}");
+    }
+    assert!(!owner.contains("prepare_closed_recovery"));
+    let acquired_attributes =
+        declaration_attribute_block(acquisition, "RuntimeAcquiredGatewayOwnerV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(acquired_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            acquisition,
+            "RuntimeAcquiredGatewayOwnerV1",
+            forbidden,
+        ));
+    }
+    assert!(!acquisition.contains("pub struct RuntimeAcquiredGatewayOwnerV1"));
+
+    for required in [
+        "const SUPPORTED_GATEWAY_SHARD_ID: &str = \"shard:0\";",
+        "pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1",
+        "GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID)",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+
+    for required in [
+        "pub(crate) struct RuntimeOwnerHeldProcessV1",
+        "foundation: RuntimeProcessFoundationV1,",
+        "owner: RuntimeAcquiredGatewayOwnerV1,",
+        "impl RuntimeProcessFoundationV1",
+        "pub(crate) async fn into_owner_held_v1(",
+        "acquire_runtime_gateway_owner_startup_v1(",
+        "self.startup_budget.operation_cutoff()",
+        "self.startup_budget.owner_cleanup_deadline()",
+        "RuntimeOwnerHeldProcessV1(<redacted>)",
+        "RuntimeProcessGatewayOwnerTransitionErrorV1(<redacted>)",
+        "RuntimeOwnerHeldProcessShutdownErrorV1(<redacted>)",
+    ] {
+        assert!(owner.contains(required), "{required}");
+    }
+    assert_eq!(
+        owner
+            .matches("acquire_runtime_gateway_owner_startup_v1(")
+            .count(),
+        1
+    );
+    assert_eq!(owner.matches("owner_cleanup_deadline()").count(), 3);
+    assert!(!owner.contains("startup_budget.cleanup_deadline()"));
+    let owner_attributes = declaration_attribute_block(owner, "RuntimeOwnerHeldProcessV1");
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(
+            !contains_identifier(owner_attributes, forbidden),
+            "{forbidden}"
+        );
+        assert!(!implements_trait(
+            owner,
+            "RuntimeOwnerHeldProcessV1",
+            forbidden,
+        ));
+    }
+    let shutdown = braced_declaration(
+        owner,
+        "pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1>",
+    );
+    let owner_release = shutdown
+        .find("owner.shutdown_until(owner_cleanup_deadline)")
+        .unwrap();
+    let database_close = shutdown.find("foundation.shutdown().await").unwrap();
+    assert!(owner_release < database_close);
+    assert!(!owner.contains("pub struct RuntimeOwnerHeldProcessV1"));
+    assert!(!library.contains("RuntimeOwnerHeldProcessV1"));
+
+    for required in [
+        "deadline_cap: Option<Instant>,",
+        ".map_or(relative, |cap| relative.min(cap))",
+        "fn capped_at(mut self, deadline_cap: Instant) -> Self",
+        "pub(crate) async fn cleanup_until(",
+        "pub(crate) async fn shutdown_until(",
+        "pub(crate) async fn release_runtime_gateway_owner_until_v1",
+        "RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed",
+        "const STARTUP_ACTOR_TERMINATION_RESERVE:",
+        "const STARTUP_TASK_ABORT_RESERVE:",
+        "task: Option<tokio::task::JoinHandle<()>>,",
+        "let task = runtime.spawn(async move",
+        "self.join_task_until(cleanup_deadline)",
+        "self.abort_and_join_task().await",
+        "cleanup_deadline: Option<Instant>,",
+        "self.request_shutdown(Some(actor_cleanup_deadline))",
+        "cleanup = cleanup.capped_at(cleanup_deadline);",
+        "struct RuntimeGatewayOwnerStartupCleanupCapV1",
+        "initial_startup_cleanup_deadline: Option<Instant>,",
+        "RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline)",
+        "startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,",
+        "startup_cleanup_cap.limit(stop.cleanup_deadline)",
+        "self.inner().clear_startup_cleanup_deadline();",
+    ] {
+        assert!(watchdog.contains(required), "{required}");
+    }
+    let stop = braced_declaration(watchdog, "impl RuntimeGatewayOwnerStartupWatchdogStopV1");
+    assert!(stop.contains("cleanup_deadline: cleanup.deadline()"));
+    assert_eq!(
+        watchdog
+            .matches("startup_cleanup_cap.limit(stop.cleanup_deadline)")
+            .count(),
+        3
+    );
+    let production_handoff =
+        braced_declaration(watchdog, "pub(crate) async fn into_production_v1(");
+    let projection = production_handoff
+        .find("self.inner().promote_to_production_v1().await?")
+        .unwrap();
+    let clear = production_handoff
+        .find("self.inner().clear_startup_cleanup_deadline()")
+        .unwrap();
+    let transfer = production_handoff
+        .find("let inner = self.take_inner()")
+        .unwrap();
+    assert!(projection < clear && clear < transfer);
+    let watchdog_start = braced_declaration(
+        watchdog,
+        "pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1",
+    );
+    let initialized_cap = watchdog_start
+        .find("RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline)")
+        .unwrap();
+    let actor_spawn = watchdog_start
+        .find("let task = runtime.spawn(async move")
+        .unwrap();
+    assert!(initialized_cap < actor_spawn);
+    assert!(!watchdog.contains("with_startup_cleanup_deadline"));
+    assert!(!watchdog.contains("fn install_startup_cleanup_deadline"));
+    assert!(!watchdog.contains("cleanup_timeout"));
+}
+
+#[test]
+fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure() {
+    let sources = source_files();
+    let process = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = source_before_test_module(process);
+    let composer = braced_declaration(
+        production,
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
+    );
+    let deadline_before_process_identity = composer
+        .find("if !startup_budget.operation_is_open()")
+        .unwrap();
+    let process_identity = composer
+        .find("generate_runtime_process_instance_id_v1()")
+        .unwrap();
+    let deadline_after_process_identity = composer[process_identity..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| process_identity + offset)
+        .unwrap();
+    let process_identity_error = composer
+        .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)")
+        .unwrap();
+    let controller_identity = composer
+        .find("generate_runtime_controller_id_v1()")
+        .unwrap();
+    let deadline_after_controller_identity = composer[controller_identity..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| controller_identity + offset)
+        .unwrap();
+    let controller_identity_error = composer
+        .find(".map_err(RuntimeProcessFoundationCompositionErrorV1::ControllerId)")
+        .unwrap();
+    let build_revision = composer.find("build_revision.into_revision()").unwrap();
+    let databases = composer
+        .find("compose_runtime_database_dependencies_v1(&config, &secrets, &startup_budget)")
+        .unwrap();
+    let closed = composer
+        .find("compose_closed_process_components_v1(&process_instance_id, config.gateway())")
+        .unwrap();
+    let deadline_after_closed_result = composer[closed..]
+        .find("if !startup_budget.operation_is_open()")
+        .map(|offset| closed + offset)
+        .unwrap();
+    let closed_result = composer
+        .find("let closed_components = match closed_components")
+        .unwrap();
+    let cleanup = composer
+        .find(".close_until(startup_budget.cleanup_deadline())")
+        .unwrap();
+
+    assert!(
+        deadline_before_process_identity < process_identity
+            && process_identity < deadline_after_process_identity
+            && deadline_after_process_identity < process_identity_error
+            && process_identity_error < controller_identity
+            && controller_identity < deadline_after_controller_identity
+            && deadline_after_controller_identity < controller_identity_error
+            && controller_identity_error < build_revision
+            && build_revision < databases
+            && databases < closed
+            && closed < deadline_after_closed_result
+            && deadline_after_closed_result < closed_result
+            && closed_result < cleanup
+    );
+    for required in [
+        "pub(crate) struct RuntimeProcessFoundationV1",
+        "config: RuntimeConfigV1,",
+        "secrets: ResolvedRuntimeSecretsV1,",
+        "build_revision: RuntimeBuildRevisionV1,",
+        "build_revision: CompiledRuntimeBuildRevisionV1",
+        "build_revision.into_revision()",
+        "build_revision,",
+        "process_instance_id: ProcessInstanceId,",
+        "controller_id: ControllerId,",
+        "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
+        "compose_runtime_gateway_bootstrap_v1(",
+        "RuntimeProcessFoundationV1(<redacted>)",
+        "RuntimeProcessFoundationCompositionErrorV1(<redacted>)",
+        "startup_budget: RuntimeStartupBudgetV1",
+        "if !startup_budget.operation_is_open()",
+        "cleanup_after_operation_deadline_v1",
+        "RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed",
+        "RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline",
+        "pub(crate) async fn shutdown(self)",
+        "shutdown.close_until(cleanup_deadline).await",
+        "finish_runtime_process_foundation_shutdown_v1(",
+        "let Self {",
+        "drop((",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    assert_eq!(
+        composer
+            .matches("if !startup_budget.operation_is_open()")
+            .count(),
+        6
+    );
+    assert_eq!(
+        composer
+            .matches("generate_runtime_process_instance_id_v1()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        composer
+            .matches("generate_runtime_controller_id_v1()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        composer.matches("build_revision.into_revision()").count(),
+        1
+    );
+    let signature = production
+        .split("pub(crate) async fn compose_runtime_process_foundation_v1(")
+        .nth(1)
+        .and_then(|source| source.split(") -> Result<").next())
+        .unwrap();
+    for owned in [
+        "config: RuntimeConfigV1",
+        "secrets: ResolvedRuntimeSecretsV1",
+        "build_revision: CompiledRuntimeBuildRevisionV1",
+    ] {
+        assert!(signature.contains(owned), "{owned}");
+    }
+    assert!(!signature.contains("config: &RuntimeConfigV1"));
+    assert!(!signature.contains("secrets: &ResolvedRuntimeSecretsV1"));
+    assert!(!signature.contains("process_instance_id: ProcessInstanceId"));
+    assert!(!signature.contains("controller_id: ControllerId"));
+    assert!(!signature.contains("build_revision: RuntimeBuildRevisionV1"));
+    assert!(!composer.contains("ControllerId::parse(process_instance_id"));
+    assert!(!composer.contains("ControllerId::parse(build_revision"));
+    assert!(!composer.contains("ProcessInstanceId::parse(controller_id"));
+    for forbidden in [
+        "ready_to_serve",
+        "health_ready",
+        "start_gateway_owner_startup_watchdog_v1",
+        "observe_current_ready_attestation()?",
+        "Discord",
+        "RuntimeStartupBudgetV1::begin()",
+        "pub struct RuntimeProcessFoundationV1",
+        "pub async fn compose_runtime_process_foundation_v1",
+        "pub async fn shutdown(self)",
+        "pub fn runtime_build_revision(&self)",
+        "pub fn process_instance_id(&self)",
+        "pub fn controller_id(&self)",
+        "pub fn databases(&self)",
+        "pub fn registry(&self)",
+        "pub fn gateway(&self)",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    assert!(!composer.contains("drop(secrets)"));
+    assert!(!composer.contains("drop(config)"));
+    let shutdown = braced_declaration(production, "pub(crate) async fn shutdown(self)");
+    let cleanup_deadline = shutdown
+        .find("let cleanup_deadline = startup_budget.cleanup_deadline()")
+        .unwrap();
+    let shutdown_handle = shutdown
+        .find("let shutdown = databases.shutdown()")
+        .unwrap();
+    let closed_components = shutdown
+        .find("drop((gateway, registry, databases))")
+        .unwrap();
+    let close = shutdown
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    let release_handle = shutdown.find("drop(shutdown)").unwrap();
+    let finish = shutdown
+        .find("finish_runtime_process_foundation_shutdown_v1(")
+        .unwrap();
+    assert!(
+        cleanup_deadline < shutdown_handle
+            && shutdown_handle < closed_components
+            && closed_components < close
+            && close < release_handle
+            && release_handle < finish
+    );
+    assert!(shutdown.contains("let cleanup_deadline = startup_budget.cleanup_deadline()"));
+    assert!(shutdown.contains("shutdown.close_until(cleanup_deadline).await"));
+    assert!(!shutdown.contains("shutdown.close().await"));
+    assert!(!composer.contains("shutdown.close().await"));
+    let finish_shutdown = braced_declaration(
+        production,
+        "fn finish_runtime_process_foundation_shutdown_v1<S, R>(",
+    );
+    let drop_secrets = finish_shutdown.find("drop(secrets)").unwrap();
+    let drop_retained = finish_shutdown.find("drop(retained)").unwrap();
+    let return_result = finish_shutdown.rfind("result").unwrap();
+    assert!(drop_secrets < drop_retained && drop_retained < return_result);
+    for required in [
+        "shutdown_finish_drops_secrets_only_after_close_returns_on_every_result",
+        "[\"pool_close_returned\", \"secrets\", \"retained\"]",
+        "assert_shutdown_finish_drop_order(Ok(()))",
+        "assert_shutdown_finish_drop_order(Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut))",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    for name in [
+        "RuntimeProcessFoundationV1",
+        "RuntimeClosedProcessComponentsV1",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
     }
 }

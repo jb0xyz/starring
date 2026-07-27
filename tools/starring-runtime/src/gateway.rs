@@ -4,17 +4,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+#[cfg(test)]
+use automation_runtime::GatewayCommandAckV3;
 use automation_runtime::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
     GatewayAdmissionSnapshotV3, GatewayConnectionEpochV3, GatewayConnectionObserverV3,
     GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
     GatewayControlTransitionErrorV3, GatewayDrainCauseV3, GatewayInvalidationSignalV3,
-    GatewayPausedConnectionV3, GatewayReadyKindV3, GatewaySynchronousInvalidatorV3,
-    SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
+    GatewayLifecycleEventV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
+    GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
-    RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
-    RuntimeRecoveryIdV2,
+    GatewayShardIdV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2,
+    RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
@@ -29,24 +31,35 @@ use automation_runtime_worker::{
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimeRegistryRecoveryEmptyObservationV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
-use tokio::sync::watch;
-use tokio::time::{sleep_until, Instant as TokioInstant};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
+#[cfg(test)]
+use crate::discord::RuntimeDiscordGatewayDriverV1;
+use crate::discord::{
+    prepare_twilight_runtime_discord_gateway_driver_v1, start_runtime_discord_gateway_v1,
+    RuntimeDiscordControlTaskV1, RuntimeDiscordGatewayActorStartV1,
+    RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
+};
 use crate::gateway_owner_startup_watchdog::{
     start_runtime_gateway_owner_startup_watchdog_v1,
     RuntimeGatewayOwnerClosedRecoveryCommitErrorV2, RuntimeGatewayOwnerClosedRecoverySupervisorV2,
     RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
-    RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
 use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
 use crate::{
-    GatewayResourceConfigV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
+    GatewayResourceConfigV1, RuntimeDiscordBotTokenV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
 };
 
 const SUPPORTED_GATEWAY_SHARD_ID: &str = "shard:0";
+
+pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1 {
+    GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID).expect("supported gateway shard identity")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeGatewayBootstrapErrorV1 {
@@ -134,7 +147,9 @@ impl RuntimeGatewayReadyObservationErrorV1 {
 
 struct SharedGatewayControlAdapterV2 {
     process_instance_id: ProcessInstanceId,
-    control: SharedGatewayControlV3,
+    control: Option<SharedGatewayControlV3>,
+    connection_observer: GatewayConnectionObserverV3,
+    discord_commands: Option<mpsc::Sender<RuntimeDiscordControlCommandV1>>,
     admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
@@ -143,11 +158,41 @@ struct SharedGatewayRuntimeHalfV3 {
     _inner: SharedGatewayRuntimeControlV3,
 }
 
+struct RuntimePreparedDiscordGatewayStartV1 {
+    runtime_handle: tokio::runtime::Handle,
+    runtime: SharedGatewayRuntimeHalfV3,
+    control_task: RuntimeDiscordControlTaskV1,
+    lifecycle_drained: watch::Receiver<u64>,
+    stopped_sender: watch::Sender<bool>,
+    stopped: watch::Receiver<bool>,
+}
+
+enum RuntimeDiscordControlCommandV1 {
+    BeginDrain {
+        response: oneshot::Sender<bool>,
+    },
+    #[cfg(test)]
+    OpenAdmission {
+        response: oneshot::Sender<bool>,
+    },
+}
+
 pub struct RuntimeGatewayBootstrapV1 {
     adapter: SharedGatewayControlAdapterV2,
-    _runtime: SharedGatewayRuntimeHalfV3,
+    _runtime: Option<SharedGatewayRuntimeHalfV3>,
     owner_invalidator: Option<RuntimeGatewayOwnerInvalidationBridgeV2>,
     owner_invalidated: Arc<AtomicBool>,
+    owner_discord_attachment: Arc<Mutex<Option<RuntimeGatewayOwnerDiscordAttachmentV1>>>,
+}
+
+pub(crate) struct RuntimeGatewayAdmissionChangeWatchV1 {
+    inner: watch::Receiver<GatewayAdmissionSnapshotV3>,
+}
+
+impl RuntimeGatewayAdmissionChangeWatchV1 {
+    pub(crate) async fn changed(&mut self) -> bool {
+        self.inner.changed().await.is_ok()
+    }
 }
 
 pub(crate) struct RuntimeEmergencyGatewaySectionV2<'a> {
@@ -209,6 +254,13 @@ struct RuntimeGatewayInvalidationBridgeV2 {
 struct RuntimeGatewayOwnerInvalidationBridgeV2 {
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
     invalidated: Arc<AtomicBool>,
+    discord_attachment: Arc<Mutex<Option<RuntimeGatewayOwnerDiscordAttachmentV1>>>,
+}
+
+struct RuntimeGatewayOwnerDiscordAttachmentV1 {
+    discord_abort_handle: Option<tokio::task::AbortHandle>,
+    control_abort_handle: Option<tokio::task::AbortHandle>,
+    stopped: watch::Receiver<bool>,
 }
 
 #[cfg(test)]
@@ -222,6 +274,26 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewaySnapshotTestInvalidatorV3
 impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidationBridgeV2 {
     fn invalidate_gateway_ownership(&self) {
         invalidate_gateway_owner_state(&self.closed_lifecycle, &self.invalidated);
+        let attachment = self
+            .discord_attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(attachment) = attachment.as_ref() {
+            if let Some(abort_handle) = attachment.discord_abort_handle.as_ref() {
+                abort_handle.abort();
+            }
+            if let Some(abort_handle) = attachment.control_abort_handle.as_ref() {
+                abort_handle.abort();
+            }
+        }
+    }
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        self.discord_attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|attachment| attachment.stopped.clone())
     }
 }
 
@@ -268,6 +340,265 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
 }
 
 impl RuntimeGatewayBootstrapV1 {
+    pub(crate) fn admission_change_watch_v1(&self) -> RuntimeGatewayAdmissionChangeWatchV1 {
+        RuntimeGatewayAdmissionChangeWatchV1 {
+            inner: self.adapter.admission_snapshot.clone(),
+        }
+    }
+
+    pub(crate) async fn start_discord_gateway_v1(
+        &mut self,
+        token: &RuntimeDiscordBotTokenV1,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1> {
+        let driver =
+            prepare_twilight_runtime_discord_gateway_driver_v1(token.expose_secret().to_owned());
+        let prepared = self
+            .prepare_discord_gateway_start_v1(operation_cutoff)
+            .await?;
+        let mut supervisor = start_runtime_discord_gateway_v1(
+            driver,
+            RuntimeDiscordGatewayActorStartV1 {
+                control: prepared.runtime._inner,
+                operation_cutoff,
+                shutdown_deadline,
+                lifecycle_drained: prepared.lifecycle_drained,
+                runtime: prepared.runtime_handle,
+                control_task: prepared.control_task,
+                stopped_sender: prepared.stopped_sender,
+                stopped: prepared.stopped,
+            },
+        );
+        self.attach_discord_supervisor_v1(&supervisor)?;
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        if !supervisor.release_start_v1() {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable);
+        }
+        Ok(supervisor)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_discord_gateway_with_driver_v1<D>(
+        &mut self,
+        driver: D,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1>
+    where
+        D: RuntimeDiscordGatewayDriverV1,
+    {
+        self.start_discord_gateway_with_driver_before_release_v1(
+            driver,
+            operation_cutoff,
+            shutdown_deadline,
+            |_| {},
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_discord_gateway_with_driver_before_release_v1<D, F>(
+        &mut self,
+        driver: D,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+        before_release: F,
+    ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1>
+    where
+        D: RuntimeDiscordGatewayDriverV1,
+        F: FnOnce(&Self),
+    {
+        let prepared = self
+            .prepare_discord_gateway_start_v1(operation_cutoff)
+            .await?;
+        let mut supervisor = start_runtime_discord_gateway_v1(
+            driver,
+            RuntimeDiscordGatewayActorStartV1 {
+                control: prepared.runtime._inner,
+                operation_cutoff,
+                shutdown_deadline,
+                lifecycle_drained: prepared.lifecycle_drained,
+                runtime: prepared.runtime_handle,
+                control_task: prepared.control_task,
+                stopped_sender: prepared.stopped_sender,
+                stopped: prepared.stopped,
+            },
+        );
+        self.attach_discord_supervisor_v1(&supervisor)?;
+        before_release(self);
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        if !supervisor.release_start_v1() {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable);
+        }
+        Ok(supervisor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_owner_for_discord_test_v1(&self) {
+        self.owner_invalidator
+            .as_ref()
+            .expect("gateway owner invalidator")
+            .invalidate_gateway_ownership();
+    }
+
+    pub(crate) fn begin_discord_drain_v1(
+        &self,
+    ) -> impl std::future::Future<Output = bool> + Send + 'static {
+        let commands = self.adapter.discord_commands.clone();
+        async move {
+            let Some(commands) = commands else {
+                return false;
+            };
+            let (response, acknowledgement) = oneshot::channel();
+            if commands
+                .send(RuntimeDiscordControlCommandV1::BeginDrain { response })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            acknowledgement.await.unwrap_or(false)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_discord_admission_for_test_v1(&self) -> bool {
+        let Some(commands) = self.adapter.discord_commands.as_ref() else {
+            return false;
+        };
+        let (response, acknowledgement) = oneshot::channel();
+        if commands
+            .send(RuntimeDiscordControlCommandV1::OpenAdmission { response })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        acknowledgement.await.unwrap_or(false)
+    }
+
+    fn attach_discord_supervisor_v1(
+        &self,
+        supervisor: &RuntimeDiscordGatewaySupervisorV1,
+    ) -> Result<(), RuntimeDiscordGatewayStartErrorV1> {
+        let Some((discord_abort_handle, control_abort_handle)) = supervisor.abort_handles() else {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable);
+        };
+        let mut attachment = self
+            .owner_discord_attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(attachment) = attachment.as_mut() else {
+            discord_abort_handle.abort();
+            control_abort_handle.abort();
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+        };
+        if attachment.discord_abort_handle.is_some() || attachment.control_abort_handle.is_some() {
+            discord_abort_handle.abort();
+            control_abort_handle.abort();
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+        }
+        attachment.discord_abort_handle = Some(discord_abort_handle.clone());
+        attachment.control_abort_handle = Some(control_abort_handle.clone());
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            discord_abort_handle.abort();
+            control_abort_handle.abort();
+        }
+        Ok(())
+    }
+
+    fn reserve_discord_supervisor_v1(
+        &self,
+        stopped: watch::Receiver<bool>,
+    ) -> Result<(), RuntimeDiscordGatewayStartErrorV1> {
+        let mut attachment = self
+            .owner_discord_attachment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if attachment.is_some() {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+        }
+        *attachment = Some(RuntimeGatewayOwnerDiscordAttachmentV1 {
+            discord_abort_handle: None,
+            control_abort_handle: None,
+            stopped,
+        });
+        Ok(())
+    }
+
+    async fn prepare_discord_gateway_start_v1(
+        &mut self,
+        operation_cutoff: Instant,
+    ) -> Result<RuntimePreparedDiscordGatewayStartV1, RuntimeDiscordGatewayStartErrorV1> {
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        let runtime_handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable)?;
+        let (stopped_sender, stopped) = watch::channel(false);
+        self.reserve_discord_supervisor_v1(stopped.clone())?;
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        if Instant::now() >= operation_cutoff {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
+        let initial_lifecycle = match self.adapter.control.as_mut() {
+            Some(control) if Instant::now() < operation_cutoff => timeout_at(
+                TokioInstant::from_std(operation_cutoff),
+                control.next_lifecycle(),
+            )
+            .await
+            .ok()
+            .flatten(),
+            Some(_) | None => None,
+        };
+        if initial_lifecycle != Some(GatewayLifecycleEventV3::Starting) {
+            let _stopped = stopped_sender.send(true);
+            return Err(if Instant::now() >= operation_cutoff {
+                RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed
+            } else {
+                RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable
+            });
+        }
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        let runtime = match self._runtime.take() {
+            Some(runtime) => runtime,
+            None => {
+                let _stopped = stopped_sender.send(true);
+                return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+            }
+        };
+        let Some(control) = self.adapter.control.take() else {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+        };
+        let (discord_commands, commands) = mpsc::channel(1);
+        let (lifecycle_drained_sender, lifecycle_drained) = watch::channel(1);
+        let control_task = RuntimeDiscordControlTaskV1::new(runtime_handle.spawn(
+            run_runtime_discord_control_v1(control, commands, lifecycle_drained_sender),
+        ));
+        self.adapter.discord_commands = Some(discord_commands);
+        Ok(RuntimePreparedDiscordGatewayStartV1 {
+            runtime_handle,
+            runtime,
+            control_task,
+            lifecycle_drained,
+            stopped_sender,
+            stopped,
+        })
+    }
+
     pub fn closed_snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
         self.adapter
             .closed_lifecycle
@@ -301,12 +632,20 @@ impl RuntimeGatewayBootstrapV1 {
         let RuntimeGatewayClosedSnapshotV2::Emergency { generation, .. } = closed else {
             return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
         };
-        let snapshot = self.adapter.control.current_admission_snapshot();
+        let snapshot = self
+            .adapter
+            .connection_observer
+            .current_admission_snapshot();
         let (observation, epoch) = self
             .adapter
             .map_paused_connected_observation(generation, snapshot)?;
         self.adapter.require_healthy_paused_control(epoch)?;
-        if self.adapter.control.current_admission_snapshot() != snapshot {
+        if self
+            .adapter
+            .connection_observer
+            .current_admission_snapshot()
+            != snapshot
+        {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
         }
         self.require_current_gateway_ownership()?;
@@ -314,7 +653,12 @@ impl RuntimeGatewayBootstrapV1 {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
         }
         self.adapter.require_healthy_paused_control(epoch)?;
-        if self.adapter.control.current_admission_snapshot() != snapshot {
+        if self
+            .adapter
+            .connection_observer
+            .current_admission_snapshot()
+            != snapshot
+        {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
         }
         if self.closed_snapshot() != closed {
@@ -324,21 +668,16 @@ impl RuntimeGatewayBootstrapV1 {
         Ok(observation)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "closed recovery composition consumes the synchronous gateway section"
-        )
-    )]
     pub(crate) fn initial_emergency_gateway_section_v2<'a>(
         &'a self,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<RuntimeEmergencyGatewaySectionV2<'a>, RuntimeGatewayReadyObservationErrorV1> {
         RuntimeEmergencyGatewaySectionV2::acquire(
             &self.adapter,
             &self.owner_invalidated,
             prepared_owner,
+            expected_paused_gateway,
         )
     }
 
@@ -349,6 +688,58 @@ impl RuntimeGatewayBootstrapV1 {
         request_started_at: Instant,
         response_observed_at: Instant,
         config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogHandleV1,
+        RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
+    >
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
+        P::Error: Send + 'static,
+    {
+        self.start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1(
+            port,
+            accepted_receipt,
+            request_started_at,
+            response_observed_at,
+            config,
+            None,
+        )
+    }
+
+    pub(crate) fn start_bounded_gateway_owner_startup_watchdog_v1<P>(
+        &mut self,
+        port: P,
+        accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogHandleV1,
+        RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
+    >
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
+        P::Error: Send + 'static,
+    {
+        self.start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1(
+            port,
+            accepted_receipt,
+            request_started_at,
+            response_observed_at,
+            config,
+            Some(cleanup_deadline),
+        )
+    }
+
+    fn start_gateway_owner_startup_watchdog_with_cleanup_deadline_v1<P>(
+        &mut self,
+        port: P,
+        accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+        cleanup_deadline: Option<Instant>,
     ) -> Result<
         RuntimeGatewayOwnerStartupWatchdogHandleV1,
         RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
@@ -395,9 +786,12 @@ impl RuntimeGatewayBootstrapV1 {
             invalidator,
             self.owner_invalidated.clone(),
             accepted_receipt,
-            request_started_at,
-            response_observed_at,
             config,
+            RuntimeGatewayOwnerStartupWatchdogStartContextV1::new(
+                request_started_at,
+                response_observed_at,
+                cleanup_deadline,
+            ),
         )
     }
 
@@ -414,6 +808,8 @@ impl RuntimeGatewayBootstrapV1 {
     #[cfg(test)]
     pub(crate) fn connect_ready_for_gateway_section_test_v2(&mut self) {
         self._runtime
+            .as_mut()
+            .expect("gateway runtime half")
             ._inner
             .mark_connected(GatewayReadyKindV3::Ready)
             .unwrap();
@@ -422,6 +818,8 @@ impl RuntimeGatewayBootstrapV1 {
     #[cfg(test)]
     pub(crate) fn disconnect_for_gateway_section_test_v2(&mut self) {
         self._runtime
+            .as_mut()
+            .expect("gateway runtime half")
             ._inner
             .mark_disconnected(automation_runtime::GatewayDisconnectKindV3::Reconnect)
             .unwrap();
@@ -432,14 +830,19 @@ impl RuntimeGatewayBootstrapV1 {
         &mut self,
         prepared_owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        let expected_paused_gateway = self.observe_paused_connected_gateway_v2()?;
         let Self {
             adapter,
             _runtime,
             owner_invalidated,
             ..
         } = self;
-        let section =
-            RuntimeEmergencyGatewaySectionV2::acquire(adapter, owner_invalidated, prepared_owner)?;
+        let section = RuntimeEmergencyGatewaySectionV2::acquire(
+            adapter,
+            owner_invalidated,
+            prepared_owner,
+            &expected_paused_gateway,
+        )?;
         let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(0);
         let (completed_sender, completed_receiver) = std::sync::mpsc::sync_channel(1);
         let (dummy_control, dummy_runtime) =
@@ -448,7 +851,10 @@ impl RuntimeGatewayBootstrapV1 {
                 GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
                 RuntimeGatewaySnapshotTestInvalidatorV3,
             );
-        let runtime_half = std::mem::replace(&mut _runtime._inner, dummy_runtime);
+        let runtime_half = std::mem::replace(
+            &mut _runtime.as_mut().expect("gateway runtime half")._inner,
+            dummy_runtime,
+        );
         let worker = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -462,7 +868,11 @@ impl RuntimeGatewayBootstrapV1 {
         started_receiver.recv().unwrap();
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            adapter.control.pause_admission(),
+            adapter
+                .control
+                .as_ref()
+                .expect("gateway control half")
+                .pause_admission(),
         )
         .await;
         assert!(blocked.is_err());
@@ -478,10 +888,92 @@ impl RuntimeGatewayBootstrapV1 {
                 automation_runtime::GatewayCommandAckV3::Paused { .. }
             )
         ));
-        _runtime._inner = runtime_half;
+        _runtime.as_mut().expect("gateway runtime half")._inner = runtime_half;
         drop(dummy_control);
         Ok(())
     }
+}
+
+async fn run_runtime_discord_control_v1(
+    mut control: SharedGatewayControlV3,
+    mut commands: mpsc::Receiver<RuntimeDiscordControlCommandV1>,
+    lifecycle_drained: watch::Sender<u64>,
+) {
+    let mut lifecycle_sequence = 1u64;
+    loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    return;
+                };
+                match command {
+                    RuntimeDiscordControlCommandV1::BeginDrain { response } => {
+                        let drained = if control.begin_drain().await.is_ok() {
+                            match control.next_lifecycle().await {
+                                Some(_) => publish_runtime_lifecycle_drain_v1(
+                                    &lifecycle_drained,
+                                    &mut lifecycle_sequence,
+                                ),
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        let _response = response.send(drained);
+                    }
+                    #[cfg(test)]
+                    RuntimeDiscordControlCommandV1::OpenAdmission { response } => {
+                        let opened = match control.pause_admission().await {
+                            Ok(GatewayCommandAckV3::Paused { resume_token, .. }) => {
+                                let paused = control.next_lifecycle().await.is_some()
+                                    && publish_runtime_lifecycle_drain_v1(
+                                        &lifecycle_drained,
+                                        &mut lifecycle_sequence,
+                                    );
+                                paused
+                                    && control.resume_admission(&resume_token).await.is_ok()
+                                    && control.next_lifecycle().await.is_some()
+                                    && publish_runtime_lifecycle_drain_v1(
+                                        &lifecycle_drained,
+                                        &mut lifecycle_sequence,
+                                    )
+                            }
+                            Ok(
+                                GatewayCommandAckV3::AdmissionResumed { .. }
+                                | GatewayCommandAckV3::Draining { .. },
+                            )
+                            | Err(_) => false,
+                        };
+                        let _response = response.send(opened);
+                    }
+                }
+            }
+            lifecycle = control.next_lifecycle() => {
+                let Some(_) = lifecycle else {
+                    return;
+                };
+                if !publish_runtime_lifecycle_drain_v1(
+                    &lifecycle_drained,
+                    &mut lifecycle_sequence,
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn publish_runtime_lifecycle_drain_v1(
+    lifecycle_drained: &watch::Sender<u64>,
+    lifecycle_sequence: &mut u64,
+) -> bool {
+    let Some(next) = lifecycle_sequence.checked_add(1) else {
+        return false;
+    };
+    *lifecycle_sequence = next;
+    lifecycle_drained.send_replace(next);
+    true
 }
 
 impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
@@ -489,6 +981,7 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
         gateway: &'a SharedGatewayControlAdapterV2,
         owner_invalidated: &'a Arc<AtomicBool>,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<Self, RuntimeGatewayReadyObservationErrorV1> {
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
         let coordinator = gateway
@@ -504,13 +997,16 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
         }
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
-        let snapshot = gateway.control.current_admission_snapshot();
+        let snapshot = gateway.connection_observer.current_admission_snapshot();
         let (paused_gateway, connection_epoch) = gateway.map_paused_connected_observation(
             RuntimeGatewayCoordinatorGenerationV2::FIRST,
             snapshot,
         )?;
+        if paused_gateway != *expected_paused_gateway {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
         gateway.require_healthy_paused_control(connection_epoch)?;
-        if gateway.control.current_admission_snapshot() != snapshot {
+        if gateway.connection_observer.current_admission_snapshot() != snapshot {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
         }
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
@@ -570,7 +1066,7 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
         Ok(RuntimeRecoveryPendingGatewayBindingV2 {
             process_instance_id: self.gateway.process_instance_id.clone(),
-            observer: self.gateway.control.connection_observer(),
+            observer: self.gateway.connection_observer.clone(),
             admission_snapshot: self.gateway.admission_snapshot.clone(),
             closed_lifecycle: self.gateway.closed_lifecycle.clone(),
             owner_invalidated: self.owner_invalidated.clone(),
@@ -655,17 +1151,14 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         ))
     }
 
-    pub(crate) async fn commit_prepared_owner_v2(
+    pub(crate) async fn commit_prepared_owner_in_place_v2(
         &self,
         _authority: &RuntimeClosedRecoveryTransitionAuthorityV2,
-        prepared_owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+        prepared_owner: &mut RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         commit_cutoff: Instant,
-    ) -> Result<
-        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-        RuntimeGatewayRecoveryOwnerCommitErrorV2,
-    > {
+    ) -> Result<(), RuntimeGatewayRecoveryOwnerCommitErrorV2> {
         let section = self
-            .pending_section_v2(&prepared_owner)
+            .pending_section_v2(prepared_owner)
             .map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Section)?;
         drop(section);
         if Instant::now() >= commit_cutoff {
@@ -676,20 +1169,18 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             _ = sleep_until(TokioInstant::from_std(commit_cutoff)) => {
                 Err(RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed)
             }
-            result = prepared_owner.commit_closed_recovery_v2(&self.permit) => {
+            result = prepared_owner.commit_closed_recovery_in_place_v2(&self.permit) => {
                 result.map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
             }
         }
     }
 
-    pub(crate) fn into_readiness_successor_v2(
-        mut self,
+    pub(crate) fn refresh_readiness_in_place_v2(
+        &mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         readiness: RuntimeCapabilityReadinessSetV2,
-    ) -> Result<
-        (Self, RuntimeAuthorizedStartupRecoveryIterationV2),
-        RuntimeGatewayRecoverySectionErrorV2,
-    > {
+    ) -> Result<RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeGatewayRecoverySectionErrorV2>
+    {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
@@ -713,7 +1204,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let iteration = transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
-        Ok((self, iteration))
+        Ok(iteration)
     }
 
     pub(crate) fn begin_startup_recovery_observation_v2(
@@ -805,6 +1296,10 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
 
     pub(crate) fn invalidate_capability_not_ready_v2(&self) {
         self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady);
+    }
+
+    pub(crate) fn invalidate_protocol_violation_v2(&self) {
+        self.invalidate_if_current_v2(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
     }
 
     fn pending_section_with_owner_v2<'a>(
@@ -1062,26 +1557,44 @@ pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
 ) -> RuntimeGatewayBootstrapV1 {
     let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
     let owner_invalidated = Arc::new(AtomicBool::new(false));
+    let owner_discord_attachment = Arc::new(Mutex::new(None));
     let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
         GatewayControlConfigV3::default(),
         GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
         RuntimeGatewaySnapshotTestInvalidatorV3,
     );
     let admission_snapshot = control.admission_snapshot_watch();
+    let connection_observer = control.connection_observer();
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
             process_instance_id,
-            control,
+            control: Some(control),
+            connection_observer,
+            discord_commands: None,
             admission_snapshot,
             closed_lifecycle: closed_lifecycle.clone(),
         },
-        _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+        _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
         owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
             closed_lifecycle,
             invalidated: owner_invalidated.clone(),
+            discord_attachment: owner_discord_attachment.clone(),
         }),
         owner_invalidated,
+        owner_discord_attachment,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn compose_runtime_gateway_section_test_bootstrap_with_capacity_v2(
+    process_instance_id: ProcessInstanceId,
+    lifecycle_capacity: std::num::NonZeroUsize,
+) -> RuntimeGatewayBootstrapV1 {
+    compose_with_control_config(
+        process_instance_id,
+        GatewayControlConfigV3::new(std::num::NonZeroUsize::MIN, lifecycle_capacity)
+            .expect("bounded test gateway capacities"),
+    )
 }
 
 fn compose_with_control_config(
@@ -1090,6 +1603,7 @@ fn compose_with_control_config(
 ) -> RuntimeGatewayBootstrapV1 {
     let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
     let owner_invalidated = Arc::new(AtomicBool::new(false));
+    let owner_discord_attachment = Arc::new(Mutex::new(None));
     let invalidation = RuntimeGatewayInvalidationBridgeV2 {
         closed_lifecycle: closed_lifecycle.clone(),
     };
@@ -1099,19 +1613,24 @@ fn compose_with_control_config(
         invalidation,
     );
     let admission_snapshot = control.admission_snapshot_watch();
+    let connection_observer = control.connection_observer();
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
             process_instance_id,
-            control,
+            control: Some(control),
+            connection_observer,
+            discord_commands: None,
             admission_snapshot,
             closed_lifecycle: closed_lifecycle.clone(),
         },
-        _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+        _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
         owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
             closed_lifecycle,
             invalidated: owner_invalidated.clone(),
+            discord_attachment: owner_discord_attachment.clone(),
         }),
         owner_invalidated,
+        owner_discord_attachment,
     }
 }
 
@@ -1167,7 +1686,7 @@ impl SharedGatewayControlAdapterV2 {
         &self,
         epoch: automation_runtime::GatewayConnectionEpochV3,
     ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
-        match self.control.issue_ready_lease(epoch) {
+        match self.connection_observer.issue_ready_lease(epoch) {
             Err(GatewayControlTransitionErrorV3::AdmissionPaused) => Ok(()),
             Err(error) => Err(map_transition_error(error)),
             Ok(_) => Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot),
@@ -1177,7 +1696,7 @@ impl SharedGatewayControlAdapterV2 {
     fn observe_current_ready_attestation(
         &self,
     ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
-        let snapshot = self.control.current_admission_snapshot();
+        let snapshot = self.connection_observer.current_admission_snapshot();
         let epoch = match snapshot.connection() {
             GatewayConnectionStateV3::Connected { epoch, .. } => epoch,
             GatewayConnectionStateV3::Starting | GatewayConnectionStateV3::Disconnected { .. } => {
@@ -1194,10 +1713,10 @@ impl SharedGatewayControlAdapterV2 {
             }
         };
         let lease = self
-            .control
+            .connection_observer
             .issue_ready_lease(epoch)
             .map_err(map_transition_error)?;
-        if !self.control.ready_lease_is_current(&lease) {
+        if !self.connection_observer.ready_lease_is_current(&lease) {
             return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotCurrent);
         }
         if !lease.was_explicitly_resumed() {
@@ -1412,31 +1931,39 @@ mod tests {
     fn bootstrap_with_panicking_invalidator() -> RuntimeGatewayBootstrapV1 {
         let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
         let owner_invalidated = Arc::new(AtomicBool::new(false));
+        let owner_discord_attachment = Arc::new(Mutex::new(None));
         let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
             GatewayControlConfigV3::default(),
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
             PanickingInvalidatorV3,
         );
         let admission_snapshot = control.admission_snapshot_watch();
+        let connection_observer = control.connection_observer();
         RuntimeGatewayBootstrapV1 {
             adapter: SharedGatewayControlAdapterV2 {
                 process_instance_id: ProcessInstanceId::parse("runtime-process:1").unwrap(),
-                control,
+                control: Some(control),
+                connection_observer,
+                discord_commands: None,
                 admission_snapshot,
                 closed_lifecycle: closed_lifecycle.clone(),
             },
-            _runtime: SharedGatewayRuntimeHalfV3 { _inner: runtime },
+            _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
             owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
                 closed_lifecycle,
                 invalidated: owner_invalidated.clone(),
+                discord_attachment: owner_discord_attachment.clone(),
             }),
             owner_invalidated,
+            owner_discord_attachment,
         }
     }
 
     fn connect(bootstrap: &mut RuntimeGatewayBootstrapV1, kind: GatewayReadyKindV3) -> u64 {
         bootstrap
             ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
             ._inner
             .mark_connected(kind)
             .unwrap()
@@ -1444,8 +1971,16 @@ mod tests {
     }
 
     async fn pause(bootstrap: &mut RuntimeGatewayBootstrapV1) -> TestPauseTokenV1 {
-        let control = &bootstrap.adapter.control;
-        let runtime = &mut bootstrap._runtime._inner;
+        let control = bootstrap
+            .adapter
+            .control
+            .as_ref()
+            .expect("gateway control half");
+        let runtime = &mut bootstrap
+            ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
+            ._inner;
         let (acknowledgement, outcome) =
             tokio::join!(control.pause_admission(), runtime.process_next_command());
         let acknowledgement = acknowledgement.unwrap();
@@ -1465,8 +2000,16 @@ mod tests {
         bootstrap: &mut RuntimeGatewayBootstrapV1,
         token: &TestPauseTokenV1,
     ) -> Result<GatewayCommandAckV3, GatewayControlErrorV3> {
-        let control = &bootstrap.adapter.control;
-        let runtime = &mut bootstrap._runtime._inner;
+        let control = bootstrap
+            .adapter
+            .control
+            .as_ref()
+            .expect("gateway control half");
+        let runtime = &mut bootstrap
+            ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
+            ._inner;
         let (acknowledgement, outcome) = tokio::join!(
             control.resume_admission(&token.0),
             runtime.process_next_command()
@@ -1490,6 +2033,8 @@ mod tests {
     fn disconnect(bootstrap: &mut RuntimeGatewayBootstrapV1) {
         bootstrap
             ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
             ._inner
             .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
             .unwrap();
@@ -1747,7 +2292,7 @@ mod tests {
         assert!(
             bootstrap
                 .adapter
-                .control
+                .connection_observer
                 .current_admission_snapshot()
                 .admission_revision()
                 .get()
@@ -1809,12 +2354,13 @@ mod tests {
                 ..
             }
         ));
+        let runtime = &mut _runtime.as_mut().expect("gateway runtime half")._inner;
         assert_eq!(
-            _runtime._inner.process_next_command().await,
+            runtime.process_next_command().await,
             GatewayRuntimeCommandOutcomeV3::ControlOrphaned
         );
         assert!(matches!(
-            _runtime._inner.current_connection(),
+            runtime.current_connection(),
             automation_runtime::GatewayConnectionStateV3::Draining { .. }
         ));
         drop(_runtime);

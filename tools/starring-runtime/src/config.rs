@@ -28,6 +28,7 @@ const MAX_GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_INSTANCE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_GATEWAY_OWNER_LEASE: Duration = Duration::from_secs(1);
 const MAX_GATEWAY_OWNER_LEASE: Duration = Duration::from_secs(300);
+const MAX_STARTUP_OWNER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(4);
 const FORBIDDEN_POSTGRES_ENVIRONMENT: [&str; 13] = [
     "PGAPPNAME",
     "PGDATABASE",
@@ -417,6 +418,19 @@ impl GatewayOwnerTimingConfigV1 {
     pub fn safety_margin(self) -> Duration {
         self.safety_margin
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test_v1(
+        lease_for: Duration,
+        renew_before: Duration,
+        safety_margin: Duration,
+    ) -> Self {
+        Self {
+            lease_for,
+            renew_before,
+            safety_margin,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -659,6 +673,11 @@ fn parse_gateway_owner_timing(
     source: &impl ConfigurationSourceV1,
     database_operation: DatabaseOperationConfigV1,
 ) -> Result<GatewayOwnerTimingConfigV1, RuntimeConfigErrorV1> {
+    if database_operation.statement_timeout() > MAX_STARTUP_OWNER_STATEMENT_TIMEOUT {
+        return Err(RuntimeConfigErrorV1::InvalidValue(
+            RuntimeConfigurationFieldV1::DatabaseStatementTimeout,
+        ));
+    }
     let lease_field = RuntimeConfigurationFieldV1::GatewayOwnerLease;
     let lease_for =
         Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 30_000)?);
@@ -1157,6 +1176,22 @@ mod tests {
             RuntimeConfigV1::from_source(&short_window).unwrap_err(),
             RuntimeConfigErrorV1::InvalidValue(
                 RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
+            )
+        );
+
+        let mut cleanup_overrun = valid_source();
+        cleanup_overrun.insert(
+            RuntimeConfigurationFieldV1::DatabaseStatementTimeout,
+            "4001",
+        );
+        cleanup_overrun.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+            "5000",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&cleanup_overrun).unwrap_err(),
+            RuntimeConfigErrorV1::InvalidValue(
+                RuntimeConfigurationFieldV1::DatabaseStatementTimeout
             )
         );
 

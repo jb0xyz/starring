@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
@@ -29,9 +29,15 @@ const RELEASE_ATTEMPTS: usize = 2;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAXIMUM_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_ACTOR_TERMINATION_RESERVE: Duration = Duration::from_millis(100);
+const STARTUP_TASK_ABORT_RESERVE: Duration = Duration::from_millis(25);
 
 pub(crate) trait RuntimeGatewayOwnerEmergencyInvalidatorV1: Send + Sync + 'static {
     fn invalidate_gateway_ownership(&self);
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +45,75 @@ pub struct RuntimeGatewayOwnerStartupWatchdogConfigV1 {
     lease_for: RuntimeGatewayOwnerLeaseDurationV1,
     policy: RuntimeGatewayOwnerRenewalPolicyV1,
     retry_delay: Duration,
-    cleanup_timeout: Duration,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeGatewayOwnerCleanupBoundV1 {
+    timeout: Duration,
+    deadline_cap: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct RuntimeGatewayOwnerStartupCleanupCapV1 {
+    deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+pub(crate) struct RuntimeGatewayOwnerStartupWatchdogStartContextV1 {
+    request_started_at: Instant,
+    response_observed_at: Instant,
+    initial_startup_cleanup_deadline: Option<Instant>,
+}
+
+impl RuntimeGatewayOwnerStartupWatchdogStartContextV1 {
+    pub(crate) fn new(
+        request_started_at: Instant,
+        response_observed_at: Instant,
+        initial_startup_cleanup_deadline: Option<Instant>,
+    ) -> Self {
+        Self {
+            request_started_at,
+            response_observed_at,
+            initial_startup_cleanup_deadline,
+        }
+    }
+}
+
+impl RuntimeGatewayOwnerStartupCleanupCapV1 {
+    fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline: Arc::new(Mutex::new(deadline)),
+        }
+    }
+
+    fn clear(&self) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn limit(&self, candidate: TokioInstant) -> TokioInstant {
+        self.deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(TokioInstant::from_std)
+            .map_or(candidate, |deadline| candidate.min(deadline))
+    }
+}
+
+impl RuntimeGatewayOwnerCleanupBoundV1 {
+    fn capped_at(mut self, deadline_cap: Instant) -> Self {
+        self.deadline_cap = Some(deadline_cap);
+        self
+    }
+
+    fn deadline(self) -> TokioInstant {
+        let relative = TokioInstant::now() + self.timeout;
+        self.deadline_cap
+            .map(TokioInstant::from_std)
+            .map_or(relative, |cap| relative.min(cap))
+    }
 }
 
 impl RuntimeGatewayOwnerStartupWatchdogConfigV1 {
@@ -48,7 +122,7 @@ impl RuntimeGatewayOwnerStartupWatchdogConfigV1 {
         renew_before: Duration,
         safety_margin: Duration,
         retry_delay: Duration,
-        cleanup_timeout: Duration,
+        cleanup: Duration,
     ) -> Result<Self, RuntimeGatewayOwnerStartupWatchdogConfigErrorV1> {
         let lease_for = RuntimeGatewayOwnerLeaseDurationV1::new(lease_for)
             .ok_or(RuntimeGatewayOwnerStartupWatchdogConfigErrorV1::InvalidLease)?;
@@ -63,14 +137,17 @@ impl RuntimeGatewayOwnerStartupWatchdogConfigV1 {
         if renew_before >= lease_for.get() {
             return Err(RuntimeGatewayOwnerStartupWatchdogConfigErrorV1::InvalidLease);
         }
-        if cleanup_timeout.is_zero() || cleanup_timeout > MAXIMUM_CLEANUP_TIMEOUT {
+        if cleanup.is_zero() || cleanup > MAXIMUM_CLEANUP_TIMEOUT {
             return Err(RuntimeGatewayOwnerStartupWatchdogConfigErrorV1::InvalidCleanupTimeout);
         }
         Ok(Self {
             lease_for,
             policy,
             retry_delay,
-            cleanup_timeout,
+            cleanup: RuntimeGatewayOwnerCleanupBoundV1 {
+                timeout: cleanup,
+                deadline_cap: None,
+            },
         })
     }
 
@@ -84,6 +161,10 @@ impl RuntimeGatewayOwnerStartupWatchdogConfigV1 {
             DEFAULT_RETRY_DELAY,
             DEFAULT_CLEANUP_TIMEOUT,
         )
+    }
+
+    pub(crate) fn lease_for(self) -> RuntimeGatewayOwnerLeaseDurationV1 {
+        self.lease_for
     }
 }
 
@@ -231,6 +312,16 @@ impl<P> RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P> {
         let deadline = TokioInstant::now() + timeout;
         release_gateway_owner_v1(&self.port, self.lease_id, deadline).await
     }
+
+    pub(crate) async fn cleanup_until(
+        self,
+        cleanup_deadline: Instant,
+    ) -> RuntimeGatewayOwnerReleaseStatusV1
+    where
+        P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
+    {
+        release_runtime_gateway_owner_until_v1(&self.port, self.lease_id, cleanup_deadline).await
+    }
 }
 
 struct RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -240,6 +331,8 @@ struct RuntimeGatewayOwnerSupervisorHandleV1 {
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
     gateway_lifetime: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
 }
 
 impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -249,6 +342,10 @@ impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
 }
 
 impl RuntimeGatewayOwnerSupervisorHandleV1 {
+    fn clear_startup_cleanup_deadline(&self) {
+        self.startup_cleanup_cap.clear();
+    }
+
     fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         Arc::ptr_eq(&self.gateway_lifetime, expected)
     }
@@ -375,11 +472,17 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
         }
     }
 
-    async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+    async fn request_shutdown(
+        &mut self,
+        cleanup_deadline: Option<Instant>,
+    ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         let (response, acknowledgement) = oneshot::channel();
         if self
             .shutdown_commands
-            .send(RuntimeGatewayOwnerStartupShutdownCommandV1 { response })
+            .send(RuntimeGatewayOwnerStartupShutdownCommandV1 {
+                response,
+                cleanup_deadline,
+            })
             .await
             .is_ok()
         {
@@ -388,6 +491,93 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
             }
         }
         self.wait_terminal().await
+    }
+
+    async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        let expected = self.request_shutdown(None).await;
+        let task_completed = self.join_task().await;
+        self.reconcile_shutdown(expected, task_completed)
+    }
+
+    async fn shutdown_until(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        if Instant::now() >= cleanup_deadline {
+            self.abort_and_join_task().await;
+            return Err(RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed);
+        }
+        let shutdown_cutoff = cleanup_deadline
+            .checked_sub(STARTUP_TASK_ABORT_RESERVE)
+            .unwrap_or(cleanup_deadline);
+        let actor_cleanup_deadline = cleanup_deadline
+            .checked_sub(STARTUP_ACTOR_TERMINATION_RESERVE)
+            .unwrap_or(cleanup_deadline);
+        let expected = {
+            let shutdown = self.request_shutdown(Some(actor_cleanup_deadline));
+            tokio::pin!(shutdown);
+            tokio::select! {
+                biased;
+                _ = sleep_until(TokioInstant::from_std(shutdown_cutoff)) => None,
+                exit = &mut shutdown => Some(exit),
+            }
+        };
+        let Some(expected) = expected else {
+            self.abort_and_join_task().await;
+            return Err(RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed);
+        };
+        let Some(task_completed) = self.join_task_until(cleanup_deadline).await else {
+            self.abort_and_join_task().await;
+            return Err(RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed);
+        };
+        Ok(self.reconcile_shutdown(expected, task_completed))
+    }
+
+    async fn join_task(&mut self) -> bool {
+        match self.task.take() {
+            Some(task) => task.await.is_ok(),
+            None => false,
+        }
+    }
+
+    async fn join_task_until(&mut self, cleanup_deadline: Instant) -> Option<bool> {
+        if Instant::now() >= cleanup_deadline {
+            return None;
+        }
+        let mut task = self.task.take()?;
+        match timeout_at(TokioInstant::from_std(cleanup_deadline), &mut task).await {
+            Ok(result) => Some(result.is_ok()),
+            Err(_) => {
+                self.task = Some(task);
+                None
+            }
+        }
+    }
+
+    async fn abort_and_join_task(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        let _result = task.await;
+    }
+
+    fn reconcile_shutdown(
+        &self,
+        expected: RuntimeGatewayOwnerStartupWatchdogExitV1,
+        task_completed: bool,
+    ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        if !task_completed {
+            return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+        }
+        match self.terminal_status() {
+            Some(published) if published == expected => published,
+            Some(_) => RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+            None => RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped,
+        }
     }
 }
 
@@ -432,6 +622,7 @@ fn accept_closed_recovery_commit_observation_v2(
 
 pub struct RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    prepared_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
@@ -454,6 +645,16 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         self.take_inner().shutdown().await
     }
 
+    pub(crate) async fn shutdown_until(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        self.take_inner().shutdown_until(cleanup_deadline).await
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -469,6 +670,7 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         RuntimeGatewayOwnerProductionHandoffErrorV1,
     > {
         let handoff_observation = self.inner().promote_to_production_v1().await?;
+        self.inner().clear_startup_cleanup_deadline();
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerProductionSupervisorV1 {
             inner: Some(inner),
@@ -476,18 +678,45 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn prepare_closed_recovery_v2(
         mut self,
     ) -> Result<
         RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
     > {
+        self.prepare_closed_recovery_in_place_v2().await?;
+        self.try_into_prepared_closed_recovery_v2()
+            .map_err(|handle| {
+                handle.inner().invalidation.invalidate();
+                RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation
+            })
+    }
+
+    pub(crate) async fn prepare_closed_recovery_in_place_v2(
+        &mut self,
+    ) -> Result<(), RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2> {
+        if self.prepared_closed_recovery_observation.is_some() {
+            self.prepared_closed_recovery_observation = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation);
+        }
         let observation = self.inner().prepare_closed_recovery_v2().await?;
+        self.prepared_closed_recovery_observation = Some(observation);
+        Ok(())
+    }
+
+    pub(crate) fn try_into_prepared_closed_recovery_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerPreparedClosedRecoveryV2, Box<Self>> {
+        let Some(observation) = self.prepared_closed_recovery_observation.take() else {
+            return Err(Box::new(self));
+        };
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
             inner: Some(inner),
             observation,
+            committed_closed_recovery_observation: None,
         })
     }
 
@@ -508,10 +737,16 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1 {
+    DeadlineElapsed,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     observation: RuntimeGatewayOwnerCurrentObservationV1,
+    committed_closed_recovery_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl std::fmt::Debug for RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
@@ -526,10 +761,19 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         &self.observation
     }
 
+    pub(crate) fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
+        self.inner_mut().wait_terminal().await
+    }
+
     pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }
 
+    #[cfg(test)]
     pub(crate) async fn abort_and_shutdown_v2(
         mut self,
     ) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
@@ -538,13 +782,27 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         inner.shutdown().await
     }
 
-    pub(crate) async fn commit_closed_recovery_v2(
+    pub(crate) async fn abort_and_shutdown_until_v2(
         mut self,
-        permit: &RuntimeClosedDrainRecoveryPermitV2,
+        cleanup_deadline: Instant,
     ) -> Result<
-        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
     > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
+    }
+
+    pub(crate) async fn commit_closed_recovery_in_place_v2(
+        &mut self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<(), RuntimeGatewayOwnerClosedRecoveryCommitErrorV2> {
+        if self.committed_closed_recovery_observation.is_some() {
+            self.committed_closed_recovery_observation = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation);
+        }
         if Instant::now() >= self.observation.safety_deadline() {
             self.inner().invalidation.invalidate();
             return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed);
@@ -553,10 +811,17 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
             self.inner().invalidation.invalidate();
             return Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::OwnerReceiptMismatch);
         }
-        let acknowledged = self
+        let acknowledged = match self
             .inner()
             .commit_closed_recovery_v2(permit.owner_receipt().clone())
-            .await?;
+            .await
+        {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                self.inner().invalidation.invalidate();
+                return Err(error);
+            }
+        };
         let acknowledged = match accept_closed_recovery_commit_observation_v2(
             acknowledged,
             &self.observation,
@@ -569,6 +834,27 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
                 return Err(error);
             }
         };
+        self.committed_closed_recovery_observation = Some(acknowledged);
+        Ok(())
+    }
+
+    pub(crate) fn try_into_committed_closed_recovery_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerClosedRecoverySupervisorV2, Box<Self>> {
+        let Some(acknowledged) = self.committed_closed_recovery_observation.take() else {
+            return Err(Box::new(self));
+        };
+        if accept_closed_recovery_commit_observation_v2(
+            acknowledged.clone(),
+            &self.observation,
+            self.observation.receipt(),
+            Instant::now(),
+        )
+        .is_err()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(Box::new(self));
+        }
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
             inner: Some(inner),
@@ -576,9 +862,31 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn commit_closed_recovery_v2(
+        mut self,
+        permit: &RuntimeClosedDrainRecoveryPermitV2,
+    ) -> Result<
+        RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+        RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    > {
+        self.commit_closed_recovery_in_place_v2(permit).await?;
+        self.try_into_committed_closed_recovery_v2()
+            .map_err(|owner| {
+                owner.inner().invalidation.invalidate();
+                RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation
+            })
+    }
+
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
             .as_ref()
+            .expect("prepared gateway owner recovery handle")
+    }
+
+    fn inner_mut(&mut self) -> &mut RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_mut()
             .expect("prepared gateway owner recovery handle")
     }
 
@@ -607,12 +915,45 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         &self.observation
     }
 
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) fn terminal_observation_v2(
+        &self,
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
+    {
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }
 
     pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         self.take_inner().shutdown().await
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
     }
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -748,6 +1089,7 @@ pub(crate) enum RuntimeGatewayOwnerProductionHandoffErrorV1 {
 
 struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
     response: oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
+    cleanup_deadline: Option<Instant>,
 }
 
 enum RuntimeGatewayOwnerSupervisorCommandV1 {
@@ -960,9 +1302,8 @@ pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1<P, I>(
     invalidator: I,
     gateway_lifetime: Arc<AtomicBool>,
     accepted_receipt: RuntimeAcceptedGatewayOwnerReceiptV1,
-    request_started_at: Instant,
-    response_observed_at: Instant,
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
+    start_context: RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 ) -> Result<
     RuntimeGatewayOwnerStartupWatchdogHandleV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1<P>,
@@ -972,6 +1313,11 @@ where
     P::Error: Send + 'static,
     I: RuntimeGatewayOwnerEmergencyInvalidatorV1,
 {
+    let RuntimeGatewayOwnerStartupWatchdogStartContextV1 {
+        request_started_at,
+        response_observed_at,
+        initial_startup_cleanup_deadline,
+    } = start_context;
     let lease_id = accepted_receipt.receipt().lease_id.clone();
     let invalidation = Arc::new(RuntimeGatewayOwnerInvalidationLatchV1::new(invalidator));
     let watchdog = match RuntimeGatewayOwnerWatchdogV1::from_accepted_receipt(
@@ -1016,17 +1362,24 @@ where
     let (supervisor_commands, supervisor_receiver) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
     let (closed_recovery_commands, closed_recovery_receiver) =
         mpsc::channel(CLOSED_RECOVERY_COMMAND_CAPACITY);
+    let receivers = RuntimeGatewayOwnerStartupWatchdogReceiversV1 {
+        shutdown_commands: shutdown_receiver,
+        supervisor_commands: supervisor_receiver,
+        closed_recovery_commands: closed_recovery_receiver,
+    };
     let (terminal_sender, terminal) = watch::channel(None);
     let guard = RuntimeGatewayOwnerStartupWatchdogGuardV1::new(invalidation.clone());
-    runtime.spawn(async move {
+    let startup_cleanup_cap =
+        RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline);
+    let actor_startup_cleanup_cap = startup_cleanup_cap.clone();
+    let task = runtime.spawn(async move {
         let exit = run_gateway_owner_startup_watchdog_v1(
             port,
             watchdog,
             config,
-            shutdown_receiver,
-            supervisor_receiver,
-            closed_recovery_receiver,
+            receivers,
             guard,
+            actor_startup_cleanup_cap,
         )
         .await;
         let _result = terminal_sender.send(Some(exit));
@@ -1039,7 +1392,10 @@ where
             terminal,
             invalidation,
             gateway_lifetime,
+            task: Some(task),
+            startup_cleanup_cap,
         }),
+        prepared_closed_recovery_observation: None,
     })
 }
 
@@ -1059,19 +1415,29 @@ fn map_schedule_start_error(
     }
 }
 
+struct RuntimeGatewayOwnerStartupWatchdogReceiversV1 {
+    shutdown_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    supervisor_commands: mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
+    closed_recovery_commands: mpsc::Receiver<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
+}
+
 async fn run_gateway_owner_startup_watchdog_v1<P>(
     port: P,
     watchdog: RuntimeGatewayOwnerWatchdogV1,
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
-    mut shutdown_commands: mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
-    mut supervisor_commands: mpsc::Receiver<RuntimeGatewayOwnerSupervisorCommandV1>,
-    mut closed_recovery_commands: mpsc::Receiver<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
+    receivers: RuntimeGatewayOwnerStartupWatchdogReceiversV1,
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
     P::Error: Send + 'static,
 {
+    let RuntimeGatewayOwnerStartupWatchdogReceiversV1 {
+        mut shutdown_commands,
+        mut supervisor_commands,
+        mut closed_recovery_commands,
+    } = receivers;
     let lease_id = watchdog.schedule().receipt().lease_id.clone();
     let mut current = Some(watchdog);
     let mut role = RuntimeGatewayOwnerSupervisorRoleV1::Startup;
@@ -1081,15 +1447,16 @@ where
     let stop = 'supervisor: loop {
         match shutdown_commands.try_recv() {
             Ok(command) => {
-                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                    receive_shutdown(Some(command), &mut shutdown_acknowledgement),
-                    config.cleanup_timeout,
+                break 'supervisor receive_shutdown(
+                    Some(command),
+                    &mut shutdown_acknowledgement,
+                    config.cleanup,
                 );
             }
             Err(TryRecvError::Disconnected) => {
                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                    config.cleanup_timeout,
+                    config.cleanup,
                 );
             }
             Err(TryRecvError::Empty) => {}
@@ -1100,7 +1467,7 @@ where
                 Err(TryRecvError::Disconnected) => {
                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                        config.cleanup_timeout,
+                        config.cleanup,
                     );
                 }
                 Err(TryRecvError::Empty) => {}
@@ -1113,7 +1480,7 @@ where
                     Err(TryRecvError::Disconnected) => {
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     }
                     Err(TryRecvError::Empty) => {}
@@ -1139,16 +1506,17 @@ where
             tokio::select! {
                 biased;
                 command = shutdown_commands.recv() => {
-                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                        receive_shutdown(command, &mut shutdown_acknowledgement),
-                        config.cleanup_timeout,
+                    break 'supervisor receive_shutdown(
+                        command,
+                        &mut shutdown_acknowledgement,
+                        config.cleanup,
                     );
                 }
                 _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
                     guard.invalidate_now();
                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                         RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                        config.cleanup_timeout,
+                        config.cleanup,
                     );
                 }
                 command = receive_closed_recovery_command_v2(
@@ -1158,7 +1526,7 @@ where
                     let Some(command) = command else {
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     };
                     match (role, command) {
@@ -1173,7 +1541,7 @@ where
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 );
                             }
                             if Instant::now() >= safety_deadline {
@@ -1183,7 +1551,7 @@ where
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 );
                             }
                             if watchdog.schedule().receipt() != &expected_receipt {
@@ -1193,7 +1561,7 @@ where
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 );
                             }
                             let observation =
@@ -1204,7 +1572,7 @@ where
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 );
                             }
                         }
@@ -1213,7 +1581,7 @@ where
                             guard.invalidate_now();
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                                config.cleanup_timeout,
+                                config.cleanup,
                             );
                         }
                     }
@@ -1226,14 +1594,14 @@ where
                     let Some(command) = command else {
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     };
                     reject_frozen_supervisor_command_v2(command);
                     guard.invalidate_now();
                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                         RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                        config.cleanup_timeout,
+                        config.cleanup,
                     );
                 }
             }
@@ -1254,7 +1622,7 @@ where
                 guard.invalidate_now();
                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                     RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                    config.cleanup_timeout,
+                    config.cleanup,
                 );
             }
             let watchdog = current.take().expect("gateway owner watchdog state");
@@ -1265,7 +1633,7 @@ where
                 &mut shutdown_commands,
                 &mut shutdown_acknowledgement,
                 &mut guard,
-                config.cleanup_timeout,
+                config.cleanup,
             )
             .await
             {
@@ -1280,7 +1648,7 @@ where
                         guard.invalidate_now();
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     }
                 }
@@ -1299,7 +1667,7 @@ where
             guard.invalidate_now();
             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                 RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                config.cleanup_timeout,
+                config.cleanup,
             );
         }
         let watchdog = current.take().expect("gateway owner watchdog state");
@@ -1308,9 +1676,10 @@ where
                 tokio::select! {
                     biased;
                     command = shutdown_commands.recv() => {
-                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                            receive_shutdown(command, &mut shutdown_acknowledgement),
-                            config.cleanup_timeout,
+                        break 'supervisor receive_shutdown(
+                            command,
+                            &mut shutdown_acknowledgement,
+                            config.cleanup,
                         );
                     }
                     command = receive_closed_recovery_command_v2(
@@ -1320,7 +1689,7 @@ where
                         let Some(command) = command else {
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                config.cleanup_timeout,
+                                config.cleanup,
                             );
                         };
                         pending_closed_recovery_command = Some(command);
@@ -1337,7 +1706,7 @@ where
                         let Some(command) = command else {
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                config.cleanup_timeout,
+                                config.cleanup,
                             );
                         };
                         match command {
@@ -1356,7 +1725,7 @@ where
                                     &mut shutdown_commands,
                                     &mut shutdown_acknowledgement,
                                     &mut guard,
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 ).await {
                                     RuntimeGatewayOwnerStartupObservationStepV1::Continue {
                                         successor,
@@ -1374,18 +1743,16 @@ where
                             RuntimeGatewayOwnerSupervisorCommandV1::Promote { response } => {
                                 match shutdown_commands.try_recv() {
                                     Ok(command) => {
-                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                            receive_shutdown(
-                                                Some(command),
-                                                &mut shutdown_acknowledgement,
-                                            ),
-                                            config.cleanup_timeout,
+                                        break 'supervisor receive_shutdown(
+                                            Some(command),
+                                            &mut shutdown_acknowledgement,
+                                            config.cleanup,
                                         );
                                     }
                                     Err(TryRecvError::Disconnected) => {
                                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                             RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                            config.cleanup_timeout,
+                                            config.cleanup,
                                         );
                                     }
                                     Err(TryRecvError::Empty) => {}
@@ -1394,14 +1761,14 @@ where
                                     guard.invalidate_now();
                                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup_timeout,
+                                        config.cleanup,
                                     );
                                 }
                                 if role != RuntimeGatewayOwnerSupervisorRoleV1::Startup {
                                     guard.invalidate_now();
                                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                         RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                                        config.cleanup_timeout,
+                                        config.cleanup,
                                     );
                                 }
                                 match watchdog.action_at(Instant::now()) {
@@ -1419,21 +1786,21 @@ where
                                         guard.invalidate_now();
                                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                             RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                                            config.cleanup_timeout,
+                                            config.cleanup,
                                         );
                                     }
                                 }
                                 let projection =
                                     RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
-                                role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
-                                current = Some(watchdog);
                                 if response.send(projection).is_err() {
                                     guard.invalidate_now();
                                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup_timeout,
+                                        config.cleanup,
                                     );
                                 }
+                                role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
+                                current = Some(watchdog);
                             }
                         }
                     }
@@ -1446,7 +1813,7 @@ where
                     Err(error) => {
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             map_watchdog_error(error),
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     }
                 };
@@ -1458,20 +1825,25 @@ where
                     biased;
                     command = shutdown_commands.recv() => {
                         guard.invalidate_now();
-                        let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                            receive_shutdown(command, &mut shutdown_acknowledgement),
-                            config.cleanup_timeout,
+                        let stop = receive_shutdown(
+                            command,
+                            &mut shutdown_acknowledgement,
+                            config.cleanup,
                         );
-                        let _joined_result = timeout_at(stop.cleanup_deadline, &mut renewal).await;
+                        let cleanup_deadline =
+                            startup_cleanup_cap.limit(stop.cleanup_deadline);
+                        let _joined_result = timeout_at(cleanup_deadline, &mut renewal).await;
                         break 'supervisor stop;
                     }
                     _ = sleep_until(TokioInstant::from_std(safety_deadline)) => {
                         guard.invalidate_now();
                         let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
-                        let _joined_result = timeout_at(stop.cleanup_deadline, &mut renewal).await;
+                        let cleanup_deadline =
+                            startup_cleanup_cap.limit(stop.cleanup_deadline);
+                        let _joined_result = timeout_at(cleanup_deadline, &mut renewal).await;
                         break 'supervisor stop;
                     }
                     result = &mut renewal => result,
@@ -1485,13 +1857,13 @@ where
                         Ok(RuntimeGatewayOwnerRenewalCompletionV1::OwnershipLost(_)) => {
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
-                                config.cleanup_timeout,
+                                config.cleanup,
                             );
                         }
                         Err(error) => {
                             break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                 map_watchdog_error(error),
-                                config.cleanup_timeout,
+                                config.cleanup,
                             );
                         }
                     },
@@ -1501,7 +1873,7 @@ where
                             Err(error) => {
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     map_watchdog_error(error),
-                                    config.cleanup_timeout,
+                                    config.cleanup,
                                 );
                             }
                         };
@@ -1512,16 +1884,17 @@ where
                         tokio::select! {
                             biased;
                             command = shutdown_commands.recv() => {
-                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                    receive_shutdown(command, &mut shutdown_acknowledgement),
-                                    config.cleanup_timeout,
+                                break 'supervisor receive_shutdown(
+                                    command,
+                                    &mut shutdown_acknowledgement,
+                                    config.cleanup,
                                 );
                             }
                             command = closed_recovery_commands.recv() => {
                                 let Some(command) = command else {
                                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup_timeout,
+                                        config.cleanup,
                                     );
                                 };
                                 pending_closed_recovery_command = Some(command);
@@ -1531,7 +1904,7 @@ where
                                 let Some(command) = command else {
                                     break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup_timeout,
+                                        config.cleanup,
                                     );
                                 };
                                 pending_supervisor_command = Some(command);
@@ -1547,7 +1920,7 @@ where
                         guard.invalidate_now();
                         break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                             RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown,
-                            config.cleanup_timeout,
+                            config.cleanup,
                         );
                     }
                 }
@@ -1555,13 +1928,21 @@ where
             RuntimeGatewayOwnerWatchdogActionV1::InvalidateNow => {
                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                     RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                    config.cleanup_timeout,
+                    config.cleanup,
                 );
             }
         }
     };
     guard.invalidate_now();
-    let release = release_gateway_owner_v1(&port, lease_id, stop.cleanup_deadline).await;
+    let cleanup_deadline = startup_cleanup_cap.limit(stop.cleanup_deadline);
+    let gateway_stopped =
+        wait_for_emergency_gateway_shutdown_v1(guard.gateway_shutdown_watch(), cleanup_deadline)
+            .await;
+    let release = if gateway_stopped {
+        release_gateway_owner_v1(&port, lease_id, cleanup_deadline).await
+    } else {
+        RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed
+    };
     let exit = finalize_gateway_owner_exit_v1(stop.exit, release);
     guard.disarm();
     if let Some(response) = shutdown_acknowledgement {
@@ -1626,7 +2007,7 @@ async fn prepare_closed_recovery_owner_v2<P>(
         oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
     >,
     guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
-    cleanup_timeout: Duration,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
 ) -> RuntimeGatewayOwnerClosedRecoveryPrepareStepV2
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
@@ -1641,7 +2022,7 @@ where
                 map_closed_recovery_prepare_watchdog_error_v2(error),
                 map_watchdog_error(error),
                 guard,
-                cleanup_timeout,
+                cleanup,
             );
         }
     };
@@ -1653,9 +2034,10 @@ where
         biased;
         shutdown = shutdown_commands.recv() => {
             guard.invalidate_now();
-            let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                receive_shutdown(shutdown, shutdown_acknowledgement),
-                cleanup_timeout,
+            let stop = receive_shutdown(
+                shutdown,
+                shutdown_acknowledgement,
+                cleanup,
             );
             let _result = response.send(Err(
                 RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SupervisorUnavailable,
@@ -1667,7 +2049,7 @@ where
             return RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(
                 RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                    cleanup_timeout,
+                    cleanup,
                 ),
             );
         }
@@ -1677,7 +2059,7 @@ where
                 RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::SafetyElapsed,
                 RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
                 guard,
-                cleanup_timeout,
+                cleanup,
             );
         }
         result = &mut observation => result,
@@ -1700,7 +2082,7 @@ where
                     RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
             Err(error) => stop_after_closed_recovery_prepare_error_v2(
@@ -1708,7 +2090,7 @@ where
                 map_closed_recovery_prepare_watchdog_error_v2(error),
                 map_watchdog_error(error),
                 guard,
-                cleanup_timeout,
+                cleanup,
             ),
         },
         Err(error) => match P::classify_observation_error(&error) {
@@ -1718,7 +2100,7 @@ where
                     RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ObservationUnavailable,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
             RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost => {
@@ -1727,7 +2109,7 @@ where
                     RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::OwnershipLost,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
             RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation => {
@@ -1736,7 +2118,7 @@ where
                     RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2::ProtocolViolation,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
         },
@@ -1753,12 +2135,12 @@ fn stop_after_closed_recovery_prepare_error_v2(
     response_error: RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
     guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
-    cleanup_timeout: Duration,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
 ) -> RuntimeGatewayOwnerClosedRecoveryPrepareStepV2 {
     guard.invalidate_now();
     let _result = response.send(Err(response_error));
     RuntimeGatewayOwnerClosedRecoveryPrepareStepV2::Stop(
-        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup_timeout),
+        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup),
     )
 }
 
@@ -1806,7 +2188,7 @@ async fn observe_current_gateway_owner_v1<P>(
         oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>,
     >,
     guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
-    cleanup_timeout: Duration,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
 ) -> RuntimeGatewayOwnerStartupObservationStepV1
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
@@ -1821,7 +2203,7 @@ where
                 map_current_observation_error(error),
                 map_watchdog_error(error),
                 guard,
-                cleanup_timeout,
+                cleanup,
             );
         }
     };
@@ -1834,9 +2216,10 @@ where
         biased;
         shutdown = shutdown_commands.recv() => {
             guard.invalidate_now();
-            let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                receive_shutdown(shutdown, shutdown_acknowledgement),
-                cleanup_timeout,
+            let stop = receive_shutdown(
+                shutdown,
+                shutdown_acknowledgement,
+                cleanup,
             );
             let _result = command.response.send(Err(
                 RuntimeGatewayOwnerCurrentObservationErrorV1::SupervisorUnavailable,
@@ -1856,7 +2239,7 @@ where
                     map_current_observation_error(error),
                     map_watchdog_error(error),
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 ),
             };
         }
@@ -1864,7 +2247,7 @@ where
             guard.invalidate_now();
             let stop = RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                 RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                cleanup_timeout,
+                cleanup,
             );
             let _result = command.response.send(Err(
                 RuntimeGatewayOwnerCurrentObservationErrorV1::SafetyElapsed,
@@ -1890,7 +2273,7 @@ where
                     RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
             Err(error) => stop_after_observation_error_v1(
@@ -1898,7 +2281,7 @@ where
                 map_current_observation_error(error),
                 map_watchdog_error(error),
                 guard,
-                cleanup_timeout,
+                cleanup,
             ),
         },
         Err(error) => match P::classify_observation_error(&error) {
@@ -1914,7 +2297,7 @@ where
                         map_current_observation_error(error),
                         map_watchdog_error(error),
                         guard,
-                        cleanup_timeout,
+                        cleanup,
                     ),
                 }
             }
@@ -1924,7 +2307,7 @@ where
                     RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
             RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation => {
@@ -1933,7 +2316,7 @@ where
                     RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
                     RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
                     guard,
-                    cleanup_timeout,
+                    cleanup,
                 )
             }
         },
@@ -1945,12 +2328,12 @@ fn stop_after_observation_error_v1(
     response_error: RuntimeGatewayOwnerCurrentObservationErrorV1,
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
     guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
-    cleanup_timeout: Duration,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
 ) -> RuntimeGatewayOwnerStartupObservationStepV1 {
     guard.invalidate_now();
     let _result = command.response.send(Err(response_error));
     RuntimeGatewayOwnerStartupObservationStepV1::Stop(
-        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup_timeout),
+        RuntimeGatewayOwnerStartupWatchdogStopV1::new(exit, cleanup),
     )
 }
 
@@ -1960,10 +2343,13 @@ struct RuntimeGatewayOwnerStartupWatchdogStopV1 {
 }
 
 impl RuntimeGatewayOwnerStartupWatchdogStopV1 {
-    fn new(exit: RuntimeGatewayOwnerStartupWatchdogExitV1, cleanup_timeout: Duration) -> Self {
+    fn new(
+        exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+        cleanup: RuntimeGatewayOwnerCleanupBoundV1,
+    ) -> Self {
         Self {
             exit,
-            cleanup_deadline: TokioInstant::now() + cleanup_timeout,
+            cleanup_deadline: cleanup.deadline(),
         }
     }
 }
@@ -1971,11 +2357,23 @@ impl RuntimeGatewayOwnerStartupWatchdogStopV1 {
 fn receive_shutdown(
     command: Option<RuntimeGatewayOwnerStartupShutdownCommandV1>,
     acknowledgement: &mut Option<oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
-) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
-    if let Some(RuntimeGatewayOwnerStartupShutdownCommandV1 { response }) = command {
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
+) -> RuntimeGatewayOwnerStartupWatchdogStopV1 {
+    let mut cleanup = cleanup;
+    if let Some(RuntimeGatewayOwnerStartupShutdownCommandV1 {
+        response,
+        cleanup_deadline,
+    }) = command
+    {
         *acknowledgement = Some(response);
+        if let Some(cleanup_deadline) = cleanup_deadline {
+            cleanup = cleanup.capped_at(cleanup_deadline);
+        }
     }
-    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+        cleanup,
+    )
 }
 
 fn map_current_observation_error(
@@ -2039,6 +2437,9 @@ where
 {
     let request = RuntimeReleaseGatewayOwnerLeaseV1 { lease_id };
     for _attempt in 0..RELEASE_ATTEMPTS {
+        if TokioInstant::now() >= cleanup_deadline {
+            return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed;
+        }
         let release = match timeout_at(
             cleanup_deadline,
             port.release_gateway_owner(request.clone()),
@@ -2048,6 +2449,9 @@ where
             Ok(release) => release,
             Err(_) => return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed,
         };
+        if TokioInstant::now() >= cleanup_deadline {
+            return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed;
+        }
         match release {
             Ok(outcome) => match accept_gateway_owner_release_v1(&request, outcome) {
                 Ok(RuntimeAcceptedGatewayOwnerReleaseV1::Released)
@@ -2073,6 +2477,9 @@ where
                         return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed;
                     }
                 };
+                if TokioInstant::now() >= cleanup_deadline {
+                    return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed;
+                }
                 match classify_unknown_gateway_owner_release_v1(&request, observation) {
                     RuntimeGatewayOwnerReleaseRecoveryV1::ReplaySameRequest => {}
                     RuntimeGatewayOwnerReleaseRecoveryV1::CompleteWithoutOwnership(_) => {
@@ -2086,6 +2493,20 @@ where
         }
     }
     RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed
+}
+
+pub(crate) async fn release_runtime_gateway_owner_until_v1<P>(
+    port: &P,
+    lease_id: RuntimeGatewayOwnerLeaseIdV1,
+    cleanup_deadline: Instant,
+) -> RuntimeGatewayOwnerReleaseStatusV1
+where
+    P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
+{
+    if Instant::now() >= cleanup_deadline {
+        return RuntimeGatewayOwnerReleaseStatusV1::Unconfirmed;
+    }
+    release_gateway_owner_v1(port, lease_id, TokioInstant::from_std(cleanup_deadline)).await
 }
 
 struct RuntimeGatewayOwnerInvalidationLatchV1 {
@@ -2105,6 +2526,10 @@ impl RuntimeGatewayOwnerInvalidationLatchV1 {
         if !self.invalidated.swap(true, Ordering::AcqRel) {
             self.invalidator.invalidate_gateway_ownership();
         }
+    }
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        self.invalidator.gateway_shutdown_watch()
     }
 }
 
@@ -2128,6 +2553,10 @@ impl RuntimeGatewayOwnerStartupWatchdogGuardV1 {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn gateway_shutdown_watch(&self) -> Option<watch::Receiver<bool>> {
+        self.invalidation.gateway_shutdown_watch()
+    }
 }
 
 impl Drop for RuntimeGatewayOwnerStartupWatchdogGuardV1 {
@@ -2135,6 +2564,87 @@ impl Drop for RuntimeGatewayOwnerStartupWatchdogGuardV1 {
         if self.armed {
             self.invalidation.invalidate();
         }
+    }
+}
+
+async fn wait_for_emergency_gateway_shutdown_v1(
+    mut stopped: Option<watch::Receiver<bool>>,
+    cleanup_deadline: TokioInstant,
+) -> bool {
+    let Some(stopped) = stopped.as_mut() else {
+        return true;
+    };
+    loop {
+        if *stopped.borrow() {
+            return true;
+        }
+        if TokioInstant::now() >= cleanup_deadline {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = sleep_until(cleanup_deadline) => return false,
+            changed = stopped.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod emergency_gateway_shutdown_tests {
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio::time::Instant;
+
+    use super::wait_for_emergency_gateway_shutdown_v1;
+
+    #[tokio::test]
+    async fn unattached_or_already_stopped_gateway_never_blocks_owner_cleanup() {
+        assert!(
+            wait_for_emergency_gateway_shutdown_v1(None, Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        let (_sender, receiver) = watch::channel(true);
+        assert!(
+            wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_gateway_must_publish_stopped_before_owner_cleanup_continues() {
+        let (sender, receiver) = watch::channel(false);
+        let waiter =
+            tokio::runtime::Handle::current().spawn(wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1),
+            ));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        sender.send(true).unwrap();
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn closed_or_expired_gateway_stop_evidence_never_authorizes_release() {
+        let (sender, receiver) = watch::channel(false);
+        drop(sender);
+        assert!(
+            !wait_for_emergency_gateway_shutdown_v1(
+                Some(receiver),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+        );
+        let (_sender, receiver) = watch::channel(false);
+        assert!(!wait_for_emergency_gateway_shutdown_v1(Some(receiver), Instant::now()).await);
     }
 }
 

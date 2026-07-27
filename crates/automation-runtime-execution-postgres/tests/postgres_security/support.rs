@@ -74,7 +74,7 @@ const EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "c5a1eb3ae9a229c127a804f6f05298ff9f797604646de202ba1a832012e7bd91";
+    "6962c1c2ffdd862a86aed3c84569ac50307964d59711d0bddc26aadbf68577e2";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
