@@ -1265,8 +1265,35 @@ SET search_path = pg_catalog
 AS $function$
 DECLARE
     initial_bytes BYTEA;
+    gate_stage TEXT;
+    gate_product_operation_id TEXT;
+    gate_drain_intent_id TEXT;
 BEGIN
     IF TG_OP <> 'INSERT' THEN
+        RETURN NEW;
+    END IF;
+    gate_stage := pg_catalog.current_setting(
+        'starring.runtime_product_drain_first_apply_stage_v2',
+        TRUE
+    );
+    gate_product_operation_id := pg_catalog.current_setting(
+        'starring.runtime_product_drain_first_apply_product_operation_id_v2',
+        TRUE
+    );
+    gate_drain_intent_id := pg_catalog.current_setting(
+        'starring.runtime_product_drain_first_apply_drain_intent_id_v2',
+        TRUE
+    );
+    IF NEW.product_operation_id IS NULL
+        OR NEW.drain_intent_id IS NULL
+        OR NEW.product_operation_id !~ '^[0-9a-f]{32}$'
+        OR NEW.drain_intent_id !~ '^[0-9a-f]{32}$'
+        OR gate_stage IS DISTINCT FROM 'drain_insert'
+        OR gate_product_operation_id
+            IS DISTINCT FROM NEW.product_operation_id
+        OR gate_drain_intent_id
+            IS DISTINCT FROM NEW.drain_intent_id
+    THEN
         RETURN NEW;
     END IF;
     IF NEW.canonical_state_bytes IS NULL
@@ -1392,71 +1419,74 @@ BEGIN
                 RETURN NEW;
             END IF;
         END IF;
-    ELSIF TG_OP = 'UPDATE'
-        AND TG_RELID = pg_catalog.to_regclass(
-            'public.runtime_drain_intents_v2'
-        )
-        AND gate_stage = 'pending_drain_recovery_update'
-        AND gate_drain_intent_id = OLD.drain_intent_id
-        AND gate_product_operation_id = OLD.product_operation_id
-        AND gate_source_revision = OLD.intent_revision::TEXT
-        AND gate_source_digest = OLD.canonical_state_digest
-        AND gate_successor_revision = NEW.intent_revision::TEXT
-        AND gate_successor_digest = NEW.canonical_state_digest
-        AND NEW.intent_revision = OLD.intent_revision + 1
-        AND NEW.drain_intent_id = OLD.drain_intent_id
-        AND NEW.tenant_id = OLD.tenant_id
-        AND NEW.installation_id = OLD.installation_id
-        AND NEW.deployment_id = OLD.deployment_id
-        AND NEW.slot_guild_id = OLD.slot_guild_id
-        AND NEW.slot_ruleset_key = OLD.slot_ruleset_key
-        AND NEW.expected_revision = OLD.expected_revision
-        AND NEW.product_operation_id = OLD.product_operation_id
-        AND NEW.product_mutation_digest
-            = OLD.product_mutation_digest
-        AND NEW.drain_intent_request_bytes
-            = OLD.drain_intent_request_bytes
-        AND NEW.drain_intent_digest = OLD.drain_intent_digest
-        AND starring_runtime_private_v2.starring_runtime_pending_drain_state_exact_v2(
-            NEW
-        )
-    THEN
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_product_drain_first_apply_stage_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_product_drain_first_apply_product_operation_id_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_product_drain_first_apply_drain_intent_id_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_pending_drain_source_revision_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_pending_drain_source_digest_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_pending_drain_successor_revision_v2',
-            '',
-            TRUE
-        );
-        PERFORM pg_catalog.set_config(
-            'starring.runtime_pending_drain_successor_digest_v2',
-            '',
-            TRUE
-        );
-        RETURN NEW;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF TG_RELID = pg_catalog.to_regclass(
+                'public.runtime_drain_intents_v2'
+            )
+        THEN
+            IF gate_stage = 'pending_drain_recovery_update'
+                AND gate_drain_intent_id = OLD.drain_intent_id
+                AND gate_product_operation_id = OLD.product_operation_id
+                AND gate_source_revision = OLD.intent_revision::TEXT
+                AND gate_source_digest = OLD.canonical_state_digest
+                AND gate_successor_revision = NEW.intent_revision::TEXT
+                AND gate_successor_digest = NEW.canonical_state_digest
+                AND NEW.intent_revision = OLD.intent_revision + 1
+                AND NEW.drain_intent_id = OLD.drain_intent_id
+                AND NEW.tenant_id = OLD.tenant_id
+                AND NEW.installation_id = OLD.installation_id
+                AND NEW.deployment_id = OLD.deployment_id
+                AND NEW.slot_guild_id = OLD.slot_guild_id
+                AND NEW.slot_ruleset_key = OLD.slot_ruleset_key
+                AND NEW.expected_revision = OLD.expected_revision
+                AND NEW.product_operation_id = OLD.product_operation_id
+                AND NEW.product_mutation_digest
+                    = OLD.product_mutation_digest
+                AND NEW.drain_intent_request_bytes
+                    = OLD.drain_intent_request_bytes
+                AND NEW.drain_intent_digest = OLD.drain_intent_digest
+                AND starring_runtime_private_v2.starring_runtime_pending_drain_state_exact_v2(
+                    NEW
+                )
+            THEN
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_product_drain_first_apply_stage_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_product_drain_first_apply_product_operation_id_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_product_drain_first_apply_drain_intent_id_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_pending_drain_source_revision_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_pending_drain_source_digest_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_pending_drain_successor_revision_v2',
+                    '',
+                    TRUE
+                );
+                PERFORM pg_catalog.set_config(
+                    'starring.runtime_pending_drain_successor_digest_v2',
+                    '',
+                    TRUE
+                );
+                RETURN NEW;
+            END IF;
+        END IF;
     END IF;
 
     RAISE EXCEPTION USING
@@ -1464,6 +1494,222 @@ BEGIN
         MESSAGE = 'runtime_product_drain_mutation_rejected';
 END;
 $function$;
+
+DO $patch_recovery_drain_state_contracts$
+DECLARE
+    identity TEXT;
+    definition TEXT;
+    previous_fragment TEXT;
+    next_fragment TEXT;
+BEGIN
+    FOREACH identity IN ARRAY ARRAY[
+        'public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)',
+        'public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'
+    ]
+    LOOP
+        SELECT pg_catalog.pg_get_functiondef(function_row.oid)
+        INTO definition
+        FROM pg_catalog.pg_proc AS function_row
+        WHERE function_row.oid = pg_catalog.to_regprocedure(identity);
+
+        previous_fragment :=
+            '        ) = ''CHECK (intent_state = ''''pending''''::text)'';';
+        next_fragment :=
+            '        ) = ''CHECK (intent_state = ANY (ARRAY[''''pending''''::text, ''''route_absent_acknowledged''''::text]))'';';
+        IF definition IS NULL
+            OR pg_catalog.strpos(definition, previous_fragment) = 0
+            OR pg_catalog.strpos(
+                pg_catalog.replace(definition, previous_fragment, ''),
+                previous_fragment
+            ) <> 0
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RE001',
+                MESSAGE = 'runtime_pending_drain_state_constraint_patch_drift';
+        END IF;
+        definition := pg_catalog.replace(
+            definition,
+            previous_fragment,
+            next_fragment
+        );
+
+        previous_fragment :=
+            '            WHERE drain.intent_state IS DISTINCT FROM ''pending''';
+        next_fragment :=
+            '            WHERE drain.intent_state NOT IN (' || E'\n' ||
+            '                    ''pending'',' || E'\n' ||
+            '                    ''route_absent_acknowledged''' || E'\n' ||
+            '                )' || E'\n' ||
+            '                OR NOT starring_runtime_private_v2.' ||
+            'starring_runtime_pending_drain_state_exact_v2(' || E'\n' ||
+            '                    drain' || E'\n' ||
+            '                )';
+        IF pg_catalog.strpos(definition, previous_fragment) = 0
+            OR pg_catalog.strpos(
+                pg_catalog.replace(definition, previous_fragment, ''),
+                previous_fragment
+            ) <> 0
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RE001',
+                MESSAGE = 'runtime_pending_drain_state_classifier_patch_drift';
+        END IF;
+        definition := pg_catalog.replace(
+            definition,
+            previous_fragment,
+            next_fragment
+        );
+
+        previous_fragment :=
+            '            AND NOT EXISTS (' || E'\n' ||
+            '                SELECT 1' || E'\n' ||
+            '                FROM public.runtime_drain_intents_v2 AS drain' ||
+            E'\n' ||
+            '                WHERE drain.slot_guild_id = deployment.guild_id' ||
+            E'\n' ||
+            '                    AND drain.slot_ruleset_key =' || E'\n' ||
+            '                        deployment.ruleset_key' || E'\n' ||
+            '                    AND drain.intent_state = ''pending''' ||
+            E'\n' ||
+            '            )';
+        next_fragment :=
+            '            AND NOT EXISTS (' || E'\n' ||
+            '                SELECT 1' || E'\n' ||
+            '                FROM public.runtime_drain_intents_v2 AS drain' ||
+            E'\n' ||
+            '                WHERE drain.slot_guild_id = deployment.guild_id' ||
+            E'\n' ||
+            '                    AND drain.slot_ruleset_key =' || E'\n' ||
+            '                        deployment.ruleset_key' || E'\n' ||
+            '                    AND drain.intent_state IN (' || E'\n' ||
+            '                        ''pending'',' || E'\n' ||
+            '                        ''route_absent_acknowledged''' || E'\n' ||
+            '                    )' || E'\n' ||
+            '            )';
+        IF pg_catalog.strpos(definition, previous_fragment) = 0
+            OR pg_catalog.strpos(
+                pg_catalog.replace(definition, previous_fragment, ''),
+                previous_fragment
+            ) <> 0
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RE001',
+                MESSAGE = 'runtime_pending_drain_live_exclusion_patch_drift';
+        END IF;
+        definition := pg_catalog.replace(
+            definition,
+            previous_fragment,
+            next_fragment
+        );
+        EXECUTE definition;
+    END LOOP;
+
+    SELECT pg_catalog.pg_get_functiondef(function_row.oid)
+    INTO definition
+    FROM pg_catalog.pg_proc AS function_row
+    WHERE function_row.oid = pg_catalog.to_regprocedure(
+        'public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)'
+    );
+
+    previous_fragment :=
+        '    active_exact_route_count BIGINT;' || E'\n' ||
+        '    pending_drain_count BIGINT;';
+    next_fragment :=
+        '    active_exact_route_count BIGINT;' || E'\n' ||
+        '    pending_drain_count BIGINT;' || E'\n' ||
+        '    acknowledged_drain_count BIGINT;';
+    IF pg_catalog.strpos(definition, previous_fragment) = 0
+        OR pg_catalog.strpos(
+            pg_catalog.replace(definition, previous_fragment, ''),
+            previous_fragment
+        ) <> 0
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RE001',
+            MESSAGE = 'runtime_pending_drain_observation_declaration_patch_drift';
+    END IF;
+    definition := pg_catalog.replace(
+        definition,
+        previous_fragment,
+        next_fragment
+    );
+
+    previous_fragment :=
+        '    SELECT pg_catalog.count(*)' || E'\n' ||
+        '    INTO pending_drain_count' || E'\n' ||
+        '    FROM public.runtime_drain_intents_v2 AS drain' || E'\n' ||
+        '    WHERE drain.intent_state = ''pending'';';
+    next_fragment :=
+        '    SELECT' || E'\n' ||
+        '        pg_catalog.count(*) FILTER (' || E'\n' ||
+        '            WHERE drain.intent_state = ''pending''' || E'\n' ||
+        '        ),' || E'\n' ||
+        '        pg_catalog.count(*) FILTER (' || E'\n' ||
+        '            WHERE drain.intent_state =' || E'\n' ||
+        '                ''route_absent_acknowledged''' || E'\n' ||
+        '        )' || E'\n' ||
+        '    INTO pending_drain_count, acknowledged_drain_count' || E'\n' ||
+        '    FROM public.runtime_drain_intents_v2 AS drain;';
+    IF pg_catalog.strpos(definition, previous_fragment) = 0
+        OR pg_catalog.strpos(
+            pg_catalog.replace(definition, previous_fragment, ''),
+            previous_fragment
+        ) <> 0
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RE001',
+            MESSAGE = 'runtime_pending_drain_observation_count_patch_drift';
+    END IF;
+    definition := pg_catalog.replace(
+        definition,
+        previous_fragment,
+        next_fragment
+    );
+
+    previous_fragment :=
+        '        OR pending_drain_count > 4294967295';
+    next_fragment :=
+        '        OR pending_drain_count > 4294967295' || E'\n' ||
+        '        OR acknowledged_drain_count > 4294967295';
+    IF pg_catalog.strpos(definition, previous_fragment) = 0
+        OR pg_catalog.strpos(
+            pg_catalog.replace(definition, previous_fragment, ''),
+            previous_fragment
+        ) <> 0
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RE001',
+            MESSAGE = 'runtime_pending_drain_observation_bound_patch_drift';
+    END IF;
+    definition := pg_catalog.replace(
+        definition,
+        previous_fragment,
+        next_fragment
+    );
+
+    previous_fragment :=
+        '    acknowledged_product_handoff_count := 0;';
+    next_fragment :=
+        '    acknowledged_product_handoff_count :=' || E'\n' ||
+        '        acknowledged_drain_count;';
+    IF pg_catalog.strpos(definition, previous_fragment) = 0
+        OR pg_catalog.strpos(
+            pg_catalog.replace(definition, previous_fragment, ''),
+            previous_fragment
+        ) <> 0
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RE001',
+            MESSAGE = 'runtime_pending_drain_observation_ack_patch_drift';
+    END IF;
+    definition := pg_catalog.replace(
+        definition,
+        previous_fragment,
+        next_fragment
+    );
+    EXECUTE definition;
+END;
+$patch_recovery_drain_state_contracts$;
 
 DO $patch_slot_fence_readers$
 DECLARE
@@ -6428,7 +6674,7 @@ BEGIN
     next_fragment :=
         'RETURN observed_count = 828' || E'\n' ||
         '        AND observed_digest' || E'\n' ||
-        '            = ''199ff4a022bafa8d4cd2a2ac942cc267cbdd735b6d33f2eac5b46d5f11dae336'';';
+        '            = ''a10c4cc166d3fa07adc4bb800e47f3c0cfb1747b8f6a49fd8e1144d1a11865a3'';';
     IF pg_catalog.strpos(definition, previous_fragment) = 0
         OR pg_catalog.strpos(
             pg_catalog.replace(definition, previous_fragment, ''),
@@ -6549,7 +6795,7 @@ BEGIN
     previous_fragment :=
         '''63268b8e2e30bbe523a437a5c326daa9ef25b863a866d4f1e67fcf46bc98bd95''::TEXT';
     next_fragment :=
-        '''8b4d7db74a3636df4332e9940e0a77132d98b1777e4954f8e7954408320a09e5''::TEXT';
+        '''9de93ea5d565254c47533c7af43959aa873014bee385a2af775fafdcbf8118b9''::TEXT';
     IF pg_catalog.strpos(definition, previous_fragment) = 0
         OR pg_catalog.strpos(
             pg_catalog.replace(definition, previous_fragment, ''),
@@ -7193,9 +7439,9 @@ BEGIN
         OR invalid_column_count <> 0
         OR invalid_alias_count <> 0
         OR manifest_digest IS DISTINCT FROM
-            '8b4d7db74a3636df4332e9940e0a77132d98b1777e4954f8e7954408320a09e5'
+            '9de93ea5d565254c47533c7af43959aa873014bee385a2af775fafdcbf8118b9'
         OR readiness_digest IS DISTINCT FROM
-            'de739460f2c86c2016cbc91aa47a625fbced903cc93722de80a33c93c7b54932'
+            '1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5'
         OR selector_digest IS DISTINCT FROM
             '480ac807bc917924090375c050705d2dcf51d5234dc9144d1d6b97be4590323d'
         OR recorder_digest IS DISTINCT FROM
@@ -7203,7 +7449,7 @@ BEGIN
         OR executor_digest IS DISTINCT FROM
             '5414574cde39e1c59410e1cac6ccb975a87d16f4807f3ae33b8f28b8157a8e9b'
         OR product_trigger_digest IS DISTINCT FROM
-            'fac3faeb3f3f5d96a9468d86656285634b86b5d1f06156f12a96b5986ff9a991'
+            '71bae3d64f810dbbe29a670a3d9cedaeb6428a809eb6d8b757e247bdd9c2a046'
         OR slot_validator_digest IS DISTINCT FROM
             '3c6901656c8edb5c8d25347d630e6c821963ca86bd0baed5176a7b2a8f34daa8'
         OR deployment_validator_digest IS DISTINCT FROM

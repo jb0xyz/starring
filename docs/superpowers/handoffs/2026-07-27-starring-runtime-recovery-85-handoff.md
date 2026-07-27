@@ -147,8 +147,9 @@ The focused checkpoint gates passed:
 | Worker integration/dependency guards | 14 passed |
 | Execution PostgreSQL library tests | 131 passed |
 | Execution PostgreSQL dependency guards | 18 passed |
-| Pending migration static guards | 7 passed |
+| Pending migration static guards | 8 passed |
 | Pending PostgreSQL security tests | 13 passed: 9 SQL and 4 adapter |
+| Full execution PostgreSQL security suite | 98 passed |
 | Starring runtime library and integration tests | 347 passed |
 | Starring runtime Clippy with warnings denied | passed |
 | Starring runtime formatting and comment guards | passed |
@@ -183,8 +184,8 @@ The pinned definition digests at this checkpoint are:
 
 | Contract | Definition digest |
 | --- | --- |
-| Execution manifest | `8b4d7db74a3636df4332e9940e0a77132d98b1777e4954f8e7954408320a09e5` |
-| Execution readiness | `de739460f2c86c2016cbc91aa47a625fbced903cc93722de80a33c93c7b54932` |
+| Execution manifest | `9de93ea5d565254c47533c7af43959aa873014bee385a2af775fafdcbf8118b9` |
+| Execution readiness | `1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5` |
 | Exact-target manifest | `bea5a930a40537f9f06f19a350d1fdba3bf21b222844eb0f442fb506d91a1ebb` |
 | Exact-target readiness | `5eba72a786aebaa8afdc226d661b45132afc5aa053fab7be6a3b9737fdab0e8c` |
 | Serving manifest | `c679ef7c0722416b514324936a95884d17242e6b67cdb130987e4d4f03a43758` |

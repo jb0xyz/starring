@@ -661,89 +661,44 @@ async fn expire_gateway_owner(pool: &PgPool) {
 }
 
 async fn seed_pending_drain(pool: &PgPool, symmetric: bool) {
-    let operation_id = "c1000000c1000000c1000000c1000000";
-    let drain_id = "c2000000c2000000c2000000c2000000";
-    let mutation_digest = "a".repeat(64);
-    let drain_digest = "b".repeat(64);
-    let mut transaction = pool.begin().await.unwrap();
-    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    for statement in [
-        "ALTER TABLE public.runtime_product_operations_v2 DISABLE TRIGGER USER",
-        "ALTER TABLE public.runtime_drain_intents_v2 DISABLE TRIGGER USER",
-        "ALTER TABLE public.runtime_slot_writer_fences_v2 DISABLE TRIGGER USER",
-    ] {
-        sqlx::query(statement)
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-    }
-    sqlx::query(
-        "INSERT INTO public.runtime_product_operations_v2 (\
-            product_operation_id, tenant_id, installation_id, deployment_id, \
-            expected_revision, expected_target_guild_id, \
-            expected_target_ruleset_key, expected_target_version, \
-            expected_target_content_hash, expected_target_binding_revision, \
-            expected_target_binding_fingerprint, product_mutation_request_bytes, \
-            product_mutation_digest\
-         ) SELECT $1, tenant_id, installation_id, deployment_id, revision, \
-            guild_id, ruleset_key, target_version, target_content_hash, \
-            binding_revision, binding_fingerprint, \
-            pg_catalog.convert_to('{}', 'UTF8'), $2 \
-         FROM public.runtime_deployments WHERE deployment_id = $3",
-    )
-    .bind(operation_id)
-    .bind(&mutation_digest)
-    .bind(DEPLOYMENT)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO public.runtime_drain_intents_v2 (\
-            drain_intent_id, tenant_id, installation_id, deployment_id, \
-            slot_guild_id, slot_ruleset_key, expected_revision, \
-            product_operation_id, product_mutation_digest, \
-            drain_intent_request_bytes, drain_intent_digest, \
-            intent_revision, intent_state\
-         ) SELECT $1, tenant_id, installation_id, deployment_id, \
-            guild_id, ruleset_key, revision, $2, $3, \
-            pg_catalog.convert_to('{}', 'UTF8'), $4, 1, 'pending' \
-         FROM public.runtime_deployments WHERE deployment_id = $5",
-    )
-    .bind(drain_id)
-    .bind(operation_id)
-    .bind(&mutation_digest)
-    .bind(&drain_digest)
-    .bind(DEPLOYMENT)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    if symmetric {
+    let snapshot = product_drain_snapshot(pool).await;
+    let canonical = canonical_product_drain(&snapshot);
+    seed_canonical_product_drain(pool, &canonical).await;
+    if !symmetric {
+        let mut transaction = pool.begin().await.unwrap();
         sqlx::query(
-            "UPDATE public.runtime_slot_writer_fences_v2 AS fence \
-             SET pending_drain_intent_id = $1, \
-                pending_product_operation_id = $2, \
-                pending_tenant_id = deployment.tenant_id, \
-                pending_installation_id = deployment.installation_id, \
-                pending_deployment_id = deployment.deployment_id, \
-                pending_expected_revision = deployment.revision, \
-                pending_marked_at = pg_catalog.clock_timestamp(), \
-                updated_at = pg_catalog.clock_timestamp() \
-             FROM public.runtime_deployments AS deployment \
-             WHERE deployment.deployment_id = $3 \
-                AND fence.slot_guild_id = deployment.guild_id \
-                AND fence.slot_ruleset_key = deployment.ruleset_key",
+            "ALTER TABLE public.runtime_slot_writer_fences_v2 \
+             DISABLE TRIGGER USER",
         )
-        .bind(drain_id)
-        .bind(operation_id)
-        .bind(DEPLOYMENT)
         .execute(&mut *transaction)
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE public.runtime_slot_writer_fences_v2 \
+             SET pending_drain_intent_id = NULL, \
+                 pending_product_operation_id = NULL, \
+                 pending_tenant_id = NULL, \
+                 pending_installation_id = NULL, \
+                 pending_deployment_id = NULL, \
+                 pending_expected_revision = NULL, \
+                 pending_marked_at = NULL, \
+                 updated_at = pg_catalog.clock_timestamp() \
+             WHERE slot_guild_id = $1 AND slot_ruleset_key = $2",
+        )
+        .bind(GUILD.to_string())
+        .bind(RULESET)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE public.runtime_slot_writer_fences_v2 \
+             ENABLE TRIGGER USER",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
     }
-    transaction.commit().await.unwrap();
 }
 
 async fn replace_suspension_root(pool: &PgPool, payload: &[u8], quiescent: bool) {

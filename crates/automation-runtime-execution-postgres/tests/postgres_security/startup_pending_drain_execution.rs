@@ -795,6 +795,11 @@ async fn startup_pending_drain_claim_ack_replay_preserves_compound_cas() {
     assert_eq!(after_acknowledgement.2, before.2);
     assert_eq!(after_acknowledgement.3, before.3);
     assert_eq!(after_acknowledgement.4, 2);
+    let observed =
+        observe_startup_state(&database.executor_pool, &fixture.owner, fixture.owner.4).await;
+    assert_eq!(observed["outcome_name"], "observed");
+    assert_eq!(observed["pending_runtime_drain_intent_count"], 0);
+    assert_eq!(observed["acknowledged_product_handoff_count"], 1);
 
     let mut later_replay_fixture = acknowledgement_fixture.clone();
     later_replay_fixture.minimum_database_now = database_now(&database.owner_pool).await;

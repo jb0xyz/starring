@@ -18,9 +18,9 @@ const SELECTOR_IDENTITY: &str = "public.starring_runtime_startup_recovery_select
 const RECORDER_IDENTITY: &str = "public.starring_runtime_startup_recovery_record_pending_drain_none_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint)";
 const EXECUTOR_IDENTITY: &str = "public.starring_runtime_startup_recovery_execute_pending_drain_v2(text,bigint,bigint,bigint,bigint,bigint,bigint,text,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean,text)";
 const MANIFEST_DEFINITION_DIGEST: &str =
-    "8b4d7db74a3636df4332e9940e0a77132d98b1777e4954f8e7954408320a09e5";
+    "9de93ea5d565254c47533c7af43959aa873014bee385a2af775fafdcbf8118b9";
 const READINESS_DEFINITION_DIGEST: &str =
-    "de739460f2c86c2016cbc91aa47a625fbced903cc93722de80a33c93c7b54932";
+    "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -177,7 +177,7 @@ fn canonical_state_ddl_trigger_and_manifest_are_pinned() {
         "CREATE TRIGGER runtime_drain_intents_v2_00_initialize_canonical_state",
         "starring_runtime_pending_drain_initialize_v2",
         "RETURN observed_count = 828",
-        "199ff4a022bafa8d4cd2a2ac942cc267cbdd735b6d33f2eac5b46d5f11dae336",
+        "a10c4cc166d3fa07adc4bb800e47f3c0cfb1747b8f6a49fd8e1144d1a11865a3",
         MANIFEST_DEFINITION_DIGEST,
         READINESS_DEFINITION_DIGEST,
         "runtime_startup_pending_drain_execution_postflight_drift",
@@ -197,6 +197,46 @@ fn canonical_state_ddl_trigger_and_manifest_are_pinned() {
     ] {
         assert!(strict_backfill.contains(required), "{required}");
     }
+}
+
+#[test]
+fn legacy_recovery_and_product_trigger_contracts_are_rebound_exactly() {
+    let recovery_patch = dollar_block("patch_recovery_drain_state_contracts");
+    for required in [
+        "public.starring_runtime_startup_recovery_observe_v2",
+        "public.starring_runtime_startup_recovery_execute_stale_live_v2",
+        "CHECK (intent_state = ANY (ARRAY[",
+        "route_absent_acknowledged",
+        "starring_runtime_pending_drain_state_exact_v2(",
+        "acknowledged_drain_count",
+        "acknowledged_product_handoff_count :=",
+        "runtime_pending_drain_live_exclusion_patch_drift",
+    ] {
+        assert!(recovery_patch.contains(required), "{required}");
+    }
+    let initializer =
+        function("starring_runtime_private_v2.starring_runtime_pending_drain_initialize_v2");
+    for required in [
+        "gate_stage IS DISTINCT FROM 'drain_insert'",
+        "NEW.product_operation_id IS NULL",
+        "NEW.drain_intent_id IS NULL",
+        "NEW.product_operation_id !~ '^[0-9a-f]{32}$'",
+        "NEW.drain_intent_id !~ '^[0-9a-f]{32}$'",
+        "IS DISTINCT FROM NEW.product_operation_id",
+        "IS DISTINCT FROM NEW.drain_intent_id",
+    ] {
+        assert!(initializer.contains(required), "{required}");
+    }
+    let product_trigger = MIGRATION
+        .split("CREATE OR REPLACE FUNCTION public.reject_runtime_product_drain_mutation()")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    assert!(product_trigger
+        .contains("ELSIF TG_OP = 'UPDATE' THEN\n        IF TG_RELID = pg_catalog.to_regclass("));
+    assert!(product_trigger.contains("IF gate_stage = 'pending_drain_recovery_update'"));
 }
 
 #[test]

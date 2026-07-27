@@ -446,6 +446,7 @@ async fn insert_drain_only(
         .unwrap();
     }
     let drain = canonical.drain_preimage();
+    set_product_drain_initializer_gate(&mut transaction, canonical).await;
     sqlx::query(
         "INSERT INTO public.runtime_drain_intents_v2 \
          (drain_intent_id, tenant_id, installation_id, deployment_id, slot_guild_id, \
@@ -467,6 +468,7 @@ async fn insert_drain_only(
     .execute(&mut *transaction)
     .await
     .unwrap();
+    clear_product_drain_initializer_gate(&mut transaction).await;
     for trigger in [
         "runtime_drain_intents_v2_assert_slot_writer_fence_symmetry",
         "runtime_drain_intents_v2_reject_row_mutation",
