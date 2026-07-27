@@ -1276,7 +1276,7 @@ fn empty_recovery_cursor_seals_and_restores_one_exact_empty_slot() {
     assert_eq!(sealed.registry_observation().sealed_slot_count(), 1);
 
     let unsealed = registry
-        .unseal_empty_recovery_drain_claim_v2(sealed.into_seal())
+        .unseal_empty_recovery_drain_claim_v2(sealed)
         .unwrap();
     assert_eq!(unsealed.slot_observation().route, None);
     assert_eq!(
@@ -1324,6 +1324,56 @@ fn empty_recovery_seal_preserves_tombstone_local_generation() {
     assert_eq!(
         sealed.slot_observation().observation_sequence.get(),
         source_slot.observation_sequence.get() + 1
+    );
+}
+
+#[test]
+fn empty_recovery_unseal_rejects_cross_thread_s1_advance_without_mutating_target() {
+    let registry = registry(8);
+    let target_key = route(10, "study", 1, 1, "p1", None).slot_key();
+    let unrelated_key = route(11, "other", 1, 1, "p1", None).slot_key();
+    let cursor = registry
+        .recovery_observation_guard_v2()
+        .unwrap()
+        .into_empty_cursor()
+        .unwrap();
+    let target = registry
+        .seal_empty_recovery_drain_claim_v2(cursor, &target_key, seal_key(16))
+        .unwrap();
+    let unrelated_registry = registry.clone();
+    std::thread::spawn(move || {
+        let (unrelated, _) = unrelated_registry
+            .seal_drain_claim_v2(&unrelated_key, seal_key(17), None)
+            .unwrap();
+        unrelated_registry.unseal_drain_claim_v2(unrelated).unwrap();
+    })
+    .join()
+    .unwrap();
+    let before = registry
+        .atomic_observation_v2(&target_key)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .unseal_empty_recovery_drain_claim_v2(target)
+            .err()
+            .unwrap(),
+        ServingSlotRegistryError::StaleSlotSeal
+    );
+    assert_eq!(
+        registry.atomic_observation_v2(&target_key).unwrap(),
+        Some(before)
+    );
+    assert_eq!(
+        registry
+            .install(
+                target_key.clone(),
+                route(10, "study", 1, 1, "p1", None),
+                fence(1),
+            )
+            .unwrap_err(),
+        ServingSlotRegistryError::SlotSealed
     );
 }
 

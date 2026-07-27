@@ -4,9 +4,9 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_registry::{
     RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
-    RegistryRecoveryObservationV2, ServingSlotKeyV1, ServingSlotRegistryConfigV1,
-    ServingSlotRegistryError, ServingSlotRegistryV1, SlotAdmissionStateV2, SlotAtomicObservationV2,
-    SlotDrainClaimSealV2, SlotSealKeyV2,
+    RegistryRecoveryObservationV2, SealedEmptyRecoveryDrainClaimV2, ServingSlotKeyV1,
+    ServingSlotRegistryConfigV1, ServingSlotRegistryError, ServingSlotRegistryV1,
+    SlotAdmissionStateV2, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2,
@@ -220,27 +220,12 @@ impl RuntimeRegistryEmptyRecoveryBindingV2 {
             .registry
             .seal_empty_recovery_drain_claim_v2(self.cursor, &key, seal_key)
             .map_err(map_registry_observation_error)?;
-        let source_slot_observation = sealed.source_slot_observation().cloned();
-        let slot_observation = sealed.slot_observation().clone();
-        let registry_observation = sealed.registry_observation();
-        let seal = sealed.into_seal();
-        validate_pending_drain_seal_v2(
-            &key,
-            seal_key,
-            &source_empty_observation,
-            source_slot_observation.as_ref(),
-            &seal,
-            &slot_observation,
-            registry_observation,
-        )?;
+        validate_pending_drain_seal_v2(&key, seal_key, &source_empty_observation, &sealed)?;
         Ok(RuntimeRegistryPendingDrainSealBindingV2 {
             process_instance_id: self.process_instance_id,
             registry: self.registry,
-            seal,
+            sealed,
             source_empty_observation,
-            source_slot_observation,
-            slot_observation,
-            registry_observation,
         })
     }
 }
@@ -255,21 +240,18 @@ impl Debug for RuntimeRegistryEmptyRecoveryBindingV2 {
 pub(crate) struct RuntimeRegistryPendingDrainSealBindingV2 {
     process_instance_id: ProcessInstanceId,
     registry: ServingSlotRegistryV1,
-    seal: SlotDrainClaimSealV2,
+    sealed: SealedEmptyRecoveryDrainClaimV2,
     source_empty_observation: RuntimeRegistryRecoveryEmptyObservationV2,
-    source_slot_observation: Option<SlotAtomicObservationV2>,
-    slot_observation: SlotAtomicObservationV2,
-    registry_observation: RegistryRecoveryObservationV2,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeRegistryPendingDrainSealBindingV2 {
     pub(crate) fn seal_key_bytes_v2(&self) -> [u8; 16] {
-        *self.seal.seal_key().as_bytes()
+        *self.sealed.seal().seal_key().as_bytes()
     }
 
     pub(crate) fn seal_generation_v2(&self) -> NonZeroU64 {
-        self.seal.seal_generation()
+        self.sealed.seal().seal_generation()
     }
 
     pub(crate) fn source_empty_observation_v2(&self) -> &RuntimeRegistryRecoveryEmptyObservationV2 {
@@ -277,73 +259,80 @@ impl RuntimeRegistryPendingDrainSealBindingV2 {
     }
 
     pub(crate) fn source_slot_is_present_v2(&self) -> bool {
-        self.source_slot_observation.is_some()
+        self.sealed.source_slot_observation().is_some()
     }
 
     pub(crate) fn source_slot_admission_generation_v2(&self) -> Option<NonZeroU64> {
-        self.source_slot_observation
-            .as_ref()
+        self.sealed
+            .source_slot_observation()
             .map(|observation| observation.admission_generation)
     }
 
     pub(crate) fn source_slot_observation_sequence_v2(&self) -> Option<NonZeroU64> {
-        self.source_slot_observation
-            .as_ref()
+        self.sealed
+            .source_slot_observation()
             .map(|observation| observation.observation_sequence)
     }
 
     pub(crate) fn post_seal_admission_generation_v2(&self) -> NonZeroU64 {
-        self.slot_observation.admission_generation
+        self.sealed.slot_observation().admission_generation
     }
 
     pub(crate) fn post_seal_slot_observation_sequence_v2(&self) -> NonZeroU64 {
-        self.slot_observation.observation_sequence
+        self.sealed.slot_observation().observation_sequence
     }
 
     pub(crate) fn post_seal_global_observation_sequence_v2(
         &self,
     ) -> RuntimeRegistryGlobalObservationSequenceV2 {
         RuntimeRegistryGlobalObservationSequenceV2::new(
-            self.registry_observation
+            self.sealed
+                .registry_observation()
                 .observation_sequence()
                 .as_non_zero(),
         )
     }
 
     pub(crate) fn post_seal_retained_slot_count_v2(&self) -> u64 {
-        self.registry_observation.retained_slot_count()
+        self.sealed.registry_observation().retained_slot_count()
     }
 
     pub(crate) fn post_seal_retained_empty_tombstone_count_v2(&self) -> u64 {
-        self.registry_observation.retained_empty_tombstone_count()
+        self.sealed
+            .registry_observation()
+            .retained_empty_tombstone_count()
     }
 
     pub(crate) fn post_seal_staged_route_count_v2(&self) -> u64 {
-        self.registry_observation.staged_route_count()
+        self.sealed.registry_observation().staged_route_count()
     }
 
     pub(crate) fn post_seal_serving_route_count_v2(&self) -> u64 {
-        self.registry_observation.serving_route_count()
+        self.sealed.registry_observation().serving_route_count()
     }
 
     pub(crate) fn post_seal_draining_route_count_v2(&self) -> u64 {
-        self.registry_observation.draining_route_count()
+        self.sealed.registry_observation().draining_route_count()
     }
 
     pub(crate) fn post_seal_sealed_slot_count_v2(&self) -> u64 {
-        self.registry_observation.sealed_slot_count()
+        self.sealed.registry_observation().sealed_slot_count()
     }
 
     pub(crate) fn post_seal_active_interaction_count_v2(&self) -> u64 {
-        self.registry_observation.active_interaction_count()
+        self.sealed
+            .registry_observation()
+            .active_interaction_count()
     }
 
     pub(crate) fn post_seal_failed_closed_slot_count_v2(&self) -> u64 {
-        self.registry_observation.failed_closed_slot_count()
+        self.sealed
+            .registry_observation()
+            .failed_closed_slot_count()
     }
 
     pub(crate) fn post_seal_registry_failed_closed_v2(&self) -> bool {
-        self.registry_observation.registry_failed_closed()
+        self.sealed.registry_observation().registry_failed_closed()
     }
 
     pub(crate) fn revalidate_sealed_v2(
@@ -353,31 +342,28 @@ impl RuntimeRegistryPendingDrainSealBindingV2 {
             .registry
             .recovery_observation_v2()
             .map_err(map_registry_observation_error)?;
-        if first_registry_observation != self.registry_observation {
+        if first_registry_observation != self.sealed.registry_observation() {
             return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
         }
         let slot_observation = self
             .registry
-            .atomic_observation_v2(self.seal.key())
+            .atomic_observation_v2(self.sealed.seal().key())
             .map_err(map_registry_observation_error)?;
-        if slot_observation.as_ref() != Some(&self.slot_observation) {
+        if slot_observation.as_ref() != Some(self.sealed.slot_observation()) {
             return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
         }
         let second_registry_observation = self
             .registry
             .recovery_observation_v2()
             .map_err(map_registry_observation_error)?;
-        if second_registry_observation != self.registry_observation {
+        if second_registry_observation != self.sealed.registry_observation() {
             return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
         }
         validate_pending_drain_seal_v2(
-            self.seal.key(),
-            self.seal.seal_key(),
+            self.sealed.seal().key(),
+            self.sealed.seal().seal_key(),
             &self.source_empty_observation,
-            self.source_slot_observation.as_ref(),
-            &self.seal,
-            &self.slot_observation,
-            self.registry_observation,
+            &self.sealed,
         )
     }
 }
@@ -392,11 +378,12 @@ fn validate_pending_drain_seal_v2(
     key: &ServingSlotKeyV1,
     seal_key: SlotSealKeyV2,
     source_empty_observation: &RuntimeRegistryRecoveryEmptyObservationV2,
-    source_slot_observation: Option<&SlotAtomicObservationV2>,
-    seal: &SlotDrainClaimSealV2,
-    slot_observation: &SlotAtomicObservationV2,
-    registry_observation: RegistryRecoveryObservationV2,
+    sealed: &SealedEmptyRecoveryDrainClaimV2,
 ) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    let seal = sealed.seal();
+    let source_slot_observation = sealed.source_slot_observation();
+    let slot_observation = sealed.slot_observation();
+    let registry_observation = sealed.registry_observation();
     if seal.key() != key
         || seal.seal_key() != seal_key
         || seal.route().is_some()
@@ -660,29 +647,34 @@ mod tests {
             RuntimeRegistryRecoveryObservationErrorV1,
         > {
             self.revalidate_sealed_v2()?;
-            let expected_slot_observation_sequence =
-                super::successor_non_zero_u64_v2(self.slot_observation.observation_sequence)?;
-            let expected_admission_generation =
-                super::successor_non_zero_u64_v2(self.slot_observation.admission_generation)?;
+            let expected_slot_observation_sequence = super::successor_non_zero_u64_v2(
+                self.sealed.slot_observation().observation_sequence,
+            )?;
+            let expected_admission_generation = super::successor_non_zero_u64_v2(
+                self.sealed.slot_observation().admission_generation,
+            )?;
             let expected_registry_observation_sequence = super::successor_non_zero_u64_v2(
-                self.registry_observation
+                self.sealed
+                    .registry_observation()
                     .observation_sequence()
                     .as_non_zero(),
             )?;
-            let expected_retained_slot_count = self.registry_observation.retained_slot_count();
+            let expected_retained_slot_count =
+                self.sealed.registry_observation().retained_slot_count();
             let expected_retained_empty_tombstone_count = self
-                .registry_observation
+                .sealed
+                .registry_observation()
                 .retained_empty_tombstone_count()
                 .checked_add(1)
                 .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ObservationOverflow)?;
             let super::RuntimeRegistryPendingDrainSealBindingV2 {
                 process_instance_id,
                 registry,
-                seal,
+                sealed,
                 ..
             } = self;
             let unsealed = registry
-                .unseal_empty_recovery_drain_claim_v2(seal)
+                .unseal_empty_recovery_drain_claim_v2(sealed)
                 .map_err(super::map_registry_observation_error)?;
             let slot_observation = unsealed.slot_observation();
             if slot_observation.route.is_some()

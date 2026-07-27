@@ -244,10 +244,6 @@ impl SealedEmptyRecoveryDrainClaimV2 {
     pub const fn registry_observation(&self) -> RegistryRecoveryObservationV2 {
         self.registry_observation
     }
-
-    pub fn into_seal(self) -> SlotDrainClaimSealV2 {
-        self.seal
-    }
 }
 
 pub struct UnsealedEmptyRecoveryDrainClaimV2 {
@@ -1217,14 +1213,15 @@ impl ServingSlotRegistryV1 {
 
     pub fn unseal_empty_recovery_drain_claim_v2(
         &self,
-        capability: SlotDrainClaimSealV2,
+        capability: SealedEmptyRecoveryDrainClaimV2,
     ) -> Result<UnsealedEmptyRecoveryDrainClaimV2, ServingSlotRegistryError> {
-        if !Weak::ptr_eq(&capability.registry, &Arc::downgrade(&self.inner)) {
+        if !Weak::ptr_eq(&capability.seal.registry, &Arc::downgrade(&self.inner)) {
             return Err(ServingSlotRegistryError::StaleSlotSeal);
         }
         let mut state = self.lock_state()?;
         let source_observation = registry_recovery_observation_v2(&state)?;
-        if source_observation.registry_failed_closed()
+        if source_observation != capability.registry_observation
+            || source_observation.registry_failed_closed()
             || source_observation.staged_route_count() != 0
             || source_observation.serving_route_count() != 0
             || source_observation.draining_route_count() != 0
@@ -1237,22 +1234,25 @@ impl ServingSlotRegistryV1 {
                     .checked_add(1)
                     .ok_or(ServingSlotRegistryError::RegistryObservationOverflow)?
         {
-            return Err(ServingSlotRegistryError::RegistryObservationInvalid);
+            return Err(ServingSlotRegistryError::StaleSlotSeal);
         }
         let slot_observation = {
             let RegistryState {
                 slots, observation, ..
             } = &mut *state;
             let slot = slots
-                .get_mut(&capability.key)
+                .get_mut(&capability.seal.key)
                 .ok_or(ServingSlotRegistryError::StaleSlotSeal)?;
             ensure_slot_open(slot)?;
+            if atomic_observation_v2(slot)? != capability.slot_observation {
+                return Err(ServingSlotRegistryError::StaleSlotSeal);
+            }
             let seal_matches = slot.seal.as_ref().is_some_and(|seal| {
-                seal.seal_key == capability.seal_key
-                    && seal.seal_generation == capability.seal_generation
+                seal.seal_key == capability.seal.seal_key
+                    && seal.seal_generation == capability.seal.seal_generation
                     && seal.route.is_none()
             });
-            if !seal_matches || selected_route(slot).is_some() || capability.route.is_some() {
+            if !seal_matches || selected_route(slot).is_some() || capability.seal.route.is_some() {
                 return Err(ServingSlotRegistryError::StaleSlotSeal);
             }
             advance_slot_mutation(observation, slot)?;
