@@ -2,8 +2,9 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::time::Instant;
 
-use automation_runtime_worker::{
-    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryObservationPortV2,
+use automation_runtime_worker::RuntimeStartupRecoveryObservationPortV2;
+pub(super) use automation_runtime_worker::{
+    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
 };
 
 use crate::closed_recovery::{
@@ -123,63 +124,28 @@ enum RuntimeStartupRecoveryObservationInterruptV2 {
     Owner,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime loop composition will consume the typed observation outcome"
-    )
-)]
 pub(crate) enum RuntimeStartupRecoveryObservationProcessOutcomeV2 {
     Continue(RuntimeStartupRecoveryContinueProcessV2),
     FixedPoint(RuntimeStartupRecoveryFixedPointProcessV2),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime loop composition will consume the continuing recovery process"
-    )
-)]
 pub(crate) struct RuntimeStartupRecoveryContinueProcessV2 {
-    discord: RuntimeDiscordGatewaySupervisorV1,
-    foundation: RuntimeProcessFoundationV1,
-    session: RuntimeClosedRecoverySessionV2,
-    continuation: RuntimeStartupRecoveryContinuationV2,
+    pub(super) discord: RuntimeDiscordGatewaySupervisorV1,
+    pub(super) foundation: RuntimeProcessFoundationV1,
+    pub(super) session: RuntimeClosedRecoverySessionV2,
+    pub(super) continuation: RuntimeStartupRecoveryContinuationV2,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime resume composition will consume the fixed-point process"
-    )
-)]
 pub(crate) struct RuntimeStartupRecoveryFixedPointProcessV2 {
     discord: RuntimeDiscordGatewaySupervisorV1,
     foundation: RuntimeProcessFoundationV1,
     fixed_point: RuntimeClosedRecoveryFixedPointV2,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime loop composition will synchronously finalize the observed process"
-    )
-)]
 pub(crate) struct RuntimeStartupRecoveryObservedProcessV2 {
     completion: RuntimeClosedRecoveryStartupObservationCompletionV2,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime loop composition will clean failed finalization authority"
-    )
-)]
 pub(crate) struct RuntimeStartupRecoveryObservationFinalizeFailureV2 {
     discord: RuntimeDiscordGatewaySupervisorV1,
     foundation: RuntimeProcessFoundationV1,
@@ -318,13 +284,6 @@ where
 }
 
 impl RuntimeRecoveryIterationReadyProcessV2 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production observation-port composition is a later runtime stage"
-        )
-    )]
     pub(crate) async fn observe_startup_recovery_once_v2<P>(
         &mut self,
         observer: &P,
@@ -338,13 +297,6 @@ impl RuntimeRecoveryIterationReadyProcessV2 {
         observe_startup_recovery_process_step_v2(self, observer).await
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime loop composition will synchronously finalize observations"
-        )
-    )]
     pub(crate) fn into_startup_recovery_observation_outcome_v2(
         self,
         observed: RuntimeStartupRecoveryObservedProcessV2,
@@ -363,13 +315,6 @@ impl RuntimeRecoveryIterationReadyProcessV2 {
         )
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime loop composition will retain transition context during cleanup"
-        )
-    )]
     pub(crate) async fn cleanup_after_startup_recovery_observation_failure_v2(
         self,
         transition: RuntimeProcessStartupRecoveryObservationFailureV2,
@@ -520,13 +465,6 @@ fn retain_typed_observation_outcome_failure_v2(
 }
 
 impl RuntimeStartupRecoveryObservationFinalizeFailureV2 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime loop composition will await failed finalization cleanup"
-        )
-    )]
     pub(crate) async fn cleanup(self) -> RuntimeProcessStartupRecoveryObservationErrorV2 {
         let Self {
             discord,
@@ -560,24 +498,10 @@ impl RuntimeStartupRecoveryObservationFinalizeFailureV2 {
 }
 
 impl RuntimeStartupRecoveryContinueProcessV2 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime loop composition will consume the continuation"
-        )
-    )]
     pub(crate) fn continuation_v2(&self) -> RuntimeStartupRecoveryContinuationV2 {
         self.continuation
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime loop composition will own continuing process shutdown"
-        )
-    )]
     pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
         shutdown_startup_observation_process_v2(
             self.foundation,
@@ -590,13 +514,6 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
 }
 
 impl RuntimeStartupRecoveryFixedPointProcessV2 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "runtime resume composition will own fixed-point process shutdown"
-        )
-    )]
     pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
         shutdown_startup_observation_process_v2(
             self.foundation,

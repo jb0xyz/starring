@@ -186,30 +186,6 @@ impl Debug for RuntimeProcessRecoveryReadinessTransitionErrorV2 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RuntimeRecoveryIterationReadyProcessShutdownErrorV2 {
-    #[error("runtime recovery iteration-ready process shutdown failed")]
-    Cleanup(RuntimeClosedRecoveryProcessCleanupFailureV2),
-}
-
-impl RuntimeRecoveryIterationReadyProcessShutdownErrorV2 {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Cleanup(error) => error.code(),
-        }
-    }
-
-    pub const fn context(self) -> Option<&'static str> {
-        None
-    }
-}
-
-impl Debug for RuntimeRecoveryIterationReadyProcessShutdownErrorV2 {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RuntimeRecoveryIterationReadyProcessShutdownErrorV2(<redacted>)")
-    }
-}
-
 pub(crate) struct RuntimeRecoveryIterationReadyProcessV2 {
     pub(super) discord: RuntimeDiscordGatewaySupervisorV1,
     pub(super) foundation: RuntimeProcessFoundationV1,
@@ -295,22 +271,6 @@ impl RuntimeClosedRecoveryProcessV2 {
             foundation,
             iteration,
         })
-    }
-}
-
-impl RuntimeRecoveryIterationReadyProcessV2 {
-    pub(crate) async fn shutdown(
-        self,
-    ) -> Result<(), RuntimeRecoveryIterationReadyProcessShutdownErrorV2> {
-        let Self {
-            discord,
-            foundation,
-            iteration,
-        } = self;
-        shutdown_ready_recovery_v2(foundation, discord, iteration)
-            .await
-            .map_err(RuntimeClosedRecoveryProcessCleanupFailureV2::from)
-            .map_err(RuntimeRecoveryIterationReadyProcessShutdownErrorV2::Cleanup)
     }
 }
 

@@ -10,12 +10,11 @@ use crate::startup::{
     run_runtime_startup_sync_stage_v1, RuntimeStartupBudgetV1, RuntimeStartupSyncStageErrorV1,
 };
 use crate::{
-    RuntimeBuildRevisionBootstrapErrorV1, RuntimeClosedRecoveryProcessShutdownErrorV2,
-    RuntimeConfigErrorV1, RuntimeConfigV1, RuntimePausedConnectedProcessShutdownErrorV1,
-    RuntimeProcessClosedRecoveryTransitionErrorV2, RuntimeProcessPausedConnectedTransitionErrorV1,
-    RuntimeProcessRecoveryPendingTransitionErrorV2,
-    RuntimeProcessRecoveryReadinessTransitionErrorV2,
-    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
+    RuntimeBuildRevisionBootstrapErrorV1, RuntimeClosedRecoveryProcessCleanupFailureV2,
+    RuntimeClosedRecoveryProcessShutdownErrorV2, RuntimeConfigErrorV1, RuntimeConfigV1,
+    RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessClosedRecoveryTransitionErrorV2,
+    RuntimeProcessPausedConnectedTransitionErrorV1, RuntimeProcessRecoveryPendingTransitionErrorV2,
+    RuntimeProcessRecoveryReadinessTransitionErrorV2, RuntimeProcessStartupRecoveryLoopErrorV2,
     RuntimeRecoveryPendingProcessShutdownErrorV2, RuntimeSecretsResolutionErrorV1,
 };
 
@@ -43,6 +42,8 @@ pub enum RuntimeProcessStagingErrorV1 {
     ClosedRecovery(RuntimeProcessClosedRecoveryTransitionErrorV2),
     #[error("runtime process recovery-readiness transition failed")]
     RecoveryReadiness(RuntimeProcessRecoveryReadinessTransitionErrorV2),
+    #[error("runtime process startup recovery loop failed")]
+    StartupRecovery(RuntimeProcessStartupRecoveryLoopErrorV2),
     #[error("runtime owner-held process shutdown failed")]
     OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
     #[error("runtime paused-connected process shutdown failed")]
@@ -51,8 +52,8 @@ pub enum RuntimeProcessStagingErrorV1 {
     RecoveryPendingShutdown(RuntimeRecoveryPendingProcessShutdownErrorV2),
     #[error("runtime closed-recovery process shutdown failed")]
     ClosedRecoveryShutdown(RuntimeClosedRecoveryProcessShutdownErrorV2),
-    #[error("runtime recovery iteration-ready process shutdown failed")]
-    RecoveryIterationReadyShutdown(RuntimeRecoveryIterationReadyProcessShutdownErrorV2),
+    #[error("runtime startup recovery fixed-point process shutdown failed")]
+    StartupRecoveryFixedPointShutdown(RuntimeClosedRecoveryProcessCleanupFailureV2),
 }
 
 impl RuntimeProcessStagingErrorV1 {
@@ -69,11 +70,12 @@ impl RuntimeProcessStagingErrorV1 {
             Self::RecoveryPending(error) => error.code(),
             Self::ClosedRecovery(error) => error.code(),
             Self::RecoveryReadiness(error) => error.code(),
+            Self::StartupRecovery(error) => error.code(),
             Self::OwnerHeldShutdown(error) => error.code(),
             Self::PausedConnectedShutdown(error) => error.code(),
             Self::RecoveryPendingShutdown(error) => error.code(),
             Self::ClosedRecoveryShutdown(error) => error.code(),
-            Self::RecoveryIterationReadyShutdown(error) => error.code(),
+            Self::StartupRecoveryFixedPointShutdown(error) => error.code(),
         }
     }
 
@@ -91,11 +93,12 @@ impl RuntimeProcessStagingErrorV1 {
             Self::RecoveryPending(error) => error.context(),
             Self::ClosedRecovery(error) => error.context(),
             Self::RecoveryReadiness(error) => error.context(),
+            Self::StartupRecovery(error) => error.context(),
             Self::OwnerHeldShutdown(error) => error.context(),
             Self::PausedConnectedShutdown(error) => error.context(),
             Self::RecoveryPendingShutdown(error) => error.context(),
             Self::ClosedRecoveryShutdown(error) => error.context(),
-            Self::RecoveryIterationReadyShutdown(error) => error.context(),
+            Self::StartupRecoveryFixedPointShutdown(error) => error.context(),
             Self::AsyncRuntimeUnavailable | Self::OperationDeadlineElapsed => None,
         }
     }
@@ -105,6 +108,28 @@ impl RuntimeProcessStagingErrorV1 {
             self,
             Self::Configuration(_) | Self::Secrets(_) | Self::BuildRevision(_)
         )
+    }
+
+    pub const fn cleanup_class(self) -> bool {
+        match self {
+            Self::StartupRecovery(error) => error.cleanup_class(),
+            Self::OwnerHeldShutdown(_)
+            | Self::PausedConnectedShutdown(_)
+            | Self::RecoveryPendingShutdown(_)
+            | Self::ClosedRecoveryShutdown(_)
+            | Self::StartupRecoveryFixedPointShutdown(_) => true,
+            Self::AsyncRuntimeUnavailable
+            | Self::OperationDeadlineElapsed
+            | Self::Configuration(_)
+            | Self::Secrets(_)
+            | Self::BuildRevision(_)
+            | Self::Foundation(_)
+            | Self::GatewayOwner(_)
+            | Self::PausedConnected(_)
+            | Self::RecoveryPending(_)
+            | Self::ClosedRecovery(_)
+            | Self::RecoveryReadiness(_) => false,
+        }
     }
 }
 
@@ -216,10 +241,14 @@ async fn stage_runtime_process_from_environment_v1(
         .into_recovery_iteration_ready_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::RecoveryReadiness)?;
-    recovery_iteration_ready
+    let fixed_point = recovery_iteration_ready
+        .into_startup_recovery_fixed_point_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::StartupRecovery)?;
+    fixed_point
         .shutdown()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::StartupRecoveryFixedPointShutdown)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 
@@ -246,7 +275,8 @@ mod tests {
         RuntimeProcessPausedConnectedTransitionFailureV1,
         RuntimeProcessRecoveryPendingTransitionFailureV2,
         RuntimeProcessRecoveryReadinessTransitionFailureV2,
-        RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeSecretResolutionErrorV1,
+        RuntimeProcessStartupRecoveryLoopFailureV2, RuntimeRecoveryPendingProcessCleanupFailureV2,
+        RuntimeSecretResolutionErrorV1,
     };
 
     #[test]
@@ -316,11 +346,14 @@ mod tests {
                     ),
                 ),
             ),
-            RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(
-                RuntimeRecoveryIterationReadyProcessShutdownErrorV2::Cleanup(
-                    RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
-                        RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
-                    ),
+            RuntimeProcessStagingErrorV1::StartupRecovery(
+                RuntimeProcessStartupRecoveryLoopErrorV2::Transition(
+                    RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveRecoveryUnavailable,
+                ),
+            ),
+            RuntimeProcessStagingErrorV1::StartupRecoveryFixedPointShutdown(
+                RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::CloseDeadlineElapsed,
                 ),
             ),
         ];
@@ -371,7 +404,11 @@ mod tests {
         );
         assert_eq!(
             errors[14].code(),
-            "runtime_discord_gateway_shutdown_task_stopped"
+            "runtime_process_startup_recovery_loop_stale_live_recovery_unavailable"
+        );
+        assert_eq!(
+            errors[15].code(),
+            "runtime_discord_gateway_shutdown_close_deadline_elapsed"
         );
         for error in errors {
             assert!(!error.code().is_empty());
@@ -401,6 +438,34 @@ mod tests {
         )
         .configuration_class());
         assert!(!RuntimeProcessStagingErrorV1::OperationDeadlineElapsed.configuration_class());
+    }
+
+    #[test]
+    fn cleanup_class_tracks_nested_loop_and_terminal_cleanup_failures() {
+        assert!(!RuntimeProcessStagingErrorV1::StartupRecovery(
+            RuntimeProcessStartupRecoveryLoopErrorV2::Transition(
+                RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainRecoveryUnavailable,
+            ),
+        )
+        .cleanup_class());
+        assert!(RuntimeProcessStagingErrorV1::StartupRecovery(
+            RuntimeProcessStartupRecoveryLoopErrorV2::CleanupAfterTransition {
+                transition:
+                    RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainRecoveryUnavailable,
+                cleanup: RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
+                ),
+            },
+        )
+        .cleanup_class());
+        assert!(
+            RuntimeProcessStagingErrorV1::StartupRecoveryFixedPointShutdown(
+                RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::TaskStopped,
+                ),
+            )
+            .cleanup_class()
+        );
     }
 
     #[test]

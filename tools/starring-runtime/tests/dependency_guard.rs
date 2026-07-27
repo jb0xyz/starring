@@ -509,6 +509,8 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/owner.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
+            "src/process/startup_loop.rs",
+            "src/process/startup_loop_tests.rs",
             "src/process.rs",
             "src/process_identity.rs",
             "src/process_startup.rs",
@@ -663,6 +665,8 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/observation_tests.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
+            && path != Path::new("src/process/startup_loop.rs")
+            && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -1847,11 +1851,16 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let ready = startup_stage
         .find(".into_recovery_iteration_ready_v2()")
         .unwrap();
-    let shutdown = startup_stage[ready..]
-        .find(".shutdown()")
-        .map(|offset| ready + offset)
+    let fixed_point = startup_stage
+        .find(".into_startup_recovery_fixed_point_v2()")
         .unwrap();
-    assert!(pending < committed && committed < ready && ready < shutdown);
+    let shutdown = startup_stage[fixed_point..]
+        .find(".shutdown()")
+        .map(|offset| fixed_point + offset)
+        .unwrap();
+    assert!(
+        pending < committed && committed < ready && ready < fixed_point && fixed_point < shutdown
+    );
     assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
     assert!(!library.contains("RuntimeClosedRecoverySessionV2"));
     assert!(!library.contains("RuntimeGatewayOwnerClosedRecoverySupervisorV2"));
@@ -1871,9 +1880,7 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
         "pub enum RuntimeProcessRecoveryReadinessFailureV2",
         "pub enum RuntimeProcessRecoveryReadinessTransitionFailureV2",
         "pub enum RuntimeProcessRecoveryReadinessTransitionErrorV2",
-        "pub enum RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
         "RuntimeProcessRecoveryReadinessTransitionErrorV2(<redacted>)",
-        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2(<redacted>)",
         "pub(crate) struct RuntimeRecoveryIterationReadyProcessV2",
         "discord: RuntimeDiscordGatewaySupervisorV1,",
         "foundation: RuntimeProcessFoundationV1,",
@@ -2200,7 +2207,6 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
         "RuntimeProcessRecoveryReadinessFailureV2",
         "RuntimeProcessRecoveryReadinessTransitionFailureV2",
         "RuntimeProcessRecoveryReadinessTransitionErrorV2",
-        "RuntimeRecoveryIterationReadyProcessShutdownErrorV2",
     ] {
         assert_eq!(library.matches(required).count(), 1, "{required}");
     }
@@ -2925,6 +2931,150 @@ fn startup_recovery_observation_process_is_single_use_interruptible_and_fail_clo
         "sqlx",
         "PgPool",
         "PostgresRuntime",
+    ] {
+        assert!(!contains_identifier(process, forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn startup_recovery_loop_is_bounded_reobserving_and_non_authorizing() {
+    let process = include_str!("../src/process/startup_loop.rs")
+        .split_once("\n#[cfg(test)]")
+        .map(|(production, _)| production)
+        .unwrap();
+    let process_tests = include_str!("../src/process/startup_loop_tests.rs");
+    let process_module = include_str!("../src/process.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let library = include_str!("../src/lib.rs");
+
+    for required in [
+        "pub enum RuntimeProcessStartupRecoveryLoopFailureV2",
+        "pub enum RuntimeProcessStartupRecoveryLoopErrorV2",
+        "RuntimeProcessStartupRecoveryLoopErrorV2(<redacted>)",
+        "trait RuntimeStartupRecoveryLoopReadyStepV2",
+        "trait RuntimeStartupRecoveryLoopContinueStepV2",
+        "async fn drive_startup_recovery_loop_v2<Ready>(",
+        "self.foundation.databases.execution().clone()",
+        "self.observe_startup_recovery_once_v2(&observer)",
+        "RuntimeStartupRecoveryLoopIterationOutcomeV2::FixedPoint",
+        "RuntimeStartupRecoveryContinuationV2::WaitForForeignFresh",
+        "wait_for_foreign_fresh_in_place_v2",
+        "into_recovery_iteration_ready_v2()",
+        "RuntimeStartupRecoveryContinuationV2::Recover",
+        "cleanup_after_unavailable_recovery_v2",
+        "sleep_until(TokioInstant::from_std(wait_cutoff))",
+        "sleep_until(TokioInstant::from_std(retry_at))",
+    ] {
+        assert!(process.contains(required), "{required}");
+    }
+    let driver = braced_declaration(process, "async fn drive_startup_recovery_loop_v2<Ready>(");
+    let observe = driver.find("ready.observe_in_place_v2().await").unwrap();
+    let finalize = driver
+        .find("ready.finalize_observation_v2(observed)")
+        .unwrap();
+    let fixed_point = driver
+        .find("RuntimeStartupRecoveryLoopIterationOutcomeV2::FixedPoint")
+        .unwrap();
+    let continuation = driver
+        .find("RuntimeStartupRecoveryLoopIterationOutcomeV2::Continue")
+        .unwrap();
+    let wait = driver.find("process.wait_in_place_v2().await").unwrap();
+    let readiness = driver
+        .find("process.into_next_ready_v2(completion).await")
+        .unwrap();
+    assert!(observe < finalize);
+    assert!(finalize < fixed_point);
+    assert!(finalize < continuation);
+    assert!(continuation < wait && wait < readiness);
+    let wait_method = braced_declaration(process, "async fn wait_for_foreign_fresh_in_place_v2(");
+    let wait_signature = wait_method
+        .split_once('{')
+        .map(|(signature, _)| signature)
+        .unwrap();
+    assert!(wait_signature.contains("&mut self"));
+    assert!(!wait_signature.contains("\n        self,"));
+    let operation_cutoff = wait_method
+        .find("self.foundation.startup_budget.operation_cutoff()")
+        .unwrap();
+    let owner_cutoff = wait_method
+        .find("self.session.owner_safety_deadline_v2()")
+        .unwrap();
+    let minimum = wait_method
+        .find("operation_cutoff.min(owner_safety_deadline)")
+        .unwrap();
+    let wait_race = wait_method.find("await_foreign_fresh_retry_v2(").unwrap();
+    assert!(operation_cutoff < minimum && owner_cutoff < minimum && minimum < wait_race);
+    let race = braced_declaration(process, "async fn await_foreign_fresh_retry_v2<");
+    let deadline = race.find("() = &mut deadline").unwrap();
+    let discord = race.find("transition = &mut discord_terminal").unwrap();
+    let owner = race.find("() = &mut owner_terminal").unwrap();
+    let retry = race.find("() = &mut retry").unwrap();
+    assert!(deadline < discord && discord < owner && owner < retry);
+    let unavailable = braced_declaration(process, "fn unavailable_recovery_failure_v2(");
+    for class in [
+        "RuntimeStartupRecoveryClassV2::StaleLive",
+        "RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification",
+        "RuntimeStartupRecoveryClassV2::SuspendedLocalEffect",
+        "RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent",
+    ] {
+        assert_eq!(unavailable.matches(class).count(), 1, "{class}");
+    }
+    let production_continue = braced_declaration(
+        process,
+        "impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinueProcessV2",
+    );
+    let recovery_cleanup = braced_declaration(
+        production_continue,
+        "fn cleanup_after_unavailable_recovery_v2(",
+    );
+    assert_eq!(recovery_cleanup.matches("self.shutdown().await").count(), 1);
+    let wait_cleanup = braced_declaration(production_continue, "fn cleanup_after_wait_failure_v2(");
+    assert_eq!(wait_cleanup.matches("self.shutdown().await").count(), 1);
+    let production_entry = braced_declaration(
+        process,
+        "pub(crate) async fn into_startup_recovery_fixed_point_v2(",
+    );
+    assert_eq!(
+        production_entry
+            .matches("drive_startup_recovery_loop_v2(self).await")
+            .count(),
+        1
+    );
+    for required_test in [
+        "production_used_driver_reobserves_after_foreign_fresh_and_stops_at_fixed_point",
+        "production_used_driver_cleans_each_failure_authority_exactly_once",
+        "foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_priority",
+        "dropping_a_polled_foreign_fresh_wait_drops_only_the_wait_future",
+        "canceling_the_production_used_borrowed_wait_retains_exactly_one_cleanup_authority",
+        "all_recovery_classes_map_to_distinct_finite_fail_closed_failures",
+    ] {
+        assert!(process_tests.contains(required_test), "{required_test}");
+        assert!(!process.contains(required_test), "{required_test}");
+    }
+    assert_eq!(
+        startup
+            .matches(".into_startup_recovery_fixed_point_v2()")
+            .count(),
+        1
+    );
+    assert!(library.contains("RuntimeProcessStartupRecoveryLoopErrorV2"));
+    assert!(library.contains("RuntimeProcessStartupRecoveryLoopFailureV2"));
+    assert!(process_module.contains("mod startup_loop;"));
+    assert!(!library.contains("mod startup_loop;"));
+    for forbidden in [
+        "resume_admission",
+        "open_admission",
+        "activate",
+        "deploy",
+        "ready_to_serve",
+        "health_ready",
+        "twilight",
+        "sqlx",
+        "PgPool",
+        "PostgresRuntime",
+        "LlmClient",
+        "gemma",
+        "codex",
     ] {
         assert!(!contains_identifier(process, forbidden), "{forbidden}");
     }
@@ -3737,7 +3887,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
 }
 
 #[test]
-fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_staging_entry() {
+fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_entry() {
     let sources = source_files();
     let process_startup = sources
         .iter()
@@ -3772,7 +3922,13 @@ fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_stagin
     let recovery_pending = staging.find(".into_recovery_pending_v2()").unwrap();
     let closed_recovery = staging.find(".into_closed_recovery_v2()").unwrap();
     let recovery_iteration_ready = staging.find(".into_recovery_iteration_ready_v2()").unwrap();
-    let shutdown = staging.find(".shutdown()").unwrap();
+    let startup_recovery = staging
+        .find(".into_startup_recovery_fixed_point_v2()")
+        .unwrap();
+    let shutdown = staging[startup_recovery..]
+        .find(".shutdown()")
+        .map(|offset| startup_recovery + offset)
+        .unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
         config < secrets
@@ -3785,7 +3941,8 @@ fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_stagin
             && paused_connected < recovery_pending
             && recovery_pending < closed_recovery
             && closed_recovery < recovery_iteration_ready
-            && recovery_iteration_ready < shutdown
+            && recovery_iteration_ready < startup_recovery
+            && startup_recovery < shutdown
             && owner < shutdown
             && shutdown < outcome
     );
@@ -3807,6 +3964,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_stagin
         ".into_recovery_pending_v2()",
         ".into_closed_recovery_v2()",
         ".into_recovery_iteration_ready_v2()",
+        ".into_startup_recovery_fixed_point_v2()",
         ".shutdown()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -3930,12 +4088,9 @@ fn process_startup_is_the_single_ordered_bounded_recovery_iteration_ready_stagin
 fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     let main = source_before_test_module(include_str!("../src/main.rs"));
     let entry = braced_declaration(main, "fn main() -> ExitCode");
-    assert!(main.contains("RecoveryIterationReadyAndClosed"));
-    assert!(main.contains("runtime_staging_recovery_iteration_ready_and_closed"));
-    assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryPendingShutdown(_))"));
-    assert!(main.contains("Self::Failed(RuntimeProcessStagingErrorV1::ClosedRecoveryShutdown(_))"));
-    assert!(main
-        .contains("Self::Failed(RuntimeProcessStagingErrorV1::RecoveryIterationReadyShutdown(_))"));
+    assert!(main.contains("StartupRecoveryFixedPointAndClosed"));
+    assert!(main.contains("runtime_staging_startup_recovery_fixed_point_and_closed"));
+    assert!(main.contains("Self::Failed(error) if error.cleanup_class()"));
     assert_eq!(
         entry
             .matches("run_runtime_process_staging_from_environment_v1()")

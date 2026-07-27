@@ -110,13 +110,6 @@ enum RuntimeClosedRecoveryReadinessStateV2 {
     Ready(RuntimeAuthorizedStartupRecoveryIterationV2),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime resume composition will consume the verified fixed point"
-    )
-)]
 pub(crate) struct RuntimeClosedRecoveryFixedPointV2 {
     owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
@@ -125,13 +118,6 @@ pub(crate) struct RuntimeClosedRecoveryFixedPointV2 {
     proof: RuntimeStartupRecoveryFixedPointProofV2,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "runtime recovery composition will consume the typed iteration outcome"
-    )
-)]
 pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2 {
     Continue {
         session: RuntimeClosedRecoverySessionV2,

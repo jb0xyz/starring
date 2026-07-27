@@ -25,6 +25,7 @@ mod observation;
 mod owner;
 mod readiness;
 mod recovery;
+mod startup_loop;
 
 pub use closed::{
     RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
@@ -43,13 +44,15 @@ pub use owner::{
 pub use readiness::{
     RuntimeProcessRecoveryReadinessFailureV2, RuntimeProcessRecoveryReadinessTransitionErrorV2,
     RuntimeProcessRecoveryReadinessTransitionFailureV2,
-    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
 };
 pub use recovery::{
     RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessGatewayOwnerPrepareFailureV2,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2,
     RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
+};
+pub use startup_loop::{
+    RuntimeProcessStartupRecoveryLoopErrorV2, RuntimeProcessStartupRecoveryLoopFailureV2,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
