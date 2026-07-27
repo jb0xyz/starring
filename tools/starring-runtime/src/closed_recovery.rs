@@ -3,6 +3,11 @@ use std::future::Future;
 use std::time::Instant;
 
 use automation_runtime_controller::RuntimeRecoveryIdV2;
+#[cfg(test)]
+use automation_runtime_worker::{
+    RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
+    RuntimeCompletedStartupRecoveryExecutionV2,
+};
 use automation_runtime_worker::{
     RuntimeAuthorizedStartupRecoveryIterationV2, RuntimePausedGatewayObservationV2,
     RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryFixedPointProofV2,
@@ -816,6 +821,43 @@ impl RuntimeClosedRecoverySessionV2 {
     {
         self.refresh_iteration_readiness_in_place_with_v2(|_| verification, post_refresh)
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_startup_recovery_with_test_executor_v2<Execute>(
+        mut self,
+        continuation: RuntimeStartupRecoveryContinuationV2,
+        execute: Execute,
+    ) -> Result<
+        (Self, RuntimeAcceptedStartupRecoveryExecutionOutcomeV2),
+        RuntimeClosedRecoveryCommitErrorV2,
+    >
+    where
+        Execute: FnOnce(
+            RuntimeAuthorizedStartupRecoveryExecutionV2,
+        ) -> RuntimeCompletedStartupRecoveryExecutionV2,
+    {
+        if !matches!(
+            &self.readiness,
+            RuntimeClosedRecoveryReadinessStateV2::Available
+        ) {
+            self.gateway.invalidate_protocol_violation_v2();
+            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
+        self.revalidate_v2()?;
+        let authorization = self
+            .gateway
+            .begin_startup_recovery_execution_for_test_v2(&self.owner, continuation)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+        let completed = execute(authorization);
+        let outcome = self
+            .gateway
+            .complete_startup_recovery_execution_for_test_v2(&self.owner, completed)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+        self.revalidate_v2()?;
+        Ok((self, outcome))
     }
 }
 

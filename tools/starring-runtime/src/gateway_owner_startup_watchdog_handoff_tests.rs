@@ -21,16 +21,18 @@ use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
-    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeCapabilityReadinessKindV2,
-    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
-    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
-    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeCompletedStartupRecoveryObservationV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeCompletedStartupRecoveryObservationV2,
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayOwnerLeasePortV1,
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
     RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
-    RuntimeStartupRecoveryObservationPortV2,
+    RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
+    RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryObservationPortV2,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Notify;
@@ -600,6 +602,29 @@ fn complete_startup_recovery_observation_v2(
         },
         state,
     })
+}
+
+fn complete_startup_recovery_execution_v2(
+    authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,
+    database_now: DateTime<Utc>,
+) -> RuntimeCompletedStartupRecoveryExecutionV2 {
+    let request = authorization.request();
+    let receipt = RuntimeStartupRecoveryExecutionReceiptV2 {
+        correlation: request.correlation().clone(),
+        class: request.class(),
+        owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1 {
+            lease_id: request.gateway_owner_lease_id().clone(),
+            owner_revision: request.expected_owner_revision(),
+            database_now,
+            expires_at: request.expected_owner_expires_at(),
+        },
+        outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+            action_identity: request.action_identity().clone(),
+            terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2::new([31; 32])
+                .unwrap(),
+        },
+    };
+    authorization.complete(receipt)
 }
 
 fn fixture(
@@ -1242,6 +1267,24 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
         } if authority_revision.get() == 3
     ));
 
+    let (session, execution) = session
+        .execute_startup_recovery_with_test_executor_v2(continuation, |authorization| {
+            complete_startup_recovery_execution_v2(authorization, at_millis(1_000_150))
+        })
+        .unwrap();
+    assert_eq!(execution.class(), RuntimeStartupRecoveryClassV2::StaleLive);
+    assert!(matches!(
+        execution.outcome(),
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
+    ));
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 4
+    ));
+
     let ready_iteration = session
         .refresh_iteration_readiness_after_test_hook_v2(
             ready(Ok(
@@ -1278,7 +1321,7 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
             authority_revision,
             ..
-        } if authority_revision.get() == 5
+        } if authority_revision.get() == 6
     ));
     drop(fixed_point);
     wait_for(|| port.release_calls() == 1).await;

@@ -1,12 +1,16 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 
-use automation_runtime_controller::{RuntimeGatewayOwnerLeaseReceiptV1, RuntimeRecoveryIdV2};
+use automation_runtime_controller::{
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeRecoveryIdV2,
+    RuntimeStartupRecoveryObservationCorrelationV2,
+};
 use chrono::{DateTime, Utc};
 
 use crate::{
     RuntimeCapabilityReadinessSetV2, RuntimeGatewayCoordinatorGenerationV2,
     RuntimePausedGatewayObservationV2, RuntimeRegistryRecoveryEmptyObservationV2,
+    RuntimeStartupRecoveryClassV2,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -31,6 +35,22 @@ impl RuntimeClosedRecoveryAuthorityRevisionV2 {
 #[derive(PartialEq, Eq)]
 pub(crate) struct RuntimeClosedRecoveryOperationAuthorityV2 {
     _private: (),
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct RuntimePendingStartupRecoveryExecutionV2 {
+    class: RuntimeStartupRecoveryClassV2,
+    selection_correlation: RuntimeStartupRecoveryObservationCorrelationV2,
+}
+
+impl RuntimePendingStartupRecoveryExecutionV2 {
+    pub(crate) fn class(&self) -> RuntimeStartupRecoveryClassV2 {
+        self.class
+    }
+
+    pub(crate) fn selection_correlation(&self) -> &RuntimeStartupRecoveryObservationCorrelationV2 {
+        &self.selection_correlation
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -120,6 +140,7 @@ pub struct RuntimeClosedDrainRecoveryPermitV2 {
     paused_gateway: RuntimePausedGatewayObservationV2,
     registry_evidence: RuntimeClosedRecoveryRegistryEvidenceV2,
     operation_authority: Option<RuntimeClosedRecoveryOperationAuthorityV2>,
+    pending_startup_recovery_execution: Option<RuntimePendingStartupRecoveryExecutionV2>,
     last_startup_observation_database_now: Option<DateTime<Utc>>,
 }
 
@@ -143,6 +164,7 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
             paused_gateway,
             registry_evidence,
             operation_authority: Some(RuntimeClosedRecoveryOperationAuthorityV2 { _private: () }),
+            pending_startup_recovery_execution: None,
             last_startup_observation_database_now: None,
         }
     }
@@ -193,16 +215,65 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
         self.last_startup_observation_database_now
     }
 
+    pub(crate) fn pending_startup_recovery_execution(
+        &self,
+    ) -> Option<&RuntimePendingStartupRecoveryExecutionV2> {
+        self.pending_startup_recovery_execution.as_ref()
+    }
+
     pub(crate) fn restore_operation_authority(
         &mut self,
         authority: RuntimeClosedRecoveryOperationAuthorityV2,
         database_now: DateTime<Utc>,
     ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
-        if self.operation_authority.is_some() {
+        if self.operation_authority.is_some() || self.pending_startup_recovery_execution.is_some() {
             return None;
         }
         let authority_revision = self.authority_revision.successor()?;
         self.operation_authority = Some(authority);
+        self.last_startup_observation_database_now = Some(database_now);
+        self.authority_revision = authority_revision;
+        Some(authority_revision)
+    }
+
+    pub(crate) fn restore_operation_authority_for_recovery(
+        &mut self,
+        authority: RuntimeClosedRecoveryOperationAuthorityV2,
+        database_now: DateTime<Utc>,
+        class: RuntimeStartupRecoveryClassV2,
+        selection_correlation: RuntimeStartupRecoveryObservationCorrelationV2,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        if self.operation_authority.is_some() || self.pending_startup_recovery_execution.is_some() {
+            return None;
+        }
+        let authority_revision = self.authority_revision.successor()?;
+        self.operation_authority = Some(authority);
+        self.pending_startup_recovery_execution = Some(RuntimePendingStartupRecoveryExecutionV2 {
+            class,
+            selection_correlation,
+        });
+        self.last_startup_observation_database_now = Some(database_now);
+        self.authority_revision = authority_revision;
+        Some(authority_revision)
+    }
+
+    pub(crate) fn restore_after_startup_recovery_execution(
+        &mut self,
+        authority: RuntimeClosedRecoveryOperationAuthorityV2,
+        class: RuntimeStartupRecoveryClassV2,
+        selection_authority_revision: NonZeroU64,
+        database_now: DateTime<Utc>,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        let pending = self.pending_startup_recovery_execution.as_ref()?;
+        if self.operation_authority.is_some()
+            || pending.class != class
+            || pending.selection_correlation.authority_revision != selection_authority_revision
+        {
+            return None;
+        }
+        let authority_revision = self.authority_revision.successor()?;
+        self.operation_authority = Some(authority);
+        self.pending_startup_recovery_execution = None;
         self.last_startup_observation_database_now = Some(database_now);
         self.authority_revision = authority_revision;
         Some(authority_revision)
@@ -215,6 +286,9 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
         RuntimeClosedRecoveryAuthorityRevisionV2,
         RuntimeClosedRecoveryOperationAuthorityV2,
     )> {
+        if self.pending_startup_recovery_execution.is_some() {
+            return None;
+        }
         let authority_revision = self.authority_revision.successor()?;
         let authority = self.take_operation_authority()?;
         self.readiness = readiness;
@@ -226,7 +300,7 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
         &mut self,
         database_now: DateTime<Utc>,
     ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
-        if self.operation_authority.is_some() {
+        if self.operation_authority.is_some() || self.pending_startup_recovery_execution.is_some() {
             return None;
         }
         let authority_revision = self.authority_revision.successor()?;
@@ -245,6 +319,52 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
     pub(crate) fn prepare_authority_revision_overflow_for_test(&mut self) {
         self.authority_revision =
             RuntimeClosedRecoveryAuthorityRevisionV2(NonZeroU64::new(i64::MAX as u64 - 1).unwrap());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_readiness_for_test(
+        &mut self,
+        readiness: RuntimeCapabilityReadinessSetV2,
+    ) {
+        self.readiness = readiness;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_paused_gateway_for_test(
+        &mut self,
+        paused_gateway: RuntimePausedGatewayObservationV2,
+    ) {
+        self.paused_gateway = paused_gateway;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_registry_evidence_for_test(
+        &mut self,
+        registry_evidence: RuntimeClosedRecoveryRegistryEvidenceV2,
+    ) {
+        self.registry_evidence = registry_evidence;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_last_database_now_for_test(&mut self, database_now: DateTime<Utc>) {
+        self.last_startup_observation_database_now = Some(database_now);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_pending_selection_revision_for_test(
+        &mut self,
+        authority_revision: NonZeroU64,
+    ) {
+        self.pending_startup_recovery_execution
+            .as_mut()
+            .expect("pending startup recovery execution")
+            .selection_correlation
+            .authority_revision = authority_revision;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_recovery_id_for_test(&mut self, recovery_id: RuntimeRecoveryIdV2) {
+        self.recovery_id = recovery_id;
     }
 }
 

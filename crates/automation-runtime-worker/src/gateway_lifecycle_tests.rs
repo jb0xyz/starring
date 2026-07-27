@@ -27,11 +27,11 @@ use crate::{
     RuntimeStartupRecoveryObservationAcceptanceErrorV2,
 };
 
-fn non_zero(value: u64) -> NonZeroU64 {
+pub(super) fn non_zero(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap()
 }
 
-fn at(second: i64) -> DateTime<Utc> {
+pub(super) fn at(second: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(second, 0).unwrap()
 }
 
@@ -101,7 +101,7 @@ fn readiness_with_checks(
     .unwrap()
 }
 
-fn current_readiness(checked_at: i64) -> RuntimeCapabilityReadinessSetV2 {
+pub(super) fn current_readiness(checked_at: i64) -> RuntimeCapabilityReadinessSetV2 {
     readiness(
         "01234567-89ab-cdef-8123-456789abcdef",
         "starring",
@@ -162,7 +162,7 @@ fn recovery_input(
     )
 }
 
-fn begin_recovery() -> (
+pub(super) fn begin_recovery() -> (
     RuntimeGatewayClosedLifecycleV2,
     RuntimeClosedDrainRecoveryPermitV2,
 ) {
@@ -184,7 +184,7 @@ fn refresh_startup_iteration(
         .unwrap()
 }
 
-fn begin_startup_observation(
+pub(super) fn begin_startup_observation(
     lifecycle: &mut RuntimeGatewayClosedLifecycleV2,
     permit: &mut RuntimeClosedDrainRecoveryPermitV2,
     checked_at: i64,
@@ -195,7 +195,7 @@ fn begin_startup_observation(
         .unwrap()
 }
 
-fn empty_startup_state() -> RuntimeStartupRecoveryStateV2 {
+pub(super) fn empty_startup_state() -> RuntimeStartupRecoveryStateV2 {
     RuntimeStartupRecoveryStateV2 {
         serving: RuntimeStartupServingStateV2::Empty,
         recoverable_awaiting_certification_count: 0,
@@ -205,7 +205,7 @@ fn empty_startup_state() -> RuntimeStartupRecoveryStateV2 {
     }
 }
 
-fn startup_observation_receipt(
+pub(super) fn startup_observation_receipt(
     request: &RuntimeStartupRecoveryObservationRequestV2,
     database_now: DateTime<Utc>,
     state: RuntimeStartupRecoveryStateV2,
@@ -222,7 +222,7 @@ fn startup_observation_receipt(
     }
 }
 
-fn complete_startup_observation(
+pub(super) fn complete_startup_observation(
     authorization: RuntimeAuthorizedStartupRecoveryObservationV2,
     database_now: DateTime<Utc>,
     state: RuntimeStartupRecoveryStateV2,
@@ -634,7 +634,12 @@ fn startup_observation_database_clock_is_monotonic_across_successors() {
     for (checked_at, database_now, expected_revision) in [(200, 101, 3), (300, 102, 5)] {
         let authorization = begin_startup_observation(&mut lifecycle, &mut permit, checked_at);
         let mut state = empty_startup_state();
-        state.serving = RuntimeStartupServingStateV2::RecoverableStale { count: 1 };
+        state.serving = RuntimeStartupServingStateV2::ForeignFresh {
+            count: 1,
+            database_now: at(database_now),
+            earliest_expiry: at(150),
+            retry_after: std::time::Duration::from_secs(1),
+        };
         let completed = complete_startup_observation(authorization, at(database_now), state);
         let outcome = lifecycle
             .complete_startup_recovery_observation(&mut permit, completed)
@@ -642,9 +647,9 @@ fn startup_observation_database_clock_is_monotonic_across_successors() {
         assert_eq!(
             outcome,
             RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(
-                RuntimeStartupRecoveryContinuationV2::Recover(
-                    RuntimeStartupRecoveryClassV2::StaleLive,
-                ),
+                RuntimeStartupRecoveryContinuationV2::WaitForForeignFresh {
+                    retry_after: std::time::Duration::from_secs(1),
+                },
             )
         );
         assert_eq!(permit.authority_revision().get(), expected_revision);

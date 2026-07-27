@@ -1,13 +1,17 @@
 use std::num::NonZeroU64;
 
 use crate::{
-    accept_validated_startup_recovery_observation_v2, authorize_startup_recovery_iteration_v2,
-    authorize_startup_recovery_observation_v2, startup_recovery_fixed_point_matches_permit_v2,
-    validate_startup_recovery_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    accept_validated_startup_recovery_execution_v2,
+    accept_validated_startup_recovery_observation_v2, authorize_startup_recovery_execution_v2,
+    authorize_startup_recovery_iteration_v2, authorize_startup_recovery_observation_v2,
+    startup_recovery_fixed_point_matches_permit_v2, validate_startup_recovery_execution_v2,
+    validate_startup_recovery_observation_v2, RuntimeAcceptedStartupRecoveryExecutionOutcomeV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
     RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
-    RuntimeCompletedStartupRecoveryObservationV2, RuntimeStartupRecoveryFixedPointProofV2,
-    RuntimeStartupRecoveryObservationAcceptanceErrorV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeCompletedStartupRecoveryObservationV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionAcceptanceErrorV2,
+    RuntimeStartupRecoveryFixedPointProofV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,6 +125,14 @@ pub enum RuntimeGatewayClosedTransitionErrorV2 {
     RecoveryOperationNotInFlight,
     #[error("runtime closed recovery iteration authority is stale")]
     StaleRecoveryIterationAuthority,
+    #[error("runtime startup recovery execution is pending")]
+    StartupRecoveryExecutionPending,
+    #[error("runtime startup recovery execution is not pending")]
+    StartupRecoveryExecutionNotPending,
+    #[error("runtime startup recovery execution class does not match")]
+    StartupRecoveryExecutionClassMismatch,
+    #[error("runtime startup recovery execution was rejected")]
+    StartupRecoveryExecution(RuntimeStartupRecoveryExecutionAcceptanceErrorV2),
     #[error("runtime startup recovery fixed point authority is stale")]
     StaleRecoveryFixedPointAuthority,
     #[error("runtime startup recovery observation was rejected")]
@@ -261,6 +273,14 @@ impl RuntimeGatewayClosedLifecycleV2 {
             )?;
             return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight);
         }
+        if permit.pending_startup_recovery_execution().is_some() {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecutionPending);
+        }
         if !permit.readiness().has_same_authority_as(&readiness) {
             let generation = permit.coordinator_generation();
             self.invalidate(
@@ -363,6 +383,107 @@ impl RuntimeGatewayClosedLifecycleV2 {
         Ok(outcome)
     }
 
+    pub fn begin_startup_recovery_execution(
+        &mut self,
+        permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+        continuation: RuntimeStartupRecoveryContinuationV2,
+    ) -> Result<RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeGatewayClosedTransitionErrorV2>
+    {
+        self.validate_recovery_permit(permit)?;
+        if !permit.operation_authority_is_available() {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationInFlight);
+        }
+        let Some(pending_class) = permit
+            .pending_startup_recovery_execution()
+            .map(|pending| pending.class())
+        else {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecutionNotPending);
+        };
+        let RuntimeStartupRecoveryContinuationV2::Recover(class) = continuation else {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecutionNotPending);
+        };
+        if class != pending_class {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(
+                RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecutionClassMismatch,
+            );
+        }
+        let Some(authorization) = authorize_startup_recovery_execution_v2(
+            permit,
+            RuntimeStartupRecoveryContinuationV2::Recover(class),
+        ) else {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(
+                RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecutionClassMismatch,
+            );
+        };
+        Ok(authorization)
+    }
+
+    pub fn complete_startup_recovery_execution(
+        &mut self,
+        permit: &mut RuntimeClosedDrainRecoveryPermitV2,
+        completed: RuntimeCompletedStartupRecoveryExecutionV2,
+    ) -> Result<
+        RuntimeAcceptedStartupRecoveryExecutionOutcomeV2,
+        RuntimeGatewayClosedTransitionErrorV2,
+    > {
+        self.validate_recovery_permit(permit)?;
+        if permit.operation_authority_is_available() {
+            let generation = permit.coordinator_generation();
+            self.invalidate(
+                generation,
+                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+            )?;
+            return Err(RuntimeGatewayClosedTransitionErrorV2::RecoveryOperationNotInFlight);
+        }
+        let validated = match validate_startup_recovery_execution_v2(permit, completed) {
+            Ok(validated) => validated,
+            Err(error) => {
+                let generation = permit.coordinator_generation();
+                self.invalidate(generation, startup_execution_invalidation_cause(error))?;
+                return Err(RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecution(error));
+            }
+        };
+        let generation = permit.coordinator_generation();
+        let recovery_id = permit.recovery_id().clone();
+        let Some((authority_revision, outcome)) =
+            accept_validated_startup_recovery_execution_v2(permit, validated)
+        else {
+            self.snapshot = RuntimeGatewayClosedSnapshotV2::Shutdown { generation };
+            return Err(RuntimeGatewayClosedTransitionErrorV2::AuthorityRevisionOverflow);
+        };
+        self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            generation,
+            recovery_id,
+            authority_revision,
+        };
+        Ok(outcome)
+    }
+
     pub fn validate_startup_recovery_fixed_point(
         &self,
         permit: &RuntimeClosedDrainRecoveryPermitV2,
@@ -436,6 +557,30 @@ impl RuntimeGatewayClosedLifecycleV2 {
     }
 }
 
+fn startup_execution_invalidation_cause(
+    error: RuntimeStartupRecoveryExecutionAcceptanceErrorV2,
+) -> RuntimeGatewayInvalidationCauseV2 {
+    match error {
+        RuntimeStartupRecoveryExecutionAcceptanceErrorV2::OwnerMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::OwnerNotCurrent => {
+            RuntimeGatewayInvalidationCauseV2::OwnershipUncertain
+        }
+        RuntimeStartupRecoveryExecutionAcceptanceErrorV2::CapabilityReadinessMismatch => {
+            RuntimeGatewayInvalidationCauseV2::CapabilityNotReady
+        }
+        RuntimeStartupRecoveryExecutionAcceptanceErrorV2::CorrelationMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::ClassMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::DatabaseClockMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::DatabaseClockRegressed
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::PausedGatewayMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::RegistryMismatch
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::InvalidRetryAfter
+        | RuntimeStartupRecoveryExecutionAcceptanceErrorV2::ProgressProofMismatch => {
+            RuntimeGatewayInvalidationCauseV2::ProtocolViolation
+        }
+    }
+}
+
 fn startup_observation_invalidation_cause(
     error: RuntimeStartupRecoveryObservationAcceptanceErrorV2,
 ) -> RuntimeGatewayInvalidationCauseV2 {
@@ -459,3 +604,7 @@ fn startup_observation_invalidation_cause(
 #[cfg(test)]
 #[path = "gateway_lifecycle_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "startup_recovery_execution_tests.rs"]
+mod execution_tests;
