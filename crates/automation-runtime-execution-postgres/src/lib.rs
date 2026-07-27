@@ -14,6 +14,7 @@ mod proof;
 mod query;
 mod recovery;
 mod row;
+mod startup_recovery;
 mod store;
 mod writer_fence;
 

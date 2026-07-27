@@ -29,6 +29,8 @@ pub enum RuntimeExecutionPersistenceErrorV1 {
     DatabaseFailure,
     #[error("runtime execution persistence outcome is indeterminate")]
     Indeterminate,
+    #[error("runtime execution observation is ambiguous")]
+    ObservationAmbiguous,
 }
 
 impl RuntimeExecutionPersistenceErrorV1 {
@@ -44,7 +46,8 @@ impl RuntimeExecutionPersistenceErrorV1 {
             Self::InvalidInput
             | Self::DatabaseAuthorityMismatch
             | Self::PersistenceCorrupt
-            | Self::DatabaseFailure => RuntimeConvergenceErrorClassV1::InvalidState,
+            | Self::DatabaseFailure
+            | Self::ObservationAmbiguous => RuntimeConvergenceErrorClassV1::InvalidState,
         }
     }
 
@@ -62,6 +65,7 @@ impl RuntimeExecutionPersistenceErrorV1 {
             Self::Unavailable => "runtime_execution_unavailable",
             Self::DatabaseFailure => "runtime_execution_database_failure",
             Self::Indeterminate => "runtime_execution_indeterminate",
+            Self::ObservationAmbiguous => "runtime_execution_observation_ambiguous",
         }
     }
 }
