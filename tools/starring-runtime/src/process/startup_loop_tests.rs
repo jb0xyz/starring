@@ -223,7 +223,11 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
     > {
         push_fake_loop_event_v2(&self.state, "recovery");
         Box::pin(ready(
-            if class == RuntimeStartupRecoveryClassV2::StaleLive {
+            if matches!(
+                class,
+                RuntimeStartupRecoveryClassV2::StaleLive
+                    | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+            ) {
                 Ok(())
             } else {
                 Err(())
@@ -377,27 +381,29 @@ async fn production_used_driver_reobserves_after_foreign_fresh_and_stops_at_fixe
 }
 
 #[tokio::test]
-async fn production_used_driver_refreshes_and_reobserves_after_stale_live_execution() {
-    let ready = fake_loop_v2([
-        FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive),
-        FakeLoopStepV2::FixedPoint,
-    ]);
-    let state = ready.state.clone();
+async fn production_used_driver_refreshes_and_reobserves_after_supported_recovery_execution() {
+    for class in [
+        RuntimeStartupRecoveryClassV2::StaleLive,
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
+    ] {
+        let ready = fake_loop_v2([FakeLoopStepV2::Recover(class), FakeLoopStepV2::FixedPoint]);
+        let state = ready.state.clone();
 
-    let fixed_point = drive_startup_recovery_loop_v2(ready).await.unwrap();
+        let fixed_point = drive_startup_recovery_loop_v2(ready).await.unwrap();
 
-    assert!(Arc::ptr_eq(&state, &fixed_point));
-    assert_eq!(
-        fake_loop_events_v2(&state),
-        [
-            "observe",
-            "finalize",
-            "recovery",
-            "readiness",
-            "observe",
-            "finalize"
-        ]
-    );
+        assert!(Arc::ptr_eq(&state, &fixed_point));
+        assert_eq!(
+            fake_loop_events_v2(&state),
+            [
+                "observe",
+                "finalize",
+                "recovery",
+                "readiness",
+                "observe",
+                "finalize"
+            ]
+        );
+    }
 }
 
 #[tokio::test]
@@ -424,7 +430,7 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
             vec!["observe", "finalize", "wait", "cleanup_readiness"],
         ),
         (
-            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification),
+            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::SuspendedLocalEffect),
             FakeLoopErrorV2::Recovery,
             vec!["observe", "finalize", "recovery", "cleanup_recovery"],
         ),
@@ -753,7 +759,7 @@ fn loop_errors_are_finite_contextual_and_redacted() {
 }
 
 #[test]
-fn stale_live_database_failures_preserve_exact_persistence_codes() {
+fn supported_recovery_database_failures_preserve_exact_persistence_codes() {
     for error in [
         automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::InvalidInput,
         automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::OwnershipLost,
@@ -763,6 +769,13 @@ fn stale_live_database_failures_preserve_exact_persistence_codes() {
     ] {
         assert_eq!(
             RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecution(error).code(),
+            error.code()
+        );
+        assert_eq!(
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationExecution(
+                error,
+            )
+            .code(),
             error.code()
         );
     }

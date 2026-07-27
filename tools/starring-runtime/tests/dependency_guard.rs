@@ -3060,14 +3060,14 @@ fn startup_recovery_loop_is_bounded_reobserving_and_non_authorizing() {
     );
     for required_test in [
         "production_used_driver_reobserves_after_foreign_fresh_and_stops_at_fixed_point",
-        "production_used_driver_refreshes_and_reobserves_after_stale_live_execution",
+        "production_used_driver_refreshes_and_reobserves_after_supported_recovery_execution",
         "production_used_driver_cleans_each_failure_authority_exactly_once",
         "foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_priority",
         "dropping_a_polled_foreign_fresh_wait_drops_only_the_wait_future",
         "canceling_the_production_used_borrowed_wait_retains_exactly_one_cleanup_authority",
         "canceling_a_borrowed_recovery_retains_exactly_one_cleanup_authority",
         "all_recovery_classes_map_to_distinct_finite_fail_closed_failures",
-        "stale_live_database_failures_preserve_exact_persistence_codes",
+        "supported_recovery_database_failures_preserve_exact_persistence_codes",
     ] {
         assert!(process_tests.contains(required_test), "{required_test}");
         assert!(!process.contains(required_test), "{required_test}");
@@ -3103,7 +3103,7 @@ fn startup_recovery_loop_is_bounded_reobserving_and_non_authorizing() {
 }
 
 #[test]
-fn stale_live_execution_is_interruptible_one_way_and_forces_fresh_observation() {
+fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fresh_observation() {
     let execution = source_before_test_module(include_str!("../src/process/execution.rs"));
     let startup_loop = include_str!("../src/process/startup_loop.rs")
         .split_once("\n#[cfg(test)]")
@@ -3114,7 +3114,8 @@ fn stale_live_execution_is_interruptible_one_way_and_forces_fresh_observation() 
 
     for required in [
         "RuntimeStartupRecoveryExecutionPortV2",
-        "class != RuntimeStartupRecoveryClassV2::StaleLive",
+        "RuntimeStartupRecoveryClassV2::StaleLive",
+        "RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification",
         ".begin_startup_recovery_execution_v2(",
         ".execute_startup_recovery(authorization, execution_cutoff)",
         ".complete_startup_recovery_execution_v2(completed)",
@@ -3127,6 +3128,9 @@ fn stale_live_execution_is_interruptible_one_way_and_forces_fresh_observation() 
         "RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter",
         "invalidate_startup_recovery_execution_v2",
         "prefer_current_startup_recovery_execution_failure_v2",
+        "startup_recovery_execution_database_failure_v2",
+        "startup_recovery_execution_rejected_v2",
+        "startup_recovery_execution_retry_after_unsupported_v2",
     ] {
         assert!(execution.contains(required), "{required}");
     }

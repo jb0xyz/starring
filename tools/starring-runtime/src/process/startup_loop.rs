@@ -34,6 +34,9 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     StaleLiveExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
     StaleLiveRetryAfterUnsupported,
     ReservedAwaitingCertificationRecoveryUnavailable,
+    ReservedAwaitingCertificationExecution(RuntimeExecutionPersistenceErrorV1),
+    ReservedAwaitingCertificationExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    ReservedAwaitingCertificationRetryAfterUnsupported,
     SuspendedLocalEffectRecoveryUnavailable,
     PendingRuntimeDrainRecoveryUnavailable,
     ProtocolViolation,
@@ -60,6 +63,13 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             Self::ReservedAwaitingCertificationRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_reserved_awaiting_certification_recovery_unavailable"
             }
+            Self::ReservedAwaitingCertificationExecution(error) => {
+                runtime_execution_error_code_v2(error)
+            }
+            Self::ReservedAwaitingCertificationExecutionRejected(error) => error.code(),
+            Self::ReservedAwaitingCertificationRetryAfterUnsupported => {
+                "runtime_process_startup_recovery_loop_reserved_awaiting_certification_retry_after_unsupported"
+            }
             Self::SuspendedLocalEffectRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_suspended_local_effect_recovery_unavailable"
             }
@@ -82,6 +92,9 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             | Self::StaleLiveExecutionRejected(_)
             | Self::StaleLiveRetryAfterUnsupported
             | Self::ReservedAwaitingCertificationRecoveryUnavailable
+            | Self::ReservedAwaitingCertificationExecution(_)
+            | Self::ReservedAwaitingCertificationExecutionRejected(_)
+            | Self::ReservedAwaitingCertificationRetryAfterUnsupported
             | Self::SuspendedLocalEffectRecoveryUnavailable
             | Self::PendingRuntimeDrainRecoveryUnavailable
             | Self::ProtocolViolation => None,

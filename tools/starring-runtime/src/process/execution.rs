@@ -29,7 +29,11 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
         RuntimeStartupRecoveryExecutionCompletionV2,
         RuntimeProcessStartupRecoveryLoopFailureV2,
     > {
-        if class != RuntimeStartupRecoveryClassV2::StaleLive {
+        if !matches!(
+            class,
+            RuntimeStartupRecoveryClassV2::StaleLive
+                | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+        ) {
             return Err(super::startup_loop::unavailable_recovery_failure_v2(class));
         }
         if let Some(transition) = current_startup_recovery_execution_transition_v2(self) {
@@ -42,11 +46,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             Err(error) => {
                 let transition = prefer_current_startup_recovery_execution_failure_v2(
                     current_startup_recovery_execution_transition_v2(self),
-                    || {
-                        RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecutionRejected(
-                            error.into(),
-                        )
-                    },
+                    || startup_recovery_execution_rejected_v2(class, error.into()),
                 );
                 self.session.invalidate_startup_recovery_execution_v2();
                 return Err(transition);
@@ -91,7 +91,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             Err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error)) => {
                 let transition = prefer_current_startup_recovery_execution_failure_v2(
                     current_startup_recovery_execution_transition_v2(self),
-                    || RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecution(error),
+                    || startup_recovery_execution_database_failure_v2(class, error),
                 );
                 self.session.invalidate_startup_recovery_execution_v2();
                 return Err(transition);
@@ -109,11 +109,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             Err(error) => {
                 let transition = prefer_current_startup_recovery_execution_failure_v2(
                     current_startup_recovery_execution_transition_v2(self),
-                    || {
-                        RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecutionRejected(
-                            error.into(),
-                        )
-                    },
+                    || startup_recovery_execution_rejected_v2(class, error.into()),
                 );
                 self.session.invalidate_startup_recovery_execution_v2();
                 return Err(transition);
@@ -123,13 +119,12 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             self.session.invalidate_startup_recovery_execution_v2();
             return Err(transition);
         }
-        if accepted.class() != RuntimeStartupRecoveryClassV2::StaleLive {
+        if accepted.class() != class {
             self.session.invalidate_startup_recovery_execution_v2();
-            return Err(
-                RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecutionRejected(
-                    crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayProtocolViolation,
-                ),
-            );
+            return Err(startup_recovery_execution_rejected_v2(
+                class,
+                crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayProtocolViolation,
+            ));
         }
         match accepted.outcome() {
             RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
@@ -138,8 +133,65 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             }
             RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { .. } => {
                 self.session.invalidate_startup_recovery_execution_v2();
-                Err(RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveRetryAfterUnsupported)
+                Err(startup_recovery_execution_retry_after_unsupported_v2(class))
             }
+        }
+    }
+}
+
+fn startup_recovery_execution_database_failure_v2(
+    class: RuntimeStartupRecoveryClassV2,
+    error: automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
+    match class {
+        RuntimeStartupRecoveryClassV2::StaleLive => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecution(error)
+        }
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationExecution(
+                error,
+            )
+        }
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+            super::startup_loop::unavailable_recovery_failure_v2(class)
+        }
+    }
+}
+
+fn startup_recovery_execution_rejected_v2(
+    class: RuntimeStartupRecoveryClassV2,
+    error: crate::RuntimeProcessClosedRecoveryCommitFailureV2,
+) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
+    match class {
+        RuntimeStartupRecoveryClassV2::StaleLive => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecutionRejected(error)
+        }
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationExecutionRejected(
+                error,
+            )
+        }
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+            super::startup_loop::unavailable_recovery_failure_v2(class)
+        }
+    }
+}
+
+fn startup_recovery_execution_retry_after_unsupported_v2(
+    class: RuntimeStartupRecoveryClassV2,
+) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
+    match class {
+        RuntimeStartupRecoveryClassV2::StaleLive => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveRetryAfterUnsupported
+        }
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationRetryAfterUnsupported
+        }
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+            super::startup_loop::unavailable_recovery_failure_v2(class)
         }
     }
 }
@@ -435,6 +487,53 @@ mod tests {
                 ),
             ),
             RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed
+        );
+    }
+
+    #[test]
+    fn supported_recovery_classes_preserve_distinct_execution_failures() {
+        let database_error =
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt;
+        let protocol_error =
+            crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayProtocolViolation;
+
+        assert_eq!(
+            startup_recovery_execution_database_failure_v2(
+                RuntimeStartupRecoveryClassV2::StaleLive,
+                database_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecution(database_error)
+        );
+        assert_eq!(
+            startup_recovery_execution_database_failure_v2(
+                RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
+                database_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationExecution(
+                database_error,
+            )
+        );
+        assert_eq!(
+            startup_recovery_execution_rejected_v2(
+                RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
+                protocol_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationExecutionRejected(
+                protocol_error,
+            )
+        );
+        assert_eq!(
+            startup_recovery_execution_retry_after_unsupported_v2(
+                RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationRetryAfterUnsupported
+        );
+        assert_eq!(
+            startup_recovery_execution_database_failure_v2(
+                RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
+                database_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectRecoveryUnavailable
         );
     }
 }
