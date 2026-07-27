@@ -260,7 +260,7 @@ fn manifest_and_readiness_cascade_is_exact() {
     ] {
         assert!(MIGRATION.contains(expected), "{expected}");
     }
-    let readiness = "c2cba3c5591876238f0ae0248b2c7c205953b6cde2a62705038a42fa9aa2aa81";
+    let readiness = "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a";
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(readiness));
     }

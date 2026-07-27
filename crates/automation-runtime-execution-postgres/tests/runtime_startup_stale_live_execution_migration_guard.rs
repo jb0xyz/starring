@@ -24,6 +24,8 @@ const CURRENT_MANIFEST_DEFINITION_DIGEST: &str =
     "00824784a0b0276e2ef83b4e4094c274cffb50b9c640af61350a152dc112c835";
 const CURRENT_READINESS_DIGEST: &str =
     "c2cba3c5591876238f0ae0248b2c7c205953b6cde2a62705038a42fa9aa2aa81";
+const LATEST_READINESS_DIGEST: &str =
+    "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a";
 const CURRENT_EXECUTION_DEFINITION_DIGEST: &str =
     "de30f26d122062ad9da6fc9bd145a7376030fa7e1c9d114db740056e33136a42";
 const CURRENT_ACTION_RECORD_DIGEST: &str =
@@ -358,7 +360,7 @@ fn manifest_readiness_acl_and_rust_pins_advance_together() {
     assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 19"));
     assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 19]"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(CURRENT_READINESS_DIGEST));
+        assert!(source.contains(LATEST_READINESS_DIGEST));
     }
     assert!(!CONTRACT_SOURCE.contains(PREVIOUS_READINESS_DIGEST));
     assert!(!DATABASE_SOURCE.contains(PREVIOUS_READINESS_DIGEST));
