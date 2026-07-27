@@ -14,3 +14,4 @@ include!("postgres_security/lock_order.rs");
 include!("postgres_security/execution_slot_writer_epoch.rs");
 include!("postgres_security/execution_selector_slot_writer_epoch.rs");
 include!("postgres_security/legacy_certification_reservation_fence.rs");
+include!("postgres_security/suspension_ledger.rs");

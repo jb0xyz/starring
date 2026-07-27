@@ -19,6 +19,8 @@ const PREVIOUS_READINESS_DIGEST: &str =
     "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f";
 const CURRENT_READINESS_DIGEST: &str =
     "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
+const LATEST_READINESS_DIGEST: &str =
+    "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -229,11 +231,11 @@ fn rust_contract_and_security_fixture_expose_exactly_seventeen_capabilities() {
 #[test]
 fn current_readiness_pin_is_propagated_without_rewriting_history() {
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(CURRENT_READINESS_DIGEST));
+        assert!(source.contains(LATEST_READINESS_DIGEST));
         assert!(!source.contains(PREVIOUS_READINESS_DIGEST));
     }
     for guard in CURRENT_PIN_GUARDS {
-        assert!(guard.contains(CURRENT_READINESS_DIGEST));
+        assert!(guard.contains(LATEST_READINESS_DIGEST));
     }
     assert!(MIGRATION.contains(PREVIOUS_READINESS_DIGEST));
     assert!(MIGRATION.contains(CURRENT_READINESS_DIGEST));

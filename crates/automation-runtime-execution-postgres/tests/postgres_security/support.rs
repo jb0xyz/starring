@@ -76,7 +76,7 @@ const EXECUTOR_FUNCTIONS: [&str; 17] = [
     "public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
+    "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
