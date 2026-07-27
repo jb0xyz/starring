@@ -1,5 +1,9 @@
 mod closed_evidence;
 mod digest;
+#[cfg(test)]
+mod pending_projection;
+#[cfg(test)]
+mod pending_semantic;
 mod projection;
 mod query;
 mod reserved_projection;
