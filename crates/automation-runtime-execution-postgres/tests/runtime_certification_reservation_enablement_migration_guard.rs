@@ -20,7 +20,7 @@ const PREVIOUS_READINESS_DIGEST: &str =
 const CURRENT_READINESS_DIGEST: &str =
     "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
 const LATEST_READINESS_DIGEST: &str =
-    "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
+    "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -190,7 +190,7 @@ fn readiness_moves_the_two_functions_from_protected_to_capability_allowlists() {
 }
 
 #[test]
-fn rust_contract_and_security_fixture_expose_exactly_seventeen_capabilities() {
+fn rust_contract_and_security_fixture_expose_exactly_eighteen_capabilities() {
     let operations = CONTRACT_SOURCE
         .split("OPERATION_CAPABILITY_IDENTITIES_V1")
         .nth(1)
@@ -198,8 +198,8 @@ fn rust_contract_and_security_fixture_expose_exactly_seventeen_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 15]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 17"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 16]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 18"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(operations.matches(identity).count(), 1, "{identity}");
     }
@@ -218,7 +218,7 @@ fn rust_contract_and_security_fixture_expose_exactly_seventeen_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 17]"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 18]"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(
             executor_functions.matches(identity).count(),

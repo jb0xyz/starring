@@ -9,15 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use automation_runtime_controller::{
     encode_runtime_live_attestation_record_v1, runtime_desired_target_digest_v1,
-    runtime_live_attestation_digest_v1, GatewayShardIdV1, RuntimeBuildRevisionV1,
-    RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1,
-    RuntimeConvergenceSessionV1, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
-    RuntimeGatewayOwnerLeaseDurationV1, RuntimeGatewayOwnerLeaseObservationV1,
-    RuntimeLiveAttestationRecordV1, RuntimeMutationReceiptV1, RuntimeObserveGatewayOwnerLeaseV1,
-    RuntimeObserveWriterFenceV1, RuntimeReleaseGatewayOwnerLeaseOutcomeV1,
-    RuntimeReleaseGatewayOwnerLeaseV1, RuntimeRenewGatewayOwnerLeaseOutcomeV1,
-    RuntimeRenewGatewayOwnerLeaseV1, RuntimeWriterFenceObservationV1,
+    runtime_live_attestation_digest_v1, GatewayShardIdV1, RuntimeAcquireGatewayOwnerLeaseOutcomeV1,
+    RuntimeAcquireGatewayOwnerLeaseV1, RuntimeBuildRevisionV1, RuntimeClaimNextExecutionV1,
+    RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
+    RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1, RuntimeGatewayOwnerLeaseDurationV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeLiveAttestationRecordV1,
+    RuntimeMutationReceiptV1, RuntimeObserveGatewayOwnerLeaseV1, RuntimeObserveWriterFenceV1,
+    RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
+    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeWriterFenceObservationV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, DrainAttestationV1,
@@ -29,20 +29,19 @@ use automation_runtime_convergence::{
 };
 use automation_runtime_execution_postgres::{
     observe_runtime_execution_database_identity_v1, PostgresRuntimeExecutionV1,
-    RuntimeExecutionDatabaseExpectationV1,
-    RuntimeExecutionPersistenceErrorV1, MIGRATOR,
+    RuntimeExecutionDatabaseExpectationV1, RuntimeExecutionPersistenceErrorV1, MIGRATOR,
 };
-use chrono::{DateTime, TimeDelta, Utc};
-use serde_json::{json, Value};
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
-use sqlx::types::Json;
-use sqlx::{Connection, Executor, PgPool};
 use automation_runtime_worker::{
     classify_unknown_gateway_owner_acquire_v1, classify_unknown_gateway_owner_release_v1,
     classify_unknown_gateway_owner_renew_v1, RuntimeGatewayOwnerAcquireRecoveryV1,
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerReleaseRecoveryV1,
     RuntimeGatewayOwnerRenewRecoveryV1, RuntimeWriterFenceObservationPortV1,
 };
+use chrono::{DateTime, TimeDelta, Utc};
+use serde_json::{json, Value};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
+use sqlx::types::Json;
+use sqlx::{Connection, Executor, PgPool};
 
 const READINESS_FUNCTION: &str = "public.starring_runtime_execution_database_readiness_v1()";
 const EXACT_TARGET_FUNCTIONS: [&str; 3] = [
@@ -56,7 +55,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 17] = [
+const EXECUTOR_FUNCTIONS: [&str; 18] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -74,9 +73,10 @@ const EXECUTOR_FUNCTIONS: [&str; 17] = [
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
     "public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)",
     "public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)",
+    "public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
+    "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

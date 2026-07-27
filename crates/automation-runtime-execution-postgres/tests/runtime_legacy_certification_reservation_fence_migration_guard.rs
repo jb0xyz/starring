@@ -7,7 +7,7 @@ const SECURITY_SUPPORT_SOURCE: &str = include_str!("postgres_security/support.rs
 const SUCCESSOR_READINESS_DIGEST: &str =
     "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f";
 const LATEST_READINESS_DIGEST: &str =
-    "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
+    "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
 
 const LEGACY_ENTRYPOINTS: [&str; 6] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
