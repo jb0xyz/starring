@@ -211,7 +211,7 @@ fn observation_is_scope_only_and_returns_database_time_with_locked_state() {
 }
 
 #[test]
-fn dormant_capabilities_are_manifested_but_not_granted_to_the_executor() {
+fn migration_creates_dormant_owner_only_capabilities() {
     for identity in [
         "public.starring_runtime_certification_reserve_intent_v2",
         "public.starring_runtime_certification_reservation_observe_v2",
@@ -219,9 +219,29 @@ fn dormant_capabilities_are_manifested_but_not_granted_to_the_executor() {
         "starring_runtime_private_v2.starring_runtime_certification_intent_fingerprint_v2",
     ] {
         assert!(MIGRATION.contains(identity), "{identity}");
-        assert!(!CONTRACT_SOURCE.contains(identity), "{identity}");
-        assert!(!SECURITY_SUPPORT_SOURCE.contains(identity), "{identity}");
     }
+    assert!(MIGRATION.contains(
+        "REVOKE ALL ON FUNCTION\n    public.starring_runtime_certification_reserve_intent_v2"
+    ));
+    assert!(MIGRATION.contains(
+        "REVOKE ALL ON FUNCTION\n    public.starring_runtime_certification_reservation_observe_v2"
+    ));
+    assert!(MIGRATION.contains(
+        "REVOKE ALL ON FUNCTION\n    starring_runtime_private_v2.starring_runtime_certification_intent_bytes_v2"
+    ));
+    assert!(MIGRATION.contains(
+        "REVOKE ALL ON FUNCTION\n    starring_runtime_private_v2.starring_runtime_certification_intent_fingerprint_v2"
+    ));
+    assert!(!MIGRATION.contains("GRANT "));
+    let postflight = MIGRATION
+        .split("DO $postflight$")
+        .nth(1)
+        .unwrap()
+        .split("$postflight$;")
+        .next()
+        .unwrap();
+    assert!(postflight.contains("privilege.grantee <> common_owner"));
+    assert!(postflight.contains("invalid_acl_count <> 0"));
     assert!(!MIGRATION.contains(
         "CREATE OR REPLACE FUNCTION public.starring_runtime_execution_certify_prepare_v1"
     ));
@@ -240,7 +260,7 @@ fn manifest_and_readiness_cascade_is_exact() {
     ] {
         assert!(MIGRATION.contains(expected), "{expected}");
     }
-    let readiness = "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f";
+    let readiness = "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(readiness));
     }

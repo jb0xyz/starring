@@ -1,5 +1,6 @@
 mod bootstrap;
 mod certification;
+mod certification_reservation;
 mod connection;
 mod contract;
 mod controller;

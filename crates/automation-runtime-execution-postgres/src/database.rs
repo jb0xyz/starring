@@ -435,7 +435,7 @@ mod tests {
         assert!(canonical_sha256_digest(digest));
         assert_eq!(
             digest,
-            "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f"
+            "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c"
         );
     }
 }

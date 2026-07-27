@@ -200,7 +200,7 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_product_drain_ports() {
+fn adapter_exposes_only_approved_runtime_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
     for required in [
@@ -209,6 +209,7 @@ fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_pro
         "impl RuntimeGatewayOwnerLeasePortV1",
         "impl RuntimeWriterFenceObservationPortV1",
         "impl RuntimeProductDrainObservationPortV2",
+        "impl RuntimeCertificationReservationPortV2",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -217,6 +218,58 @@ fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_pro
     assert!(source.contains("execute_observe_previous_serving_v1"));
     assert!(source.contains("execute_recover_next_stale_live_v1"));
     assert!(source.contains("!matches!(self, Self::Observe { .. })"));
+}
+
+#[test]
+fn certification_reservation_uses_only_scoped_functions_and_verified_transactions() {
+    let adapter = include_str!("../src/certification_reservation/mod.rs");
+    let query = include_str!("../src/certification_reservation/query.rs");
+    for capability in [
+        "starring_runtime_certification_reserve_intent_v2",
+        "starring_runtime_certification_reservation_observe_v2",
+    ] {
+        assert!(query.contains(capability));
+    }
+    for column in [
+        "outcome_name",
+        "locked_snapshot",
+        "locked_convergence_attempt_no",
+        "observed_at",
+        "operation_id",
+        "tenant_id",
+        "installation_id",
+        "deployment_id",
+        "deployment_revision",
+        "convergence_attempt_no",
+        "certification_intent_bytes",
+        "intent_fingerprint",
+    ] {
+        assert!(query.contains(column));
+    }
+    assert!(query.contains("$27"));
+    for required in [
+        "begin_execution_mutation_transaction",
+        "begin_execution_locked_observation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "ExecutionConnectionGuardV1",
+        "map_mutation_commit_error",
+        "RuntimeCertificationReservationRowV2",
+        "RuntimeCertificationReservationPortV2",
+        "RuntimeExecutionPersistenceErrorV1::Indeterminate",
+        "i64::try_from",
+    ] {
+        assert!(adapter.contains(required));
+    }
+    for forbidden in [
+        "runtime_certification_intent_reservations",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "TRUNCATE ",
+        " as i64",
+    ] {
+        assert!(!adapter.contains(forbidden));
+    }
 }
 
 #[test]

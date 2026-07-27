@@ -19,6 +19,10 @@ const EXECUTION_SELECTOR_SLOT_WRITER_CATALOG: [&str; 6] = [
 
 type ExecutionSelectorCatalogRow = (String, i64, i64, String, String);
 
+fn pre_enable_executor_functions() -> &'static [&'static str] {
+    &EXECUTOR_FUNCTIONS[..15]
+}
+
 async fn raw_selector_claim(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     controller_id: &str,
@@ -103,7 +107,7 @@ async fn create_execution_selector_role(pool: &PgPool, role: &str, can_login: bo
     )
     .await
     .unwrap();
-    for capability in EXECUTOR_FUNCTIONS {
+    for capability in pre_enable_executor_functions() {
         pool.execute(format!("GRANT EXECUTE ON FUNCTION {capability} TO {role}").as_str())
             .await
             .unwrap();
@@ -114,7 +118,7 @@ async fn execution_selector_capability_image(
     pool: &PgPool,
 ) -> Vec<(String, i64, i64, String)> {
     let mut image = Vec::new();
-    for identity in EXECUTOR_FUNCTIONS {
+    for identity in pre_enable_executor_functions() {
         image.push(
             sqlx::query_as(
                 "SELECT $1::TEXT, function_row.oid::BIGINT, \
@@ -137,7 +141,7 @@ async fn assert_execution_selector_capabilities(
     role: &str,
 ) -> Vec<(String, i64, i64, String)> {
     let image = execution_selector_capability_image(pool).await;
-    assert_eq!(image.len(), EXECUTOR_FUNCTIONS.len());
+    assert_eq!(image.len(), pre_enable_executor_functions().len());
     assert_eq!(
         image
             .iter()
@@ -146,7 +150,7 @@ async fn assert_execution_selector_capabilities(
             .len(),
         1
     );
-    for identity in EXECUTOR_FUNCTIONS {
+    for identity in pre_enable_executor_functions() {
         assert!(
             sqlx::query_scalar::<_, bool>(
                 "SELECT pg_catalog.has_function_privilege($1, $2, 'EXECUTE')",

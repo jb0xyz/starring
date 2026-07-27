@@ -56,7 +56,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 15] = [
+const EXECUTOR_FUNCTIONS: [&str; 17] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -72,9 +72,11 @@ const EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
     "public.starring_runtime_writer_fence_observe_v1()",
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
+    "public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)",
+    "public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f";
+    "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

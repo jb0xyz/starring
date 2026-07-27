@@ -6,6 +6,8 @@ const DATABASE_SOURCE: &str = include_str!("../src/database.rs");
 const SECURITY_SUPPORT_SOURCE: &str = include_str!("postgres_security/support.rs");
 const SUCCESSOR_READINESS_DIGEST: &str =
     "a57602a79ee2aa5ac884dffb56d152bb5721d111e07eac5a5f853952d6db214f";
+const LATEST_READINESS_DIGEST: &str =
+    "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
 
 const LEGACY_ENTRYPOINTS: [&str; 6] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -299,7 +301,7 @@ fn predecessor_and_successor_definition_pins_cascade_through_readiness() {
         assert!(postflight.contains(digest), "{digest}");
     }
     assert!(!MIGRATION.contains("0000000000000000000000000000000000000000000000000000000000000000"));
-    assert!(CONTRACT_SOURCE.contains(SUCCESSOR_READINESS_DIGEST));
-    assert!(DATABASE_SOURCE.contains(SUCCESSOR_READINESS_DIGEST));
-    assert!(SECURITY_SUPPORT_SOURCE.contains(SUCCESSOR_READINESS_DIGEST));
+    assert!(CONTRACT_SOURCE.contains(LATEST_READINESS_DIGEST));
+    assert!(DATABASE_SOURCE.contains(LATEST_READINESS_DIGEST));
+    assert!(SECURITY_SUPPORT_SOURCE.contains(LATEST_READINESS_DIGEST));
 }
