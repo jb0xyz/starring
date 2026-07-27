@@ -4,6 +4,8 @@ const CONTRACT_SOURCE: &str = include_str!("../src/contract.rs");
 const DATABASE_SOURCE: &str = include_str!("../src/database.rs");
 const SECURITY_SUPPORT_SOURCE: &str = include_str!("postgres_security/support.rs");
 const SUSPENSION_GUARD: &str = include_str!("runtime_suspend_attempt_ledger_migration_guard.rs");
+const OWNER_PROJECTION_GUARD: &str =
+    include_str!("runtime_startup_recovery_owner_projection_migration_guard.rs");
 
 const FUNCTION_IDENTITY: &str =
     "public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)";
@@ -15,6 +17,8 @@ const PREVIOUS_READINESS_DIGEST: &str =
     "6523d219df9a148c9428ac8f45b9317bcad6b56af44b753f11167fc582ca5875";
 const CURRENT_READINESS_DIGEST: &str =
     "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
+const LATEST_READINESS_DIGEST: &str =
+    "9acd85e2162d4c06593dedae7d2043e53bebc8cd1d70c7aea5aa364cec0cb27f";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -226,10 +230,11 @@ fn only_observation_execute_is_exposed_and_readiness_pins_move_once() {
     );
     assert!(postflight.contains("pg_catalog.has_function_privilege"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(CURRENT_READINESS_DIGEST));
+        assert!(source.contains(LATEST_READINESS_DIGEST));
     }
     assert!(CONTRACT_SOURCE.contains(FUNCTION_IDENTITY));
     assert!(SECURITY_SUPPORT_SOURCE.contains(FUNCTION_IDENTITY));
     assert!(SUSPENSION_GUARD.contains(PREVIOUS_READINESS_DIGEST));
-    assert!(SUSPENSION_GUARD.contains(CURRENT_READINESS_DIGEST));
+    assert!(OWNER_PROJECTION_GUARD.contains(CURRENT_READINESS_DIGEST));
+    assert!(OWNER_PROJECTION_GUARD.contains(LATEST_READINESS_DIGEST));
 }

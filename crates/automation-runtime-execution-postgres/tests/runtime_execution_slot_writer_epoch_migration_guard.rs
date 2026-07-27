@@ -175,7 +175,7 @@ fn migration_pins_current_and_resulting_contracts_without_new_grants() {
 fn adapter_classifies_pending_drain_as_retry_not_ready_and_pins_readiness() {
     assert!(ERROR_SOURCE
         .contains("\"RX007\" => Some(RuntimeExecutionPersistenceErrorV1::RetryNotReady)"));
-    let readiness = "ae397ea106f18aa71c6cf2427ebf2705638462066e480b6d0f10b9759a8adc5e";
+    let readiness = "9acd85e2162d4c06593dedae7d2043e53bebc8cd1d70c7aea5aa364cec0cb27f";
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(readiness));
     }
