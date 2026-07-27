@@ -12,13 +12,15 @@ use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
 
 use super::{
+    RuntimeCanonicalSuspendAttemptDrainProgressV2, RuntimeCanonicalSuspendedAttemptV2,
     RuntimeSuspendAttemptDrainProgressErrorV2, RuntimeSuspendAttemptDrainProgressV2,
-    RuntimeSuspendedAttemptStateErrorV2, RuntimeSuspendedAttemptStateFieldV2,
-    RuntimeSuspendedAttemptV2,
+    RuntimeSuspendedAttemptCanonicalErrorV2, RuntimeSuspendedAttemptStateErrorV2,
+    RuntimeSuspendedAttemptStateFieldV2, RuntimeSuspendedAttemptV2,
 };
 use crate::{
     GatewayShardIdV1, RuntimeAttemptDispositionV2, RuntimeBarrierIdV1,
-    RuntimeBarrierPauseWitnessV2, RuntimeBuildRevisionV1, RuntimeCanonicalSuspendAttemptV2,
+    RuntimeBarrierPauseWitnessV2, RuntimeBuildRevisionV1,
+    RuntimeCanonicalRouteMutationProvenanceV2, RuntimeCanonicalSuspendAttemptV2,
     RuntimeCanonicalValueErrorV2, RuntimeClosedRecoveryRouteWitnessV2, RuntimeDeploymentScopeV1,
     RuntimeDrainObligationV2, RuntimeExactLocalRouteIdentityV2, RuntimeExecutionGuardV1,
     RuntimeExecutionReceiptV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
@@ -982,4 +984,165 @@ fn terminal_states_cannot_record_another_local_absence() {
         ),
         Err(RuntimeSuspendAttemptDrainProgressErrorV2::NoExactLocalRoute)
     );
+}
+
+#[test]
+fn canonical_sidecar_roundtrips_exact_standalone_bytes() {
+    for with_previous in [false, true] {
+        let operation = exact_operation(RuntimeSuspendedRouteLifecycleV2::Draining, with_previous);
+        let request = operation.canonical_attempt().request();
+        let canonical = RuntimeCanonicalSuspendedAttemptV2::from_inserted(
+            &operation,
+            non_zero(1),
+            request.local_effect.clone(),
+            request.drain_obligation.clone(),
+            at_microseconds(4_000_001),
+        )
+        .unwrap();
+        assert_eq!(canonical.local_effect_kind(), "exact_route");
+        assert!(canonical.local_effect_bytes().starts_with(
+            br#"{"kind":"exact_route","route":{"identity":{"target":{"guild_id":"7","#
+        ));
+        assert!(canonical
+            .local_effect_bytes()
+            .ends_with(br#","lifecycle":"draining"}"#));
+        assert_eq!(
+            canonical.drain_obligation_kind(),
+            if with_previous {
+                "local_and_previous"
+            } else {
+                "exact_local_route"
+            }
+        );
+
+        let root = persisted_root(&operation);
+        let restored = RuntimeCanonicalSuspendedAttemptV2::from_persisted(
+            &root,
+            non_zero(1),
+            canonical.local_effect_kind(),
+            canonical.local_effect_bytes(),
+            canonical.drain_obligation_kind(),
+            canonical.drain_obligation_bytes(),
+            canonical.suspended_attempt().suspended_at(),
+        )
+        .unwrap();
+        assert_eq!(restored, canonical);
+    }
+}
+
+#[test]
+fn canonical_sidecar_rejects_kind_mismatch_and_noncanonical_bytes() {
+    let operation = exact_operation(RuntimeSuspendedRouteLifecycleV2::Staged, false);
+    let request = operation.canonical_attempt().request();
+    let canonical = RuntimeCanonicalSuspendedAttemptV2::from_inserted(
+        &operation,
+        non_zero(1),
+        request.local_effect.clone(),
+        request.drain_obligation.clone(),
+        at(4),
+    )
+    .unwrap();
+    let root = persisted_root(&operation);
+    assert_eq!(
+        RuntimeCanonicalSuspendedAttemptV2::from_persisted(
+            &root,
+            non_zero(1),
+            "route_absent",
+            canonical.local_effect_bytes(),
+            canonical.drain_obligation_kind(),
+            canonical.drain_obligation_bytes(),
+            at(4),
+        ),
+        Err(RuntimeSuspendedAttemptCanonicalErrorV2::LocalEffectKindMismatch)
+    );
+
+    let mut corruptions = Vec::new();
+    let mut appended = canonical.local_effect_bytes().to_vec();
+    appended.push(b' ');
+    corruptions.push(appended);
+    corruptions
+        .push(canonical.local_effect_bytes()[..canonical.local_effect_bytes().len() - 1].to_vec());
+    let mut flipped = canonical.local_effect_bytes().to_vec();
+    let offset = flipped
+        .windows(b"exact_route".len())
+        .position(|window| window == b"exact_route")
+        .unwrap();
+    flipped[offset] = b'z';
+    corruptions.push(flipped);
+    for corrupted in corruptions {
+        assert!(RuntimeCanonicalSuspendedAttemptV2::from_persisted(
+            &root,
+            non_zero(1),
+            canonical.local_effect_kind(),
+            &corrupted,
+            canonical.drain_obligation_kind(),
+            canonical.drain_obligation_bytes(),
+            at(4),
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn canonical_local_absence_progress_seals_reachable_successor_bytes() {
+    for with_previous in [false, true] {
+        let operation = exact_operation(RuntimeSuspendedRouteLifecycleV2::Draining, with_previous);
+        let request = operation.canonical_attempt().request();
+        let source = RuntimeCanonicalSuspendedAttemptV2::from_inserted(
+            &operation,
+            non_zero(7),
+            request.local_effect.clone(),
+            request.drain_obligation.clone(),
+            at_microseconds(4_000_001),
+        )
+        .unwrap();
+        let provenance =
+            RuntimeCanonicalRouteMutationProvenanceV2::new(closed_recovery_provenance()).unwrap();
+        let progress = RuntimeCanonicalSuspendAttemptDrainProgressV2::record_local_absent(
+            source,
+            provenance,
+            non_zero(40),
+        )
+        .unwrap();
+        assert_eq!(progress.replacement_local_effect_kind(), "route_absent");
+        assert_eq!(
+            progress.replacement_drain_obligation_kind(),
+            if with_previous {
+                "previous_serving"
+            } else {
+                "none"
+            }
+        );
+        assert!(progress
+            .replacement_local_effect_bytes()
+            .windows(br#""kind":"closed_recovery""#.len())
+            .any(|window| window == br#""kind":"closed_recovery""#));
+        assert_eq!(
+            RuntimeCanonicalRouteMutationProvenanceV2::from_persisted(
+                progress.provenance().provenance_bytes(),
+            )
+            .unwrap(),
+            progress.provenance().clone()
+        );
+
+        let root = persisted_root(&operation);
+        let successor = RuntimeCanonicalSuspendedAttemptV2::from_persisted(
+            &root,
+            non_zero(8),
+            progress.replacement_local_effect_kind(),
+            progress.replacement_local_effect_bytes(),
+            progress.replacement_drain_obligation_kind(),
+            progress.replacement_drain_obligation_bytes(),
+            progress.source().suspended_attempt().suspended_at(),
+        )
+        .unwrap();
+        assert_eq!(
+            successor.suspended_attempt().local_effect(),
+            progress.progress().replacement_local_effect()
+        );
+        assert_eq!(
+            successor.suspended_attempt().drain_obligation(),
+            progress.progress().replacement_drain_obligation()
+        );
+    }
 }

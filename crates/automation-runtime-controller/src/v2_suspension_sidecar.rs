@@ -7,7 +7,11 @@ use automation_runtime_convergence::RuntimeFailureV1;
 use chrono::{DateTime, Utc};
 
 use crate::v2_canonical_value::RuntimePersistenceU64V2;
-use crate::v2_suspension_canonical::validate_suspend_attempt_mutable_state;
+use crate::v2_suspension_canonical::{
+    decode_drain_obligation_bytes, decode_local_effect_bytes, encode_drain_obligation_bytes,
+    encode_local_effect_bytes, validate_suspend_attempt_mutable_state,
+    RuntimeCanonicalRouteMutationProvenanceV2,
+};
 use crate::{
     RuntimeAttemptDispositionV2, RuntimeCanonicalSuspendAttemptV2, RuntimeCanonicalValueErrorV2,
     RuntimeDrainObligationV2, RuntimeExecutionGuardV1, RuntimeLocalRouteEffectV2,
@@ -45,6 +49,18 @@ pub enum RuntimeSuspendAttemptDrainProgressErrorV2 {
     NoExactLocalRoute,
     #[error(transparent)]
     State(#[from] RuntimeSuspendedAttemptStateErrorV2),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeSuspendedAttemptCanonicalErrorV2 {
+    #[error(transparent)]
+    Canonical(#[from] RuntimeSuspendAttemptCanonicalErrorV2),
+    #[error(transparent)]
+    State(#[from] RuntimeSuspendedAttemptStateErrorV2),
+    #[error("runtime suspended-attempt local-effect kind does not match its canonical bytes")]
+    LocalEffectKindMismatch,
+    #[error("runtime suspended-attempt drain-obligation kind does not match its canonical bytes")]
+    DrainObligationKindMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +191,97 @@ impl RuntimeSuspendedAttemptV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeCanonicalSuspendedAttemptV2 {
+    suspended: RuntimeSuspendedAttemptV2,
+    local_effect_bytes: Box<[u8]>,
+    drain_obligation_bytes: Box<[u8]>,
+}
+
+impl RuntimeCanonicalSuspendedAttemptV2 {
+    pub fn from_inserted(
+        operation: &RuntimeSuspendAttemptOperationV2,
+        sidecar_revision: NonZeroU64,
+        local_effect: RuntimeLocalRouteEffectV2,
+        drain_obligation: RuntimeDrainObligationV2,
+        suspended_at: DateTime<Utc>,
+    ) -> Result<Self, RuntimeSuspendedAttemptCanonicalErrorV2> {
+        let suspended = RuntimeSuspendedAttemptV2::from_inserted(
+            operation,
+            sidecar_revision,
+            local_effect,
+            drain_obligation,
+            suspended_at,
+        )?;
+        Self::encode(suspended)
+    }
+
+    pub fn from_persisted(
+        root: &RuntimePersistedSuspendAttemptRootV2,
+        sidecar_revision: NonZeroU64,
+        local_effect_kind: &str,
+        local_effect_bytes: &[u8],
+        drain_obligation_kind: &str,
+        drain_obligation_bytes: &[u8],
+        suspended_at: DateTime<Utc>,
+    ) -> Result<Self, RuntimeSuspendedAttemptCanonicalErrorV2> {
+        let local_effect = decode_local_effect_bytes(local_effect_bytes)?;
+        if local_effect_kind != local_effect_kind_v2(&local_effect) {
+            return Err(RuntimeSuspendedAttemptCanonicalErrorV2::LocalEffectKindMismatch);
+        }
+        let drain_obligation = decode_drain_obligation_bytes(drain_obligation_bytes)?;
+        if drain_obligation_kind != drain_obligation_kind_v2(&drain_obligation) {
+            return Err(RuntimeSuspendedAttemptCanonicalErrorV2::DrainObligationKindMismatch);
+        }
+        let suspended = RuntimeSuspendedAttemptV2::from_persisted(
+            root,
+            sidecar_revision,
+            local_effect,
+            drain_obligation,
+            suspended_at,
+        )?;
+        Ok(Self {
+            suspended,
+            local_effect_bytes: local_effect_bytes.to_vec().into_boxed_slice(),
+            drain_obligation_bytes: drain_obligation_bytes.to_vec().into_boxed_slice(),
+        })
+    }
+
+    pub fn suspended_attempt(&self) -> &RuntimeSuspendedAttemptV2 {
+        &self.suspended
+    }
+
+    pub fn local_effect_kind(&self) -> &'static str {
+        local_effect_kind_v2(self.suspended.local_effect())
+    }
+
+    pub fn local_effect_bytes(&self) -> &[u8] {
+        &self.local_effect_bytes
+    }
+
+    pub fn drain_obligation_kind(&self) -> &'static str {
+        drain_obligation_kind_v2(self.suspended.drain_obligation())
+    }
+
+    pub fn drain_obligation_bytes(&self) -> &[u8] {
+        &self.drain_obligation_bytes
+    }
+
+    fn encode(
+        suspended: RuntimeSuspendedAttemptV2,
+    ) -> Result<Self, RuntimeSuspendedAttemptCanonicalErrorV2> {
+        let local_effect_bytes =
+            encode_local_effect_bytes(suspended.local_effect())?.into_boxed_slice();
+        let drain_obligation_bytes =
+            encode_drain_obligation_bytes(suspended.drain_obligation())?.into_boxed_slice();
+        Ok(Self {
+            suspended,
+            local_effect_bytes,
+            drain_obligation_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSuspendAttemptDrainProgressV2 {
     source: RuntimeSuspendedAttemptV2,
     replacement_local_effect: RuntimeLocalRouteEffectV2,
@@ -247,6 +354,88 @@ impl RuntimeSuspendAttemptDrainProgressV2 {
 
     pub fn replacement_drain_obligation(&self) -> &RuntimeDrainObligationV2 {
         &self.replacement_drain_obligation
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeCanonicalSuspendAttemptDrainProgressV2 {
+    source: RuntimeCanonicalSuspendedAttemptV2,
+    progress: RuntimeSuspendAttemptDrainProgressV2,
+    provenance: RuntimeCanonicalRouteMutationProvenanceV2,
+    replacement_local_effect_bytes: Box<[u8]>,
+    replacement_drain_obligation_bytes: Box<[u8]>,
+}
+
+impl RuntimeCanonicalSuspendAttemptDrainProgressV2 {
+    pub fn record_local_absent(
+        source: RuntimeCanonicalSuspendedAttemptV2,
+        provenance: RuntimeCanonicalRouteMutationProvenanceV2,
+        observed_sequence: NonZeroU64,
+    ) -> Result<Self, RuntimeSuspendAttemptDrainProgressErrorV2> {
+        let progress = RuntimeSuspendAttemptDrainProgressV2::record_local_absent(
+            source.suspended.clone(),
+            provenance.provenance().clone(),
+            observed_sequence,
+        )?;
+        let replacement_local_effect_bytes =
+            encode_local_effect_bytes(progress.replacement_local_effect())
+                .map_err(RuntimeSuspendedAttemptStateErrorV2::from)?;
+        let replacement_drain_obligation_bytes =
+            encode_drain_obligation_bytes(progress.replacement_drain_obligation())
+                .map_err(RuntimeSuspendedAttemptStateErrorV2::from)?;
+        Ok(Self {
+            source,
+            progress,
+            provenance,
+            replacement_local_effect_bytes: replacement_local_effect_bytes.into_boxed_slice(),
+            replacement_drain_obligation_bytes: replacement_drain_obligation_bytes
+                .into_boxed_slice(),
+        })
+    }
+
+    pub fn source(&self) -> &RuntimeCanonicalSuspendedAttemptV2 {
+        &self.source
+    }
+
+    pub fn progress(&self) -> &RuntimeSuspendAttemptDrainProgressV2 {
+        &self.progress
+    }
+
+    pub fn provenance(&self) -> &RuntimeCanonicalRouteMutationProvenanceV2 {
+        &self.provenance
+    }
+
+    pub fn replacement_local_effect_kind(&self) -> &'static str {
+        local_effect_kind_v2(self.progress.replacement_local_effect())
+    }
+
+    pub fn replacement_local_effect_bytes(&self) -> &[u8] {
+        &self.replacement_local_effect_bytes
+    }
+
+    pub fn replacement_drain_obligation_kind(&self) -> &'static str {
+        drain_obligation_kind_v2(self.progress.replacement_drain_obligation())
+    }
+
+    pub fn replacement_drain_obligation_bytes(&self) -> &[u8] {
+        &self.replacement_drain_obligation_bytes
+    }
+}
+
+fn local_effect_kind_v2(local_effect: &RuntimeLocalRouteEffectV2) -> &'static str {
+    match local_effect {
+        RuntimeLocalRouteEffectV2::None => "none",
+        RuntimeLocalRouteEffectV2::ExactRoute { .. } => "exact_route",
+        RuntimeLocalRouteEffectV2::RouteAbsent { .. } => "route_absent",
+    }
+}
+
+fn drain_obligation_kind_v2(drain_obligation: &RuntimeDrainObligationV2) -> &'static str {
+    match drain_obligation {
+        RuntimeDrainObligationV2::None => "none",
+        RuntimeDrainObligationV2::ExactLocalRoute(_) => "exact_local_route",
+        RuntimeDrainObligationV2::PreviousServing(_) => "previous_serving",
+        RuntimeDrainObligationV2::LocalAndPrevious { .. } => "local_and_previous",
     }
 }
 

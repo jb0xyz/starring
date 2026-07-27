@@ -291,6 +291,63 @@ pub(super) fn validate_suspend_attempt_mutable_state(
     Ok(())
 }
 
+pub(crate) fn encode_local_effect_bytes(
+    local_effect: &RuntimeLocalRouteEffectV2,
+) -> Result<Vec<u8>, RuntimeSuspendAttemptCanonicalErrorV2> {
+    encode_root(&encode_local_effect(local_effect)?)
+}
+
+pub(crate) fn decode_local_effect_bytes(
+    encoded: &[u8],
+) -> Result<RuntimeLocalRouteEffectV2, RuntimeSuspendAttemptCanonicalErrorV2> {
+    ensure_size(encoded)?;
+    let wire = serde_json::from_slice::<LocalRouteEffectWireV2>(encoded)
+        .map_err(|_| RuntimeSuspendAttemptCanonicalErrorV2::Decoding)?;
+    let local_effect = decode_local_effect(wire)?;
+    if encode_local_effect_bytes(&local_effect)? != encoded {
+        return Err(RuntimeSuspendAttemptCanonicalErrorV2::NonCanonicalEncoding);
+    }
+    Ok(local_effect)
+}
+
+pub(crate) fn encode_drain_obligation_bytes(
+    drain_obligation: &RuntimeDrainObligationV2,
+) -> Result<Vec<u8>, RuntimeSuspendAttemptCanonicalErrorV2> {
+    encode_root(&encode_drain_obligation(drain_obligation)?)
+}
+
+pub(crate) fn decode_drain_obligation_bytes(
+    encoded: &[u8],
+) -> Result<RuntimeDrainObligationV2, RuntimeSuspendAttemptCanonicalErrorV2> {
+    ensure_size(encoded)?;
+    let wire = serde_json::from_slice::<DrainObligationWireV2>(encoded)
+        .map_err(|_| RuntimeSuspendAttemptCanonicalErrorV2::Decoding)?;
+    let drain_obligation = decode_drain_obligation(wire)?;
+    if encode_drain_obligation_bytes(&drain_obligation)? != encoded {
+        return Err(RuntimeSuspendAttemptCanonicalErrorV2::NonCanonicalEncoding);
+    }
+    Ok(drain_obligation)
+}
+
+pub(super) fn encode_provenance_bytes(
+    provenance: &RuntimeRouteMutationProvenanceV2,
+) -> Result<Vec<u8>, RuntimeSuspendAttemptCanonicalErrorV2> {
+    encode_root(&encode_provenance(provenance)?)
+}
+
+pub(super) fn decode_provenance_bytes(
+    encoded: &[u8],
+) -> Result<RuntimeRouteMutationProvenanceV2, RuntimeSuspendAttemptCanonicalErrorV2> {
+    ensure_size(encoded)?;
+    let wire = serde_json::from_slice::<RouteMutationProvenanceWireV2>(encoded)
+        .map_err(|_| RuntimeSuspendAttemptCanonicalErrorV2::Decoding)?;
+    let provenance = decode_provenance(wire)?;
+    if encode_provenance_bytes(&provenance)? != encoded {
+        return Err(RuntimeSuspendAttemptCanonicalErrorV2::NonCanonicalEncoding);
+    }
+    Ok(provenance)
+}
+
 pub(super) fn decode_suspend_attempt(
     encoded: &[u8],
 ) -> Result<RuntimeSuspendAttemptRequestV2, RuntimeSuspendAttemptCanonicalErrorV2> {

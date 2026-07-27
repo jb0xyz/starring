@@ -1791,6 +1791,75 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
 }
 
 #[test]
+fn v2_drain_intent_canonical_state_is_strict_pure_and_two_phase() {
+    let source = include_str!("../src/v2_drain_intent_canonical_state.rs");
+    let wire = include_str!("../src/v2_drain_intent_canonical_state/wire.rs");
+    let tests = include_str!("../src/v2_drain_intent_canonical_state/tests.rs");
+
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "std::fs",
+        "std::net",
+        "SystemTime",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+        assert!(!wire.contains(forbidden), "{forbidden}");
+    }
+
+    for declaration in [
+        "pub struct RuntimeCanonicalDrainIntentStateV2",
+        "pub struct RuntimePersistedUnclaimedPendingDrainIntentV2",
+        "pub struct RuntimePersistedRouteAbsenceCandidateDrainIntentV2",
+        "pub struct RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2",
+        "pub struct RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2",
+        "const DRAIN_INTENT_STATE_MAX_OCTETS: usize = 1_048_576;",
+    ] {
+        assert!(source.contains(declaration), "{declaration}");
+    }
+
+    for exact_check in [
+        "RuntimeCanonicalDrainIntentStateV2::from_persisted(",
+        "RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(",
+        "RuntimeDrainIntentReceiptV2::acknowledged(",
+        "RuntimeDrainClaimProgressKindV2::Claimed => None",
+        "RuntimeDrainClaimProgressKindV2::Refenced => {",
+        "claim.progress().removal_target().cloned()",
+        "if encode_state(&intent)? != encoded",
+        "#[serde(deny_unknown_fields)]",
+        "#[serde(tag = \"kind\", deny_unknown_fields)]",
+    ] {
+        assert!(
+            source.contains(exact_check) || wire.contains(exact_check),
+            "{exact_check}"
+        );
+    }
+
+    assert!(!source.contains("pub struct RuntimeClosedRecoveryPendingDrainTransitionV2"));
+
+    for test_name in [
+        "all_state_and_pending_progress_variants_roundtrip_exactly",
+        "simple_pending_encoding_is_a_fixed_order_golden",
+        "decoder_rejects_unknown_noncanonical_and_mismatched_root_state",
+        "pending_subtype_and_nested_provenance_corruption_fail_closed",
+        "payload_limit_matches_the_one_mebibyte_execution_frame_cap",
+        "closed_recovery_requires_two_persisted_cas_transitions",
+        "persisted_refenced_candidate_acknowledges_the_exact_removal_target",
+        "routed_claimed_state_is_not_a_route_absence_candidate",
+        "closed_recovery_builder_rejects_owner_drift_and_revision_overflow",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V2 drain-intent canonical-state test: {test_name}"
+        );
+    }
+}
+
+#[test]
 fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
     let source = include_str!("../src/v2_drain_intent_receipt.rs");
     let tests = include_str!("../src/v2_drain_intent_receipt/tests.rs");
@@ -3332,6 +3401,18 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_drain_intent_state/tests.rs",
             include_str!("../src/v2_drain_intent_state/tests.rs"),
+        ),
+        (
+            "src/v2_drain_intent_canonical_state.rs",
+            include_str!("../src/v2_drain_intent_canonical_state.rs"),
+        ),
+        (
+            "src/v2_drain_intent_canonical_state/wire.rs",
+            include_str!("../src/v2_drain_intent_canonical_state/wire.rs"),
+        ),
+        (
+            "src/v2_drain_intent_canonical_state/tests.rs",
+            include_str!("../src/v2_drain_intent_canonical_state/tests.rs"),
         ),
         (
             "src/v2_drain_intent_receipt.rs",
