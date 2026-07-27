@@ -200,7 +200,7 @@ fn execution_metadata_and_controller_lookup_preserve_capability_ownership() {
 }
 
 #[test]
-fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_product_drain_ports() {
+fn adapter_exposes_only_approved_runtime_ports() {
     let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     let source = sources.join("\n");
     for required in [
@@ -209,6 +209,9 @@ fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_pro
         "impl RuntimeGatewayOwnerLeasePortV1",
         "impl RuntimeWriterFenceObservationPortV1",
         "impl RuntimeProductDrainObservationPortV2",
+        "impl RuntimeCertificationReservationPortV2",
+        "impl RuntimeStartupRecoveryObservationPortV2",
+        "impl RuntimeStartupRecoveryExecutionPortV2",
     ] {
         assert!(source.contains(required), "missing port: {required}");
     }
@@ -217,6 +220,173 @@ fn adapter_exposes_only_execution_observation_gateway_owner_writer_fence_and_pro
     assert!(source.contains("execute_observe_previous_serving_v1"));
     assert!(source.contains("execute_recover_next_stale_live_v1"));
     assert!(source.contains("!matches!(self, Self::Observe { .. })"));
+}
+
+#[test]
+fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution() {
+    let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let source = sources.join("\n");
+    assert!(source.contains("impl RuntimeStartupRecoveryExecutionPortV2"));
+    assert!(source.contains("public.starring_runtime_startup_recovery_execute_stale_live_v2"));
+    for forbidden in [
+        "starring_runtime_private_v2",
+        "starring_runtime_startup_recovery_action_record_v2",
+        "runtime_startup_recovery_actions_v2",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden surface: {forbidden}"
+        );
+    }
+    let contract = include_str!("../src/contract.rs");
+    assert_eq!(
+        contract
+            .split("pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1")
+            .nth(1)
+            .unwrap()
+            .split("];")
+            .next()
+            .unwrap()
+            .matches("public.starring_runtime_")
+            .count(),
+        17
+    );
+}
+
+#[test]
+fn startup_recovery_observation_is_atomic_bounded_and_fail_closed() {
+    let adapter = include_str!("../src/startup_recovery/mod.rs");
+    let query = include_str!("../src/startup_recovery/query.rs");
+    let row = include_str!("../src/startup_recovery/row.rs");
+    let adapter_production = adapter.split("#[cfg(test)]").next().unwrap();
+    let query_production = query.split("#[cfg(test)]").next().unwrap();
+    assert!(query.contains("starring_runtime_startup_recovery_observe_v2"));
+    assert_eq!(query_production.matches('$').count(), 6);
+    for required in [
+        "operation_cutoff.min(statement_cutoff)",
+        "begin_execution_mutation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "ExecutionConnectionGuardV1",
+        "RuntimeStartupRecoveryObservationRowV2",
+        "RuntimeStartupRecoveryObservationPortV2",
+        "transaction.commit()",
+        "authorization.complete(*receipt)",
+        "RuntimeExecutionPersistenceErrorV1::OwnershipLost",
+        "RuntimeExecutionPersistenceErrorV1::ObservationAmbiguous",
+    ] {
+        assert!(
+            adapter.contains(required),
+            "missing adapter contract: {required}"
+        );
+    }
+    assert_eq!(
+        adapter_production
+            .matches("connection.release_to_pool()")
+            .count(),
+        1
+    );
+    assert!(adapter_production.contains(
+        "if Instant::now() >= operation_cutoff {\n            return Err(RuntimeExecutionPersistenceErrorV1::Timeout);"
+    ));
+    assert_eq!(
+        adapter_production
+            .matches("if Instant::now() >= effective_cutoff")
+            .count(),
+        3
+    );
+    let completed_operation = adapter_production
+        .find("let outcome = match result")
+        .unwrap();
+    let final_cutoff = adapter_production[..completed_operation]
+        .rfind("if Instant::now() >= effective_cutoff")
+        .unwrap();
+    assert!(final_cutoff < completed_operation);
+    assert!(adapter_production
+        .contains("Ok(Ok(outcome)) => {\n                connection.release_to_pool();"));
+    assert!(adapter_production.contains("Ok(Err(error)) => return Err(error)"));
+    assert_eq!(
+        adapter_production
+            .matches("authorization.complete(*receipt)")
+            .count(),
+        1
+    );
+    let transaction = adapter_production
+        .split("async fn observe_startup_recovery_on_connection_v2")
+        .nth(1)
+        .unwrap();
+    let decode = transaction.find(".decode(request)?").unwrap();
+    let commit = transaction.find("transaction.commit()").unwrap();
+    assert!(decode < commit);
+    assert!(row.contains("\"observed\" => self.decode_observed(request)"));
+    assert!(row.contains("\"not_current\" => self.decode_not_current(request)"));
+    assert!(row.contains("\"ambiguous\" => self.decode_ambiguous(request)"));
+    assert!(row.contains("MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION"));
+    assert!(row.contains("u32::try_from"));
+    for source in [adapter_production, query_production] {
+        for forbidden in [
+            "runtime_gateway_owners",
+            "runtime_deployments",
+            "runtime_serving_leases",
+            "INSERT ",
+            "UPDATE ",
+            "DELETE ",
+            "TRUNCATE ",
+        ] {
+            assert!(!source.contains(forbidden), "raw startup edge: {forbidden}");
+        }
+    }
+}
+
+#[test]
+fn certification_reservation_uses_only_scoped_functions_and_verified_transactions() {
+    let adapter = include_str!("../src/certification_reservation/mod.rs");
+    let query = include_str!("../src/certification_reservation/query.rs");
+    for capability in [
+        "starring_runtime_certification_reserve_intent_v2",
+        "starring_runtime_certification_reservation_observe_v2",
+    ] {
+        assert!(query.contains(capability));
+    }
+    for column in [
+        "outcome_name",
+        "locked_snapshot",
+        "locked_convergence_attempt_no",
+        "observed_at",
+        "operation_id",
+        "tenant_id",
+        "installation_id",
+        "deployment_id",
+        "deployment_revision",
+        "convergence_attempt_no",
+        "certification_intent_bytes",
+        "intent_fingerprint",
+    ] {
+        assert!(query.contains(column));
+    }
+    assert!(query.contains("$27"));
+    for required in [
+        "begin_execution_mutation_transaction",
+        "begin_execution_locked_observation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "ExecutionConnectionGuardV1",
+        "map_mutation_commit_error",
+        "RuntimeCertificationReservationRowV2",
+        "RuntimeCertificationReservationPortV2",
+        "RuntimeExecutionPersistenceErrorV1::Indeterminate",
+        "i64::try_from",
+    ] {
+        assert!(adapter.contains(required));
+    }
+    for forbidden in [
+        "runtime_certification_intent_reservations",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "TRUNCATE ",
+        " as i64",
+    ] {
+        assert!(!adapter.contains(forbidden));
+    }
 }
 
 #[test]

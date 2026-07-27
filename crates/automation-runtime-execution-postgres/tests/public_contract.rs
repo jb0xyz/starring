@@ -18,7 +18,8 @@ use automation_runtime_execution_postgres::{
 };
 use automation_runtime_worker::{
     RuntimeGatewayOwnerLeasePortV1, RuntimeGatewayOwnerObservationErrorClassV1,
-    RuntimeProductDrainObservationPortV2, RuntimeWriterFenceObservationPortV1,
+    RuntimeProductDrainObservationPortV2, RuntimeStartupRecoveryObservationPortV2,
+    RuntimeWriterFenceObservationPortV1,
 };
 
 fn assert_mutate_signature(
@@ -64,6 +65,12 @@ where
 fn assert_product_drain_port<T>()
 where
     T: RuntimeProductDrainObservationPortV2<Error = RuntimeExecutionPersistenceErrorV1>,
+{
+}
+
+fn assert_startup_recovery_observation_port<T>()
+where
+    T: RuntimeStartupRecoveryObservationPortV2<Error = RuntimeExecutionPersistenceErrorV1>,
 {
 }
 
@@ -150,6 +157,11 @@ fn persistence_error_codes_and_classes_are_stable_and_unique() {
             RuntimeConvergenceErrorClassV1::Retryable,
             "runtime_execution_indeterminate",
         ),
+        (
+            RuntimeExecutionPersistenceErrorV1::ObservationAmbiguous,
+            RuntimeConvergenceErrorClassV1::InvalidState,
+            "runtime_execution_observation_ambiguous",
+        ),
     ];
     let mut codes = BTreeSet::new();
     for (error, class, code) in cases {
@@ -188,6 +200,7 @@ fn gateway_owner_observation_error_classes_fail_closed() {
         RuntimeExecutionPersistenceErrorV1::RetryNotReady,
         RuntimeExecutionPersistenceErrorV1::Superseded,
         RuntimeExecutionPersistenceErrorV1::DatabaseFailure,
+        RuntimeExecutionPersistenceErrorV1::ObservationAmbiguous,
     ] {
         assert_eq!(
             PostgresRuntimeExecutionV1::classify_observation_error(&error),
@@ -278,6 +291,7 @@ fn verified_adapter_exposes_the_scoped_execution_contract() {
     assert_gateway_owner_port::<PostgresRuntimeExecutionV1>();
     assert_writer_fence_port::<PostgresRuntimeExecutionV1>();
     assert_product_drain_port::<PostgresRuntimeExecutionV1>();
+    assert_startup_recovery_observation_port::<PostgresRuntimeExecutionV1>();
     let _ = assert_gateway_owner_signatures;
     let _ = assert_writer_fence_signature;
     assert_eq!(

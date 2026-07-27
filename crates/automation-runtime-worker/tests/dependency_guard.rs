@@ -51,6 +51,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/capability_readiness.rs"),
+            PathBuf::from("src/certification_reservation.rs"),
             PathBuf::from("src/closed_recovery.rs"),
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_lifecycle_tests.rs"),
@@ -62,6 +63,8 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_recovery.rs"),
+            PathBuf::from("src/startup_recovery_execution.rs"),
+            PathBuf::from("src/startup_recovery_execution_tests.rs"),
             PathBuf::from("src/writer_fence.rs"),
         ]
     );
@@ -139,6 +142,48 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             );
         }
     }
+}
+
+#[test]
+fn certification_reservation_port_is_pure_checked_and_non_authorizing() {
+    let source = include_str!("../src/certification_reservation.rs");
+    let port = source
+        .split("pub trait RuntimeCertificationReservationPortV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+
+    for expected in [
+        "type Error;",
+        "reservation: RuntimeReservedCertificationIntentV2,",
+        "Result<RuntimeCertificationIntentReservationOutcomeV2, Self::Error>",
+        "lookup: RuntimeCertificationReservationScopeLookupV2,",
+        "Result<RuntimeCertificationReservationScopeObservationV2, Self::Error>",
+    ] {
+        assert!(port.contains(expected), "{expected}");
+    }
+    for forbidden in [
+        "RuntimeCertificationOperationIdV2",
+        "RuntimeCanonicalCertificationIntentV2",
+        "RuntimeCertificationIntentV2",
+        "RuntimeExecutionReceiptV1",
+        "authorize",
+        "commit",
+        "prepare",
+        "reset",
+        "consume",
+        "generate",
+        "new_id",
+    ] {
+        assert!(!port.contains(forbidden), "{forbidden}");
+    }
+    assert_eq!(port.matches("fn ").count(), 2);
+    assert_eq!(port.matches("fn reserve_certification_intent(").count(), 1);
+    assert_eq!(
+        port.matches("fn observe_certification_reservation_scope(")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -487,6 +532,7 @@ fn startup_observation_authority_is_iteration_linear_owner_bound_and_observe_onl
     }
     assert!(closed.contains(concat!(
         "operation_authority: Option<RuntimeClosedRecoveryOperationAuthorityV2>,\n",
+        "    pending_startup_recovery_execution: Option<RuntimePendingStartupRecoveryExecutionV2>,\n",
         "    last_startup_observation_database_now: Option<DateTime<Utc>>,"
     )));
     assert_eq!(
@@ -689,7 +735,13 @@ fn startup_observation_authority_is_iteration_linear_owner_bound_and_observe_onl
         acceptance
             .matches("permit.restore_operation_authority(operation_authority, database_now)?")
             .count(),
-        2
+        1
+    );
+    assert_eq!(
+        acceptance
+            .matches("permit.restore_operation_authority_for_recovery(")
+            .count(),
+        1
     );
     assert_eq!(
         acceptance
@@ -849,6 +901,302 @@ fn startup_observation_authority_is_iteration_linear_owner_bound_and_observe_onl
         .unwrap();
     assert!(fixed_current < fixed_match);
     assert!(!complete.contains("restore_operation_authority"));
+}
+
+#[test]
+fn startup_recovery_execution_is_linear_exactly_bound_and_progress_proven() {
+    let execution = include_str!("../src/startup_recovery_execution.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let lifecycle = include_str!("../src/gateway_lifecycle.rs");
+
+    for authority in [
+        "RuntimeStartupRecoveryExecutionRequestV2",
+        "RuntimeAuthorizedStartupRecoveryExecutionV2",
+        "RuntimeStartupRecoveryExecutionReceiptV2",
+        "RuntimeCompletedStartupRecoveryExecutionV2",
+        "RuntimeAcceptedStartupRecoveryExecutionOutcomeV2",
+        "RuntimeStartupRecoveryExecutionTerminalDigestV2",
+    ] {
+        let declaration = execution
+            .split(&format!("pub struct {authority}"))
+            .next()
+            .unwrap();
+        let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(execution, authority, forbidden));
+        }
+    }
+    for authority in [
+        "RuntimeStartupRecoveryExecutionRequestV2",
+        "RuntimeAuthorizedStartupRecoveryExecutionV2",
+        "RuntimeCompletedStartupRecoveryExecutionV2",
+        "RuntimeAcceptedStartupRecoveryExecutionOutcomeV2",
+    ] {
+        let fields = execution
+            .split(&format!("pub struct {authority} {{"))
+            .nth(1)
+            .and_then(|source| source.split("}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(execution.contains(&format!("{authority}(<redacted>)")));
+    }
+    assert!(execution.contains(concat!(
+        "pub struct RuntimeStartupRecoveryExecutionReceiptV2 {\n",
+        "    pub correlation: RuntimeStartupRecoveryExecutionCorrelationV2,\n",
+        "    pub class: RuntimeStartupRecoveryClassV2,\n",
+        "    pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,\n",
+        "    pub outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2,\n",
+        "}"
+    )));
+    assert!(execution.contains(concat!(
+        "Progressed {\n",
+        "        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,\n",
+        "        terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,\n",
+        "    }"
+    )));
+    assert!(!execution.contains("Progressed,"));
+    assert!(execution.contains("if value == [0; 32]"));
+    assert!(execution.contains("RuntimeStartupRecoveryExecutionDigestErrorV2::Zero"));
+    let identity_impl = execution
+        .split("impl RuntimeStartupRecoveryExecutionActionIdentityV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl Debug").next())
+        .unwrap();
+    assert!(!identity_impl.contains("fn new("));
+    for identity in [
+        "RuntimeStartupRecoveryExecutionCorrelationV2",
+        "RuntimeStartupRecoveryExecutionActionIdentityV2",
+    ] {
+        let fields = execution
+            .split(&format!("pub struct {identity} {{"))
+            .nth(1)
+            .and_then(|source| source.split("}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{identity}");
+    }
+    assert_eq!(
+        execution
+            .matches("action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2 {\n",)
+            .count(),
+        1
+    );
+    assert!(execution.contains(concat!(
+        "pub struct RuntimeAuthorizedStartupRecoveryExecutionV2 {\n",
+        "    request: RuntimeStartupRecoveryExecutionRequestV2,\n",
+        "    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,\n",
+        "}"
+    )));
+    assert!(execution.contains(concat!(
+        "pub struct RuntimeCompletedStartupRecoveryExecutionV2 {\n",
+        "    authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,\n",
+        "    receipt: RuntimeStartupRecoveryExecutionReceiptV2,\n",
+        "}"
+    )));
+    assert!(execution.contains(concat!(
+        "pub(crate) struct RuntimeValidatedStartupRecoveryExecutionV2 {\n",
+        "    operation_authority: RuntimeClosedRecoveryOperationAuthorityV2,\n",
+        "    request: RuntimeStartupRecoveryExecutionRequestV2,\n",
+        "    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,\n",
+        "    outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2,\n",
+        "}"
+    )));
+
+    for field in [
+        "correlation",
+        "class",
+        "action_identity",
+        "gateway_owner_lease_id",
+        "expected_owner_revision",
+        "expected_owner_expires_at",
+        "minimum_database_now",
+        "readiness",
+        "paused_gateway",
+        "registry_process_instance_id",
+        "registry_observation_sequence",
+        "registry_retained_slot_count",
+        "registry_retained_empty_tombstone_count",
+    ] {
+        assert!(
+            execution.contains(&format!("    {field}:")),
+            "missing execution request binding: {field}"
+        );
+    }
+    let port = execution
+        .split("pub trait RuntimeStartupRecoveryExecutionPortV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    assert_eq!(port.matches("fn execute_startup_recovery(").count(), 1);
+    assert!(port.contains("authorization: RuntimeAuthorizedStartupRecoveryExecutionV2"));
+    assert!(port.contains("operation_cutoff: Instant"));
+    assert!(port.contains("RuntimeCompletedStartupRecoveryExecutionV2"));
+    for forbidden in [
+        "deploy",
+        "activate",
+        "admission",
+        "Discord",
+        "sqlx",
+        "twilight",
+    ] {
+        assert!(!port.contains(forbidden), "{forbidden}");
+    }
+
+    let validation = execution
+        .split("pub(crate) fn validate_startup_recovery_execution_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\npub(crate) fn accept_validated_startup_recovery_execution_v2(")
+                .next()
+        })
+        .unwrap();
+    for required in [
+        "validate_execution_request_binding_v2(permit, &request)?",
+        "receipt.correlation != request.correlation",
+        "receipt.class != request.class",
+        "observed_owner.lease_id != request.gateway_owner_lease_id",
+        "observed_owner.owner_revision != request.expected_owner_revision",
+        "observed_owner.expires_at != request.expected_owner_expires_at",
+        "observed_owner.database_now < request.minimum_database_now",
+        "observed_owner.database_lease_duration()",
+        "action_identity != &request.action_identity",
+        "retry_after.is_zero() || *retry_after > available",
+    ] {
+        assert!(validation.contains(required), "{required}");
+    }
+    let request_binding = execution
+        .split("fn validate_execution_request_binding_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\nfn startup_recovery_execution_request_v2(")
+                .next()
+        })
+        .unwrap();
+    for required in [
+        "correlation.recovery_id != *permit.recovery_id()",
+        "correlation.authority_revision.get() != permit.authority_revision().get()",
+        "correlation.selection_authority_revision",
+        "pending.selection_correlation().authority_revision",
+        "request.class != pending.class()",
+        "request.readiness != *permit.readiness()",
+        "request.paused_gateway != *permit.paused_gateway()",
+        "request.registry_observation_sequence != registry.observation_sequence()",
+    ] {
+        assert!(request_binding.contains(required), "{required}");
+    }
+
+    assert!(closed.contains(concat!(
+        "pending_startup_recovery_execution: Option<RuntimePendingStartupRecoveryExecutionV2>,\n",
+        "    last_startup_observation_database_now: Option<DateTime<Utc>>,"
+    )));
+    let recovery_restore = closed
+        .split("pub(crate) fn restore_operation_authority_for_recovery(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub(crate) fn restore_after_startup_recovery_execution(")
+                .next()
+        })
+        .unwrap();
+    let successor = recovery_restore
+        .find("let authority_revision = self.authority_revision.successor()?")
+        .unwrap();
+    let authority = recovery_restore
+        .find("self.operation_authority = Some(authority)")
+        .unwrap();
+    let pending = recovery_restore
+        .find("self.pending_startup_recovery_execution =")
+        .unwrap();
+    let publication = recovery_restore
+        .find("self.authority_revision = authority_revision")
+        .unwrap();
+    assert!(successor < authority && authority < pending && pending < publication);
+    let execution_restore = closed
+        .split("pub(crate) fn restore_after_startup_recovery_execution(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub(crate) fn refresh_readiness(")
+                .next()
+        })
+        .unwrap();
+    let exact_pending = execution_restore
+        .find("pending.selection_correlation.authority_revision != selection_authority_revision")
+        .unwrap();
+    let successor = execution_restore
+        .find("let authority_revision = self.authority_revision.successor()?")
+        .unwrap();
+    let authority = execution_restore
+        .find("self.operation_authority = Some(authority)")
+        .unwrap();
+    let clear = execution_restore
+        .find("self.pending_startup_recovery_execution = None")
+        .unwrap();
+    let publication = execution_restore
+        .find("self.authority_revision = authority_revision")
+        .unwrap();
+    assert!(
+        exact_pending < successor
+            && successor < authority
+            && authority < clear
+            && clear < publication
+    );
+
+    let begin = lifecycle
+        .split("pub fn begin_startup_recovery_execution(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub fn complete_startup_recovery_execution(")
+                .next()
+        })
+        .unwrap();
+    let current = begin
+        .find("self.validate_recovery_permit(permit)?")
+        .unwrap();
+    let available = begin
+        .find("!permit.operation_authority_is_available()")
+        .unwrap();
+    let pending = begin
+        .find("permit\n            .pending_startup_recovery_execution()")
+        .unwrap();
+    let class = begin.find("if class != pending_class").unwrap();
+    let authorization = begin
+        .find("authorize_startup_recovery_execution_v2(")
+        .unwrap();
+    assert!(current < available && available < pending && pending < class && class < authorization);
+    let complete = lifecycle
+        .split("pub fn complete_startup_recovery_execution(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("\n    pub fn validate_startup_recovery_fixed_point(")
+                .next()
+        })
+        .unwrap();
+    let current = complete
+        .find("self.validate_recovery_permit(permit)?")
+        .unwrap();
+    let unavailable = complete
+        .find("permit.operation_authority_is_available()")
+        .unwrap();
+    let validation = complete
+        .find("validate_startup_recovery_execution_v2(permit, completed)")
+        .unwrap();
+    let acceptance = complete
+        .find("accept_validated_startup_recovery_execution_v2(permit, validated)")
+        .unwrap();
+    let publication = complete
+        .find("self.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending")
+        .unwrap();
+    assert!(
+        current < unavailable
+            && unavailable < validation
+            && validation < acceptance
+            && acceptance < publication
+    );
 }
 
 #[test]

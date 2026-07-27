@@ -1,5 +1,6 @@
 mod bootstrap;
 mod certification;
+mod certification_reservation;
 mod connection;
 mod contract;
 mod controller;
@@ -13,6 +14,8 @@ mod proof;
 mod query;
 mod recovery;
 mod row;
+mod startup_recovery;
+mod startup_recovery_execution;
 mod store;
 mod writer_fence;
 

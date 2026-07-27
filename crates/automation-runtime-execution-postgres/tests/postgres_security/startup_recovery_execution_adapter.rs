@@ -1,0 +1,502 @@
+use automation_runtime_worker::{
+    RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionPortV2,
+    RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
+};
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_accepts_progressed_and_replayed_receipts() {
+    let server = PostgresTestServer::start();
+
+    let applied_database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&applied_database, 1_000).await;
+    wait_for_stale_live(&applied_database).await;
+    let applied_adapter = verified_execution_adapter(&applied_database).await;
+    let applied_owner = acquire_startup_observation_port_owner(&applied_adapter).await;
+    let (mut applied_lifecycle, mut applied_permit, applied_authorization) =
+        authorize_stale_live_execution_port_call(
+            &applied_adapter,
+            applied_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let applied_action = applied_authorization.request().action_identity().clone();
+    let applied_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &applied_adapter,
+        applied_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let applied = applied_lifecycle
+        .complete_startup_recovery_execution(&mut applied_permit, applied_completed)
+        .unwrap();
+    assert_eq!(applied.class(), RuntimeStartupRecoveryClassV2::StaleLive);
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = applied.outcome()
+    else {
+        panic!("stale live adapter execution must progress")
+    };
+    assert_eq!(action_identity, &applied_action);
+    assert_ne!(terminal_digest.as_bytes(), &[0; 32]);
+    assert_eq!(
+        startup_stale_live_journal_count(
+            &applied_database.owner_pool,
+            applied_action.correlation().recovery_id().as_str(),
+        )
+        .await,
+        1
+    );
+    cleanup(applied_database).await;
+
+    let replayed_database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&replayed_database, 1_000).await;
+    wait_for_stale_live(&replayed_database).await;
+    let replayed_adapter = verified_execution_adapter(&replayed_database).await;
+    let replayed_owner = acquire_startup_observation_port_owner(&replayed_adapter).await;
+    let (mut replayed_lifecycle, mut replayed_permit, replayed_authorization) =
+        authorize_stale_live_execution_port_call(
+            &replayed_adapter,
+            replayed_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let replayed_input =
+        startup_stale_live_input_from_authorization(&replayed_authorization).unwrap();
+    let direct_applied =
+        execute_startup_stale_live(&replayed_database.executor_pool, &replayed_input, "5s")
+            .await
+            .unwrap();
+    assert_eq!(direct_applied["journal_outcome_name"], "applied");
+    assert_eq!(direct_applied["terminal_outcome_name"], "progressed");
+    let expected_digest =
+        decode_lowercase_hex_32(direct_applied["terminal_digest"].as_str().unwrap());
+    let replayed_action = replayed_authorization.request().action_identity().clone();
+    let replayed_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &replayed_adapter,
+        replayed_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let replayed = replayed_lifecycle
+        .complete_startup_recovery_execution(&mut replayed_permit, replayed_completed)
+        .unwrap();
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = replayed.outcome()
+    else {
+        panic!("exact stale live replay must preserve progress proof")
+    };
+    assert_eq!(action_identity, &replayed_action);
+    assert_eq!(terminal_digest.as_bytes(), &expected_digest);
+    assert_eq!(
+        startup_stale_live_journal_count(
+            &replayed_database.owner_pool,
+            replayed_action.correlation().recovery_id().as_str(),
+        )
+        .await,
+        1
+    );
+    cleanup(replayed_database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_accepts_no_candidate_receipt() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&database, 1_000).await;
+    wait_for_stale_live(&database).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (mut lifecycle, mut permit, authorization) =
+        authorize_stale_live_execution_port_call(&adapter, owner, Duration::from_secs(5)).await;
+    let recovery_id = authorization
+        .request()
+        .correlation()
+        .recovery_id()
+        .as_str()
+        .to_owned();
+    assert!(
+        RuntimeExecutionConvergencePort::recover_next_stale_live(&adapter)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &adapter,
+        authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome(),
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate
+    ));
+    assert_eq!(
+        startup_stale_live_journal_count(&database.owner_pool, &recovery_id).await,
+        1
+    );
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_maps_lost_owner() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&database, 1_000).await;
+    wait_for_stale_live(&database).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (_, _, authorization) =
+        authorize_stale_live_execution_port_call(&adapter, owner.clone(), Duration::from_secs(5))
+            .await;
+    let released = RuntimeGatewayOwnerLeasePortV1::release_gateway_owner(
+        &adapter,
+        RuntimeReleaseGatewayOwnerLeaseV1 {
+            lease_id: owner.lease_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        released,
+        RuntimeReleaseGatewayOwnerLeaseOutcomeV1::Released { .. }
+    ));
+
+    assert!(matches!(
+        RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+            &adapter,
+            authorization,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await,
+        Err(RuntimeExecutionPersistenceErrorV1::OwnershipLost)
+    ));
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_pre_dispatch_cutoff_is_timeout() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&database, 1_000).await;
+    wait_for_stale_live(&database).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (_, _, authorization) =
+        authorize_stale_live_execution_port_call(&adapter, owner, Duration::from_secs(5)).await;
+    let mut blocker = database.owner_pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.product_control_plane_identity IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let execution_adapter = adapter.clone();
+    let execution = tokio::spawn(async move {
+        RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+            &execution_adapter,
+            authorization,
+            Instant::now() + Duration::from_millis(500),
+        )
+        .await
+    });
+    wait_for_blocked_startup_recovery_binding(&database.owner_pool).await;
+    assert!(matches!(
+        execution.await.unwrap(),
+        Err(RuntimeExecutionPersistenceErrorV1::Timeout)
+    ));
+    blocker.rollback().await.unwrap();
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_cutoff_detaches_dispatched_connection() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&database, 1_000).await;
+    wait_for_stale_live(&database).await;
+    let single_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            database
+                .foreign_database_options
+                .clone()
+                .database(&database.name),
+        )
+        .await
+        .unwrap();
+    let adapter = verified_execution_adapter_for_pool(
+        &database,
+        single_pool.clone(),
+        automation_runtime_execution_postgres::RuntimeExecutionDatabaseTimeoutsV1::new(
+            Duration::from_secs(5),
+            Duration::from_secs(4),
+        )
+        .unwrap(),
+    )
+    .await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (_, _, authorization) =
+        authorize_stale_live_execution_port_call(&adapter, owner, Duration::from_secs(5)).await;
+    let mut blocker = database.owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(\
+            pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0)\
+         )",
+    )
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let execution_adapter = adapter.clone();
+    let execution = tokio::spawn(async move {
+        RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+            &execution_adapter,
+            authorization,
+            Instant::now() + Duration::from_millis(250),
+        )
+        .await
+    });
+    let blocked_backend = wait_for_blocked_startup_recovery_execution(&database.owner_pool).await;
+    assert!(matches!(
+        execution.await.unwrap(),
+        Err(RuntimeExecutionPersistenceErrorV1::Indeterminate)
+    ));
+    blocker.rollback().await.unwrap();
+    wait_for_startup_recovery_execution_backend_exit(&database.owner_pool, blocked_backend).await;
+    let replacement = sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(&single_pool)
+        .await
+        .unwrap();
+    assert_ne!(replacement, blocked_backend);
+
+    single_pool.close().await;
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_elapsed_cutoff_wins_before_database_access() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_for_startup_observation(&database, 1_000).await;
+    wait_for_stale_live(&database).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (_, _, authorization) =
+        authorize_stale_live_execution_port_call(&adapter, owner, Duration::from_secs(5)).await;
+    database.executor_pool.close().await;
+
+    assert!(matches!(
+        RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+            &adapter,
+            authorization,
+            Instant::now(),
+        )
+        .await,
+        Err(RuntimeExecutionPersistenceErrorV1::Timeout)
+    ));
+
+    cleanup(database).await;
+    drop(server);
+}
+
+async fn authorize_stale_live_execution_port_call(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    cutoff_after: Duration,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2,
+) {
+    let (mut lifecycle, mut permit, observation_authorization) =
+        authorize_startup_observation_port_call(adapter, owner);
+    let completed = RuntimeStartupRecoveryObservationPortV2::observe_startup_recovery(
+        adapter,
+        observation_authorization,
+        Instant::now() + cutoff_after,
+    )
+    .await
+    .unwrap();
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(continuation) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("stale live observation must request recovery")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive)
+    );
+    let authorization = lifecycle
+        .begin_startup_recovery_execution(&mut permit, continuation)
+        .unwrap();
+    (lifecycle, permit, authorization)
+}
+
+fn startup_stale_live_input_from_authorization(
+    authorization: &RuntimeAuthorizedStartupRecoveryExecutionV2,
+) -> Result<StartupStaleLiveExecutionInput, std::num::TryFromIntError> {
+    let request = authorization.request();
+    let correlation = request.correlation();
+    let owner = request.gateway_owner_lease_id();
+    Ok(StartupStaleLiveExecutionInput {
+        recovery_id: correlation.recovery_id().as_str().to_owned(),
+        originating_emergency_generation: i64::try_from(
+            correlation.originating_emergency_generation().get(),
+        )?,
+        coordinator_generation: i64::try_from(correlation.coordinator_generation().get())?,
+        action_authority_revision: i64::try_from(correlation.authority_revision().get())?,
+        selection_authority_revision: i64::try_from(
+            correlation.selection_authority_revision().get(),
+        )?,
+        owner: (
+            owner.gateway_shard_id.as_str().to_owned(),
+            owner.process_instance_id.as_str().to_owned(),
+            i64::try_from(owner.lease_epoch.get())?,
+            owner.expected_build_revision.as_str().to_owned(),
+            i64::try_from(request.expected_owner_revision().get())?,
+            request.expected_owner_expires_at(),
+        ),
+        minimum_database_now: request.minimum_database_now(),
+    })
+}
+
+async fn wait_for_stale_live(database: &IsolatedDatabase) {
+    let expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT expires_at FROM public.runtime_serving_leases \
+         WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    wait_for_database_time(&database.owner_pool, expiry).await;
+}
+
+async fn verified_execution_adapter_for_pool(
+    database: &IsolatedDatabase,
+    pool: PgPool,
+    timeouts: automation_runtime_execution_postgres::RuntimeExecutionDatabaseTimeoutsV1,
+) -> PostgresRuntimeExecutionV1 {
+    let database_identity = sqlx::query_scalar::<_, String>(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeExecutionDatabaseExpectationV1::new(
+        database_identity,
+        &database.name,
+        &database.role,
+    )
+    .unwrap();
+    PostgresRuntimeExecutionV1::connect_verified(pool, expectation, timeouts)
+        .await
+        .unwrap()
+}
+
+async fn wait_for_blocked_startup_recovery_execution(pool: &PgPool) -> i32 {
+    for _ in 0..200 {
+        let backend = sqlx::query_scalar::<_, i32>(
+            "SELECT activity.pid \
+             FROM pg_catalog.pg_stat_activity AS activity \
+             WHERE activity.datname = pg_catalog.current_database() \
+                AND activity.pid <> pg_catalog.pg_backend_pid() \
+                AND activity.state = 'active' \
+                AND activity.wait_event_type = 'Lock' \
+                AND activity.query LIKE \
+                    '%starring_runtime_startup_recovery_execute_stale_live_v2%' \
+             ORDER BY activity.pid \
+             LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some(backend) = backend {
+            return backend;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("startup recovery execution did not reach the writer fence lock")
+}
+
+async fn wait_for_blocked_startup_recovery_binding(pool: &PgPool) {
+    for _ in 0..200 {
+        let blocked = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                SELECT 1 \
+                FROM pg_catalog.pg_stat_activity AS activity \
+                WHERE activity.datname = pg_catalog.current_database() \
+                    AND activity.pid <> pg_catalog.pg_backend_pid() \
+                    AND activity.state = 'active' \
+                    AND activity.wait_event_type = 'Lock' \
+                    AND activity.query LIKE \
+                        '%starring_runtime_execution_database_identity_v1%'\
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("startup recovery execution did not reach the binding read")
+}
+
+async fn wait_for_startup_recovery_execution_backend_exit(pool: &PgPool, backend: i32) {
+    for _ in 0..200 {
+        let absent = sqlx::query_scalar::<_, bool>(
+            "SELECT NOT EXISTS (\
+                SELECT 1 \
+                FROM pg_catalog.pg_stat_activity AS activity \
+                WHERE activity.pid = $1\
+             )",
+        )
+        .bind(backend)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if absent {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out startup recovery execution backend did not exit")
+}
+
+fn decode_lowercase_hex_32(value: &str) -> [u8; 32] {
+    assert_eq!(value.len(), 64);
+    assert!(value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+    }
+    decoded
+}

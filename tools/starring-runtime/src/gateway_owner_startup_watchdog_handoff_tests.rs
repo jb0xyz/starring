@@ -21,15 +21,18 @@ use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
-    RuntimeAuthorizedStartupRecoveryObservationV2, RuntimeCapabilityReadinessKindV2,
-    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
-    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
-    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeCompletedStartupRecoveryObservationV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeAuthorizedStartupRecoveryObservationV2,
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeCompletedStartupRecoveryObservationV2,
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayOwnerLeasePortV1,
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
     RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
+    RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryObservationPortV2,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Notify;
@@ -152,6 +155,25 @@ struct FakeOperationGuardV1 {
     state: Arc<FakePortStateV1>,
 }
 
+struct StartupObservationFixturePortV2 {
+    calls: Arc<AtomicUsize>,
+    outcome: StartupObservationFixtureOutcomeV2,
+}
+
+enum StartupObservationFixtureOutcomeV2 {
+    Complete(RuntimeStartupRecoveryStateV2),
+    Error(FakeErrorV1),
+    Pending {
+        active: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    },
+}
+
+struct PendingStartupObservationGuardV2 {
+    active: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
 struct WakeCounterV1 {
     wakes: AtomicUsize,
 }
@@ -179,6 +201,57 @@ impl FakeOperationGuardV1 {
 impl Drop for FakeOperationGuardV1 {
     fn drop(&mut self) {
         self.state.active_operations.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for PendingStartupObservationGuardV2 {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.dropped.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl RuntimeStartupRecoveryObservationPortV2 for StartupObservationFixturePortV2 {
+    type Error = FakeErrorV1;
+
+    fn observe_startup_recovery(
+        &self,
+        authorization: RuntimeAuthorizedStartupRecoveryObservationV2,
+        _operation_cutoff: Instant,
+    ) -> impl Future<Output = Result<RuntimeCompletedStartupRecoveryObservationV2, Self::Error>> + Send
+    {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let outcome = match &self.outcome {
+            StartupObservationFixtureOutcomeV2::Complete(state) => {
+                StartupObservationFixtureOutcomeV2::Complete(state.clone())
+            }
+            StartupObservationFixtureOutcomeV2::Error(error) => {
+                StartupObservationFixtureOutcomeV2::Error(*error)
+            }
+            StartupObservationFixtureOutcomeV2::Pending { active, dropped } => {
+                StartupObservationFixtureOutcomeV2::Pending {
+                    active: active.clone(),
+                    dropped: dropped.clone(),
+                }
+            }
+        };
+        async move {
+            match outcome {
+                StartupObservationFixtureOutcomeV2::Complete(state) => {
+                    Ok(complete_startup_recovery_observation_v2(
+                        authorization,
+                        at_millis(1_000_100),
+                        state,
+                    ))
+                }
+                StartupObservationFixtureOutcomeV2::Error(error) => Err(error),
+                StartupObservationFixtureOutcomeV2::Pending { active, dropped } => {
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let _guard = PendingStartupObservationGuardV2 { active, dropped };
+                    std::future::pending().await
+                }
+            }
+        }
     }
 }
 
@@ -531,6 +604,29 @@ fn complete_startup_recovery_observation_v2(
     })
 }
 
+fn complete_startup_recovery_execution_v2(
+    authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,
+    database_now: DateTime<Utc>,
+) -> RuntimeCompletedStartupRecoveryExecutionV2 {
+    let request = authorization.request();
+    let receipt = RuntimeStartupRecoveryExecutionReceiptV2 {
+        correlation: request.correlation().clone(),
+        class: request.class(),
+        owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1 {
+            lease_id: request.gateway_owner_lease_id().clone(),
+            owner_revision: request.expected_owner_revision(),
+            database_now,
+            expires_at: request.expected_owner_expires_at(),
+        },
+        outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+            action_identity: request.action_identity().clone(),
+            terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2::new([31; 32])
+                .unwrap(),
+        },
+    };
+    authorization.complete(receipt)
+}
+
 fn fixture(
     lease_for: Duration,
     renew_before: Duration,
@@ -699,6 +795,319 @@ async fn initial_committed_recovery_fixture_until_v2(
     (gateway, registry, session, port)
 }
 
+async fn ready_recovery_iteration_fixture_v2(
+    recovery_id: &str,
+    operation_cutoff: Instant,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoveryReadyIterationV2,
+    FakePortV1,
+) {
+    let (gateway, registry, session, port) =
+        initial_committed_recovery_fixture_until_v2(recovery_id, operation_cutoff).await;
+    let ready = session
+        .refresh_iteration_readiness_with_test_verifier_v2(|_| {
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_for_test_v2(),
+            ))
+        })
+        .await
+        .unwrap();
+    (gateway, registry, ready, port)
+}
+
+#[tokio::test]
+async fn in_place_startup_observation_finalizes_continue_once() {
+    let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "41414141414141414141414141414141",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut state = empty_startup_recovery_state_v2();
+    state.serving = RuntimeStartupServingStateV2::RecoverableStale { count: 1 };
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Complete(state),
+    };
+
+    let completion = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, std::future::pending::<()>())
+        .await
+        .unwrap();
+    let outcome = iteration
+        .into_startup_recovery_observation_outcome_v2(completion)
+        .unwrap();
+
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected startup continuation")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let _ = session
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn in_place_startup_observation_finalizes_fixed_point_once() {
+    let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "42424242424242424242424242424242",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Complete(empty_startup_recovery_state_v2()),
+    };
+
+    let completion = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, std::future::pending::<()>())
+        .await
+        .unwrap();
+    let outcome = iteration
+        .into_startup_recovery_observation_outcome_v2(completion)
+        .unwrap();
+
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let _ = fixed_point
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn in_place_startup_observer_error_retains_bounded_cleanup_authority() {
+    let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "43434343434343434343434343434343",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Error(FakeErrorV1::Retryable),
+    };
+
+    let error = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryStartupObservationAttemptErrorV2::Observation(
+            crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::Observer(
+                FakeErrorV1::Retryable
+            )
+        )
+    ));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let _ = iteration
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn in_place_startup_deadline_skips_observer_and_retains_cleanup() {
+    let (gateway, _registry, iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "44444444444444444444444444444444",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let mut iteration = iteration.with_operation_cutoff_for_test_v2(Instant::now());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Complete(empty_startup_recovery_state_v2()),
+    };
+
+    let error = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryStartupObservationAttemptErrorV2::Observation(
+            crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::DeadlineElapsed
+        )
+    ));
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    let _ = iteration
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn in_place_startup_interrupt_drops_losing_observer_and_retains_cleanup() {
+    let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "45454545454545454545454545454545",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Pending {
+            active: active.clone(),
+            dropped: dropped.clone(),
+        },
+    };
+    let interrupt_active = active.clone();
+    let interrupt = async move {
+        while interrupt_active.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        "discord"
+    };
+
+    let error = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, interrupt)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::closed_recovery::RuntimeClosedRecoveryStartupObservationAttemptErrorV2::Interrupted(
+            "discord"
+        )
+    ));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(active.load(Ordering::Acquire), 0);
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    let _ = iteration
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn dropping_polled_in_place_observation_preserves_cleanup_authority() {
+    let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "46464646464646464646464646464646",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Pending {
+            active: active.clone(),
+            dropped: dropped.clone(),
+        },
+    };
+    let mut observation = Box::pin(
+        iteration.observe_startup_recovery_interruptible_in_place_v2(
+            &observer,
+            std::future::pending::<()>(),
+        ),
+    );
+    std::future::poll_fn(|context| {
+        assert!(observation.as_mut().poll(context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    drop(observation);
+
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(active.load(Ordering::Acquire), 0);
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    let _ = iteration
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+    ));
+    wait_for(|| owner_port.release_calls() == 1).await;
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(owner_port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn dropping_unpolled_in_place_observation_preserves_the_single_call() {
+    let (_gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
+        "47474747474747474747474747474747",
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observer = StartupObservationFixturePortV2 {
+        calls: calls.clone(),
+        outcome: StartupObservationFixtureOutcomeV2::Complete(empty_startup_recovery_state_v2()),
+    };
+    let observation = iteration.observe_startup_recovery_interruptible_in_place_v2(
+        &observer,
+        std::future::pending::<()>(),
+    );
+
+    drop(observation);
+
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    let completion = iteration
+        .observe_startup_recovery_interruptible_in_place_v2(&observer, std::future::pending::<()>())
+        .await
+        .unwrap();
+    let outcome = iteration
+        .into_startup_recovery_observation_outcome_v2(completion)
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let _ = fixed_point
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await;
+    wait_for(|| owner_port.release_calls() == 1).await;
+}
+
 #[tokio::test]
 async fn committed_startup_observation_refreshes_then_advances_and_remains_closed() {
     let operation_cutoff = Instant::now() + Duration::from_secs(2);
@@ -858,6 +1267,24 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
         } if authority_revision.get() == 3
     ));
 
+    let (session, execution) = session
+        .execute_startup_recovery_with_test_executor_v2(continuation, |authorization| {
+            complete_startup_recovery_execution_v2(authorization, at_millis(1_000_150))
+        })
+        .unwrap();
+    assert_eq!(execution.class(), RuntimeStartupRecoveryClassV2::StaleLive);
+    assert!(matches!(
+        execution.outcome(),
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
+    ));
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 4
+    ));
+
     let ready_iteration = session
         .refresh_iteration_readiness_after_test_hook_v2(
             ready(Ok(
@@ -894,7 +1321,7 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
             authority_revision,
             ..
-        } if authority_revision.get() == 5
+        } if authority_revision.get() == 6
     ));
     drop(fixed_point);
     wait_for(|| port.release_calls() == 1).await;

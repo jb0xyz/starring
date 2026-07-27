@@ -1,6 +1,13 @@
+use automation_runtime_controller::{
+    RuntimeCertificationDivergenceV2, RuntimeCertificationIntentReservationOutcomeV2,
+    RuntimeCertificationReservationScopeLookupV2,
+    RuntimeCertificationReservationScopeObservationKindV2,
+};
+use automation_runtime_worker::RuntimeCertificationReservationPortV2;
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL test authority"]
-async fn certification_reservation_is_canonical_replay_safe_and_dormant() {
+async fn certification_reservation_adapter_is_replay_safe_and_capability_scoped() {
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
     certification_reservation_scenario(&database).await;
@@ -20,6 +27,7 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
         1
     );
 
+    let adapter = verified_execution_adapter(database).await;
     let mut session =
         gateway_ready_session(database, "runtime-certification-reservation-controller").await;
     let gateway_ready = gateway_ready_attestation(database, &session).await;
@@ -52,20 +60,18 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
                         CERTIFICATION_BUILD,
                     )
                     .unwrap(),
-                panel_report_digest:
-                    automation_runtime_controller::PanelReportDigestV1::parse(
-                        CERTIFICATION_REPORT,
-                    )
-                    .unwrap(),
-                gateway_shard_id:
-                    automation_runtime_controller::GatewayShardIdV1::parse(
-                        CERTIFICATION_SHARD,
-                    )
-                    .unwrap(),
+                panel_report_digest: automation_runtime_controller::PanelReportDigestV1::parse(
+                    CERTIFICATION_REPORT,
+                )
+                .unwrap(),
+                gateway_shard_id: automation_runtime_controller::GatewayShardIdV1::parse(
+                    CERTIFICATION_SHARD,
+                )
+                .unwrap(),
             },
             Duration::from_millis(CERTIFICATION_LEASE_MILLISECONDS as u64),
-    )
-    .unwrap();
+        )
+        .unwrap();
     let target = execution.snapshot.target.clone();
     let target_guild_id = target.guild_id.0.to_string();
     let process_identity = automation_runtime_convergence::RuntimeProcessIdentityV1 {
@@ -76,72 +82,59 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
     let panel = execution.snapshot.panel_certificate.as_ref().unwrap();
     let intent = automation_runtime_controller::RuntimeCertificationIntentV2 {
         action_id: request.action_id,
-        operation_id:
-            automation_runtime_controller::RuntimeCertificationOperationIdV2::parse(
-                "00112233445566778899aabbccddeeff",
-            )
-            .unwrap(),
+        operation_id: automation_runtime_controller::RuntimeCertificationOperationIdV2::parse(
+            "00112233445566778899aabbccddeeff",
+        )
+        .unwrap(),
         guard: request.guard,
         target: target.clone(),
         binding_pin: automation_runtime_controller::RuntimeBindingPinV1 {
             tenant_id: execution.snapshot.identity.tenant_id.clone(),
             installation_id: execution.snapshot.identity.installation_id.clone(),
-            installation_authority_revision:
-                std::num::NonZeroU64::new(1).unwrap(),
+            installation_authority_revision: std::num::NonZeroU64::new(1).unwrap(),
             binding_revision: target.binding_revision,
             binding_fingerprint: target.binding_fingerprint.clone(),
         },
         process_identity: process_identity.clone(),
-        gateway_owner_lease_id:
-            automation_runtime_controller::RuntimeGatewayOwnerLeaseIdV1 {
-                gateway_shard_id:
-                    automation_runtime_controller::GatewayShardIdV1::parse(
-                        CERTIFICATION_SHARD,
-                    )
-                    .unwrap(),
-                process_instance_id: process_instance_id.clone(),
-                lease_epoch: std::num::NonZeroU64::new(lease_epoch as u64).unwrap(),
-                expected_build_revision:
-                    automation_runtime_controller::RuntimeBuildRevisionV1::parse(
-                        CERTIFICATION_BUILD,
-                    )
-                    .unwrap(),
-            },
-        observed_owner_revision:
-            std::num::NonZeroU64::new(owner_revision as u64).unwrap(),
-        runtime_build_revision:
-            automation_runtime_controller::RuntimeBuildRevisionV1::parse(
+        gateway_owner_lease_id: automation_runtime_controller::RuntimeGatewayOwnerLeaseIdV1 {
+            gateway_shard_id: automation_runtime_controller::GatewayShardIdV1::parse(
+                CERTIFICATION_SHARD,
+            )
+            .unwrap(),
+            process_instance_id: process_instance_id.clone(),
+            lease_epoch: std::num::NonZeroU64::new(lease_epoch as u64).unwrap(),
+            expected_build_revision: automation_runtime_controller::RuntimeBuildRevisionV1::parse(
                 CERTIFICATION_BUILD,
             )
             .unwrap(),
+        },
+        observed_owner_revision: std::num::NonZeroU64::new(owner_revision as u64).unwrap(),
+        runtime_build_revision: automation_runtime_controller::RuntimeBuildRevisionV1::parse(
+            CERTIFICATION_BUILD,
+        )
+        .unwrap(),
         panel: automation_runtime_controller::RuntimePanelEvidenceV2 {
             certificate_id: panel.certificate_id.clone(),
             report_digest: panel.report_digest.clone(),
             process_identity,
             controller_fencing_token: execution.fencing_token,
         },
-        serving_lease_for: Duration::from_millis(
-            CERTIFICATION_LEASE_MILLISECONDS as u64,
-        ),
+        serving_lease_for: Duration::from_millis(CERTIFICATION_LEASE_MILLISECONDS as u64),
     };
     let canonical =
-        automation_runtime_controller::RuntimeCanonicalCertificationIntentV2::new(
-            intent.clone(),
-        )
-        .unwrap();
-    let reservation =
-        automation_runtime_controller::RuntimeReservedCertificationIntentV2::new(
-            &execution,
-            canonical,
-        )
-        .unwrap();
+        automation_runtime_controller::RuntimeCanonicalCertificationIntentV2::new(intent.clone())
+            .unwrap();
+    let reservation = automation_runtime_controller::RuntimeReservedCertificationIntentV2::new(
+        &execution, canonical,
+    )
+    .unwrap();
+    let lookup =
+        RuntimeCertificationReservationScopeLookupV2::from_awaiting_execution(&execution).unwrap();
 
     let before_absent = database_now(&database.owner_pool).await;
-    let absent = raw_certification_reservation_observe(
-        &database.owner_pool,
-        reservation.operation_scope(),
-    )
-    .await;
+    let absent =
+        raw_certification_reservation_observe(&database.owner_pool, reservation.operation_scope())
+            .await;
     let after_absent = database_now(&database.owner_pool).await;
     assert_eq!(absent.0, "absent");
     assert!(absent.1.is_none());
@@ -155,14 +148,10 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
         target.ruleset_key.as_str(),
     )
     .await;
-    let isolation_error = raw_certification_reserve_result(
-        &database.owner_pool,
-        &reservation,
-        None,
-        false,
-    )
-    .await
-    .unwrap_err();
+    let isolation_error =
+        raw_certification_reserve_result(&database.owner_pool, &reservation, None, false)
+            .await
+            .unwrap_err();
     assert_sqlstate(&isolation_error, "RX004");
     assert_eq!(
         certification_slot_writer_epoch(
@@ -174,8 +163,86 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
         initial_slot_epoch
     );
 
-    let first =
-        raw_certification_reserve(&database.owner_pool, &reservation, None).await;
+    let timeout_adapter = verified_execution_adapter_with_timeouts(
+        database,
+        automation_runtime_execution_postgres::RuntimeExecutionDatabaseTimeoutsV1::new(
+            Duration::from_millis(250),
+            Duration::from_millis(249),
+        )
+        .unwrap(),
+    )
+    .await;
+    let mut blocker = database.owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT writer_epoch \
+         FROM public.runtime_slot_writer_fences_v2 \
+         WHERE slot_guild_id = $1 AND slot_ruleset_key = $2 \
+         FOR UPDATE",
+    )
+    .bind(target_guild_id.as_str())
+    .bind(target.ruleset_key.as_str())
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let blocked_error = RuntimeCertificationReservationPortV2::reserve_certification_intent(
+        &timeout_adapter,
+        reservation.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        blocked_error,
+        RuntimeExecutionPersistenceErrorV1::Timeout
+            | RuntimeExecutionPersistenceErrorV1::Indeterminate
+    ));
+    blocker.rollback().await.unwrap();
+    let absent_after_deadline =
+        RuntimeCertificationReservationPortV2::observe_certification_reservation_scope(
+            &adapter,
+            lookup.clone(),
+        )
+        .await
+        .unwrap();
+    match absent_after_deadline.kind() {
+        RuntimeCertificationReservationScopeObservationKindV2::Absent {
+            lookup: persisted_lookup,
+            snapshot,
+            ..
+        } => {
+            assert_eq!(persisted_lookup, &lookup);
+            assert_eq!(snapshot, &execution.snapshot);
+        }
+        RuntimeCertificationReservationScopeObservationKindV2::Reserved { .. }
+        | RuntimeCertificationReservationScopeObservationKindV2::Diverged(_) => {
+            panic!("expected absent certification observation after deadline")
+        }
+    }
+    assert_eq!(
+        certification_slot_writer_epoch(
+            &database.owner_pool,
+            target_guild_id.as_str(),
+            target.ruleset_key.as_str(),
+        )
+        .await,
+        initial_slot_epoch
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    let first = RuntimeCertificationReservationPortV2::reserve_certification_intent(
+        &adapter,
+        reservation.clone(),
+    )
+    .await
+    .unwrap();
     let reserved_slot_epoch = certification_slot_writer_epoch(
         &database.owner_pool,
         target_guild_id.as_str(),
@@ -183,22 +250,17 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
     )
     .await;
     assert_eq!(reserved_slot_epoch, initial_slot_epoch + 1);
-    assert_eq!(first.0, "reserved");
     assert_eq!(
-        first.1.as_deref(),
-        Some(reservation.operation_id().as_str())
-    );
-    assert_eq!(
-        first.2.as_deref(),
-        Some(reservation.certification_intent_bytes())
-    );
-    assert_eq!(
-        first.3.as_deref(),
-        Some(reservation.intent_fingerprint().as_str())
+        first,
+        RuntimeCertificationIntentReservationOutcomeV2::Reserved(reservation.clone())
     );
 
-    let replay =
-        raw_certification_reserve(&database.owner_pool, &reservation, None).await;
+    let replay = RuntimeCertificationReservationPortV2::reserve_certification_intent(
+        &adapter,
+        reservation.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(replay, first);
     assert_eq!(
         certification_slot_writer_epoch(
@@ -210,18 +272,49 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
         reserved_slot_epoch
     );
 
-    let observed = raw_certification_reservation_observe(
-        &database.owner_pool,
-        reservation.operation_scope(),
+    let observed = RuntimeCertificationReservationPortV2::observe_certification_reservation_scope(
+        &adapter,
+        lookup.clone(),
     )
-    .await;
-    assert_eq!(observed.0, "reserved");
+    .await
+    .unwrap();
+    match observed.kind() {
+        RuntimeCertificationReservationScopeObservationKindV2::Reserved {
+            lookup: persisted_lookup,
+            snapshot,
+            reservation: persisted_reservation,
+            observed_at,
+        } => {
+            assert_eq!(persisted_lookup, &lookup);
+            assert_eq!(snapshot, &execution.snapshot);
+            assert_eq!(persisted_reservation, &reservation);
+            assert!(*observed_at >= before_absent);
+        }
+        RuntimeCertificationReservationScopeObservationKindV2::Absent { .. }
+        | RuntimeCertificationReservationScopeObservationKindV2::Diverged(_) => {
+            panic!("expected reserved certification observation")
+        }
+    }
     assert_eq!(
-        observed.1.as_deref(),
+        certification_slot_writer_epoch(
+            &database.owner_pool,
+            target_guild_id.as_str(),
+            target.ruleset_key.as_str(),
+        )
+        .await,
+        reserved_slot_epoch
+    );
+
+    let owner_observed =
+        raw_certification_reservation_observe(&database.owner_pool, reservation.operation_scope())
+            .await;
+    assert_eq!(owner_observed.0, "reserved");
+    assert_eq!(
+        owner_observed.1.as_deref(),
         Some(reservation.operation_id().as_str())
     );
     assert_eq!(
-        observed.2.as_deref(),
+        owner_observed.2.as_deref(),
         Some(reservation.certification_intent_bytes())
     );
 
@@ -231,21 +324,31 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
             "ffeeddccbbaa99887766554433221100",
         )
         .unwrap();
-    let competing =
-        automation_runtime_controller::RuntimeReservedCertificationIntentV2::new(
-            &execution,
-            automation_runtime_controller::RuntimeCanonicalCertificationIntentV2::new(
-                competing_intent,
-            )
+    let competing = automation_runtime_controller::RuntimeReservedCertificationIntentV2::new(
+        &execution,
+        automation_runtime_controller::RuntimeCanonicalCertificationIntentV2::new(competing_intent)
             .unwrap(),
-        )
-        .unwrap();
+    )
+    .unwrap();
     let diverged =
-        raw_certification_reserve(&database.owner_pool, &competing, None).await;
-    assert_eq!(diverged.0, "diverged");
-    assert!(diverged.1.is_none());
-    assert!(diverged.2.is_none());
-    assert!(diverged.3.is_none());
+        RuntimeCertificationReservationPortV2::reserve_certification_intent(&adapter, competing)
+            .await
+            .unwrap();
+    assert_eq!(
+        diverged,
+        RuntimeCertificationIntentReservationOutcomeV2::Diverged(
+            RuntimeCertificationDivergenceV2::ReservationMismatch,
+        )
+    );
+    assert_eq!(
+        certification_slot_writer_epoch(
+            &database.owner_pool,
+            target_guild_id.as_str(),
+            target.ruleset_key.as_str(),
+        )
+        .await,
+        reserved_slot_epoch
+    );
 
     let mut hostile_bytes = reservation.certification_intent_bytes().to_vec();
     hostile_bytes.push(b' ');
@@ -267,40 +370,21 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
     .unwrap_err();
     assert_sqlstate(&error, "RX002");
 
-    let executor_observe_error = sqlx::query(
-        "SELECT * FROM public.\
-         starring_runtime_certification_reservation_observe_v2($1,$2,$3,$4,$5)",
+    let executor_private_helper_error = sqlx::query_scalar::<_, String>(
+        "SELECT starring_runtime_private_v2.\
+         starring_runtime_certification_intent_fingerprint_v2($1)",
     )
-    .bind(reservation.operation_scope().scope().tenant_id.as_str())
-    .bind(
-        reservation
-            .operation_scope()
-            .scope()
-            .installation_id
-            .as_str(),
-    )
-    .bind(
-        reservation
-            .operation_scope()
-            .scope()
-            .deployment_id
-            .as_str(),
-    )
-    .bind(reservation.operation_scope().deployment_revision().get() as i64)
-    .bind(i64::from(
-        reservation.operation_scope().convergence_attempt().get(),
-    ))
-    .fetch_optional(&database.executor_pool)
+    .bind(reservation.certification_intent_bytes())
+    .fetch_one(&database.executor_pool)
     .await
     .unwrap_err();
-    assert_sqlstate(&executor_observe_error, "42501");
+    assert_sqlstate(&executor_private_helper_error, "42501");
 
-    let executor_table_error = sqlx::query(
-        "SELECT operation_id FROM public.runtime_certification_operations_v2",
-    )
-    .fetch_optional(&database.executor_pool)
-    .await
-    .unwrap_err();
+    let executor_table_error =
+        sqlx::query("SELECT operation_id FROM public.runtime_certification_operations_v2")
+            .fetch_optional(&database.executor_pool)
+            .await
+            .unwrap_err();
     assert_sqlstate(&executor_table_error, "42501");
 
     for statement in [
@@ -330,18 +414,48 @@ async fn certification_reservation_scenario(database: &IsolatedDatabase) {
         .unwrap(),
         1
     );
+    assert_eq!(
+        certification_slot_writer_epoch(
+            &database.owner_pool,
+            target_guild_id.as_str(),
+            target.ruleset_key.as_str(),
+        )
+        .await,
+        reserved_slot_epoch
+    );
+}
+
+async fn verified_execution_adapter_with_timeouts(
+    database: &IsolatedDatabase,
+    timeouts: automation_runtime_execution_postgres::RuntimeExecutionDatabaseTimeoutsV1,
+) -> PostgresRuntimeExecutionV1 {
+    let database_identity = sqlx::query_scalar::<_, String>(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeExecutionDatabaseExpectationV1::new(
+        database_identity,
+        &database.name,
+        &database.role,
+    )
+    .unwrap();
+    PostgresRuntimeExecutionV1::connect_verified(
+        database.executor_pool.clone(),
+        expectation,
+        timeouts,
+    )
+    .await
+    .unwrap()
 }
 
 async fn raw_certification_reserve(
     pool: &PgPool,
     reservation: &automation_runtime_controller::RuntimeReservedCertificationIntentV2,
     proposed: Option<(&[u8], &str)>,
-) -> (
-    String,
-    Option<String>,
-    Option<Vec<u8>>,
-    Option<String>,
-) {
+) -> (String, Option<String>, Option<Vec<u8>>, Option<String>) {
     raw_certification_reserve_result(pool, reservation, proposed, true)
         .await
         .unwrap()
@@ -352,21 +466,12 @@ async fn raw_certification_reserve_result(
     reservation: &automation_runtime_controller::RuntimeReservedCertificationIntentV2,
     proposed: Option<(&[u8], &str)>,
     serializable: bool,
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<Vec<u8>>,
-        Option<String>,
-    ),
-    sqlx::Error,
-> {
+) -> Result<(String, Option<String>, Option<Vec<u8>>, Option<String>), sqlx::Error> {
     let intent = reservation.canonical_intent().intent();
     let guard = &intent.guard;
     let scope = &guard.scope;
     let target = &intent.target;
-    let proposed_bytes =
-        proposed.map_or(reservation.certification_intent_bytes(), |value| value.0);
+    let proposed_bytes = proposed.map_or(reservation.certification_intent_bytes(), |value| value.0);
     let proposed_fingerprint =
         proposed.map_or(reservation.intent_fingerprint().as_str(), |value| value.1);
     let mut transaction = pool.begin().await?;
@@ -375,15 +480,7 @@ async fn raw_certification_reserve_result(
             .execute(&mut *transaction)
             .await?;
     }
-    let result = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            Option<Vec<u8>>,
-            Option<String>,
-        ),
-    >(
+    let result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, Option<String>)>(
         "SELECT outcome_name, operation_id, certification_intent_bytes, \
          intent_fingerprint \
          FROM public.starring_runtime_certification_reserve_intent_v2(\
@@ -431,11 +528,7 @@ async fn raw_certification_reserve_result(
     }
 }
 
-async fn certification_slot_writer_epoch(
-    pool: &PgPool,
-    guild_id: &str,
-    ruleset_key: &str,
-) -> i64 {
+async fn certification_slot_writer_epoch(pool: &PgPool, guild_id: &str, ruleset_key: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT writer_epoch \
          FROM public.runtime_slot_writer_fences_v2 \
@@ -450,29 +543,15 @@ async fn certification_slot_writer_epoch(
 
 async fn raw_certification_reservation_observe(
     pool: &PgPool,
-    scope:
-        &automation_runtime_controller::RuntimeCertificationOperationScopeV2,
-) -> (
-    String,
-    Option<String>,
-    Option<Vec<u8>>,
-    DateTime<Utc>,
-) {
+    scope: &automation_runtime_controller::RuntimeCertificationOperationScopeV2,
+) -> (String, Option<String>, Option<Vec<u8>>, DateTime<Utc>) {
     let deployment_scope = scope.scope();
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
         .execute(&mut *transaction)
         .await
         .unwrap();
-    let row = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            Option<Vec<u8>>,
-            DateTime<Utc>,
-        ),
-    >(
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, DateTime<Utc>)>(
         "SELECT outcome_name, operation_id, certification_intent_bytes, observed_at \
          FROM public.starring_runtime_certification_reservation_observe_v2(\
          $1,$2,$3,$4,$5)",

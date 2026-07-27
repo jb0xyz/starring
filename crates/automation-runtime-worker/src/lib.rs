@@ -1,4 +1,5 @@
 mod capability_readiness;
+mod certification_reservation;
 mod closed_recovery;
 mod gateway_lifecycle;
 mod gateway_owner;
@@ -8,12 +9,14 @@ mod product_drain;
 mod recovery;
 mod registry_recovery;
 mod startup_recovery;
+mod startup_recovery_execution;
 mod writer_fence;
 
 pub use capability_readiness::{
     RuntimeCapabilityReadinessErrorV2, RuntimeCapabilityReadinessKindV2,
     RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
 };
+pub use certification_reservation::RuntimeCertificationReservationPortV2;
 pub use closed_recovery::{
     RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryAuthorityRevisionV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
@@ -69,5 +72,17 @@ pub use startup_recovery::{
     RuntimeStartupRecoveryFixedPointProofV2, RuntimeStartupRecoveryObservationAcceptanceErrorV2,
     RuntimeStartupRecoveryObservationFixedPointV2, RuntimeStartupRecoveryObservationPortV2,
     RuntimeStartupRecoveryPlanErrorV2,
+};
+pub(crate) use startup_recovery_execution::{
+    accept_validated_startup_recovery_execution_v2, authorize_startup_recovery_execution_v2,
+    validate_startup_recovery_execution_v2,
+};
+pub use startup_recovery_execution::{
+    RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeStartupRecoveryExecutionAcceptanceErrorV2,
+    RuntimeStartupRecoveryExecutionActionIdentityV2, RuntimeStartupRecoveryExecutionCorrelationV2,
+    RuntimeStartupRecoveryExecutionDigestErrorV2, RuntimeStartupRecoveryExecutionPortV2,
+    RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
+    RuntimeStartupRecoveryExecutionRequestV2, RuntimeStartupRecoveryExecutionTerminalDigestV2,
 };
 pub use writer_fence::RuntimeWriterFenceObservationPortV1;

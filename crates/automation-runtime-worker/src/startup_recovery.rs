@@ -269,8 +269,12 @@ pub(crate) fn accept_validated_startup_recovery_observation_v2(
     let database_now = owner_receipt.database_now;
     match decision {
         RuntimeStartupRecoveryDecisionV2::Recover(class) => {
-            let authority_revision =
-                permit.restore_operation_authority(operation_authority, database_now)?;
+            let authority_revision = permit.restore_operation_authority_for_recovery(
+                operation_authority,
+                database_now,
+                class,
+                request.correlation,
+            )?;
             Some((
                 authority_revision,
                 RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(

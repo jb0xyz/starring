@@ -54,8 +54,9 @@ pub use process::{
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2,
-    RuntimeProcessRecoveryReadinessTransitionFailureV2,
-    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
+    RuntimeProcessRecoveryReadinessTransitionFailureV2, RuntimeProcessStartupRecoveryLoopErrorV2,
+    RuntimeProcessStartupRecoveryLoopFailureV2, RuntimeProcessStartupRecoveryObservationErrorV2,
+    RuntimeProcessStartupRecoveryObservationFailureV2,
     RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
 };
 pub use process_identity::RuntimeProcessInstanceIdGenerationErrorV1;

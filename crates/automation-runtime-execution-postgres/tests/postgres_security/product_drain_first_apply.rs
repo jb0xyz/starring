@@ -1289,14 +1289,15 @@ async fn product_drain_first_apply_upgrade_preserves_fifteen_executor_capabiliti
         )
         .await
         .unwrap();
-    for function in EXECUTOR_FUNCTIONS {
+    let pre_enable_functions = &EXECUTOR_FUNCTIONS[..15];
+    for function in pre_enable_functions {
         pool.execute(
             format!("GRANT EXECUTE ON FUNCTION {function} TO {executor_role}").as_str(),
         )
         .await
         .unwrap();
     }
-    assert_eq!(EXECUTOR_FUNCTIONS.len(), 15);
+    assert_eq!(pre_enable_functions.len(), 15);
     let before = public_runtime_function_acl_fingerprint(&pool).await;
     let mut transaction = pool.begin().await.unwrap();
     sqlx::raw_sql(PRODUCT_DRAIN_FIRST_APPLY_MIGRATION)
@@ -1322,7 +1323,7 @@ async fn product_drain_first_apply_upgrade_preserves_fifteen_executor_capabiliti
                 ),\
                 public.starring_runtime_execution_schema_manifest_v1()",
         )
-        .bind(EXECUTOR_FUNCTIONS.as_slice())
+        .bind(pre_enable_functions)
         .bind(&executor_role)
         .bind(PRODUCT_DRAIN_FIRST_APPLY_IDENTITY)
         .fetch_one(&pool)

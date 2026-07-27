@@ -12,7 +12,7 @@ pub(crate) const FOUNDATIONAL_CAPABILITY_IDENTITIES_V1: [&str; 2] = [
     "public.starring_runtime_execution_database_identity_v1()",
 ];
 
-pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 13] = [
+pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 17] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
@@ -26,16 +26,20 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 13] = [
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
     "public.starring_runtime_writer_fence_observe_v1()",
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
+    "public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)",
+    "public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)",
+    "public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)",
+    "public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("6962c1c2ffdd862a86aed3c84569ac50307964d59711d0bddc26aadbf68577e2");
+    Some("a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
         .iter()
         .chain(OPERATION_CAPABILITY_IDENTITIES_V1.iter());
-    if capabilities.clone().count() != 15 {
+    if capabilities.clone().count() != 19 {
         return false;
     }
     for (index, capability) in capabilities.clone().enumerate() {

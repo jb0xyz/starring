@@ -20,14 +20,22 @@ use crate::{
 
 mod closed;
 pub(crate) mod connected;
+mod execution;
+#[cfg_attr(test, allow(dead_code))]
+mod observation;
 mod owner;
 mod readiness;
 mod recovery;
+mod startup_loop;
 
 pub use closed::{
     RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
     RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
     RuntimeProcessClosedRecoveryTransitionFailureV2, RuntimeProcessGatewayOwnerCommitFailureV2,
+};
+pub use observation::{
+    RuntimeProcessStartupRecoveryObservationErrorV2,
+    RuntimeProcessStartupRecoveryObservationFailureV2,
 };
 pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{
@@ -37,13 +45,15 @@ pub use owner::{
 pub use readiness::{
     RuntimeProcessRecoveryReadinessFailureV2, RuntimeProcessRecoveryReadinessTransitionErrorV2,
     RuntimeProcessRecoveryReadinessTransitionFailureV2,
-    RuntimeRecoveryIterationReadyProcessShutdownErrorV2,
 };
 pub use recovery::{
     RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessGatewayOwnerPrepareFailureV2,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2,
     RuntimeRecoveryPendingProcessCleanupFailureV2, RuntimeRecoveryPendingProcessShutdownErrorV2,
+};
+pub use startup_loop::{
+    RuntimeProcessStartupRecoveryLoopErrorV2, RuntimeProcessStartupRecoveryLoopFailureV2,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
