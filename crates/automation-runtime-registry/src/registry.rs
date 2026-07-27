@@ -221,6 +221,51 @@ pub struct SlotDrainClaimSealV2 {
     route: Option<SlotRouteWitnessV1>,
 }
 
+pub struct SealedEmptyRecoveryDrainClaimV2 {
+    seal: SlotDrainClaimSealV2,
+    source_slot_observation: Option<SlotAtomicObservationV2>,
+    slot_observation: SlotAtomicObservationV2,
+    registry_observation: RegistryRecoveryObservationV2,
+}
+
+impl SealedEmptyRecoveryDrainClaimV2 {
+    pub fn seal(&self) -> &SlotDrainClaimSealV2 {
+        &self.seal
+    }
+
+    pub fn source_slot_observation(&self) -> Option<&SlotAtomicObservationV2> {
+        self.source_slot_observation.as_ref()
+    }
+
+    pub fn slot_observation(&self) -> &SlotAtomicObservationV2 {
+        &self.slot_observation
+    }
+
+    pub const fn registry_observation(&self) -> RegistryRecoveryObservationV2 {
+        self.registry_observation
+    }
+}
+
+pub struct UnsealedEmptyRecoveryDrainClaimV2 {
+    cursor: RegistryEmptyRecoveryCursorV2,
+    slot_observation: SlotAtomicObservationV2,
+    registry_observation: RegistryRecoveryObservationV2,
+}
+
+impl UnsealedEmptyRecoveryDrainClaimV2 {
+    pub fn into_cursor(self) -> RegistryEmptyRecoveryCursorV2 {
+        self.cursor
+    }
+
+    pub fn slot_observation(&self) -> &SlotAtomicObservationV2 {
+        &self.slot_observation
+    }
+
+    pub const fn registry_observation(&self) -> RegistryRecoveryObservationV2 {
+        self.registry_observation
+    }
+}
+
 struct AdmittedInteractionPartsV2 {
     route: ExactServingRouteV1,
     snapshot: ServingSlotSnapshotV1,
@@ -1045,6 +1090,99 @@ impl ServingSlotRegistryV1 {
         Ok((capability, atomic_observation_v2(slot)?))
     }
 
+    pub fn seal_empty_recovery_drain_claim_v2(
+        &self,
+        cursor: RegistryEmptyRecoveryCursorV2,
+        key: &ServingSlotKeyV1,
+        seal_key: crate::SlotSealKeyV2,
+    ) -> Result<SealedEmptyRecoveryDrainClaimV2, ServingSlotRegistryError> {
+        let mut state = self.lock_state()?;
+        if !Weak::ptr_eq(&cursor.registry, &Arc::downgrade(&self.inner)) {
+            return Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor);
+        }
+        let source_observation = registry_recovery_observation_v2(&state)?;
+        if source_observation.observation_sequence() != cursor.expected_sequence {
+            return Err(ServingSlotRegistryError::StaleRegistryEmptyRecoveryCursor);
+        }
+        if !source_observation.is_recovery_empty() {
+            return Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty);
+        }
+        let source_slot_observation = state
+            .slots
+            .get(key)
+            .map(atomic_observation_v2)
+            .transpose()?;
+        let slot_is_new = !state.slots.contains_key(key);
+        if slot_is_new && state.slots.len() >= self.inner.config.max_slots.get() as usize {
+            return Err(ServingSlotRegistryError::SlotCapacityExceeded);
+        }
+        let seal_generation = if slot_is_new {
+            let mut slot = SlotCell::default();
+            let seal_generation = advance_slot_seal(&mut state.observation, &mut slot, true)?;
+            slot.seal = Some(SlotSealState {
+                seal_key,
+                seal_generation,
+                route: None,
+            });
+            state.slots.insert(key.clone(), slot);
+            seal_generation
+        } else {
+            let RegistryState {
+                slots, observation, ..
+            } = &mut *state;
+            let slot = slots
+                .get_mut(key)
+                .ok_or(ServingSlotRegistryError::StaleSlotObservation)?;
+            ensure_slot_open(slot)?;
+            ensure_slot_unsealed(slot)?;
+            if selected_route(slot).is_some()
+                || atomic_observation_v2(slot)?.active_interactions != 0
+            {
+                return Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty);
+            }
+            let seal_generation = advance_slot_seal(observation, slot, false)?;
+            slot.seal = Some(SlotSealState {
+                seal_key,
+                seal_generation,
+                route: None,
+            });
+            seal_generation
+        };
+        let slot_observation = state
+            .slots
+            .get(key)
+            .ok_or(ServingSlotRegistryError::StaleSlotObservation)
+            .and_then(atomic_observation_v2)?;
+        let registry_observation = registry_recovery_observation_v2(&state)?;
+        if registry_observation.registry_failed_closed()
+            || registry_observation.staged_route_count() != 0
+            || registry_observation.serving_route_count() != 0
+            || registry_observation.draining_route_count() != 0
+            || registry_observation.sealed_slot_count() != 1
+            || registry_observation.active_interaction_count() != 0
+            || registry_observation.failed_closed_slot_count() != 0
+            || registry_observation.retained_slot_count()
+                != registry_observation
+                    .retained_empty_tombstone_count()
+                    .checked_add(1)
+                    .ok_or(ServingSlotRegistryError::RegistryObservationOverflow)?
+        {
+            return Err(ServingSlotRegistryError::RegistryObservationInvalid);
+        }
+        Ok(SealedEmptyRecoveryDrainClaimV2 {
+            seal: SlotDrainClaimSealV2 {
+                registry: Arc::downgrade(&self.inner),
+                key: key.clone(),
+                seal_key,
+                seal_generation,
+                route: None,
+            },
+            source_slot_observation,
+            slot_observation,
+            registry_observation,
+        })
+    }
+
     pub fn unseal_drain_claim_v2(
         &self,
         capability: SlotDrainClaimSealV2,
@@ -1071,6 +1209,68 @@ impl ServingSlotRegistryV1 {
         advance_slot_mutation(observation, slot)?;
         slot.seal = None;
         atomic_observation_v2(slot)
+    }
+
+    pub fn unseal_empty_recovery_drain_claim_v2(
+        &self,
+        capability: SealedEmptyRecoveryDrainClaimV2,
+    ) -> Result<UnsealedEmptyRecoveryDrainClaimV2, ServingSlotRegistryError> {
+        if !Weak::ptr_eq(&capability.seal.registry, &Arc::downgrade(&self.inner)) {
+            return Err(ServingSlotRegistryError::StaleSlotSeal);
+        }
+        let mut state = self.lock_state()?;
+        let source_observation = registry_recovery_observation_v2(&state)?;
+        if source_observation != capability.registry_observation
+            || source_observation.registry_failed_closed()
+            || source_observation.staged_route_count() != 0
+            || source_observation.serving_route_count() != 0
+            || source_observation.draining_route_count() != 0
+            || source_observation.sealed_slot_count() != 1
+            || source_observation.active_interaction_count() != 0
+            || source_observation.failed_closed_slot_count() != 0
+            || source_observation.retained_slot_count()
+                != source_observation
+                    .retained_empty_tombstone_count()
+                    .checked_add(1)
+                    .ok_or(ServingSlotRegistryError::RegistryObservationOverflow)?
+        {
+            return Err(ServingSlotRegistryError::StaleSlotSeal);
+        }
+        let slot_observation = {
+            let RegistryState {
+                slots, observation, ..
+            } = &mut *state;
+            let slot = slots
+                .get_mut(&capability.seal.key)
+                .ok_or(ServingSlotRegistryError::StaleSlotSeal)?;
+            ensure_slot_open(slot)?;
+            if atomic_observation_v2(slot)? != capability.slot_observation {
+                return Err(ServingSlotRegistryError::StaleSlotSeal);
+            }
+            let seal_matches = slot.seal.as_ref().is_some_and(|seal| {
+                seal.seal_key == capability.seal.seal_key
+                    && seal.seal_generation == capability.seal.seal_generation
+                    && seal.route.is_none()
+            });
+            if !seal_matches || selected_route(slot).is_some() || capability.seal.route.is_some() {
+                return Err(ServingSlotRegistryError::StaleSlotSeal);
+            }
+            advance_slot_mutation(observation, slot)?;
+            slot.seal = None;
+            atomic_observation_v2(slot)?
+        };
+        let registry_observation = registry_recovery_observation_v2(&state)?;
+        if !registry_observation.is_recovery_empty() {
+            return Err(ServingSlotRegistryError::RegistryRecoveryNotEmpty);
+        }
+        Ok(UnsealedEmptyRecoveryDrainClaimV2 {
+            cursor: RegistryEmptyRecoveryCursorV2 {
+                registry: Arc::downgrade(&self.inner),
+                expected_sequence: registry_observation.observation_sequence(),
+            },
+            slot_observation,
+            registry_observation,
+        })
     }
 
     pub fn route_status(

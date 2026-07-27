@@ -5,7 +5,9 @@ use std::time::Instant;
 use automation_runtime_controller::RuntimeRecoveryIdV2;
 use automation_runtime_worker::{
     RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
-    RuntimeCompletedStartupRecoveryExecutionV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeDurablyAcknowledgedPendingDrainV2,
+    RuntimePendingDrainCandidateV2, RuntimePendingDrainRegistrySealWitnessV2,
+    RuntimePendingDrainRegistryUnsealWitnessV2,
 };
 use automation_runtime_worker::{
     RuntimeAuthorizedStartupRecoveryIterationV2, RuntimePausedGatewayObservationV2,
@@ -27,7 +29,7 @@ use crate::gateway_owner_startup_watchdog::{
 };
 use crate::registry::{
     RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
-    RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeRegistryPendingDrainSealBindingV2, RuntimeRegistryRecoveryObservationErrorV1,
 };
 
 #[path = "startup_recovery_observation.rs"]
@@ -95,9 +97,15 @@ pub(crate) struct RuntimeClosedRecoveryBeginFailureV2 {
 pub(crate) struct RuntimeClosedRecoverySessionV2 {
     owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
-    registry: RuntimeRegistryEmptyRecoveryBindingV2,
+    registry: RuntimeClosedRecoverySessionRegistryV2,
     operation_cutoff: Instant,
     readiness: RuntimeClosedRecoveryReadinessStateV2,
+}
+
+enum RuntimeClosedRecoverySessionRegistryV2 {
+    Empty(RuntimeRegistryEmptyRecoveryBindingV2),
+    PendingDrainSealed(Box<RuntimeRegistryPendingDrainSealBindingV2>),
+    Failed,
 }
 
 pub(crate) struct RuntimeClosedRecoveryReadyIterationV2 {
@@ -231,7 +239,7 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
         Ok(RuntimeClosedRecoverySessionV2 {
             owner,
             gateway,
-            registry,
+            registry: RuntimeClosedRecoverySessionRegistryV2::Empty(registry),
             operation_cutoff,
             readiness: RuntimeClosedRecoveryReadinessStateV2::Available,
         })
@@ -251,12 +259,29 @@ impl RuntimeClosedRecoveryBeginFailureV2 {
 
 impl RuntimeClosedRecoverySessionV2 {
     pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
-        revalidate_committed_recovery_v2(
-            &self.owner,
-            &self.gateway,
-            &self.registry,
-            self.operation_cutoff,
-        )
+        match &self.registry {
+            RuntimeClosedRecoverySessionRegistryV2::Empty(registry) => {
+                revalidate_committed_recovery_v2(
+                    &self.owner,
+                    &self.gateway,
+                    registry,
+                    self.operation_cutoff,
+                )
+            }
+            RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed(registry) => {
+                revalidate_committed_pending_drain_sealed_v2(
+                    &self.owner,
+                    &self.gateway,
+                    registry,
+                    self.operation_cutoff,
+                )
+            }
+            RuntimeClosedRecoverySessionRegistryV2::Failed => {
+                Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                ))
+            }
+        }
     }
 
     pub(crate) async fn abort_and_shutdown_until_v2(
@@ -313,6 +338,15 @@ impl RuntimeClosedRecoverySessionV2 {
             ));
         }
         self.revalidate_v2()?;
+        if !matches!(
+            &self.registry,
+            RuntimeClosedRecoverySessionRegistryV2::Empty(_)
+        ) {
+            self.gateway.invalidate_protocol_violation_v2();
+            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
         self.gateway
             .begin_startup_recovery_execution_v2(&self.owner, continuation)
             .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)
@@ -323,6 +357,15 @@ impl RuntimeClosedRecoverySessionV2 {
         completed: RuntimeCompletedStartupRecoveryExecutionV2,
     ) -> Result<RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeClosedRecoveryCommitErrorV2>
     {
+        if !matches!(
+            &self.registry,
+            RuntimeClosedRecoverySessionRegistryV2::Empty(_)
+        ) {
+            self.gateway.invalidate_protocol_violation_v2();
+            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
         let outcome = self
             .gateway
             .complete_startup_recovery_execution_v2(&self.owner, completed)
@@ -333,6 +376,59 @@ impl RuntimeClosedRecoverySessionV2 {
 
     pub(crate) fn invalidate_startup_recovery_execution_v2(&self) {
         self.gateway.invalidate_capability_not_ready_v2();
+    }
+
+    pub(crate) fn seal_pending_drain_candidate_v2(
+        &mut self,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<RuntimePendingDrainRegistrySealWitnessV2, RuntimeClosedRecoveryCommitErrorV2> {
+        self.revalidate_v2()?;
+        let registry = match std::mem::replace(
+            &mut self.registry,
+            RuntimeClosedRecoverySessionRegistryV2::Failed,
+        ) {
+            RuntimeClosedRecoverySessionRegistryV2::Empty(registry) => registry,
+            registry => {
+                self.registry = registry;
+                self.gateway.invalidate_protocol_violation_v2();
+                return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                ));
+            }
+        };
+        let (sealed, witness) = registry
+            .into_pending_drain_seal_binding_v2(candidate)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Registry)?;
+        self.registry =
+            RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed(Box::new(sealed));
+        self.revalidate_v2()?;
+        Ok(witness)
+    }
+
+    pub(crate) fn unseal_pending_drain_after_durable_ack_v2(
+        &mut self,
+        durable: &RuntimeDurablyAcknowledgedPendingDrainV2,
+    ) -> Result<RuntimePendingDrainRegistryUnsealWitnessV2, RuntimeClosedRecoveryCommitErrorV2>
+    {
+        self.revalidate_v2()?;
+        let registry = match std::mem::replace(
+            &mut self.registry,
+            RuntimeClosedRecoverySessionRegistryV2::Failed,
+        ) {
+            RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed(registry) => registry,
+            registry => {
+                self.registry = registry;
+                self.gateway.invalidate_protocol_violation_v2();
+                return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                ));
+            }
+        };
+        let (empty, witness) = (*registry)
+            .into_empty_binding_after_durable_ack_v2(durable)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Registry)?;
+        self.registry = RuntimeClosedRecoverySessionRegistryV2::Empty(empty);
+        Ok(witness)
     }
 
     pub(crate) async fn refresh_iteration_readiness_in_place_v2(
@@ -413,6 +509,16 @@ impl RuntimeClosedRecoverySessionV2 {
         } = self;
         match readiness {
             RuntimeClosedRecoveryReadinessStateV2::Ready(iteration) => {
+                let RuntimeClosedRecoverySessionRegistryV2::Empty(registry) = registry else {
+                    gateway.invalidate_protocol_violation_v2();
+                    return Err(Box::new(Self {
+                        owner,
+                        gateway,
+                        registry,
+                        operation_cutoff,
+                        readiness: RuntimeClosedRecoveryReadinessStateV2::Ready(iteration),
+                    }));
+                };
                 Ok(RuntimeClosedRecoveryReadyIterationV2 {
                     owner,
                     gateway,
@@ -551,6 +657,24 @@ fn revalidate_committed_recovery_v2(
     section
         .validate_empty_registry_projection_v2(&observation)
         .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)
+}
+
+fn revalidate_committed_pending_drain_sealed_v2(
+    owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    gateway: &RuntimeRecoveryPendingGatewayBindingV2,
+    registry: &RuntimeRegistryPendingDrainSealBindingV2,
+    operation_cutoff: Instant,
+) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
+    if Instant::now() >= operation_cutoff {
+        return Err(RuntimeClosedRecoveryCommitErrorV2::DeadlineElapsed);
+    }
+    let section = gateway
+        .committed_pending_section_v2(owner)
+        .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+    drop(section);
+    registry
+        .revalidate_sealed_v2()
+        .map_err(RuntimeClosedRecoveryCommitErrorV2::Registry)
 }
 
 impl Debug for RuntimeClosedRecoveryPendingPhaseV2 {

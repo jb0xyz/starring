@@ -22,14 +22,18 @@ starring_runtime_slot_writer_fence_mark_drain_v2(\
 text,text,bigint,text,text,text,text,text,bigint)";
 const INSTALLATION_TRIGGER_IDENTITY: &str = "starring_runtime_private_v2.\
 starring_runtime_slot_writer_fence_installation_insert_v2()";
-const EXACT_TARGET_READINESS_DIGEST: &str =
+const MIGRATION_EXACT_TARGET_READINESS_DIGEST: &str =
     "e4bae4b38acc529accd4401af853eb7e96d2a34ad8fb1224b9965166ff40c229";
-const SERVING_READINESS_DIGEST: &str =
+const CURRENT_EXACT_TARGET_READINESS_DIGEST: &str =
+    "5eba72a786aebaa8afdc226d661b45132afc5aa053fab7be6a3b9737fdab0e8c";
+const MIGRATION_SERVING_READINESS_DIGEST: &str =
     "1c0c79c6fbf528f28fb56e91a54b78cd1fe17c70d2bc3e8d7e3dc515d8a7f8f7";
+const CURRENT_SERVING_READINESS_DIGEST: &str =
+    "80e9f1da2a7b48610e95e2540db4c77a3daed2d53b3a2ec18de37c0767ac5380";
 const MIGRATION_READINESS_DIGEST: &str =
     "48a10f783603fe02879f2a1cddbecbb39541ac0ca154c77f7b1e0eef8d9f6834";
 const CURRENT_READINESS_DIGEST: &str =
-    "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a";
+    "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
 
 fn function_section(marker: &str) -> &'static str {
     MIGRATION
@@ -553,11 +557,11 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
         "356::BIGINT",
         "ca4d76873d9256406baaad080943a78b7a6eeeae409ad67e8dc896f0a237642a",
         "5fe0365d0cb4912a01778f3d30a2d649a40e82c5b964ba9e2e7e1901e79eb109",
-        EXACT_TARGET_READINESS_DIGEST,
+        MIGRATION_EXACT_TARGET_READINESS_DIGEST,
         "471::BIGINT",
         "1b476578005a17dadfa9a6f3d26f966e929af5909cdc5097eb6a63050ec310fa",
         "14a0c119d8fa0b7a85b72509df29156a6c869b5e3f240bc8fffc89fd1a86c4c9",
-        SERVING_READINESS_DIGEST,
+        MIGRATION_SERVING_READINESS_DIGEST,
         "runtime_slot_writer_fence_shared_manifest_drift",
         "runtime_slot_writer_fence_shared_readiness_drift",
         "runtime_slot_writer_fence_manifest_relation_drift",
@@ -592,8 +596,8 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
             !source.contains("3e2d46d692daf8bd9cff68f00459f00f6b8bf314378a663727b94493d7e45279")
         );
     }
-    assert!(EXACT_TARGET_DATABASE_SOURCE.contains(EXACT_TARGET_READINESS_DIGEST));
-    assert!(SERVING_DATABASE_SOURCE.contains(SERVING_READINESS_DIGEST));
+    assert!(EXACT_TARGET_DATABASE_SOURCE.contains(CURRENT_EXACT_TARGET_READINESS_DIGEST));
+    assert!(SERVING_DATABASE_SOURCE.contains(CURRENT_SERVING_READINESS_DIGEST));
     let postflight = dollar_block("postflight");
     assert!(postflight.contains(
         "manifest_digest\n            <> \
@@ -605,6 +609,6 @@ fn manifest_readiness_and_rust_pins_cover_the_new_private_contract() {
     assert!(postflight.contains("installation_count <> fence_count"));
     assert!(postflight.contains("unmatched_installation_count <> 0"));
     assert!(postflight.contains("unmatched_fence_count <> 0"));
-    assert!(postflight.contains(EXACT_TARGET_READINESS_DIGEST));
-    assert!(postflight.contains(SERVING_READINESS_DIGEST));
+    assert!(postflight.contains(MIGRATION_EXACT_TARGET_READINESS_DIGEST));
+    assert!(postflight.contains(MIGRATION_SERVING_READINESS_DIGEST));
 }

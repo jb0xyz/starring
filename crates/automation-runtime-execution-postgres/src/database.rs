@@ -265,6 +265,19 @@ pub(crate) async fn begin_execution_mutation_transaction(
     Ok(transaction)
 }
 
+pub(crate) async fn begin_execution_serializable_observation_transaction(
+    connection: &mut PgConnection,
+    timeouts: RuntimeExecutionDatabaseTimeoutsV1,
+) -> Result<Transaction<'_, Postgres>, RuntimeExecutionPersistenceErrorV1> {
+    let mut transaction = connection.begin().await.map_err(map_query_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_query_error)?;
+    configure_execution_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
 pub(crate) async fn begin_execution_locked_observation_transaction(
     connection: &mut PgConnection,
     timeouts: RuntimeExecutionDatabaseTimeoutsV1,
@@ -435,7 +448,7 @@ mod tests {
         assert!(canonical_sha256_digest(digest));
         assert_eq!(
             digest,
-            "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a"
+            "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5"
         );
     }
 }

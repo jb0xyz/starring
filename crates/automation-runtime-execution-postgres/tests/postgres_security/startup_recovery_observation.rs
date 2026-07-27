@@ -96,7 +96,7 @@ async fn startup_recovery_observation_counts_pending_and_rejects_historical_ambi
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL 16"]
-async fn startup_recovery_observation_detects_pending_only_constraint_drift() {
+async fn startup_recovery_observation_detects_drain_state_constraint_drift() {
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
     let owner = acquire_startup_observation_owner(&database.executor_pool).await;
@@ -492,71 +492,9 @@ async fn remove_suspension_completion_for_startup_observation(pool: &PgPool) {
 }
 
 async fn seed_pending_product_drain_for_startup_observation(pool: &PgPool) {
-    let mut transaction = pool.begin().await.unwrap();
-    for statement in [
-        "ALTER TABLE public.runtime_product_operations_v2 DISABLE TRIGGER USER",
-        "ALTER TABLE public.runtime_drain_intents_v2 DISABLE TRIGGER USER",
-    ] {
-        sqlx::query(statement)
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-    }
-    sqlx::query(
-        "INSERT INTO public.runtime_product_operations_v2 (\
-            product_operation_id, tenant_id, installation_id, deployment_id, \
-            expected_revision, expected_target_guild_id, expected_target_ruleset_key, \
-            expected_target_version, expected_target_content_hash, \
-            expected_target_binding_revision, expected_target_binding_fingerprint, \
-            product_mutation_request_bytes, product_mutation_digest\
-         ) VALUES (\
-            '11111111111111111111111111111111', $1, $2, $3, 1, $4, $5, 1, $6, 1, $7, \
-            pg_catalog.convert_to('{}', 'UTF8'), $8\
-         )",
-    )
-    .bind(TENANT)
-    .bind(INSTALLATION)
-    .bind(DEPLOYMENT)
-    .bind(GUILD.to_string())
-    .bind(RULESET)
-    .bind(CONTENT_HASH)
-    .bind(BINDING_FINGERPRINT)
-    .bind("2".repeat(64))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO public.runtime_drain_intents_v2 (\
-            drain_intent_id, tenant_id, installation_id, deployment_id, \
-            slot_guild_id, slot_ruleset_key, expected_revision, product_operation_id, \
-            product_mutation_digest, drain_intent_request_bytes, drain_intent_digest, \
-            intent_revision, intent_state\
-         ) VALUES (\
-            '33333333333333333333333333333333', $1, $2, $3, $4, $5, 1, \
-            '11111111111111111111111111111111', $6, \
-            pg_catalog.convert_to('{}', 'UTF8'), $7, 1, 'pending'\
-         )",
-    )
-    .bind(TENANT)
-    .bind(INSTALLATION)
-    .bind(DEPLOYMENT)
-    .bind(GUILD.to_string())
-    .bind(RULESET)
-    .bind("2".repeat(64))
-    .bind("4".repeat(64))
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    for statement in [
-        "ALTER TABLE public.runtime_product_operations_v2 ENABLE TRIGGER USER",
-        "ALTER TABLE public.runtime_drain_intents_v2 ENABLE TRIGGER USER",
-    ] {
-        sqlx::query(statement)
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-    }
-    transaction.commit().await.unwrap();
+    let snapshot = product_drain_snapshot(pool).await;
+    let canonical = canonical_product_drain(&snapshot);
+    seed_canonical_product_drain(pool, &canonical).await;
 }
 
 async fn seed_nonawaiting_certification_root_for_startup_observation(pool: &PgPool) {
@@ -811,6 +749,18 @@ fn authorize_startup_observation_port_call(
     RuntimeClosedDrainRecoveryPermitV2,
     automation_runtime_worker::RuntimeAuthorizedStartupRecoveryObservationV2,
 ) {
+    authorize_startup_observation_port_call_with_last_resume(adapter, owner, None)
+}
+
+fn authorize_startup_observation_port_call_with_last_resume(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    last_resume_sequence: Option<u64>,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    automation_runtime_worker::RuntimeAuthorizedStartupRecoveryObservationV2,
+) {
     let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
     let generation = lifecycle.snapshot().generation();
     let process = owner.lease_id.process_instance_id.clone();
@@ -823,7 +773,9 @@ fn authorize_startup_observation_port_call(
         RuntimePausedGatewaySequenceV2::new(
             RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(5).unwrap()),
             RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(4).unwrap()),
-            None,
+            last_resume_sequence.map(|sequence| {
+                RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(sequence).unwrap())
+            }),
         )
         .unwrap(),
     );

@@ -351,6 +351,52 @@ async fn set_product_drain_row_triggers(pool: &PgPool, enabled: bool) {
     }
 }
 
+async fn set_product_drain_initializer_gate(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    canonical: &automation_runtime_controller::RuntimeCanonicalProductDrainV2,
+) {
+    sqlx::query(
+        "SELECT \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_stage_v2',\
+                'drain_insert', TRUE\
+            ), \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_product_operation_id_v2',\
+                $1, TRUE\
+            ), \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_drain_intent_id_v2',\
+                $2, TRUE\
+            )",
+    )
+    .bind(canonical.product_preimage().operation_id.as_str())
+    .bind(canonical.drain_preimage().key.intent_id.as_str())
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+}
+
+async fn clear_product_drain_initializer_gate(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) {
+    sqlx::query(
+        "SELECT \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_stage_v2', '', TRUE\
+            ), \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_product_operation_id_v2', '', TRUE\
+            ), \
+            pg_catalog.set_config(\
+                'starring.runtime_product_drain_first_apply_drain_intent_id_v2', '', TRUE\
+            )",
+    )
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+}
+
 async fn insert_canonical_product_drain(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     canonical: &automation_runtime_controller::RuntimeCanonicalProductDrainV2,
@@ -392,6 +438,7 @@ async fn insert_canonical_product_drain(
     .execute(&mut **transaction)
     .await
     .unwrap();
+    set_product_drain_initializer_gate(transaction, canonical).await;
     sqlx::query(
         "INSERT INTO public.runtime_drain_intents_v2 \
          (drain_intent_id, tenant_id, installation_id, deployment_id, slot_guild_id, \
@@ -413,6 +460,7 @@ async fn insert_canonical_product_drain(
     .execute(&mut **transaction)
     .await
     .unwrap();
+    clear_product_drain_initializer_gate(transaction).await;
     sqlx::query_scalar::<_, i64>(
         "SELECT starring_runtime_private_v2.\
              starring_runtime_slot_writer_fence_mark_drain_v2(\

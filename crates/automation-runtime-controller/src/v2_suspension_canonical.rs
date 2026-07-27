@@ -3,6 +3,11 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use wire::{
+    decode_drain_obligation_bytes, decode_local_effect_bytes, encode_drain_obligation_bytes,
+    encode_local_effect_bytes,
+};
+
 use crate::v2_digest::suspend_attempt_digest_v2;
 use crate::{
     RuntimeAttemptDispositionV2, RuntimeCanonicalValueErrorV2, RuntimeDrainObligationV2,
@@ -179,6 +184,40 @@ impl RuntimeCanonicalSuspendAttemptV2 {
 
     pub fn suspend_attempt_digest(&self) -> &RuntimeSuspendAttemptDigestV2 {
         &self.digest
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeCanonicalRouteMutationProvenanceV2 {
+    provenance: RuntimeRouteMutationProvenanceV2,
+    bytes: Box<[u8]>,
+}
+
+impl RuntimeCanonicalRouteMutationProvenanceV2 {
+    pub fn new(
+        provenance: RuntimeRouteMutationProvenanceV2,
+    ) -> Result<Self, RuntimeSuspendAttemptCanonicalErrorV2> {
+        let bytes = wire::encode_provenance_bytes(&provenance)?;
+        Ok(Self {
+            provenance,
+            bytes: bytes.into_boxed_slice(),
+        })
+    }
+
+    pub fn from_persisted(bytes: &[u8]) -> Result<Self, RuntimeSuspendAttemptCanonicalErrorV2> {
+        let provenance = wire::decode_provenance_bytes(bytes)?;
+        Ok(Self {
+            provenance,
+            bytes: bytes.to_vec().into_boxed_slice(),
+        })
+    }
+
+    pub fn provenance(&self) -> &RuntimeRouteMutationProvenanceV2 {
+        &self.provenance
+    }
+
+    pub fn provenance_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 

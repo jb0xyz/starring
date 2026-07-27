@@ -25,7 +25,7 @@ const CURRENT_MANIFEST_DEFINITION_DIGEST: &str =
 const CURRENT_READINESS_DIGEST: &str =
     "c2cba3c5591876238f0ae0248b2c7c205953b6cde2a62705038a42fa9aa2aa81";
 const LATEST_READINESS_DIGEST: &str =
-    "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a";
+    "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
 const CURRENT_EXECUTION_DEFINITION_DIGEST: &str =
     "de30f26d122062ad9da6fc9bd145a7376030fa7e1c9d114db740056e33136a42";
 const CURRENT_ACTION_RECORD_DIGEST: &str =
@@ -356,9 +356,9 @@ fn manifest_readiness_acl_and_rust_pins_advance_together() {
         readiness.contains("runtime_startup_stale_live_execution_readiness_allowlist_patch_drift")
     );
     assert!(postflight.contains("pg_catalog.has_function_privilege"));
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 17]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 19"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 19]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 22]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 24"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 24]"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(LATEST_READINESS_DIGEST));
     }

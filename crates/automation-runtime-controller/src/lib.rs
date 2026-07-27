@@ -23,6 +23,7 @@ mod v2_certification_outcome;
 mod v2_digest;
 mod v2_drain;
 mod v2_drain_claim;
+mod v2_drain_intent_canonical_state;
 mod v2_drain_intent_receipt;
 mod v2_drain_intent_state;
 mod v2_evidence;
@@ -123,6 +124,16 @@ pub use v2_drain_claim::{
     RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
     RuntimeRouteAbsentAcknowledgementV2,
 };
+pub use v2_drain_intent_canonical_state::{
+    RuntimeCanonicalDrainIntentStateV2, RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimInputV2,
+    RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2,
+    RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2,
+    RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2,
+    RuntimeDrainIntentCanonicalStateCorrelationV2, RuntimeDrainIntentCanonicalStateErrorV2,
+    RuntimeDrainIntentCanonicalStateFieldV2, RuntimeDrainIntentCanonicalStateKindV2,
+    RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
+    RuntimePersistedUnclaimedPendingDrainIntentV2,
+};
 pub use v2_drain_intent_receipt::{
     RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,
     RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainRefenceSourceV2,
@@ -190,8 +201,9 @@ pub use v2_suspension::{
     RuntimeSuspensionSourcePhaseV2,
 };
 pub use v2_suspension_canonical::{
-    RuntimeCanonicalSuspendAttemptV2, RuntimeSuspendAttemptCanonicalErrorV2,
-    RuntimeSuspendAttemptCanonicalFieldV2, RuntimeSuspendAttemptCorrelationV2,
+    RuntimeCanonicalRouteMutationProvenanceV2, RuntimeCanonicalSuspendAttemptV2,
+    RuntimeSuspendAttemptCanonicalErrorV2, RuntimeSuspendAttemptCanonicalFieldV2,
+    RuntimeSuspendAttemptCorrelationV2,
 };
 pub use v2_suspension_observation::{
     RuntimeLocallyQuiescentSuspendedAttemptV2, RuntimeSuspendedAttemptObservationErrorV2,
@@ -214,9 +226,10 @@ pub use v2_suspension_resume::{
     RuntimeSuspendAttemptResumeBasisV2, RuntimeSuspendAttemptResumeGateV2,
 };
 pub use v2_suspension_sidecar::{
+    RuntimeCanonicalSuspendAttemptDrainProgressV2, RuntimeCanonicalSuspendedAttemptV2,
     RuntimeSuspendAttemptDrainProgressErrorV2, RuntimeSuspendAttemptDrainProgressV2,
-    RuntimeSuspendedAttemptStateErrorV2, RuntimeSuspendedAttemptStateFieldV2,
-    RuntimeSuspendedAttemptV2,
+    RuntimeSuspendedAttemptCanonicalErrorV2, RuntimeSuspendedAttemptStateErrorV2,
+    RuntimeSuspendedAttemptStateFieldV2, RuntimeSuspendedAttemptV2,
 };
 pub use v2_writer_fence::{
     RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,

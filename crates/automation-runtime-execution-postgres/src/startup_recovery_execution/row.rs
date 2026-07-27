@@ -1,16 +1,41 @@
 use automation_runtime_controller::{
     RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseReceiptV1,
 };
-use automation_runtime_worker::RuntimeStartupRecoveryExecutionTerminalDigestV2;
+use automation_runtime_worker::{
+    RuntimePendingDrainStateDigestV2, RuntimeStartupRecoveryExecutionTerminalDigestV2,
+};
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
+use super::closed_evidence::{
+    validate_closed_recovery_evidence_v2, RuntimeClosedRecoveryExpectedEvidenceV2,
+};
 use super::digest::{
     lowercase_sha256_bytes, startup_recovery_action_digest_v2, RuntimeStartupRecoveryActionProofV2,
+};
+use super::pending_projection::{
+    decode_pending_drain_terminal_projection_v2, RuntimePendingDrainTerminalProjectionV2,
+};
+use super::pending_semantic::{
+    validate_pending_drain_acknowledged_projection_v2,
+    validate_pending_drain_claimed_projection_v2, RuntimePendingDrainExpectationV2,
 };
 use super::projection::{
     decode_terminal_projection_v2, RuntimeStartupRecoveryTerminalProjectionV2,
 };
+use super::reserved_projection::{
+    decode_reserved_terminal_projection_v2, RuntimeReservedStartupRecoveryTerminalProjectionV2,
+};
+use super::reserved_semantic::{
+    validate_reserved_progressed_projection_v2, RuntimeReservedStartupRecoveryExpectationV2,
+};
 use super::semantic::validate_progressed_projection_v2;
+use super::suspended_projection::{
+    decode_suspended_terminal_projection_v2, RuntimeSuspendedStartupRecoveryTerminalProjectionV2,
+};
+use super::suspended_semantic::{
+    validate_suspended_progressed_projection_v2, RuntimeSuspendedStartupRecoveryExpectationV2,
+};
 use crate::gateway_owner::MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION;
 use crate::RuntimeExecutionPersistenceErrorV1;
 
@@ -48,6 +73,7 @@ pub(super) struct RuntimeStartupRecoveryExecutionExpectedV2 {
     pub owner_revision: i64,
     pub owner_expires_at: DateTime<Utc>,
     pub minimum_database_now: DateTime<Utc>,
+    pub closed_evidence: Option<RuntimeClosedRecoveryExpectedEvidenceV2>,
 }
 
 pub(super) struct RuntimeStartupRecoveryExecutionDatabaseReceiptV2 {
@@ -60,6 +86,18 @@ pub(super) enum RuntimeStartupRecoveryExecutionDatabaseOutcomeV2 {
     Progressed(RuntimeStartupRecoveryExecutionTerminalDigestV2),
 }
 
+pub(super) struct RuntimePendingDrainNoCandidateDatabaseReceiptV2 {
+    pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,
+}
+
+pub(super) struct RuntimePendingDrainProgressedDatabaseReceiptV2 {
+    pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,
+    pub successor_intent_revision: std::num::NonZeroU64,
+    pub successor_state_digest: RuntimePendingDrainStateDigestV2,
+}
+
 impl RuntimeStartupRecoveryExecutionRowV2 {
     pub(super) fn decode(
         self,
@@ -69,10 +107,7 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
         self.require_exact_identity(expected)?;
         self.require_exact_owner(expected)?;
         self.require_valid_times(expected)?;
-        let projection = decode_terminal_projection_v2(
-            &self.terminal_outcome_name,
-            &self.terminal_projection_bytes,
-        )?;
+        let projection_outcome = self.decode_projection(expected)?;
         let persisted_digest = lowercase_sha256_bytes(&self.terminal_digest)?;
         let derived_digest =
             startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
@@ -97,27 +132,280 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
         }
         let terminal_digest = RuntimeStartupRecoveryExecutionTerminalDigestV2::new(derived_digest)
             .map_err(|_| invalid())?;
-        let outcome = match projection {
-            RuntimeStartupRecoveryTerminalProjectionV2::NoCandidate => {
+        let outcome = match projection_outcome {
+            RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate => {
                 RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::NoCandidate
             }
-            RuntimeStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
-                validate_progressed_projection_v2(&projection, self.recorded_at)?;
+            RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed => {
                 RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::Progressed(terminal_digest)
             }
         };
         Ok(RuntimeStartupRecoveryExecutionDatabaseReceiptV2 {
-            owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1 {
-                lease_id: expected.gateway_owner_lease_id.clone(),
-                owner_revision: u64::try_from(self.observed_owner_revision)
-                    .ok()
-                    .and_then(std::num::NonZeroU64::new)
-                    .ok_or_else(invalid)?,
-                database_now: self.database_now,
-                expires_at: self.observed_owner_expires_at,
-            },
+            owner_receipt: self.owner_receipt(expected)?,
             outcome,
         })
+    }
+
+    pub(super) fn decode_pending_no_candidate(
+        self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        expected_evidence: &RuntimeClosedRecoveryExpectedEvidenceV2,
+    ) -> Result<RuntimePendingDrainNoCandidateDatabaseReceiptV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        let (owner_receipt, terminal_digest) = self.decode_pending_common(expected, false)?;
+        match decode_pending_drain_terminal_projection_v2(
+            &self.terminal_outcome_name,
+            &self.terminal_projection_bytes,
+        )? {
+            RuntimePendingDrainTerminalProjectionV2::NoCandidate(evidence) => {
+                validate_closed_recovery_evidence_v2(&evidence, expected_evidence)?;
+            }
+            RuntimePendingDrainTerminalProjectionV2::Claimed(_)
+            | RuntimePendingDrainTerminalProjectionV2::RouteAbsentAcknowledged(_) => {
+                return Err(invalid());
+            }
+        }
+        Ok(RuntimePendingDrainNoCandidateDatabaseReceiptV2 {
+            owner_receipt,
+            terminal_digest,
+        })
+    }
+
+    pub(super) fn decode_pending_claimed(
+        self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        pending: &RuntimePendingDrainExpectationV2<'_>,
+    ) -> Result<RuntimePendingDrainProgressedDatabaseReceiptV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        self.decode_pending_progressed(expected, pending, true)
+    }
+
+    pub(super) fn decode_pending_acknowledged(
+        self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        pending: &RuntimePendingDrainExpectationV2<'_>,
+    ) -> Result<RuntimePendingDrainProgressedDatabaseReceiptV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        self.decode_pending_progressed(expected, pending, false)
+    }
+
+    fn decode_pending_progressed(
+        self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        pending: &RuntimePendingDrainExpectationV2<'_>,
+        claimed: bool,
+    ) -> Result<RuntimePendingDrainProgressedDatabaseReceiptV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        let (owner_receipt, terminal_digest) = self.decode_pending_common(expected, true)?;
+        let projection = match decode_pending_drain_terminal_projection_v2(
+            &self.terminal_outcome_name,
+            &self.terminal_projection_bytes,
+        )? {
+            RuntimePendingDrainTerminalProjectionV2::Claimed(projection) if claimed => projection,
+            RuntimePendingDrainTerminalProjectionV2::RouteAbsentAcknowledged(projection)
+                if !claimed =>
+            {
+                projection
+            }
+            RuntimePendingDrainTerminalProjectionV2::NoCandidate(_)
+            | RuntimePendingDrainTerminalProjectionV2::Claimed(_)
+            | RuntimePendingDrainTerminalProjectionV2::RouteAbsentAcknowledged(_) => {
+                return Err(invalid());
+            }
+        };
+        if claimed {
+            validate_pending_drain_claimed_projection_v2(
+                &projection,
+                pending,
+                self.minimum_database_now,
+                self.database_now,
+                self.recorded_at,
+            )?;
+        } else {
+            validate_pending_drain_acknowledged_projection_v2(
+                &projection,
+                pending,
+                self.minimum_database_now,
+                self.database_now,
+                self.recorded_at,
+            )?;
+        }
+        let successor_intent_revision =
+            pending_successor_intent_revision(&projection.successor_state_bytes)?;
+        let successor_state_digest = RuntimePendingDrainStateDigestV2::new(
+            Sha256::digest(&projection.successor_state_bytes).into(),
+        )
+        .map_err(|_| invalid())?;
+        Ok(RuntimePendingDrainProgressedDatabaseReceiptV2 {
+            owner_receipt,
+            terminal_digest,
+            successor_intent_revision,
+            successor_state_digest,
+        })
+    }
+
+    fn decode_pending_common(
+        &self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        allow_later_replay_minimum: bool,
+    ) -> Result<
+        (
+            RuntimeGatewayOwnerLeaseReceiptV1,
+            RuntimeStartupRecoveryExecutionTerminalDigestV2,
+        ),
+        RuntimeExecutionPersistenceErrorV1,
+    > {
+        self.require_exact_identity(expected)?;
+        self.require_exact_owner(expected)?;
+        self.require_valid_pending_times(expected, allow_later_replay_minimum)?;
+        let persisted_digest = lowercase_sha256_bytes(&self.terminal_digest)?;
+        let derived_digest =
+            startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
+                recovery_id: &self.recovery_id,
+                originating_emergency_generation: self.originating_emergency_generation,
+                coordinator_generation: self.coordinator_generation,
+                action_authority_revision: self.action_authority_revision,
+                selection_authority_revision: self.selection_authority_revision,
+                recovery_class: &self.recovery_class,
+                gateway_shard_id: &self.observed_gateway_shard_id,
+                owner_process_instance_id: &self.observed_process_instance_id,
+                owner_lease_epoch: self.observed_lease_epoch,
+                owner_runtime_build_revision: &self.observed_runtime_build_revision,
+                owner_revision: self.observed_owner_revision,
+                owner_expires_at: self.observed_owner_expires_at,
+                minimum_database_now: self.minimum_database_now,
+                recorded_at: self.recorded_at,
+                terminal_projection_bytes: &self.terminal_projection_bytes,
+            })?;
+        if persisted_digest != derived_digest {
+            return Err(invalid());
+        }
+        let terminal_digest = RuntimeStartupRecoveryExecutionTerminalDigestV2::new(derived_digest)
+            .map_err(|_| invalid())?;
+        Ok((self.owner_receipt(expected)?, terminal_digest))
+    }
+
+    fn require_valid_pending_times(
+        &self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+        allow_later_replay_minimum: bool,
+    ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
+        let minimum_matches = self.minimum_database_now == expected.minimum_database_now
+            || (allow_later_replay_minimum
+                && self.journal_outcome_name == "replayed"
+                && self.minimum_database_now < expected.minimum_database_now);
+        if !minimum_matches
+            || self.database_now < expected.minimum_database_now
+            || self.recorded_at < self.minimum_database_now
+            || self.database_now < self.recorded_at
+            || self.database_now >= self.observed_owner_expires_at
+            || self.recorded_at >= self.observed_owner_expires_at
+            || (self.journal_outcome_name == "applied" && self.database_now != self.recorded_at)
+        {
+            return Err(invalid());
+        }
+        let owner_duration = self
+            .observed_owner_expires_at
+            .signed_duration_since(self.database_now)
+            .to_std()
+            .map_err(|_| invalid())?;
+        if owner_duration.is_zero() || owner_duration > MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION {
+            Err(invalid())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn owner_receipt(
+        &self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+    ) -> Result<RuntimeGatewayOwnerLeaseReceiptV1, RuntimeExecutionPersistenceErrorV1> {
+        Ok(RuntimeGatewayOwnerLeaseReceiptV1 {
+            lease_id: expected.gateway_owner_lease_id.clone(),
+            owner_revision: u64::try_from(self.observed_owner_revision)
+                .ok()
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or_else(invalid)?,
+            database_now: self.database_now,
+            expires_at: self.observed_owner_expires_at,
+        })
+    }
+
+    fn decode_projection(
+        &self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+    ) -> Result<RuntimeStartupRecoveryDecodedProjectionOutcomeV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        match self.recovery_class.as_str() {
+            "stale_live" => match decode_terminal_projection_v2(
+                &self.terminal_outcome_name,
+                &self.terminal_projection_bytes,
+            )? {
+                RuntimeStartupRecoveryTerminalProjectionV2::NoCandidate => {
+                    Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                }
+                RuntimeStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                    validate_progressed_projection_v2(&projection, self.recorded_at)?;
+                    Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                }
+            },
+            "reserved_awaiting_certification" => {
+                match decode_reserved_terminal_projection_v2(
+                    &self.terminal_outcome_name,
+                    &self.terminal_projection_bytes,
+                )? {
+                    RuntimeReservedStartupRecoveryTerminalProjectionV2::NoCandidate => {
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                    }
+                    RuntimeReservedStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                        validate_reserved_progressed_projection_v2(
+                            &projection,
+                            &RuntimeReservedStartupRecoveryExpectationV2 {
+                                recovery_id: &expected.recovery_id,
+                                originating_emergency_generation: expected
+                                    .originating_emergency_generation,
+                                coordinator_generation: expected.coordinator_generation,
+                                action_authority_revision: expected.action_authority_revision,
+                                selection_authority_revision: expected.selection_authority_revision,
+                            },
+                            self.recorded_at,
+                        )?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                    }
+                }
+            }
+            "suspended_local_effect" => {
+                let suspended_evidence = expected.closed_evidence.as_ref().ok_or_else(invalid)?;
+                match decode_suspended_terminal_projection_v2(
+                    &self.terminal_outcome_name,
+                    &self.terminal_projection_bytes,
+                )? {
+                    RuntimeSuspendedStartupRecoveryTerminalProjectionV2::NoCandidate(evidence) => {
+                        validate_closed_recovery_evidence_v2(&evidence, suspended_evidence)?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                    }
+                    RuntimeSuspendedStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                        validate_suspended_progressed_projection_v2(
+                            &projection,
+                            &RuntimeSuspendedStartupRecoveryExpectationV2 {
+                                recovery_id: &expected.recovery_id,
+                                originating_emergency_generation: expected
+                                    .originating_emergency_generation,
+                                coordinator_generation: expected.coordinator_generation,
+                                action_authority_revision: expected.action_authority_revision,
+                                selection_authority_revision: expected.selection_authority_revision,
+                                gateway_owner_lease_id: &expected.gateway_owner_lease_id,
+                                owner_revision: expected.owner_revision,
+                                owner_expires_at: expected.owner_expires_at,
+                                evidence: suspended_evidence,
+                            },
+                        )?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                    }
+                }
+            }
+            _ => Err(invalid()),
+        }
     }
 
     fn require_exact_identity(
@@ -184,6 +472,28 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
     }
 }
 
+fn pending_successor_intent_revision(
+    state_bytes: &[u8],
+) -> Result<std::num::NonZeroU64, RuntimeExecutionPersistenceErrorV1> {
+    let revision = serde_json::from_slice::<serde_json::Value>(state_bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .and_then(|object| object.get("intent_revision"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .filter(|revision| *revision <= i64::MAX as u64)
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or_else(invalid)?;
+    Ok(revision)
+}
+
+enum RuntimeStartupRecoveryDecodedProjectionOutcomeV2 {
+    NoCandidate,
+    Progressed,
+}
+
 fn invalid() -> RuntimeExecutionPersistenceErrorV1 {
     RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt
 }
@@ -206,14 +516,14 @@ mod tests {
         DateTime::from_timestamp(second, 0).unwrap()
     }
 
-    fn expected() -> RuntimeStartupRecoveryExecutionExpectedV2 {
+    fn expected_for(recovery_class: &'static str) -> RuntimeStartupRecoveryExecutionExpectedV2 {
         RuntimeStartupRecoveryExecutionExpectedV2 {
             recovery_id: "0123456789abcdef0123456789abcdef".to_owned(),
             originating_emergency_generation: 2,
             coordinator_generation: 3,
             action_authority_revision: 5,
             selection_authority_revision: 4,
-            recovery_class: "stale_live",
+            recovery_class,
             gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1 {
                 gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
                 process_instance_id: ProcessInstanceId::parse("process:1").unwrap(),
@@ -223,11 +533,23 @@ mod tests {
             owner_revision: 7,
             owner_expires_at: at(200),
             minimum_database_now: at(100),
+            closed_evidence: None,
         }
     }
 
-    fn no_candidate_projection() -> Vec<u8> {
-        let domain = b"starring.runtime.startup_recovery.stale_live.terminal.v2";
+    fn expected() -> RuntimeStartupRecoveryExecutionExpectedV2 {
+        expected_for("stale_live")
+    }
+
+    fn no_candidate_projection(recovery_class: &str) -> Vec<u8> {
+        let domain = match recovery_class {
+            "stale_live" => b"starring.runtime.startup_recovery.stale_live.terminal.v2".as_slice(),
+            "reserved_awaiting_certification" => {
+                b"starring.runtime.startup_recovery.reserved_awaiting_certification.terminal.v2"
+                    .as_slice()
+            }
+            _ => panic!(),
+        };
         [
             (domain.len() as i64).to_be_bytes().as_slice(),
             domain,
@@ -239,7 +561,7 @@ mod tests {
 
     fn row() -> RuntimeStartupRecoveryExecutionRowV2 {
         let expected = expected();
-        let projection = no_candidate_projection();
+        let projection = no_candidate_projection(expected.recovery_class);
         let recorded_at = at(101);
         let digest = startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
             recovery_id: &expected.recovery_id,
@@ -300,11 +622,77 @@ mod tests {
     }
 
     #[test]
+    fn reserved_no_candidate_uses_its_own_projection_domain() {
+        let expected = expected_for("reserved_awaiting_certification");
+        let mut reserved = row();
+        reserved.recovery_class = expected.recovery_class.to_owned();
+        reserved.terminal_projection_bytes = no_candidate_projection(expected.recovery_class);
+        reserved.terminal_digest =
+            startup_recovery_action_digest_v2(&RuntimeStartupRecoveryActionProofV2 {
+                recovery_id: &expected.recovery_id,
+                originating_emergency_generation: expected.originating_emergency_generation,
+                coordinator_generation: expected.coordinator_generation,
+                action_authority_revision: expected.action_authority_revision,
+                selection_authority_revision: expected.selection_authority_revision,
+                recovery_class: expected.recovery_class,
+                gateway_shard_id: expected.gateway_owner_lease_id.gateway_shard_id.as_str(),
+                owner_process_instance_id: expected
+                    .gateway_owner_lease_id
+                    .process_instance_id
+                    .as_str(),
+                owner_lease_epoch: 6,
+                owner_runtime_build_revision: expected
+                    .gateway_owner_lease_id
+                    .expected_build_revision
+                    .as_str(),
+                owner_revision: expected.owner_revision,
+                owner_expires_at: expected.owner_expires_at,
+                minimum_database_now: expected.minimum_database_now,
+                recorded_at: reserved.recorded_at,
+                terminal_projection_bytes: &reserved.terminal_projection_bytes,
+            })
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(matches!(
+            reserved.decode(&expected).unwrap().outcome,
+            RuntimeStartupRecoveryExecutionDatabaseOutcomeV2::NoCandidate
+        ));
+    }
+
+    #[test]
     fn replay_accepts_later_database_now_but_preserves_recorded_proof() {
         let mut replayed = row();
         replayed.journal_outcome_name = "replayed".to_owned();
         replayed.database_now = at(102);
         assert!(replayed.decode(&expected()).is_ok());
+    }
+
+    #[test]
+    fn pending_replay_separates_requested_clock_floor_from_persisted_action_minimum() {
+        let mut expected = expected_for("pending_runtime_drain_intent");
+        expected.minimum_database_now = at(102);
+        let mut replayed = row();
+        replayed.recovery_class = expected.recovery_class.to_owned();
+        replayed.journal_outcome_name = "replayed".to_owned();
+        replayed.database_now = at(103);
+        assert!(replayed
+            .require_valid_pending_times(&expected, true)
+            .is_ok());
+        assert!(replayed
+            .require_valid_pending_times(&expected, false)
+            .is_err());
+
+        replayed.minimum_database_now = at(103);
+        assert!(replayed
+            .require_valid_pending_times(&expected, true)
+            .is_err());
+        replayed.minimum_database_now = at(100);
+        replayed.database_now = at(101);
+        assert!(replayed
+            .require_valid_pending_times(&expected, true)
+            .is_err());
     }
 
     #[test]

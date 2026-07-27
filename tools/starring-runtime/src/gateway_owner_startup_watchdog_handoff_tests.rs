@@ -8,19 +8,21 @@ use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeBuildRevisionV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
-    RuntimeGatewayReadyKindV2, RuntimeObserveGatewayOwnerLeaseV1,
-    RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
+    RuntimeBuildRevisionV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
+    RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseObservationV1,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
+    RuntimeObserveGatewayOwnerLeaseV1, RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
     RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1, RuntimeServingSlotV2,
     RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2,
 };
-use automation_runtime_convergence::ProcessInstanceId;
+use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
+    RuntimeAcceptedPendingDrainSelectionV2, RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV2,
     RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
@@ -29,7 +31,11 @@ use automation_runtime_worker::{
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayOwnerLeasePortV1,
     RuntimeGatewayOwnerMutationErrorV1, RuntimeGatewayOwnerObservationErrorClassV1,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
-    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimePendingDrainAcknowledgementReceiptV2, RuntimePendingDrainCandidateV2,
+    RuntimePendingDrainClaimReceiptV2, RuntimePendingDrainNoCandidateReceiptV2,
+    RuntimePendingDrainSelectionOutcomeV2, RuntimePendingDrainSelectionReceiptV2,
+    RuntimePendingDrainStateDigestV2, RuntimeRegistryGlobalObservationSequenceV2,
+    RuntimeRegistryRecoveryObservationInputV2, RuntimeSelectedPendingDrainNoCandidateV2,
     RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
     RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
     RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryObservationPortV2,
@@ -627,6 +633,246 @@ fn complete_startup_recovery_execution_v2(
     authorization.complete(receipt)
 }
 
+fn pending_drain_candidate_v2() -> RuntimePendingDrainCandidateV2 {
+    let target: RuntimeDeploymentTargetV1 = serde_json::from_value(serde_json::json!({
+        "guild_id": "42",
+        "ruleset_key": "studyroom",
+        "version": 1,
+        "content_hash": "2".repeat(64),
+        "binding_revision": 1,
+        "binding_fingerprint": "3".repeat(64)
+    }))
+    .unwrap();
+    RuntimePendingDrainCandidateV2::new(
+        RuntimeDrainIntentIdV2::parse("07".repeat(16)).unwrap(),
+        RuntimeServingSlotV2::from_target(&target),
+        target,
+        NonZeroU64::new(1).unwrap(),
+        RuntimePendingDrainStateDigestV2::new([41; 32]).unwrap(),
+    )
+    .unwrap()
+}
+
+fn pending_drain_owner_receipt_v2(
+    request: &automation_runtime_worker::RuntimeStartupRecoveryExecutionRequestV2,
+    database_now: DateTime<Utc>,
+) -> RuntimeGatewayOwnerLeaseReceiptV1 {
+    RuntimeGatewayOwnerLeaseReceiptV1 {
+        lease_id: request.gateway_owner_lease_id().clone(),
+        owner_revision: request.expected_owner_revision(),
+        database_now,
+        expires_at: request.expected_owner_expires_at(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDrainTestStageV2 {
+    Selection,
+    NoCandidate,
+    Claim,
+    Acknowledgement,
+}
+
+#[derive(Clone, Copy)]
+enum PendingDrainTestSelectionV2 {
+    Candidate,
+    NoCandidate,
+}
+
+#[derive(Clone, Copy)]
+enum PendingDrainTestAwaitFailureV2 {
+    Transition(crate::process::RuntimeProcessStartupRecoveryLoopFailureV2),
+    Database(automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1),
+}
+
+struct FakePendingDrainRecoveryEnvironmentV2 {
+    selection: PendingDrainTestSelectionV2,
+    failure: Option<(PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    events: Vec<PendingDrainTestStageV2>,
+}
+
+impl FakePendingDrainRecoveryEnvironmentV2 {
+    fn candidate() -> Self {
+        Self {
+            selection: PendingDrainTestSelectionV2::Candidate,
+            failure: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn no_candidate() -> Self {
+        Self {
+            selection: PendingDrainTestSelectionV2::NoCandidate,
+            failure: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn failing(stage: PendingDrainTestStageV2, failure: PendingDrainTestAwaitFailureV2) -> Self {
+        Self {
+            selection: if stage == PendingDrainTestStageV2::NoCandidate {
+                PendingDrainTestSelectionV2::NoCandidate
+            } else {
+                PendingDrainTestSelectionV2::Candidate
+            },
+            failure: Some((stage, failure)),
+            events: Vec::new(),
+        }
+    }
+
+    fn finish_stage_v2<T>(
+        &mut self,
+        stage: PendingDrainTestStageV2,
+        value: T,
+    ) -> Result<
+        T,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        self.events.push(stage);
+        match self.failure {
+            Some((failed_stage, PendingDrainTestAwaitFailureV2::Transition(error)))
+                if failed_stage == stage =>
+            {
+                Err(
+                    crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(
+                        error,
+                    ),
+                )
+            }
+            Some((failed_stage, PendingDrainTestAwaitFailureV2::Database(error)))
+                if failed_stage == stage =>
+            {
+                Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
+            }
+            _ => Ok(value),
+        }
+    }
+}
+
+fn pending_drain_test_database_now_v2(
+    request: &automation_runtime_worker::RuntimeStartupRecoveryExecutionRequestV2,
+    offset_millis: i64,
+) -> DateTime<Utc> {
+    request.minimum_database_now() + TimeDelta::milliseconds(offset_millis)
+}
+
+impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
+    for FakePendingDrainRecoveryEnvironmentV2
+{
+    fn current_transition_v2(
+        &self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    ) -> Option<crate::process::RuntimeProcessStartupRecoveryLoopFailureV2> {
+        None
+    }
+
+    async fn select_pending_drain_v2(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSelectionV2,
+    ) -> Result<
+        RuntimePendingDrainSelectionReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        let outcome = match self.selection {
+            PendingDrainTestSelectionV2::Candidate => {
+                RuntimePendingDrainSelectionOutcomeV2::Candidate(pending_drain_candidate_v2())
+            }
+            PendingDrainTestSelectionV2::NoCandidate => {
+                RuntimePendingDrainSelectionOutcomeV2::NoCandidate
+            }
+        };
+        let receipt = RuntimePendingDrainSelectionReceiptV2::new(
+            authorization.request().correlation().clone(),
+            pending_drain_owner_receipt_v2(
+                authorization.request(),
+                pending_drain_test_database_now_v2(authorization.request(), 1),
+            ),
+            outcome,
+        );
+        self.finish_stage_v2(PendingDrainTestStageV2::Selection, receipt)
+    }
+
+    async fn record_pending_drain_no_candidate_v2(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        selection: &RuntimeSelectedPendingDrainNoCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainNoCandidateReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        let receipt = RuntimePendingDrainNoCandidateReceiptV2::new(
+            selection.request().action_identity().clone(),
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([46; 32]).unwrap(),
+            pending_drain_owner_receipt_v2(
+                selection.request(),
+                pending_drain_test_database_now_v2(selection.request(), 2),
+            ),
+        );
+        self.finish_stage_v2(PendingDrainTestStageV2::NoCandidate, receipt)
+    }
+
+    async fn execute_pending_drain_claim_v2(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainClaimV2,
+    ) -> Result<
+        RuntimePendingDrainClaimReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        let receipt = RuntimePendingDrainClaimReceiptV2::new(
+            authorization.action_identity().clone(),
+            authorization.candidate().clone(),
+            authorization.seal().clone(),
+            NonZeroU64::new(2).unwrap(),
+            RuntimePendingDrainStateDigestV2::new([42; 32]).unwrap(),
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([43; 32]).unwrap(),
+            pending_drain_owner_receipt_v2(
+                authorization.request(),
+                pending_drain_test_database_now_v2(authorization.request(), 2),
+            ),
+        );
+        self.finish_stage_v2(PendingDrainTestStageV2::Claim, receipt)
+    }
+
+    async fn execute_pending_drain_acknowledgement_v2(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    ) -> Result<
+        RuntimePendingDrainAcknowledgementReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        let receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
+            authorization.action_identity().clone(),
+            authorization.request().action_identity().clone(),
+            authorization.candidate().clone(),
+            authorization.seal().clone(),
+            authorization.claimed_intent_revision(),
+            authorization.claimed_state_digest().clone(),
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([43; 32]).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+            RuntimePendingDrainStateDigestV2::new([44; 32]).unwrap(),
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([45; 32]).unwrap(),
+            pending_drain_owner_receipt_v2(
+                authorization.request(),
+                pending_drain_test_database_now_v2(authorization.request(), 3),
+            ),
+        );
+        self.finish_stage_v2(PendingDrainTestStageV2::Acknowledgement, receipt)
+    }
+}
+
 fn fixture(
     lease_for: Duration,
     renew_before: Duration,
@@ -704,13 +950,41 @@ async fn initial_pending_recovery_fixture_v2(
     crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
     FakePortV1,
 ) {
-    initial_pending_recovery_fixture_until_v2(recovery_id, Instant::now() + Duration::from_secs(4))
-        .await
+    initial_pending_recovery_fixture_until_with_registry_v2(
+        recovery_id,
+        Instant::now() + Duration::from_secs(4),
+        InitialRegistryFixtureV2::RetainedTombstone,
+    )
+    .await
 }
 
 async fn initial_pending_recovery_fixture_until_v2(
     recovery_id: &str,
     operation_cutoff: Instant,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
+    FakePortV1,
+) {
+    initial_pending_recovery_fixture_until_with_registry_v2(
+        recovery_id,
+        operation_cutoff,
+        InitialRegistryFixtureV2::RetainedTombstone,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum InitialRegistryFixtureV2 {
+    Fresh,
+    RetainedTombstone,
+}
+
+async fn initial_pending_recovery_fixture_until_with_registry_v2(
+    recovery_id: &str,
+    operation_cutoff: Instant,
+    registry_fixture: InitialRegistryFixtureV2,
 ) -> (
     crate::RuntimeGatewayBootstrapV1,
     crate::RuntimeRegistryBootstrapV1,
@@ -751,7 +1025,12 @@ async fn initial_pending_recovery_fixture_until_v2(
         crate::GatewayResourceConfigV1::default(),
     )
     .unwrap();
-    registry.advance_empty_sequence_for_test_v2();
+    if matches!(
+        registry_fixture,
+        InitialRegistryFixtureV2::RetainedTombstone
+    ) {
+        registry.advance_empty_sequence_for_test_v2();
+    }
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
     let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
@@ -777,6 +1056,65 @@ async fn initial_committed_recovery_fixture_v2(
 ) {
     let (gateway, registry, pending, port) = initial_pending_recovery_fixture_v2(recovery_id).await;
     let session = pending.commit_owner_v2().await.unwrap();
+    (gateway, registry, session, port)
+}
+
+async fn initial_committed_fresh_registry_recovery_fixture_v2(
+    recovery_id: &str,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    FakePortV1,
+) {
+    let (gateway, registry, pending, port) =
+        initial_pending_recovery_fixture_until_with_registry_v2(
+            recovery_id,
+            Instant::now() + Duration::from_secs(4),
+            InitialRegistryFixtureV2::Fresh,
+        )
+        .await;
+    let session = pending.commit_owner_v2().await.unwrap();
+    (gateway, registry, session, port)
+}
+
+async fn initial_pending_drain_continue_fresh_registry_fixture_v2(
+    recovery_id: &str,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    FakePortV1,
+) {
+    let (gateway, registry, session, port) =
+        initial_committed_fresh_registry_recovery_fixture_v2(recovery_id).await;
+    let mut pending = empty_startup_recovery_state_v2();
+    pending.pending_runtime_drain_intent_count = 1;
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    pending,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected pending drain continuation")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+        )
+    );
     (gateway, registry, session, port)
 }
 
@@ -1324,6 +1662,436 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
         } if authority_revision.get() == 6
     ));
     drop(fixed_point);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_rolls_fresh_slot_s0_s1_s2() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "36363636363636363636363636363636",
+        )
+        .await;
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    assert_eq!(source.retained_slot_count(), 0);
+    assert_eq!(source.retained_empty_tombstone_count(), 0);
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::candidate();
+
+    crate::process::execute_pending_drain_recovery_with_environment_v2(
+        &mut session,
+        &mut environment,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Acknowledgement,
+        ]
+    );
+    let successor = registry.observe_recovery_empty_projection_v2().unwrap();
+    assert_eq!(
+        successor.observation_sequence().get(),
+        source.observation_sequence().get() + 2
+    );
+    assert_eq!(successor.retained_slot_count(), 1);
+    assert_eq!(successor.retained_empty_tombstone_count(), 1);
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
+    ));
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_records_no_candidate_without_sealing() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "35353535353535353535353535353535",
+        )
+        .await;
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::no_candidate();
+
+    crate::process::execute_pending_drain_recovery_with_environment_v2(
+        &mut session,
+        &mut environment,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::NoCandidate,
+        ]
+    );
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2().unwrap(),
+        source
+    );
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
+    ));
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every_await_failure() {
+    let cases = [
+        (
+            "34343434343434343434343434343434",
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestAwaitFailureV2::Database(
+                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+            ),
+            false,
+        ),
+        (
+            "33333333333333333333333333333333",
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainTestAwaitFailureV2::Database(
+                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+            ),
+            false,
+        ),
+        (
+            "32323232323232323232323232323232",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(
+                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+            ),
+            true,
+        ),
+        (
+            "31313131313131313131313131313131",
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestAwaitFailureV2::Database(
+                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+            ),
+            true,
+        ),
+        (
+            "30303030303030303030303030303030",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Transition(
+                crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
+            ),
+            true,
+        ),
+    ];
+
+    for (recovery_id, stage, failure, leaves_sealed) in cases {
+        let (gateway, registry, mut session, port) =
+            initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
+        let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing(stage, failure);
+
+        let error = match crate::process::execute_pending_drain_recovery_with_environment_v2(
+            &mut session,
+            &mut environment,
+        )
+        .await
+        {
+            Ok(_) => panic!("pending drain recovery unexpectedly completed"),
+            Err(error) => error,
+        };
+
+        match failure {
+            PendingDrainTestAwaitFailureV2::Transition(expected) => {
+                assert_eq!(error, expected);
+            }
+            PendingDrainTestAwaitFailureV2::Database(expected) => {
+                assert_eq!(
+                    error,
+                    crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                        expected,
+                    )
+                );
+            }
+        }
+        assert_eq!(environment.events.last(), Some(&stage));
+        assert_eq!(
+            registry.observe_recovery_empty_projection_v2().is_err(),
+            leaves_sealed
+        );
+        assert!(matches!(
+            gateway.closed_snapshot(),
+            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+                cause:
+                    automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+                ..
+            }
+        ));
+        drop(session);
+        wait_for(|| port.release_calls() == 1).await;
+    }
+}
+
+#[tokio::test]
+async fn pending_drain_compound_rolls_tombstone_s0_s1_s2_then_reobserves() {
+    let (gateway, registry, session, port) =
+        initial_committed_recovery_fixture_v2("39393939393939393939393939393939").await;
+    let mut pending = empty_startup_recovery_state_v2();
+    pending.pending_runtime_drain_intent_count = 1;
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    pending,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        mut session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected pending drain continuation")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+        )
+    );
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    let selection = session
+        .begin_startup_recovery_execution_v2(continuation)
+        .unwrap()
+        .into_pending_drain_selection()
+        .unwrap();
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_drain_owner_receipt_v2(selection.request(), at_millis(1_000_150)),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(pending_drain_candidate_v2()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected candidate")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    assert_eq!(
+        seal.pre_slot_observation()
+            .unwrap()
+            .admission_generation
+            .get(),
+        2
+    );
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2(),
+        Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+    );
+    let claim = selected.bind_registry_seal(seal).unwrap();
+    let claim_receipt = RuntimePendingDrainClaimReceiptV2::new(
+        claim.action_identity().clone(),
+        claim.candidate().clone(),
+        claim.seal().clone(),
+        NonZeroU64::new(2).unwrap(),
+        RuntimePendingDrainStateDigestV2::new([42; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([43; 32]).unwrap(),
+        pending_drain_owner_receipt_v2(claim.request(), at_millis(1_000_160)),
+    );
+    let acknowledgement = claim.complete(claim_receipt).unwrap();
+    let acknowledgement_receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
+        acknowledgement.action_identity().clone(),
+        acknowledgement.request().action_identity().clone(),
+        acknowledgement.candidate().clone(),
+        acknowledgement.seal().clone(),
+        acknowledgement.claimed_intent_revision(),
+        acknowledgement.claimed_state_digest().clone(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([43; 32]).unwrap(),
+        NonZeroU64::new(3).unwrap(),
+        RuntimePendingDrainStateDigestV2::new([44; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([45; 32]).unwrap(),
+        pending_drain_owner_receipt_v2(acknowledgement.request(), at_millis(1_000_170)),
+    );
+    let durable = acknowledgement.complete(acknowledgement_receipt).unwrap();
+    let unseal = session
+        .unseal_pending_drain_after_durable_ack_v2(&durable)
+        .unwrap();
+    let completed = durable.complete_registry_rollover(unseal).unwrap();
+    let accepted = session
+        .complete_startup_recovery_execution_v2(completed)
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome(),
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
+    ));
+    let successor = registry.observe_recovery_empty_projection_v2().unwrap();
+    assert_eq!(
+        successor.observation_sequence().get(),
+        source.observation_sequence().get() + 2
+    );
+    assert_eq!(successor.retained_slot_count(), 1);
+    assert_eq!(successor.retained_empty_tombstone_count(), 1);
+
+    let ready_iteration = session
+        .refresh_iteration_readiness_after_test_hook_v2(
+            ready(Ok(
+                crate::database::runtime_database_readiness_refresh_at_for_test_v2(3_000_000),
+            )),
+            || {},
+        )
+        .await
+        .unwrap();
+    let outcome = ready_iteration
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_200),
+                    empty_startup_recovery_state_v2(),
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
+    assert!(matches!(
+        gateway.closed_snapshot(),
+        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+            authority_revision,
+            ..
+        } if authority_revision.get() == 6
+    ));
+    drop(fixed_point);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn pending_drain_no_candidate_records_without_registry_seal() {
+    let (_gateway, registry, session, port) =
+        initial_committed_recovery_fixture_v2("38383838383838383838383838383838").await;
+    let mut pending = empty_startup_recovery_state_v2();
+    pending.pending_runtime_drain_intent_count = 1;
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    pending,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        mut session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected pending drain continuation")
+    };
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    let selection = session
+        .begin_startup_recovery_execution_v2(continuation)
+        .unwrap()
+        .into_pending_drain_selection()
+        .unwrap();
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_drain_owner_receipt_v2(selection.request(), at_millis(1_000_150)),
+        RuntimePendingDrainSelectionOutcomeV2::NoCandidate,
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::NoCandidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected no candidate")
+    };
+    let receipt = RuntimePendingDrainNoCandidateReceiptV2::new(
+        selected.request().action_identity().clone(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([46; 32]).unwrap(),
+        pending_drain_owner_receipt_v2(selected.request(), at_millis(1_000_160)),
+    );
+    let completed = selected.complete(receipt).unwrap();
+    let accepted = session
+        .complete_startup_recovery_execution_v2(completed)
+        .unwrap();
+
+    assert!(matches!(
+        accepted.outcome(),
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate
+    ));
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2().unwrap(),
+        source
+    );
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn pending_drain_transition_failure_after_seal_leaves_registry_sealed() {
+    let (_gateway, registry, session, port) =
+        initial_committed_recovery_fixture_v2("37373737373737373737373737373737").await;
+    let mut pending = empty_startup_recovery_state_v2();
+    pending.pending_runtime_drain_intent_count = 1;
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    pending,
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::Continue {
+        mut session,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected pending drain continuation")
+    };
+    let selection = session
+        .begin_startup_recovery_execution_v2(continuation)
+        .unwrap()
+        .into_pending_drain_selection()
+        .unwrap();
+    let receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_drain_owner_receipt_v2(selection.request(), at_millis(1_000_150)),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(pending_drain_candidate_v2()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(receipt).unwrap()
+    else {
+        panic!("expected candidate")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    let _claim = selected.bind_registry_seal(seal).unwrap();
+
+    session.invalidate_startup_recovery_execution_v2();
+    drop(session);
+
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2(),
+        Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+    );
     wait_for(|| port.release_calls() == 1).await;
 }
 

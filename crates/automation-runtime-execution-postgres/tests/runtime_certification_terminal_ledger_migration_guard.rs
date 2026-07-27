@@ -22,6 +22,8 @@ const CURRENT_READINESS_DEFINITION_DIGEST: &str =
     "a5191ef59e5365476860af1150a176049ef00c5b0d6c3f7cfe40e0b5be9d738a";
 const CURRENT_OBSERVATION_DEFINITION_DIGEST: &str =
     "7153d2dcf3eaa6a6534368eead9f40c157c63372c879ce99adf173eb3d23f306";
+const LATEST_READINESS_DEFINITION_DIGEST: &str =
+    "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -193,7 +195,7 @@ fn manifest_readiness_and_rust_pins_advance_once() {
     }
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(
-            source.contains(CURRENT_READINESS_DEFINITION_DIGEST),
+            source.contains(LATEST_READINESS_DEFINITION_DIGEST),
             "latest readiness pin"
         );
     }

@@ -62,6 +62,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/product_drain.rs"),
             PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
+            PathBuf::from("src/startup_pending_drain.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/startup_recovery_execution.rs"),
             PathBuf::from("src/startup_recovery_execution_tests.rs"),
@@ -991,6 +992,8 @@ fn startup_recovery_execution_is_linear_exactly_bound_and_progress_proven() {
         "pub struct RuntimeCompletedStartupRecoveryExecutionV2 {\n",
         "    authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,\n",
         "    receipt: RuntimeStartupRecoveryExecutionReceiptV2,\n",
+        "    pending_drain_proof: Option<crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2>,\n",
+        "    pending_registry_successor: Option<RuntimeRegistryRecoveryEmptyObservationV2>,\n",
         "}"
     )));
     assert!(execution.contains(concat!(
@@ -999,6 +1002,8 @@ fn startup_recovery_execution_is_linear_exactly_bound_and_progress_proven() {
         "    request: RuntimeStartupRecoveryExecutionRequestV2,\n",
         "    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,\n",
         "    outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2,\n",
+        "    pending_drain_proof: Option<crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2>,\n",
+        "    pending_registry_successor: Option<RuntimeRegistryRecoveryEmptyObservationV2>,\n",
         "}"
     )));
 
@@ -1197,6 +1202,110 @@ fn startup_recovery_execution_is_linear_exactly_bound_and_progress_proven() {
             && validation < acceptance
             && acceptance < publication
     );
+}
+
+#[test]
+fn pending_drain_compound_authority_is_linear_and_registry_rollover_gated() {
+    let source = include_str!("../src/startup_pending_drain.rs");
+    for authority in [
+        "RuntimeAuthorizedPendingDrainSelectionV2",
+        "RuntimeSelectedPendingDrainCandidateV2",
+        "RuntimeSelectedPendingDrainNoCandidateV2",
+        "RuntimeAuthorizedPendingDrainClaimV2",
+        "RuntimeAuthorizedPendingDrainAcknowledgementV2",
+        "RuntimeDurablyAcknowledgedPendingDrainV2",
+    ] {
+        let declaration = source
+            .split(&format!("pub struct {authority} {{"))
+            .next()
+            .unwrap();
+        let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(source, authority, forbidden));
+        }
+        let fields = source
+            .split(&format!("pub struct {authority} {{"))
+            .nth(1)
+            .and_then(|value| value.split("}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(source.contains(&format!("{authority}(<redacted>)")));
+    }
+    for required in [
+        "pub fn accept_selection(\n        self,",
+        "pub fn bind_registry_seal(\n        self,",
+        "pub fn complete_registry_rollover(\n        self,",
+        "pub fn seal_witness(&self) -> &RuntimePendingDrainRegistrySealWitnessV2",
+        "validate_registry_rollover_v2(&self.seal, &unseal)?",
+        "claim_action_identity != *self.authorization.request().action_identity()",
+        "prior_claim_terminal_digest.as_bytes()",
+        "RuntimePendingDrainExecutionProofV2::Compound",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    let durable = source
+        .split("pub struct RuntimeDurablyAcknowledgedPendingDrainV2 {")
+        .nth(1)
+        .unwrap();
+    let seal_access = durable.find("pub fn seal_witness(&self)").unwrap();
+    let consume = durable
+        .find("pub fn complete_registry_rollover(\n        self,")
+        .unwrap();
+    let validation = durable
+        .find("validate_registry_rollover_v2(&self.seal, &unseal)?")
+        .unwrap();
+    let completion = durable
+        .find("self.authorization.complete_pending_drain(")
+        .unwrap();
+    assert!(seal_access < consume && consume < validation && validation < completion);
+
+    for (port_name, method, authority, receipt) in [
+        (
+            "RuntimePendingDrainNoCandidateRecorderPortV2",
+            "record_pending_drain_no_candidate",
+            "RuntimeSelectedPendingDrainNoCandidateV2",
+            "RuntimePendingDrainNoCandidateReceiptV2",
+        ),
+        (
+            "RuntimePendingDrainClaimExecutionPortV2",
+            "execute_pending_drain_claim",
+            "RuntimeAuthorizedPendingDrainClaimV2",
+            "RuntimePendingDrainClaimReceiptV2",
+        ),
+        (
+            "RuntimePendingDrainAcknowledgementExecutionPortV2",
+            "execute_pending_drain_acknowledgement",
+            "RuntimeAuthorizedPendingDrainAcknowledgementV2",
+            "RuntimePendingDrainAcknowledgementReceiptV2",
+        ),
+    ] {
+        let port = source
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert_eq!(port.matches(&format!("fn {method}(")).count(), 1);
+        assert!(port.contains(&format!("&{authority}")));
+        assert!(port.contains("operation_cutoff: Instant"));
+        assert!(port.contains(&format!("Result<{receipt}, Self::Error>")));
+        assert!(port.contains("impl Future"));
+        assert!(port.contains("+ Send"));
+        for forbidden in [
+            "RuntimeClosedRecoveryOperationAuthorityV2",
+            "RuntimeAuthorizedStartupRecoveryExecutionV2",
+            "RuntimeCompletedStartupRecoveryExecutionV2",
+            "RuntimeDurablyAcknowledgedPendingDrainV2",
+            "deploy",
+            "activate",
+            "admission",
+            "Discord",
+            "sqlx",
+            "twilight",
+        ] {
+            assert!(!port.contains(forbidden), "{port_name}: {forbidden}");
+        }
+    }
 }
 
 #[test]

@@ -34,8 +34,17 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     StaleLiveExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
     StaleLiveRetryAfterUnsupported,
     ReservedAwaitingCertificationRecoveryUnavailable,
+    ReservedAwaitingCertificationExecution(RuntimeExecutionPersistenceErrorV1),
+    ReservedAwaitingCertificationExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    ReservedAwaitingCertificationRetryAfterUnsupported,
     SuspendedLocalEffectRecoveryUnavailable,
+    SuspendedLocalEffectExecution(RuntimeExecutionPersistenceErrorV1),
+    SuspendedLocalEffectExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    SuspendedLocalEffectRetryAfterUnsupported,
     PendingRuntimeDrainRecoveryUnavailable,
+    PendingRuntimeDrainExecution(RuntimeExecutionPersistenceErrorV1),
+    PendingRuntimeDrainExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    PendingRuntimeDrainCompound,
     ProtocolViolation,
 }
 
@@ -60,11 +69,28 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             Self::ReservedAwaitingCertificationRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_reserved_awaiting_certification_recovery_unavailable"
             }
+            Self::ReservedAwaitingCertificationExecution(error) => {
+                runtime_execution_error_code_v2(error)
+            }
+            Self::ReservedAwaitingCertificationExecutionRejected(error) => error.code(),
+            Self::ReservedAwaitingCertificationRetryAfterUnsupported => {
+                "runtime_process_startup_recovery_loop_reserved_awaiting_certification_retry_after_unsupported"
+            }
             Self::SuspendedLocalEffectRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_suspended_local_effect_recovery_unavailable"
             }
+            Self::SuspendedLocalEffectExecution(error) => runtime_execution_error_code_v2(error),
+            Self::SuspendedLocalEffectExecutionRejected(error) => error.code(),
+            Self::SuspendedLocalEffectRetryAfterUnsupported => {
+                "runtime_process_startup_recovery_loop_suspended_local_effect_retry_after_unsupported"
+            }
             Self::PendingRuntimeDrainRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_pending_runtime_drain_recovery_unavailable"
+            }
+            Self::PendingRuntimeDrainExecution(error) => runtime_execution_error_code_v2(error),
+            Self::PendingRuntimeDrainExecutionRejected(error) => error.code(),
+            Self::PendingRuntimeDrainCompound => {
+                "runtime_process_startup_recovery_loop_pending_runtime_drain_compound"
             }
             Self::ProtocolViolation => {
                 "runtime_process_startup_recovery_loop_protocol_violation"
@@ -82,8 +108,17 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             | Self::StaleLiveExecutionRejected(_)
             | Self::StaleLiveRetryAfterUnsupported
             | Self::ReservedAwaitingCertificationRecoveryUnavailable
+            | Self::ReservedAwaitingCertificationExecution(_)
+            | Self::ReservedAwaitingCertificationExecutionRejected(_)
+            | Self::ReservedAwaitingCertificationRetryAfterUnsupported
             | Self::SuspendedLocalEffectRecoveryUnavailable
+            | Self::SuspendedLocalEffectExecution(_)
+            | Self::SuspendedLocalEffectExecutionRejected(_)
+            | Self::SuspendedLocalEffectRetryAfterUnsupported
             | Self::PendingRuntimeDrainRecoveryUnavailable
+            | Self::PendingRuntimeDrainExecution(_)
+            | Self::PendingRuntimeDrainExecutionRejected(_)
+            | Self::PendingRuntimeDrainCompound
             | Self::ProtocolViolation => None,
         }
     }

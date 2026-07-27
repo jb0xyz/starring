@@ -108,6 +108,184 @@ async fn startup_recovery_execution_port_accepts_progressed_and_replayed_receipt
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_reserved_progress_and_replay() {
+    let server = PostgresTestServer::start();
+
+    let applied_database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&applied_database).await;
+    expire_current_gateway_owner(&applied_database.owner_pool).await;
+    let applied_adapter = verified_execution_adapter(&applied_database).await;
+    let applied_owner = acquire_startup_observation_port_owner(&applied_adapter).await;
+    let (mut applied_lifecycle, mut applied_permit, applied_authorization) =
+        authorize_reserved_awaiting_execution_port_call(
+            &applied_adapter,
+            applied_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let applied_action = applied_authorization.request().action_identity().clone();
+    let applied_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &applied_adapter,
+        applied_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let applied = applied_lifecycle
+        .complete_startup_recovery_execution(&mut applied_permit, applied_completed)
+        .unwrap();
+    assert_eq!(
+        applied.class(),
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+    );
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = applied.outcome()
+    else {
+        panic!("reserved awaiting adapter execution must progress")
+    };
+    assert_eq!(action_identity, &applied_action);
+    assert_ne!(terminal_digest.as_bytes(), &[0; 32]);
+    cleanup(applied_database).await;
+
+    let replayed_database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&replayed_database).await;
+    expire_current_gateway_owner(&replayed_database.owner_pool).await;
+    let replayed_adapter = verified_execution_adapter(&replayed_database).await;
+    let replayed_owner = acquire_startup_observation_port_owner(&replayed_adapter).await;
+    let (mut replayed_lifecycle, mut replayed_permit, replayed_authorization) =
+        authorize_reserved_awaiting_execution_port_call(
+            &replayed_adapter,
+            replayed_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let direct_applied = execute_reserved_awaiting_from_authorization(
+        &replayed_database.executor_pool,
+        &replayed_authorization,
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct_applied["journal_outcome_name"], "applied");
+    assert_eq!(direct_applied["terminal_outcome_name"], "progressed");
+    let expected_digest =
+        decode_lowercase_hex_32(direct_applied["terminal_digest"].as_str().unwrap());
+    let replayed_action = replayed_authorization.request().action_identity().clone();
+    let replayed_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &replayed_adapter,
+        replayed_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let replayed = replayed_lifecycle
+        .complete_startup_recovery_execution(&mut replayed_permit, replayed_completed)
+        .unwrap();
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = replayed.outcome()
+    else {
+        panic!("reserved awaiting exact replay must preserve progress proof")
+    };
+    assert_eq!(action_identity, &replayed_action);
+    assert_eq!(terminal_digest.as_bytes(), &expected_digest);
+
+    cleanup(replayed_database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_suspended_local_progress() {
+    assert_suspended_local_execution_port_progress(Some(5)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_suspended_local_progress_without_resume() {
+    assert_suspended_local_execution_port_progress(None).await;
+}
+
+async fn assert_suspended_local_execution_port_progress(last_resume_sequence: Option<u64>) {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_claimable_deployment(&database.owner_pool).await;
+    let mut claim = database.executor_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *claim)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT outcome_name \
+         FROM public.starring_runtime_execution_claim_next_v1(\
+            'suspended-local-controller', 300000\
+         )",
+    )
+    .fetch_one(&mut *claim)
+    .await
+    .unwrap();
+    claim.commit().await.unwrap();
+    seed_exact_local_suspension(&database.owner_pool).await;
+
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (mut lifecycle, mut permit, authorization) =
+        authorize_suspended_local_execution_port_call(
+            &adapter,
+            owner,
+            Duration::from_secs(5),
+            last_resume_sequence,
+        )
+        .await;
+    assert_eq!(
+        authorization
+            .request()
+            .paused_gateway()
+            .last_resume_sequence()
+            .map(|sequence| sequence.get()),
+        last_resume_sequence
+    );
+    let before = suspended_local_state(&database.owner_pool).await;
+    let action = authorization.request().action_identity().clone();
+    let completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &adapter,
+        authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+    assert_eq!(
+        accepted.class(),
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+    );
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = accepted.outcome()
+    else {
+        panic!("suspended local adapter execution must progress")
+    };
+    assert_eq!(action_identity, &action);
+    assert_ne!(terminal_digest.as_bytes(), &[0; 32]);
+    let after = suspended_local_state(&database.owner_pool).await;
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+    assert_eq!(after.2, before.2 + 1);
+    assert_eq!(after.3, "route_absent");
+    assert_eq!(after.4, "none");
+    assert_eq!(after.5, 1);
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
 async fn startup_recovery_execution_port_accepts_no_candidate_receipt() {
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
@@ -353,6 +531,156 @@ async fn authorize_stale_live_execution_port_call(
         .begin_startup_recovery_execution(&mut permit, continuation)
         .unwrap();
     (lifecycle, permit, authorization)
+}
+
+async fn authorize_reserved_awaiting_execution_port_call(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    cutoff_after: Duration,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2,
+) {
+    let (mut lifecycle, mut permit, observation_authorization) =
+        authorize_startup_observation_port_call(adapter, owner);
+    let completed = RuntimeStartupRecoveryObservationPortV2::observe_startup_recovery(
+        adapter,
+        observation_authorization,
+        Instant::now() + cutoff_after,
+    )
+    .await
+    .unwrap();
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(continuation) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("reserved awaiting observation must request recovery")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+        )
+    );
+    let authorization = lifecycle
+        .begin_startup_recovery_execution(&mut permit, continuation)
+        .unwrap();
+    (lifecycle, permit, authorization)
+}
+
+async fn authorize_suspended_local_execution_port_call(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    cutoff_after: Duration,
+    last_resume_sequence: Option<u64>,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2,
+) {
+    let (mut lifecycle, mut permit, observation_authorization) =
+        authorize_startup_observation_port_call_with_last_resume(
+            adapter,
+            owner,
+            last_resume_sequence,
+        );
+    let completed = RuntimeStartupRecoveryObservationPortV2::observe_startup_recovery(
+        adapter,
+        observation_authorization,
+        Instant::now() + cutoff_after,
+    )
+    .await
+    .unwrap();
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(continuation) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("suspended local observation must request recovery")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+        )
+    );
+    let authorization = lifecycle
+        .begin_startup_recovery_execution(&mut permit, continuation)
+        .unwrap();
+    (lifecycle, permit, authorization)
+}
+
+async fn expire_current_gateway_owner(pool: &PgPool) {
+    let expired_at = database_now(pool).await - TimeDelta::seconds(1);
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE public.runtime_gateway_owners DISABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query(
+            "UPDATE public.runtime_gateway_owners \
+             SET expires_at = $1 \
+             WHERE gateway_shard_id = 'shard:0'",
+        )
+        .bind(expired_at)
+        .execute(&mut *transaction)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    sqlx::query("ALTER TABLE public.runtime_gateway_owners ENABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn execute_reserved_awaiting_from_authorization(
+    pool: &PgPool,
+    authorization: &RuntimeAuthorizedStartupRecoveryExecutionV2,
+) -> Result<Value, sqlx::Error> {
+    let request = authorization.request();
+    let correlation = request.correlation();
+    let owner = request.gateway_owner_lease_id();
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT pg_catalog.set_config('statement_timeout', '5s', TRUE)")
+        .execute(&mut *transaction)
+        .await?;
+    let result = sqlx::query_scalar::<_, Json<Value>>(
+        "SELECT pg_catalog.to_jsonb(result) \
+         FROM public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2(\
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12\
+         ) AS result",
+    )
+    .bind(correlation.recovery_id().as_str())
+    .bind(i64::try_from(correlation.originating_emergency_generation().get()).unwrap())
+    .bind(i64::try_from(correlation.coordinator_generation().get()).unwrap())
+    .bind(i64::try_from(correlation.authority_revision().get()).unwrap())
+    .bind(i64::try_from(correlation.selection_authority_revision().get()).unwrap())
+    .bind(owner.gateway_shard_id.as_str())
+    .bind(owner.process_instance_id.as_str())
+    .bind(i64::try_from(owner.lease_epoch.get()).unwrap())
+    .bind(owner.expected_build_revision.as_str())
+    .bind(i64::try_from(request.expected_owner_revision().get()).unwrap())
+    .bind(request.expected_owner_expires_at())
+    .bind(request.minimum_database_now())
+    .fetch_one(&mut *transaction)
+    .await;
+    match result {
+        Ok(Json(value)) => {
+            transaction.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 fn startup_stale_live_input_from_authorization(

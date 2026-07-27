@@ -4,13 +4,18 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_registry::{
     RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
-    RegistryRecoveryObservationV2, ServingSlotRegistryConfigV1, ServingSlotRegistryError,
-    ServingSlotRegistryV1,
+    RegistryRecoveryObservationV2, SealedEmptyRecoveryDrainClaimV2, ServingSlotKeyV1,
+    ServingSlotRegistryConfigV1, ServingSlotRegistryError, ServingSlotRegistryV1,
+    SlotAdmissionStateV2, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2,
-    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
-    RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeDurablyAcknowledgedPendingDrainV2, RuntimePendingDrainCandidateV2,
+    RuntimePendingDrainCompoundErrorV2, RuntimePendingDrainRegistrySealWitnessInputV2,
+    RuntimePendingDrainRegistrySealWitnessV2, RuntimePendingDrainRegistryUnsealWitnessV2,
+    RuntimePendingDrainSlotObservationV2, RuntimeRegistryGlobalObservationSequenceV2,
+    RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV2,
+    RuntimeRegistryRecoveryObservationInputV2,
 };
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
@@ -206,12 +211,428 @@ impl RuntimeRegistryEmptyRecoveryBindingV2 {
             .map_err(map_registry_observation_error)?;
         project_empty_observation_v2(&self.process_instance_id, observation)
     }
+
+    pub(crate) fn into_pending_drain_seal_binding_v2(
+        self,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        (
+            RuntimeRegistryPendingDrainSealBindingV2,
+            RuntimePendingDrainRegistrySealWitnessV2,
+        ),
+        RuntimeRegistryRecoveryObservationErrorV1,
+    > {
+        let key = ServingSlotKeyV1::new(
+            candidate.slot().guild_id,
+            candidate.slot().ruleset_key.clone(),
+        );
+        let seal_key = SlotSealKeyV2::try_from(candidate.intent_id().canonical_bytes().as_slice())
+            .map_err(|_| RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)?;
+        let source_empty_observation = self.revalidate_empty_projection_unordered_v2()?;
+        let sealed = self
+            .registry
+            .seal_empty_recovery_drain_claim_v2(self.cursor, &key, seal_key)
+            .map_err(map_registry_observation_error)?;
+        validate_pending_drain_seal_v2(&key, seal_key, &source_empty_observation, &sealed)?;
+        let witness = pending_drain_seal_witness_v2(
+            &self.process_instance_id,
+            candidate,
+            &source_empty_observation,
+            &sealed,
+        )?;
+        let binding = RuntimeRegistryPendingDrainSealBindingV2 {
+            process_instance_id: self.process_instance_id,
+            registry: self.registry,
+            sealed,
+            source_empty_observation,
+            witness: witness.clone(),
+        };
+        Ok((binding, witness))
+    }
 }
 
 impl Debug for RuntimeRegistryEmptyRecoveryBindingV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeRegistryEmptyRecoveryBindingV2(<redacted>)")
     }
+}
+
+pub(crate) struct RuntimeRegistryPendingDrainSealBindingV2 {
+    process_instance_id: ProcessInstanceId,
+    registry: ServingSlotRegistryV1,
+    sealed: SealedEmptyRecoveryDrainClaimV2,
+    source_empty_observation: RuntimeRegistryRecoveryEmptyObservationV2,
+    witness: RuntimePendingDrainRegistrySealWitnessV2,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeRegistryPendingDrainSealBindingV2 {
+    pub(crate) fn seal_key_bytes_v2(&self) -> [u8; 16] {
+        *self.sealed.seal().seal_key().as_bytes()
+    }
+
+    pub(crate) fn seal_generation_v2(&self) -> NonZeroU64 {
+        self.sealed.seal().seal_generation()
+    }
+
+    pub(crate) fn source_empty_observation_v2(&self) -> &RuntimeRegistryRecoveryEmptyObservationV2 {
+        &self.source_empty_observation
+    }
+
+    pub(crate) fn source_slot_is_present_v2(&self) -> bool {
+        self.sealed.source_slot_observation().is_some()
+    }
+
+    pub(crate) fn source_slot_admission_generation_v2(&self) -> Option<NonZeroU64> {
+        self.sealed
+            .source_slot_observation()
+            .map(|observation| observation.admission_generation)
+    }
+
+    pub(crate) fn source_slot_observation_sequence_v2(&self) -> Option<NonZeroU64> {
+        self.sealed
+            .source_slot_observation()
+            .map(|observation| observation.observation_sequence)
+    }
+
+    pub(crate) fn post_seal_admission_generation_v2(&self) -> NonZeroU64 {
+        self.sealed.slot_observation().admission_generation
+    }
+
+    pub(crate) fn post_seal_slot_observation_sequence_v2(&self) -> NonZeroU64 {
+        self.sealed.slot_observation().observation_sequence
+    }
+
+    pub(crate) fn post_seal_global_observation_sequence_v2(
+        &self,
+    ) -> RuntimeRegistryGlobalObservationSequenceV2 {
+        RuntimeRegistryGlobalObservationSequenceV2::new(
+            self.sealed
+                .registry_observation()
+                .observation_sequence()
+                .as_non_zero(),
+        )
+    }
+
+    pub(crate) fn post_seal_retained_slot_count_v2(&self) -> u64 {
+        self.sealed.registry_observation().retained_slot_count()
+    }
+
+    pub(crate) fn post_seal_retained_empty_tombstone_count_v2(&self) -> u64 {
+        self.sealed
+            .registry_observation()
+            .retained_empty_tombstone_count()
+    }
+
+    pub(crate) fn post_seal_staged_route_count_v2(&self) -> u64 {
+        self.sealed.registry_observation().staged_route_count()
+    }
+
+    pub(crate) fn post_seal_serving_route_count_v2(&self) -> u64 {
+        self.sealed.registry_observation().serving_route_count()
+    }
+
+    pub(crate) fn post_seal_draining_route_count_v2(&self) -> u64 {
+        self.sealed.registry_observation().draining_route_count()
+    }
+
+    pub(crate) fn post_seal_sealed_slot_count_v2(&self) -> u64 {
+        self.sealed.registry_observation().sealed_slot_count()
+    }
+
+    pub(crate) fn post_seal_active_interaction_count_v2(&self) -> u64 {
+        self.sealed
+            .registry_observation()
+            .active_interaction_count()
+    }
+
+    pub(crate) fn post_seal_failed_closed_slot_count_v2(&self) -> u64 {
+        self.sealed
+            .registry_observation()
+            .failed_closed_slot_count()
+    }
+
+    pub(crate) fn post_seal_registry_failed_closed_v2(&self) -> bool {
+        self.sealed.registry_observation().registry_failed_closed()
+    }
+
+    pub(crate) fn revalidate_sealed_v2(
+        &self,
+    ) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+        let first_registry_observation = self
+            .registry
+            .recovery_observation_v2()
+            .map_err(map_registry_observation_error)?;
+        if first_registry_observation != self.sealed.registry_observation() {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        let slot_observation = self
+            .registry
+            .atomic_observation_v2(self.sealed.seal().key())
+            .map_err(map_registry_observation_error)?;
+        if slot_observation.as_ref() != Some(self.sealed.slot_observation()) {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        let second_registry_observation = self
+            .registry
+            .recovery_observation_v2()
+            .map_err(map_registry_observation_error)?;
+        if second_registry_observation != self.sealed.registry_observation() {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        validate_pending_drain_seal_v2(
+            self.sealed.seal().key(),
+            self.sealed.seal().seal_key(),
+            &self.source_empty_observation,
+            &self.sealed,
+        )
+    }
+
+    pub(crate) fn into_empty_binding_after_durable_ack_v2(
+        self,
+        durable: &RuntimeDurablyAcknowledgedPendingDrainV2,
+    ) -> Result<
+        (
+            RuntimeRegistryEmptyRecoveryBindingV2,
+            RuntimePendingDrainRegistryUnsealWitnessV2,
+        ),
+        RuntimeRegistryRecoveryObservationErrorV1,
+    > {
+        require_pending_drain_durable_seal_match_v2(&self.witness, durable.seal_witness())?;
+        self.revalidate_sealed_v2()?;
+        let expected_slot_observation_sequence =
+            successor_non_zero_u64_v2(self.sealed.slot_observation().observation_sequence)?;
+        let expected_admission_generation =
+            successor_non_zero_u64_v2(self.sealed.slot_observation().admission_generation)?;
+        let expected_registry_observation_sequence = successor_non_zero_u64_v2(
+            self.sealed
+                .registry_observation()
+                .observation_sequence()
+                .as_non_zero(),
+        )?;
+        let expected_retained_slot_count = self.sealed.registry_observation().retained_slot_count();
+        let expected_retained_empty_tombstone_count = self
+            .sealed
+            .registry_observation()
+            .retained_empty_tombstone_count()
+            .checked_add(1)
+            .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ObservationOverflow)?;
+        let slot = durable.candidate().slot().clone();
+        let Self {
+            process_instance_id,
+            registry,
+            sealed,
+            ..
+        } = self;
+        let unsealed = registry
+            .unseal_empty_recovery_drain_claim_v2(sealed)
+            .map_err(map_registry_observation_error)?;
+        let slot_observation = unsealed.slot_observation();
+        if slot_observation.route.is_some()
+            || slot_observation.admission_state != SlotAdmissionStateV2::Empty
+            || slot_observation.active_interactions != 0
+            || slot_observation.admission_generation != expected_admission_generation
+            || slot_observation.observation_sequence != expected_slot_observation_sequence
+        {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        let post_slot_admission_generation = slot_observation.admission_generation;
+        let post_slot_observation_sequence = slot_observation.observation_sequence;
+        let registry_observation = unsealed.registry_observation();
+        if registry_observation.observation_sequence().as_non_zero()
+            != expected_registry_observation_sequence
+            || registry_observation.retained_slot_count() != expected_retained_slot_count
+            || registry_observation.retained_empty_tombstone_count()
+                != expected_retained_empty_tombstone_count
+        {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        let empty_observation =
+            project_empty_observation_v2(&process_instance_id, registry_observation)?;
+        let binding = RuntimeRegistryEmptyRecoveryBindingV2 {
+            process_instance_id: process_instance_id.clone(),
+            registry,
+            cursor: unsealed.into_cursor(),
+        };
+        if binding.revalidate_empty_projection_unordered_v2()? != empty_observation {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+        }
+        let witness = RuntimePendingDrainRegistryUnsealWitnessV2::new(
+            process_instance_id,
+            slot,
+            post_slot_admission_generation,
+            post_slot_observation_sequence,
+            empty_observation,
+        )
+        .map_err(map_pending_drain_compound_error)?;
+        Ok((binding, witness))
+    }
+}
+
+fn require_pending_drain_durable_seal_match_v2(
+    actual: &RuntimePendingDrainRegistrySealWitnessV2,
+    authorized: &RuntimePendingDrainRegistrySealWitnessV2,
+) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    if actual != authorized {
+        Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)
+    } else {
+        Ok(())
+    }
+}
+
+impl Debug for RuntimeRegistryPendingDrainSealBindingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryPendingDrainSealBindingV2(<redacted>)")
+    }
+}
+
+fn validate_pending_drain_seal_v2(
+    key: &ServingSlotKeyV1,
+    seal_key: SlotSealKeyV2,
+    source_empty_observation: &RuntimeRegistryRecoveryEmptyObservationV2,
+    sealed: &SealedEmptyRecoveryDrainClaimV2,
+) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    let seal = sealed.seal();
+    let source_slot_observation = sealed.source_slot_observation();
+    let slot_observation = sealed.slot_observation();
+    let registry_observation = sealed.registry_observation();
+    if seal.key() != key
+        || seal.seal_key() != seal_key
+        || seal.route().is_some()
+        || slot_observation.route.is_some()
+        || slot_observation.active_interactions != 0
+        || slot_observation.admission_state
+            != (SlotAdmissionStateV2::DrainClaimSealed {
+                seal_key,
+                seal_generation: seal.seal_generation(),
+            })
+        || registry_observation.registry_failed_closed()
+        || registry_observation.staged_route_count() != 0
+        || registry_observation.serving_route_count() != 0
+        || registry_observation.draining_route_count() != 0
+        || registry_observation.sealed_slot_count() != 1
+        || registry_observation.active_interaction_count() != 0
+        || registry_observation.failed_closed_slot_count() != 0
+    {
+        return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+    }
+    let expected_registry_sequence = successor_non_zero_u64_v2(
+        source_empty_observation
+            .observation_sequence()
+            .as_non_zero(),
+    )?;
+    if registry_observation.observation_sequence().as_non_zero() != expected_registry_sequence {
+        return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+    }
+    let source_retained_slot_count = source_empty_observation.retained_slot_count();
+    let source_retained_empty_tombstone_count =
+        source_empty_observation.retained_empty_tombstone_count();
+    if source_retained_slot_count != source_retained_empty_tombstone_count {
+        return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+    }
+    let (expected_retained_slot_count, expected_retained_empty_tombstone_count) =
+        if let Some(source_slot_observation) = source_slot_observation {
+            if source_slot_observation.route.is_some()
+                || source_slot_observation.admission_state != SlotAdmissionStateV2::Empty
+                || source_slot_observation.active_interactions != 0
+                || slot_observation.admission_generation
+                    != successor_non_zero_u64_v2(source_slot_observation.admission_generation)?
+                || slot_observation.observation_sequence
+                    != successor_non_zero_u64_v2(source_slot_observation.observation_sequence)?
+            {
+                return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+            }
+            (
+                source_retained_slot_count,
+                source_retained_empty_tombstone_count
+                    .checked_sub(1)
+                    .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)?,
+            )
+        } else {
+            if slot_observation.admission_generation != NonZeroU64::MIN
+                || slot_observation.observation_sequence != NonZeroU64::MIN
+            {
+                return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+            }
+            (
+                source_retained_slot_count
+                    .checked_add(1)
+                    .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ObservationOverflow)?,
+                source_retained_empty_tombstone_count,
+            )
+        };
+    if registry_observation.retained_slot_count() != expected_retained_slot_count
+        || registry_observation.retained_empty_tombstone_count()
+            != expected_retained_empty_tombstone_count
+        || registry_observation.retained_slot_count()
+            != registry_observation
+                .retained_empty_tombstone_count()
+                .checked_add(1)
+                .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ObservationOverflow)?
+    {
+        return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+    }
+    Ok(())
+}
+
+fn pending_drain_seal_witness_v2(
+    process_instance_id: &ProcessInstanceId,
+    candidate: &RuntimePendingDrainCandidateV2,
+    source_empty_observation: &RuntimeRegistryRecoveryEmptyObservationV2,
+    sealed: &SealedEmptyRecoveryDrainClaimV2,
+) -> Result<RuntimePendingDrainRegistrySealWitnessV2, RuntimeRegistryRecoveryObservationErrorV1> {
+    let source_slot_observation =
+        sealed
+            .source_slot_observation()
+            .map(|observation| RuntimePendingDrainSlotObservationV2 {
+                admission_generation: observation.admission_generation,
+                observation_sequence: observation.observation_sequence,
+            });
+    let registry_observation = sealed.registry_observation();
+    RuntimePendingDrainRegistrySealWitnessV2::new(RuntimePendingDrainRegistrySealWitnessInputV2 {
+        process_instance_id: process_instance_id.clone(),
+        slot: candidate.slot().clone(),
+        pre_slot_observation: source_slot_observation,
+        seal_key: *sealed.seal().seal_key().as_bytes(),
+        seal_generation: sealed.seal().seal_generation(),
+        post_slot_admission_generation: sealed.slot_observation().admission_generation,
+        post_slot_observation_sequence: sealed.slot_observation().observation_sequence,
+        pre_registry_observation_sequence: source_empty_observation.observation_sequence(),
+        pre_registry_retained_slot_count: source_empty_observation.retained_slot_count(),
+        pre_registry_retained_empty_tombstone_count: source_empty_observation
+            .retained_empty_tombstone_count(),
+        post_registry_observation: RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+                registry_observation.observation_sequence().as_non_zero(),
+            ),
+            retained_slot_count: registry_observation.retained_slot_count(),
+            retained_empty_tombstone_count: registry_observation.retained_empty_tombstone_count(),
+            staged_route_count: registry_observation.staged_route_count(),
+            serving_route_count: registry_observation.serving_route_count(),
+            draining_route_count: registry_observation.draining_route_count(),
+            sealed_slot_count: registry_observation.sealed_slot_count(),
+            active_interaction_count: registry_observation.active_interaction_count(),
+            failed_closed_slot_count: registry_observation.failed_closed_slot_count(),
+            registry_failed_closed: registry_observation.registry_failed_closed(),
+        },
+    })
+    .map_err(map_pending_drain_compound_error)
+}
+
+fn map_pending_drain_compound_error(
+    _error: RuntimePendingDrainCompoundErrorV2,
+) -> RuntimeRegistryRecoveryObservationErrorV1 {
+    RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation
+}
+
+fn successor_non_zero_u64_v2(
+    value: NonZeroU64,
+) -> Result<NonZeroU64, RuntimeRegistryRecoveryObservationErrorV1> {
+    value
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ObservationOverflow)
 }
 
 pub fn compose_runtime_registry_bootstrap_v1(
@@ -333,11 +754,15 @@ fn map_worker_observation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU64, NonZeroUsize};
 
+    use automation_runtime_controller::{RuntimeDrainIntentIdV2, RuntimeServingSlotV2};
     use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
     use automation_runtime_registry::{ServingSlotKeyV1, ServingSlotRegistryError, SlotSealKeyV2};
-    use automation_runtime_worker::RuntimeRegistryRecoveryObservationErrorV2;
+    use automation_runtime_worker::{
+        RuntimePendingDrainCandidateV2, RuntimePendingDrainStateDigestV2,
+        RuntimeRegistryRecoveryObservationErrorV2,
+    };
     use serde_json::json;
 
     use super::{
@@ -348,8 +773,8 @@ mod tests {
     };
     use crate::GatewayResourceConfigV1;
 
-    fn slot_key() -> ServingSlotKeyV1 {
-        let target: RuntimeDeploymentTargetV1 = serde_json::from_value(json!({
+    fn target() -> RuntimeDeploymentTargetV1 {
+        serde_json::from_value(json!({
             "guild_id": "42",
             "ruleset_key": "studyroom",
             "version": 1,
@@ -357,8 +782,23 @@ mod tests {
             "binding_revision": 1,
             "binding_fingerprint": "3".repeat(64)
         }))
-        .unwrap();
-        ServingSlotKeyV1::from_target(&target)
+        .unwrap()
+    }
+
+    fn slot_key() -> ServingSlotKeyV1 {
+        ServingSlotKeyV1::from_target(&target())
+    }
+
+    fn candidate() -> RuntimePendingDrainCandidateV2 {
+        let target = target();
+        RuntimePendingDrainCandidateV2::new(
+            RuntimeDrainIntentIdV2::parse("07".repeat(16)).unwrap(),
+            RuntimeServingSlotV2::from_target(&target),
+            target,
+            NonZeroU64::new(1).unwrap(),
+            RuntimePendingDrainStateDigestV2::new([8; 32]).unwrap(),
+        )
+        .unwrap()
     }
 
     fn seal_key() -> SlotSealKeyV2 {
@@ -486,6 +926,221 @@ mod tests {
         assert_eq!(
             foreign_binding.revalidate_empty_projection_unordered_v2(),
             Err(RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding)
+        );
+    }
+
+    #[test]
+    fn pending_drain_seal_binding_tracks_absent_slot_s0_s1_exactly() {
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let guard = bootstrap.recovery_observation_guard_unordered_v2().unwrap();
+        let source = guard.empty_projection_v2().unwrap();
+        let binding = guard.into_empty_binding_v2().unwrap();
+
+        let (sealed, witness) = binding
+            .into_pending_drain_seal_binding_v2(&candidate())
+            .unwrap();
+
+        assert_eq!(sealed.source_empty_observation_v2(), &source);
+        assert_eq!(&witness, &sealed.witness);
+        assert_eq!(sealed.seal_key_bytes_v2(), [7_u8; 16]);
+        assert_eq!(sealed.seal_generation_v2().get(), 1);
+        assert!(!sealed.source_slot_is_present_v2());
+        assert_eq!(sealed.source_slot_admission_generation_v2(), None);
+        assert_eq!(sealed.source_slot_observation_sequence_v2(), None);
+        assert_eq!(sealed.post_seal_admission_generation_v2().get(), 1);
+        assert_eq!(sealed.post_seal_slot_observation_sequence_v2().get(), 1);
+        assert_eq!(
+            sealed.post_seal_global_observation_sequence_v2().get(),
+            source.observation_sequence().get() + 1
+        );
+        assert_eq!(sealed.post_seal_retained_slot_count_v2(), 1);
+        assert_eq!(sealed.post_seal_retained_empty_tombstone_count_v2(), 0);
+        assert_eq!(sealed.post_seal_staged_route_count_v2(), 0);
+        assert_eq!(sealed.post_seal_serving_route_count_v2(), 0);
+        assert_eq!(sealed.post_seal_draining_route_count_v2(), 0);
+        assert_eq!(sealed.post_seal_sealed_slot_count_v2(), 1);
+        assert_eq!(sealed.post_seal_active_interaction_count_v2(), 0);
+        assert_eq!(sealed.post_seal_failed_closed_slot_count_v2(), 0);
+        assert!(!sealed.post_seal_registry_failed_closed_v2());
+        assert_eq!(
+            format!("{sealed:?}"),
+            "RuntimeRegistryPendingDrainSealBindingV2(<redacted>)"
+        );
+        sealed.revalidate_sealed_v2().unwrap();
+    }
+
+    #[test]
+    fn pending_drain_seal_binding_preserves_tombstone_local_generation() {
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        bootstrap.advance_empty_sequence_for_test_v2();
+        let guard = bootstrap.recovery_observation_guard_unordered_v2().unwrap();
+        let source = guard.empty_projection_v2().unwrap();
+        let binding = guard.into_empty_binding_v2().unwrap();
+
+        let (sealed, _) = binding
+            .into_pending_drain_seal_binding_v2(&candidate())
+            .unwrap();
+
+        assert!(sealed.source_slot_is_present_v2());
+        assert_eq!(
+            sealed.source_slot_admission_generation_v2().unwrap().get(),
+            2
+        );
+        assert_eq!(
+            sealed.source_slot_observation_sequence_v2().unwrap().get(),
+            2
+        );
+        assert_eq!(sealed.seal_generation_v2().get(), 2);
+        assert_eq!(sealed.post_seal_admission_generation_v2().get(), 3);
+        assert_eq!(sealed.post_seal_slot_observation_sequence_v2().get(), 3);
+        assert_eq!(sealed.post_seal_retained_slot_count_v2(), 1);
+        assert_eq!(sealed.post_seal_retained_empty_tombstone_count_v2(), 0);
+        assert_eq!(
+            sealed.post_seal_global_observation_sequence_v2().get(),
+            source.observation_sequence().get() + 1
+        );
+    }
+
+    #[test]
+    fn pending_drain_seal_rejects_stale_and_foreign_s0_bindings() {
+        let process_instance_id = ProcessInstanceId::parse("runtime-process:1").unwrap();
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            process_instance_id.clone(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let stale = bootstrap
+            .recovery_observation_guard_unordered_v2()
+            .unwrap()
+            .into_empty_binding_v2()
+            .unwrap();
+        bootstrap.advance_empty_sequence_for_test_v2();
+
+        assert_eq!(
+            stale
+                .into_pending_drain_seal_binding_v2(&candidate())
+                .err()
+                .unwrap(),
+            RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding
+        );
+
+        let source = compose_runtime_registry_bootstrap_v1(
+            process_instance_id.clone(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let foreign = compose_runtime_registry_bootstrap_v1(
+            process_instance_id,
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let cursor = source
+            .registry
+            .recovery_observation_guard_v2()
+            .unwrap()
+            .into_empty_cursor()
+            .unwrap();
+        let foreign_binding = RuntimeRegistryEmptyRecoveryBindingV2 {
+            process_instance_id: foreign.process_instance_id.clone(),
+            registry: foreign.registry.clone(),
+            cursor,
+        };
+
+        assert_eq!(
+            foreign_binding
+                .into_pending_drain_seal_binding_v2(&candidate())
+                .err()
+                .unwrap(),
+            RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding
+        );
+    }
+
+    #[test]
+    fn pending_drain_seal_exposes_no_mutable_capability_and_drop_stays_sealed() {
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let binding = bootstrap
+            .recovery_observation_guard_unordered_v2()
+            .unwrap()
+            .into_empty_binding_v2()
+            .unwrap();
+        let (sealed, _) = binding
+            .into_pending_drain_seal_binding_v2(&candidate())
+            .unwrap();
+        let mut exposed_key = sealed.seal_key_bytes_v2();
+        exposed_key[0] = 99;
+
+        assert_eq!(exposed_key[0], 99);
+        assert_eq!(sealed.seal_key_bytes_v2(), [7_u8; 16]);
+        sealed.revalidate_sealed_v2().unwrap();
+        drop(sealed);
+        assert_eq!(
+            bootstrap.observe_recovery_empty_projection_v2(),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+        );
+        let observation = bootstrap
+            .registry
+            .atomic_observation_v2(&slot_key())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            observation.admission_state,
+            automation_runtime_registry::SlotAdmissionStateV2::DrainClaimSealed { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_drain_durable_token_seal_mismatch_precedes_registry_mutation() {
+        let bootstrap = compose_runtime_registry_bootstrap_v1(
+            ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let binding = bootstrap
+            .recovery_observation_guard_unordered_v2()
+            .unwrap()
+            .into_empty_binding_v2()
+            .unwrap();
+        let (sealed, witness) = binding
+            .into_pending_drain_seal_binding_v2(&candidate())
+            .unwrap();
+        let mismatched = automation_runtime_worker::RuntimePendingDrainRegistrySealWitnessV2::new(
+            automation_runtime_worker::RuntimePendingDrainRegistrySealWitnessInputV2 {
+                process_instance_id: witness.process_instance_id().clone(),
+                slot: witness.slot().clone(),
+                pre_slot_observation: witness.pre_slot_observation(),
+                seal_key: [9; 16],
+                seal_generation: witness.seal_generation(),
+                post_slot_admission_generation: witness.post_slot_admission_generation(),
+                post_slot_observation_sequence: witness.post_slot_observation_sequence(),
+                pre_registry_observation_sequence: witness.pre_registry_observation_sequence(),
+                pre_registry_retained_slot_count: witness.pre_registry_retained_slot_count(),
+                pre_registry_retained_empty_tombstone_count: witness
+                    .pre_registry_retained_empty_tombstone_count(),
+                post_registry_observation: witness.post_registry_observation(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::require_pending_drain_durable_seal_match_v2(&witness, &mismatched),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)
+        );
+        sealed.revalidate_sealed_v2().unwrap();
+        assert_eq!(
+            bootstrap.observe_recovery_empty_projection_v2(),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
         );
     }
 
