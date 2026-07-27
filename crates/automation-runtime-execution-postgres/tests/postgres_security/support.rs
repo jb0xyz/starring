@@ -55,7 +55,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 20] = [
+const EXECUTOR_FUNCTIONS: [&str; 21] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -76,9 +76,10 @@ const EXECUTOR_FUNCTIONS: [&str; 20] = [
     "public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
+    "public.starring_runtime_startup_recovery_execute_suspended_local_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
+    "7526d7365225da6514fcc589d76c316dd1363c40cad30e12e3f752b4c85e8044";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

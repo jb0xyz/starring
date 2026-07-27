@@ -12,7 +12,7 @@ pub(crate) const FOUNDATIONAL_CAPABILITY_IDENTITIES_V1: [&str; 2] = [
     "public.starring_runtime_execution_database_identity_v1()",
 ];
 
-pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 18] = [
+pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 19] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
@@ -31,16 +31,17 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 18] = [
     "public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
+    "public.starring_runtime_startup_recovery_execute_suspended_local_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint)",
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8");
+    Some("7526d7365225da6514fcc589d76c316dd1363c40cad30e12e3f752b4c85e8044");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
         .iter()
         .chain(OPERATION_CAPABILITY_IDENTITIES_V1.iter());
-    if capabilities.clone().count() != 20 {
+    if capabilities.clone().count() != 21 {
         return false;
     }
     for (index, capability) in capabilities.clone().enumerate() {

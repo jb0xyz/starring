@@ -3029,7 +3029,6 @@ fn startup_recovery_loop_is_bounded_reobserving_and_non_authorizing() {
         "RuntimeStartupRecoveryClassV2::StaleLive",
         "RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification",
         "RuntimeStartupRecoveryClassV2::SuspendedLocalEffect",
-        "RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent",
     ] {
         assert_eq!(unavailable.matches(class).count(), 1, "{class}");
     }
@@ -3116,6 +3115,8 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         "RuntimeStartupRecoveryExecutionPortV2",
         "RuntimeStartupRecoveryClassV2::StaleLive",
         "RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification",
+        "RuntimeStartupRecoveryClassV2::SuspendedLocalEffect",
+        "RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent",
         ".begin_startup_recovery_execution_v2(",
         ".execute_startup_recovery(authorization, execution_cutoff)",
         ".complete_startup_recovery_execution_v2(completed)",

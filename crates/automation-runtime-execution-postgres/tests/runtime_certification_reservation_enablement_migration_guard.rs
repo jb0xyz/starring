@@ -198,8 +198,8 @@ fn rust_contract_and_security_fixture_expose_the_latest_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 18]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 20"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 19]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 21"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(operations.matches(identity).count(), 1, "{identity}");
     }
@@ -218,7 +218,7 @@ fn rust_contract_and_security_fixture_expose_the_latest_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 20]"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 21]"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(
             executor_functions.matches(identity).count(),

@@ -33,6 +33,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             class,
             RuntimeStartupRecoveryClassV2::StaleLive
                 | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+                | RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
         ) {
             return Err(super::startup_loop::unavailable_recovery_failure_v2(class));
         }
@@ -152,8 +153,10 @@ fn startup_recovery_execution_database_failure_v2(
                 error,
             )
         }
-        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
-        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectExecution(error)
+        }
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
             super::startup_loop::unavailable_recovery_failure_v2(class)
         }
     }
@@ -172,8 +175,10 @@ fn startup_recovery_execution_rejected_v2(
                 error,
             )
         }
-        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
-        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectExecutionRejected(error)
+        }
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
             super::startup_loop::unavailable_recovery_failure_v2(class)
         }
     }
@@ -189,8 +194,10 @@ fn startup_recovery_execution_retry_after_unsupported_v2(
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
             RuntimeProcessStartupRecoveryLoopFailureV2::ReservedAwaitingCertificationRetryAfterUnsupported
         }
-        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
-        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => {
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectRetryAfterUnsupported
+        }
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
             super::startup_loop::unavailable_recovery_failure_v2(class)
         }
     }
@@ -533,7 +540,31 @@ mod tests {
                 RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
                 database_error,
             ),
-            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectRecoveryUnavailable
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectExecution(
+                database_error,
+            )
+        );
+        assert_eq!(
+            startup_recovery_execution_rejected_v2(
+                RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
+                protocol_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectExecutionRejected(
+                protocol_error,
+            )
+        );
+        assert_eq!(
+            startup_recovery_execution_retry_after_unsupported_v2(
+                RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectRetryAfterUnsupported
+        );
+        assert_eq!(
+            startup_recovery_execution_database_failure_v2(
+                RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+                database_error,
+            ),
+            RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainRecoveryUnavailable
         );
     }
 }

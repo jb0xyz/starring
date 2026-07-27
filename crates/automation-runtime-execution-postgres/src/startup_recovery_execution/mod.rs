@@ -1,3 +1,4 @@
+mod closed_evidence;
 mod digest;
 mod projection;
 mod query;
@@ -5,6 +6,8 @@ mod reserved_projection;
 mod reserved_semantic;
 mod row;
 mod semantic;
+mod suspended_projection;
+mod suspended_semantic;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +21,10 @@ use automation_runtime_worker::{
 };
 use sqlx::{PgConnection, Postgres, Transaction};
 
+use self::closed_evidence::RuntimeClosedRecoveryExpectedEvidenceV2;
 use self::query::{
     EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY, EXECUTE_STALE_LIVE_STARTUP_RECOVERY_QUERY,
+    EXECUTE_SUSPENDED_LOCAL_STARTUP_RECOVERY_QUERY,
 };
 use self::row::{
     RuntimeStartupRecoveryExecutionDatabaseOutcomeV2, RuntimeStartupRecoveryExecutionExpectedV2,
@@ -154,7 +159,7 @@ impl PostgresRuntimeExecutionV1 {
         let owner = request.gateway_owner_lease_id();
         let query = recovery_execution_query(request.class())?;
         mutation_dispatched.store(true, Ordering::Release);
-        let mut rows = sqlx::query_as::<_, RuntimeStartupRecoveryExecutionRowV2>(query)
+        let query = sqlx::query_as::<_, RuntimeStartupRecoveryExecutionRowV2>(query)
             .bind(correlation.recovery_id().as_str())
             .bind(bindings.originating_emergency_generation)
             .bind(bindings.coordinator_generation)
@@ -166,7 +171,25 @@ impl PostgresRuntimeExecutionV1 {
             .bind(owner.expected_build_revision.as_str())
             .bind(bindings.owner_revision)
             .bind(request.expected_owner_expires_at())
-            .bind(request.minimum_database_now())
+            .bind(request.minimum_database_now());
+        let query = if let Some(evidence) = bindings.closed_evidence.as_ref() {
+            query
+                .bind(evidence.paused_process_instance_id.as_str())
+                .bind(evidence.paused_coordinator_generation)
+                .bind(evidence.paused_connection_epoch)
+                .bind(evidence.paused_ready_kind)
+                .bind(evidence.paused_admission_revision)
+                .bind(evidence.paused_transition_sequence)
+                .bind(evidence.paused_connected_event_sequence)
+                .bind(evidence.paused_last_resume_sequence.unwrap_or(0))
+                .bind(evidence.registry_process_instance_id.as_str())
+                .bind(evidence.registry_observation_sequence)
+                .bind(evidence.registry_retained_slot_count)
+                .bind(evidence.registry_retained_empty_tombstone_count)
+        } else {
+            query
+        };
+        let mut rows = query
             .fetch_all(&mut *transaction)
             .await
             .map_err(map_mutation_dispatch_error)?;
@@ -198,7 +221,7 @@ impl RuntimeStartupRecoveryExecutionPortV2 for PostgresRuntimeExecutionV1 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RuntimeStartupRecoveryExecutionBindingsV2 {
     originating_emergency_generation: i64,
     coordinator_generation: i64,
@@ -206,6 +229,7 @@ struct RuntimeStartupRecoveryExecutionBindingsV2 {
     selection_authority_revision: i64,
     owner_lease_epoch: i64,
     owner_revision: i64,
+    closed_evidence: Option<RuntimeClosedRecoveryExpectedEvidenceV2>,
 }
 
 impl RuntimeStartupRecoveryExecutionBindingsV2 {
@@ -224,6 +248,7 @@ impl RuntimeStartupRecoveryExecutionBindingsV2 {
             )?,
             owner_lease_epoch: positive_i64(request.gateway_owner_lease_id().lease_epoch.get())?,
             owner_revision: positive_i64(request.expected_owner_revision().get())?,
+            closed_evidence: closed_recovery_expected_evidence_v2(request)?,
         };
         if bindings.selection_authority_revision.checked_add(1)
             != Some(bindings.action_authority_revision)
@@ -234,7 +259,7 @@ impl RuntimeStartupRecoveryExecutionBindingsV2 {
     }
 
     fn expected(
-        self,
+        &self,
         request: &RuntimeStartupRecoveryExecutionRequestV2,
     ) -> RuntimeStartupRecoveryExecutionExpectedV2 {
         RuntimeStartupRecoveryExecutionExpectedV2 {
@@ -249,6 +274,7 @@ impl RuntimeStartupRecoveryExecutionBindingsV2 {
             owner_revision: self.owner_revision,
             owner_expires_at: request.expected_owner_expires_at(),
             minimum_database_now: request.minimum_database_now(),
+            closed_evidence: self.closed_evidence.clone(),
         }
     }
 }
@@ -261,8 +287,10 @@ fn recovery_execution_query(
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
             Ok(EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY)
         }
-        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
-        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => {
+            Ok(EXECUTE_SUSPENDED_LOCAL_STARTUP_RECOVERY_QUERY)
+        }
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => {
             Err(RuntimeExecutionPersistenceErrorV1::RetryNotReady)
         }
     }
@@ -274,9 +302,57 @@ fn recovery_class_name(class: RuntimeStartupRecoveryClassV2) -> Option<&'static 
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification => {
             Some("reserved_awaiting_certification")
         }
-        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
-        | RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => None,
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => Some("suspended_local_effect"),
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => None,
     }
+}
+
+fn closed_recovery_expected_evidence_v2(
+    request: &RuntimeStartupRecoveryExecutionRequestV2,
+) -> Result<Option<RuntimeClosedRecoveryExpectedEvidenceV2>, RuntimeExecutionPersistenceErrorV1> {
+    if request.class() != RuntimeStartupRecoveryClassV2::SuspendedLocalEffect {
+        return Ok(None);
+    }
+    let paused = request.paused_gateway();
+    let owner_process = request
+        .gateway_owner_lease_id()
+        .process_instance_id
+        .as_str();
+    if paused.process_instance_id().as_str() != owner_process
+        || paused.coordinator_generation().get()
+            != request
+                .correlation()
+                .originating_emergency_generation()
+                .get()
+        || request.registry_process_instance_id().as_str() != owner_process
+        || request.registry_retained_slot_count()
+            != request.registry_retained_empty_tombstone_count()
+    {
+        return Err(RuntimeExecutionPersistenceErrorV1::InvalidInput);
+    }
+    let paused_ready_kind = match paused.kind() {
+        automation_runtime_controller::RuntimeGatewayReadyKindV2::Ready => "ready",
+        automation_runtime_controller::RuntimeGatewayReadyKindV2::Resumed => "resumed",
+    };
+    Ok(Some(RuntimeClosedRecoveryExpectedEvidenceV2 {
+        paused_process_instance_id: paused.process_instance_id().as_str().to_owned(),
+        paused_coordinator_generation: positive_i64(paused.coordinator_generation().get())?,
+        paused_connection_epoch: positive_i64(paused.connection_epoch().get())?,
+        paused_ready_kind,
+        paused_admission_revision: positive_i64(paused.admission_revision().get())?,
+        paused_transition_sequence: positive_i64(paused.transition_sequence().get())?,
+        paused_connected_event_sequence: positive_i64(paused.connected_event_sequence().get())?,
+        paused_last_resume_sequence: paused
+            .last_resume_sequence()
+            .map(|sequence| positive_i64(sequence.get()))
+            .transpose()?,
+        registry_process_instance_id: request.registry_process_instance_id().as_str().to_owned(),
+        registry_observation_sequence: positive_i64(request.registry_observation_sequence().get())?,
+        registry_retained_slot_count: nonnegative_i64(request.registry_retained_slot_count())?,
+        registry_retained_empty_tombstone_count: nonnegative_i64(
+            request.registry_retained_empty_tombstone_count(),
+        )?,
+    }))
 }
 
 fn positive_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {
@@ -287,6 +363,10 @@ fn positive_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {
     } else {
         Ok(value)
     }
+}
+
+fn nonnegative_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {
+    i64::try_from(value).map_err(|_| RuntimeExecutionPersistenceErrorV1::InvalidInput)
 }
 
 fn client_cutoff_error(mutation_dispatched: bool) -> RuntimeExecutionPersistenceErrorV1 {
@@ -387,8 +467,9 @@ mod tests {
                 .unwrap(),
             EXECUTE_RESERVED_AWAITING_STARTUP_RECOVERY_QUERY
         );
-        assert!(
-            recovery_execution_query(RuntimeStartupRecoveryClassV2::SuspendedLocalEffect).is_err()
+        assert_eq!(
+            recovery_execution_query(RuntimeStartupRecoveryClassV2::SuspendedLocalEffect).unwrap(),
+            EXECUTE_SUSPENDED_LOCAL_STARTUP_RECOVERY_QUERY
         );
         assert!(
             recovery_execution_query(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent)

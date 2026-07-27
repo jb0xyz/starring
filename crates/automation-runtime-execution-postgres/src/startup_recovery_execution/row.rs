@@ -4,6 +4,9 @@ use automation_runtime_controller::{
 use automation_runtime_worker::RuntimeStartupRecoveryExecutionTerminalDigestV2;
 use chrono::{DateTime, Utc};
 
+use super::closed_evidence::{
+    validate_closed_recovery_evidence_v2, RuntimeClosedRecoveryExpectedEvidenceV2,
+};
 use super::digest::{
     lowercase_sha256_bytes, startup_recovery_action_digest_v2, RuntimeStartupRecoveryActionProofV2,
 };
@@ -17,6 +20,12 @@ use super::reserved_semantic::{
     validate_reserved_progressed_projection_v2, RuntimeReservedStartupRecoveryExpectationV2,
 };
 use super::semantic::validate_progressed_projection_v2;
+use super::suspended_projection::{
+    decode_suspended_terminal_projection_v2, RuntimeSuspendedStartupRecoveryTerminalProjectionV2,
+};
+use super::suspended_semantic::{
+    validate_suspended_progressed_projection_v2, RuntimeSuspendedStartupRecoveryExpectationV2,
+};
 use crate::gateway_owner::MAX_RUNTIME_GATEWAY_OWNER_LEASE_DURATION;
 use crate::RuntimeExecutionPersistenceErrorV1;
 
@@ -54,6 +63,7 @@ pub(super) struct RuntimeStartupRecoveryExecutionExpectedV2 {
     pub owner_revision: i64,
     pub owner_expires_at: DateTime<Utc>,
     pub minimum_database_now: DateTime<Utc>,
+    pub closed_evidence: Option<RuntimeClosedRecoveryExpectedEvidenceV2>,
 }
 
 pub(super) struct RuntimeStartupRecoveryExecutionDatabaseReceiptV2 {
@@ -160,6 +170,36 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
                                 selection_authority_revision: expected.selection_authority_revision,
                             },
                             self.recorded_at,
+                        )?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                    }
+                }
+            }
+            "suspended_local_effect" => {
+                let suspended_evidence = expected.closed_evidence.as_ref().ok_or_else(invalid)?;
+                match decode_suspended_terminal_projection_v2(
+                    &self.terminal_outcome_name,
+                    &self.terminal_projection_bytes,
+                )? {
+                    RuntimeSuspendedStartupRecoveryTerminalProjectionV2::NoCandidate(evidence) => {
+                        validate_closed_recovery_evidence_v2(&evidence, suspended_evidence)?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::NoCandidate)
+                    }
+                    RuntimeSuspendedStartupRecoveryTerminalProjectionV2::Progressed(projection) => {
+                        validate_suspended_progressed_projection_v2(
+                            &projection,
+                            &RuntimeSuspendedStartupRecoveryExpectationV2 {
+                                recovery_id: &expected.recovery_id,
+                                originating_emergency_generation: expected
+                                    .originating_emergency_generation,
+                                coordinator_generation: expected.coordinator_generation,
+                                action_authority_revision: expected.action_authority_revision,
+                                selection_authority_revision: expected.selection_authority_revision,
+                                gateway_owner_lease_id: &expected.gateway_owner_lease_id,
+                                owner_revision: expected.owner_revision,
+                                owner_expires_at: expected.owner_expires_at,
+                                evidence: suspended_evidence,
+                            },
                         )?;
                         Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
                     }
@@ -277,6 +317,7 @@ mod tests {
             owner_revision: 7,
             owner_expires_at: at(200),
             minimum_database_now: at(100),
+            closed_evidence: None,
         }
     }
 

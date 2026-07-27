@@ -830,6 +830,18 @@ fn authorize_startup_observation_port_call(
     RuntimeClosedDrainRecoveryPermitV2,
     automation_runtime_worker::RuntimeAuthorizedStartupRecoveryObservationV2,
 ) {
+    authorize_startup_observation_port_call_with_last_resume(adapter, owner, None)
+}
+
+fn authorize_startup_observation_port_call_with_last_resume(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    last_resume_sequence: Option<u64>,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    automation_runtime_worker::RuntimeAuthorizedStartupRecoveryObservationV2,
+) {
     let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
     let generation = lifecycle.snapshot().generation();
     let process = owner.lease_id.process_instance_id.clone();
@@ -842,7 +854,9 @@ fn authorize_startup_observation_port_call(
         RuntimePausedGatewaySequenceV2::new(
             RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(5).unwrap()),
             RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(4).unwrap()),
-            None,
+            last_resume_sequence.map(|sequence| {
+                RuntimeGatewayAdmissionSequenceV2::new(NonZeroU64::new(sequence).unwrap())
+            }),
         )
         .unwrap(),
     );

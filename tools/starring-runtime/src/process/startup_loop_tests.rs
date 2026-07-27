@@ -222,17 +222,12 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
         Self::RecoveryFailure,
     > {
         push_fake_loop_event_v2(&self.state, "recovery");
-        Box::pin(ready(
-            if matches!(
-                class,
-                RuntimeStartupRecoveryClassV2::StaleLive
-                    | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
-            ) {
-                Ok(())
-            } else {
-                Err(())
-            },
-        ))
+        Box::pin(ready(match class {
+            RuntimeStartupRecoveryClassV2::StaleLive
+            | RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+            | RuntimeStartupRecoveryClassV2::SuspendedLocalEffect => Ok(()),
+            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent => Err(()),
+        }))
     }
 
     async fn cleanup_after_recovery_failure_v2(
@@ -385,6 +380,7 @@ async fn production_used_driver_refreshes_and_reobserves_after_supported_recover
     for class in [
         RuntimeStartupRecoveryClassV2::StaleLive,
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
     ] {
         let ready = fake_loop_v2([FakeLoopStepV2::Recover(class), FakeLoopStepV2::FixedPoint]);
         let state = ready.state.clone();
@@ -430,7 +426,7 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
             vec!["observe", "finalize", "wait", "cleanup_readiness"],
         ),
         (
-            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::SuspendedLocalEffect),
+            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent),
             FakeLoopErrorV2::Recovery,
             vec!["observe", "finalize", "recovery", "cleanup_recovery"],
         ),
@@ -776,6 +772,10 @@ fn supported_recovery_database_failures_preserve_exact_persistence_codes() {
                 error,
             )
             .code(),
+            error.code()
+        );
+        assert_eq!(
+            RuntimeProcessStartupRecoveryLoopFailureV2::SuspendedLocalEffectExecution(error).code(),
             error.code()
         );
     }

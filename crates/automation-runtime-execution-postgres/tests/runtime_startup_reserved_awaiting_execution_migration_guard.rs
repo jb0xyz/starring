@@ -194,10 +194,10 @@ fn manifest_readiness_acl_and_rust_pins_advance_together() {
     ] {
         assert!(MIGRATION.contains(required), "{required}");
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 18]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 19]"));
     assert!(CONTRACT_SOURCE.contains(EXECUTOR));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 20"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 20]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 21"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 21]"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(READINESS_DIGEST));
     }

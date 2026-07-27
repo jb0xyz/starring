@@ -38,6 +38,9 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     ReservedAwaitingCertificationExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
     ReservedAwaitingCertificationRetryAfterUnsupported,
     SuspendedLocalEffectRecoveryUnavailable,
+    SuspendedLocalEffectExecution(RuntimeExecutionPersistenceErrorV1),
+    SuspendedLocalEffectExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    SuspendedLocalEffectRetryAfterUnsupported,
     PendingRuntimeDrainRecoveryUnavailable,
     ProtocolViolation,
 }
@@ -73,6 +76,11 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             Self::SuspendedLocalEffectRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_suspended_local_effect_recovery_unavailable"
             }
+            Self::SuspendedLocalEffectExecution(error) => runtime_execution_error_code_v2(error),
+            Self::SuspendedLocalEffectExecutionRejected(error) => error.code(),
+            Self::SuspendedLocalEffectRetryAfterUnsupported => {
+                "runtime_process_startup_recovery_loop_suspended_local_effect_retry_after_unsupported"
+            }
             Self::PendingRuntimeDrainRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_pending_runtime_drain_recovery_unavailable"
             }
@@ -96,6 +104,9 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             | Self::ReservedAwaitingCertificationExecutionRejected(_)
             | Self::ReservedAwaitingCertificationRetryAfterUnsupported
             | Self::SuspendedLocalEffectRecoveryUnavailable
+            | Self::SuspendedLocalEffectExecution(_)
+            | Self::SuspendedLocalEffectExecutionRejected(_)
+            | Self::SuspendedLocalEffectRetryAfterUnsupported
             | Self::PendingRuntimeDrainRecoveryUnavailable
             | Self::ProtocolViolation => None,
         }

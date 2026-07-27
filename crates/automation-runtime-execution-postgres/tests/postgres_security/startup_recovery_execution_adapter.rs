@@ -198,6 +198,94 @@ async fn startup_recovery_execution_port_verifies_reserved_progress_and_replay()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_suspended_local_progress() {
+    assert_suspended_local_execution_port_progress(Some(5)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_suspended_local_progress_without_resume() {
+    assert_suspended_local_execution_port_progress(None).await;
+}
+
+async fn assert_suspended_local_execution_port_progress(last_resume_sequence: Option<u64>) {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_claimable_deployment(&database.owner_pool).await;
+    let mut claim = database.executor_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *claim)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT outcome_name \
+         FROM public.starring_runtime_execution_claim_next_v1(\
+            'suspended-local-controller', 300000\
+         )",
+    )
+    .fetch_one(&mut *claim)
+    .await
+    .unwrap();
+    claim.commit().await.unwrap();
+    seed_exact_local_suspension(&database.owner_pool).await;
+
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (mut lifecycle, mut permit, authorization) =
+        authorize_suspended_local_execution_port_call(
+            &adapter,
+            owner,
+            Duration::from_secs(5),
+            last_resume_sequence,
+        )
+        .await;
+    assert_eq!(
+        authorization
+            .request()
+            .paused_gateway()
+            .last_resume_sequence()
+            .map(|sequence| sequence.get()),
+        last_resume_sequence
+    );
+    let before = suspended_local_state(&database.owner_pool).await;
+    let action = authorization.request().action_identity().clone();
+    let completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &adapter,
+        authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+    assert_eq!(
+        accepted.class(),
+        RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
+    );
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = accepted.outcome()
+    else {
+        panic!("suspended local adapter execution must progress")
+    };
+    assert_eq!(action_identity, &action);
+    assert_ne!(terminal_digest.as_bytes(), &[0; 32]);
+    let after = suspended_local_state(&database.owner_pool).await;
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+    assert_eq!(after.2, before.2 + 1);
+    assert_eq!(after.3, "route_absent");
+    assert_eq!(after.4, "none");
+    assert_eq!(after.5, 1);
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
 async fn startup_recovery_execution_port_accepts_no_candidate_receipt() {
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
@@ -473,6 +561,47 @@ async fn authorize_reserved_awaiting_execution_port_call(
         continuation,
         RuntimeStartupRecoveryContinuationV2::Recover(
             RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+        )
+    );
+    let authorization = lifecycle
+        .begin_startup_recovery_execution(&mut permit, continuation)
+        .unwrap();
+    (lifecycle, permit, authorization)
+}
+
+async fn authorize_suspended_local_execution_port_call(
+    adapter: &PostgresRuntimeExecutionV1,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    cutoff_after: Duration,
+    last_resume_sequence: Option<u64>,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeAuthorizedStartupRecoveryExecutionV2,
+) {
+    let (mut lifecycle, mut permit, observation_authorization) =
+        authorize_startup_observation_port_call_with_last_resume(
+            adapter,
+            owner,
+            last_resume_sequence,
+        );
+    let completed = RuntimeStartupRecoveryObservationPortV2::observe_startup_recovery(
+        adapter,
+        observation_authorization,
+        Instant::now() + cutoff_after,
+    )
+    .await
+    .unwrap();
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::Continue(continuation) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("suspended local observation must request recovery")
+    };
+    assert_eq!(
+        continuation,
+        RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::SuspendedLocalEffect
         )
     );
     let authorization = lifecycle
