@@ -20,6 +20,7 @@ use crate::{
 
 mod closed;
 pub(crate) mod connected;
+mod execution;
 #[cfg_attr(test, allow(dead_code))]
 mod observation;
 mod owner;

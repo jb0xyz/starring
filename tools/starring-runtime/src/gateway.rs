@@ -20,21 +20,18 @@ use automation_runtime_controller::{
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
-    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    RuntimeAcceptedGatewayOwnerReceiptV1, RuntimeAcceptedStartupRecoveryExecutionOutcomeV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
     RuntimeAuthorizedStartupRecoveryIterationV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
-    RuntimeCompletedStartupRecoveryObservationV2, RuntimeGatewayClosedLifecycleV2,
-    RuntimeGatewayClosedSnapshotV2, RuntimeGatewayClosedTransitionErrorV2,
-    RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayEmergencyCauseV2,
-    RuntimeGatewayInvalidationCauseV2, RuntimeGatewayOwnerLeasePortV1,
-    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
-    RuntimeRegistryRecoveryEmptyObservationV2, RuntimeStartupRecoveryFixedPointProofV2,
-};
-#[cfg(test)]
-use automation_runtime_worker::{
-    RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
-    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimeCompletedStartupRecoveryObservationV2,
+    RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
+    RuntimeGatewayClosedTransitionErrorV2, RuntimeGatewayCoordinatorGenerationV2,
+    RuntimeGatewayEmergencyCauseV2, RuntimeGatewayInvalidationCauseV2,
+    RuntimeGatewayOwnerLeasePortV1, RuntimePausedGatewayObservationV2,
+    RuntimePausedGatewaySequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
@@ -1267,8 +1264,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         Ok((self, transition))
     }
 
-    #[cfg(test)]
-    pub(crate) fn begin_startup_recovery_execution_for_test_v2(
+    pub(crate) fn begin_startup_recovery_execution_v2(
         &mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         continuation: RuntimeStartupRecoveryContinuationV2,
@@ -1290,8 +1286,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         Ok(authorization)
     }
 
-    #[cfg(test)]
-    pub(crate) fn complete_startup_recovery_execution_for_test_v2(
+    pub(crate) fn complete_startup_recovery_execution_v2(
         &mut self,
         committed_owner: &RuntimeGatewayOwnerClosedRecoverySupervisorV2,
         completed: RuntimeCompletedStartupRecoveryExecutionV2,

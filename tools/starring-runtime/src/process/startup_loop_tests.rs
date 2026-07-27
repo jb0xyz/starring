@@ -192,6 +192,8 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
     type Ready = FakeReadyProcessV2;
     type WaitCompletion = ();
     type WaitFailure = ();
+    type RecoveryCompletion = ();
+    type RecoveryFailure = ();
     type Error = FakeLoopErrorV2;
 
     fn continuation_v2(&self) -> RuntimeStartupRecoveryContinuationV2 {
@@ -211,12 +213,38 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
         FakeLoopErrorV2::Wait
     }
 
-    async fn cleanup_after_unavailable_recovery_v2(
+    fn execute_recovery_in_place_v2(
+        &mut self,
+        class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryBorrowedStepFutureV2<
+        '_,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+    > {
+        push_fake_loop_event_v2(&self.state, "recovery");
+        Box::pin(ready(
+            if class == RuntimeStartupRecoveryClassV2::StaleLive {
+                Ok(())
+            } else {
+                Err(())
+            },
+        ))
+    }
+
+    async fn cleanup_after_recovery_failure_v2(
         self,
-        _class: RuntimeStartupRecoveryClassV2,
+        _failure: Self::RecoveryFailure,
     ) -> Self::Error {
         push_fake_loop_event_v2(&self.state, "cleanup_recovery");
         FakeLoopErrorV2::Recovery
+    }
+
+    async fn into_next_ready_after_recovery_v2(
+        self,
+        _completion: Self::RecoveryCompletion,
+    ) -> Result<Self::Ready, Self::Error> {
+        push_fake_loop_event_v2(&self.state, "readiness");
+        Ok(FakeReadyProcessV2 { state: self.state })
     }
 
     async fn into_next_ready_v2(
@@ -237,6 +265,8 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeCancelableContinueProcessV
     type Ready = ();
     type WaitCompletion = ();
     type WaitFailure = ();
+    type RecoveryCompletion = ();
+    type RecoveryFailure = ();
     type Error = FakeLoopErrorV2;
 
     fn continuation_v2(&self) -> RuntimeStartupRecoveryContinuationV2 {
@@ -264,12 +294,37 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeCancelableContinueProcessV
         FakeLoopErrorV2::Wait
     }
 
-    async fn cleanup_after_unavailable_recovery_v2(
-        self,
+    fn execute_recovery_in_place_v2(
+        &mut self,
         _class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryBorrowedStepFutureV2<
+        '_,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+    > {
+        let recovery = TrackedPendingWaitV2 {
+            polled: self.polled.clone(),
+            dropped: self.dropped.clone(),
+        };
+        Box::pin(async move {
+            recovery.await;
+            Ok(())
+        })
+    }
+
+    async fn cleanup_after_recovery_failure_v2(
+        self,
+        _failure: Self::RecoveryFailure,
     ) -> Self::Error {
         self.cleanup_count.fetch_add(1, Ordering::AcqRel);
         FakeLoopErrorV2::Recovery
+    }
+
+    async fn into_next_ready_after_recovery_v2(
+        self,
+        _completion: Self::RecoveryCompletion,
+    ) -> Result<Self::Ready, Self::Error> {
+        Ok(())
     }
 
     async fn into_next_ready_v2(
@@ -322,6 +377,30 @@ async fn production_used_driver_reobserves_after_foreign_fresh_and_stops_at_fixe
 }
 
 #[tokio::test]
+async fn production_used_driver_refreshes_and_reobserves_after_stale_live_execution() {
+    let ready = fake_loop_v2([
+        FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive),
+        FakeLoopStepV2::FixedPoint,
+    ]);
+    let state = ready.state.clone();
+
+    let fixed_point = drive_startup_recovery_loop_v2(ready).await.unwrap();
+
+    assert!(Arc::ptr_eq(&state, &fixed_point));
+    assert_eq!(
+        fake_loop_events_v2(&state),
+        [
+            "observe",
+            "finalize",
+            "recovery",
+            "readiness",
+            "observe",
+            "finalize"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
     let cases = [
         (
@@ -345,9 +424,9 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
             vec!["observe", "finalize", "wait", "cleanup_readiness"],
         ),
         (
-            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::StaleLive),
+            FakeLoopStepV2::Recover(RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification),
             FakeLoopErrorV2::Recovery,
-            vec!["observe", "finalize", "cleanup_recovery"],
+            vec!["observe", "finalize", "recovery", "cleanup_recovery"],
         ),
     ];
 
@@ -480,6 +559,39 @@ async fn canceling_the_production_used_borrowed_wait_retains_exactly_one_cleanup
     assert_eq!(
         process.cleanup_after_wait_failure_v2(()).await,
         FakeLoopErrorV2::Wait
+    );
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn canceling_a_borrowed_recovery_retains_exactly_one_cleanup_authority() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let mut process = FakeCancelableContinueProcessV2 {
+        polled: polled.clone(),
+        dropped: dropped.clone(),
+        cleanup_count: cleanup_count.clone(),
+    };
+    let mut recovery =
+        process.execute_recovery_in_place_v2(RuntimeStartupRecoveryClassV2::StaleLive);
+
+    std::future::poll_fn(|context| {
+        assert!(Future::poll(recovery.as_mut(), context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(polled.load(Ordering::Acquire));
+    assert!(!dropped.load(Ordering::Acquire));
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+
+    drop(recovery);
+
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+    assert_eq!(
+        process.cleanup_after_recovery_failure_v2(()).await,
+        FakeLoopErrorV2::Recovery
     );
     assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
 }
@@ -637,5 +749,21 @@ fn loop_errors_are_finite_contextual_and_redacted() {
             "RuntimeProcessStartupRecoveryLoopErrorV2(<redacted>)"
         );
         assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[test]
+fn stale_live_database_failures_preserve_exact_persistence_codes() {
+    for error in [
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::InvalidInput,
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::OwnershipLost,
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt,
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Unavailable,
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+    ] {
+        assert_eq!(
+            RuntimeProcessStartupRecoveryLoopFailureV2::StaleLiveExecution(error).code(),
+            error.code()
+        );
     }
 }

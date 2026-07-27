@@ -3,15 +3,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use crate::RuntimeClosedRecoveryProcessCleanupFailureV2;
 
-use super::closed::RuntimeClosedRecoveryProcessV2;
+use super::closed::{RuntimeClosedRecoveryProcessV2, RuntimeProcessClosedRecoveryCommitFailureV2};
 use super::connected::{
     discord_transition_failure_v1, map_discord_transition_exit_v1,
     RuntimeProcessPausedConnectedTransitionFailureV1,
 };
+use super::execution::RuntimeStartupRecoveryExecutionCompletionV2;
 use super::observation::{
     RuntimeProcessStartupRecoveryObservationErrorV2, RuntimeStartupRecoveryClassV2,
     RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryContinueProcessV2,
@@ -28,6 +30,9 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     PausedConnection(RuntimeProcessPausedConnectedTransitionFailureV1),
     InvalidForeignFreshRetry,
     StaleLiveRecoveryUnavailable,
+    StaleLiveExecution(RuntimeExecutionPersistenceErrorV1),
+    StaleLiveExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
+    StaleLiveRetryAfterUnsupported,
     ReservedAwaitingCertificationRecoveryUnavailable,
     SuspendedLocalEffectRecoveryUnavailable,
     PendingRuntimeDrainRecoveryUnavailable,
@@ -47,6 +52,11 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             Self::StaleLiveRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_stale_live_recovery_unavailable"
             }
+            Self::StaleLiveExecution(error) => runtime_execution_error_code_v2(error),
+            Self::StaleLiveExecutionRejected(error) => error.code(),
+            Self::StaleLiveRetryAfterUnsupported => {
+                "runtime_process_startup_recovery_loop_stale_live_retry_after_unsupported"
+            }
             Self::ReservedAwaitingCertificationRecoveryUnavailable => {
                 "runtime_process_startup_recovery_loop_reserved_awaiting_certification_recovery_unavailable"
             }
@@ -63,7 +73,19 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
     }
 
     pub const fn context(self) -> Option<&'static str> {
-        None
+        match self {
+            Self::OperationDeadlineElapsed
+            | Self::PausedConnection(_)
+            | Self::InvalidForeignFreshRetry
+            | Self::StaleLiveRecoveryUnavailable
+            | Self::StaleLiveExecution(_)
+            | Self::StaleLiveExecutionRejected(_)
+            | Self::StaleLiveRetryAfterUnsupported
+            | Self::ReservedAwaitingCertificationRecoveryUnavailable
+            | Self::SuspendedLocalEffectRecoveryUnavailable
+            | Self::PendingRuntimeDrainRecoveryUnavailable
+            | Self::ProtocolViolation => None,
+        }
     }
 }
 
@@ -114,6 +136,35 @@ impl RuntimeProcessStartupRecoveryLoopErrorV2 {
                     RuntimeProcessRecoveryReadinessTransitionErrorV2::CleanupAfterTransition { .. }
                 )
         )
+    }
+}
+
+const fn runtime_execution_error_code_v2(
+    error: RuntimeExecutionPersistenceErrorV1,
+) -> &'static str {
+    match error {
+        RuntimeExecutionPersistenceErrorV1::InvalidInput => "runtime_execution_invalid_input",
+        RuntimeExecutionPersistenceErrorV1::DatabaseAuthorityMismatch => {
+            "runtime_execution_database_authority_mismatch"
+        }
+        RuntimeExecutionPersistenceErrorV1::OwnershipLost => "runtime_execution_ownership_lost",
+        RuntimeExecutionPersistenceErrorV1::AuthorityChanged => {
+            "runtime_execution_authority_changed"
+        }
+        RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt => {
+            "runtime_execution_persistence_corrupt"
+        }
+        RuntimeExecutionPersistenceErrorV1::RetryNotReady => "runtime_execution_retry_not_ready",
+        RuntimeExecutionPersistenceErrorV1::Superseded => "runtime_execution_superseded",
+        RuntimeExecutionPersistenceErrorV1::Timeout => "runtime_execution_timeout",
+        RuntimeExecutionPersistenceErrorV1::Concurrency => "runtime_execution_concurrency",
+        RuntimeExecutionPersistenceErrorV1::Unavailable => "runtime_execution_unavailable",
+        RuntimeExecutionPersistenceErrorV1::DatabaseFailure => "runtime_execution_database_failure",
+        RuntimeExecutionPersistenceErrorV1::Indeterminate => "runtime_execution_indeterminate",
+        RuntimeExecutionPersistenceErrorV1::ObservationAmbiguous => {
+            "runtime_execution_observation_ambiguous"
+        }
+        _ => "runtime_execution_unknown",
     }
 }
 
@@ -172,6 +223,8 @@ trait RuntimeStartupRecoveryLoopContinueStepV2: Sized {
     type Ready;
     type WaitCompletion;
     type WaitFailure;
+    type RecoveryCompletion;
+    type RecoveryFailure;
     type Error;
 
     fn continuation_v2(&self) -> RuntimeStartupRecoveryContinuationV2;
@@ -182,10 +235,22 @@ trait RuntimeStartupRecoveryLoopContinueStepV2: Sized {
 
     async fn cleanup_after_wait_failure_v2(self, failure: Self::WaitFailure) -> Self::Error;
 
-    async fn cleanup_after_unavailable_recovery_v2(
-        self,
+    fn execute_recovery_in_place_v2(
+        &mut self,
         class: RuntimeStartupRecoveryClassV2,
-    ) -> Self::Error;
+    ) -> RuntimeStartupRecoveryBorrowedStepFutureV2<
+        '_,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+    >;
+
+    async fn cleanup_after_recovery_failure_v2(self, failure: Self::RecoveryFailure)
+        -> Self::Error;
+
+    async fn into_next_ready_after_recovery_v2(
+        self,
+        completion: Self::RecoveryCompletion,
+    ) -> Result<Self::Ready, Self::Error>;
 
     async fn into_next_ready_v2(
         self,
@@ -219,7 +284,17 @@ where
             RuntimeStartupRecoveryLoopIterationOutcomeV2::Continue(mut process) => {
                 match process.continuation_v2() {
                     RuntimeStartupRecoveryContinuationV2::Recover(class) => {
-                        return Err(process.cleanup_after_unavailable_recovery_v2(class).await);
+                        let completion = match process.execute_recovery_in_place_v2(class).await {
+                            Ok(completion) => completion,
+                            Err(failure) => {
+                                return Err(process
+                                    .cleanup_after_recovery_failure_v2(failure)
+                                    .await);
+                            }
+                        };
+                        ready = process
+                            .into_next_ready_after_recovery_v2(completion)
+                            .await?;
                     }
                     RuntimeStartupRecoveryContinuationV2::WaitForForeignFresh { .. } => {
                         let completion = match process.wait_in_place_v2().await {
@@ -289,6 +364,8 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinue
     type Ready = RuntimeRecoveryIterationReadyProcessV2;
     type WaitCompletion = RuntimeForeignFreshWaitCompletionV2;
     type WaitFailure = RuntimeProcessStartupRecoveryLoopFailureV2;
+    type RecoveryCompletion = RuntimeStartupRecoveryExecutionCompletionV2;
+    type RecoveryFailure = RuntimeProcessStartupRecoveryLoopFailureV2;
     type Error = RuntimeProcessStartupRecoveryLoopErrorV2;
 
     fn continuation_v2(&self) -> RuntimeStartupRecoveryContinuationV2 {
@@ -306,14 +383,43 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinue
         finish_startup_recovery_loop_transition_v2(failure, self.shutdown().await)
     }
 
-    async fn cleanup_after_unavailable_recovery_v2(
-        self,
+    fn execute_recovery_in_place_v2(
+        &mut self,
         class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryBorrowedStepFutureV2<
+        '_,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+    > {
+        Box::pin(self.execute_startup_recovery_in_place_v2(class))
+    }
+
+    async fn cleanup_after_recovery_failure_v2(
+        self,
+        failure: Self::RecoveryFailure,
     ) -> Self::Error {
-        finish_startup_recovery_loop_transition_v2(
-            unavailable_recovery_failure_v2(class),
-            self.shutdown().await,
-        )
+        self.session.invalidate_startup_recovery_execution_v2();
+        finish_startup_recovery_loop_transition_v2(failure, self.shutdown().await)
+    }
+
+    async fn into_next_ready_after_recovery_v2(
+        self,
+        _completion: Self::RecoveryCompletion,
+    ) -> Result<Self::Ready, Self::Error> {
+        let Self {
+            discord,
+            foundation,
+            session,
+            continuation: _,
+        } = self;
+        RuntimeClosedRecoveryProcessV2 {
+            discord,
+            foundation,
+            session,
+        }
+        .into_recovery_iteration_ready_v2()
+        .await
+        .map_err(RuntimeProcessStartupRecoveryLoopErrorV2::Readiness)
     }
 
     async fn into_next_ready_v2(
@@ -511,7 +617,7 @@ where
     }
 }
 
-fn unavailable_recovery_failure_v2(
+pub(super) fn unavailable_recovery_failure_v2(
     class: RuntimeStartupRecoveryClassV2,
 ) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
     match class {

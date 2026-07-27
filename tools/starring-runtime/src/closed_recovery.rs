@@ -3,7 +3,6 @@ use std::future::Future;
 use std::time::Instant;
 
 use automation_runtime_controller::RuntimeRecoveryIdV2;
-#[cfg(test)]
 use automation_runtime_worker::{
     RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
     RuntimeCompletedStartupRecoveryExecutionV2,
@@ -297,6 +296,43 @@ impl RuntimeClosedRecoverySessionV2 {
         &self,
     ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
         self.owner.terminal_observation_v2()
+    }
+
+    pub(crate) fn begin_startup_recovery_execution_v2(
+        &mut self,
+        continuation: RuntimeStartupRecoveryContinuationV2,
+    ) -> Result<RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeClosedRecoveryCommitErrorV2>
+    {
+        if !matches!(
+            &self.readiness,
+            RuntimeClosedRecoveryReadinessStateV2::Available
+        ) {
+            self.gateway.invalidate_protocol_violation_v2();
+            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
+                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+            ));
+        }
+        self.revalidate_v2()?;
+        self.gateway
+            .begin_startup_recovery_execution_v2(&self.owner, continuation)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)
+    }
+
+    pub(crate) fn complete_startup_recovery_execution_v2(
+        &mut self,
+        completed: RuntimeCompletedStartupRecoveryExecutionV2,
+    ) -> Result<RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeClosedRecoveryCommitErrorV2>
+    {
+        let outcome = self
+            .gateway
+            .complete_startup_recovery_execution_v2(&self.owner, completed)
+            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+        self.revalidate_v2()?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn invalidate_startup_recovery_execution_v2(&self) {
+        self.gateway.invalidate_capability_not_ready_v2();
     }
 
     pub(crate) async fn refresh_iteration_readiness_in_place_v2(
@@ -837,26 +873,9 @@ impl RuntimeClosedRecoverySessionV2 {
             RuntimeAuthorizedStartupRecoveryExecutionV2,
         ) -> RuntimeCompletedStartupRecoveryExecutionV2,
     {
-        if !matches!(
-            &self.readiness,
-            RuntimeClosedRecoveryReadinessStateV2::Available
-        ) {
-            self.gateway.invalidate_protocol_violation_v2();
-            return Err(RuntimeClosedRecoveryCommitErrorV2::Gateway(
-                RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
-            ));
-        }
-        self.revalidate_v2()?;
-        let authorization = self
-            .gateway
-            .begin_startup_recovery_execution_for_test_v2(&self.owner, continuation)
-            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
+        let authorization = self.begin_startup_recovery_execution_v2(continuation)?;
         let completed = execute(authorization);
-        let outcome = self
-            .gateway
-            .complete_startup_recovery_execution_for_test_v2(&self.owner, completed)
-            .map_err(RuntimeClosedRecoveryCommitErrorV2::Gateway)?;
-        self.revalidate_v2()?;
+        let outcome = self.complete_startup_recovery_execution_v2(completed)?;
         Ok((self, outcome))
     }
 }
