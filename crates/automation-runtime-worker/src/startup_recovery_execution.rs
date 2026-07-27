@@ -15,8 +15,8 @@ use crate::closed_recovery::{
 use crate::{
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
     RuntimeClosedRecoveryAuthorityRevisionV2, RuntimePausedGatewayObservationV2,
-    RuntimeRegistryGlobalObservationSequenceV2, RuntimeStartupRecoveryClassV2,
-    RuntimeStartupRecoveryContinuationV2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
+    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -74,6 +74,26 @@ impl RuntimeStartupRecoveryExecutionActionIdentityV2 {
 
     pub fn class(&self) -> RuntimeStartupRecoveryClassV2 {
         self.class
+    }
+
+    pub(crate) fn pending_drain_acknowledgement_successor(&self) -> Option<Self> {
+        if self.class != RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent {
+            return None;
+        }
+        let authority_revision = self
+            .correlation
+            .authority_revision
+            .get()
+            .checked_add(1)
+            .filter(|revision| *revision <= i64::MAX as u64)
+            .and_then(NonZeroU64::new)?;
+        let mut correlation = self.correlation.clone();
+        correlation.selection_authority_revision = correlation.authority_revision;
+        correlation.authority_revision = authority_revision;
+        Some(Self {
+            correlation,
+            class: self.class,
+        })
     }
 }
 
@@ -205,6 +225,31 @@ impl RuntimeAuthorizedStartupRecoveryExecutionV2 {
         RuntimeCompletedStartupRecoveryExecutionV2 {
             authorization: self,
             receipt,
+            pending_drain_proof: None,
+            pending_registry_successor: None,
+        }
+    }
+
+    pub fn into_pending_drain_selection(
+        self,
+    ) -> Result<
+        crate::RuntimeAuthorizedPendingDrainSelectionV2,
+        crate::RuntimePendingDrainCompoundErrorV2,
+    > {
+        crate::startup_pending_drain::authorize_pending_drain_selection_v2(self)
+    }
+
+    pub(crate) fn complete_pending_drain(
+        self,
+        receipt: RuntimeStartupRecoveryExecutionReceiptV2,
+        proof: crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2,
+        registry_successor: Option<RuntimeRegistryRecoveryEmptyObservationV2>,
+    ) -> RuntimeCompletedStartupRecoveryExecutionV2 {
+        RuntimeCompletedStartupRecoveryExecutionV2 {
+            authorization: self,
+            receipt,
+            pending_drain_proof: Some(proof),
+            pending_registry_successor: registry_successor,
         }
     }
 }
@@ -243,6 +288,8 @@ impl Debug for RuntimeStartupRecoveryExecutionReceiptV2 {
 pub struct RuntimeCompletedStartupRecoveryExecutionV2 {
     authorization: RuntimeAuthorizedStartupRecoveryExecutionV2,
     receipt: RuntimeStartupRecoveryExecutionReceiptV2,
+    pending_drain_proof: Option<crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2>,
+    pending_registry_successor: Option<RuntimeRegistryRecoveryEmptyObservationV2>,
 }
 
 impl Debug for RuntimeCompletedStartupRecoveryExecutionV2 {
@@ -256,6 +303,7 @@ pub struct RuntimeAcceptedStartupRecoveryExecutionOutcomeV2 {
     outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
     successor_authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2,
     owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pending_drain_proof: Option<crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2>,
 }
 
 impl RuntimeAcceptedStartupRecoveryExecutionOutcomeV2 {
@@ -273,6 +321,12 @@ impl RuntimeAcceptedStartupRecoveryExecutionOutcomeV2 {
 
     pub fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
         &self.owner_receipt
+    }
+
+    pub fn pending_drain_proof(
+        &self,
+    ) -> Option<&crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2> {
+        self.pending_drain_proof.as_ref()
     }
 }
 
@@ -323,6 +377,8 @@ pub(crate) struct RuntimeValidatedStartupRecoveryExecutionV2 {
     request: RuntimeStartupRecoveryExecutionRequestV2,
     owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
+    pending_drain_proof: Option<crate::startup_pending_drain::RuntimePendingDrainExecutionProofV2>,
+    pending_registry_successor: Option<RuntimeRegistryRecoveryEmptyObservationV2>,
 }
 
 pub(crate) fn authorize_startup_recovery_execution_v2(
@@ -354,12 +410,25 @@ pub(crate) fn validate_startup_recovery_execution_v2(
     let RuntimeCompletedStartupRecoveryExecutionV2 {
         authorization,
         receipt,
+        pending_drain_proof,
+        pending_registry_successor,
     } = completed;
     let RuntimeAuthorizedStartupRecoveryExecutionV2 {
         request,
         operation_authority,
     } = authorization;
     validate_execution_request_binding_v2(permit, &request)?;
+    let requires_pending_drain_proof =
+        request.class == RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent;
+    if requires_pending_drain_proof != pending_drain_proof.is_some()
+        || pending_drain_proof.as_ref().is_some_and(|proof| {
+            !proof.matches_request(&request)
+                || proof.requires_registry_successor() != pending_registry_successor.is_some()
+        })
+        || (pending_drain_proof.is_none() && pending_registry_successor.is_some())
+    {
+        return Err(RuntimeStartupRecoveryExecutionAcceptanceErrorV2::ProgressProofMismatch);
+    }
     if receipt.correlation != request.correlation {
         return Err(RuntimeStartupRecoveryExecutionAcceptanceErrorV2::CorrelationMismatch);
     }
@@ -400,6 +469,8 @@ pub(crate) fn validate_startup_recovery_execution_v2(
         request,
         owner_receipt: receipt.owner_receipt,
         outcome: receipt.outcome,
+        pending_drain_proof,
+        pending_registry_successor,
     })
 }
 
@@ -415,14 +486,24 @@ pub(crate) fn accept_validated_startup_recovery_execution_v2(
         request,
         owner_receipt,
         outcome,
+        pending_drain_proof,
+        pending_registry_successor,
     } = validated;
     let database_now = owner_receipt.database_now;
-    let authority_revision = permit.restore_after_startup_recovery_execution(
-        operation_authority,
-        request.class,
-        request.correlation.selection_authority_revision,
-        database_now,
-    )?;
+    let authority_revision = match pending_registry_successor {
+        Some(registry_successor) => permit.restore_after_startup_pending_drain_execution(
+            operation_authority,
+            request.correlation.selection_authority_revision,
+            database_now,
+            registry_successor,
+        )?,
+        None => permit.restore_after_startup_recovery_execution(
+            operation_authority,
+            request.class,
+            request.correlation.selection_authority_revision,
+            database_now,
+        )?,
+    };
     Some((
         authority_revision,
         RuntimeAcceptedStartupRecoveryExecutionOutcomeV2 {
@@ -430,6 +511,7 @@ pub(crate) fn accept_validated_startup_recovery_execution_v2(
             outcome,
             successor_authority_revision: authority_revision,
             owner_receipt,
+            pending_drain_proof,
         },
     ))
 }

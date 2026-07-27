@@ -8,6 +8,7 @@ mod paused_gateway;
 mod product_drain;
 mod recovery;
 mod registry_recovery;
+mod startup_pending_drain;
 mod startup_recovery;
 mod startup_recovery_execution;
 mod writer_fence;
@@ -58,6 +59,20 @@ pub use registry_recovery::{
     accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
     RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
+};
+pub use startup_pending_drain::{
+    RuntimeAcceptedPendingDrainSelectionV2, RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV2,
+    RuntimeDurablyAcknowledgedPendingDrainV2, RuntimePendingDrainAcknowledgementReceiptV2,
+    RuntimePendingDrainCandidateV2, RuntimePendingDrainClaimReceiptV2,
+    RuntimePendingDrainCompoundErrorV2, RuntimePendingDrainCompoundProofV2,
+    RuntimePendingDrainExecutionProofV2, RuntimePendingDrainNoCandidateProofV2,
+    RuntimePendingDrainNoCandidateReceiptV2, RuntimePendingDrainRegistryRolloverProofV2,
+    RuntimePendingDrainRegistrySealWitnessInputV2, RuntimePendingDrainRegistrySealWitnessV2,
+    RuntimePendingDrainRegistryUnsealWitnessV2, RuntimePendingDrainSelectionOutcomeV2,
+    RuntimePendingDrainSelectionPortV2, RuntimePendingDrainSelectionReceiptV2,
+    RuntimePendingDrainSlotObservationV2, RuntimePendingDrainStateDigestV2,
+    RuntimeSelectedPendingDrainCandidateV2, RuntimeSelectedPendingDrainNoCandidateV2,
 };
 pub(crate) use startup_recovery::{
     accept_validated_startup_recovery_observation_v2, authorize_startup_recovery_iteration_v2,

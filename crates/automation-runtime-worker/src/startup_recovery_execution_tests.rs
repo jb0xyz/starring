@@ -2,8 +2,9 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use automation_runtime_controller::{
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
-    RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2,
+    RuntimeCanonicalProductDrainV2, RuntimeDrainIntentDigestV2, RuntimeDrainIntentIdV2,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2, RuntimeProductMutationDigestV2,
+    RuntimeRecoveryIdV2, RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2,
 };
 
 use super::tests::{
@@ -16,10 +17,16 @@ use super::{
     RuntimeGatewayEmergencyCauseV2, RuntimeGatewayInvalidationCauseV2,
 };
 use crate::{
-    accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
-    RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeClosedDrainRecoveryPermitV2,
-    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeCompletedStartupRecoveryExecutionV2,
-    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
+    accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedPendingDrainSelectionV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimeCompletedStartupRecoveryExecutionV2, RuntimePausedGatewayObservationV2,
+    RuntimePausedGatewaySequenceV2, RuntimePendingDrainAcknowledgementReceiptV2,
+    RuntimePendingDrainCandidateV2, RuntimePendingDrainClaimReceiptV2,
+    RuntimePendingDrainCompoundErrorV2, RuntimePendingDrainExecutionProofV2,
+    RuntimePendingDrainRegistrySealWitnessInputV2, RuntimePendingDrainRegistrySealWitnessV2,
+    RuntimePendingDrainRegistryUnsealWitnessV2, RuntimePendingDrainSelectionOutcomeV2,
+    RuntimePendingDrainSelectionReceiptV2, RuntimePendingDrainStateDigestV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
     RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
     RuntimeStartupRecoveryExecutionAcceptanceErrorV2, RuntimeStartupRecoveryExecutionDigestErrorV2,
@@ -129,6 +136,189 @@ fn complete_execution(
 ) -> RuntimeCompletedStartupRecoveryExecutionV2 {
     let receipt = execution_receipt(&authorization, database_now, outcome);
     authorization.complete(receipt)
+}
+
+fn pending_candidate() -> RuntimePendingDrainCandidateV2 {
+    let product_bytes = format!(
+        concat!(
+            "{{\"format_version\":2,\"operation_id\":\"{}\",",
+            "\"scope\":{{\"tenant_id\":\"tenant:1\",\"installation_id\":",
+            "\"installation:1\",\"deployment_id\":\"deployment:1\"}},",
+            "\"expected_revision\":11,\"slot\":{{\"guild_id\":\"9223372036854775808\",",
+            "\"ruleset_key\":\"studyroom\"}},\"expected_target\":{{\"guild_id\":",
+            "\"9223372036854775808\",\"ruleset_key\":\"studyroom\",\"version\":1,",
+            "\"content_hash\":\"{}\",\"binding_revision\":3,",
+            "\"binding_fingerprint\":\"{}\"}},\"mutation_kind\":",
+            "\"authority_change\",\"product_semantic_request_digest\":\"{}\"}}"
+        ),
+        "00112233445566778899aabbccddeeff",
+        "b".repeat(64),
+        "a".repeat(64),
+        "c".repeat(64),
+    )
+    .into_bytes();
+    let product_digest = RuntimeProductMutationDigestV2::parse(
+        "e35c1116d5bee2949184cceff540ee2575ac389461270f96f525ccd9c193166d",
+    )
+    .unwrap();
+    let drain_bytes = format!(
+        concat!(
+            "{{\"format_version\":2,\"key\":{{\"intent_id\":\"{}\",",
+            "\"product_operation_id\":\"{}\",",
+            "\"product_mutation_digest\":\"{}\",",
+            "\"scope\":{{\"tenant_id\":\"tenant:1\",\"installation_id\":",
+            "\"installation:1\",\"deployment_id\":\"deployment:1\"}},",
+            "\"expected_revision\":11,\"slot\":{{\"guild_id\":\"9223372036854775808\",",
+            "\"ruleset_key\":\"studyroom\"}},\"expected_target\":{{\"guild_id\":",
+            "\"9223372036854775808\",\"ruleset_key\":\"studyroom\",\"version\":1,",
+            "\"content_hash\":\"{}\",\"binding_revision\":3,",
+            "\"binding_fingerprint\":\"{}\"}},\"mutation_kind\":",
+            "\"authority_change\"}}}}"
+        ),
+        "ffeeddccbbaa99887766554433221100",
+        "00112233445566778899aabbccddeeff",
+        product_digest.as_str(),
+        "b".repeat(64),
+        "a".repeat(64),
+    )
+    .into_bytes();
+    let drain_digest = RuntimeDrainIntentDigestV2::parse(
+        "edf1671e7c1395205cae7962d6cf043610c51b5ed49b2d4528d72351bed287fc",
+    )
+    .unwrap();
+    let canonical = RuntimeCanonicalProductDrainV2::from_persisted(
+        &product_bytes,
+        &product_digest,
+        &drain_bytes,
+        &drain_digest,
+    )
+    .unwrap();
+    RuntimePendingDrainCandidateV2::new(
+        RuntimeDrainIntentIdV2::parse("ffeeddccbbaa99887766554433221100").unwrap(),
+        canonical.product_preimage().slot.clone(),
+        canonical.product_preimage().expected_target.clone(),
+        non_zero(5),
+        RuntimePendingDrainStateDigestV2::new([1; 32]).unwrap(),
+    )
+    .unwrap()
+}
+
+fn pending_owner_receipt(
+    request: &crate::RuntimeStartupRecoveryExecutionRequestV2,
+    database_now: i64,
+) -> RuntimeGatewayOwnerLeaseReceiptV1 {
+    RuntimeGatewayOwnerLeaseReceiptV1 {
+        lease_id: request.gateway_owner_lease_id().clone(),
+        owner_revision: request.expected_owner_revision(),
+        database_now: at(database_now),
+        expires_at: request.expected_owner_expires_at(),
+    }
+}
+
+fn pending_seal(
+    request: &crate::RuntimeStartupRecoveryExecutionRequestV2,
+    candidate: &RuntimePendingDrainCandidateV2,
+) -> RuntimePendingDrainRegistrySealWitnessV2 {
+    RuntimePendingDrainRegistrySealWitnessV2::new(RuntimePendingDrainRegistrySealWitnessInputV2 {
+        process_instance_id: request.registry_process_instance_id().clone(),
+        slot: candidate.slot().clone(),
+        pre_slot_observation: None,
+        seal_key: candidate.intent_id().canonical_bytes(),
+        seal_generation: non_zero(1),
+        post_slot_admission_generation: non_zero(1),
+        post_slot_observation_sequence: non_zero(1),
+        pre_registry_observation_sequence: request.registry_observation_sequence(),
+        pre_registry_retained_slot_count: request.registry_retained_slot_count(),
+        pre_registry_retained_empty_tombstone_count: request
+            .registry_retained_empty_tombstone_count(),
+        post_registry_observation: RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(
+                request.registry_observation_sequence().get() + 1,
+            )),
+            retained_slot_count: request.registry_retained_slot_count() + 1,
+            retained_empty_tombstone_count: request.registry_retained_empty_tombstone_count(),
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 1,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    })
+    .unwrap()
+}
+
+fn pending_unseal(
+    request: &crate::RuntimeStartupRecoveryExecutionRequestV2,
+    candidate: &RuntimePendingDrainCandidateV2,
+) -> RuntimePendingDrainRegistryUnsealWitnessV2 {
+    let observation = accept_runtime_registry_recovery_empty_observation_v2(
+        request.registry_process_instance_id().clone(),
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(
+                request.registry_observation_sequence().get() + 2,
+            )),
+            retained_slot_count: request.registry_retained_slot_count() + 1,
+            retained_empty_tombstone_count: request.registry_retained_slot_count() + 1,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    )
+    .unwrap();
+    RuntimePendingDrainRegistryUnsealWitnessV2::new(
+        request.registry_process_instance_id().clone(),
+        candidate.slot().clone(),
+        non_zero(2),
+        non_zero(2),
+        observation,
+    )
+    .unwrap()
+}
+
+fn pending_acknowledgement_authorization() -> (
+    crate::RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    RuntimePendingDrainCandidateV2,
+    RuntimePendingDrainRegistrySealWitnessV2,
+    crate::RuntimeStartupRecoveryExecutionActionIdentityV2,
+) {
+    let (_, _, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    let candidate = pending_candidate();
+    let seal = pending_seal(selection.request(), &candidate);
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 102),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(candidate.clone()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected pending drain candidate")
+    };
+    let claim = (*selected).bind_registry_seal(seal.clone()).unwrap();
+    let claim_action = claim.action_identity().clone();
+    let claim_receipt = RuntimePendingDrainClaimReceiptV2::new(
+        claim_action.clone(),
+        candidate.clone(),
+        seal.clone(),
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([3; 32]).unwrap(),
+        pending_owner_receipt(claim.request(), 103),
+    );
+    (
+        claim.complete(claim_receipt).unwrap(),
+        candidate,
+        seal,
+        claim_action,
+    )
 }
 
 fn expected_emergency(
@@ -320,7 +510,6 @@ fn every_recovery_class_and_nonprogress_outcome_restores_one_successor() {
         RuntimeStartupRecoveryClassV2::StaleLive,
         RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification,
         RuntimeStartupRecoveryClassV2::SuspendedLocalEffect,
-        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
     ];
     for class in classes {
         let (mut lifecycle, mut permit, _, authorization) = begin_execution(class);
@@ -724,4 +913,372 @@ fn execution_authority_overflow_is_terminal_and_nonrestoring() {
     );
     assert_eq!(permit.authority_revision().get(), i64::MAX as u64);
     assert!(permit.pending_startup_recovery_execution().is_some());
+}
+
+#[test]
+fn pending_drain_compound_binds_two_actions_and_rolls_registry_s0_to_s2_once() {
+    let (mut lifecycle, mut permit, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    assert_eq!(
+        selection
+            .claim_action_identity()
+            .correlation()
+            .authority_revision(),
+        non_zero(3)
+    );
+    assert_eq!(
+        selection
+            .claim_action_identity()
+            .correlation()
+            .selection_authority_revision(),
+        non_zero(2)
+    );
+    assert_eq!(
+        selection
+            .acknowledgement_action_identity()
+            .correlation()
+            .authority_revision(),
+        non_zero(4)
+    );
+    assert_eq!(
+        selection
+            .acknowledgement_action_identity()
+            .correlation()
+            .selection_authority_revision(),
+        non_zero(3)
+    );
+    let candidate = pending_candidate();
+    let seal = pending_seal(selection.request(), &candidate);
+    let unseal = pending_unseal(selection.request(), &candidate);
+    let expected_s2_sequence = selection.request().registry_observation_sequence().get() + 2;
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 102),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(candidate.clone()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected pending drain candidate")
+    };
+    let claim = (*selected).bind_registry_seal(seal.clone()).unwrap();
+    let claim_action = claim.action_identity().clone();
+    let claim_receipt = RuntimePendingDrainClaimReceiptV2::new(
+        claim_action.clone(),
+        candidate.clone(),
+        seal.clone(),
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([3; 32]).unwrap(),
+        pending_owner_receipt(claim.request(), 103),
+    );
+    let acknowledgement = claim.complete(claim_receipt).unwrap();
+    assert_eq!(
+        acknowledgement
+            .action_identity()
+            .correlation()
+            .authority_revision(),
+        non_zero(4)
+    );
+    let acknowledgement_receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
+        acknowledgement.action_identity().clone(),
+        claim_action,
+        candidate.clone(),
+        seal.clone(),
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([3; 32]).unwrap(),
+        non_zero(7),
+        RuntimePendingDrainStateDigestV2::new([4; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([5; 32]).unwrap(),
+        pending_owner_receipt(acknowledgement.request(), 104),
+    );
+    let acknowledged = acknowledgement.complete(acknowledgement_receipt).unwrap();
+    assert_eq!(acknowledged.seal_witness(), &seal);
+    let completed = acknowledged.complete_registry_rollover(unseal).unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+
+    assert_eq!(permit.authority_revision().get(), 4);
+    assert_eq!(
+        permit
+            .registry_evidence()
+            .empty_observation()
+            .observation_sequence()
+            .get(),
+        expected_s2_sequence
+    );
+    let Some(RuntimePendingDrainExecutionProofV2::Compound(proof)) = accepted.pending_drain_proof()
+    else {
+        panic!("expected pending drain compound proof")
+    };
+    assert_eq!(proof.candidate(), &candidate);
+    assert_eq!(proof.seal(), &seal);
+    assert_eq!(proof.claimed_intent_revision(), non_zero(6));
+    assert_eq!(proof.acknowledged_intent_revision(), non_zero(7));
+    assert_eq!(
+        proof
+            .acknowledgement_action_identity()
+            .correlation()
+            .selection_authority_revision(),
+        non_zero(3)
+    );
+    assert_eq!(
+        proof
+            .registry_rollover()
+            .registry_observation_sequence()
+            .get(),
+        expected_s2_sequence
+    );
+}
+
+#[test]
+fn pending_drain_no_candidate_requires_checked_selection_and_terminal_proof() {
+    let (mut lifecycle, mut permit, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    let action_identity = selection.claim_action_identity().clone();
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 102),
+        RuntimePendingDrainSelectionOutcomeV2::NoCandidate,
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::NoCandidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected no pending drain candidate")
+    };
+    let no_candidate_owner = pending_owner_receipt(selected.request(), 103);
+    let completed = (*selected)
+        .complete(crate::RuntimePendingDrainNoCandidateReceiptV2::new(
+            action_identity,
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([9; 32]).unwrap(),
+            no_candidate_owner,
+        ))
+        .unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+
+    assert_eq!(permit.authority_revision().get(), 4);
+    let Some(RuntimePendingDrainExecutionProofV2::NoCandidate(proof)) =
+        accepted.pending_drain_proof()
+    else {
+        panic!("expected no-candidate terminal proof")
+    };
+    assert_eq!(proof.terminal_digest().as_bytes(), &[9; 32]);
+}
+
+#[test]
+fn pending_drain_rejects_selector_seal_claim_ack_and_rollover_mismatches() {
+    let (_, _, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    let stale_selection = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 100),
+        RuntimePendingDrainSelectionOutcomeV2::NoCandidate,
+    );
+    assert_eq!(
+        selection.accept_selection(stale_selection).unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::DatabaseClockRegressed
+    );
+
+    let (_, _, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    let candidate = pending_candidate();
+    let mut foreign_input = RuntimePendingDrainRegistrySealWitnessInputV2 {
+        process_instance_id: selection.request().registry_process_instance_id().clone(),
+        slot: candidate.slot().clone(),
+        pre_slot_observation: None,
+        seal_key: [8; 16],
+        seal_generation: non_zero(1),
+        post_slot_admission_generation: non_zero(1),
+        post_slot_observation_sequence: non_zero(1),
+        pre_registry_observation_sequence: selection.request().registry_observation_sequence(),
+        pre_registry_retained_slot_count: selection.request().registry_retained_slot_count(),
+        pre_registry_retained_empty_tombstone_count: selection
+            .request()
+            .registry_retained_empty_tombstone_count(),
+        post_registry_observation: RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(2)),
+            retained_slot_count: 1,
+            retained_empty_tombstone_count: 0,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 1,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    };
+    foreign_input.post_registry_observation.observation_sequence =
+        RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(
+            foreign_input.pre_registry_observation_sequence.get() + 1,
+        ));
+    let foreign_seal = RuntimePendingDrainRegistrySealWitnessV2::new(foreign_input).unwrap();
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 102),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(candidate.clone()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected pending drain candidate")
+    };
+    assert_eq!(
+        (*selected).bind_registry_seal(foreign_seal).unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::SealMismatch
+    );
+
+    let (_, _, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let selection = authorization.into_pending_drain_selection().unwrap();
+    let seal = pending_seal(selection.request(), &candidate);
+    let selection_receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        selection.request().correlation().clone(),
+        pending_owner_receipt(selection.request(), 102),
+        RuntimePendingDrainSelectionOutcomeV2::Candidate(candidate.clone()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV2::Candidate(selected) =
+        selection.accept_selection(selection_receipt).unwrap()
+    else {
+        panic!("expected pending drain candidate")
+    };
+    let claim = (*selected).bind_registry_seal(seal.clone()).unwrap();
+    let wrong_action = claim
+        .action_identity()
+        .pending_drain_acknowledgement_successor()
+        .unwrap();
+    let claim_receipt = RuntimePendingDrainClaimReceiptV2::new(
+        wrong_action,
+        candidate,
+        seal,
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([3; 32]).unwrap(),
+        pending_owner_receipt(claim.request(), 103),
+    );
+    assert_eq!(
+        claim.complete(claim_receipt).unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::ActionMismatch
+    );
+
+    let (acknowledgement, candidate, seal, claim_action) = pending_acknowledgement_authorization();
+    let acknowledgement_receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
+        acknowledgement.action_identity().clone(),
+        claim_action,
+        candidate,
+        seal,
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([7; 32]).unwrap(),
+        non_zero(7),
+        RuntimePendingDrainStateDigestV2::new([4; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([5; 32]).unwrap(),
+        pending_owner_receipt(acknowledgement.request(), 104),
+    );
+    assert_eq!(
+        acknowledgement
+            .complete(acknowledgement_receipt)
+            .unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::SourceContinuityMismatch
+    );
+
+    let (acknowledgement, candidate, seal, claim_action) = pending_acknowledgement_authorization();
+    let acknowledgement_receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
+        acknowledgement.action_identity().clone(),
+        claim_action,
+        candidate.clone(),
+        seal,
+        non_zero(6),
+        RuntimePendingDrainStateDigestV2::new([2; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([3; 32]).unwrap(),
+        non_zero(7),
+        RuntimePendingDrainStateDigestV2::new([4; 32]).unwrap(),
+        RuntimeStartupRecoveryExecutionTerminalDigestV2::new([5; 32]).unwrap(),
+        pending_owner_receipt(acknowledgement.request(), 104),
+    );
+    let acknowledged = acknowledgement.complete(acknowledgement_receipt).unwrap();
+    let sealed_registry = acknowledged.seal_witness().post_registry_observation();
+    let restored = accept_runtime_registry_recovery_empty_observation_v2(
+        acknowledged.seal_witness().process_instance_id().clone(),
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(
+                sealed_registry.observation_sequence.get() + 1,
+            )),
+            retained_slot_count: sealed_registry.retained_slot_count,
+            retained_empty_tombstone_count: sealed_registry.retained_slot_count,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    )
+    .unwrap();
+    let mismatched_unseal = RuntimePendingDrainRegistryUnsealWitnessV2::new(
+        acknowledged.seal_witness().process_instance_id().clone(),
+        candidate.slot().clone(),
+        non_zero(3),
+        non_zero(2),
+        restored,
+    )
+    .unwrap();
+    assert_eq!(
+        acknowledged
+            .complete_registry_rollover(mismatched_unseal)
+            .unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::RegistryRolloverMismatch
+    );
+}
+
+#[test]
+fn pending_drain_ack_action_overflow_is_rejected_before_selection() {
+    let (mut lifecycle, mut permit) = begin_recovery();
+    let continuation = observe_pending_class(
+        &mut lifecycle,
+        &mut permit,
+        RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+    );
+    permit.exhaust_authority_revision_for_test();
+    permit
+        .replace_pending_selection_revision_for_test(NonZeroU64::new(i64::MAX as u64 - 1).unwrap());
+    lifecycle.snapshot = RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+        generation: permit.coordinator_generation(),
+        recovery_id: permit.recovery_id().clone(),
+        authority_revision: permit.authority_revision(),
+    };
+    let authorization = lifecycle
+        .begin_startup_recovery_execution(&mut permit, continuation)
+        .unwrap();
+
+    assert_eq!(
+        authorization.into_pending_drain_selection().unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::AuthorityRevisionOverflow
+    );
+}
+
+#[test]
+fn pending_drain_generic_completion_cannot_bypass_checked_typestate() {
+    let (mut lifecycle, mut permit, _, authorization) =
+        begin_execution(RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent);
+    let completed = complete_execution(authorization, 102, TestExecutionOutcome::NoCandidate);
+
+    assert_eq!(
+        lifecycle
+            .complete_startup_recovery_execution(&mut permit, completed)
+            .unwrap_err(),
+        RuntimeGatewayClosedTransitionErrorV2::StartupRecoveryExecution(
+            RuntimeStartupRecoveryExecutionAcceptanceErrorV2::ProgressProofMismatch
+        )
+    );
+    assert_eq!(permit.authority_revision().get(), 3);
 }

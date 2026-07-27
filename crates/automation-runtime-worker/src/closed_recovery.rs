@@ -279,6 +279,29 @@ impl RuntimeClosedDrainRecoveryPermitV2 {
         Some(authority_revision)
     }
 
+    pub(crate) fn restore_after_startup_pending_drain_execution(
+        &mut self,
+        authority: RuntimeClosedRecoveryOperationAuthorityV2,
+        selection_authority_revision: NonZeroU64,
+        database_now: DateTime<Utc>,
+        registry_successor: RuntimeRegistryRecoveryEmptyObservationV2,
+    ) -> Option<RuntimeClosedRecoveryAuthorityRevisionV2> {
+        let pending = self.pending_startup_recovery_execution.as_ref()?;
+        if self.operation_authority.is_some()
+            || pending.class != RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent
+            || pending.selection_correlation.authority_revision != selection_authority_revision
+        {
+            return None;
+        }
+        let authority_revision = self.authority_revision.successor()?;
+        self.registry_evidence = RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry_successor);
+        self.operation_authority = Some(authority);
+        self.pending_startup_recovery_execution = None;
+        self.last_startup_observation_database_now = Some(database_now);
+        self.authority_revision = authority_revision;
+        Some(authority_revision)
+    }
+
     pub(crate) fn refresh_readiness(
         &mut self,
         readiness: RuntimeCapabilityReadinessSetV2,
