@@ -1291,7 +1291,7 @@ async fn product_drain_first_apply_upgrade_preserves_fifteen_executor_capabiliti
         )
         .await
         .unwrap();
-    let pre_enable_functions = &EXECUTOR_FUNCTIONS[..15];
+    let pre_enable_functions = &PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS;
     for function in pre_enable_functions {
         pool.execute(
             format!("GRANT EXECUTE ON FUNCTION {function} TO {executor_role}").as_str(),

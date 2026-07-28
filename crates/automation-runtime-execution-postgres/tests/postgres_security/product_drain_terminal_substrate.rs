@@ -248,6 +248,30 @@ async fn insert_product_drain_terminal_action(
     .fetch_one(&mut **transaction)
     .await
     .unwrap();
+    let source_deployment_snapshot_bytes = if terminal_kind == "cancelled" {
+        Some(serde_json::to_vec(&source_result_snapshot).unwrap())
+    } else {
+        None
+    };
+    let source_deployment_snapshot_digest =
+        if let Some(snapshot_bytes) = source_deployment_snapshot_bytes.as_ref() {
+            Some(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pg_catalog.encode(pg_catalog.sha256($1), 'hex')",
+                )
+                .bind(snapshot_bytes)
+                .fetch_one(&mut **transaction)
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+    let source_canonical_state_bytes = if terminal_kind == "cancelled" {
+        Some(source.source_state_bytes.as_slice())
+    } else {
+        None
+    };
     let source_result_deployment_revision = source.expected_revision + 1;
     source_result_snapshot["revision"] = json!(source_result_deployment_revision);
     let source_result_snapshot_bytes = serde_json::to_vec(&source_result_snapshot).unwrap();
@@ -395,8 +419,10 @@ async fn insert_product_drain_terminal_action(
             product_action_idempotency_digest, \
             product_action_semantic_request_digest, cancellation_reason_digest, \
             source_intent_revision, source_canonical_state_digest, \
+            source_canonical_state_bytes, \
             result_intent_revision, result_canonical_state_digest, \
-            source_deployment_revision, source_result_deployment_revision, \
+            source_deployment_revision, source_deployment_snapshot_bytes, \
+            source_deployment_snapshot_digest, source_result_deployment_revision, \
             source_result_deployment_snapshot_digest, \
             source_result_deployment_snapshot_bytes, result_deployment_id, \
             result_deployment_revision, result_deployment_snapshot_digest, \
@@ -407,7 +433,8 @@ async fn insert_product_drain_terminal_action(
             terminal_projection_bytes, terminal_projection_digest\
          ) VALUES (\
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,\
-            $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30\
+            $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,\
+            $31,$32,$33\
          )",
     )
     .bind(&terminal_action_id)
@@ -421,9 +448,12 @@ async fn insert_product_drain_terminal_action(
     .bind(cancellation_reason_digest.as_deref())
     .bind(source.source_intent_revision)
     .bind(&source.source_state_digest)
+    .bind(source_canonical_state_bytes)
     .bind(result.intent_revision)
     .bind(&result.canonical_state_digest)
     .bind(source.expected_revision)
+    .bind(source_deployment_snapshot_bytes.as_deref())
+    .bind(source_deployment_snapshot_digest.as_deref())
     .bind(source_result_deployment_revision)
     .bind(&source_result_snapshot_digest)
     .bind(&source_result_snapshot_bytes)
@@ -841,7 +871,7 @@ async fn exercise_product_drain_terminal_kind(
     .fetch_one(&database.owner_pool)
     .await
     .unwrap();
-    assert_eq!(public_terminal_capability_count, 1);
+    assert_eq!(public_terminal_capability_count, 2);
     let runtime_executor_can_consume = sqlx::query_scalar::<_, bool>(
         "SELECT pg_catalog.has_function_privilege(\
              CURRENT_USER, function_row.oid, 'EXECUTE'\

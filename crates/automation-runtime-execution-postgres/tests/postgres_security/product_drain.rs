@@ -81,7 +81,7 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         "INSERT INTO public.runtime_drain_intents_v2 DEFAULT VALUES",
         "UPDATE public.runtime_drain_intents_v2 SET drain_intent_id = drain_intent_id",
         "DELETE FROM public.runtime_drain_intents_v2",
-        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
+        "TRUNCATE public.runtime_product_drain_terminal_actions_v2, public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
     ] {
         let error = sqlx::query(statement)
             .execute(&database.owner_pool)
@@ -90,7 +90,8 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         assert_sqlstate(&error, "23514");
     }
     let error = sqlx::query(
-        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2, \
+        "TRUNCATE public.runtime_product_drain_terminal_actions_v2, \
+         public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2, \
          public.runtime_product_operations_v2",
     )
     .execute(&database.owner_pool)
@@ -108,7 +109,7 @@ async fn product_drain_observation_is_scope_only_and_function_bound() {
         "INSERT INTO public.runtime_drain_intents_v2 DEFAULT VALUES",
         "UPDATE public.runtime_drain_intents_v2 SET drain_intent_id = drain_intent_id",
         "DELETE FROM public.runtime_drain_intents_v2",
-        "TRUNCATE public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
+        "TRUNCATE public.runtime_product_drain_terminal_actions_v2, public.runtime_slot_writer_fences_v2, public.runtime_drain_intents_v2",
     ] {
         let error = sqlx::query(statement)
             .execute(&database.executor_pool)

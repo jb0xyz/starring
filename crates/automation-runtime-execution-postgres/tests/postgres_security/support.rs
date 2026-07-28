@@ -87,6 +87,23 @@ const EXECUTOR_FUNCTIONS: [&str; 28] = [
     "public.starring_runtime_startup_recovery_select_pending_drain_v3(text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_pending_drain_succession_v3(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean)",
 ];
+const PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS: [&str; 15] = [
+    "public.starring_runtime_execution_database_readiness_v1()",
+    "public.starring_runtime_execution_database_identity_v1()",
+    "public.starring_runtime_execution_claim_next_v1(text,bigint)",
+    "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
+    "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
+    "public.starring_runtime_execution_certify_prepare_v1(text,text,text,bigint,text,bigint,bigint,bigint,jsonb,text,text,text,bigint)",
+    "public.starring_runtime_execution_certify_commit_v1(text,text,text,bigint,text,bigint,bigint,bigint,jsonb,text,text,text,bigint,timestamp with time zone,jsonb,text,jsonb,text)",
+    "public.starring_runtime_execution_recover_stale_live_v1()",
+    "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",
+    "public.starring_runtime_gateway_owner_observe_v1(text)",
+    "public.starring_runtime_gateway_owner_acquire_v1(text,text,text,bigint)",
+    "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
+    "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
+    "public.starring_runtime_writer_fence_observe_v1()",
+    "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
+];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
     "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
 const TENANT: &str = "runtime-execution-tenant";
