@@ -43,16 +43,190 @@ fn source_files_contain_no_comments() {
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/registry.rs", include_str!("../src/registry.rs")),
         (
+            "src/registry/v4_drain.rs",
+            include_str!("../src/registry/v4_drain.rs"),
+        ),
+        (
+            "src/registry/v4_drain/worker_port.rs",
+            include_str!("../src/registry/v4_drain/worker_port.rs"),
+        ),
+        (
+            "src/registry/v4_drain/state.rs",
+            include_str!("../src/registry/v4_drain/state.rs"),
+        ),
+        (
             "src/v2_observation.rs",
             include_str!("../src/v2_observation.rs"),
         ),
         ("src/v2_recovery.rs", include_str!("../src/v2_recovery.rs")),
         ("tests/registry.rs", include_str!("registry.rs")),
+        ("tests/v4_drain.rs", include_str!("v4_drain.rs")),
     ];
     for (path, source) in sources {
         assert!(!source.contains("//"), "line comment in {path}");
         assert!(!source.contains("/*"), "block comment in {path}");
         assert!(!source.contains("*/"), "block comment terminator in {path}");
+    }
+}
+
+#[test]
+fn v4_drain_capabilities_are_linear_nonserializable_and_nonconstructible() {
+    let source = concat!(
+        include_str!("../src/registry/v4_drain.rs"),
+        include_str!("../src/registry/v4_drain/state.rs"),
+        include_str!("../src/registry/v4_drain/worker_port.rs")
+    );
+    let public = include_str!("../src/lib.rs");
+    let states = [
+        "RoutedObservedV4",
+        "RoutedSealedV4",
+        "RoutedSealedObservationV4",
+        "RoutedClaimedSealedV4",
+        "LocallyRefencedSealedV4",
+        "DurablyRefencedSealedV4",
+        "DrainingRefencedSealedV4",
+        "DrainingRefencedObservationV4",
+        "RouteAbsentSealedV4",
+        "EmptySuccessionSealedV4",
+        "AcknowledgedEmptyV4",
+    ];
+    for state in states {
+        let declaration = format!("pub struct {state}");
+        let prefix = source.split(&declaration).next().unwrap_or("").trim_end();
+        assert!(!prefix.ends_with(")]"), "{state}");
+        let implementation = source
+            .split(&format!("impl {state} {{"))
+            .nth(1)
+            .unwrap_or("")
+            .split("\n}")
+            .next()
+            .unwrap_or("");
+        for constructor in [
+            "pub fn new(",
+            "pub const fn new(",
+            "from_raw",
+            "from_parts",
+            "into_raw",
+            "into_parts",
+        ] {
+            assert!(
+                !implementation.contains(constructor),
+                "{state}: {constructor}"
+            );
+        }
+        for implemented in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !source.contains(&format!("impl {implemented} for {state}")),
+                "{state}: {implemented}"
+            );
+        }
+        assert!(public.contains(state), "{state}");
+    }
+    for forbidden in [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "async fn",
+        ".await",
+        "tokio",
+        "twilight",
+        "sqlx",
+        "rusqlite",
+        "from_raw_parts",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn v4_drain_transitions_consume_sources_and_use_dedicated_methods() {
+    let source = concat!(
+        include_str!("../src/registry/v4_drain.rs"),
+        include_str!("../src/registry/v4_drain/worker_port.rs")
+    );
+    for signature in [
+        "source: RoutedObservedV4,",
+        "source: RoutedSealedV4,",
+        "source: RoutedClaimedSealedV4,",
+        "source: LocallyRefencedSealedV4,",
+        "source: DurablyRefencedSealedV4,",
+        "source: DrainingRefencedSealedV4,",
+        "observation: DrainingRefencedObservationV4,",
+        "source: RouteAbsentSealedV4,",
+        "source: EmptySuccessionSealedV4,",
+    ] {
+        assert!(source.contains(signature), "{signature}");
+    }
+    for method in [
+        "pub fn observe_routed_v4(",
+        "pub fn observe_routed_sealed_v4(",
+        "pub fn observe_draining_refenced_v4(",
+        "pub fn seal_empty_succession_v4(",
+        "pub fn checkpoint_locally_refenced_seal_v4(",
+        "pub fn resume_locally_refenced_sealed_v4(",
+        "pub fn resume_durably_refenced_sealed_v4(",
+        "pub fn checkpoint_route_absent_seal_v4(",
+        "pub fn resume_route_absent_sealed_v4(",
+        "fn seal_routed(",
+        "fn recover_routed_claimed(",
+        "fn bind_claim(",
+        "fn refence<J: Send, S: Send, C: Send>(",
+        "fn bind_refence(",
+        "fn recover_durable_refence(",
+        "fn begin_drain(",
+        "fn remove(",
+        "fn recover_route_absent(",
+        "fn seal_empty_succession(",
+        "fn consume_acknowledgement(",
+        "fn consume_succession_acknowledgement(",
+        "fn rollback_routed_seal_v4(",
+    ] {
+        assert!(source.contains(method), "{method}");
+    }
+    for forbidden in [
+        "pub fn seal_routed_v4(",
+        "pub fn bind_routed_claim_v4(",
+        "pub fn refence_routed_claim_v4(",
+        "pub fn bind_durable_refence_v4(",
+        "pub fn remove_draining_refenced_v4(",
+        "pub fn consume_route_absent_acknowledgement_v4(",
+        "pub fn consume_empty_succession_acknowledgement_v4(",
+        "pub fn mutate_sealed",
+        "pub fn remove_sealed",
+        "pub fn unseal_v4",
+        "pub fn escape",
+        "pub fn resume_routed_sealed_v4",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    assert!(source.contains("source: LocallyRefencedSealedV4,"));
+    assert!(source.contains("source: RouteAbsentSealedV4,"));
+    assert!(source.contains("claim_receipt_digest: RegistryDurableReceiptDigestV4,"));
+    assert!(source.contains("refence_receipt_digest: RegistryDurableReceiptDigestV4,"));
+    assert_eq!(source.matches("pub fn resume_").count(), 3);
+    assert!(source.contains("type RoutedSealed = RoutedSealedV4;"));
+    assert!(source.contains("RuntimeRoutedDrainRollbackPermitV4,"));
+}
+
+#[test]
+fn ordinary_registry_mutations_remain_closed_under_a_seal() {
+    let source = include_str!("../src/registry.rs");
+    for method in [
+        "pub fn install(",
+        "pub fn activate_with_sequence_v2(",
+        "pub fn begin_drain_with_authority(",
+        "pub fn remove(",
+        "pub fn remove_with_authority(",
+        "pub fn advance_authority(",
+    ] {
+        let body = source
+            .split(method)
+            .nth(1)
+            .unwrap_or("")
+            .split("\n    pub fn ")
+            .next()
+            .unwrap_or("");
+        assert!(body.contains("ensure_slot_unsealed(slot)?;"), "{method}");
     }
 }
 

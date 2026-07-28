@@ -852,7 +852,16 @@ fn map_registry_observation_error(
         | ServingSlotRegistryError::AdmissionGenerationMismatch { .. }
         | ServingSlotRegistryError::StaleSlotObservation
         | ServingSlotRegistryError::SlotSealed
-        | ServingSlotRegistryError::StaleSlotSeal => {
+        | ServingSlotRegistryError::StaleSlotSeal
+        | ServingSlotRegistryError::V4RegistryMismatch
+        | ServingSlotRegistryError::V4CapabilityStale
+        | ServingSlotRegistryError::V4RouteMismatch
+        | ServingSlotRegistryError::V4LifecycleMismatch
+        | ServingSlotRegistryError::V4FenceMismatch
+        | ServingSlotRegistryError::V4GuardMismatch
+        | ServingSlotRegistryError::V4ReceiptMismatch
+        | ServingSlotRegistryError::V4ObservationMismatch
+        | ServingSlotRegistryError::V4EmptySuccessionMismatch => {
             RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation
         }
     }

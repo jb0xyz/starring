@@ -555,8 +555,11 @@ name = "automation-runtime-registry"
 version = "0.1.0"
 dependencies = [
  "automation-ruleset",
+ "automation-runtime-controller",
  "automation-runtime-convergence",
+ "automation-runtime-worker",
  "automation-state",
+ "chrono",
  "desired-state",
  "discord-model",
  "resource-resolution",

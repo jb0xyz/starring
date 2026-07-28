@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use automation_runtime_convergence::{
@@ -12,6 +13,31 @@ use crate::{
     ExactServingRouteV1, RegistryGlobalObservationSequenceV2, RegistryRecoveryObservationV2,
     ServingSlotKeyV1, ServingSlotRegistryError, SlotAdmissionStateV2, SlotAtomicObservationV2,
 };
+
+mod v4_drain;
+
+pub use v4_drain::{
+    AcknowledgedEmptyV4, DrainingRefencedObservationV4, DrainingRefencedSealedV4,
+    DurablyRefencedSealedV4, EmptySuccessionSealedV4, LocallyRefencedSealedV4,
+    PreviousRouteEnvelopeV4, RegistryDurableReceiptDigestV4, RouteAbsentSealedV4,
+    RoutedClaimedSealedV4, RoutedObservedV4, RoutedSealedObservationV4, RoutedSealedV4,
+};
+
+static NEXT_REGISTRY_LIFETIME_V4: AtomicU64 = AtomicU64::new(1);
+
+fn next_registry_lifetime_digest() -> [u8; 32] {
+    let sequence = NEXT_REGISTRY_LIFETIME_V4
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("registry lifetime identity exhausted"));
+    let mut digest = [0x72; 32];
+    digest[0..8].copy_from_slice(&sequence.to_be_bytes());
+    digest[8..16].copy_from_slice(&sequence.rotate_left(17).to_be_bytes());
+    digest[16..24].copy_from_slice(&sequence.rotate_left(37).to_be_bytes());
+    digest[24..32].copy_from_slice(&sequence.rotate_left(53).to_be_bytes());
+    digest
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServingSlotRegistryConfigV1 {
@@ -359,6 +385,7 @@ pub struct ServingSlotRegistryV1 {
 
 struct RegistryInner {
     config: ServingSlotRegistryConfigV1,
+    lifetime_digest: [u8; 32],
     state: Mutex<RegistryState>,
 }
 
@@ -452,6 +479,10 @@ struct SlotSealState {
     seal_key: crate::SlotSealKeyV2,
     seal_generation: NonZeroU64,
     route: Option<SlotRouteWitnessV1>,
+    source_route: Option<SlotRouteWitnessV1>,
+    source_admission_generation: NonZeroU64,
+    source_observation_sequence: NonZeroU64,
+    source_registry_observation_sequence: RegistryGlobalObservationSequenceV2,
 }
 
 struct FenceHighWater {
@@ -496,6 +527,7 @@ impl ServingSlotRegistryV1 {
         Self {
             inner: Arc::new(RegistryInner {
                 config,
+                lifetime_digest: next_registry_lifetime_digest(),
                 state: Mutex::new(RegistryState::default()),
             }),
         }
@@ -1053,6 +1085,10 @@ impl ServingSlotRegistryV1 {
                 seal_key,
                 seal_generation,
                 route: None,
+                source_route: None,
+                source_admission_generation: slot.admission_generation,
+                source_observation_sequence: slot.observation_sequence,
+                source_registry_observation_sequence: state.observation.sequence,
             });
             let observed = atomic_observation_v2(&slot)?;
             state.slots.insert(key.clone(), slot);
@@ -1079,6 +1115,10 @@ impl ServingSlotRegistryV1 {
             seal_key,
             seal_generation,
             route: route.clone(),
+            source_route: route.clone(),
+            source_admission_generation: slot.admission_generation,
+            source_observation_sequence: slot.observation_sequence,
+            source_registry_observation_sequence: observation.sequence,
         });
         let capability = SlotDrainClaimSealV2 {
             registry: Arc::downgrade(&self.inner),
@@ -1123,6 +1163,10 @@ impl ServingSlotRegistryV1 {
                 seal_key,
                 seal_generation,
                 route: None,
+                source_route: None,
+                source_admission_generation: slot.admission_generation,
+                source_observation_sequence: slot.observation_sequence,
+                source_registry_observation_sequence: state.observation.sequence,
             });
             state.slots.insert(key.clone(), slot);
             seal_generation
@@ -1145,6 +1189,10 @@ impl ServingSlotRegistryV1 {
                 seal_key,
                 seal_generation,
                 route: None,
+                source_route: None,
+                source_admission_generation: slot.admission_generation,
+                source_observation_sequence: slot.observation_sequence,
+                source_registry_observation_sequence: observation.sequence,
             });
             seal_generation
         };
