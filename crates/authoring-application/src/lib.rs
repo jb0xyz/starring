@@ -2,6 +2,7 @@ mod application;
 mod authority;
 mod control;
 mod identity;
+mod lifecycle;
 mod promotion;
 mod status;
 
@@ -27,6 +28,15 @@ pub use control::{
 pub use identity::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,
     AuthenticationClaimsV1, AuthenticationError, AuthenticationPort, MutationAuthenticationPort,
+};
+pub use lifecycle::{
+    AuthorizedCancelProductLifecycleV1, CancelProductLifecycleMutationV1,
+    ProductDrainSelectorError, ProductDrainSelectorV1,
+    ProductLifecycleCancellationDeploymentProjectionV1,
+    ProductLifecycleCancellationDrainProjectionV1, ProductLifecycleCancellationPort,
+    ProductLifecycleCancellationReasonError, ProductLifecycleCancellationReasonV1,
+    ProductLifecycleCancellationReceiptError, ProductLifecycleCancellationReceiptV1,
+    ProductLifecycleCancellationSlotProjectionV1,
 };
 pub use promotion::{
     AuthoringApplicationError, AuthorizedPromotionAccessV1, AuthorizedPromotionBackendFailureV1,

@@ -7,7 +7,7 @@ use discord_model::GuildId;
 
 use crate::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthorizedInstallationScopeV1,
-    ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDrainSelectorV1,
 };
 
 const REJECTION_REASON_MAX_SCALARS: usize = 1_000;
@@ -436,6 +436,10 @@ pub enum ProductControlPortError {
     InvalidState,
     #[error("runtime drain is required before product apply can continue")]
     RuntimeDrainRequired,
+    #[error("runtime drain is pending before product apply can continue")]
+    RuntimeDrainPending(ProductDrainSelectorV1),
+    #[error("the correlated Product lifecycle operation was cancelled")]
+    LifecycleCancelled(ProductDrainSelectorV1),
     #[error("requester self-approval is forbidden")]
     SelfApprovalForbidden,
     #[error("the same product decision already exists")]

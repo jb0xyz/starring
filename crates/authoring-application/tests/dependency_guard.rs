@@ -168,10 +168,17 @@ fn authenticated_actor_stays_crate_issued_and_authority_load_stays_atomic() {
         include_str!("../src/application.rs"),
         include_str!("../src/application/promotion_flow.rs"),
         include_str!("../src/application/decision_mutation.rs"),
+        include_str!("../src/application/lifecycle_cancellation.rs"),
     ]
     .join("\n");
     assert!(application.contains("authenticate_mutation(credential, csrf)"));
-    for mutation in ["promote_owned_session", "approve", "reject", "apply"] {
+    for mutation in [
+        "promote_owned_session",
+        "approve",
+        "reject",
+        "apply",
+        "cancel_product_lifecycle",
+    ] {
         let method = application
             .split(&format!("fn {mutation}"))
             .nth(1)
@@ -193,6 +200,7 @@ fn product_commands_never_accept_trusted_authority_or_apply_attempt_fields() {
         "ApproveProductPromotionV1",
         "RejectProductPromotionV1",
         "ApplyProductPromotionV1",
+        "CancelProductLifecycleMutationV1",
     ] {
         let command = source
             .split(&format!("pub struct {command_name}"))
@@ -263,6 +271,74 @@ fn decision_port_has_only_bound_decisions_and_adapter_derived_apply_identity() {
 }
 
 #[test]
+fn product_lifecycle_cancellation_is_distinct_checked_and_additive() {
+    let source = source();
+    for required in [
+        "CancelLifecycle",
+        "ProductDrainSelectorV1",
+        "InvalidAcknowledgedStateDigest",
+        "IdentityCollision",
+        "CancelProductLifecycleMutationV1",
+        "AuthorizedCancelProductLifecycleV1",
+        "ProductLifecycleCancellationPort",
+        "cancel_lifecycle_idempotent",
+        "ProductLifecycleCancellationReceiptV1",
+        "RuntimeDrainPending(ProductDrainSelectorV1)",
+        "LifecycleCancelled(ProductDrainSelectorV1)",
+        "CapabilityV1::CancelLifecycle",
+        "cancel_product_lifecycle",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    let command = source
+        .split("pub struct CancelProductLifecycleMutationV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    for field in [
+        "promotion",
+        "expected_payload_digest",
+        "expected_revision",
+        "drain_selector",
+        "idempotency_key",
+        "reason",
+    ] {
+        assert!(command.contains(field), "{field}");
+    }
+    for forbidden in [
+        "actor",
+        "guild_id",
+        "requester",
+        "policy",
+        "target",
+        "authority",
+        "slot_writer_epoch",
+    ] {
+        assert!(!command.contains(forbidden), "{forbidden}");
+    }
+    let authorized = source
+        .split("pub struct AuthorizedCancelProductLifecycleV1")
+        .nth(1)
+        .unwrap()
+        .split("pub enum ProductLifecycleCancellationReceiptError")
+        .next()
+        .unwrap();
+    assert!(authorized.contains("ProductMutationContextV1"));
+    assert!(authorized.contains("pub(crate) fn new"));
+    assert!(!authorized.contains("pub fn new"));
+    let marker = source
+        .split("pub trait ProductDecisionPort")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(!marker.contains("ProductLifecycleCancellationPort"));
+}
+
+#[test]
 fn product_mutation_context_is_crate_issued_bound_and_redacted() {
     let control = include_str!("../src/control.rs");
     let context = control
@@ -305,12 +381,14 @@ fn source() -> String {
         include_str!("../src/application.rs"),
         include_str!("../src/application/approval_query.rs"),
         include_str!("../src/application/decision_mutation.rs"),
+        include_str!("../src/application/lifecycle_cancellation.rs"),
         include_str!("../src/application/projection_validation.rs"),
         include_str!("../src/application/promotion_flow.rs"),
         include_str!("../src/application/status_query.rs"),
         include_str!("../src/authority.rs"),
         include_str!("../src/control.rs"),
         include_str!("../src/identity.rs"),
+        include_str!("../src/lifecycle.rs"),
         include_str!("../src/promotion.rs"),
         include_str!("../src/status.rs"),
         include_str!("../src/status/runtime.rs"),
