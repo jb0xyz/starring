@@ -21,6 +21,11 @@ use crate::{
 const DIGEST_LENGTH: usize = 64;
 const MAX_GUILD_ROLES: usize = 250;
 const MAX_MEMBER_ROLES: usize = 250;
+const AUTHORITY_DIGEST_DOMAIN_V1: &[u8] = b"starring.discord-authority.v1";
+const APPLY_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1: &[u8] =
+    b"starring.discord-authority.apply-runtime.v1";
+const CANCEL_LIFECYCLE_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1: &[u8] =
+    b"starring.discord-authority.cancel-lifecycle-runtime.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DiscordAuthoritySourceError {
@@ -101,7 +106,8 @@ impl DiscordAuthorityConfigV1 {
             CapabilityV1::Promote
             | CapabilityV1::Approve
             | CapabilityV1::Reject
-            | CapabilityV1::Apply => self.write_lifetime,
+            | CapabilityV1::Apply
+            | CapabilityV1::CancelLifecycle => self.write_lifetime,
         }
     }
 }
@@ -170,7 +176,7 @@ where
         let expires_at = observed_at
             .checked_add_signed(self.config.evidence_lifetime(capability))
             .ok_or_else(|| FreshGuildAuthorityError::Backend("authority_time_overflow".into()))?;
-        let evaluated = if capability == CapabilityV1::Apply {
+        let evaluated = if requires_runtime_environment(capability) {
             let bot_user_id = self.client.bot_user_id().ok_or_else(|| {
                 FreshGuildAuthorityError::Backend("discord_apply_bot_identity_unavailable".into())
             })?;
@@ -198,7 +204,8 @@ where
         if completed_at < observed_at || completed_at >= expires_at {
             return Err(FreshGuildAuthorityError::Stale);
         }
-        if (capability == CapabilityV1::Apply) != evaluated.apply_runtime_environment.is_some() {
+        if requires_runtime_environment(capability) != evaluated.apply_runtime_environment.is_some()
+        {
             return Err(FreshGuildAuthorityError::Backend(
                 "discord_authority_runtime_evidence_invalid".into(),
             ));
@@ -472,11 +479,12 @@ fn observation_digest(
 ) -> String {
     let mut hasher = Sha256::new();
     let digest_domain = match capability {
-        CapabilityV1::Apply => b"starring.discord-authority.apply-runtime.v1".as_slice(),
+        CapabilityV1::Apply => APPLY_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1,
+        CapabilityV1::CancelLifecycle => CANCEL_LIFECYCLE_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1,
         CapabilityV1::Promote
         | CapabilityV1::Read
         | CapabilityV1::Approve
-        | CapabilityV1::Reject => b"starring.discord-authority.v1".as_slice(),
+        | CapabilityV1::Reject => AUTHORITY_DIGEST_DOMAIN_V1,
     };
     update_field(&mut hasher, digest_domain);
     update_field(&mut hasher, record.tenant_id.as_str().as_bytes());
@@ -570,7 +578,15 @@ fn capability_name(capability: CapabilityV1) -> &'static [u8] {
         CapabilityV1::Approve => b"approve",
         CapabilityV1::Reject => b"reject",
         CapabilityV1::Apply => b"apply",
+        CapabilityV1::CancelLifecycle => b"cancel_lifecycle",
     }
+}
+
+fn requires_runtime_environment(capability: CapabilityV1) -> bool {
+    matches!(
+        capability,
+        CapabilityV1::Apply | CapabilityV1::CancelLifecycle
+    )
 }
 
 fn encode_lower_hex(bytes: &[u8]) -> String {
