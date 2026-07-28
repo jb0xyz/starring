@@ -694,7 +694,7 @@ fn payload_limit_matches_the_one_mebibyte_execution_frame_cap() {
 }
 
 #[test]
-fn closed_recovery_requires_two_persisted_cas_transitions() {
+fn unclaimed_closed_recovery_requires_two_persisted_cas_transitions() {
     let operation = operation();
     let root = root(&operation);
     let unclaimed = persisted_unclaimed(&root, non_zero(1));

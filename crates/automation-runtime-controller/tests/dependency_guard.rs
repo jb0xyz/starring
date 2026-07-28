@@ -1852,7 +1852,7 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
         "decoder_rejects_unknown_noncanonical_and_mismatched_root_state",
         "pending_subtype_and_nested_provenance_corruption_fail_closed",
         "payload_limit_matches_the_one_mebibyte_execution_frame_cap",
-        "closed_recovery_requires_two_persisted_cas_transitions",
+        "unclaimed_closed_recovery_requires_two_persisted_cas_transitions",
         "persisted_refenced_candidate_acknowledges_the_exact_removal_target",
         "routed_claimed_state_is_not_a_route_absence_candidate",
         "closed_recovery_builder_rejects_owner_drift_and_revision_overflow",
